@@ -18,6 +18,7 @@ import {
   Globe,
   Loader2,
   RefreshCw,
+  Server,
   Trash2,
   Upload,
 } from "lucide-react"
@@ -561,13 +562,21 @@ export function BranchDropdown() {
   if (!activeFolder) return null
 
   const folderName = activeFolder.name
+  const isRemote = activeFolder.connection_id !== null
 
   if (branch === null) {
     return (
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button className="flex min-w-0 items-center gap-1 text-sm tracking-tight outline-none transition-colors cursor-default hover:text-foreground/80">
-            <GitFork className="h-3 w-3 shrink-0" />
+            {isRemote ? (
+              <Server
+                className="h-3 w-3 shrink-0 text-muted-foreground"
+                aria-label="remote folder"
+              />
+            ) : (
+              <GitFork className="h-3 w-3 shrink-0" />
+            )}
             <span className="max-w-[320px] truncate">
               {folderName}
               <span className="mx-1.5 inline-block h-3 w-px bg-foreground/20 align-middle" />
@@ -596,7 +605,14 @@ export function BranchDropdown() {
       <DropdownMenu open={dropdownOpen} onOpenChange={handleDropdownOpenChange}>
         <DropdownMenuTrigger asChild>
           <button className="flex min-w-0 items-center gap-1 text-sm tracking-tight outline-none transition-colors cursor-default hover:text-foreground/80">
-            <GitBranch className="h-3 w-3 shrink-0" />
+            {isRemote ? (
+              <Server
+                className="h-3 w-3 shrink-0 text-muted-foreground"
+                aria-label="remote folder"
+              />
+            ) : (
+              <GitBranch className="h-3 w-3 shrink-0" />
+            )}
             <span className="max-w-[320px] truncate">
               {folderName}
               <span className="mx-1.5 inline-block h-3 w-px bg-foreground/20 align-middle" />

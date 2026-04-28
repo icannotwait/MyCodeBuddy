@@ -1010,7 +1010,8 @@
       "cloneRepository": "克隆仓库",
       "projectBoot": "项目启动器",
       "opened": "已打开",
-      "recentOpen": "最近打开"
+      "recentOpen": "最近打开",
+      "openFromSsh": "从 SSH 连接打开…"
     },
     "fileWorkspacePanel": {
       "viewDiff": "查看差异",
@@ -2245,5 +2246,22 @@
       "importFailed": "导入别名失败。",
       "loadFailed": "读取 ~/.ssh/config 失败。"
     }
+  },
+  "SshFolderDialog": {
+    "title": "打开远程目录",
+    "description": "打开一个通过 SSH 可达的远端机器上的目录。",
+    "loading": "正在加载连接…",
+    "connection": "连接",
+    "noConnections": "尚未配置 SSH 连接。请先到「设置 → SSH 连接」添加。",
+    "manageConnections": "管理连接",
+    "remotePath": "远端路径",
+    "remotePathPlaceholder": "/home/alice/myproject",
+    "remotePathHint": "可以用 ~ 指代远端 home 目录。",
+    "errPathRequired": "远端路径为必填项。",
+    "errPathRelative": "路径必须是绝对路径（以 / 或 ~ 起始）。",
+    "open": "打开",
+    "cancel": "取消",
+    "openSuccess": "已打开远程目录。",
+    "openFailed": "打开远程目录失败："
   }
 }

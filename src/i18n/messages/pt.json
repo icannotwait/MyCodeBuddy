@@ -1010,7 +1010,8 @@
       "cloneRepository": "Clonar repositório",
       "projectBoot": "Inicializador de projeto",
       "opened": "Aberto",
-      "recentOpen": "Abertos recentemente"
+      "recentOpen": "Abertos recentemente",
+      "openFromSsh": "From SSH connection…"
     },
     "fileWorkspacePanel": {
       "viewDiff": "Ver Diff",
@@ -2245,5 +2246,22 @@
       "importFailed": "Failed to import alias.",
       "loadFailed": "Failed to read ~/.ssh/config."
     }
+  },
+  "SshFolderDialog": {
+    "title": "Open Remote Folder",
+    "description": "Open a folder hosted on a remote machine reachable through SSH.",
+    "loading": "Loading connections…",
+    "connection": "Connection",
+    "noConnections": "No SSH connections configured. Add one in Settings → SSH Connections first.",
+    "manageConnections": "Manage connections",
+    "remotePath": "Remote path",
+    "remotePathPlaceholder": "/home/alice/myproject",
+    "remotePathHint": "Use ~ for the remote home directory.",
+    "errPathRequired": "Remote path is required.",
+    "errPathRelative": "Path must be absolute (start with / or ~).",
+    "open": "Open",
+    "cancel": "Cancel",
+    "openSuccess": "Opened remote folder.",
+    "openFailed": "Failed to open remote folder:"
   }
 }

@@ -15,6 +15,7 @@ mod m20260423_000001_drop_folder_parent_branch;
 mod m20260424_000001_folder_color;
 mod m20260424_000002_quick_message;
 mod m20260428_000001_connection;
+mod m20260428_000002_folder_remote_columns;
 
 pub struct Migrator;
 
@@ -37,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260424_000001_folder_color::Migration),
             Box::new(m20260424_000002_quick_message::Migration),
             Box::new(m20260428_000001_connection::Migration),
+            Box::new(m20260428_000002_folder_remote_columns::Migration),
         ]
     }
 }

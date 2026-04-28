@@ -1125,6 +1125,16 @@ export async function openFolder(path: string): Promise<FolderDetail> {
   return getTransport().call("open_folder", { path })
 }
 
+export async function openRemoteFolder(params: {
+  connectionId: string
+  remotePath: string
+}): Promise<FolderDetail> {
+  return getTransport().call("open_remote_folder", {
+    connectionId: params.connectionId,
+    remotePath: params.remotePath,
+  })
+}
+
 export async function openCommitWindow(folderId: number): Promise<void> {
   if (getTransport().isDesktop()) {
     return getTransport().call("open_commit_window", { folderId })
@@ -1143,6 +1153,7 @@ export type SettingsSection =
   | "skills"
   | "shortcuts"
   | "system"
+  | "ssh-connections"
 
 interface OpenSettingsWindowOptions {
   agentType?: AgentType | null

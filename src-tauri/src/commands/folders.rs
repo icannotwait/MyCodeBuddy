@@ -541,6 +541,62 @@ pub async fn open_folder_by_id(
         .ok_or_else(|| AppCommandError::not_found(format!("Folder {folder_id} not found")))
 }
 
+/// Validate a remote path supplied by the UI: must be non-empty and start
+/// with `/` or `~`. NUL bytes are rejected to avoid surprises when the path
+/// is later embedded into shell commands.
+#[cfg_attr(not(feature = "tauri-runtime"), allow(dead_code))]
+fn validate_remote_path(p: &str) -> Result<(), AppCommandError> {
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return Err(AppCommandError::invalid_input("remote path is required"));
+    }
+    if !trimmed.starts_with('/') && !trimmed.starts_with('~') {
+        return Err(AppCommandError::invalid_input(
+            "remote path must be absolute (start with / or ~)",
+        ));
+    }
+    if trimmed.contains('\0') {
+        return Err(AppCommandError::invalid_input("remote path contains NUL"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn open_remote_folder(
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, crate::remote::RemoteConnectionManager>,
+    connection_id: String,
+    remote_path: String,
+) -> Result<FolderDetail, AppCommandError> {
+    use crate::db::service::connection_service;
+
+    validate_remote_path(&remote_path)?;
+    let conn = connection_service::get_by_id(&db.conn, &connection_id)
+        .await?
+        .ok_or_else(|| {
+            AppCommandError::not_found(format!("connection {connection_id} not found"))
+        })?;
+
+    let folder = folder_service::upsert_remote_folder(&db.conn, &connection_id, &remote_path)
+        .await
+        .map_err(AppCommandError::from)?;
+
+    // Fire-and-forget: kick off the bootstrap pipeline so the UI sees status
+    // events through the existing `connection://status` channel. We don't
+    // block opening the folder on the connect succeeding — failures still
+    // leave the folder visible (in error state) so the user can retry.
+    let rcm_handle = rcm.inner().clone_ref();
+    let cfg = conn;
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = rcm_handle.connect(cfg).await {
+            eprintln!("[Remote] auto-connect failed: {e}");
+        }
+    });
+
+    Ok(folder)
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn remove_folder_from_workspace(
@@ -3689,3 +3745,41 @@ async fn get_unpushed_hashes(
 
     Ok((Some(hashes), has_upstream))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_path_accepts_absolute() {
+        assert!(validate_remote_path("/home/alice/proj").is_ok());
+    }
+
+    #[test]
+    fn validate_path_accepts_tilde() {
+        assert!(validate_remote_path("~/code/foo").is_ok());
+    }
+
+    #[test]
+    fn validate_path_rejects_relative() {
+        assert!(validate_remote_path("code/foo").is_err());
+        assert!(validate_remote_path("./foo").is_err());
+    }
+
+    #[test]
+    fn validate_path_rejects_empty() {
+        assert!(validate_remote_path("").is_err());
+        assert!(validate_remote_path("   ").is_err());
+    }
+
+    #[test]
+    fn validate_path_rejects_nul() {
+        assert!(validate_remote_path("/foo bar").is_err());
+    }
+
+    #[test]
+    fn validate_path_trims_surrounding_whitespace() {
+        assert!(validate_remote_path("  /tmp  ").is_ok());
+    }
+}
+

@@ -153,6 +153,8 @@ export interface FolderHistoryEntry {
   path: string
   name: string
   last_opened_at: string
+  connection_id: string | null
+  remote_path: string | null
 }
 
 export interface FolderDetail {
@@ -164,6 +166,8 @@ export interface FolderDetail {
   last_opened_at: string
   sort_order: number
   color: string
+  connection_id: string | null
+  remote_path: string | null
 }
 
 export interface OpenedTab {

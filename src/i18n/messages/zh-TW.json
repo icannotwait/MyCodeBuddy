@@ -1010,7 +1010,8 @@
       "cloneRepository": "複製倉庫",
       "projectBoot": "專案啟動器",
       "opened": "已打開",
-      "recentOpen": "最近打開"
+      "recentOpen": "最近打開",
+      "openFromSsh": "From SSH connection…"
     },
     "fileWorkspacePanel": {
       "viewDiff": "查看差異",
@@ -2245,5 +2246,22 @@
       "importFailed": "Failed to import alias.",
       "loadFailed": "Failed to read ~/.ssh/config."
     }
+  },
+  "SshFolderDialog": {
+    "title": "Open Remote Folder",
+    "description": "Open a folder hosted on a remote machine reachable through SSH.",
+    "loading": "Loading connections…",
+    "connection": "Connection",
+    "noConnections": "No SSH connections configured. Add one in Settings → SSH Connections first.",
+    "manageConnections": "Manage connections",
+    "remotePath": "Remote path",
+    "remotePathPlaceholder": "/home/alice/myproject",
+    "remotePathHint": "Use ~ for the remote home directory.",
+    "errPathRequired": "Remote path is required.",
+    "errPathRelative": "Path must be absolute (start with / or ~).",
+    "open": "Open",
+    "cancel": "Cancel",
+    "openSuccess": "Opened remote folder.",
+    "openFailed": "Failed to open remote folder:"
   }
 }

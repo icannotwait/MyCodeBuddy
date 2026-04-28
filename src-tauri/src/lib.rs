@@ -335,6 +335,7 @@ mod tauri_app {
                 folders::list_all_folder_details,
                 folders::open_folder,
                 folders::open_folder_by_id,
+                folders::open_remote_folder,
                 folders::remove_folder_from_workspace,
                 folders::reorder_folders,
                 folders::update_folder_color,

@@ -17,6 +17,7 @@ import {
   listOpenFolderDetails,
   openFolder as apiOpenFolder,
   openFolderById as apiOpenFolderById,
+  openRemoteFolder as apiOpenRemoteFolder,
   removeFolderFromWorkspace as apiRemoveFolderFromWorkspace,
   reorderFolders as apiReorderFolders,
   getFolder as apiGetFolder,
@@ -52,6 +53,10 @@ interface AppWorkspaceContextValue {
   setBranch: (folderId: number, branch: string | null) => void
 
   openFolder: (path: string) => Promise<FolderDetail>
+  openRemoteFolder: (
+    connectionId: string,
+    remotePath: string
+  ) => Promise<FolderDetail>
   addFolderToWorkspaceById: (folderId: number) => Promise<FolderDetail>
   removeFolderFromWorkspace: (folderId: number) => Promise<void>
   reorderFolders: (ids: number[]) => Promise<void>
@@ -253,6 +258,21 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     [refreshConversations, upsertFolder]
   )
 
+  const openRemoteFolder = useCallback(
+    async (connectionId: string, remotePath: string) => {
+      const detail = await apiOpenRemoteFolder({ connectionId, remotePath })
+      upsertFolder(detail)
+      setBranches((prev) => {
+        const next = new Map(prev)
+        next.set(detail.id, detail.git_branch ?? null)
+        return next
+      })
+      void refreshConversations()
+      return detail
+    },
+    [refreshConversations, upsertFolder]
+  )
+
   const removeFolderFromWorkspace = useCallback(
     async (folderId: number) => {
       await apiRemoveFolderFromWorkspace(folderId)
@@ -388,6 +408,7 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       getBranch,
       setBranch,
       openFolder,
+      openRemoteFolder,
       addFolderToWorkspaceById,
       removeFolderFromWorkspace,
       reorderFolders,
@@ -411,6 +432,7 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       getBranch,
       setBranch,
       openFolder,
+      openRemoteFolder,
       addFolderToWorkspaceById,
       removeFolderFromWorkspace,
       reorderFolders,

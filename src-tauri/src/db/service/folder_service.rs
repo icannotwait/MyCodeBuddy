@@ -21,6 +21,8 @@ fn to_entry(m: folder::Model) -> FolderHistoryEntry {
         path: m.path,
         name: m.name,
         last_opened_at: m.last_opened_at,
+        connection_id: m.connection_id,
+        remote_path: m.remote_path,
     }
 }
 
@@ -40,6 +42,8 @@ fn to_detail(m: folder::Model) -> FolderDetail {
         last_opened_at: m.last_opened_at,
         sort_order: m.sort_order,
         color: m.color,
+        connection_id: m.connection_id,
+        remote_path: m.remote_path,
     }
 }
 
@@ -98,6 +102,8 @@ pub async fn add_folder(
             is_open: Set(true),
             sort_order: Set(max_order + 1),
             color: Set(DEFAULT_FOLDER_COLOR.to_string()),
+            connection_id: Set(None),
+            remote_path: Set(None),
         };
         active.insert(conn).await?
     };
@@ -235,4 +241,64 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
         .await?;
 
     Ok(())
+}
+
+/// Insert (or refresh) a remote folder row keyed by the synthetic
+/// `ssh://<connection_id><remote_path>` path. On hit we bump
+/// `last_opened_at` and re-open the folder; on miss we create a new row
+/// with the connection metadata and let the path's UNIQUE constraint
+/// enforce one-row-per-(connection, remote_path).
+pub async fn upsert_remote_folder(
+    conn: &DatabaseConnection,
+    connection_id: &str,
+    remote_path: &str,
+) -> Result<FolderDetail, DbError> {
+    use crate::models::folder::{folder_name_from_remote_path, synthetic_remote_path};
+
+    let synthetic = synthetic_remote_path(connection_id, remote_path);
+    let display_name = folder_name_from_remote_path(remote_path);
+    let now = Utc::now();
+
+    let existing = folder::Entity::find()
+        .filter(folder::Column::Path.eq(synthetic.clone()))
+        .one(conn)
+        .await?;
+
+    let model = if let Some(row) = existing {
+        let mut active = row.into_active_model();
+        active.name = Set(display_name);
+        active.last_opened_at = Set(now);
+        active.updated_at = Set(now);
+        active.deleted_at = Set(None);
+        active.is_open = Set(true);
+        active.connection_id = Set(Some(connection_id.to_string()));
+        active.remote_path = Set(Some(remote_path.trim().to_string()));
+        active.update(conn).await?
+    } else {
+        let max_order = folder::Entity::find()
+            .order_by_desc(folder::Column::SortOrder)
+            .one(conn)
+            .await?
+            .map(|m| m.sort_order)
+            .unwrap_or(0);
+        let active = folder::ActiveModel {
+            id: NotSet,
+            name: Set(display_name),
+            path: Set(synthetic),
+            git_branch: Set(None),
+            default_agent_type: Set(None),
+            last_opened_at: Set(now),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            is_open: Set(true),
+            sort_order: Set(max_order + 1),
+            color: Set(DEFAULT_FOLDER_COLOR.to_string()),
+            connection_id: Set(Some(connection_id.to_string())),
+            remote_path: Set(Some(remote_path.trim().to_string())),
+        };
+        active.insert(conn).await?
+    };
+
+    Ok(to_detail(model))
 }

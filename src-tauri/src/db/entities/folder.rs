@@ -17,6 +17,8 @@ pub struct Model {
     pub is_open: bool,
     pub sort_order: i32,
     pub color: String,
+    pub connection_id: Option<String>,
+    pub remote_path: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
