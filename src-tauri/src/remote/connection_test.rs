@@ -343,8 +343,10 @@ fn build_ssh_args(config: &ConnectionConfig) -> Vec<String> {
     // Identity file: only meaningful for `Key` auth method.
     if config.ssh_auth_method == SshAuthMethod::Key {
         if let Some(key) = &config.ssh_key_path {
+            let expanded = expand_tilde_in_local_path(key);
+            crate::remote::ssh_process::ensure_key_permissions(&expanded);
             args.push("-i".into());
-            args.push(expand_tilde_in_local_path(key));
+            args.push(expanded);
         }
     }
     // ProxyJump: pass through to system ssh.
