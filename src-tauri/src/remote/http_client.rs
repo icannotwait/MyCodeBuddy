@@ -1,11 +1,13 @@
 // Thin HTTP client for the daemon's loopback REST surface (capabilities,
-// health). The remote daemon runs on `127.0.0.1:<port>` of the desktop
-// host because we forward the port over SSH; the bearer token comes from
-// the bootstrap handshake.
+// health, conversations). The remote daemon runs on `127.0.0.1:<port>` of
+// the desktop host because we forward the port over SSH; the bearer token
+// comes from the bootstrap handshake.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::models::{AgentType, ConversationDetail, ConversationSummary};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +109,76 @@ impl DaemonClient {
         }
         Ok(())
     }
+
+    pub async fn list_conversations(
+        &self,
+        agent_type: Option<AgentType>,
+        folder_path: Option<String>,
+    ) -> Result<Vec<ConversationSummary>, ClientError> {
+        let url = format!("{}/api/list_conversations", self.base_url);
+        let body = ListConversationsBody {
+            agent_type,
+            search: None,
+            sort_by: None,
+            folder_path,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn get_conversation(
+        &self,
+        agent_type: AgentType,
+        conversation_id: String,
+    ) -> Result<ConversationDetail, ClientError> {
+        let url = format!("{}/api/get_conversation", self.base_url);
+        let body = GetConversationBody {
+            agent_type,
+            conversation_id,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<R, ClientError> {
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(&self.bearer)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet = resp.text().await.unwrap_or_default();
+            return Err(ClientError::HttpStatusWithBody {
+                status: status.as_u16(),
+                body: snippet,
+            });
+        }
+        resp.json::<R>()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListConversationsBody {
+    agent_type: Option<AgentType>,
+    search: Option<String>,
+    sort_by: Option<String>,
+    folder_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetConversationBody {
+    agent_type: AgentType,
+    conversation_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +187,8 @@ pub enum ClientError {
     Network(String),
     #[error("http status: {0}")]
     HttpStatus(u16),
+    #[error("http {status}: {body}")]
+    HttpStatusWithBody { status: u16, body: String },
     #[error("parse: {0}")]
     Parse(String),
 }

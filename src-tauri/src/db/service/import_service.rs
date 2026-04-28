@@ -5,7 +5,7 @@ use sea_orm::{
 
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
-use crate::models::{AgentType, ImportResult};
+use crate::models::{AgentType, ConversationSummary, ImportResult};
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codex::CodexParser;
@@ -13,6 +13,7 @@ use crate::parsers::gemini::GeminiParser;
 use crate::parsers::openclaw::OpenClawParser;
 use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::{path_eq_for_matching, AgentParser};
+use crate::remote::http_client::DaemonClient;
 
 pub async fn import_local_conversations(
     conn: &DatabaseConnection,
@@ -56,10 +57,21 @@ pub async fn import_local_conversations(
     .await
     .map_err(|e| DbError::Migration(e.to_string()))?;
 
+    persist_summaries(conn, folder_id, &summaries).await
+}
+
+/// Same DB upsert path as `import_local_conversations`, but takes already
+/// parsed summaries so callers like the remote-import branch don't need to
+/// touch the local filesystem.
+pub async fn persist_summaries(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    summaries: &[(AgentType, ConversationSummary)],
+) -> Result<ImportResult, DbError> {
     let mut imported = 0u32;
     let mut skipped = 0u32;
 
-    for (agent_type, summary) in &summaries {
+    for (agent_type, summary) in summaries {
         let at_str = serde_json::to_value(agent_type)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
@@ -100,4 +112,48 @@ pub async fn import_local_conversations(
     }
 
     Ok(ImportResult { imported, skipped })
+}
+
+/// Pulls conversation summaries from a remote daemon (one HTTP call per
+/// supported agent type) and persists them via [`persist_summaries`].
+///
+/// `remote_folder_path` is the path *as the daemon sees it* — i.e. the real
+/// remote filesystem path, not the desktop's `ssh://...` synthetic form.
+/// The caller is responsible for stripping the synthetic prefix before
+/// invoking this function.
+pub async fn import_remote_conversations(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    remote_folder_path: &str,
+    client: &DaemonClient,
+) -> Result<ImportResult, DbError> {
+    let agent_types = [
+        AgentType::ClaudeCode,
+        AgentType::Codex,
+        AgentType::OpenCode,
+        AgentType::Gemini,
+        AgentType::OpenClaw,
+        AgentType::Cline,
+    ];
+
+    let mut all = Vec::new();
+    for at in agent_types {
+        match client
+            .list_conversations(Some(at), Some(remote_folder_path.to_string()))
+            .await
+        {
+            Ok(rows) => {
+                for c in rows {
+                    all.push((at, c));
+                }
+            }
+            Err(e) => {
+                // Non-fatal: log and move on so a single agent error doesn't
+                // strand the whole import. Mirrors the local path's tolerance.
+                eprintln!("[remote-import] {at} list failed: {e}");
+            }
+        }
+    }
+
+    persist_summaries(conn, folder_id, &all).await
 }

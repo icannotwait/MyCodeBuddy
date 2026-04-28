@@ -4,11 +4,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
 use crate::models::connection::ConnectionConfig;
-use crate::remote::connection::{ConnectionRuntime, ConnectionTask, ControlMessage};
+use crate::remote::connection::{ConnectionRuntime, ConnectionStatus, ConnectionTask, ControlMessage};
+use crate::remote::http_client::DaemonClient;
 use crate::remote::manifest::{self, RemoteDaemonManifest};
 use crate::web::event_bridge::EventEmitter;
 
@@ -127,6 +129,58 @@ impl RemoteConnectionManager {
         Some(s.snapshot(connection_id))
     }
 
+    /// Ensure the connection has reached `Live` and return a `DaemonClient`
+    /// pointing at its tunnel. Triggers a `Connect` if no task exists yet
+    /// or the current status isn't `Live`. Polls the runtime snapshot every
+    /// 250 ms and gives up after `timeout`.
+    ///
+    /// Errors out early on `Error` (transmits `last_error`) or
+    /// `AwaitingManual` (asks the user to finish manual install). M1 will
+    /// add a reconnect supervisor; until then the caller is expected to
+    /// surface the error and let the user retry.
+    pub async fn ensure_live(
+        &self,
+        config: ConnectionConfig,
+        timeout: Duration,
+    ) -> Result<DaemonClient, EnsureLiveError> {
+        // Take a snapshot first; if already Live we can short-circuit.
+        if let Some(rt) = self.current_runtime(&config.id).await {
+            if let ConnectionStatus::Live = rt.status {
+                return rt_to_client(&rt).ok_or(EnsureLiveError::MissingHandshake);
+            }
+        }
+
+        self.connect(config.clone())
+            .await
+            .map_err(EnsureLiveError::Connect)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            if let Some(rt) = self.current_runtime(&config.id).await {
+                match &rt.status {
+                    ConnectionStatus::Live => {
+                        return rt_to_client(&rt).ok_or(EnsureLiveError::MissingHandshake);
+                    }
+                    ConnectionStatus::Error => {
+                        return Err(EnsureLiveError::Failed(
+                            rt.last_error
+                                .unwrap_or_else(|| "unknown remote error".into()),
+                        ));
+                    }
+                    ConnectionStatus::AwaitingManual => {
+                        return Err(EnsureLiveError::AwaitingManual);
+                    }
+                    _ => {} // Probing/Deploying/Launching/Handshaking/etc — keep waiting
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(EnsureLiveError::Timeout);
+            }
+        }
+    }
+
     /// Send Disconnect to every task. Used at desktop shutdown.
     pub async fn disconnect_all(&self) {
         let tasks = self.inner.tasks.read().await;
@@ -155,4 +209,24 @@ pub enum ConnectError {
     Manifest(String),
     #[error("task channel closed")]
     TaskClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnsureLiveError {
+    #[error("connect: {0}")]
+    Connect(ConnectError),
+    #[error("timed out waiting for remote daemon to come online")]
+    Timeout,
+    #[error("remote daemon needs manual install (open settings)")]
+    AwaitingManual,
+    #[error("remote: {0}")]
+    Failed(String),
+    #[error("daemon handshake missing on Live runtime")]
+    MissingHandshake,
+}
+
+fn rt_to_client(rt: &ConnectionRuntime) -> Option<DaemonClient> {
+    let port = rt.local_port?;
+    let token = rt.handshake.as_ref()?.token.clone();
+    Some(DaemonClient::new(port, token))
 }

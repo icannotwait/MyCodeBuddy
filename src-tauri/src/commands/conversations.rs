@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::app_error::AppCommandError;
 #[cfg(feature = "tauri-runtime")]
 use crate::db::entities::conversation;
-#[cfg(feature = "tauri-runtime")]
 use crate::db::service::import_service;
 use crate::db::service::{conversation_service, folder_service};
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
+use crate::models::folder::parse_remote_path;
 use crate::models::*;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
@@ -16,6 +17,11 @@ use crate::parsers::gemini::GeminiParser;
 use crate::parsers::openclaw::OpenClawParser;
 use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::{path_eq_for_matching, AgentParser, ParseError};
+use crate::remote::http_client::ClientError;
+use crate::remote::manager::EnsureLiveError;
+use crate::remote::RemoteConnectionManager;
+
+const REMOTE_ENSURE_LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -259,13 +265,16 @@ fn compute_folders(all_conversations: &[ConversationSummary]) -> Vec<FolderInfo>
     folders
 }
 
-#[cfg(feature = "tauri-runtime")]
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn import_local_conversations(
-    db: tauri::State<'_, AppDatabase>,
+/// Core for `import_local_conversations`. The remote branch needs an RCM,
+/// so callers in non-Tauri contexts (Web handler, server mode) can pass
+/// `None` — folders that turn out to be remote will fail with a clear
+/// "remote not available" error rather than silently degrading.
+pub async fn import_conversations_core(
+    conn: &sea_orm::DatabaseConnection,
+    rcm: Option<&RemoteConnectionManager>,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
-    let folder = folder_service::get_folder_by_id(&db.conn, folder_id)
+    let folder = folder_service::get_folder_by_id(conn, folder_id)
         .await
         .map_err(AppCommandError::from)?
         .ok_or_else(|| {
@@ -273,32 +282,109 @@ pub async fn import_local_conversations(
                 .with_detail(format!("folder_id={folder_id}"))
         })?;
 
-    import_service::import_local_conversations(&db.conn, folder_id, &folder.path)
+    if let Some(connection_id) = folder.connection_id.as_deref() {
+        let rcm = rcm.ok_or_else(|| {
+            AppCommandError::not_found("remote connections unavailable in this runtime")
+                .with_detail(format!("folder_id={folder_id}"))
+        })?;
+        let (_, remote_path) = parse_remote_path(&folder.path).ok_or_else(|| {
+            AppCommandError::invalid_input("folder is marked remote but path is not ssh://...")
+                .with_detail(folder.path.clone())
+        })?;
+        let cfg = crate::db::service::connection_service::get_by_id(conn, connection_id)
+            .await
+            .map_err(AppCommandError::from)?
+            .ok_or_else(|| {
+                AppCommandError::not_found("connection not found")
+                    .with_detail(connection_id.to_string())
+            })?;
+        let client = rcm
+            .ensure_live(cfg, REMOTE_ENSURE_LIVE_TIMEOUT)
+            .await
+            .map_err(ensure_live_to_app_error)?;
+        return import_service::import_remote_conversations(conn, folder_id, remote_path, &client)
+            .await
+            .map_err(AppCommandError::from);
+    }
+
+    import_service::import_local_conversations(conn, folder_id, &folder.path)
         .await
         .map_err(AppCommandError::from)
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn import_local_conversations(
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+    folder_id: i32,
+) -> Result<ImportResult, AppCommandError> {
+    import_conversations_core(&db.conn, Some(&rcm), folder_id).await
+}
+
 /// Core logic for loading a folder conversation with full OpenClaw fallback.
 /// Shared by both the Tauri command and the web handler.
+///
+/// `rcm` is `Some(_)` when the caller can route remote folders through an
+/// SSH tunnel (desktop mode); when `None`, remote folders bail with
+/// "remote not available". Local folders never need it.
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
+    rcm: Option<&RemoteConnectionManager>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
     let summary = conversation_service::get_by_id(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
 
+    // Resolve the folder up-front so both the remote and local branches can
+    // consult `connection_id` / `path` without re-fetching.
+    let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
+        .await
+        .ok()
+        .flatten();
+
+    // Remote branch: proxy the parser call to the daemon over the tunnel.
+    if let Some(folder_row) = &folder {
+        if let Some(connection_id) = folder_row.connection_id.as_deref() {
+            let ext_id = summary.external_id.clone().ok_or_else(|| {
+                AppCommandError::invalid_input("remote conversation missing external_id")
+                    .with_detail(format!("conversation_id={conversation_id}"))
+            })?;
+            let rcm = rcm.ok_or_else(|| {
+                AppCommandError::not_found("remote connections unavailable in this runtime")
+                    .with_detail(format!("conversation_id={conversation_id}"))
+            })?;
+            let cfg = crate::db::service::connection_service::get_by_id(conn, connection_id)
+                .await
+                .map_err(AppCommandError::from)?
+                .ok_or_else(|| {
+                    AppCommandError::not_found("connection not found")
+                        .with_detail(connection_id.to_string())
+                })?;
+            let client = rcm
+                .ensure_live(cfg, REMOTE_ENSURE_LIVE_TIMEOUT)
+                .await
+                .map_err(ensure_live_to_app_error)?;
+            let detail = client
+                .get_conversation(summary.agent_type, ext_id)
+                .await
+                .map_err(client_error_to_app_error)?;
+            let mut summary = summary;
+            summary.message_count = detail.turns.len() as u32;
+            return Ok(DbConversationDetail {
+                summary,
+                turns: detail.turns,
+                session_stats: detail.session_stats,
+            });
+        }
+    }
+
     let (turns, session_stats, resolved_ext_id) = if let Some(ref ext_id) = summary.external_id {
         let at = summary.agent_type;
         let eid = ext_id.clone();
         let db_created_at = summary.created_at;
-        let folder_path_for_fallback = {
-            let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
-                .await
-                .ok()
-                .flatten();
-            folder.map(|f| f.path)
-        };
+        let folder_path_for_fallback = folder.map(|f| f.path);
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
             let parser: Box<dyn AgentParser> = match at {
                 AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
@@ -383,9 +469,10 @@ pub async fn get_folder_conversation_core(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_folder_conversation(
     db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    get_folder_conversation_core(&db.conn, conversation_id).await
+    get_folder_conversation_core(&db.conn, Some(&rcm), conversation_id).await
 }
 
 /// Core logic for creating a conversation with git branch detection.
@@ -514,6 +601,41 @@ fn compute_stats(all_conversations: &[ConversationSummary]) -> AgentStats {
         total_conversations: all_conversations.len() as u32,
         total_messages,
         by_agent,
+    }
+}
+
+fn ensure_live_to_app_error(err: EnsureLiveError) -> AppCommandError {
+    match err {
+        EnsureLiveError::AwaitingManual => AppCommandError::configuration_missing(
+            "remote daemon needs manual install (open settings)",
+        ),
+        EnsureLiveError::Timeout => AppCommandError::network(
+            "remote daemon not ready (timed out waiting for Live)",
+        ),
+        EnsureLiveError::Failed(msg) => {
+            AppCommandError::network("remote connection failed").with_detail(msg)
+        }
+        EnsureLiveError::Connect(e) => {
+            AppCommandError::network("failed to dispatch remote connect").with_detail(e.to_string())
+        }
+        EnsureLiveError::MissingHandshake => {
+            AppCommandError::network("remote daemon handshake missing on Live runtime")
+        }
+    }
+}
+
+fn client_error_to_app_error(err: ClientError) -> AppCommandError {
+    match err {
+        ClientError::Network(msg) => {
+            AppCommandError::network("remote daemon network error").with_detail(msg)
+        }
+        ClientError::HttpStatus(s) => AppCommandError::network(format!("remote daemon http {s}")),
+        ClientError::HttpStatusWithBody { status, body } => {
+            AppCommandError::network(format!("remote daemon http {status}")).with_detail(body)
+        }
+        ClientError::Parse(msg) => {
+            AppCommandError::network("remote daemon response parse error").with_detail(msg)
+        }
     }
 }
 

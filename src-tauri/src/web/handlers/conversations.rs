@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::conversations as conv_commands;
-use crate::db::service::{conversation_service, folder_service, import_service};
+use crate::db::service::conversation_service;
 use crate::models::*;
 
 #[derive(Deserialize, Default)]
@@ -113,8 +113,12 @@ pub async fn get_folder_conversation(
     Json(params): Json<GetFolderConversationParams>,
 ) -> Result<Json<DbConversationDetail>, AppCommandError> {
     let db = &state.db;
-    let result =
-        conv_commands::get_folder_conversation_core(&db.conn, params.conversation_id).await?;
+    let result = conv_commands::get_folder_conversation_core(
+        &db.conn,
+        Some(&state.remote_connections),
+        params.conversation_id,
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -143,15 +147,12 @@ pub async fn import_local_conversations(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<ImportLocalConversationsParams>,
 ) -> Result<Json<ImportResult>, AppCommandError> {
-    let db = &state.db;
-    let folder = folder_service::get_folder_by_id(&db.conn, params.folder_id)
-        .await
-        .map_err(AppCommandError::from)?
-        .ok_or_else(|| AppCommandError::not_found("Folder not found"))?;
-    let result =
-        import_service::import_local_conversations(&db.conn, params.folder_id, &folder.path)
-            .await
-            .map_err(AppCommandError::from)?;
+    let result = conv_commands::import_conversations_core(
+        &state.db.conn,
+        Some(&state.remote_connections),
+        params.folder_id,
+    )
+    .await?;
     Ok(Json(result))
 }
 
