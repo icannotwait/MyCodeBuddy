@@ -77,7 +77,8 @@ pub struct CreateFileTreeEntryParams {
 pub async fn read_file_preview(
     Json(params): Json<ReadFilePreviewParams>,
 ) -> Result<Json<folder_commands::FilePreviewContent>, AppCommandError> {
-    let result = folder_commands::read_file_preview(params.root_path, params.path).await?;
+    let result =
+        folder_commands::read_file_preview_local(params.root_path, params.path).await?;
     Ok(Json(result))
 }
 
@@ -91,14 +92,15 @@ pub async fn read_file_base64(
 pub async fn read_file_for_edit(
     Json(params): Json<ReadFileForEditParams>,
 ) -> Result<Json<folder_commands::FileEditContent>, AppCommandError> {
-    let result = folder_commands::read_file_for_edit(params.root_path, params.path).await?;
+    let result =
+        folder_commands::read_file_for_edit_local(params.root_path, params.path).await?;
     Ok(Json(result))
 }
 
 pub async fn save_file_content(
     Json(params): Json<SaveFileContentParams>,
 ) -> Result<Json<folder_commands::FileSaveResult>, AppCommandError> {
-    let result = folder_commands::save_file_content(
+    let result = folder_commands::save_file_content_local(
         params.root_path,
         params.path,
         params.content,
@@ -112,30 +114,34 @@ pub async fn save_file_copy(
     Json(params): Json<SaveFileCopyParams>,
 ) -> Result<Json<folder_commands::FileSaveResult>, AppCommandError> {
     let result =
-        folder_commands::save_file_copy(params.root_path, params.path, params.content).await?;
+        folder_commands::save_file_copy_local(params.root_path, params.path, params.content)
+            .await?;
     Ok(Json(result))
 }
 
 pub async fn rename_file_tree_entry(
     Json(params): Json<RenameFileTreeEntryParams>,
 ) -> Result<Json<String>, AppCommandError> {
-    let result =
-        folder_commands::rename_file_tree_entry(params.root_path, params.path, params.new_name)
-            .await?;
+    let result = folder_commands::rename_file_tree_entry_local(
+        params.root_path,
+        params.path,
+        params.new_name,
+    )
+    .await?;
     Ok(Json(result))
 }
 
 pub async fn delete_file_tree_entry(
     Json(params): Json<DeleteFileTreeEntryParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::delete_file_tree_entry(params.root_path, params.path).await?;
+    folder_commands::delete_file_tree_entry_local(params.root_path, params.path).await?;
     Ok(Json(()))
 }
 
 pub async fn create_file_tree_entry(
     Json(params): Json<CreateFileTreeEntryParams>,
 ) -> Result<Json<String>, AppCommandError> {
-    let result = folder_commands::create_file_tree_entry(
+    let result = folder_commands::create_file_tree_entry_local(
         params.root_path,
         params.path,
         params.name,

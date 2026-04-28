@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use tokio::sync::Semaphore;
 use walkdir::WalkDir;
@@ -24,8 +24,75 @@ use crate::db::service::folder_service;
 use crate::db::AppDatabase;
 use crate::models::GitCredentials;
 #[cfg(feature = "tauri-runtime")]
+use crate::models::folder::parse_remote_path;
+#[cfg(feature = "tauri-runtime")]
 use crate::models::{FolderDetail, FolderHistoryEntry};
+#[cfg(feature = "tauri-runtime")]
+use crate::remote::http_client::{ClientError, DaemonClient};
+#[cfg(feature = "tauri-runtime")]
+use crate::remote::manager::EnsureLiveError;
+#[cfg(feature = "tauri-runtime")]
+use crate::remote::RemoteConnectionManager;
 use crate::web::event_bridge::EventEmitter;
+
+#[cfg(feature = "tauri-runtime")]
+const REMOTE_FILE_ENSURE_LIVE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+#[cfg(feature = "tauri-runtime")]
+fn ensure_live_to_app_error(err: EnsureLiveError) -> AppCommandError {
+    match err {
+        EnsureLiveError::AwaitingManual => AppCommandError::configuration_missing(
+            "remote daemon needs manual install (open SSH connection settings)",
+        ),
+        EnsureLiveError::Timeout => AppCommandError::task_execution_failed(
+            "remote daemon not ready (timed out waiting for Live)",
+        ),
+        EnsureLiveError::Failed(msg) => {
+            AppCommandError::task_execution_failed(format!("remote: {msg}"))
+        }
+        EnsureLiveError::Connect(e) => {
+            AppCommandError::task_execution_failed(format!("remote connect: {e}"))
+        }
+        EnsureLiveError::MissingHandshake => {
+            AppCommandError::task_execution_failed("remote handshake missing on Live runtime")
+        }
+    }
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn client_error_to_app_error(err: ClientError) -> AppCommandError {
+    match err {
+        ClientError::Network(msg) => AppCommandError::network(format!("remote network: {msg}")),
+        ClientError::HttpStatus(s) => {
+            AppCommandError::task_execution_failed(format!("remote http {s}"))
+        }
+        ClientError::HttpStatusWithBody { status, body } => {
+            AppCommandError::task_execution_failed(format!("remote http {status}: {body}"))
+        }
+        ClientError::Parse(msg) => {
+            AppCommandError::task_execution_failed(format!("remote parse: {msg}"))
+        }
+    }
+}
+
+/// Look up the SSH connection by id, ensure it's Live, and return a tunnel
+/// `DaemonClient`. Used at the head of every remote-aware Tauri file
+/// editing command.
+#[cfg(feature = "tauri-runtime")]
+async fn resolve_remote_file_client(
+    rcm: &RemoteConnectionManager,
+    db: &AppDatabase,
+    ssh_id: &str,
+) -> Result<DaemonClient, AppCommandError> {
+    let cfg = crate::db::service::connection_service::get_by_id(&db.conn, ssh_id)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(format!("connection lookup: {e}")))?
+        .ok_or_else(|| AppCommandError::not_found(format!("connection {ssh_id} not found")))?;
+    rcm.ensure_live(cfg, REMOTE_FILE_ENSURE_LIVE_TIMEOUT)
+        .await
+        .map_err(ensure_live_to_app_error)
+}
 
 /// Configure a git command for remote operations:
 /// - Always disable interactive prompts (prevent hanging in a GUI app)
@@ -241,13 +308,13 @@ pub enum FileTreeNode {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FilePreviewContent {
     pub path: String,
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileEditContent {
     pub path: String,
     pub content: String,
@@ -257,7 +324,7 @@ pub struct FileEditContent {
     pub line_ending: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileSaveResult {
     pub path: String,
     pub etag: String,
@@ -2909,8 +2976,7 @@ pub async fn read_file_base64(
     .await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn read_file_preview(
+pub async fn read_file_preview_local(
     root_path: String,
     path: String,
 ) -> Result<FilePreviewContent, AppCommandError> {
@@ -2939,8 +3005,25 @@ pub async fn read_file_preview(
     .await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn read_file_for_edit(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn read_file_preview(
+    root_path: String,
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<FilePreviewContent, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .read_file_preview(real_root.to_string(), path)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    read_file_preview_local(root_path, path).await
+}
+
+pub async fn read_file_for_edit_local(
     root_path: String,
     path: String,
 ) -> Result<FileEditContent, AppCommandError> {
@@ -2980,8 +3063,25 @@ pub async fn read_file_for_edit(
     .await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn save_file_content(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn read_file_for_edit(
+    root_path: String,
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<FileEditContent, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .read_file_for_edit(real_root.to_string(), path)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    read_file_for_edit_local(root_path, path).await
+}
+
+pub async fn save_file_content_local(
     root_path: String,
     path: String,
     content: String,
@@ -3056,6 +3156,26 @@ pub async fn save_file_content(
     .await
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn save_file_content(
+    root_path: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<FileSaveResult, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .save_file_content(real_root.to_string(), path, content, expected_etag)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    save_file_content_local(root_path, path, content, expected_etag).await
+}
+
 fn build_local_copy_file_name(original_name: &str, attempt: usize) -> String {
     let original = Path::new(original_name);
     let stem = original
@@ -3080,8 +3200,7 @@ fn build_local_copy_file_name(original_name: &str, attempt: usize) -> String {
     }
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn save_file_copy(
+pub async fn save_file_copy_local(
     root_path: String,
     path: String,
     content: String,
@@ -3171,8 +3290,26 @@ pub async fn save_file_copy(
     .await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn rename_file_tree_entry(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn save_file_copy(
+    root_path: String,
+    path: String,
+    content: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<FileSaveResult, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .save_file_copy(real_root.to_string(), path, content)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    save_file_copy_local(root_path, path, content).await
+}
+
+pub async fn rename_file_tree_entry_local(
     root_path: String,
     path: String,
     new_name: String,
@@ -3220,8 +3357,26 @@ pub async fn rename_file_tree_entry(
     Ok(rel)
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn delete_file_tree_entry(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn rename_file_tree_entry(
+    root_path: String,
+    path: String,
+    new_name: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .rename_file_tree_entry(real_root.to_string(), path, new_name)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    rename_file_tree_entry_local(root_path, path, new_name).await
+}
+
+pub async fn delete_file_tree_entry_local(
     root_path: String,
     path: String,
 ) -> Result<(), AppCommandError> {
@@ -3250,8 +3405,25 @@ pub async fn delete_file_tree_entry(
     Ok(())
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn create_file_tree_entry(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn delete_file_tree_entry(
+    root_path: String,
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<(), AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .delete_file_tree_entry(real_root.to_string(), path)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    delete_file_tree_entry_local(root_path, path).await
+}
+
+pub async fn create_file_tree_entry_local(
     root_path: String,
     path: String,
     name: String,
@@ -3310,6 +3482,26 @@ pub async fn create_file_tree_entry(
         .to_string_lossy()
         .to_string();
     Ok(rel)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn create_file_tree_entry(
+    root_path: String,
+    path: String,
+    name: String,
+    kind: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_root)) = parse_remote_path(&root_path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .create_file_tree_entry(real_root.to_string(), path, name, kind)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    create_file_tree_entry_local(root_path, path, name, kind).await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]

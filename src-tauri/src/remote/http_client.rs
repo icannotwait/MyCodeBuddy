@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::types::{ForkResultInfo, PromptInputBlock};
 use crate::acp::LiveSessionSnapshot;
+use crate::commands::folders::{FileEditContent, FilePreviewContent, FileSaveResult};
 use crate::models::{AgentType, ConversationDetail, ConversationSummary};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -257,6 +258,101 @@ impl DaemonClient {
         self.post_json(&url, &body).await
     }
 
+    pub async fn read_file_preview(
+        &self,
+        root_path: String,
+        path: String,
+    ) -> Result<FilePreviewContent, ClientError> {
+        let url = format!("{}/api/read_file_preview", self.base_url);
+        let body = ReadFileBody { root_path, path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn read_file_for_edit(
+        &self,
+        root_path: String,
+        path: String,
+    ) -> Result<FileEditContent, ClientError> {
+        let url = format!("{}/api/read_file_for_edit", self.base_url);
+        let body = ReadFileBody { root_path, path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn save_file_content(
+        &self,
+        root_path: String,
+        path: String,
+        content: String,
+        expected_etag: Option<String>,
+    ) -> Result<FileSaveResult, ClientError> {
+        let url = format!("{}/api/save_file_content", self.base_url);
+        let body = SaveFileContentBody {
+            root_path,
+            path,
+            content,
+            expected_etag,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn save_file_copy(
+        &self,
+        root_path: String,
+        path: String,
+        content: String,
+    ) -> Result<FileSaveResult, ClientError> {
+        let url = format!("{}/api/save_file_copy", self.base_url);
+        let body = SaveFileCopyBody {
+            root_path,
+            path,
+            content,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn rename_file_tree_entry(
+        &self,
+        root_path: String,
+        path: String,
+        new_name: String,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/rename_file_tree_entry", self.base_url);
+        let body = RenameFileBody {
+            root_path,
+            path,
+            new_name,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn delete_file_tree_entry(
+        &self,
+        root_path: String,
+        path: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/delete_file_tree_entry", self.base_url);
+        let body = ReadFileBody { root_path, path };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn create_file_tree_entry(
+        &self,
+        root_path: String,
+        path: String,
+        name: String,
+        kind: String,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/create_file_tree_entry", self.base_url);
+        let body = CreateFileBody {
+            root_path,
+            path,
+            name,
+            kind,
+        };
+        self.post_json(&url, &body).await
+    }
+
     async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         &self,
         url: &str,
@@ -344,6 +440,47 @@ struct AcpSetConfigOptionBody {
     connection_id: String,
     config_id: String,
     value_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadFileBody {
+    root_path: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveFileContentBody {
+    root_path: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveFileCopyBody {
+    root_path: String,
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameFileBody {
+    root_path: String,
+    path: String,
+    new_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateFileBody {
+    root_path: String,
+    path: String,
+    name: String,
+    kind: String,
 }
 
 #[derive(Debug, thiserror::Error)]
