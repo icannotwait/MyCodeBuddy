@@ -166,7 +166,7 @@ pub async fn git_log(
 // ---------------------------------------------------------------------------
 
 pub async fn git_init(Json(params): Json<PathParams>) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_init(params.path).await?;
+    folder_commands::git_init_local(params.path).await?;
     Ok(Json(()))
 }
 
@@ -232,7 +232,7 @@ pub async fn git_worktree_add(
 pub async fn git_checkout(
     Json(params): Json<PathBranchParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_checkout(params.path, params.branch_name).await?;
+    folder_commands::git_checkout_local(params.path, params.branch_name).await?;
     Ok(Json(()))
 }
 
@@ -245,7 +245,7 @@ pub struct GitResetParams {
 }
 
 pub async fn git_reset(Json(params): Json<GitResetParams>) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_reset(params.path, params.commit, params.mode).await?;
+    folder_commands::git_reset_local(params.path, params.commit, params.mode).await?;
     Ok(Json(()))
 }
 
@@ -364,7 +364,7 @@ pub async fn git_show_diff(
 pub async fn git_rollback_file(
     Json(params): Json<PathFileParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_rollback_file(params.path, params.file).await?;
+    folder_commands::git_rollback_file_local(params.path, params.file).await?;
     Ok(Json(()))
 }
 
@@ -378,7 +378,7 @@ pub struct GitAddFilesParams {
 pub async fn git_add_files(
     Json(params): Json<GitAddFilesParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_add_files(params.path, params.files).await?;
+    folder_commands::git_add_files_local(params.path, params.files).await?;
     Ok(Json(()))
 }
 

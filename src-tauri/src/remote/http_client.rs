@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::acp::types::{ForkResultInfo, PromptInputBlock};
 use crate::acp::LiveSessionSnapshot;
 use crate::commands::folders::{
-    FileEditContent, FilePreviewContent, FileSaveResult, GitBranchList, GitLogResult, GitRemote,
-    GitStatusEntry,
+    FileEditContent, FilePreviewContent, FileSaveResult, GitBranchList, GitCommitResult,
+    GitLogResult, GitRemote, GitStatusEntry,
 };
 use crate::models::{AgentType, ConversationDetail, ConversationSummary};
 
@@ -470,6 +470,75 @@ impl DaemonClient {
         self.post_json(&url, &body).await
     }
 
+    pub async fn git_init(&self, path: String) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_init", self.base_url);
+        let body = GitPathBody { path };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_checkout(
+        &self,
+        path: String,
+        branch_name: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_checkout", self.base_url);
+        let body = GitCheckoutBody { path, branch_name };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_reset(
+        &self,
+        path: String,
+        commit: String,
+        mode: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_reset", self.base_url);
+        let body = GitResetBody { path, commit, mode };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_add_files(
+        &self,
+        path: String,
+        files: Vec<String>,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_add_files", self.base_url);
+        let body = GitAddFilesBody { path, files };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_rollback_file(
+        &self,
+        path: String,
+        file: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_rollback_file", self.base_url);
+        let body = GitPathFileBody { path, file };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_commit(
+        &self,
+        path: String,
+        message: String,
+        files: Vec<String>,
+        folder_id: Option<i32>,
+    ) -> Result<GitCommitResult, ClientError> {
+        let url = format!("{}/api/git_commit", self.base_url);
+        let body = GitCommitBody {
+            folder_id,
+            path,
+            message,
+            files,
+        };
+        self.post_json(&url, &body).await
+    }
+
     async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         &self,
         url: &str,
@@ -658,6 +727,37 @@ struct GitShowDiffBody {
     path: String,
     commit: String,
     file: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCheckoutBody {
+    path: String,
+    branch_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitResetBody {
+    path: String,
+    commit: String,
+    mode: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitAddFilesBody {
+    path: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitBody {
+    folder_id: Option<i32>,
+    path: String,
+    message: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
