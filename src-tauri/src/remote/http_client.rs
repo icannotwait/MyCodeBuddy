@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::acp::types::PromptInputBlock;
+use crate::acp::types::{ForkResultInfo, PromptInputBlock};
+use crate::acp::LiveSessionSnapshot;
 use crate::models::{AgentType, ConversationDetail, ConversationSummary};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,6 +196,67 @@ impl DaemonClient {
         Ok(())
     }
 
+    pub async fn acp_set_mode(
+        &self,
+        connection_id: String,
+        mode_id: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/acp_set_mode", self.base_url);
+        let body = AcpSetModeBody {
+            connection_id,
+            mode_id,
+        };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn acp_set_config_option(
+        &self,
+        connection_id: String,
+        config_id: String,
+        value_id: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/acp_set_config_option", self.base_url);
+        let body = AcpSetConfigOptionBody {
+            connection_id,
+            config_id,
+            value_id,
+        };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn acp_fork(&self, connection_id: String) -> Result<ForkResultInfo, ClientError> {
+        let url = format!("{}/api/acp_fork", self.base_url);
+        let body = AcpConnectionIdBody { connection_id };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn acp_disconnect(&self, connection_id: String) -> Result<(), ClientError> {
+        let url = format!("{}/api/acp_disconnect", self.base_url);
+        let body = AcpConnectionIdBody { connection_id };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn acp_touch_connection(
+        &self,
+        connection_id: String,
+    ) -> Result<bool, ClientError> {
+        let url = format!("{}/api/acp_touch_connection", self.base_url);
+        let body = AcpConnectionIdBody { connection_id };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn acp_get_session_snapshot(
+        &self,
+        connection_id: String,
+    ) -> Result<Option<LiveSessionSnapshot>, ClientError> {
+        let url = format!("{}/api/acp_get_session_snapshot", self.base_url);
+        let body = AcpConnectionIdBody { connection_id };
+        self.post_json(&url, &body).await
+    }
+
     async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         &self,
         url: &str,
@@ -267,6 +329,21 @@ struct AcpRespondPermissionBody {
     connection_id: String,
     request_id: String,
     option_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSetModeBody {
+    connection_id: String,
+    mode_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSetConfigOptionBody {
+    connection_id: String,
+    config_id: String,
+    value_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]

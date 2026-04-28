@@ -74,8 +74,7 @@ impl RemoteConnectionManager {
             .cloned()
     }
 
-    /// Remove a single ACP id (called on `acp_disconnect`, A3+).
-    #[allow(dead_code)]
+    /// Remove a single ACP id (called on `acp_disconnect`).
     pub async fn unregister_acp(&self, acp_connection_id: &str) {
         self.inner
             .acp_connections

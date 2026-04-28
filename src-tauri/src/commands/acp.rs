@@ -2176,7 +2176,15 @@ pub async fn acp_set_mode(
     connection_id: String,
     mode_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<(), AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        return client
+            .acp_set_mode(connection_id, mode_id)
+            .await
+            .map_err(client_error_to_acp_error);
+    }
     manager.set_mode(&connection_id, mode_id).await
 }
 
@@ -2187,7 +2195,15 @@ pub async fn acp_set_config_option(
     config_id: String,
     value_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<(), AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        return client
+            .acp_set_config_option(connection_id, config_id, value_id)
+            .await
+            .map_err(client_error_to_acp_error);
+    }
     manager
         .set_config_option(&connection_id, config_id, value_id)
         .await
@@ -2215,7 +2231,15 @@ pub async fn acp_cancel(
 pub async fn acp_fork(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<ForkResultInfo, AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        return client
+            .acp_fork(connection_id)
+            .await
+            .map_err(client_error_to_acp_error);
+    }
     manager.fork_session(&connection_id).await
 }
 
@@ -2245,7 +2269,21 @@ pub async fn acp_respond_permission(
 pub async fn acp_disconnect(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<(), AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        let res = client
+            .acp_disconnect(connection_id.clone())
+            .await
+            .map_err(client_error_to_acp_error);
+        // Drop the desktop-side ACP id mapping regardless of daemon outcome:
+        // even if the daemon returned an error, the local UI is asking us to
+        // forget this connection, and a stale entry would mis-route future
+        // commands to a daemon that no longer holds it.
+        rcm.unregister_acp(&connection_id).await;
+        return res;
+    }
     manager.disconnect(&connection_id).await
 }
 
@@ -2254,7 +2292,15 @@ pub async fn acp_disconnect(
 pub async fn acp_touch_connection(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<bool, AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        return client
+            .acp_touch_connection(connection_id)
+            .await
+            .map_err(client_error_to_acp_error);
+    }
     Ok(manager.touch(&connection_id).await)
 }
 
@@ -2282,7 +2328,15 @@ pub(crate) async fn acp_get_session_snapshot_core(
 pub async fn acp_get_session_snapshot(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    rcm: State<'_, RemoteConnectionManager>,
 ) -> Result<Option<crate::acp::LiveSessionSnapshot>, AcpError> {
+    if let Some(client) = resolve_remote_for_acp(&rcm, &db, &connection_id).await? {
+        return client
+            .acp_get_session_snapshot(connection_id)
+            .await
+            .map_err(client_error_to_acp_error);
+    }
     acp_get_session_snapshot_core(&manager, &connection_id).await
 }
 
@@ -2305,6 +2359,10 @@ pub async fn acp_get_session_snapshot_by_conversation(
     conversation_id: i32,
     manager: State<'_, ConnectionManager>,
 ) -> Result<Option<crate::acp::LiveSessionSnapshot>, AcpError> {
+    // Local-only: remote conversation rows live in the daemon's DB and have
+    // no desktop-side conversation_id mapping yet (deferred to CG-002.8 C).
+    // Frontend opening a remote conversation should call
+    // acp_get_session_snapshot(connection_id) instead.
     acp_get_session_snapshot_by_conversation_core(&manager, conversation_id).await
 }
 

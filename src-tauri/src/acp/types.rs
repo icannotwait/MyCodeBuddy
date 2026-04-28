@@ -235,7 +235,7 @@ pub enum ConnectionStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub id: String,
     pub agent_type: crate::models::agent::AgentType,
@@ -328,7 +328,7 @@ pub struct AvailableCommandInfo {
     pub input_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkResultInfo {
     pub forked_session_id: String,
