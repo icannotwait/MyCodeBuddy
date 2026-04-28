@@ -2309,6 +2309,63 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     resolveListenerReadyWaiters,
   ])
 
+  // ── Remote SSH bridge re-sync ──
+  // Backend's WS bridge (`ws_bridge.rs`) emits `connection://remote_resync`
+  // on every reconnect after the first. Daemon-emitted events during the WS
+  // gap are otherwise lost; we close the gap by re-fetching session
+  // snapshots for any open ACP connections rooted on this SSH host. The
+  // HYDRATE_FROM_SNAPSHOT reducer's `event_seq` guard makes this idempotent
+  // when snapshots race against live events on the freshly-restored stream.
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+
+    subscribe<{ ssh_connection_id: string }>(
+      "connection://remote_resync",
+      (payload) => {
+        if (cancelled) return
+        const sshId = payload?.ssh_connection_id
+        if (!sshId) return
+        const prefix = `ssh://${sshId}/`
+        for (const conn of storeRef.current.connections.values()) {
+          if (!conn.workingDir || !conn.workingDir.startsWith(prefix)) continue
+          const contextKey = conn.contextKey
+          const connectionId = conn.connectionId
+          void acpGetSessionSnapshot(connectionId)
+            .then((snapshot) => {
+              if (!snapshot) return
+              const patch = denormalizeSnapshot(snapshot)
+              dispatch({
+                type: "HYDRATE_FROM_SNAPSHOT",
+                contextKey,
+                patch,
+              })
+            })
+            .catch((e: unknown) => {
+              console.warn(
+                "[acp-context] resync snapshot failed for",
+                connectionId,
+                e
+              )
+            })
+        }
+      }
+    )
+      .then((fn) => {
+        if (cancelled) {
+          fn()
+        } else {
+          unlisten = fn
+        }
+      })
+      .catch(() => {})
+
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [dispatch])
+
   // ── Backend keepalive timer ──
   // Frontend is the only side that knows which conversation tabs the
   // user has open. Without this, the backend's idle sweep

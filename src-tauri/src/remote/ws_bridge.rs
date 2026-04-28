@@ -14,6 +14,11 @@
 // exponential backoff retry (1/2/4/8/16s, capped) until the killer fires.
 // The supervisor (CG-002.7) is the authority on whether the SSH-level
 // connection is dead — the bridge just keeps trying until told to stop.
+//
+// Snapshot rehydrate (Phase D): on every reconnect after the first, the
+// bridge emits a `connection://remote_resync` event so the frontend can
+// re-hydrate ACP session snapshots for connections living on this SSH.
+// Events emitted by the daemon during the WS gap are otherwise lost.
 
 use std::time::Duration;
 
@@ -33,9 +38,14 @@ const MAX_BACKOFF_SECS: u64 = 16;
 
 /// Run a bridge against `ws://127.0.0.1:<local_port>/ws/events?token=...`.
 ///
+/// `ssh_connection_id` is the desktop's SSH connection id (used to label the
+/// `connection://remote_resync` event so the frontend can re-hydrate the
+/// matching ACP sessions; see Phase D dev design).
+///
 /// The bridge auths via the `?token=` query string (matches
 /// `web::auth::require_token`). Returns only when the killer fires.
 pub async fn bridge_loop(
+    ssh_connection_id: String,
     local_port: u16,
     token: String,
     emitter: EventEmitter,
@@ -47,6 +57,7 @@ pub async fn bridge_loop(
         urlencoding::encode(&token)
     );
     let mut backoff_secs: u64 = 1;
+    let mut is_first_connect = true;
 
     loop {
         // 1. Connect (killer-aware).
@@ -74,8 +85,22 @@ pub async fn bridge_loop(
             }
         };
 
-        eprintln!("[Remote ws-bridge] connected port={}", local_port);
+        eprintln!(
+            "[Remote ws-bridge] connected ssh={} port={}",
+            ssh_connection_id, local_port
+        );
         backoff_secs = 1;
+        if !is_first_connect {
+            // Reconnect: tell the frontend to re-hydrate snapshots for ACP
+            // sessions on this SSH. Daemon-emitted events during the WS gap
+            // are otherwise lost; HYDRATE_FROM_SNAPSHOT closes that gap.
+            emit_event(
+                &emitter,
+                "connection://remote_resync",
+                serde_json::json!({ "ssh_connection_id": ssh_connection_id.clone() }),
+            );
+        }
+        is_first_connect = false;
 
         use futures_util::StreamExt;
         let (_write, mut read) = ws_stream.split();
@@ -154,7 +179,8 @@ mod tests {
         // very first sleep wakes up right away.
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            bridge_loop(1, "tok".into(), EventEmitter::Noop, kill_rx).await;
+            bridge_loop("ssh-1".into(), 1, "tok".into(), EventEmitter::Noop, kill_rx)
+                .await;
         });
 
         // Yield once so the bridge can attempt its first connect_async, then

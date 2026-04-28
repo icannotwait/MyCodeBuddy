@@ -227,8 +227,10 @@ impl LoopCtx {
         // WS bridge mirrors daemon-emitted events into our local emitter.
         let (bkt, bkr) = oneshot::channel();
         let bridge_emitter = self.emitter.clone();
+        let ssh_id = self.config.id.clone();
         let bh = tokio::spawn(async move {
-            crate::remote::ws_bridge::bridge_loop(port, token, bridge_emitter, bkr).await;
+            crate::remote::ws_bridge::bridge_loop(ssh_id, port, token, bridge_emitter, bkr)
+                .await;
         });
         self.bridge_killer = Some(bkt);
         self.bridge_handle = Some(bh);
