@@ -135,7 +135,7 @@ pub async fn git_diff(Json(params): Json<GitDiffParams>) -> Result<Json<String>,
 pub async fn git_list_remotes(
     Json(params): Json<PathParams>,
 ) -> Result<Json<Vec<folder_commands::GitRemote>>, AppCommandError> {
-    let result = folder_commands::git_list_remotes(params.path).await?;
+    let result = folder_commands::git_list_remotes_local(params.path).await?;
     Ok(Json(result))
 }
 
@@ -252,7 +252,7 @@ pub async fn git_reset(Json(params): Json<GitResetParams>) -> Result<Json<()>, A
 pub async fn git_list_branches(
     Json(params): Json<PathParams>,
 ) -> Result<Json<Vec<String>>, AppCommandError> {
-    let result = folder_commands::git_list_branches(params.path).await?;
+    let result = folder_commands::git_list_branches_local(params.path).await?;
     Ok(Json(result))
 }
 
@@ -324,7 +324,7 @@ pub async fn git_stash_show(
 pub async fn git_is_tracked(
     Json(params): Json<PathFileParams>,
 ) -> Result<Json<bool>, AppCommandError> {
-    let result = folder_commands::git_is_tracked(params.path, params.file).await?;
+    let result = folder_commands::git_is_tracked_local(params.path, params.file).await?;
     Ok(Json(result))
 }
 
@@ -340,7 +340,8 @@ pub async fn git_diff_with_branch(
     Json(params): Json<GitDiffWithBranchParams>,
 ) -> Result<Json<String>, AppCommandError> {
     let result =
-        folder_commands::git_diff_with_branch(params.path, params.branch, params.file).await?;
+        folder_commands::git_diff_with_branch_local(params.path, params.branch, params.file)
+            .await?;
     Ok(Json(result))
 }
 
@@ -355,7 +356,8 @@ pub struct GitShowDiffParams {
 pub async fn git_show_diff(
     Json(params): Json<GitShowDiffParams>,
 ) -> Result<Json<String>, AppCommandError> {
-    let result = folder_commands::git_show_diff(params.path, params.commit, params.file).await?;
+    let result =
+        folder_commands::git_show_diff_local(params.path, params.commit, params.file).await?;
     Ok(Json(result))
 }
 

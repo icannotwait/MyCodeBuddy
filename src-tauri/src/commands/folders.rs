@@ -275,7 +275,7 @@ pub struct GitStashEntry {
     pub ref_name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GitRemote {
     pub name: String,
     pub url: String,
@@ -1100,7 +1100,7 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
         .filter(|v| !v.is_empty());
 
     // Get all remotes
-    let remotes = git_list_remotes(path).await?;
+    let remotes = git_list_remotes_local(path).await?;
 
     Ok(GitPushInfo {
         branch,
@@ -1353,8 +1353,7 @@ pub async fn git_reset(path: String, commit: String, mode: String) -> Result<(),
     Ok(())
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_list_branches(path: String) -> Result<Vec<String>, AppCommandError> {
+pub async fn git_list_branches_local(path: String) -> Result<Vec<String>, AppCommandError> {
     ensure_git_repo(&path)?;
 
     let output = crate::process::tokio_command("git")
@@ -1374,6 +1373,23 @@ pub async fn git_list_branches(path: String) -> Result<Vec<String>, AppCommandEr
         .filter(|l| !l.is_empty())
         .collect();
     Ok(branches)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn git_list_branches(
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<Vec<String>, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_list_branches(real_path.to_string())
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_list_branches_local(path).await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -1620,8 +1636,10 @@ pub async fn git_status(
     git_status_local(path, show_all_untracked).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_is_tracked(path: String, file: String) -> Result<bool, AppCommandError> {
+pub async fn git_is_tracked_local(
+    path: String,
+    file: String,
+) -> Result<bool, AppCommandError> {
     let literal_file = to_git_literal_pathspec(&file);
     let output = crate::process::tokio_command("git")
         .args(["ls-files", "--error-unmatch", "--"])
@@ -1632,6 +1650,24 @@ pub async fn git_is_tracked(path: String, file: String) -> Result<bool, AppComma
         .map_err(AppCommandError::io)?;
 
     Ok(output.status.success())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn git_is_tracked(
+    path: String,
+    file: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<bool, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_is_tracked(real_path.to_string(), file)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_is_tracked_local(path, file).await
 }
 
 pub async fn git_diff_local(
@@ -1691,8 +1727,7 @@ pub async fn git_diff(
     git_diff_local(path, file).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_diff_with_branch(
+pub async fn git_diff_with_branch_local(
     path: String,
     branch: String,
     file: Option<String>,
@@ -1735,8 +1770,26 @@ pub async fn git_diff_with_branch(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_show_diff(
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn git_diff_with_branch(
+    path: String,
+    branch: String,
+    file: Option<String>,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_diff_with_branch(real_path.to_string(), branch, file)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_diff_with_branch_local(path, branch, file).await
+}
+
+pub async fn git_show_diff_local(
     path: String,
     commit: String,
     file: Option<String>,
@@ -1767,6 +1820,25 @@ pub async fn git_show_diff(
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn git_show_diff(
+    path: String,
+    commit: String,
+    file: Option<String>,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_show_diff(real_path.to_string(), commit, file)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_show_diff_local(path, commit, file).await
 }
 
 pub async fn git_show_file_local(
@@ -2111,8 +2183,7 @@ pub async fn git_list_all_branches(
     git_list_all_branches_local(path).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_list_remotes(path: String) -> Result<Vec<GitRemote>, AppCommandError> {
+pub async fn git_list_remotes_local(path: String) -> Result<Vec<GitRemote>, AppCommandError> {
     ensure_git_repo(&path)?;
 
     let output = crate::process::tokio_command("git")
@@ -2146,6 +2217,23 @@ pub async fn git_list_remotes(path: String) -> Result<Vec<GitRemote>, AppCommand
         }
     }
     Ok(remotes)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn git_list_remotes(
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<Vec<GitRemote>, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_list_remotes(real_path.to_string())
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_list_remotes_local(path).await
 }
 
 pub(crate) async fn git_fetch_remote_core(

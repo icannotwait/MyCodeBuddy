@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::types::{ForkResultInfo, PromptInputBlock};
 use crate::acp::LiveSessionSnapshot;
 use crate::commands::folders::{
-    FileEditContent, FilePreviewContent, FileSaveResult, GitBranchList, GitLogResult,
+    FileEditContent, FilePreviewContent, FileSaveResult, GitBranchList, GitLogResult, GitRemote,
     GitStatusEntry,
 };
 use crate::models::{AgentType, ConversationDetail, ConversationSummary};
@@ -420,6 +420,56 @@ impl DaemonClient {
         self.post_json(&url, &body).await
     }
 
+    pub async fn git_list_branches(
+        &self,
+        path: String,
+    ) -> Result<Vec<String>, ClientError> {
+        let url = format!("{}/api/git_list_branches", self.base_url);
+        let body = GitPathBody { path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_list_remotes(
+        &self,
+        path: String,
+    ) -> Result<Vec<GitRemote>, ClientError> {
+        let url = format!("{}/api/git_list_remotes", self.base_url);
+        let body = GitPathBody { path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_is_tracked(
+        &self,
+        path: String,
+        file: String,
+    ) -> Result<bool, ClientError> {
+        let url = format!("{}/api/git_is_tracked", self.base_url);
+        let body = GitPathFileBody { path, file };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_diff_with_branch(
+        &self,
+        path: String,
+        branch: String,
+        file: Option<String>,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/git_diff_with_branch", self.base_url);
+        let body = GitDiffWithBranchBody { path, branch, file };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_show_diff(
+        &self,
+        path: String,
+        commit: String,
+        file: Option<String>,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/git_show_diff", self.base_url);
+        let body = GitShowDiffBody { path, commit, file };
+        self.post_json(&url, &body).await
+    }
+
     async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         &self,
         url: &str,
@@ -585,6 +635,29 @@ struct GitShowFileBody {
     path: String,
     file: String,
     ref_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPathFileBody {
+    path: String,
+    file: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitDiffWithBranchBody {
+    path: String,
+    branch: String,
+    file: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitShowDiffBody {
+    path: String,
+    commit: String,
+    file: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
