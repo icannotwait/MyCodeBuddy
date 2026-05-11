@@ -380,11 +380,6 @@ pub async fn open_commit_window(
     let label = format!("commit-{folder_id}");
 
     if let Some(existing) = app.get_webview_window(&label) {
-        if let Some(owner_window) = app.get_webview_window(&owner_label) {
-            owner_window.set_enabled(false).map_err(|e| {
-                AppCommandError::window("Failed to disable owner window", e.to_string())
-            })?;
-        }
         state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing
@@ -406,21 +401,14 @@ pub async fn open_commit_window(
         .title(format!("提交代码 - {}", folder.name))
         .inner_size(1220.0, 820.0)
         .min_inner_size(980.0, 620.0)
-        .always_on_top(true)
         .center();
+    let builder = builder
+        .parent(&window)
+        .map_err(|e| AppCommandError::window("Failed to attach commit window to parent", e.to_string()))?;
     let commit_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open commit window", e.to_string()))?;
     post_window_setup(&commit_window);
-    if let Some(owner_window) = app.get_webview_window(&owner_label) {
-        if let Err(err) = owner_window.set_enabled(false) {
-            let _ = commit_window.close();
-            return Err(AppCommandError::window(
-                "Failed to disable owner window",
-                err.to_string(),
-            ));
-        }
-    }
     state.set_owner(label, owner_label);
     commit_window
         .set_focus()
@@ -452,18 +440,7 @@ pub async fn open_settings_window(
                 AppCommandError::window("Failed to navigate settings window", e.to_string())
             })?;
         }
-        if let Some(prev_owner) = state.take_owner() {
-            if prev_owner != owner_label {
-                if let Some(prev_window) = app.get_webview_window(&prev_owner) {
-                    let _ = prev_window.set_enabled(true);
-                }
-            }
-        }
-        if let Some(owner_window) = app.get_webview_window(&owner_label) {
-            owner_window.set_enabled(false).map_err(|e| {
-                AppCommandError::window("Failed to disable owner window", e.to_string())
-            })?;
-        }
+        let _ = state.take_owner();
         state.set_owner(owner_label);
         let _ = existing.unminimize();
         existing.set_focus().map_err(|e| {
@@ -477,21 +454,14 @@ pub async fn open_settings_window(
         .title("Settings")
         .inner_size(1080.0, 700.0)
         .min_inner_size(1080.0, 600.0)
-        .always_on_top(true)
         .center();
+    let builder = builder
+        .parent(&window)
+        .map_err(|e| AppCommandError::window("Failed to attach settings window to parent", e.to_string()))?;
     let settings_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open settings window", e.to_string()))?;
     post_window_setup(&settings_window);
-    if let Some(owner_window) = app.get_webview_window(&owner_label) {
-        if let Err(err) = owner_window.set_enabled(false) {
-            let _ = settings_window.close();
-            return Err(AppCommandError::window(
-                "Failed to disable owner window",
-                err.to_string(),
-            ));
-        }
-    }
     state.set_owner(owner_label);
     settings_window
         .set_focus()
@@ -502,7 +472,6 @@ pub async fn open_settings_window(
 pub fn restore_windows_after_settings(app: &AppHandle, state: &SettingsWindowState) {
     if let Some(owner_label) = state.take_owner() {
         if let Some(window) = app.get_webview_window(&owner_label) {
-            let _ = window.set_enabled(true);
             let _ = window.set_focus();
         }
     }
@@ -515,7 +484,6 @@ pub fn restore_window_after_commit(
 ) {
     if let Some(owner_label) = state.take_owner(commit_window_label) {
         if let Some(window) = app.get_webview_window(&owner_label) {
-            let _ = window.set_enabled(true);
             let _ = window.set_focus();
         }
     }
@@ -567,11 +535,6 @@ pub async fn open_merge_window(
     let label = format!("merge-{folder_id}");
 
     if let Some(existing) = app.get_webview_window(&label) {
-        if let Some(owner_window) = app.get_webview_window(&owner_label) {
-            owner_window.set_enabled(false).map_err(|e| {
-                AppCommandError::window("Failed to disable owner window", e.to_string())
-            })?;
-        }
         state.set_owner(label.clone(), owner_label);
         let _ = existing.unminimize();
         existing
@@ -597,21 +560,14 @@ pub async fn open_merge_window(
         .title(format!("解决冲突 - {}", folder.name))
         .inner_size(1400.0, 900.0)
         .min_inner_size(1100.0, 650.0)
-        .always_on_top(true)
         .center();
+    let builder = builder
+        .parent(&window)
+        .map_err(|e| AppCommandError::window("Failed to attach merge window to parent", e.to_string()))?;
     let merge_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open merge window", e.to_string()))?;
     post_window_setup(&merge_window);
-    if let Some(owner_window) = app.get_webview_window(&owner_label) {
-        if let Err(err) = owner_window.set_enabled(false) {
-            let _ = merge_window.close();
-            return Err(AppCommandError::window(
-                "Failed to disable owner window",
-                err.to_string(),
-            ));
-        }
-    }
     state.set_owner(label, owner_label);
     merge_window
         .set_focus()
@@ -627,7 +583,6 @@ pub fn restore_window_after_merge(
 ) {
     if let Some(owner_label) = state.take_owner(merge_window_label) {
         if let Some(window) = app.get_webview_window(&owner_label) {
-            let _ = window.set_enabled(true);
             let _ = window.set_focus();
         }
     }
@@ -724,6 +679,7 @@ pub async fn open_stash_window(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn open_push_window(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     db: tauri::State<'_, AppDatabase>,
     folder_id: i32,
 ) -> Result<(), AppCommandError> {
@@ -752,6 +708,9 @@ pub async fn open_push_window(
         .inner_size(1100.0, 700.0)
         .min_inner_size(800.0, 500.0)
         .center();
+    let builder = builder
+        .parent(&window)
+        .map_err(|e| AppCommandError::window("Failed to attach push window to parent", e.to_string()))?;
     let push_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open push window", e.to_string()))?;
