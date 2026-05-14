@@ -35,6 +35,12 @@ export class WebTransport implements Transport {
   // may have desynced during the disconnect window.
   private hasReadiedOnce = false
   private reconnectCallbacks = new Set<() => void>()
+  // Latched in `destroy()`. The async `onclose` fired by `ws.close()` inside
+  // `destroy()` would otherwise increment `wsFailCount` and schedule a new
+  // reconnect — and, worse, can trip `wsFailCount >= 3` after repeated
+  // teardowns and call `redirectToLogin()` from a transport the caller
+  // already let go of. Guard `onclose` to short-circuit when destroyed.
+  private destroyed = false
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl
@@ -212,6 +218,7 @@ export class WebTransport implements Transport {
       // New subscribers (and any concurrent subscribe() calls in flight)
       // must wait for the next connection's `__ready__` before resolving.
       this.resetReady()
+      if (this.destroyed) return
       this.wsFailCount++
       if (this.wsFailCount >= 3) {
         WebTransport.redirectToLogin()
@@ -226,11 +233,24 @@ export class WebTransport implements Transport {
   }
 
   destroy() {
+    this.destroyed = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
     }
-    this.ws?.close()
-    this.ws = null
+    if (this.ws) {
+      // Detach handlers BEFORE close() so the async `onclose` fired by the
+      // browser doesn't see this instance at all and can't trip the
+      // wsFailCount-based redirectToLogin from a transport the caller
+      // already discarded. The `destroyed` guard above covers any handlers
+      // that may have already been dispatched before this detach.
+      this.ws.onopen = null
+      this.ws.onmessage = null
+      this.ws.onclose = null
+      this.ws.onerror = null
+      this.ws.close()
+      this.ws = null
+    }
     this.handlers.clear()
     this.reconnectCallbacks.clear()
     // Settle any in-flight `subscribe()` awaiters so their promises don't

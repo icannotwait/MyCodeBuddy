@@ -24,6 +24,11 @@ export class RemoteDesktopTransport implements Transport {
   // subsequent `__ready__` arrivals (not the initial connect).
   private hasReadiedOnce = false
   private reconnectCallbacks = new Set<() => void>()
+  // Latched in `destroy()`. Without it, the async `onclose` fired by
+  // `ws.close()` inside `destroy()` would schedule a new reconnect timer
+  // (resurrected zombie WS, ignored by every consumer but still consuming
+  // sockets and CPU). `onclose` short-circuits when this is true.
+  private destroyed = false
 
   constructor(config: RemoteTransportConfig) {
     this.config = {
@@ -180,6 +185,7 @@ export class RemoteDesktopTransport implements Transport {
     this.ws.onclose = () => {
       this.ws = null
       this.resetReady()
+      if (this.destroyed) return
       this.wsFailCount++
       if (this.wsFailCount >= 3) {
         this.config.onUnauthorized?.()
@@ -194,12 +200,22 @@ export class RemoteDesktopTransport implements Transport {
   }
 
   destroy() {
+    this.destroyed = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.ws?.close()
-    this.ws = null
+    if (this.ws) {
+      // Detach handlers BEFORE close() so the async `onclose` fired by the
+      // browser doesn't see this instance at all. The `destroyed` guard above
+      // is defensive belt-and-suspenders for any pending events already queued.
+      this.ws.onopen = null
+      this.ws.onmessage = null
+      this.ws.onclose = null
+      this.ws.onerror = null
+      this.ws.close()
+      this.ws = null
+    }
     this.handlers.clear()
     this.reconnectCallbacks.clear()
     // Settle any in-flight `subscribe()` awaiters so their promises don't

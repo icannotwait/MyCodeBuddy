@@ -29,11 +29,16 @@ export async function subscribe<T>(
  * where the underlying channel cannot disconnect mid-session.
  */
 export function onTransportReconnect(callback: () => void): UnsubscribeFn {
-  const reconnect = getTransport().onReconnect
+  // Capture the transport instance once: between two `getTransport()` calls
+  // the remote transport could be swapped via `configureRemoteDesktopTransport`
+  // / `clearRemoteDesktopTransport`, leaving the bound method on a different
+  // object than the one we destructured from.
+  const transport = getTransport()
+  const reconnect = transport.onReconnect
   if (!reconnect) {
     return () => {}
   }
-  return reconnect.call(getTransport(), callback)
+  return reconnect.call(transport, callback)
 }
 
 /**
@@ -44,9 +49,11 @@ export function onTransportReconnect(callback: () => void): UnsubscribeFn {
  * events silently dropped. No-op for IPC-only transports.
  */
 export async function waitForTransportReady(): Promise<void> {
-  const waitForReady = getTransport().waitForReady
+  // See onTransportReconnect for why we capture the instance once.
+  const transport = getTransport()
+  const waitForReady = transport.waitForReady
   if (!waitForReady) return
-  await waitForReady.call(getTransport())
+  await waitForReady.call(transport)
 }
 
 /**
