@@ -44,6 +44,7 @@ import {
   deleteConversation,
 } from "@/lib/api"
 import { isDesktop, openFileDialog, revealItemInDir } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import type { ConversationStatus, DbConversationSummary } from "@/lib/types"
 import {
   loadFolderExpanded,
@@ -1049,7 +1050,12 @@ export function SidebarConversationList({
   }, [persistReorder])
 
   const handleOpenFolderAction = useCallback(async () => {
-    if (isDesktop()) {
+    // Native Tauri dialog only when running on local desktop (no active
+    // remote workspace). Inside a remote workspace window the path lives
+    // on the remote host, so we route to the in-app server-side browser
+    // instead — the native dialog would pick a local path the remote
+    // server can't open.
+    if (isDesktop() && getActiveRemoteConnectionId() === null) {
       try {
         const result = await openFileDialog({
           directory: true,

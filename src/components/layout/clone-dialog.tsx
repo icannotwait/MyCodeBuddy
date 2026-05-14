@@ -7,6 +7,7 @@ import { FolderOpen, Loader2 } from "lucide-react"
 import { cloneRepository } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { isDesktop, openFileDialog } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
@@ -47,7 +48,10 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
   )
 
   const handleBrowse = async () => {
-    if (isDesktop()) {
+    // Clone happens on the remote host when bound to a remote workspace —
+    // the target dir must therefore live on that host, not on the local
+    // desktop. Route to the in-app browser unless we're truly local.
+    if (isDesktop() && getActiveRemoteConnectionId() === null) {
       const selected = await openFileDialog({
         directory: true,
         multiple: false,

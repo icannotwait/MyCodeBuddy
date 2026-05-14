@@ -12,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { openProjectBootWindow } from "@/lib/api"
 import { isDesktop, openFileDialog } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { CloneDialog } from "@/components/layout/clone-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
@@ -23,7 +24,12 @@ export function NewFolderDropdown() {
   const [browserOpen, setBrowserOpen] = useState(false)
 
   async function handleOpenFolder() {
-    if (isDesktop()) {
+    // Only use the native Tauri directory dialog when running on the local
+    // desktop. In a remote workspace window we're still inside Tauri, but the
+    // folder we want lives on the remote host — the native dialog would
+    // browse the *local* filesystem and produce a path the remote server
+    // can't open. Fall through to the in-app server-side browser instead.
+    if (isDesktop() && getActiveRemoteConnectionId() === null) {
       const selected = await openFileDialog({
         directory: true,
         multiple: false,

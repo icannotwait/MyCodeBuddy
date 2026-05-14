@@ -77,10 +77,12 @@ import {
   openPushWindow,
   openStashWindow,
 } from "@/lib/api"
-import { openFileDialog, subscribe } from "@/lib/platform"
+import { isDesktop, openFileDialog, subscribe } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { RemoteManageDialog } from "@/components/layout/remote-manage-dialog"
 import { ConflictDialog } from "@/components/layout/conflict-dialog"
 import { StashDialog } from "@/components/layout/stash-dialog"
+import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 import { toErrorMessage } from "@/lib/app-error"
 import type { GitBranchList, GitConflictInfo } from "@/lib/types"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -143,6 +145,7 @@ export function BranchDropdown() {
   const [remoteOpen, setRemoteOpen] = useState(false)
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null)
   const [worktreeOpen, setWorktreeOpen] = useState(false)
+  const [worktreeBrowserOpen, setWorktreeBrowserOpen] = useState(false)
   const [worktreeBranchName, setWorktreeBranchName] = useState("")
   const [worktreePath, setWorktreePath] = useState("")
   const [manageRemotesOpen, setManageRemotesOpen] = useState(false)
@@ -332,9 +335,20 @@ export function BranchDropdown() {
   }
 
   async function handleBrowseWorktreePath() {
-    const selected = await openFileDialog({ directory: true, multiple: false })
-    if (selected) {
-      setWorktreePath(Array.isArray(selected) ? selected[0] : selected)
+    // The worktree is created on whatever host runs the git binary — local
+    // for the desktop, remote for a remote workspace. The picker must
+    // therefore browse the matching filesystem, otherwise the user
+    // ends up with a path the wrong side can't resolve.
+    if (isDesktop() && getActiveRemoteConnectionId() === null) {
+      const selected = await openFileDialog({
+        directory: true,
+        multiple: false,
+      })
+      if (selected) {
+        setWorktreePath(Array.isArray(selected) ? selected[0] : selected)
+      }
+    } else {
+      setWorktreeBrowserOpen(true)
     }
   }
 
@@ -930,6 +944,12 @@ export function BranchDropdown() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <DirectoryBrowserDialog
+        open={worktreeBrowserOpen}
+        onOpenChange={setWorktreeBrowserOpen}
+        onSelect={(path) => setWorktreePath(path)}
+      />
 
       <RemoteManageDialog
         open={manageRemotesOpen}

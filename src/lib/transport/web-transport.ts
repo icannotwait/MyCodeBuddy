@@ -10,6 +10,15 @@ const WEB_CALL_TIMEOUT_MS = 30_000
 // permanently lock the UI. On timeout we proceed without confirmation — the
 // pre-fix race window reopens, but the UI stays responsive.
 const READY_TIMEOUT_MS = 5_000
+// Number of consecutive WS reconnect failures before we give up and surface
+// the session-expired state. Matches `WS_RECONNECT_FAIL_THRESHOLD` in
+// `src-tauri/src/commands/remote_proxy.rs` so behaviour is consistent across
+// transports.
+const WS_RECONNECT_FAIL_THRESHOLD = 3
+// Exponential backoff bounds, in milliseconds: 1s → 2s → 4s → … capped at
+// 32s. Cap matches the Rust-side WS_BACKOFF_MAX_SECS.
+const WS_BACKOFF_INITIAL_MS = 1_000
+const WS_BACKOFF_MAX_MS = 32_000
 
 interface WebEvent {
   channel: string
@@ -220,11 +229,18 @@ export class WebTransport implements Transport {
       this.resetReady()
       if (this.destroyed) return
       this.wsFailCount++
-      if (this.wsFailCount >= 3) {
+      if (this.wsFailCount >= WS_RECONNECT_FAIL_THRESHOLD) {
         WebTransport.redirectToLogin()
         return
       }
-      this.reconnectTimer = setTimeout(() => this.connectWs(), 3000)
+      // Exponential backoff: 1s, 2s, 4s, … capped at WS_BACKOFF_MAX_MS.
+      // Kept in lockstep with the Rust-side WS task in
+      // `src-tauri/src/commands/remote_proxy.rs` so the user experiences
+      // the same reconnect cadence whether they're on the web client or
+      // a desktop remote workspace.
+      const shift = Math.min(this.wsFailCount - 1, 8)
+      const delay = Math.min(WS_BACKOFF_INITIAL_MS << shift, WS_BACKOFF_MAX_MS)
+      this.reconnectTimer = setTimeout(() => this.connectWs(), delay)
     }
 
     this.ws.onerror = () => {

@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::error::DbError;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppErrorCode {
     InvalidInput,
@@ -24,21 +24,21 @@ pub enum AppErrorCode {
     TaskExecutionFailed,
 }
 
-#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
 pub struct AppCommandError {
     pub code: AppErrorCode,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Optional dotted i18n key (e.g. `"mcp.errors.unsupportedType"`) the
     /// frontend can use to render a localized message. When absent, the
     /// frontend falls back to `message` (English).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i18n_key: Option<String>,
     /// Optional named parameters substituted into the localized template.
     /// All values are pre-stringified so the wire format stays JSON-safe.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i18n_params: Option<BTreeMap<String, String>>,
 }
 

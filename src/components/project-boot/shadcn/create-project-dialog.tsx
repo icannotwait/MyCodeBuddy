@@ -35,6 +35,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { isDesktop, openFileDialog } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import {
   createShadcnProject,
   openFolder,
@@ -98,7 +99,11 @@ export function CreateProjectDialog({
   }, [open, packageManager, checkPackageManager])
 
   const handleBrowse = async () => {
-    if (isDesktop()) {
+    // Project scaffolding runs on whichever host hosts the workspace —
+    // remote when bound to a remote workspace, local otherwise. The
+    // picker must match that host, so we only use the native Tauri
+    // dialog when we are truly on a local desktop workspace.
+    if (isDesktop() && getActiveRemoteConnectionId() === null) {
       const result = await openFileDialog({ directory: true, multiple: false })
       if (!result) return
       const selected = Array.isArray(result) ? result[0] : result

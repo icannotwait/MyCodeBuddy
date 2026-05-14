@@ -42,8 +42,9 @@ mod tauri_app {
         acp as acp_commands, chat_channel as chat_channel_commands, conversations,
         experts as experts_commands, file_io, folder_commands, folders, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
-        quick_messages as quick_messages_commands, remote_workspace as remote_workspace_commands,
-        system_settings, terminal as terminal_commands, version_control, windows,
+        quick_messages as quick_messages_commands, remote_proxy as remote_proxy_commands,
+        remote_workspace as remote_workspace_commands, system_settings,
+        terminal as terminal_commands, version_control, windows,
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
@@ -160,6 +161,13 @@ mod tauri_app {
             .manage(windows::CommitWindowState::new())
             .manage(windows::MergeWindowState::new())
             .manage(web::WebServerState::new())
+            // Remote-workspace IPC proxy. Routes HTTP / WS for windows
+            // opened against a remote codeg-server through Rust so we
+            // bypass webview mixed-content blocking and can centrally
+            // manage per-window subscriptions.
+            .manage(std::sync::Arc::new(
+                crate::commands::remote_proxy::RemoteProxyState::new(),
+            ))
             .manage(std::sync::Arc::new(
                 web::event_bridge::WebEventBroadcaster::new(),
             ))
@@ -376,6 +384,27 @@ mod tauri_app {
             })
             .on_window_event(|window, event| {
                 let label = window.label().to_string();
+
+                // Remote-workspace IPC proxy cleanup: when ANY webview is
+                // destroyed, remove its label from every active WS
+                // subscription. This is the fail-safe for forced quits /
+                // crashes where the frontend never got a chance to call
+                // `remote_ws_unsubscribe`; the happy path is covered by
+                // RemoteDesktopTransport.destroy() in JS. Subscriber sets
+                // shrink to zero → the WS task self-shuts-down, so we
+                // don't leak per-connection background work.
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    let app = window.app_handle();
+                    if let Some(proxy) =
+                        app.try_state::<std::sync::Arc<crate::commands::remote_proxy::RemoteProxyState>>()
+                    {
+                        let proxy_arc = proxy.inner().clone();
+                        let label_clone = label.clone();
+                        tauri::async_runtime::spawn(async move {
+                            proxy_arc.remove_subscriber_globally(&label_clone).await;
+                        });
+                    }
+                }
 
                 if (label == "settings" || label.starts_with("remote-settings-"))
                     && matches!(
@@ -608,6 +637,9 @@ mod tauri_app {
                 remote_workspace_commands::get_remote_workspace_connection,
                 remote_workspace_commands::reorder_remote_workspace_connections,
                 remote_workspace_commands::open_remote_workspace,
+                remote_proxy_commands::remote_http_call,
+                remote_proxy_commands::remote_ws_subscribe,
+                remote_proxy_commands::remote_ws_unsubscribe,
                 windows::open_pet_window,
                 windows::close_pet_window,
                 windows::pet_window_record_position,

@@ -154,12 +154,19 @@ export function SettingsShell({ children }: SettingsShellProps) {
         return
       }
 
+      // Preserve current query string so the active remote workspace context
+      // (`?remoteConnectionId=N`) carries over to sub-pages — without this,
+      // navigating from /settings/appearance to /settings/mcp drops the
+      // remote id and the next page falls back to the local Tauri backend.
+      const search = window.location.search
+      const fullTarget = search ? `${target}${search}` : target
+
       if (isWindowsRuntime()) {
-        window.location.assign(target)
+        window.location.assign(fullTarget)
         return
       }
 
-      router.push(target)
+      router.push(fullTarget)
       setNavOpen(false)
     },
     [router, setNavOpen]
