@@ -7,12 +7,52 @@
 
 param(
     [string]$Version = "",
-    [string]$InstallDir = "$env:LOCALAPPDATA\codeg"
+    [string]$InstallDir = "$env:LOCALAPPDATA\codeg",
+    [switch]$NoCleanup
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = "xintaofei/codeg"
 $Artifact = "codeg-server-windows-x64"
+
+# Stale codeg-server binaries elsewhere in PATH are removed by default so the
+# user's `codeg-server` command always runs the freshly installed binary. Pass
+# -NoCleanup (or set CODEG_NO_CLEANUP=1) to disable.
+$Cleanup = -not $NoCleanup
+if ($env:CODEG_NO_CLEANUP -eq "1") {
+    $Cleanup = $false
+}
+
+function Get-CanonicalPath([string]$Path) {
+    if (-not $Path) { return "" }
+    try {
+        return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    } catch {
+        return $Path
+    }
+}
+
+function Read-BinVersion([string]$BinPath) {
+    if (-not (Test-Path -LiteralPath $BinPath)) { return "" }
+    $stdout = Join-Path $env:TEMP ("codeg-ver-" + [Guid]::NewGuid().ToString() + ".txt")
+    $stderr = Join-Path $env:TEMP ("codeg-vererr-" + [Guid]::NewGuid().ToString() + ".txt")
+    try {
+        $proc = Start-Process -FilePath $BinPath -ArgumentList "--version" `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $exited = $proc.WaitForExit(3000)
+        if (-not $exited) { try { $proc.Kill() } catch {} }
+        if (Test-Path $stdout) {
+            $line = (Get-Content $stdout -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($line) { return $line.Trim() }
+        }
+        return ""
+    } catch {
+        return ""
+    } finally {
+        Remove-Item $stdout -Force -ErrorAction SilentlyContinue
+        Remove-Item $stderr -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # ── Resolve version ──
 
@@ -28,33 +68,55 @@ if (-not $Version) {
 
 $TargetVer = $Version -replace '^v', ''
 
-# ── Version detection — skip if already up to date ──
+# ── Scan PATH for every codeg-server[.exe] binary ──
 
-$ExistingBin = Join-Path $InstallDir "codeg-server.exe"
-$CurrentVersion = ""
-$WasRunning = $false
+$DestBin = Join-Path $InstallDir "codeg-server.exe"
+$DestBinReal = Get-CanonicalPath $DestBin
 
-if (Test-Path $ExistingBin) {
-    # Run with timeout to handle old binaries that lack --version support
-    # (old binaries would start the full server and hang)
-    try {
-        $verProc = Start-Process -FilePath $ExistingBin -ArgumentList "--version" `
-            -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\codeg-ver.txt" `
-            -RedirectStandardError "$env:TEMP\codeg-ver-err.txt"
-        $exited = $verProc.WaitForExit(3000)
-        if (-not $exited) { $verProc.Kill() }
-        if (Test-Path "$env:TEMP\codeg-ver.txt") {
-            $CurrentVersion = (Get-Content "$env:TEMP\codeg-ver.txt" -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+$PathConflicts = @()
+$seenReal = @{}
+$pathDirs = @()
+if ($env:Path) { $pathDirs = $env:Path.Split(';') }
+foreach ($dir in $pathDirs) {
+    if (-not $dir) { continue }
+    foreach ($leaf in @("codeg-server.exe", "codeg-server")) {
+        $bin = Join-Path $dir $leaf
+        if (Test-Path -LiteralPath $bin -PathType Leaf) {
+            $real = Get-CanonicalPath $bin
+            if ($seenReal.ContainsKey($real)) { continue }
+            $seenReal[$real] = $true
+            if ($real -ne $DestBinReal) {
+                $PathConflicts += $bin
+            }
         }
-    } catch {
-        $CurrentVersion = ""
-    } finally {
-        Remove-Item "$env:TEMP\codeg-ver.txt" -Force -ErrorAction SilentlyContinue
-        Remove-Item "$env:TEMP\codeg-ver-err.txt" -Force -ErrorAction SilentlyContinue
     }
 }
 
-if ($CurrentVersion -and ($CurrentVersion -eq $TargetVer)) {
+# What does `codeg-server` actually resolve to in the current PATH?
+$ActiveBin = ""
+$resolved = Get-Command codeg-server -ErrorAction SilentlyContinue
+if ($resolved) { $ActiveBin = $resolved.Source }
+
+# ── Version detection — prefer the binary the user actually invokes ──
+
+$VersionCheckBin = ""
+if ($ActiveBin -and (Test-Path -LiteralPath $ActiveBin)) {
+    $VersionCheckBin = $ActiveBin
+} elseif (Test-Path -LiteralPath $DestBin) {
+    $VersionCheckBin = $DestBin
+}
+
+$CurrentVersion = ""
+$WasRunning = $false
+if ($VersionCheckBin) {
+    $CurrentVersion = Read-BinVersion $VersionCheckBin
+}
+
+# Only short-circuit when the active binary is up to date AND the destination
+# itself has it AND no other PATH entries shadow it.
+if ($CurrentVersion -and ($CurrentVersion -eq $TargetVer) `
+        -and ($PathConflicts.Count -eq 0) `
+        -and (Test-Path -LiteralPath $DestBin)) {
     Write-Host "codeg-server is already at version $TargetVer, nothing to do."
     exit 0
 }
@@ -63,6 +125,28 @@ if ($CurrentVersion) {
     Write-Host "Upgrading codeg-server: $CurrentVersion -> $TargetVer..."
 } else {
     Write-Host "Installing codeg-server $Version (windows/x64)..."
+}
+
+# ── Warn about codeg-server binaries shadowing the target install ──
+
+if ($PathConflicts.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Found other codeg-server binaries in PATH that may shadow ${DestBin}:"
+    foreach ($c in $PathConflicts) {
+        $cv = Read-BinVersion $c
+        if ($cv) {
+            Write-Host "  - $c  (version $cv)"
+        } else {
+            Write-Host "  - $c"
+        }
+    }
+    if ($Cleanup) {
+        Write-Host "These will be removed after installation. Pass -NoCleanup to keep them."
+    } else {
+        Write-Host "Keeping them (-NoCleanup). You may need to remove them manually so that"
+        Write-Host "typing 'codeg-server' runs the new install at $DestBin."
+    }
+    Write-Host ""
 }
 
 # ── Stop running service before upgrade ──
@@ -132,6 +216,21 @@ if ($UserPath -notlike "*$InstallDir*") {
 
 Remove-Item $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 
+# ── Remove conflicting binaries from other PATH locations ──
+
+if ($Cleanup -and $PathConflicts.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Removing stale codeg-server binaries..."
+    foreach ($c in $PathConflicts) {
+        try {
+            Remove-Item -LiteralPath $c -Force -ErrorAction Stop
+            Write-Host "  removed $c"
+        } catch {
+            Write-Host "  failed to remove $c — $($_.Exception.Message)"
+        }
+    }
+}
+
 # ── Restart service if it was running ──
 
 if ($WasRunning) {
@@ -152,6 +251,27 @@ if (-not $InstalledVer) { $InstalledVer = $TargetVer }
 Write-Host ""
 Write-Host "codeg-server installed to $InstallDir\codeg-server.exe"
 Write-Host "Version: $InstalledVer"
+
+# Verify the user's `codeg-server` command actually resolves to the new binary.
+$ActiveBinAfter = ""
+$resolvedAfter = Get-Command codeg-server -ErrorAction SilentlyContinue
+if ($resolvedAfter) { $ActiveBinAfter = $resolvedAfter.Source }
+$ActiveBinAfterReal = Get-CanonicalPath $ActiveBinAfter
+
+if (-not $ActiveBinAfter) {
+    Write-Host ""
+    Write-Host "Note: $InstallDir is not on the current session's PATH."
+    Write-Host "Open a new terminal (PATH was just updated) or run:"
+    Write-Host "  `$env:Path = `"$InstallDir;`$env:Path`""
+} elseif ($ActiveBinAfterReal -ne $DestBinReal) {
+    Write-Host ""
+    Write-Host "Warning: typing 'codeg-server' still runs $ActiveBinAfter, not $DestBin."
+    Write-Host "Another binary earlier in PATH is shadowing the new install. To fix, either:"
+    Write-Host "  - re-run without -NoCleanup (the default removes shadowing binaries), or"
+    Write-Host "  - remove the stale binary manually: Remove-Item '$ActiveBinAfter', or"
+    Write-Host "  - put $InstallDir before its directory in PATH."
+}
+
 Write-Host ""
 Write-Host "Quick start:"
 Write-Host "  `$env:CODEG_STATIC_DIR=`"$WebDir`"; codeg-server"
