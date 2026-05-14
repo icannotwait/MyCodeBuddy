@@ -41,6 +41,7 @@ import {
   updateSystemTerminalSettings,
 } from "@/lib/api"
 import { isDesktop, openUrl } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
 import type {
   AppLocale,
   AvailableTerminalShells,
@@ -110,7 +111,12 @@ export function SystemNetworkSettings() {
   const { languageSettings, languageSettingsLoaded, setLanguageSettings } =
     useAppI18n()
   const { isWindows } = usePlatform()
-  const renderingSettingsLoadable = isDesktop()
+  // Rendering settings are a local Tauri preference (preferences.json). They
+  // are only meaningful when the active transport is the local Tauri shell —
+  // remote workspace windows route every API call to a remote web server,
+  // which deliberately does not expose this endpoint.
+  const renderingSettingsLoadable =
+    isDesktop() && getActiveRemoteConnectionId() === null
   const renderingSectionVisible = renderingSettingsLoadable && isWindows
 
   const [loading, setLoading] = useState(true)
