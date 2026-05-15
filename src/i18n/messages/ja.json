@@ -1653,7 +1653,13 @@
         "expertSkills": "エキスパートスキル",
         "expertsEmptyForAgent": "このエージェントで有効なエキスパートはありません。「設定 > エキスパート」から有効にしてください。",
         "slashSearchPlaceholder": "コマンドを検索...",
-        "slashSearchEmpty": "一致するコマンドがありません"
+        "slashSearchEmpty": "一致するコマンドがありません",
+        "attachLocalUpload": "ローカルファイルを添付",
+        "attachServerFile": "サーバーファイルを添付",
+        "attachUploadTooLarge": "{names} は {limit}MB のアップロード上限を超えたためスキップしました。",
+        "attachUploadFailed": "{names} のアップロードに失敗しました。",
+        "attachUploadNotAFile": "{names} は通常ファイルではなく（ディレクトリまたは特殊ファイル）、スキップされました。",
+        "attachUploadQuotaExceeded": "サーバーのアップロード容量が不足しているため、{names} をアップロードできませんでした。"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
@@ -2398,5 +2404,17 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
+  },
+  "ServerFileBrowser": {
+    "title": "サーバーファイルを選択",
+    "pathPlaceholder": "ディレクトリパスを入力...",
+    "goHome": "ホームディレクトリへ",
+    "navigateUp": "上の階層へ",
+    "select": "選択",
+    "cancel": "キャンセル",
+    "loading": "読み込み中...",
+    "emptyDirectory": "このディレクトリは空です",
+    "errorLoadingDir": "ディレクトリの読み込みに失敗しました",
+    "selectedCount": "{count} 件選択中"
   }
 }

@@ -1653,7 +1653,13 @@
         "expertSkills": "專家技能",
         "expertsEmptyForAgent": "該智慧代理沒有啟用任何專家。請在「設定 > 專家」中啟用。",
         "slashSearchPlaceholder": "搜尋命令...",
-        "slashSearchEmpty": "沒有符合的指令"
+        "slashSearchEmpty": "沒有符合的指令",
+        "attachLocalUpload": "附加本機檔案",
+        "attachServerFile": "附加伺服器檔案",
+        "attachUploadTooLarge": "{names} 超過 {limit}MB 上傳上限，已略過。",
+        "attachUploadFailed": "上傳失敗：{names}。",
+        "attachUploadNotAFile": "{names} 不是常規檔案（目錄或特殊檔案），已略過。",
+        "attachUploadQuotaExceeded": "伺服器上傳空間已用盡，{names} 未能上傳。"
       },
       "messageQueue": {
         "addToQueue": "加入佇列",
@@ -2398,5 +2404,17 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
+  },
+  "ServerFileBrowser": {
+    "title": "選擇伺服器檔案",
+    "pathPlaceholder": "輸入目錄路徑...",
+    "goHome": "回到主目錄",
+    "navigateUp": "返回上層目錄",
+    "select": "選擇",
+    "cancel": "取消",
+    "loading": "載入中...",
+    "emptyDirectory": "此目錄為空",
+    "errorLoadingDir": "載入目錄失敗",
+    "selectedCount": "已選 {count} 項"
   }
 }

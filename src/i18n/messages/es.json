@@ -1653,7 +1653,13 @@
         "expertSkills": "Habilidades de expertos",
         "expertsEmptyForAgent": "Este agente no tiene expertos habilitados. Actívalos en Configuración > Expertos.",
         "slashSearchPlaceholder": "Buscar comandos...",
-        "slashSearchEmpty": "Sin comandos coincidentes"
+        "slashSearchEmpty": "Sin comandos coincidentes",
+        "attachLocalUpload": "Subir archivo local",
+        "attachServerFile": "Seleccionar archivo del servidor",
+        "attachUploadTooLarge": "{names} supera el límite de carga de {limit}MB y se omitió.",
+        "attachUploadFailed": "Error al subir {names}.",
+        "attachUploadNotAFile": "{names} no es un archivo regular (directorio o archivo especial) y se omitió.",
+        "attachUploadQuotaExceeded": "El servidor se quedó sin espacio para subidas; no se pudo cargar {names}."
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",
@@ -2398,5 +2404,17 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
+  },
+  "ServerFileBrowser": {
+    "title": "Seleccionar archivo del servidor",
+    "pathPlaceholder": "Introducir ruta de directorio...",
+    "goHome": "Ir al directorio personal",
+    "navigateUp": "Ir al directorio superior",
+    "select": "Seleccionar",
+    "cancel": "Cancelar",
+    "loading": "Cargando...",
+    "emptyDirectory": "Este directorio está vacío",
+    "errorLoadingDir": "Error al cargar el directorio",
+    "selectedCount": "{count} seleccionado(s)"
   }
 }

@@ -1636,6 +1636,8 @@
         "askAnything": "Ask anything...",
         "removeAttachmentAria": "Remove {name}",
         "attachFiles": "Attach files",
+        "attachLocalUpload": "Upload local file",
+        "attachServerFile": "Pick server file",
         "addActions": "Add",
         "quickMessages": "Quick messages",
         "quickMessagesEmpty": "No quick messages yet",
@@ -1653,7 +1655,11 @@
         "expertSkills": "Expert skills",
         "expertsEmptyForAgent": "This agent has no enabled experts. Enable them in Settings > Experts.",
         "slashSearchPlaceholder": "Search commands...",
-        "slashSearchEmpty": "No matching commands"
+        "slashSearchEmpty": "No matching commands",
+        "attachUploadTooLarge": "{names} exceeds the {limit}MB upload limit and was skipped.",
+        "attachUploadFailed": "Failed to upload {names}.",
+        "attachUploadNotAFile": "{names} isn't a regular file (directory or special file) and was skipped.",
+        "attachUploadQuotaExceeded": "The server is out of upload storage; {names} couldn't be uploaded."
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -2039,6 +2045,18 @@
     "emptyDirectory": "This directory is empty",
     "errorLoadingDir": "Failed to load directory",
     "permissionDenied": "Permission denied"
+  },
+  "ServerFileBrowser": {
+    "title": "Pick server file",
+    "pathPlaceholder": "Enter directory path...",
+    "goHome": "Go to home directory",
+    "navigateUp": "Go to parent directory",
+    "select": "Select",
+    "cancel": "Cancel",
+    "loading": "Loading...",
+    "emptyDirectory": "This directory is empty",
+    "errorLoadingDir": "Failed to load directory",
+    "selectedCount": "{count} selected"
   },
   "ChatChannelSettings": {
     "loading": "Loading...",

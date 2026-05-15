@@ -1653,7 +1653,13 @@
         "expertSkills": "전문가 스킬",
         "expertsEmptyForAgent": "이 에이전트에 활성화된 전문가가 없습니다. 설정 > 전문가에서 활성화하세요.",
         "slashSearchPlaceholder": "명령 검색...",
-        "slashSearchEmpty": "일치하는 명령이 없습니다"
+        "slashSearchEmpty": "일치하는 명령이 없습니다",
+        "attachLocalUpload": "로컬 파일 첨부",
+        "attachServerFile": "서버 파일 첨부",
+        "attachUploadTooLarge": "{names}이(가) {limit}MB 업로드 한도를 초과하여 건너뛰었습니다.",
+        "attachUploadFailed": "{names} 업로드 실패.",
+        "attachUploadNotAFile": "{names} 은(는) 일반 파일이 아니므로(디렉터리 또는 특수 파일) 건너뛰었습니다.",
+        "attachUploadQuotaExceeded": "서버 업로드 저장 공간이 부족하여 {names} 을(를) 업로드하지 못했습니다."
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",
@@ -2398,5 +2404,17 @@
     "openFailed": "Failed to open remote workspace",
     "connectionLoadFailed": "Failed to load remote connection: {message}",
     "connectionExpired": "Remote connection \"{name}\" is expired. Update its token and reload this window."
+  },
+  "ServerFileBrowser": {
+    "title": "서버 파일 선택",
+    "pathPlaceholder": "디렉토리 경로 입력...",
+    "goHome": "홈 디렉토리로",
+    "navigateUp": "상위 디렉토리로",
+    "select": "선택",
+    "cancel": "취소",
+    "loading": "로드 중...",
+    "emptyDirectory": "이 디렉토리는 비어 있습니다",
+    "errorLoadingDir": "디렉토리 로드 실패",
+    "selectedCount": "{count}개 선택됨"
   }
 }

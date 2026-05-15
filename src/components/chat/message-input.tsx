@@ -12,6 +12,7 @@ import {
   ChevronUp,
   Cog,
   FileSearch,
+  FolderSearch,
   GitFork,
   MessageSquareText,
   Paperclip,
@@ -21,6 +22,7 @@ import {
   Command,
   Sparkles,
   Square,
+  Upload,
   X,
 } from "lucide-react"
 import {
@@ -39,8 +41,22 @@ import { AgentIcon } from "@/components/agent-icon"
 import { cn, randomUUID } from "@/lib/utils"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
-import { readFileBase64, quickMessagesList } from "@/lib/api"
+import {
+  readFileBase64,
+  quickMessagesList,
+  uploadAttachment,
+  uploadLocalPathToRemote,
+  isEmptyAttachmentError,
+  UPLOAD_MAX_BYTES,
+  UPLOAD_I18N_KEY_TOO_LARGE,
+  UPLOAD_I18N_KEY_NOT_A_FILE,
+  UPLOAD_I18N_KEY_QUOTA_EXCEEDED,
+} from "@/lib/api"
+import { extractAppCommandError } from "@/lib/app-error"
 import { openFileDialog } from "@/lib/platform"
+import { getActiveRemoteConnectionId } from "@/lib/transport"
+import { ServerFileBrowserDialog } from "@/components/shared/server-file-browser-dialog"
+import { toast } from "sonner"
 import { disposeTauriListener } from "@/lib/tauri-listener"
 import type {
   AgentSkillItem,
@@ -345,6 +361,21 @@ export function MessageInput({
   const t = useTranslations("Folder.chat.messageInput")
   const tQueue = useTranslations("Folder.chat.messageQueue")
   const tExperts = useTranslations("ExpertsSettings")
+  // Kept as a separate binding from `t` so its call sites — exclusively
+  // upload / attachment toasts — read as a single coherent group when
+  // scanning the file. Same namespace, no extra runtime cost.
+  const tAttach = useTranslations("Folder.chat.messageInput")
+  const desktopMode = isDesktop()
+  // Cached for the window's lifetime: `getActiveRemoteConnectionId()` is
+  // configured once when a remote-workspace window is created and never
+  // mutates afterwards. A desktop window bound to a remote codeg-server
+  // has to behave like the web client for attachments — local OS paths
+  // would be ENOENT on the remote agent. Only the truly local desktop
+  // shows the native Paperclip picker.
+  const showNativePaperclip = useMemo(
+    () => desktopMode && getActiveRemoteConnectionId() === null,
+    [desktopMode]
+  )
   const locale = useLocale()
   const builtInExperts = useBuiltInExperts()
   const expertIdSet = useMemo(
@@ -798,6 +829,94 @@ export function MessageInput({
     [appendResourceLinks]
   )
 
+  // Shared upload pool used by the menu's "Upload local file" button,
+  // browser drag-drop in web mode, paste in web mode, and the fallback
+  // path of `appendFilesAsResources` for remote-desktop. Splits oversize
+  // from acceptable, runs uploads with bounded concurrency, surfaces
+  // failures via toast, and finally appends the successful paths as
+  // ResourceLinks. Returns nothing — all state changes happen via the
+  // existing setters / toast.
+  const uploadAndAppendFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return
+      const oversized = files.filter((f) => f.size > UPLOAD_MAX_BYTES)
+      const accepted = files.filter((f) => f.size <= UPLOAD_MAX_BYTES)
+      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
+      if (oversized.length > 0) {
+        toast.error(
+          tAttach("attachUploadTooLarge", {
+            limit: limitMb,
+            names: oversized.map((f) => f.name).join(", "),
+          })
+        )
+      }
+      if (accepted.length === 0) return
+
+      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
+      // small enough to keep server load predictable, large enough to feel
+      // responsive for a handful of files.
+      const uploaded: string[] = []
+      const failed: Array<{ name: string; reason: unknown }> = []
+      const quotaRejected: string[] = []
+      const CONCURRENCY = 3
+      let cursor = 0
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, accepted.length) },
+        async () => {
+          while (cursor < accepted.length) {
+            const idx = cursor++
+            const file = accepted[idx]
+            try {
+              const r = await uploadAttachment(file, attachmentTabId ?? null)
+              uploaded.push(r.path)
+            } catch (error) {
+              if (isEmptyAttachmentError(error)) {
+                // Empty files are explicitly dropped on the floor — log
+                // and move on without a user-facing error toast.
+                console.warn(
+                  `[MessageInput] skipping empty attachment: ${file.name}`
+                )
+                continue
+              }
+              const appError = extractAppCommandError(error)
+              if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
+                quotaRejected.push(file.name)
+                continue
+              }
+              failed.push({ name: file.name, reason: error })
+            }
+          }
+        }
+      )
+      await Promise.all(workers)
+
+      if (quotaRejected.length > 0) {
+        toast.error(
+          tAttach("attachUploadQuotaExceeded", {
+            names: quotaRejected.join(", "),
+          })
+        )
+      }
+      if (failed.length > 0) {
+        for (const f of failed) {
+          console.error(
+            `[MessageInput] upload attachment failed (${f.name}):`,
+            f.reason
+          )
+        }
+        toast.error(
+          tAttach("attachUploadFailed", {
+            names: failed.map((r) => r.name).join(", "),
+          })
+        )
+      }
+      if (uploaded.length > 0) {
+        appendResourceAttachments(uploaded)
+      }
+    },
+    [appendResourceAttachments, attachmentTabId, tAttach]
+  )
+
   const appendEmbeddedResources = useCallback(
     (
       resources: Array<{
@@ -826,6 +945,12 @@ export function MessageInput({
     []
   )
 
+  // Path-less files (browser `File` objects: drag-drop in web mode, paste,
+  // or `<input type=file>` in any mode) need a real backing path before
+  // the agent can read them. Only the truly local desktop keeps the legacy
+  // base64/embedded fallback — web and remote-desktop both push through
+  // `uploadAndAppendFiles` so the resulting ResourceLink points at a real
+  // server-side file.
   const appendFilesAsResources = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return
@@ -848,6 +973,7 @@ export function MessageInput({
         text?: string | null
         blob?: string | null
       }> = []
+      const uploadCandidates: File[] = []
 
       for (const file of files) {
         const path = getFilePath(file)
@@ -861,6 +987,11 @@ export function MessageInput({
             mimeType: mimeTypeFromPath(path) ?? mimeType ?? null,
             dedupeKey: uri,
           })
+          continue
+        }
+
+        if (!showNativePaperclip) {
+          uploadCandidates.push(file)
           continue
         }
 
@@ -899,11 +1030,16 @@ export function MessageInput({
       appendResourceLinks(pathLinks)
       appendResourceLinks(fallbackDataLinks)
       appendEmbeddedResources(embeddedResources)
+      if (uploadCandidates.length > 0) {
+        await uploadAndAppendFiles(uploadCandidates)
+      }
     },
     [
       appendEmbeddedResources,
       appendResourceLinks,
       promptCapabilities.embedded_context,
+      showNativePaperclip,
+      uploadAndAppendFiles,
     ]
   )
 
@@ -996,6 +1132,121 @@ export function MessageInput({
   useEffect(() => {
     appendPathsFromDropRef.current = appendPathsFromDrop
   }, [appendPathsFromDrop])
+
+  // Remote-workspace counterpart of `appendPathsFromDrop`. Reads each
+  // local path through Rust, ships the bytes via the upload proxy, then
+  // appends the resulting server-side paths as ResourceLinks. Failures
+  // (oversize, ENOENT, network) are reported in a single aggregated toast
+  // matching `uploadAndAppendFiles`.
+  const uploadPathsToRemote = useCallback(
+    async (paths: string[]) => {
+      const normalized = paths.filter(
+        (p): p is string => typeof p === "string" && p.length > 0
+      )
+      if (normalized.length === 0) return
+
+      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
+      const succeeded: string[] = []
+      const failed: Array<{ name: string; reason: unknown }> = []
+      const oversize: string[] = []
+      const directories: string[] = []
+      const quotaRejected: string[] = []
+
+      const CONCURRENCY = 3
+      let cursor = 0
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, normalized.length) },
+        async () => {
+          while (cursor < normalized.length) {
+            const idx = cursor++
+            const path = normalized[idx]
+            const name = path.split(/[/\\]/).pop() || path
+            try {
+              const r = await uploadLocalPathToRemote(
+                path,
+                attachmentTabId ?? null
+              )
+              succeeded.push(r.path)
+            } catch (error) {
+              if (isEmptyAttachmentError(error)) {
+                console.warn(
+                  `[MessageInput] skipping empty remote-drop attachment: ${name}`
+                )
+                continue
+              }
+              // The Rust side tags structured upload errors with an
+              // `i18n_key` (see `app_error::UPLOAD_I18N_KEY_*`); branch
+              // on the key so each user-visible category lands in its own
+              // toast instead of the generic "upload failed" bucket.
+              // Falling back to the bare message would couple us to the
+              // exact English phrasing in `remote_proxy.rs`.
+              const appError = extractAppCommandError(error)
+              const i18nKey = appError?.i18n_key ?? null
+              if (i18nKey === UPLOAD_I18N_KEY_TOO_LARGE) {
+                oversize.push(name)
+              } else if (i18nKey === UPLOAD_I18N_KEY_NOT_A_FILE) {
+                // Dragging a directory or a special file (FIFO, device
+                // node) lands here. The Rust guard short-circuits before
+                // we even read bytes; surface a dedicated toast so the
+                // user understands why nothing was attached.
+                directories.push(name)
+              } else if (i18nKey === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
+                quotaRejected.push(name)
+              } else {
+                failed.push({ name, reason: error })
+              }
+            }
+          }
+        }
+      )
+      await Promise.all(workers)
+
+      if (oversize.length > 0) {
+        toast.error(
+          tAttach("attachUploadTooLarge", {
+            limit: limitMb,
+            names: oversize.join(", "),
+          })
+        )
+      }
+      if (directories.length > 0) {
+        toast.error(
+          tAttach("attachUploadNotAFile", {
+            names: directories.join(", "),
+          })
+        )
+      }
+      if (quotaRejected.length > 0) {
+        toast.error(
+          tAttach("attachUploadQuotaExceeded", {
+            names: quotaRejected.join(", "),
+          })
+        )
+      }
+      if (failed.length > 0) {
+        for (const f of failed) {
+          console.error(
+            `[MessageInput] remote path upload failed (${f.name}):`,
+            f.reason
+          )
+        }
+        toast.error(
+          tAttach("attachUploadFailed", {
+            names: failed.map((f) => f.name).join(", "),
+          })
+        )
+      }
+      if (succeeded.length > 0) {
+        appendResourceAttachments(succeeded)
+      }
+    },
+    [appendResourceAttachments, attachmentTabId, tAttach]
+  )
+
+  const uploadPathsToRemoteRef = useRef(uploadPathsToRemote)
+  useEffect(() => {
+    uploadPathsToRemoteRef.current = uploadPathsToRemote
+  }, [uploadPathsToRemote])
 
   const appendFilesFromInput = useCallback(
     async (files: File[]) => {
@@ -1332,6 +1583,8 @@ export function MessageInput({
 
   const handlePickFiles = useCallback(async () => {
     if (disabled) return
+    // Only wired up when `showNativePaperclip` is true (i.e. local desktop),
+    // so we can hand raw OS paths to the local agent without a round-trip.
     try {
       const selected = await openFileDialog({
         multiple: true,
@@ -1345,6 +1598,33 @@ export function MessageInput({
       console.error("[MessageInput] pick files failed:", error)
     }
   }, [appendResourceAttachments, defaultPath, disabled])
+
+  const [serverFilePickerOpen, setServerFilePickerOpen] = useState(false)
+
+  const handleUploadLocalFiles = useCallback(async () => {
+    if (disabled) return
+    // Open a hidden <input type="file"> to grab File objects (browsers and
+    // Tauri webviews both produce blob-style File objects from this control,
+    // never raw OS paths), then upload each one — `uploadAttachment` picks
+    // the right transport (direct fetch in web mode, IPC-proxied multipart
+    // in remote-desktop mode).
+    const input = document.createElement("input")
+    input.type = "file"
+    input.multiple = true
+    input.onchange = async () => {
+      const all = input.files ? Array.from(input.files) : []
+      await uploadAndAppendFiles(all)
+    }
+    input.click()
+  }, [disabled, uploadAndAppendFiles])
+
+  const handleServerFilesSelected = useCallback(
+    (paths: string[]) => {
+      if (paths.length === 0) return
+      appendResourceAttachments(paths)
+    },
+    [appendResourceAttachments]
+  )
 
   const loadQuickMessages = useCallback(async () => {
     setQuickMessagesLoading(true)
@@ -1460,6 +1740,18 @@ export function MessageInput({
         setDragActiveIfChanged(false)
         if (Date.now() - lastDomDropAtRef.current < 250) return
         if (!inside || disabledRef.current) return
+        if (getActiveRemoteConnectionId() !== null) {
+          // Remote workspace: local OS paths are unreachable from the
+          // remote agent, so stream the bytes through the upload proxy and
+          // attach the resulting server-side paths instead.
+          void uploadPathsToRemoteRef.current(payload.paths).catch((error) => {
+            console.error(
+              "[MessageInput] remote drag-drop upload failed:",
+              error
+            )
+          })
+          return
+        }
         void appendPathsFromDropRef.current(payload.paths).catch((error) => {
           console.error("[MessageInput] drag drop paths failed:", error)
         })
@@ -2120,19 +2412,43 @@ export function MessageInput({
                 align="start"
                 className="min-w-48"
               >
-                <DropdownMenuItem
-                  onClick={() => {
-                    handlePickFiles().catch((error) => {
-                      console.error(
-                        "[MessageInput] pick files from menu failed:",
-                        error
-                      )
-                    })
-                  }}
-                >
-                  <Paperclip className="size-4" />
-                  {t("attachFiles")}
-                </DropdownMenuItem>
+                {showNativePaperclip ? (
+                  <DropdownMenuItem
+                    onClick={() => {
+                      handlePickFiles().catch((error) => {
+                        console.error(
+                          "[MessageInput] pick files from menu failed:",
+                          error
+                        )
+                      })
+                    }}
+                  >
+                    <Paperclip className="size-4" />
+                    {t("attachFiles")}
+                  </DropdownMenuItem>
+                ) : (
+                  <>
+                    <DropdownMenuItem
+                      onClick={() => {
+                        handleUploadLocalFiles().catch((error) => {
+                          console.error(
+                            "[MessageInput] upload local files failed:",
+                            error
+                          )
+                        })
+                      }}
+                    >
+                      <Upload className="size-4" />
+                      {t("attachLocalUpload")}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => setServerFilePickerOpen(true)}
+                    >
+                      <FolderSearch className="size-4" />
+                      {t("attachServerFile")}
+                    </DropdownMenuItem>
+                  </>
+                )}
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger>
                     <MessageSquareText className="size-4" />
@@ -2387,6 +2703,14 @@ export function MessageInput({
           if (!open) setPreviewAttachmentId(null)
         }}
       />
+      {!showNativePaperclip && (
+        <ServerFileBrowserDialog
+          open={serverFilePickerOpen}
+          onOpenChange={setServerFilePickerOpen}
+          onSelect={handleServerFilesSelected}
+          initialPath={defaultPath ?? undefined}
+        />
+      )}
     </div>
   )
 }

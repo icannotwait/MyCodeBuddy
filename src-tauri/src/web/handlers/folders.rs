@@ -190,6 +190,13 @@ pub async fn list_directory_entries(
     Ok(Json(result))
 }
 
+pub async fn list_directory_with_files(
+    Json(params): Json<ListDirectoryEntriesParams>,
+) -> Result<Json<Vec<folder_commands::DirectoryItem>>, AppCommandError> {
+    let result = folder_commands::list_directory_with_files(params.path).await?;
+    Ok(Json(result))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetFileTreeParams {

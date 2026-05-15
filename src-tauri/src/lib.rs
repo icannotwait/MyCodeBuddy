@@ -48,7 +48,7 @@ mod tauri_app {
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
-    use crate::{db, network, process, web};
+    use crate::{db, git_credential, network, paths, process, web};
     use tauri::Manager;
 
     static APP_QUITTING: AtomicBool = AtomicBool::new(false);
@@ -184,10 +184,77 @@ mod tauri_app {
             .manage(crate::pet_state_mapper::new_pet_state_handle())
             .setup(|app| {
                 let app_data_dir = app.path().app_data_dir()?;
+
+                // Unify the data root across every consumer:
+                //   * SQLite database (initialised below)
+                //   * `paths::codeg_uploads_root` / `codeg_pets_root`
+                //   * `AppState.data_dir` and every desktop command
+                //     that injects a git credential helper / askpass
+                //     into a subprocess (terminal, ACP, folder ops)
+                //
+                // The contract is "one effective root, end of story."
+                // `paths::resolve_effective_data_dir` is the single
+                // source of truth; every desktop call site that
+                // historically read `app.path().app_data_dir()` and
+                // passed it to a credential helper has been migrated
+                // to the same helper so a pre-set `CODEG_DATA_DIR` is
+                // honored end-to-end.
+                //
+                // We also write the absolutized value back to the env,
+                // even when the operator pre-set it, so:
+                //   * subprocesses inherit an absolute path (a relative
+                //     `CODEG_DATA_DIR` would otherwise re-resolve
+                //     against the subprocess CWD, which may differ
+                //     from ours), and
+                //   * any future caller that reaches for the env
+                //     directly sees the same value the in-process
+                //     resolver returns.
+                //
+                // `set_var` is `unsafe` in edition 2024. We are still
+                // single-threaded at this point: `setup` runs on the
+                // main thread before any window or async runtime task
+                // reads the var, the Tauri plugins registered above
+                // (window state, opener, dialog, updater, process,
+                // notification) do not read `CODEG_DATA_DIR`, and the
+                // value is never mutated again for the lifetime of the
+                // process.
+                let effective_data_dir = paths::resolve_effective_data_dir(&app_data_dir);
+                // SAFETY: see the rationale block above — still
+                // single-threaded at setup; edition 2024 will require
+                // the `unsafe` block, mirroring the WebView2 rendering
+                // override.
+                unsafe {
+                    std::env::set_var("CODEG_DATA_DIR", &effective_data_dir);
+                }
+
+                // `CODEG_HOME` overrides `CODEG_DATA_DIR` inside
+                // `paths::codeg_uploads_root` / `codeg_pets_root` for
+                // backwards-compatibility with the legacy `~/.codeg/`
+                // layout. If both are set and point at different roots,
+                // uploads/pets land on `CODEG_HOME` while the database
+                // lands on `CODEG_DATA_DIR` — a silent split. The
+                // backup story here is "loud warning, no automatic
+                // override": the operator likely meant one of them, but
+                // we don't know which.
+                if let Some(home) = std::env::var_os("CODEG_HOME").filter(|s| !s.is_empty()) {
+                    let home_path = git_credential::absolutize(std::path::Path::new(&home));
+                    if home_path != effective_data_dir {
+                        eprintln!(
+                            "[paths][WARN] CODEG_HOME ({}) and CODEG_DATA_DIR ({}) point at different roots. \
+                             Uploads/pets follow CODEG_HOME; the database follows CODEG_DATA_DIR. \
+                             Unset one or align them to avoid split state.",
+                            home_path.display(),
+                            effective_data_dir.display()
+                        );
+                    }
+                }
+
                 let app_version = env!("CARGO_PKG_VERSION");
-                let database =
-                    tauri::async_runtime::block_on(db::init_database(&app_data_dir, app_version))
-                        .map_err(|e| e.to_string())?;
+                let database = tauri::async_runtime::block_on(db::init_database(
+                    &effective_data_dir,
+                    app_version,
+                ))
+                .map_err(|e| e.to_string())?;
                 app.manage(database);
 
                 // Restore and apply saved system proxy settings before any network operation.
@@ -609,6 +676,7 @@ mod tauri_app {
                 workspace_state_commands::get_workspace_snapshot,
                 folders::get_home_directory,
                 folders::list_directory_entries,
+                folders::list_directory_with_files,
                 folders::get_file_tree,
                 folders::read_file_base64,
                 folders::read_file_preview,
@@ -636,6 +704,8 @@ mod tauri_app {
                 remote_workspace_commands::reorder_remote_workspace_connections,
                 remote_workspace_commands::open_remote_workspace,
                 remote_proxy_commands::remote_http_call,
+                remote_proxy_commands::remote_upload_attachment,
+                remote_proxy_commands::read_local_file_for_upload,
                 remote_proxy_commands::remote_ws_subscribe,
                 remote_proxy_commands::remote_ws_unsubscribe,
                 remote_proxy_commands::remote_ws_send_text,

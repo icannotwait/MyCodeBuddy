@@ -81,8 +81,14 @@ pub async fn terminal_spawn(
         .path()
         .app_data_dir()
         .map_err(|e| TerminalError::SpawnFailed(e.to_string()))?;
+    // Honor a pre-set `CODEG_DATA_DIR` so the credential helper
+    // injected into this terminal points at the same database the
+    // desktop process initialized in `lib.rs setup`. Without this,
+    // a custom `CODEG_DATA_DIR` would leave terminals reading an
+    // empty / nonexistent DB at the Tauri default path.
+    let effective_data_dir = crate::paths::resolve_effective_data_dir(&app_data_dir);
 
-    let extra_env = prepare_credential_env(&app_data_dir);
+    let extra_env = prepare_credential_env(&effective_data_dir);
 
     manager.spawn_with_id(
         SpawnOptions {

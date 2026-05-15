@@ -399,6 +399,21 @@ pub(crate) async fn do_start_web_server_with_state(
     let host = host.unwrap_or_else(|| "0.0.0.0".to_string());
     let token = resolve_web_service_token(&app_state.db.conn, token).await?;
 
+    // Validate the upload-quota strict-mode posture before any I/O. A
+    // misconfigured env var must surface as a clean `AppCommandError`
+    // on the desktop — the standalone server's process-exit path is
+    // wrong here because that would take down the whole webview app
+    // (and the persisted web-service config would survive the crash,
+    // re-tripping on every relaunch).
+    handlers::files::log_upload_quota_config_at_startup();
+    if let Err(err) = handlers::files::validate_upload_quota_config() {
+        return Err(AppCommandError::new(
+            AppErrorCode::InvalidInput,
+            "Upload quota configuration is invalid",
+        )
+        .with_detail(err.to_string()));
+    }
+
     let addr: SocketAddr =
         format!("{}:{}", host, port)
             .parse()
@@ -422,13 +437,21 @@ pub(crate) async fn do_start_web_server_with_state(
         );
     }
 
-    // Persist only after a successful bind so a failed attempt doesn't overwrite saved state.
+    // Persist only after a successful bind AND a successful strict-
+    // mode check, so a misconfiguration doesn't overwrite saved state
+    // and lock the desktop into a permanent "Web service won't start"
+    // loop.
     persist_web_service_config(&app_state.db.conn, &token, port).await?;
 
     // Reset before any handler subscribes, so a leftover signal from the
     // previous cycle cannot make a new handler exit immediately.
     ws.shutdown_signal.reset();
     let shutdown_signal = ws.shutdown_signal.clone();
+
+    // Sweep abandoned upload staging files from any previous run. Safe to
+    // call before binding the listener; only touches `<uploads_root>/.tmp/`.
+    handlers::files::purge_upload_staging().await;
+
     let router = router::build_router(
         app_state.clone(),
         token.clone(),
@@ -559,6 +582,18 @@ pub(crate) async fn do_start_web_server_tauri(
     let host_val = host.unwrap_or_else(|| "0.0.0.0".to_string());
     let token = resolve_web_service_token(&db.conn, token).await?;
 
+    // Same strict-mode validation as `do_start_web_server_with_state`:
+    // run before any I/O so a misconfiguration cleanly fails the toggle
+    // instead of taking the desktop down.
+    handlers::files::log_upload_quota_config_at_startup();
+    if let Err(err) = handlers::files::validate_upload_quota_config() {
+        return Err(AppCommandError::new(
+            AppErrorCode::InvalidInput,
+            "Upload quota configuration is invalid",
+        )
+        .with_detail(err.to_string()));
+    }
+
     let addr: SocketAddr =
         format!("{}:{}", host_val, port_val)
             .parse()
@@ -579,7 +614,9 @@ pub(crate) async fn do_start_web_server_tauri(
         );
     }
 
-    // Persist only after a successful bind so a failed attempt doesn't overwrite saved state.
+    // Persist only after a successful bind AND strict-mode validation,
+    // so a misconfiguration doesn't lock the desktop into a permanent
+    // "Web service won't start" loop.
     persist_web_service_config(&db.conn, &token, port_val).await?;
 
     let static_dir = find_static_dir_tauri(&app);
@@ -601,7 +638,12 @@ pub(crate) async fn do_start_web_server_tauri(
             .inner()
             .clone(),
         emitter: crate::web::event_bridge::EventEmitter::Tauri(app.clone()),
-        data_dir: app.path().app_data_dir().unwrap_or_default(),
+        // Resolve through the effective data dir so a custom
+        // `CODEG_DATA_DIR` reaches the credential helper and any HTTP
+        // handler that reads `state.data_dir`.
+        data_dir: crate::paths::resolve_effective_data_dir(
+            &app.path().app_data_dir().unwrap_or_default(),
+        ),
         web_server_state: WebServerState::new(), // placeholder; not used by handlers
         chat_channel_manager: crate::app_state::default_chat_channel_manager(),
         // Reuse the same handle the Tauri-mode subscriber writes to so HTTP
@@ -615,6 +657,12 @@ pub(crate) async fn do_start_web_server_tauri(
     // See do_start_web_server_with_state for rationale on the reset.
     ws.shutdown_signal.reset();
     let shutdown_signal = ws.shutdown_signal.clone();
+
+    // Sweep abandoned upload staging files. See the matching call in
+    // `do_start_web_server_with_state` for rationale. Quota log/validate
+    // already ran earlier in this function before the bind.
+    handlers::files::purge_upload_staging().await;
+
     let router = router::build_router(
         app_state,
         token.clone(),

@@ -2174,8 +2174,12 @@ pub async fn acp_connect(
     // accounts configured in Settings → Version Control, mirroring what
     // the built-in terminal already does.
     if let Ok(app_data_dir) = app_handle.path().app_data_dir() {
+        // Match `commands::terminal`: resolve through the effective
+        // data dir so a custom `CODEG_DATA_DIR` reaches the helper
+        // script the agent's git subprocess will execute.
+        let effective_data_dir = crate::paths::resolve_effective_data_dir(&app_data_dir);
         if let Some(cred_env) =
-            crate::commands::terminal::prepare_credential_env(&app_data_dir)
+            crate::commands::terminal::prepare_credential_env(&effective_data_dir)
         {
             for (key, value) in cred_env {
                 runtime_env.insert(key, value);
