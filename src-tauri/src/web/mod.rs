@@ -433,6 +433,11 @@ pub(crate) async fn do_start_web_server_with_state(
     // call before binding the listener; only touches `<uploads_root>/.tmp/`.
     handlers::files::purge_upload_staging().await;
 
+    // Surface the effective upload-quota posture on every web-server
+    // start. Operators who toggle the desktop web service on/off won't
+    // see the codeg-server banner — this fills in the same line.
+    handlers::files::log_upload_quota_config_at_startup();
+
     let router = router::build_router(
         app_state.clone(),
         token.clone(),
@@ -618,6 +623,7 @@ pub(crate) async fn do_start_web_server_tauri(
     // Sweep abandoned upload staging files. See the matching call in
     // `do_start_web_server_with_state` for rationale.
     handlers::files::purge_upload_staging().await;
+    handlers::files::log_upload_quota_config_at_startup();
 
     let router = router::build_router(
         app_state,

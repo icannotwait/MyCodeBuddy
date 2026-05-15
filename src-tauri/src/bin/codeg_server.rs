@@ -192,6 +192,12 @@ async fn async_main() {
     // serving the first request.
     codeg_lib::web::handlers::files::purge_upload_staging().await;
 
+    // Report the effective upload-quota configuration. Operators have
+    // historically been bitten by env-var typos that silently disable
+    // safety caps; the log line guarantees the actual posture is
+    // visible at boot.
+    codeg_lib::web::handlers::files::log_upload_quota_config_at_startup();
+
     // Build router
     let shutdown_signal = state.web_server_state.shutdown_signal();
     let router = codeg_lib::web::router::build_router(

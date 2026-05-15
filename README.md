@@ -256,8 +256,9 @@ Environment variables:
 | `CODEG_PORT` | `3080` | HTTP port |
 | `CODEG_HOST` | `0.0.0.0` | Bind address |
 | `CODEG_TOKEN` | *(random)* | Auth token (printed to stderr on start) |
-| `CODEG_DATA_DIR` | `~/.local/share/codeg` | SQLite database directory |
+| `CODEG_DATA_DIR` | `~/.local/share/codeg` | SQLite database directory (also roots `uploads/`, `pets/`) |
 | `CODEG_STATIC_DIR` | `./web` or `./out` | Next.js static export directory |
+| `CODEG_UPLOAD_MAX_TOTAL_BYTES` | *(unset)* | Hard cap on total bytes resident under `<data dir>/uploads/`. Plain decimal byte count (e.g. `10737418240` for 10 GiB). Unset, `0`, or an unparseable value disables the cap and prints a startup line so the posture is visible. |
 
 ## Architecture
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::app_error::{
     AppCommandError, UPLOAD_I18N_KEY_QUOTA_EXCEEDED, UPLOAD_I18N_KEY_TOO_LARGE,
@@ -166,7 +167,7 @@ pub async fn create_file_tree_entry(
 /// limit change must not silently allow oversized writes to disk.
 pub const UPLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Env-controlled soft cap on the *total* bytes resident under
+/// Env-controlled cap on the *total* bytes resident under
 /// `uploads_root/`. Per-file `UPLOAD_MAX_BYTES` bounds one payload; this
 /// bounds long-term accumulation so a compromised or shared token can't
 /// repeatedly upload small files until the host runs out of disk. Unset
@@ -177,23 +178,159 @@ pub const UPLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// are streamed to disk, assuming the worst-case `UPLOAD_MAX_BYTES`.
 /// That over-rejects in the last `UPLOAD_MAX_BYTES` of headroom (e.g. a
 /// 100 KB upload may get rejected when only 1 MB remains under the
-/// cap), but it keeps the code free of mid-stream cleanup races and
-/// gives operators a hard ceiling.
+/// cap), but it keeps the code free of mid-stream cleanup races. With
+/// the in-flight reservation (see `UPLOAD_IN_FLIGHT_BYTES` below) this
+/// is effectively a hard ceiling: concurrent admits cannot accumulate
+/// past `cap` because each one decrements the in-flight headroom seen
+/// by the next.
 const UPLOAD_TOTAL_BYTES_ENV: &str = "CODEG_UPLOAD_MAX_TOTAL_BYTES";
 
-fn upload_total_max_bytes_from_env() -> Option<u64> {
-    parse_upload_total_max_bytes(std::env::var(UPLOAD_TOTAL_BYTES_ENV).ok().as_deref())
+/// Outcome of parsing `CODEG_UPLOAD_MAX_TOTAL_BYTES`. Carries enough
+/// context that the startup banner can distinguish "operator turned it
+/// off" from "operator typo silently disabled the cap".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadQuotaConfig {
+    /// Env var unset; cap disabled by default.
+    Unset,
+    /// Env var present but `0` (or only whitespace); cap explicitly off.
+    Disabled,
+    /// Cap active at this many bytes.
+    Enabled(u64),
+    /// Env var was set to a value we could not parse as a positive
+    /// `u64`. Carries the offending raw value so the operator gets a
+    /// loud error mentioning the exact string they typed. Cap is *off*
+    /// in this branch — we choose availability over safety here so a
+    /// typo doesn't 5xx the upload endpoint, but the startup WARN line
+    /// makes the failure mode discoverable.
+    Invalid(String),
+}
+
+impl UploadQuotaConfig {
+    /// Active cap, if any. Returns `None` for `Unset`, `Disabled`, and
+    /// `Invalid` — all three mean "no quota enforcement this run".
+    pub fn cap_bytes(&self) -> Option<u64> {
+        match self {
+            UploadQuotaConfig::Enabled(c) => Some(*c),
+            _ => None,
+        }
+    }
 }
 
 /// Pure-function form of the env parser so unit tests don't need to
 /// mutate process-global state (which would race the test harness's
 /// concurrent runner).
-fn parse_upload_total_max_bytes(raw: Option<&str>) -> Option<u64> {
-    let parsed: u64 = raw?.trim().parse().ok()?;
-    if parsed == 0 {
-        None
-    } else {
-        Some(parsed)
+fn parse_upload_quota_config(raw: Option<&str>) -> UploadQuotaConfig {
+    let Some(s) = raw else {
+        return UploadQuotaConfig::Unset;
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        // Empty / whitespace-only is treated the same as unset rather
+        // than as a typo — common in `docker run -e VAR= ...` and not
+        // worth shouting about.
+        return UploadQuotaConfig::Unset;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => UploadQuotaConfig::Disabled,
+        Ok(n) => UploadQuotaConfig::Enabled(n),
+        Err(_) => UploadQuotaConfig::Invalid(trimmed.to_string()),
+    }
+}
+
+fn upload_quota_config_from_env() -> UploadQuotaConfig {
+    parse_upload_quota_config(std::env::var(UPLOAD_TOTAL_BYTES_ENV).ok().as_deref())
+}
+
+/// Emit a startup banner describing the current upload-quota
+/// configuration. Operators expect either a clear "cap = N" line or a
+/// loud WARN — silent fallthrough on a typo is exactly the failure
+/// mode we want to eliminate.
+///
+/// Called once from each binary entry point right after the data
+/// directory and listener are resolved. Cheap: a single env read + one
+/// `eprintln!`.
+pub fn log_upload_quota_config_at_startup() {
+    match upload_quota_config_from_env() {
+        UploadQuotaConfig::Unset => {
+            eprintln!(
+                "[uploads] {UPLOAD_TOTAL_BYTES_ENV} unset → total-size cap disabled (set to a byte count to enable)"
+            );
+        }
+        UploadQuotaConfig::Disabled => {
+            eprintln!("[uploads] {UPLOAD_TOTAL_BYTES_ENV}=0 → total-size cap disabled");
+        }
+        UploadQuotaConfig::Enabled(cap) => {
+            eprintln!("[uploads] total-size cap: {cap} bytes ({UPLOAD_TOTAL_BYTES_ENV})");
+        }
+        UploadQuotaConfig::Invalid(raw) => {
+            eprintln!(
+                "[uploads][WARN] {UPLOAD_TOTAL_BYTES_ENV}={raw:?} is not a positive integer; \
+                 total-size cap is DISABLED. Use a plain decimal byte count (e.g. 10737418240 for 10 GiB)."
+            );
+        }
+    }
+}
+
+/// Running tally of bytes reserved by `upload_attachment` calls that
+/// have passed the quota check but haven't yet finished writing or
+/// failed. Combined with `current_uploads_total_bytes` on disk, this
+/// closes the TOCTOU race where two concurrent uploads both saw the
+/// same disk-level free space and admitted past the cap.
+///
+/// Reservation strategy: each upload reserves the worst case
+/// (`UPLOAD_MAX_BYTES`) up front and releases it on guard drop.
+/// Over-reservation is acceptable — the operator-facing budget is the
+/// disk, not the counter — and a uniform reservation size keeps the
+/// CAS loop and the cleanup path symmetric.
+static UPLOAD_IN_FLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard returned by `try_reserve_in_flight`. Releases the
+/// reservation on drop, including the error and panic paths in
+/// `upload_attachment`.
+struct InFlightGuard<'a> {
+    counter: &'a AtomicU64,
+    bytes: u64,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        // `AcqRel` here pairs with the `Acquire` load and `AcqRel` CAS
+        // in `try_reserve_in_flight` so the next reservation sees the
+        // post-decrement value.
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Lock-free CAS reserve against `counter`. Returns `Ok(guard)` if the
+/// reservation fits inside `cap` given the current on-disk `used`, or
+/// `Err(())` if the cap is full.
+///
+/// Takes the counter by reference (rather than reading the module-level
+/// static) so the unit tests can drive it with a local atomic and run
+/// concurrently without poisoning each other.
+fn try_reserve_in_flight<'a>(
+    counter: &'a AtomicU64,
+    bytes: u64,
+    used: u64,
+    cap: u64,
+) -> Result<InFlightGuard<'a>, ()> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let projected = used
+            .saturating_add(current)
+            .saturating_add(bytes);
+        if projected > cap {
+            return Err(());
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(InFlightGuard { counter, bytes }),
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -396,20 +533,30 @@ pub async fn upload_attachment(
     // payload size (`UPLOAD_MAX_BYTES`) since the actual size isn't
     // known until the multipart body is drained — admitting a request
     // we'd reject mid-stream would waste disk and require cleanup races.
-    if let Some(cap) = upload_total_max_bytes_from_env() {
+    //
+    // The reservation guard (`_quota_guard`) is bound to a name so its
+    // RAII drop runs at function exit, not immediately. Releasing it
+    // on every exit path (success, multipart error, panic) closes the
+    // TOCTOU window where two concurrent uploads both saw the same
+    // disk-level `used` and admitted past the cap.
+    let _quota_guard = if let Some(cap) = upload_quota_config_from_env().cap_bytes() {
         let used = current_uploads_total_bytes(&uploads_root).await;
-        let projected = used.saturating_add(UPLOAD_MAX_BYTES);
-        if projected > cap {
-            let mut params = BTreeMap::new();
-            params.insert("used".to_string(), used.to_string());
-            params.insert("limit".to_string(), cap.to_string());
-            return Err(AppCommandError::io_error(
-                "Upload quota exceeded for this server",
-            )
-            .with_detail(format!("used={used} limit={cap}"))
-            .with_i18n(UPLOAD_I18N_KEY_QUOTA_EXCEEDED, params));
+        match try_reserve_in_flight(&UPLOAD_IN_FLIGHT_BYTES, UPLOAD_MAX_BYTES, used, cap) {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                let mut params = BTreeMap::new();
+                params.insert("used".to_string(), used.to_string());
+                params.insert("limit".to_string(), cap.to_string());
+                return Err(AppCommandError::io_error(
+                    "Upload quota exceeded for this server",
+                )
+                .with_detail(format!("used={used} limit={cap}"))
+                .with_i18n(UPLOAD_I18N_KEY_QUOTA_EXCEEDED, params));
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // Pre-stage the file under <uploads_root>/.tmp/<uuid>.part so we can
     // stream bytes to disk without knowing the final bucket up front (the
@@ -428,6 +575,8 @@ pub async fn upload_attachment(
     if result.is_err() {
         let _ = tokio::fs::remove_file(&staging_path).await;
     }
+    // `_quota_guard` drops here regardless of `result`, releasing the
+    // reservation for the next admission.
     result.map(Json)
 }
 
@@ -636,33 +785,129 @@ mod tests {
         assert_eq!(current_uploads_total_bytes(dir.path()).await, 42);
     }
 
-    // ─── parse_upload_total_max_bytes ─────────────────────────────────
+    // ─── parse_upload_quota_config ────────────────────────────────────
     //
     // Tests the pure parser, NOT the env reader — mutating
     // `CODEG_UPLOAD_MAX_TOTAL_BYTES` from a test would race the harness's
     // parallel runner.
 
     #[test]
-    fn parse_upload_total_max_bytes_handles_all_branches() {
-        assert_eq!(parse_upload_total_max_bytes(None), None, "unset → None");
-        assert_eq!(parse_upload_total_max_bytes(Some("")), None, "empty → None");
-        assert_eq!(parse_upload_total_max_bytes(Some("   ")), None, "whitespace → None");
-        assert_eq!(parse_upload_total_max_bytes(Some("0")), None, "zero → None");
+    fn parse_upload_quota_config_classifies_branches() {
+        assert_eq!(parse_upload_quota_config(None), UploadQuotaConfig::Unset);
+        assert_eq!(parse_upload_quota_config(Some("")), UploadQuotaConfig::Unset);
+        assert_eq!(parse_upload_quota_config(Some("   ")), UploadQuotaConfig::Unset);
+        assert_eq!(parse_upload_quota_config(Some("0")), UploadQuotaConfig::Disabled);
         assert_eq!(
-            parse_upload_total_max_bytes(Some("  1048576  ")),
-            Some(1_048_576),
+            parse_upload_quota_config(Some("  1048576  ")),
+            UploadQuotaConfig::Enabled(1_048_576),
             "trim + parse"
         );
+        // The whole point of the rewrite: typos and unit-suffixed values
+        // surface as `Invalid` instead of silently going to `Unset`. The
+        // startup banner reads these and prints a WARN line naming the
+        // exact value the operator typed.
         assert_eq!(
-            parse_upload_total_max_bytes(Some("not-a-number")),
-            None,
-            "invalid → None"
+            parse_upload_quota_config(Some("10GB")),
+            UploadQuotaConfig::Invalid("10GB".to_string())
         );
-        // Negative numbers don't fit u64 — parse fails, falls through.
         assert_eq!(
-            parse_upload_total_max_bytes(Some("-1")),
-            None,
-            "negative → None"
+            parse_upload_quota_config(Some("1g")),
+            UploadQuotaConfig::Invalid("1g".to_string())
         );
+        assert_eq!(
+            parse_upload_quota_config(Some("not-a-number")),
+            UploadQuotaConfig::Invalid("not-a-number".to_string())
+        );
+        assert_eq!(
+            parse_upload_quota_config(Some("-1")),
+            UploadQuotaConfig::Invalid("-1".to_string())
+        );
+    }
+
+    #[test]
+    fn upload_quota_config_cap_bytes_active_only_when_enabled() {
+        assert_eq!(UploadQuotaConfig::Unset.cap_bytes(), None);
+        assert_eq!(UploadQuotaConfig::Disabled.cap_bytes(), None);
+        assert_eq!(UploadQuotaConfig::Enabled(42).cap_bytes(), Some(42));
+        assert_eq!(
+            UploadQuotaConfig::Invalid("oops".into()).cap_bytes(),
+            None,
+            "invalid disables the cap — fail-open so a typo doesn't 5xx uploads"
+        );
+    }
+
+    // ─── try_reserve_in_flight ────────────────────────────────────────
+
+    #[test]
+    fn try_reserve_in_flight_admits_when_under_cap() {
+        let counter = AtomicU64::new(0);
+        let guard = try_reserve_in_flight(&counter, 2, 0, 10).expect("under cap");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        drop(guard);
+        assert_eq!(counter.load(Ordering::Acquire), 0, "released on drop");
+    }
+
+    #[test]
+    fn try_reserve_in_flight_rejects_when_full() {
+        let counter = AtomicU64::new(0);
+        let _g1 = try_reserve_in_flight(&counter, 2, 6, 10).expect("first fits: 6+0+2=8");
+        // Disk has 6 in use, 2 reserved → next 2 would push to 10.
+        // Boundary: equal to cap is admitted.
+        let _g2 = try_reserve_in_flight(&counter, 2, 6, 10).expect("boundary: 6+2+2=10");
+        // Now 6+4+2=12 > 10 — must reject.
+        assert!(
+            try_reserve_in_flight(&counter, 2, 6, 10).is_err(),
+            "12 > 10 must reject"
+        );
+    }
+
+    #[test]
+    fn try_reserve_in_flight_serializes_concurrent_admits() {
+        // Two concurrent admits against an empty-disk cap of 4 with 2-byte
+        // reservations. Both threads see used=0 initially; the CAS loop
+        // ensures the second one observes the first's increment and either
+        // succeeds (4 = cap) or rejects (>cap).
+        //
+        // We need the guards returned by the spawned threads to outlive
+        // the assertions on `counter` — otherwise both guards drop on
+        // thread-exit and we read 0. `Box::leak` produces a `'static`
+        // counter so guards can be sent back across the join boundary.
+        // The leak is bounded to one test invocation and the harness
+        // tears the test process down at exit; no test-isolation issues.
+        let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let cap = 4;
+        let bytes = 2;
+        let used = 0;
+
+        let h1 = std::thread::spawn(move || try_reserve_in_flight(counter, bytes, used, cap));
+        let h2 = std::thread::spawn(move || try_reserve_in_flight(counter, bytes, used, cap));
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        let admits = [r1.is_ok(), r2.is_ok()].iter().filter(|ok| **ok).count();
+        let counter_val = counter.load(Ordering::Acquire);
+        assert_eq!(
+            counter_val,
+            admits as u64 * bytes,
+            "counter must reflect exactly the admits, not stale CAS retries"
+        );
+        assert!(admits >= 1, "at least one must admit; CAS shouldn't starve both");
+        assert!(counter_val <= cap, "counter {counter_val} exceeded cap {cap}");
+
+        // Hold the guards until after the assert, then explicitly drop
+        // to release reservations on the leaked counter.
+        drop(r1);
+        drop(r2);
+        assert_eq!(counter.load(Ordering::Acquire), 0, "drops returned to zero");
+    }
+
+    #[test]
+    fn try_reserve_in_flight_handles_saturating_used() {
+        // If `used` is reported as near-`u64::MAX` (would never happen in
+        // practice but the math should still be safe), the saturating add
+        // pushes us over any reasonable cap and we reject.
+        let counter = AtomicU64::new(0);
+        assert!(try_reserve_in_flight(&counter, 1, u64::MAX, 100).is_err());
+        assert_eq!(counter.load(Ordering::Acquire), 0, "no leak on rejection");
     }
 }

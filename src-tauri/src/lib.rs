@@ -48,7 +48,7 @@ mod tauri_app {
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
-    use crate::{db, network, process, web};
+    use crate::{db, git_credential, network, process, web};
     use tauri::Manager;
 
     static APP_QUITTING: AtomicBool = AtomicBool::new(false);
@@ -174,6 +174,41 @@ mod tauri_app {
             .manage(crate::pet_state_mapper::new_pet_state_handle())
             .setup(|app| {
                 let app_data_dir = app.path().app_data_dir()?;
+
+                // Pin `CODEG_DATA_DIR` to the Tauri-resolved data root so
+                // every downstream resolver — `paths::codeg_uploads_root`,
+                // `paths::codeg_pets_root`, and the credential helper
+                // subprocess — sees the same path the database is written
+                // to. Without this, a default desktop install puts the DB
+                // under `app_data_dir()` (Tauri's identifier-derived path)
+                // but uploads under `~/.codeg/uploads` (the legacy
+                // `paths::codeg_uploads_root` fallback), splitting the
+                // persistent surface across two filesystem roots.
+                //
+                // If the operator already set `CODEG_DATA_DIR` (rare on
+                // desktop but supported), respect that choice and don't
+                // overwrite it.
+                //
+                // `set_var` is `unsafe` in edition 2024. We are still
+                // single-threaded at this point: `setup` runs on the main
+                // thread before any window or async runtime task reads
+                // the var, the Tauri plugins registered above (window
+                // state, opener, dialog, updater, process, notification)
+                // do not read `CODEG_DATA_DIR`, and the value is never
+                // mutated again for the lifetime of the process.
+                if std::env::var_os("CODEG_DATA_DIR").is_none() {
+                    let absolute = git_credential::absolutize(&app_data_dir);
+                    // SAFETY: see the rationale on this block — the
+                    // process is still effectively single-threaded for
+                    // reads of this var. Edition 2024 will require the
+                    // unsafe block; we already write it that way for
+                    // forward compatibility, mirroring the WebView2
+                    // rendering override above.
+                    unsafe {
+                        std::env::set_var("CODEG_DATA_DIR", &absolute);
+                    }
+                }
+
                 let app_version = env!("CARGO_PKG_VERSION");
                 let database =
                     tauri::async_runtime::block_on(db::init_database(&app_data_dir, app_version))
