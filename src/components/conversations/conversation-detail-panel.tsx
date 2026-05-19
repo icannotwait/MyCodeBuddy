@@ -922,9 +922,7 @@ const ConversationTabView = memo(function ConversationTabView({
             <div className="flex flex-col gap-4">
               <div className="flex justify-center px-4">
                 <AgentSelector
-                  defaultAgentType={
-                    conversationId != null ? selectedAgent : undefined
-                  }
+                  defaultAgentType={selectedAgent}
                   onSelect={handleAgentSelect}
                   onAgentsLoaded={(agents) => {
                     setAgentsLoaded(true)
@@ -982,9 +980,7 @@ const ConversationTabView = memo(function ConversationTabView({
         <div className="flex h-full min-h-0 flex-col">
           <div className="px-4 pt-3 pb-2">
             <AgentSelector
-              defaultAgentType={
-                conversationId != null ? selectedAgent : undefined
-              }
+              defaultAgentType={selectedAgent}
               onSelect={handleAgentSelect}
               onAgentsLoaded={(agents) => {
                 setAgentsLoaded(true)
