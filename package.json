@@ -13,7 +13,6 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.1.0",
-    "@lobehub/icons": "^5.3.0",
     "@monaco-editor/react": "^4.7.0",
     "@radix-ui/react-use-controllable-state": "^1.2.2",
     "@streamdown/cjk": "^1.0.2",

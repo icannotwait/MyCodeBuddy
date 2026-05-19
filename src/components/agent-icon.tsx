@@ -4,12 +4,172 @@ import type { AgentType } from "@/lib/types"
 import { AGENT_COLORS } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-import { Cline, GeminiCLI, OpenClaw, OpenCode } from "@lobehub/icons"
-
 interface AgentIconProps {
   agentType: AgentType
   className?: string
 }
+
+interface IconProps {
+  size?: string | number
+}
+
+const baseSvgStyle = { flex: "none", lineHeight: 1 } as const
+
+const ClineMonoIcon = memo(function ClineMonoIcon({ size = "1em" }: IconProps) {
+  return (
+    <svg
+      fill="currentColor"
+      fillRule="evenodd"
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 24 24"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>Cline</title>
+      <path d="M17.035 3.991c2.75 0 4.98 2.24 4.98 5.003v1.667l1.45 2.896a1.01 1.01 0 01-.002.909l-1.448 2.864v1.668c0 2.762-2.23 5.002-4.98 5.002H7.074c-2.751 0-4.98-2.24-4.98-5.002V17.33l-1.48-2.855a1.01 1.01 0 01-.003-.927l1.482-2.887V8.994c0-2.763 2.23-5.003 4.98-5.003h9.962zM8.265 9.6a2.274 2.274 0 00-2.274 2.274v4.042a2.274 2.274 0 004.547 0v-4.042A2.274 2.274 0 008.265 9.6zm7.326 0a2.274 2.274 0 00-2.274 2.274v4.042a2.274 2.274 0 104.548 0v-4.042A2.274 2.274 0 0015.59 9.6z" />
+      <path d="M12.054 5.558a2.779 2.779 0 100-5.558 2.779 2.779 0 000 5.558z" />
+    </svg>
+  )
+})
+
+const OpenCodeMonoIcon = memo(function OpenCodeMonoIcon({
+  size = "1em",
+}: IconProps) {
+  return (
+    <svg
+      fill="currentColor"
+      fillRule="evenodd"
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 24 24"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>OpenCode</title>
+      <path d="M16 6H8v12h8V6zm4 16H4V2h16v20z" />
+    </svg>
+  )
+})
+
+const GeminiCliColorIcon = memo(function GeminiCliColorIcon({
+  size = "1em",
+}: IconProps) {
+  const id = useId()
+  return (
+    <svg
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 24 24"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>Gemini CLI</title>
+      <path
+        d="M0 4.391A4.391 4.391 0 014.391 0h15.217A4.391 4.391 0 0124 4.391v15.217A4.391 4.391 0 0119.608 24H4.391A4.391 4.391 0 010 19.608V4.391z"
+        fill={`url(#${id})`}
+      />
+      <path
+        clipRule="evenodd"
+        d="M19.74 1.444a2.816 2.816 0 012.816 2.816v15.48a2.816 2.816 0 01-2.816 2.816H4.26a2.816 2.816 0 01-2.816-2.816V4.26A2.816 2.816 0 014.26 1.444h15.48zM7.236 8.564l7.752 3.728-7.752 3.727v2.802l9.557-4.596v-3.866L7.236 5.763v2.801z"
+        fill="#1E1E2E"
+        fillRule="evenodd"
+      />
+      <defs>
+        <linearGradient
+          gradientUnits="userSpaceOnUse"
+          id={id}
+          x1="24"
+          x2="0"
+          y1="6.587"
+          y2="16.494"
+        >
+          <stop stopColor="#EE4D5D" />
+          <stop offset=".328" stopColor="#B381DD" />
+          <stop offset=".476" stopColor="#207CFE" />
+        </linearGradient>
+      </defs>
+    </svg>
+  )
+})
+
+const OpenClawColorIcon = memo(function OpenClawColorIcon({
+  size = "1em",
+}: IconProps) {
+  const idA = useId()
+  const idB = useId()
+  const idC = useId()
+  return (
+    <svg
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 24 24"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>OpenClaw</title>
+      <path
+        d="M12 2.568c-6.33 0-9.495 5.275-9.495 9.495 0 4.22 3.165 8.44 6.33 9.494v2.11h2.11v-2.11s1.055.422 2.11 0v2.11h2.11v-2.11c3.165-1.055 6.33-5.274 6.33-9.494S18.33 2.568 12 2.568z"
+        fill={`url(#${idA})`}
+      />
+      <path
+        d="M3.56 9.953C.396 8.898-.66 11.008.396 13.118c1.055 2.11 3.164 1.055 4.22-1.055.632-1.477 0-2.11-1.056-2.11z"
+        fill={`url(#${idB})`}
+      />
+      <path
+        d="M20.44 9.953c3.164-1.055 4.22 1.055 3.164 3.165-1.055 2.11-3.164 1.055-4.22-1.055-.632-1.477 0-2.11 1.056-2.11z"
+        fill={`url(#${idC})`}
+      />
+      <path
+        d="M5.507 1.875c.476-.285 1.036-.233 1.615.037.577.27 1.223.774 1.937 1.488a.316.316 0 01-.447.447c-.693-.693-1.279-1.138-1.757-1.361-.475-.222-.795-.205-1.022-.069a.317.317 0 01-.326-.542zM16.877 1.913c.58-.27 1.14-.323 1.616-.038a.317.317 0 01-.326.542c-.227-.136-.547-.153-1.022.069-.478.223-1.064.668-1.756 1.361a.316.316 0 11-.448-.447c.714-.714 1.36-1.218 1.936-1.487z"
+        fill="#FF4D4D"
+      />
+      <path
+        d="M8.835 9.109a1.266 1.266 0 100-2.532 1.266 1.266 0 000 2.532zM15.165 9.109a1.266 1.266 0 100-2.532 1.266 1.266 0 000 2.532z"
+        fill="#050810"
+      />
+      <path
+        d="M9.046 8.16a.527.527 0 100-1.056.527.527 0 000 1.055zM15.376 8.16a.527.527 0 100-1.055.527.527 0 000 1.054z"
+        fill="#00E5CC"
+      />
+      <defs>
+        <linearGradient
+          gradientUnits="userSpaceOnUse"
+          id={idA}
+          x1="-.659"
+          x2="27.023"
+          y1=".458"
+          y2="22.855"
+        >
+          <stop stopColor="#FF4D4D" />
+          <stop offset="1" stopColor="#991B1B" />
+        </linearGradient>
+        <linearGradient
+          gradientUnits="userSpaceOnUse"
+          id={idB}
+          x1="0"
+          x2="4.311"
+          y1="9.672"
+          y2="14.949"
+        >
+          <stop stopColor="#FF4D4D" />
+          <stop offset="1" stopColor="#991B1B" />
+        </linearGradient>
+        <linearGradient
+          gradientUnits="userSpaceOnUse"
+          id={idC}
+          x1="19.385"
+          x2="24.399"
+          y1="9.953"
+          y2="14.462"
+        >
+          <stop stopColor="#FF4D4D" />
+          <stop offset="1" stopColor="#991B1B" />
+        </linearGradient>
+      </defs>
+    </svg>
+  )
+})
 
 // Codex.Color has a white background rect that shows as a white square on
 // dark backgrounds. This component renders only the logo path with its
@@ -51,9 +211,6 @@ const CodexColorIcon = memo(function CodexColorIcon({
   )
 })
 
-// @lobehub/icons mislabels ClaudeCode's <title> as "Antigravity", which leaks
-// out as a browser tooltip on hover. Render the same artwork locally so we
-// control the title.
 const ClaudeCodeColorIcon = memo(function ClaudeCodeColorIcon({
   size = "1em",
 }: {
@@ -84,13 +241,13 @@ type AnyIcon = React.ComponentType<any>
 const COLOR_ICONS: Partial<Record<AgentType, AnyIcon>> = {
   claude_code: ClaudeCodeColorIcon,
   codex: CodexColorIcon,
-  gemini: GeminiCLI.Color,
-  open_claw: OpenClaw.Color,
+  gemini: GeminiCliColorIcon,
+  open_claw: OpenClawColorIcon,
 }
 
 const MONO_ICONS: Partial<Record<AgentType, AnyIcon>> = {
-  open_code: OpenCode,
-  cline: Cline,
+  open_code: OpenCodeMonoIcon,
+  cline: ClineMonoIcon,
 }
 
 // Text-color versions for Mono icons
