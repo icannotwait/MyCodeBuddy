@@ -186,6 +186,7 @@ const FolderHeader = memo(function FolderHeader({
   appThemeColor,
   currentDefaultAgent,
   availableAgents,
+  availableAgentsFresh,
   onToggle,
   onRemoveFromWorkspace,
   onNewConversation,
@@ -209,6 +210,15 @@ const FolderHeader = memo(function FolderHeader({
   appThemeColor: ThemeColor
   currentDefaultAgent: AgentType | null
   availableAgents: AgentType[]
+  /**
+   * False while `useSortedAvailableAgents` is still serving the
+   * localStorage seed (i.e. `acpListAgents()` has not yet succeeded this
+   * session). The "Set default agent" submenu disables agent selection
+   * while not fresh — otherwise the user could persist a folder default
+   * pointing at a stale/uninstalled agent. The "No default" option stays
+   * usable since clearing a default doesn't depend on the live list.
+   */
+  availableAgentsFresh: boolean
   onToggle: (folderId: number) => void
   onRemoveFromWorkspace: (folderId: number) => void
   onNewConversation: (folderId: number) => void
@@ -222,7 +232,11 @@ const FolderHeader = memo(function FolderHeader({
   dragControls: DragControls
   t: ReturnType<typeof useTranslations>
 }) {
+  // Only flag a stale default once the live list is known; before fresh,
+  // `availableAgents` is the localStorage seed and may legitimately omit a
+  // newly-enabled agent.
   const showStaleDefault =
+    availableAgentsFresh &&
     currentDefaultAgent !== null &&
     !availableAgents.includes(currentDefaultAgent)
   const tFileTree = useTranslations("Folder.fileTreeTab")
@@ -379,33 +393,45 @@ const FolderHeader = memo(function FolderHeader({
               ) : null}
             </ContextMenuItem>
             <ContextMenuSeparator />
-            {availableAgents.map((agent) => {
-              const active = currentDefaultAgent === agent
-              return (
-                <ContextMenuItem
-                  key={agent}
-                  onSelect={() => onSetDefaultAgent(folderId, agent)}
-                  className="gap-2"
-                >
-                  <span className="min-w-0 flex-1 truncate">
-                    {AGENT_LABELS[agent]}
-                  </span>
-                  {active ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
-                </ContextMenuItem>
-              )
-            })}
-            {showStaleDefault && currentDefaultAgent !== null ? (
-              <ContextMenuItem
-                key={currentDefaultAgent}
-                disabled
-                className="gap-2 opacity-60"
-              >
+            {availableAgentsFresh ? (
+              <>
+                {availableAgents.map((agent) => {
+                  const active = currentDefaultAgent === agent
+                  return (
+                    <ContextMenuItem
+                      key={agent}
+                      onSelect={() => onSetDefaultAgent(folderId, agent)}
+                      className="gap-2"
+                    >
+                      <span className="min-w-0 flex-1 truncate">
+                        {AGENT_LABELS[agent]}
+                      </span>
+                      {active ? (
+                        <Check className="h-3.5 w-3.5 shrink-0" />
+                      ) : null}
+                    </ContextMenuItem>
+                  )
+                })}
+                {showStaleDefault && currentDefaultAgent !== null ? (
+                  <ContextMenuItem
+                    key={currentDefaultAgent}
+                    disabled
+                    className="gap-2 opacity-60"
+                  >
+                    <span className="min-w-0 flex-1 truncate">
+                      {`${AGENT_LABELS[currentDefaultAgent]} ${t("folderHeaderMenu.agentUnavailableSuffix")}`}
+                    </span>
+                    <Check className="h-3.5 w-3.5 shrink-0" />
+                  </ContextMenuItem>
+                ) : null}
+              </>
+            ) : (
+              <ContextMenuItem disabled className="gap-2 opacity-60">
                 <span className="min-w-0 flex-1 truncate">
-                  {`${AGENT_LABELS[currentDefaultAgent]} ${t("folderHeaderMenu.agentUnavailableSuffix")}`}
+                  {t("folderHeaderMenu.loadingAgents")}
                 </span>
-                <Check className="h-3.5 w-3.5 shrink-0" />
               </ContextMenuItem>
-            ) : null}
+            )}
           </ContextMenuSubContent>
         </ContextMenuSub>
         <ContextMenuSub>
@@ -486,6 +512,7 @@ interface FolderGroupItemProps {
   appThemeColor: ThemeColor
   currentDefaultAgent: AgentType | null
   availableAgents: AgentType[]
+  availableAgentsFresh: boolean
   darkMode: boolean
   onToggle: (folderId: number) => void
   onRemoveFromWorkspace: (folderId: number) => void
@@ -527,6 +554,7 @@ function FolderGroupItem({
   appThemeColor,
   currentDefaultAgent,
   availableAgents,
+  availableAgentsFresh,
   darkMode,
   onToggle,
   onRemoveFromWorkspace,
@@ -614,6 +642,7 @@ function FolderGroupItem({
             appThemeColor={appThemeColor}
             currentDefaultAgent={currentDefaultAgent}
             availableAgents={availableAgents}
+            availableAgentsFresh={availableAgentsFresh}
             onToggle={handleToggle}
             onRemoveFromWorkspace={onRemoveFromWorkspace}
             onNewConversation={onNewConversationForFolder}
@@ -759,7 +788,8 @@ export function SidebarConversationList({
   }, [tabs])
 
   const [importing, setImporting] = useState(false)
-  const { sortedTypes: availableAgents } = useSortedAvailableAgents()
+  const { sortedTypes: availableAgents, fresh: availableAgentsFresh } =
+    useSortedAvailableAgents()
   const [folderExpanded, setFolderExpanded] = useState<Record<number, boolean>>(
     {}
   )
@@ -1309,6 +1339,7 @@ export function SidebarConversationList({
                         appThemeColor={appThemeColor}
                         currentDefaultAgent={currentDefaultAgent}
                         availableAgents={availableAgents}
+                        availableAgentsFresh={availableAgentsFresh}
                         darkMode={resolvedTheme === "dark"}
                         onToggle={toggleFolder}
                         onRemoveFromWorkspace={handleRemoveFolder}

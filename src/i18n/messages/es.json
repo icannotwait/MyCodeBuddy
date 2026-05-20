@@ -868,6 +868,7 @@
         "setDefaultAgent": "Establecer agente predeterminado",
         "defaultAgentNone": "Sin valor (usar predeterminado global)",
         "agentUnavailableSuffix": "(no disponible)",
+        "loadingAgents": "Cargando agentes…",
         "removeFromWorkspace": "Quitar del espacio de trabajo"
       },
       "manageConversations": {

@@ -10,7 +10,16 @@ import { cn } from "@/lib/utils"
 
 interface AgentSelectorProps {
   defaultAgentType?: AgentType
+  /** Fires on user click. The caller should treat this as confirmation. */
   onSelect: (agentType: AgentType) => void
+  /**
+   * Fires when `defaultAgentType` is missing/unavailable and the selector
+   * had to pick a substitute on its own. Distinct from `onSelect` so the
+   * caller can avoid promoting a system pick to a confirmed user choice
+   * (which would otherwise mask a stale-default correction upstream).
+   * When omitted, falls back to `onSelect` for backwards compatibility.
+   */
+  onFallback?: (agentType: AgentType) => void
   onAgentsLoaded?: (agents: AcpAgentInfo[]) => void
   onOpenAgentsSettings?: () => void
   disabled?: boolean
@@ -19,6 +28,7 @@ interface AgentSelectorProps {
 export function AgentSelector({
   defaultAgentType,
   onSelect,
+  onFallback,
   onAgentsLoaded,
   onOpenAgentsSettings,
   disabled = false,
@@ -30,6 +40,7 @@ export function AgentSelector({
     [rawAgents]
   )
   const onSelectRef = useRef(onSelect)
+  const onFallbackRef = useRef(onFallback)
   const onAgentsLoadedRef = useRef(onAgentsLoaded)
 
   // Effective selection. Priority: prop default (when still available) →
@@ -103,13 +114,23 @@ export function AgentSelector({
   }, [onSelect])
 
   useEffect(() => {
+    onFallbackRef.current = onFallback
+  }, [onFallback])
+
+  useEffect(() => {
     onAgentsLoadedRef.current = onAgentsLoaded
   }, [onAgentsLoaded])
 
-  // Notify parent when the agent list changes, and fire onSelect on
-  // fallback (when the requested preferred agent is unavailable and we
-  // had to pick a substitute). Selection itself is derived above, so this
-  // effect only emits side-effects — never calls setState.
+  // Notify parent when the agent list changes, and emit a *fallback* event
+  // (not onSelect) when the requested preferred agent is unavailable and
+  // we had to pick a substitute. Splitting the channel matters: the caller
+  // treats `onSelect` as a confirmed user choice and clears any "this is a
+  // provisional default" flag upstream — if the auto-fallback came through
+  // the same path, a hydrated draft whose old agent is now disabled would
+  // be silently locked onto sortedTypes[0] before TabProvider's correction
+  // effect has a chance to apply the folder's saved default. Callers that
+  // don't supply `onFallback` get the legacy behavior (fallback as
+  // onSelect) so this prop stays optional.
   useEffect(() => {
     onAgentsLoadedRef.current?.(agents)
     const found = defaultAgentType
@@ -117,7 +138,13 @@ export function AgentSelector({
       : null
     if (found) return
     const first = agents.find((a) => a.available)
-    if (first) onSelectRef.current(first.agent_type)
+    if (!first) return
+    const fallback = onFallbackRef.current
+    if (fallback) {
+      fallback(first.agent_type)
+    } else {
+      onSelectRef.current(first.agent_type)
+    }
   }, [agents, defaultAgentType])
 
   const handleSelect = (agentType: AgentType) => {

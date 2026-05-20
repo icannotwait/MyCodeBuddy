@@ -868,6 +868,7 @@
         "setDefaultAgent": "設定預設智能體",
         "defaultAgentNone": "不設定（使用全域預設）",
         "agentUnavailableSuffix": "（不可用）",
+        "loadingAgents": "正在載入代理…",
         "removeFromWorkspace": "從工作區移除"
       },
       "manageConversations": {

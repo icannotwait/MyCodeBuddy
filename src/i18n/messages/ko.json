@@ -868,6 +868,7 @@
         "setDefaultAgent": "기본 에이전트 설정",
         "defaultAgentNone": "설정 없음(전역 사용)",
         "agentUnavailableSuffix": "(사용 불가)",
+        "loadingAgents": "에이전트 로드 중…",
         "removeFromWorkspace": "워크스페이스에서 제거"
       },
       "manageConversations": {

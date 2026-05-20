@@ -868,6 +868,7 @@
         "setDefaultAgent": "Set default agent",
         "defaultAgentNone": "No default (use global)",
         "agentUnavailableSuffix": "(unavailable)",
+        "loadingAgents": "Loading agents…",
         "removeFromWorkspace": "Remove from workspace"
       },
       "manageConversations": {

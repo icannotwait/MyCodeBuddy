@@ -868,6 +868,7 @@
         "setDefaultAgent": "تعيين الوكيل الافتراضي",
         "defaultAgentNone": "بدون افتراضي (استخدام العام)",
         "agentUnavailableSuffix": "(غير متاح)",
+        "loadingAgents": "جارٍ تحميل الوكلاء…",
         "removeFromWorkspace": "إزالة من مساحة العمل"
       },
       "manageConversations": {

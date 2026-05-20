@@ -75,7 +75,31 @@ interface TabContextValue {
   switchTab: (tabId: string) => void
   pinTab: (tabId: string) => void
   toggleTileMode: () => void
-  openNewConversationTab: (folderId: number, workingDir: string) => void
+  /**
+   * Open (or re-target the singleton) draft conversation tab.
+   *
+   * - `inheritFromActive: false` (default) — resolve the agent purely from
+   *   the target folder's saved default (with sortedTypes[0] fallback).
+   *   Use this for sidebar/toolbar entry points where the new tab's
+   *   folder is unrelated to the currently focused tab.
+   * - `inheritFromActive: true` — when no folder default is set, fall
+   *   back to the active tab's agent before the global default. "Active
+   *   tab" means either a real conversation tab OR a draft whose agent
+   *   the user has already confirmed (provisional flag cleared); a
+   *   draft whose agent is still a system best-guess is NOT inherited
+   *   because doing so would propagate uncertainty across folders. Use
+   *   this from inside a conversation (right-click "new conversation",
+   *   failed-session retry, folder picker on a draft) where the user
+   *   expects to keep their current agent.
+   *
+   * Both modes still honor `folderDefault` first — explicit pinning
+   * always wins.
+   */
+  openNewConversationTab: (
+    folderId: number,
+    workingDir: string,
+    options?: { inheritFromActive?: boolean }
+  ) => void
   /**
    * Mark a draft tab's agent as user-confirmed. Patches `agentType` on
    * the tab and clears the `agentTypeProvisional` flag so the correction
@@ -84,6 +108,16 @@ interface TabContextValue {
    * from conversation-detail-panel's `handleAgentSelect`.
    */
   confirmDraftAgent: (tabId: string, agentType: AgentType) => void
+  /**
+   * Mirror AgentSelector's automatic fallback (the requested default
+   * wasn't available, so it picked a substitute) into the draft tab
+   * without promoting it to a confirmed choice. Keeps
+   * `agentTypeProvisional = true` so the correction effect can still
+   * re-resolve against the folder's saved default when its hydration
+   * gate opens. No-op for tabs bound to a real conversation. Wired up
+   * from conversation-detail-panel's `handleAgentFallback`.
+   */
+  setDraftAgentFromFallback: (tabId: string, agentType: AgentType) => void
   bindConversationTab: (
     tabId: string,
     conversationId: number,
@@ -147,7 +181,8 @@ const TILE_MODE_STORAGE_KEY = "workspace:tile-mode"
 export function TabProvider({ children }: TabProviderProps) {
   const t = useTranslations("Folder.tabContext")
   const { activateConversationPane } = useWorkspaceContext()
-  const { conversations, folders, setActiveFolderId } = useAppWorkspace()
+  const { conversations, folders, foldersHydrated, setActiveFolderId } =
+    useAppWorkspace()
   const { disconnect: acpDisconnect } = useAcpActions()
 
   const [rawTabs, setTabs] = useState<TabItemInternal[]>([])
@@ -608,21 +643,38 @@ export function TabProvider({ children }: TabProviderProps) {
   )
 
   const openNewConversationTab = useCallback(
-    (folderId: number, workingDir: string) => {
+    (
+      folderId: number,
+      workingDir: string,
+      options?: { inheritFromActive?: boolean }
+    ) => {
       // Pick the agent for the new conversation via the shared resolver.
-      // Inherit from the active tab only when it's a real conversation
-      // (so "new conversation" inside a Claude Code session stays on
-      // Claude Code instead of snapping back to the global default);
-      // never inherit from another draft, since its agent may itself be
-      // provisional. AgentSelector will further pick the first available
-      // agent if the chosen one turns out to be disabled or uninstalled.
-      const activeTab = rawTabsRef.current.find(
-        (t) => t.id === activeTabIdRef.current
-      )
-      const inherit =
-        activeTab && activeTab.conversationId != null
-          ? activeTab.agentType
-          : null
+      // Only inherit from the active tab when the caller opted in. The
+      // active tab counts as a valid inherit source if it's either:
+      //   - a real conversation (`conversationId != null`), or
+      //   - a draft whose agent the user has already confirmed
+      //     (`!agentTypeProvisional`).
+      // We refuse to inherit from a draft whose agent is still a system
+      // best-guess — propagating that across folders would launder
+      // uncertainty into a value the resolver treats as explicit intent.
+      // Sidebar/toolbar entry points pass `inheritFromActive: false`
+      // (default) so a new conversation for folder B doesn't silently
+      // pick up folder A's agent just because A happened to be focused.
+      // AgentSelector will further pick the first available agent if the
+      // chosen one is disabled or uninstalled.
+      const inheritFromActive = options?.inheritFromActive === true
+      let inherit: AgentType | null = null
+      if (inheritFromActive) {
+        const activeTab = rawTabsRef.current.find(
+          (t) => t.id === activeTabIdRef.current
+        )
+        if (
+          activeTab &&
+          (activeTab.conversationId != null || !activeTab.agentTypeProvisional)
+        ) {
+          inherit = activeTab.agentType
+        }
+      }
       const { agentType: targetAgent, provisional } = resolveAgentForFolder(
         folderId,
         inherit
@@ -658,15 +710,25 @@ export function TabProvider({ children }: TabProviderProps) {
               console.error("[TabProvider] disconnect draft tab:", err)
             }
             // Race guard: if the tab was bound to a real conversation
-            // (e.g. the user sent a message just before we got the
-            // disconnect callback) or its agent was changed by another
-            // path (confirmDraftAgent, correctDraftAgents) during the
-            // await window, leave it alone.
+            // during the await (e.g. the user sent a message just before
+            // we got the disconnect callback), leave it alone. If the
+            // agent was changed during the await, the meaning depends on
+            // who changed it:
+            //   - User click (`confirmDraftAgent`) clears `provisional`
+            //     — explicit choice, bail.
+            //   - AgentSelector auto-fallback (`setDraftAgentFromFallback`)
+            //     keeps `provisional` true — system pick, we should
+            //     still apply this folder switch on top of it.
             setTabs((prev) => {
               const target = prev.find((tab) => tab.id === existingTab.id)
               if (!target) return prev
               if (target.conversationId != null) return prev
-              if (target.agentType !== expectedAgent) return prev
+              if (
+                target.agentType !== expectedAgent &&
+                !target.agentTypeProvisional
+              ) {
+                return prev
+              }
               return prev.map((tab) =>
                 tab.id === existingTab.id
                   ? {
@@ -724,6 +786,23 @@ export function TabProvider({ children }: TabProviderProps) {
           if (t.conversationId != null) return t // not a draft
           if (t.agentType === agentType && !t.agentTypeProvisional) return t
           return { ...t, agentType, agentTypeProvisional: false }
+        })
+      )
+    },
+    []
+  )
+
+  const setDraftAgentFromFallback = useCallback(
+    (tabId: string, agentType: AgentType) => {
+      setTabs((prev) =>
+        prev.map((t) => {
+          if (t.id !== tabId) return t
+          if (t.conversationId != null) return t // not a draft
+          // Already at this agent AND already flagged provisional — no
+          // change. Otherwise patch the agent and ensure provisional stays
+          // true so correction will re-resolve.
+          if (t.agentType === agentType && t.agentTypeProvisional) return t
+          return { ...t, agentType, agentTypeProvisional: true }
         })
       )
     },
@@ -862,18 +941,26 @@ export function TabProvider({ children }: TabProviderProps) {
           console.error("[TabProvider] correct provisional disconnect:", err)
         }
 
-        // Race guard: if `agentType` changed during the await (user
-        // clicked a different agent → `confirmDraftAgent`), their choice
-        // wins. We can't gate on `agentTypeProvisional` here because
-        // hydrated drafts are never provisional — but they DO need
-        // correcting when their agent has been disabled/uninstalled,
-        // which is exactly when `agentType !== expectedAgent` stays
-        // false (nobody else touched it).
+        // Race guard: if `agentType` changed during the await, decide
+        // whether that change should win:
+        //   - User click (`confirmDraftAgent`) clears the provisional
+        //     flag — that's an explicit choice, bail out.
+        //   - AgentSelector auto-fallback (`setDraftAgentFromFallback`)
+        //     keeps the flag set — that's still a system pick, we should
+        //     proceed and apply the folder default on top.
+        // When agentType is unchanged, fall through and patch — covers
+        // the hydrated-draft case (agent disabled/uninstalled, flag was
+        // never true, nobody touched it during await).
         setTabs((prev) => {
           const target = prev.find((t) => t.id === tab.id)
           if (!target) return prev
           if (target.conversationId != null) return prev
-          if (target.agentType !== expectedAgent) return prev
+          if (
+            target.agentType !== expectedAgent &&
+            !target.agentTypeProvisional
+          ) {
+            return prev
+          }
           return prev.map((t) =>
             t.id === tab.id
               ? { ...t, agentType: newAgent, agentTypeProvisional: false }
@@ -884,13 +971,17 @@ export function TabProvider({ children }: TabProviderProps) {
     }
   }, [acpDisconnect, resolveAgentForFolder])
 
-  // Correction must wait for BOTH `agentsFresh` (so the sorted list is
-  // real) AND `tabsHydrated` (so any persisted drafts are already in
-  // `rawTabs`). Without the second gate, correction can fire against an
-  // empty rawTabs (immediately after mount but before hydration resolves)
-  // and then never re-run because `correctionRanRef` is one-shot — leaving
-  // hydrated drafts whose agent has since been disabled stuck on the
-  // wrong agent.
+  // Correction must wait for ALL THREE of:
+  //   1. `agentsFresh` — the sorted agent list is real (not localStorage seed).
+  //   2. `tabsHydrated` — persisted drafts are loaded into `rawTabs`.
+  //   3. `foldersHydrated` — `foldersRef.current` reflects the real folder
+  //      list, so `resolveAgentForFolder` can read each draft's folder
+  //      `default_agent_type`. Without this gate, correction can fire in
+  //      the (agents → tabs → folders) race window: `foldersRef.current`
+  //      is `[]`, the resolver falls through to `sortedTypes[0]`, and the
+  //      folder's persisted default is silently dropped — `correctionRanRef`
+  //      is one-shot per session, so the folder default never gets applied
+  //      even after it arrives.
   //
   // No timer-based fallback: if `acpListAgents()` never succeeds this
   // session, drafts simply keep their `agentTypeProvisional` hint. The
@@ -903,9 +994,10 @@ export function TabProvider({ children }: TabProviderProps) {
     if (correctionRanRef.current) return
     if (!agentsFresh) return
     if (!tabsHydrated) return
+    if (!foldersHydrated) return
     correctionRanRef.current = true
     correctDraftAgents()
-  }, [agentsFresh, tabsHydrated, correctDraftAgents])
+  }, [agentsFresh, tabsHydrated, foldersHydrated, correctDraftAgents])
 
   const value = useMemo(
     () => ({
@@ -924,6 +1016,7 @@ export function TabProvider({ children }: TabProviderProps) {
       toggleTileMode,
       openNewConversationTab,
       confirmDraftAgent,
+      setDraftAgentFromFallback,
       bindConversationTab,
       setTabRuntimeConversationId,
       reorderTabs,
@@ -945,6 +1038,7 @@ export function TabProvider({ children }: TabProviderProps) {
       toggleTileMode,
       openNewConversationTab,
       confirmDraftAgent,
+      setDraftAgentFromFallback,
       bindConversationTab,
       setTabRuntimeConversationId,
       reorderTabs,

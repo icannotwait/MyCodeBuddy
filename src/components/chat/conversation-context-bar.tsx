@@ -146,11 +146,15 @@ export const ConversationFolderBranchPicker = memo(
             if (!target) return
             try {
               // Route through openNewConversationTab so the target folder's
-              // saved default agent is applied (mirrors sidebar "new
-              // conversation" semantics). The function's existing-draft
-              // branch reuses ownTab via the singleton invariant and runs
-              // the disconnect-then-patch dance for folder+agent changes.
-              openNewConversationTab(target.id, target.path)
+              // saved default agent is applied. The function's existing-
+              // draft branch reuses ownTab via the singleton invariant and
+              // runs the disconnect-then-patch dance for folder+agent
+              // changes. `inheritFromActive: true` preserves the user's
+              // current agent when the target folder has no pinned default
+              // — "I'm switching folders, keep my workflow".
+              openNewConversationTab(target.id, target.path, {
+                inheritFromActive: true,
+              })
               toast.success(t("toasts.folderChanged", { name: target.name }))
             } catch (err) {
               console.error(

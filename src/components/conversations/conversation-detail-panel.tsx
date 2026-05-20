@@ -157,6 +157,7 @@ const ConversationTabView = memo(function ConversationTabView({
     openNewConversationTab,
     closeTab,
     confirmDraftAgent,
+    setDraftAgentFromFallback,
   } = useTabContext()
   const { setSessionStats } = useSessionStats()
   const {
@@ -728,12 +729,30 @@ const ConversationTabView = memo(function ConversationTabView({
       setDraftAgentType(nextAgentType)
       setModeId(getSavedModeId(nextAgentType))
       setAgentConnectError(null)
-      // Notify the tab provider so its provisional-default correction
-      // logic skips this tab — the agent is now a confirmed user choice
-      // (or an AgentSelector fallback, both equally final).
+      // Real user click — clear the provisional flag so TabProvider's
+      // correction effect leaves this tab alone.
       confirmDraftAgent(tabId, nextAgentType)
     },
     [confirmDraftAgent, tabId]
+  )
+
+  // AgentSelector auto-fallback: the requested default agent was missing
+  // or unavailable, so it picked a substitute on its own. Sync local UI
+  // state (so the connection points at the right agent immediately) but
+  // mark the tab as still provisional — TabProvider's correction effect
+  // will re-resolve against the folder's saved default once all three
+  // hydration gates are open, and overwrite this substitute if needed.
+  const handleAgentFallback = useCallback(
+    (nextAgentType: AgentType) => {
+      if (nextAgentType === selectedAgentRef.current) return
+      if (dbConvIdRef.current) return
+
+      setDraftAgentType(nextAgentType)
+      setModeId(getSavedModeId(nextAgentType))
+      setAgentConnectError(null)
+      setDraftAgentFromFallback(tabId, nextAgentType)
+    },
+    [setDraftAgentFromFallback, tabId]
   )
 
   const handleModeChange = useCallback(
@@ -831,7 +850,12 @@ const ConversationTabView = memo(function ConversationTabView({
   // runs against the result of the first.
   const handleOpenNewSession = useCallback(() => {
     if (!folder) return
-    openNewConversationTab(folder.id, workingDirForConnection ?? folder.path)
+    // Retry-from-error: user wants a fresh draft in the same conversation
+    // context, so inherit the active tab's agent when the folder has no
+    // pinned default.
+    openNewConversationTab(folder.id, workingDirForConnection ?? folder.path, {
+      inheritFromActive: true,
+    })
     closeTab(tabId)
   }, [closeTab, folder, openNewConversationTab, tabId, workingDirForConnection])
 
@@ -912,6 +936,7 @@ const ConversationTabView = memo(function ConversationTabView({
               <AgentSelector
                 defaultAgentType={selectedAgent}
                 onSelect={handleAgentSelect}
+                onFallback={handleAgentFallback}
                 onAgentsLoaded={(agents) => {
                   setAgentsLoaded(true)
                   setUsableAgentCount(
@@ -971,6 +996,7 @@ const ConversationTabView = memo(function ConversationTabView({
             <AgentSelector
               defaultAgentType={selectedAgent}
               onSelect={handleAgentSelect}
+              onFallback={handleAgentFallback}
               onAgentsLoaded={(agents) => {
                 setAgentsLoaded(true)
                 setUsableAgentCount(
@@ -1216,7 +1242,9 @@ export function ConversationDetailPanel() {
 
   const handleNewConversation = useCallback(() => {
     if (!folder) return
-    openNewConversationTab(folder.id, folder.path)
+    // Right-click "new conversation" inside a conversation tab: keep the
+    // active agent when the target folder has no pinned default.
+    openNewConversationTab(folder.id, folder.path, { inheritFromActive: true })
   }, [folder, openNewConversationTab])
 
   const handleCloseActiveTab = useCallback(() => {

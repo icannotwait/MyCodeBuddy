@@ -868,6 +868,7 @@
         "setDefaultAgent": "デフォルトエージェントを設定",
         "defaultAgentNone": "設定なし（グローバルを使用）",
         "agentUnavailableSuffix": "（利用不可）",
+        "loadingAgents": "エージェントを読み込み中…",
         "removeFromWorkspace": "ワークスペースから削除"
       },
       "manageConversations": {

@@ -868,6 +868,7 @@
         "setDefaultAgent": "Standard-Agent festlegen",
         "defaultAgentNone": "Kein Standard (global verwenden)",
         "agentUnavailableSuffix": "(nicht verfügbar)",
+        "loadingAgents": "Agenten werden geladen…",
         "removeFromWorkspace": "Aus Arbeitsbereich entfernen"
       },
       "manageConversations": {
