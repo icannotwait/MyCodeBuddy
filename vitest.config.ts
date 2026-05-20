@@ -18,9 +18,14 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],
+      include: ["src/**/*.{ts,tsx}"],
       exclude: [
         "node_modules/",
+        ".next/**",
+        "out/**",
         "src/test-setup.ts",
+        "**/*.test.{ts,tsx}",
+        "**/*.spec.{ts,tsx}",
         "**/*.config.*",
         "**/*.d.ts",
         "src-tauri/**",
