@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "Fechar todas as abas de arquivo",
-        "description": "Fecha todas as abas de arquivo apenas no modo de arquivos"
+        "description": "Fecha todas as abas de arquivo abertas quando o painel de arquivos está ativo"
       },
       "send_message": {
         "title": "Enviar mensagem",
@@ -802,12 +802,6 @@
       "openFile": "Abrir arquivo",
       "viewDiff": "Ver Diff",
       "push": "Enviar..."
-    },
-    "modes": {
-      "conversation": "Modo conversa",
-      "fusion": "Modo fusão",
-      "files": "Modo arquivos",
-      "workspaceModesAria": "Modos do workspace"
     },
     "statusLabels": {
       "in_progress": "Em andamento",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> abre o terminal integrado, <shortcut>{toggleSidebar}</shortcut> alterna a barra lateral.",
           "customShortcuts": "Todos os atalhos podem ser reatribuídos em Configurações → Atalhos.",
           "webService": "Ative Configurações → Serviço web para que sua equipe acesse o mesmo codeg pelo navegador.",
-          "fusionMode": "Mude para o modo Fusion na barra superior para ver a conversa ao lado dos arquivos / Git.",
+          "fusionMode": "Abra um arquivo ou diff para exibi-lo automaticamente ao lado da conversa.",
           "quickMessages": "Abra o botão + ao lado da entrada e escolha Mensagens rápidas para inserir um trecho salvo (gerencie-os em Configurações → Mensagens rápidas).",
           "experts": "O botão + tem um menu Habilidades de especialista — carregue papéis como Depuração ou Planejamento com um clique."
         }

@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "Cerrar todas las pestañas de archivos",
-        "description": "Cierra todas las pestañas de archivos solo en modo de archivos"
+        "description": "Cierra todas las pestañas de archivos abiertas cuando el panel de archivos está activo"
       },
       "send_message": {
         "title": "Enviar mensaje",
@@ -802,12 +802,6 @@
       "openFile": "Abrir archivo",
       "viewDiff": "Ver Diff",
       "push": "Enviar..."
-    },
-    "modes": {
-      "conversation": "Modo conversación",
-      "fusion": "Modo fusión",
-      "files": "Modo archivos",
-      "workspaceModesAria": "Modos del espacio de trabajo"
     },
     "statusLabels": {
       "in_progress": "En progreso",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> abre la terminal integrada, <shortcut>{toggleSidebar}</shortcut> alterna la barra lateral.",
           "customShortcuts": "Todos los atajos se pueden reasignar en Ajustes → Atajos.",
           "webService": "Activa Ajustes → Servicio web para que tu equipo acceda al mismo codeg desde un navegador.",
-          "fusionMode": "Cambia al modo Fusión desde la barra superior para ver la conversación junto a los archivos / Git.",
+          "fusionMode": "Abre un archivo o diff para mostrarlo automáticamente junto a la conversación.",
           "quickMessages": "Abre el botón + junto a la entrada y elige Mensajes rápidos para insertar un fragmento guardado (gestiónalos en Ajustes → Mensajes rápidos).",
           "experts": "El botón + tiene un menú Habilidades expertas: carga roles como Depuración o Planificación con un clic."
         }

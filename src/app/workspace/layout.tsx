@@ -207,7 +207,6 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
             )}
             onPointerDownCapture={markConversationActive}
             onFocusCapture={markConversationActive}
-            aria-hidden={mode === "files"}
           >
             <TabBar />
             <div className="relative flex-1 min-h-0 overflow-hidden">
@@ -230,10 +229,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
           minSize={mode === "fusion" ? 20 : 0}
         >
           <section
-            className={cn(
-              "flex h-full min-h-0 flex-col overflow-hidden",
-              mode === "files" && "absolute inset-0 z-30 bg-background"
-            )}
+            className="flex h-full min-h-0 flex-col overflow-hidden"
             onPointerDownCapture={markFileActive}
             onFocusCapture={markFileActive}
             aria-hidden={mode === "conversation"}
@@ -250,9 +246,10 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 }
 
 function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
-  const { mode } = useWorkspaceContext()
+  const { mode, activePane } = useWorkspaceContext()
 
-  const showConversation = mode === "conversation" || mode === "fusion"
+  const showConversation =
+    mode === "conversation" || activePane === "conversation"
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">

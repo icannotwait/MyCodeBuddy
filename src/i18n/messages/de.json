@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "Alle Dateitabs schließen",
-        "description": "Schließt alle Dateitabs nur im Dateimodus"
+        "description": "Schließt alle geöffneten Dateitabs, wenn der Dateibereich aktiv ist"
       },
       "send_message": {
         "title": "Nachricht senden",
@@ -802,12 +802,6 @@
       "openFile": "Datei öffnen",
       "viewDiff": "Diff anzeigen",
       "push": "Pushen..."
-    },
-    "modes": {
-      "conversation": "Konversationsmodus",
-      "fusion": "Fusionsmodus",
-      "files": "Dateimodus",
-      "workspaceModesAria": "Workspace-Modi"
     },
     "statusLabels": {
       "in_progress": "In Bearbeitung",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> öffnet das eingebaute Terminal, <shortcut>{toggleSidebar}</shortcut> schaltet die Seitenleiste um.",
           "customShortcuts": "Alle Tastenkürzel lassen sich unter Einstellungen → Tastenkürzel frei belegen.",
           "webService": "Aktiviere Einstellungen → Webdienst, damit Teammitglieder dasselbe codeg im Browser nutzen können.",
-          "fusionMode": "Wechsle in der oberen Leiste in den Fusion-Modus, um Konversation und Datei- / Git-Panel nebeneinander zu sehen.",
+          "fusionMode": "Öffne eine Datei oder ein Diff, um es automatisch neben der Konversation zu sehen.",
           "quickMessages": "Klicke auf die +-Schaltfläche neben der Eingabe und wähle Schnellnachrichten, um ein gespeichertes Snippet einzufügen (verwaltbar unter Einstellungen → Schnellnachrichten).",
           "experts": "Die +-Schaltfläche hat ein Menü Expertenfähigkeiten – lade Rollen wie Debugging oder Planung mit einem Klick."
         }

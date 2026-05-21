@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "すべてのファイルタブを閉じる",
-        "description": "ファイルモードでのみすべてのファイルタブを閉じます"
+        "description": "ファイルペインがアクティブなときに開いているすべてのファイルタブを閉じます"
       },
       "send_message": {
         "title": "メッセージを送信",
@@ -802,12 +802,6 @@
       "openFile": "ファイルを開く",
       "viewDiff": "差分を見る",
       "push": "プッシュ..."
-    },
-    "modes": {
-      "conversation": "会話モード",
-      "fusion": "フュージョンモード",
-      "files": "ファイルモード",
-      "workspaceModesAria": "ワークスペースモード"
     },
     "statusLabels": {
       "in_progress": "進行中",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> で内蔵ターミナル、<shortcut>{toggleSidebar}</shortcut> でサイドバーを切り替えできます",
           "customShortcuts": "すべてのショートカットは「設定 → ショートカット」で自由に変更できます",
           "webService": "「設定 → Web サービス」を有効にすると、チームメンバーが同じ codeg にブラウザでアクセスできます",
-          "fusionMode": "上部ツールバーの「Fusion モード」に切り替えると、会話とファイル / Git パネルが並んで表示されます",
+          "fusionMode": "ファイルや差分を開くと、会話の横に自動で表示されます。",
           "quickMessages": "入力欄横の + ボタンから「クイックメッセージ」を選ぶと、保存済みのスニペットを一発で挿入できます（「設定 → クイックメッセージ」で管理）",
           "experts": "+ ボタンの「エキスパートスキル」メニューから、デバッグや計画などのプリセットロールをワンクリックで読み込めます"
         }

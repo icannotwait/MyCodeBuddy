@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "Close All File Tabs",
-        "description": "Close all file tabs in file mode only"
+        "description": "Close all open file tabs when the file pane is active"
       },
       "send_message": {
         "title": "Send Message",
@@ -802,12 +802,6 @@
       "openFile": "Open File",
       "viewDiff": "View Diff",
       "push": "Push..."
-    },
-    "modes": {
-      "conversation": "Conversation Mode",
-      "fusion": "Fusion Mode",
-      "files": "Files Mode",
-      "workspaceModesAria": "Workspace modes"
     },
     "statusLabels": {
       "in_progress": "In Progress",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> opens the built-in terminal, <shortcut>{toggleSidebar}</shortcut> toggles the sidebar.",
           "customShortcuts": "Every shortcut is fully remappable under Settings → Shortcuts.",
           "webService": "Enable Settings → Web Service so teammates can reach the same codeg from a browser.",
-          "fusionMode": "Switch to Fusion Mode from the top toolbar to view the conversation alongside files / Git.",
+          "fusionMode": "Open a file or diff to automatically show it alongside the conversation.",
           "quickMessages": "Open the + button next to the input and pick Quick Messages to insert a saved snippet (manage them under Settings → Quick Messages).",
           "experts": "The + button has an Expert Skills menu — preload roles like Debug or Planning with one click."
         }

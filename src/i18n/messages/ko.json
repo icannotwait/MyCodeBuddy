@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "모든 파일 탭 닫기",
-        "description": "파일 모드에서만 모든 파일 탭을 닫습니다"
+        "description": "파일 패널이 활성 상태일 때 열린 모든 파일 탭을 닫습니다"
       },
       "send_message": {
         "title": "메시지 보내기",
@@ -802,12 +802,6 @@
       "openFile": "파일 열기",
       "viewDiff": "Diff 보기",
       "push": "푸시..."
-    },
-    "modes": {
-      "conversation": "대화 모드",
-      "fusion": "퓨전 모드",
-      "files": "파일 모드",
-      "workspaceModesAria": "워크스페이스 모드"
     },
     "statusLabels": {
       "in_progress": "진행 중",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut>로 내장 터미널, <shortcut>{toggleSidebar}</shortcut>로 사이드바를 토글할 수 있습니다",
           "customShortcuts": "모든 단축키는 '설정 → 단축키'에서 자유롭게 변경할 수 있습니다",
           "webService": "'설정 → 웹 서비스'를 켜면 팀원이 브라우저로 같은 codeg에 접속할 수 있습니다",
-          "fusionMode": "상단 도구 모음의 'Fusion 모드'로 전환하면 대화와 파일 / Git 패널이 나란히 표시됩니다",
+          "fusionMode": "파일이나 diff를 열면 대화 옆에 자동으로 표시됩니다.",
           "quickMessages": "입력창 옆 + 버튼에서 '빠른 메시지'를 선택하면 저장된 스니펫을 한 번에 삽입할 수 있습니다('설정 → 빠른 메시지'에서 관리)",
           "experts": "+ 버튼의 '전문가 스킬' 메뉴에서 디버그 / 기획 등 사전 정의된 역할을 한 번에 불러올 수 있습니다"
         }

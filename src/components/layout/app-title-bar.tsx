@@ -12,7 +12,6 @@ interface AppTitleBarProps {
   right?: ReactNode
   className?: string
   rowClassName?: string
-  centerInteractive?: boolean
   showWindowControls?: boolean
 }
 
@@ -22,7 +21,6 @@ export function AppTitleBar({
   right,
   className,
   rowClassName,
-  centerInteractive = false,
   showWindowControls = true,
 }: AppTitleBarProps) {
   const { isMac, isWindows } = usePlatform()
@@ -70,9 +68,7 @@ export function AppTitleBar({
 
       {center ? (
         <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
-          <div className={cn(centerInteractive && "pointer-events-auto")}>
-            {center}
-          </div>
+          <div>{center}</div>
         </div>
       ) : null}
 

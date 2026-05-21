@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "Fermer tous les onglets de fichiers",
-        "description": "Fermer tous les onglets de fichiers uniquement en mode fichiers"
+        "description": "Fermer tous les onglets de fichiers ouverts lorsque le panneau de fichiers est actif"
       },
       "send_message": {
         "title": "Envoyer le message",
@@ -802,12 +802,6 @@
       "openFile": "Ouvrir le fichier",
       "viewDiff": "Voir le Diff",
       "push": "Pousser..."
-    },
-    "modes": {
-      "conversation": "Mode conversation",
-      "fusion": "Mode fusion",
-      "files": "Mode fichiers",
-      "workspaceModesAria": "Modes de l’espace de travail"
     },
     "statusLabels": {
       "in_progress": "En cours",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> ouvre le terminal intégré, <shortcut>{toggleSidebar}</shortcut> bascule la barre latérale.",
           "customShortcuts": "Tous les raccourcis peuvent être réassignés dans Paramètres → Raccourcis.",
           "webService": "Activez Paramètres → Service Web pour que votre équipe accède au même codeg depuis un navigateur.",
-          "fusionMode": "Passez au mode Fusion depuis la barre supérieure pour voir la conversation à côté des fichiers / Git.",
+          "fusionMode": "Ouvrez un fichier ou un diff pour l'afficher automatiquement à côté de la conversation.",
           "quickMessages": "Ouvrez le bouton + à côté de la saisie et choisissez Messages rapides pour insérer un extrait enregistré (à gérer dans Paramètres → Messages rapides).",
           "experts": "Le bouton + propose un menu Compétences expertes — chargez en un clic des rôles comme Débogage ou Planification."
         }

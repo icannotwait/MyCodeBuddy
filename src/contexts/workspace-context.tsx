@@ -24,16 +24,10 @@ import {
   saveFileContent,
 } from "@/lib/api"
 import { languageFromPath } from "@/lib/language-detect"
-import {
-  loadPersistedWorkspaceMode,
-  savePersistedWorkspaceMode,
-} from "@/lib/workspace-mode-storage"
 import { toErrorMessage } from "@/lib/app-error"
 
-export type WorkspaceMode = "conversation" | "fusion" | "files"
+export type WorkspaceMode = "conversation" | "fusion"
 export type WorkspacePane = "conversation" | "files"
-
-const DEFAULT_WORKSPACE_MODE: WorkspaceMode = "conversation"
 
 type FileWorkspaceTabKind = "file" | "diff" | "rich-diff"
 type FileSaveState = "idle" | "saving" | "error"
@@ -64,7 +58,6 @@ export interface FileWorkspaceTab {
 interface WorkspaceContextValue {
   mode: WorkspaceMode
   activePane: WorkspacePane
-  setMode: (mode: WorkspaceMode) => void
   setActivePane: (pane: WorkspacePane) => void
   activateConversationPane: () => void
   activateFilePane: () => void
@@ -211,13 +204,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const t = useTranslations("Folder.workspaceContext")
   const { activeFolder, activeFolderId } = useActiveFolder()
   const folderPath = activeFolder?.path
-  const storageKey = "workspace:mode"
   /* activeFolderId used in effect below to reset file tabs on folder switch */
   void activeFolderId
-  const [mode, setModeState] = useState<WorkspaceMode>(DEFAULT_WORKSPACE_MODE)
   const [activePane, setActivePaneState] =
     useState<WorkspacePane>("conversation")
-  const [restored, setRestored] = useState(false)
   const [fileTabs, setFileTabs] = useState<FileWorkspaceTab[]>([])
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null)
   const [pendingFileReveal, setPendingFileReveal] = useState<{
@@ -235,17 +225,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     fileTabsRef.current = fileTabs
   }, [fileTabs])
 
-  useEffect(() => {
-    const storedMode = loadPersistedWorkspaceMode(storageKey)
-    const nextMode = (storedMode ?? DEFAULT_WORKSPACE_MODE) as WorkspaceMode
-    // Hydrate from localStorage after mount to keep SSR/CSR markup consistent.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setModeState(nextMode)
-    if (nextMode === "conversation" || nextMode === "files") {
-      setActivePaneState(nextMode)
-    }
-    setRestored(true)
-  }, [storageKey])
+  const mode: WorkspaceMode = fileTabs.length > 0 ? "fusion" : "conversation"
 
   // Clear file tabs when the active folder changes — files are not persisted
   // across folder switches in the workspace model.
@@ -258,18 +238,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [activeFolderId])
 
-  useEffect(() => {
-    if (!restored) return
-    savePersistedWorkspaceMode(storageKey, mode)
-  }, [mode, restored, storageKey])
-
-  const setModeSafe = useCallback((nextMode: WorkspaceMode) => {
-    setModeState(nextMode)
-    if (nextMode === "conversation" || nextMode === "files") {
-      setActivePaneState(nextMode)
-    }
-  }, [])
-
   const setActivePane = useCallback((nextPane: WorkspacePane) => {
     setActivePaneState((prev) => (prev === nextPane ? prev : nextPane))
   }, [])
@@ -278,12 +246,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     setActivePaneState((prev) =>
       prev === "conversation" ? prev : "conversation"
     )
-    setModeState((prev) => (prev === "fusion" ? prev : "conversation"))
   }, [])
 
   const activateFilePane = useCallback(() => {
     setActivePaneState((prev) => (prev === "files" ? prev : "files"))
-    setModeState((prev) => (prev === "fusion" ? prev : "files"))
   }, [])
 
   const upsertLoadingTab = useCallback(
@@ -1058,7 +1024,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     () => ({
       mode,
       activePane,
-      setMode: setModeSafe,
       setActivePane,
       activateConversationPane,
       activateFilePane,
@@ -1088,7 +1053,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     [
       mode,
       activePane,
-      setModeSafe,
       setActivePane,
       activateConversationPane,
       activateFilePane,

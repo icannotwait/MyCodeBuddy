@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "关闭全部文件标签",
-        "description": "仅在文件模式下关闭所有文件标签"
+        "description": "当文件面板处于活动状态时关闭所有打开的文件标签"
       },
       "send_message": {
         "title": "发送消息",
@@ -802,12 +802,6 @@
       "openFile": "打开文件",
       "viewDiff": "查看差异",
       "push": "推送..."
-    },
-    "modes": {
-      "conversation": "会话模式",
-      "fusion": "融合模式",
-      "files": "文件模式",
-      "workspaceModesAria": "工作区模式"
     },
     "statusLabels": {
       "in_progress": "进行中",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> 打开内置终端，<shortcut>{toggleSidebar}</shortcut> 切换侧边栏",
           "customShortcuts": "所有快捷键都可在「设置 → 快捷键」中自定义",
           "webService": "开启「设置 → Web 服务」后，团队成员可从浏览器接入同一台 codeg",
-          "fusionMode": "切到顶部的「融合模式」，会话和文件 / Git 面板会并排显示",
+          "fusionMode": "打开文件或差异后，会自动与会话并排显示",
           "quickMessages": "点输入框旁的 + 按钮选择「快捷消息」，可一键插入预存片段（在「设置 → 快捷消息」中管理）",
           "experts": "通过 + 按钮里的「专家技能」可一键加载预设角色（调试 / 规划等）"
         }

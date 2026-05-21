@@ -285,7 +285,7 @@
       },
       "close_all_file_tabs": {
         "title": "關閉全部檔案分頁",
-        "description": "僅在檔案模式下關閉所有檔案分頁"
+        "description": "當檔案面板處於作用中狀態時關閉所有開啟的檔案分頁"
       },
       "send_message": {
         "title": "傳送訊息",
@@ -802,12 +802,6 @@
       "openFile": "打開檔案",
       "viewDiff": "查看差異",
       "push": "推送..."
-    },
-    "modes": {
-      "conversation": "會話模式",
-      "fusion": "融合模式",
-      "files": "檔案模式",
-      "workspaceModesAria": "工作區模式"
     },
     "statusLabels": {
       "in_progress": "進行中",
@@ -1726,7 +1720,7 @@
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> 開啟內建終端機，<shortcut>{toggleSidebar}</shortcut> 切換側邊欄",
           "customShortcuts": "所有快捷鍵都可在「設定 → 快捷鍵」中自訂",
           "webService": "開啟「設定 → Web 服務」後，團隊成員可從瀏覽器接入同一臺 codeg",
-          "fusionMode": "切到頂部的「融合模式」，會話和檔案 / Git 面板會並排顯示",
+          "fusionMode": "開啟檔案或差異後，會自動與會話並排顯示",
           "quickMessages": "點輸入框旁的 + 按鈕選擇「快捷訊息」，可一鍵插入預存片段（在「設定 → 快捷訊息」中管理）",
           "experts": "透過 + 按鈕裡的「專家技能」可一鍵載入預設角色（除錯 / 規劃等）"
         }
