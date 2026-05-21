@@ -1789,7 +1789,8 @@
         "errorNoWorkspace": "現在アクティブなワークスペースフォルダがありません。",
         "errorOutsideWorkspace": "ファイルが現在のワークスペースフォルダの外にあります。",
         "errorFailedOpen": "ローカルファイルを開けませんでした",
-        "errorFailedLink": "リンクを開けませんでした"
+        "errorFailedLink": "リンクを開けませんでした",
+        "errorUnsupportedLinkProtocol": "このリンクプロトコルはサポートされていません。"
       },
       "messageList": {
         "attachedResources": "添付リソース",

@@ -1789,7 +1789,8 @@
         "errorNoWorkspace": "Es ist kein Arbeitsbereichsordner aktiv.",
         "errorOutsideWorkspace": "Die Datei befindet sich außerhalb des aktuellen Arbeitsbereichsordners.",
         "errorFailedOpen": "Lokale Datei konnte nicht geöffnet werden",
-        "errorFailedLink": "Link konnte nicht geöffnet werden"
+        "errorFailedLink": "Link konnte nicht geöffnet werden",
+        "errorUnsupportedLinkProtocol": "Dieses Linkprotokoll wird nicht unterstützt."
       },
       "messageList": {
         "attachedResources": "Angehängte Ressourcen",

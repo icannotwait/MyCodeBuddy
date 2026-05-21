@@ -1,25 +1,16 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef } from "react"
 import { useTranslations } from "next-intl"
 import { openUrl } from "@/lib/platform"
+import { getActiveRemoteConnectionId, isDesktop } from "@/lib/transport"
 import { toErrorMessage } from "@/lib/app-error"
 import type { LinkSafetyConfig, LinkSafetyModalProps } from "streamdown"
 import { toast } from "sonner"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
 import { cn } from "@/lib/utils"
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog"
 
 interface LocalFileTarget {
   path: string
@@ -28,6 +19,12 @@ interface LocalFileTarget {
 
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
 const URL_SCHEME = /^[a-zA-Z][a-zA-Z\d+\-.]*:/
+const ALLOWED_EXTERNAL_PROTOCOLS = new Set([
+  "http:",
+  "https:",
+  "mailto:",
+  "tel:",
+])
 
 function normalizeSlashPath(path: string): string {
   return path.replace(/\\/g, "/")
@@ -122,7 +119,7 @@ function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {
 
   // Split on raw # / ? before decoding so encoded `%23` / `%3F` inside the
   // path don't get promoted to fragment/query separators (which would point
-  // the open-file dialog at the wrong file).
+  // the file opener at the wrong file).
   const hashIndex = trimmed.indexOf("#")
   const rawHash = hashIndex >= 0 ? trimmed.slice(hashIndex) : ""
   const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed
@@ -138,6 +135,42 @@ function parseLocalFileTarget(rawUrl: string): LocalFileTarget | null {
     path: normalizeSlashPath(normalizedPath),
     line: parseHashLine(rawHash) ?? pathAndLine.line,
   }
+}
+
+function parseExternalUrl(rawUrl: string): URL | null {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return null
+
+  if (trimmed.startsWith("//")) {
+    try {
+      return new URL(trimmed, window.location.href)
+    } catch {
+      return null
+    }
+  }
+
+  if (!URL_SCHEME.test(trimmed) || WINDOWS_ABSOLUTE_PATH.test(trimmed)) {
+    return null
+  }
+
+  try {
+    return new URL(trimmed)
+  } catch {
+    return null
+  }
+}
+
+function isAllowedExternalUrl(rawUrl: string): boolean {
+  const parsed = parseExternalUrl(rawUrl)
+  return parsed
+    ? ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol.toLowerCase())
+    : false
+}
+
+function shouldLetStreamdownOpenExternalUrl(rawUrl: string): boolean {
+  if (parseLocalFileTarget(rawUrl)) return false
+  if (!isAllowedExternalUrl(rawUrl)) return false
+  return !isDesktop() || getActiveRemoteConnectionId() !== null
 }
 
 function toWorkspaceRelativePath(
@@ -169,7 +202,7 @@ function toWorkspaceRelativePath(
   return normalizedPath.slice(normalizedWorkspace.length + 1)
 }
 
-function LinkSafetyModal({
+function DirectLinkOpen({
   url,
   isOpen,
   onClose,
@@ -177,55 +210,27 @@ function LinkSafetyModal({
 }: LinkSafetyModalProps & {
   onAction: (url: string) => Promise<void>
 }) {
-  const t = useTranslations("Folder.chat.linkSafety")
-  const [opening, setOpening] = useState(false)
-  const localTarget = useMemo(() => parseLocalFileTarget(url), [url])
-  const isLocalFile = Boolean(localTarget)
+  const openingUrlRef = useRef<string | null>(null)
 
-  const handleAction = useCallback(() => {
-    if (opening) return
-    setOpening(true)
+  useEffect(() => {
+    if (!isOpen) {
+      openingUrlRef.current = null
+      return
+    }
+    if (openingUrlRef.current === url) return
+
+    let cancelled = false
+    openingUrlRef.current = url
     void onAction(url).finally(() => {
-      setOpening(false)
+      if (!cancelled) onClose()
     })
-  }, [onAction, opening, url])
 
-  return (
-    <AlertDialog
-      open={isOpen}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen) onClose()
-      }}
-    >
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>
-            {isLocalFile ? t("localFileTitle") : t("externalLinkTitle")}
-          </AlertDialogTitle>
-          <AlertDialogDescription>
-            {isLocalFile
-              ? t("localFileDescription")
-              : t("externalLinkDescription")}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <div className="max-h-28 overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs break-all">
-          {localTarget?.path ?? url}
-        </div>
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={opening}>
-            {t("cancel")}
-          </AlertDialogCancel>
-          <AlertDialogAction disabled={opening} onClick={handleAction}>
-            {opening
-              ? t("opening")
-              : isLocalFile
-                ? t("openFile")
-                : t("openLink")}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  )
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen, onAction, onClose, url])
+
+  return null
 }
 
 function useOpenLinkOrFile() {
@@ -268,6 +273,13 @@ function useOpenLinkOrFile() {
         return
       }
 
+      if (!isAllowedExternalUrl(url)) {
+        toast.error(t("errorFailedLink"), {
+          description: t("errorUnsupportedLinkProtocol"),
+        })
+        return
+      }
+
       try {
         await openUrl(url)
       } catch (error) {
@@ -283,9 +295,14 @@ function useOpenLinkOrFile() {
 export function useStreamdownLinkSafety(): LinkSafetyConfig {
   const handleOpenTarget = useOpenLinkOrFile()
 
+  const handleLinkCheck = useCallback(
+    (url: string) => shouldLetStreamdownOpenExternalUrl(url),
+    []
+  )
+
   const renderModal = useCallback(
     (props: LinkSafetyModalProps) => (
-      <LinkSafetyModal {...props} onAction={handleOpenTarget} />
+      <DirectLinkOpen {...props} onAction={handleOpenTarget} />
     ),
     [handleOpenTarget]
   )
@@ -293,16 +310,17 @@ export function useStreamdownLinkSafety(): LinkSafetyConfig {
   return useMemo(
     () => ({
       enabled: true,
+      onLinkCheck: handleLinkCheck,
       renderModal,
     }),
-    [renderModal]
+    [handleLinkCheck, renderModal]
   )
 }
 
 /**
  * Resolve a tool-call file path (which may be absolute, workspace-relative, or
  * a bare relative path) into something `openFilePreview` can consume. Falls
- * back to the raw input when no other heuristic matches so the dialog can
+ * back to the raw input when no other heuristic matches so the opener can
  * still surface a useful error toast.
  */
 function resolveToolFilePath(
@@ -323,9 +341,7 @@ function resolveToolFilePath(
 }
 
 /**
- * Clickable file-path label that opens the same "open local file" confirmation
- * dialog used for markdown links inside agent messages, then routes the file
- * into the workspace file panel.
+ * Clickable file-path label that routes the file into the workspace file panel.
  */
 export function FilePathLink({
   filePath,
@@ -344,17 +360,14 @@ export function FilePathLink({
   const { activeFolder: folder } = useActiveFolder()
   const folderPath = folder?.path ?? null
   const { openFilePreview } = useWorkspaceContext()
+  const openingRef = useRef(false)
 
-  const [isOpen, setIsOpen] = useState(false)
-  const [opening, setOpening] = useState(false)
-
-  const handleConfirm = useCallback(() => {
-    if (opening) return
+  const handleOpen = useCallback(() => {
+    if (openingRef.current) return
     if (!folderPath) {
       toast.error(t("errorCannotOpen"), {
         description: t("errorNoWorkspace"),
       })
-      setIsOpen(false)
       return
     }
     const relativePath = resolveToolFilePath(filePath, folderPath)
@@ -362,11 +375,10 @@ export function FilePathLink({
       toast.error(t("errorCannotOpen"), {
         description: t("errorOutsideWorkspace"),
       })
-      setIsOpen(false)
       return
     }
 
-    setOpening(true)
+    openingRef.current = true
     void openFilePreview(relativePath, {
       line: line ?? undefined,
     })
@@ -376,52 +388,23 @@ export function FilePathLink({
         })
       })
       .finally(() => {
-        setOpening(false)
-        setIsOpen(false)
+        openingRef.current = false
       })
-  }, [filePath, folderPath, line, opening, openFilePreview, t])
+  }, [filePath, folderPath, line, openFilePreview, t])
 
   return (
-    <>
-      <span className={cn("block min-w-0", className)}>
-        <button
-          type="button"
-          title={title ?? filePath}
-          className="max-w-full cursor-pointer truncate text-left align-bottom hover:underline focus-visible:underline focus-visible:outline-none"
-          onClick={(e) => {
-            e.stopPropagation()
-            setIsOpen(true)
-          }}
-        >
-          {children}
-        </button>
-      </span>
-      <AlertDialog
-        open={isOpen}
-        onOpenChange={(next) => {
-          if (!next && !opening) setIsOpen(false)
+    <span className={cn("block min-w-0", className)}>
+      <button
+        type="button"
+        title={title ?? filePath}
+        className="max-w-full cursor-pointer truncate text-left align-bottom hover:underline focus-visible:underline focus-visible:outline-none"
+        onClick={(e) => {
+          e.stopPropagation()
+          handleOpen()
         }}
       >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t("localFileTitle")}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {t("localFileDescription")}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="max-h-28 overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs break-all">
-            {filePath}
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={opening}>
-              {t("cancel")}
-            </AlertDialogCancel>
-            <AlertDialogAction disabled={opening} onClick={handleConfirm}>
-              {opening ? t("opening") : t("openFile")}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+        {children}
+      </button>
+    </span>
   )
 }
