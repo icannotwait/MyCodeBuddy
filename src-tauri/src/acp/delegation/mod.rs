@@ -30,4 +30,7 @@
 //! to the child, and returns. v2 will introduce `continue_with_session` /
 //! `close_session` tools without protocol breakage.
 
+pub mod broker;
+pub mod depth;
 pub mod spawner;
+pub mod types;
