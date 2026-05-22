@@ -37,6 +37,7 @@ import {
   ReasoningContent,
 } from "@/components/ai-elements/reasoning"
 import { AgentToolCallPart } from "./agent-tool-call"
+import { DelegatedSubThread } from "./delegated-sub-thread"
 import { GeneratedImagesBlock } from "./generated-images-block"
 import {
   FileTextIcon,
@@ -2290,6 +2291,14 @@ const ToolCallPart = memo(function ToolCallPart({
         )}
       />
     )
+  }
+
+  // Multi-agent delegation tool: surfaces an inline DelegatedSubThread
+  // bound to the child sub-session via parent_tool_use_id. Falls through to
+  // the normal renderer when no toolCallId is available (snapshot replays
+  // without a live binding) so the user still sees the tool input/output.
+  if (toolNameLower === "delegate_to_agent" && part.toolCallId) {
+    return <DelegatedSubThread parentToolUseId={part.toolCallId} />
   }
 
   // Cline: attempt_completion — render as an expanded card with result + progress

@@ -1837,6 +1837,26 @@
         "error": "오류",
         "result": "결과"
       },
+      "delegation": {
+        "inFlight": "delegating…",
+        "loading": "Loading sub-session…",
+        "loadFailed": "Failed to load sub-session: {detail}",
+        "noDetail": "No detail available yet.",
+        "status": {
+          "running": "running",
+          "ok": "done",
+          "err": {
+            "default": "failed",
+            "delegation_disabled": "disabled",
+            "depth_limit": "depth limit",
+            "invalid_agent_type": "bad agent",
+            "spawn_failed": "spawn failed",
+            "send_failed": "send failed",
+            "timeout": "timeout",
+            "canceled": "canceled"
+          }
+        }
+      },
       "contentParts": {
         "showingTailOutput": "성능을 위해 스트리밍 중에는 출력의 끝부분만 표시합니다.",
         "result": "결과",

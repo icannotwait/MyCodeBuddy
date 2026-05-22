@@ -1837,6 +1837,26 @@
         "error": "錯誤",
         "result": "結果"
       },
+      "delegation": {
+        "inFlight": "委派中…",
+        "loading": "正在載入子會話…",
+        "loadFailed": "載入子會話失敗：{detail}",
+        "noDetail": "暫無詳情。",
+        "status": {
+          "running": "執行中",
+          "ok": "完成",
+          "err": {
+            "default": "失敗",
+            "delegation_disabled": "已停用",
+            "depth_limit": "深度超限",
+            "invalid_agent_type": "代理類型無效",
+            "spawn_failed": "啟動失敗",
+            "send_failed": "傳送失敗",
+            "timeout": "逾時",
+            "canceled": "已取消"
+          }
+        }
+      },
       "contentParts": {
         "showingTailOutput": "為確保效能，串流輸出時僅顯示尾端內容。",
         "result": "結果",

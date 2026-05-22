@@ -1837,6 +1837,26 @@
         "error": "خطأ",
         "result": "النتيجة"
       },
+      "delegation": {
+        "inFlight": "delegating…",
+        "loading": "Loading sub-session…",
+        "loadFailed": "Failed to load sub-session: {detail}",
+        "noDetail": "No detail available yet.",
+        "status": {
+          "running": "running",
+          "ok": "done",
+          "err": {
+            "default": "failed",
+            "delegation_disabled": "disabled",
+            "depth_limit": "depth limit",
+            "invalid_agent_type": "bad agent",
+            "spawn_failed": "spawn failed",
+            "send_failed": "send failed",
+            "timeout": "timeout",
+            "canceled": "canceled"
+          }
+        }
+      },
       "contentParts": {
         "showingTailOutput": "يتم عرض نهاية المخرجات أثناء البث لتحسين الأداء.",
         "result": "النتيجة",

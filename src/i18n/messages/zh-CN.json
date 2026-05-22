@@ -1837,6 +1837,26 @@
         "error": "错误",
         "result": "结果"
       },
+      "delegation": {
+        "inFlight": "委托中…",
+        "loading": "正在加载子会话…",
+        "loadFailed": "加载子会话失败：{detail}",
+        "noDetail": "暂无详情。",
+        "status": {
+          "running": "运行中",
+          "ok": "完成",
+          "err": {
+            "default": "失败",
+            "delegation_disabled": "已禁用",
+            "depth_limit": "深度超限",
+            "invalid_agent_type": "代理类型无效",
+            "spawn_failed": "启动失败",
+            "send_failed": "发送失败",
+            "timeout": "超时",
+            "canceled": "已取消"
+          }
+        }
+      },
       "contentParts": {
         "showingTailOutput": "为保证性能，流式输出时仅显示尾部内容。",
         "result": "结果",
