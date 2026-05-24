@@ -22,10 +22,17 @@ import {
   useRef,
   useSyncExternalStore,
 } from "react"
-import { ChevronDown, ChevronRight, Loader2 } from "lucide-react"
+import {
+  CheckCircleIcon,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  XCircleIcon,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
+import { Badge } from "@/components/ui/badge"
 import { MessageResponse } from "@/components/ai-elements/message"
 import { useDelegatedSubSession } from "@/hooks/use-delegated-sub-session"
 import { AGENT_LABELS, type AgentType } from "@/lib/types"
@@ -622,7 +629,7 @@ export function DelegatedSubThread({
             </div>
           )}
         </div>
-        <span className="mt-1 shrink-0 text-muted-foreground">
+        <span className="self-center shrink-0 text-muted-foreground">
           {expanded ? (
             <ChevronDown className="h-4 w-4" />
           ) : (
@@ -734,26 +741,29 @@ function StatusBadge({
   const t = useTranslations("Folder.chat.delegation.status")
   if (status === "running") {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-        <Loader2 className="h-2.5 w-2.5 animate-spin" />
+      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
+        <Loader2 className="animate-spin" />
         {t("running")}
-      </span>
+      </Badge>
     )
   }
   if (status === "ok") {
     return (
-      <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
+        <CheckCircleIcon className="text-green-600" />
         {t("ok")}
-      </span>
+      </Badge>
     )
   }
   return (
-    <span
-      className="rounded-full bg-destructive/15 px-2 py-0.5 text-[10px] font-medium text-destructive"
+    <Badge
+      className="gap-1.5 rounded-full text-xs"
+      variant="secondary"
       title={errorCode ?? undefined}
     >
+      <XCircleIcon className="text-red-600" />
       <ErrorLabel code={errorCode} />
-    </span>
+    </Badge>
   )
 }
 
