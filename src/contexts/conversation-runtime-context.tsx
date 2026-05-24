@@ -559,6 +559,12 @@ function buildStreamingTurnsFromLiveMessage(
           tool_use_id: block.info.tool_call_id,
           tool_name: toolName,
           input_preview: block.info.raw_input,
+          // Forward the ACP `meta` field downstream so the renderer can
+          // read delegation state (`meta["codeg.delegation"]`) for
+          // pre-binding / post-refresh fallback rendering of
+          // <DelegatedSubThread>. Opaque pass-through — adapter layer
+          // does not interpret.
+          meta: block.info.meta,
         })
         const isFinalState =
           block.info.status === "completed" || block.info.status === "failed"

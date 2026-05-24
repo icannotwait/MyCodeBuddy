@@ -187,6 +187,9 @@ impl AgentParser for ClineParser {
                 message_count,
                 model,
                 git_branch: None,
+                parent_id: None,
+                parent_tool_use_id: None,
+                delegation_call_id: None,
             });
         }
 
@@ -338,6 +341,9 @@ impl AgentParser for ClineParser {
             message_count: turns.len() as u32,
             model: default_model,
             git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         };
 
         Ok(ConversationDetail {
@@ -552,6 +558,7 @@ fn parse_content_blocks(content: &serde_json::Value) -> Vec<ContentBlock> {
                             tool_use_id,
                             tool_name,
                             input_preview,
+                            meta: None,
                         });
                     }
                     "tool_result" => {

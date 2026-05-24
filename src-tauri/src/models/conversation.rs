@@ -16,6 +16,12 @@ pub struct ConversationSummary {
     pub message_count: u32,
     pub model: Option<String>,
     pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +37,12 @@ pub struct DbConversationSummary {
     pub message_count: u32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

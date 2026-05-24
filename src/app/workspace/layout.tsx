@@ -26,6 +26,7 @@ import {
   AcpConnectionsProvider,
   useAcpActions,
 } from "@/contexts/acp-connections-context"
+import { DelegationProvider } from "@/contexts/delegation-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { TabProvider, useTabContext } from "@/contexts/tab-context"
 import { SessionStatsProvider } from "@/contexts/session-stats-context"
@@ -775,25 +776,29 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
           <GitCredentialProvider>
             <TaskProvider>
               <AcpConnectionsProvider>
-                <ConversationStatusEventBridge />
-                <ConversationRuntimeProvider>
-                  <WorkspaceProvider>
-                    <TabProvider>
-                      <WorkspaceDocumentTitle />
-                      <TabKeysSync />
-                      <DeepLinkBootstrap />
-                      <SessionStatsProvider>
-                        <SidebarProvider>
-                          <AuxPanelProvider>
-                            <TerminalProvider>
-                              <FolderLayoutShell>{children}</FolderLayoutShell>
-                            </TerminalProvider>
-                          </AuxPanelProvider>
-                        </SidebarProvider>
-                      </SessionStatsProvider>
-                    </TabProvider>
-                  </WorkspaceProvider>
-                </ConversationRuntimeProvider>
+                <DelegationProvider>
+                  <ConversationStatusEventBridge />
+                  <ConversationRuntimeProvider>
+                    <WorkspaceProvider>
+                      <TabProvider>
+                        <WorkspaceDocumentTitle />
+                        <TabKeysSync />
+                        <DeepLinkBootstrap />
+                        <SessionStatsProvider>
+                          <SidebarProvider>
+                            <AuxPanelProvider>
+                              <TerminalProvider>
+                                <FolderLayoutShell>
+                                  {children}
+                                </FolderLayoutShell>
+                              </TerminalProvider>
+                            </AuxPanelProvider>
+                          </SidebarProvider>
+                        </SessionStatsProvider>
+                      </TabProvider>
+                    </WorkspaceProvider>
+                  </ConversationRuntimeProvider>
+                </DelegationProvider>
               </AcpConnectionsProvider>
             </TaskProvider>
           </GitCredentialProvider>

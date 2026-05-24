@@ -89,6 +89,8 @@ pub async fn import_local_conversations(
             git_branch: Set(summary.git_branch.clone()),
             external_id: Set(Some(summary.id.clone())),
             parent_id: Set(None),
+            parent_tool_use_id: Set(None),
+            delegation_call_id: Set(None),
             message_count: Set(summary.message_count as i32),
             created_at: Set(created_at),
             updated_at: Set(updated_at),

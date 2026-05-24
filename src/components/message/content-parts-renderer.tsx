@@ -37,6 +37,7 @@ import {
   ReasoningContent,
 } from "@/components/ai-elements/reasoning"
 import { AgentToolCallPart } from "./agent-tool-call"
+import { DelegatedSubThread } from "./delegated-sub-thread"
 import { GeneratedImagesBlock } from "./generated-images-block"
 import {
   FileTextIcon,
@@ -2288,6 +2289,32 @@ const ToolCallPart = memo(function ToolCallPart({
           // Strip agentStats to prevent recursive Agent nesting
           <ToolCallPart key={key} part={{ ...p, agentStats: undefined }} />
         )}
+      />
+    )
+  }
+
+  // Multi-agent delegation tool: surfaces an inline DelegatedSubThread
+  // bound to the child sub-session via parent_tool_use_id. Matches the
+  // bare `delegate_to_agent` (post-normalization) plus any host-specific
+  // server-prefixed form (`mcp__<server>__delegate_to_agent`,
+  // `<server>/delegate_to_agent`, `<server>.delegate_to_agent`, etc.)
+  // as a defensive fallback in case the value reaches the renderer
+  // un-normalized. Falls through to the normal renderer when no
+  // toolCallId is available (snapshot replays without a live binding)
+  // so the user still sees the tool input/output.
+  if (
+    (toolNameLower === "delegate_to_agent" ||
+      /[^a-z0-9]delegate_to_agent$/.test(toolNameLower)) &&
+    part.toolCallId
+  ) {
+    return (
+      <DelegatedSubThread
+        parentToolUseId={part.toolCallId}
+        input={part.input ?? null}
+        output={part.output ?? null}
+        errorText={part.errorText ?? null}
+        state={part.state}
+        meta={part.meta ?? null}
       />
     )
   }

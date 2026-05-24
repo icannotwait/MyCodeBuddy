@@ -369,6 +369,9 @@ impl ClaudeParser {
             message_count,
             model,
             git_branch,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         }))
     }
 }
@@ -707,6 +710,7 @@ impl ClaudeParser {
                             tool_use_id: Some(synthetic_id),
                             tool_name,
                             input_preview,
+                            meta: None,
                         });
                     } else {
                         messages.push(UnifiedMessage {
@@ -716,6 +720,7 @@ impl ClaudeParser {
                                 tool_use_id: Some(synthetic_id),
                                 tool_name,
                                 input_preview,
+                                meta: None,
                             }],
                             timestamp,
                             usage: None,
@@ -874,6 +879,9 @@ impl ClaudeParser {
             message_count: turns.len() as u32,
             model,
             git_branch,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         };
 
         Ok(ConversationDetail {
@@ -1076,6 +1084,7 @@ fn extract_assistant_content(value: &serde_json::Value) -> Vec<ContentBlock> {
                         tool_use_id,
                         tool_name,
                         input_preview,
+                        meta: None,
                     });
                 }
                 _ => {}

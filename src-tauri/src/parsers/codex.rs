@@ -169,6 +169,9 @@ impl CodexParser {
             message_count,
             model,
             git_branch,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         }))
     }
 }
@@ -1033,6 +1036,7 @@ impl CodexParser {
                                                 tool_use_id,
                                                 tool_name: "Agent".to_string(),
                                                 input_preview: Some(agent_input.to_string()),
+                                                meta: None,
                                             }],
                                             timestamp,
                                             usage: None,
@@ -1093,6 +1097,7 @@ impl CodexParser {
                                                 tool_use_id,
                                                 tool_name: raw_tool_name.to_string(),
                                                 input_preview,
+                                                meta: None,
                                             }],
                                             timestamp,
                                             usage: None,
@@ -1381,6 +1386,9 @@ impl CodexParser {
             message_count: turns.len() as u32,
             model,
             git_branch,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         };
 
         Ok(ConversationDetail {

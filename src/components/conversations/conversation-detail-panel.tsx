@@ -35,11 +35,7 @@ import { MessageListView } from "@/components/message/message-list-view"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { AgentSelector } from "@/components/chat/agent-selector"
 import { ChatInput } from "@/components/chat/chat-input"
-import {
-  WelcomeBackdrop,
-  WelcomeHero,
-  WelcomeTip,
-} from "@/components/chat/welcome-hero"
+import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { acpFork, createConversation, openSettingsWindow } from "@/lib/api"
 import { useConversationRuntime } from "@/contexts/conversation-runtime-context"
@@ -930,7 +926,6 @@ const ConversationTabView = memo(function ConversationTabView({
     >
       {isWelcomeMode ? (
         <div className="relative isolate flex h-full min-h-0 flex-col overflow-x-hidden overflow-y-auto">
-          <WelcomeBackdrop />
           <div className="flex-1" />
           <div className="mx-auto flex w-full max-w-2xl shrink-0 flex-col gap-6 px-4 py-4">
             <WelcomeHero />

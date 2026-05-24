@@ -46,12 +46,12 @@ pub struct SystemTerminalSettings {
 /// One row in the "default shell" picker. Backend owns the option list so the
 /// frontend doesn't have to know which shells are available on which platform.
 /// Labels are not localized server-side: `label_key` points at a frontend i18n
-/// key under `SystemSettings.*`.
+/// key under `GeneralSettings.*`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalShellOption {
     /// Stable identifier the dropdown uses as its <option value>.
     pub id: String,
-    /// i18n key resolved by the frontend (`SystemSettings.<label_key>`).
+    /// i18n key resolved by the frontend (`GeneralSettings.<label_key>`).
     pub label_key: String,
     /// Concrete value persisted into `SystemTerminalSettings.default_shell`.
     /// `None` for `system` (use `resolve_shell()`) and `custom` (user supplies path).

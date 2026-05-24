@@ -103,6 +103,9 @@ impl OpenCodeParser {
             message_count,
             model: normalize_optional_string(model),
             git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         })
     }
 
@@ -483,6 +486,7 @@ impl OpenCodeParser {
                             tool_use_id: call_id.clone(),
                             tool_name: "Agent".to_string(),
                             input_preview: Some(agent_input.to_string()),
+                            meta: None,
                         });
 
                         let output_preview = state
@@ -540,6 +544,7 @@ impl OpenCodeParser {
                             tool_use_id: call_id.clone(),
                             tool_name: raw_tool_name.to_string(),
                             input_preview,
+                            meta: None,
                         });
 
                         let output_preview = state

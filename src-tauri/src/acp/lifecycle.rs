@@ -18,6 +18,8 @@ use std::time::Duration;
 use sea_orm::DatabaseConnection;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::acp::delegation::broker::DelegationBroker;
+use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
@@ -44,12 +46,18 @@ const WORKER_QUEUE_CAPACITY: usize = 64;
 /// uninteresting events) means ContentDelta floods can't crowd out a
 /// TurnComplete in the worker mailbox: only events that may write the DB
 /// or update the per-connection cache enter the queue.
+///
+/// `ToolCall` is in the accept list because the worker's ToolCall arm
+/// captures `delegate_to_agent` invocations for the broker's pending
+/// tool_call_id queue. ToolCall fires a handful of times per turn (not
+/// per-token like ContentDelta), so the queue pressure is bounded.
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     matches!(
         event,
         AcpEvent::SessionStarted { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationLinked { .. }
+            | AcpEvent::ToolCall { .. }
             | AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected
             }
@@ -91,8 +99,9 @@ async fn handle_event_with_retry(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
     envelope: &EventEnvelope,
+    broker: Option<&Arc<DelegationBroker>>,
 ) {
-    match handle_event(db_conn, manager, envelope).await {
+    match handle_event(db_conn, manager, envelope, broker).await {
         Ok(()) => return,
         Err(e) => {
             eprintln!(
@@ -103,7 +112,7 @@ async fn handle_event_with_retry(
     }
     for (attempt, backoff) in HANDLE_EVENT_RETRY_BACKOFFS.iter().enumerate() {
         tokio::time::sleep(*backoff).await;
-        match handle_event(db_conn, manager, envelope).await {
+        match handle_event(db_conn, manager, envelope, broker).await {
             Ok(()) => return,
             Err(e) => {
                 let attempt_num = attempt + 2;
@@ -128,8 +137,34 @@ pub(crate) async fn handle_event(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
     envelope: &EventEnvelope,
+    broker: Option<&Arc<DelegationBroker>>,
 ) -> Result<(), DbError> {
     match &envelope.payload {
+        AcpEvent::ToolCall {
+            tool_call_id,
+            title,
+            raw_input,
+            ..
+        } => {
+            // MCP clients don't reliably populate `_meta.tool_use_id`, so we
+            // capture every parent-side `delegate_to_agent` tool_call_id
+            // here. The broker pops the most recent one when the matching
+            // MCP round-trip arrives. See [`DelegationBroker::register_pending_tool_call`].
+            //
+            // ACP `title` is a free-form human-readable string the agent
+            // composes from the tool name (Codex emits the bare MCP method,
+            // Claude Code emits "Run <method>", others phrase it as
+            // "Delegate to <agent>"). Pair the title match with a raw_input
+            // shape check so we don't miss a delegation just because the
+            // host re-phrased the title.
+            if let Some(b) = broker {
+                if is_delegation_invocation(title, raw_input.as_deref()) {
+                    b.register_pending_tool_call(&envelope.connection_id, tool_call_id.clone())
+                        .await;
+                }
+            }
+            Ok(())
+        }
         AcpEvent::SessionStarted { session_id } => {
             // Look up conversation_id from the live state.
             let Some(state_arc) = manager.get_state(&envelope.connection_id).await else {
@@ -164,44 +199,138 @@ pub(crate) async fn handle_event(
             // we leave it alone here. `completed` transitions remain
             // frontend-driven.
             let target_status = match stop_reason.as_str() {
-                "end_turn" => ConversationStatus::PendingReview,
+                "end_turn" => Some(ConversationStatus::PendingReview),
                 "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
-                    ConversationStatus::Cancelled
+                    Some(ConversationStatus::Cancelled)
                 }
                 // `cancelled` and any future reason: don't write here.
-                _ => return Ok(()),
+                _ => None,
             };
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
                 return Ok(());
             };
-            let conversation_id = state_arc.read().await.conversation_id;
+            let (conversation_id, last_text) = {
+                let snap = state_arc.read().await;
+                (snap.conversation_id, snap.last_assistant_text.clone())
+            };
             // No conversation row bound (defensive — should never happen in
             // practice since `send_prompt_linked` runs before TurnComplete can
             // fire). Nothing to update.
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
-            // DB write before emit so any downstream subscriber that observes
-            // the ConversationStatusChanged event can assume the row is
-            // already at the target status.
-            conversation_service::update_status(db_conn, cid, target_status.clone()).await?;
-            emit_with_state(
-                &state_arc,
-                &emitter,
-                AcpEvent::ConversationStatusChanged {
-                    conversation_id: cid,
-                    status: target_status,
-                },
-            )
-            .await;
+            if let Some(ts) = target_status.clone() {
+                // DB write before emit so any downstream subscriber that observes
+                // the ConversationStatusChanged event can assume the row is
+                // already at the target status.
+                conversation_service::update_status(db_conn, cid, ts.clone()).await?;
+                emit_with_state(
+                    &state_arc,
+                    &emitter,
+                    AcpEvent::ConversationStatusChanged {
+                        conversation_id: cid,
+                        status: ts,
+                    },
+                )
+                .await;
+            }
+
+            // If this conversation was spawned by a delegation, resolve the
+            // pending broker call. The broker maps the outcome onto the
+            // parent's `tool_use_id` via the registered `call_id`.
+            if let Some(b) = broker {
+                forward_turn_complete_to_broker(
+                    db_conn,
+                    b.as_ref(),
+                    cid,
+                    stop_reason.as_str(),
+                    last_text,
+                )
+                .await;
+            }
             Ok(())
         }
         // Other events don't need cross-connection DB persistence today; extend
         // this dispatcher with new arms as the lifecycle scope grows.
         _ => Ok(()),
     }
+}
+
+/// On TurnComplete for a delegation child, resolve the pending broker call
+/// and let the broker drive the rest of the lifecycle (meta write, the
+/// `AcpEvent::DelegationCompleted` emit against the parent stream, child
+/// disconnect, tx.send). Keeping the emit responsibility inside
+/// `broker.complete_call` is what guarantees the broker's other terminal
+/// paths (`timeout` / `cancel_by_child_connection` / `cancel_by_parent`)
+/// also surface the event — see
+/// `.docs/issues/2026-05-24-delegation-termination-cascade.md`.
+async fn forward_turn_complete_to_broker(
+    db_conn: &DatabaseConnection,
+    broker: &DelegationBroker,
+    conversation_id: i32,
+    stop_reason: &str,
+    last_text: Option<String>,
+) {
+    let row = match conversation_service::get_by_id(db_conn, conversation_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[delegation][lifecycle] couldn't fetch child conversation \
+                 {conversation_id} for outcome routing: {e}"
+            );
+            return;
+        }
+    };
+    let call_id = match row.delegation_call_id.clone() {
+        Some(id) => id,
+        None => return, // not a delegation child; nothing to do.
+    };
+    if row.parent_tool_use_id.is_none() {
+        eprintln!(
+            "[delegation][lifecycle] conversation {conversation_id} has \
+             delegation_call_id but no parent_tool_use_id; dropping"
+        );
+        return;
+    }
+    let agent_type = row.agent_type;
+    let outcome = match stop_reason {
+        "end_turn" => DelegationOutcome::Ok(DelegationSuccess {
+            text: last_text.unwrap_or_default(),
+            child_conversation_id: conversation_id,
+            child_agent_type: agent_type,
+            turn_count: 1,
+            duration_ms: 0,
+            token_usage: None,
+        }),
+        "cancelled" => DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: "child session was cancelled".into(),
+            },
+            Some(conversation_id),
+        ),
+        // Each child turn-failure reason gets a distinct wire code so the
+        // parent UI can show a more useful error label than a generic
+        // "subagent error". Mirrors the parent's own
+        // `turn_failure_error_event` mapping in `connection.rs`.
+        "refusal" => {
+            DelegationOutcome::from_err(DelegationError::ChildRefusal, Some(conversation_id))
+        }
+        "max_tokens" => {
+            DelegationOutcome::from_err(DelegationError::ChildMaxTokens, Some(conversation_id))
+        }
+        "max_turn_requests" => DelegationOutcome::from_err(
+            DelegationError::ChildMaxTurnRequests,
+            Some(conversation_id),
+        ),
+        "empty" => DelegationOutcome::from_err(DelegationError::ChildEmpty, Some(conversation_id)),
+        other => DelegationOutcome::from_err(
+            DelegationError::ChildUnknown(other.to_string()),
+            Some(conversation_id),
+        ),
+    };
+    broker.complete_call(&call_id, outcome).await;
 }
 
 /// Snapshot the connection's `(state, emitter)` into the lifecycle cache when
@@ -276,6 +405,90 @@ async fn handle_terminal_event(
     Ok(())
 }
 
+/// On a non-TurnComplete terminal event (Disconnected / Error) for a
+/// delegation child, surface a `canceled` outcome to the broker. The
+/// child's DB row may already be marked `Cancelled` by `handle_terminal_event`
+/// above; this separately wakes the parent's pending `delegate_to_agent`
+/// tool_use_id. Match-by-`child_connection_id` is O(pending), bounded by
+/// active delegations.
+async fn forward_disconnect_to_broker(broker: &DelegationBroker, connection_id: &str) {
+    broker.cancel_by_child_connection(connection_id).await;
+}
+
+/// True when the ACP `tool_call` smells like an invocation of the
+/// `delegate_to_agent` MCP tool. Defensive on both inputs because the host
+/// agent gets to decide both fields:
+///
+/// * `title` is a free-form human-readable string the host composes. Some
+///   hosts copy the MCP method verbatim (`mcp__codeg-delegate__delegate_to_agent`),
+///   some prefix it with a verb (`Run mcp__…__delegate_to_agent`), some
+///   rephrase it (`Delegate to codex`). We match by substring so any
+///   form containing `delegate_to_agent` is captured.
+/// * `raw_input` is the JSON arg blob the agent sent to the MCP server. The
+///   `delegate_to_agent` schema requires `agent_type` AND `task`; presence
+///   of both is a near-zero false-positive shape check that catches any
+///   host that mangles the title beyond recognition.
+fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
+    let normalized_title = title.to_ascii_lowercase().replace([' ', '-'], "_");
+    if normalized_title.contains("delegate_to_agent") {
+        return true;
+    }
+    if let Some(raw) = raw_input {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(obj) = v.as_object() {
+                let has_task = obj.get("task").and_then(|t| t.as_str()).is_some();
+                let has_agent_type = obj.get("agent_type").and_then(|a| a.as_str()).is_some();
+                if has_task && has_agent_type {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod delegation_title_tests {
+    use super::is_delegation_invocation;
+
+    #[test]
+    fn matches_bare_method_in_title() {
+        assert!(is_delegation_invocation("delegate_to_agent", None));
+        assert!(is_delegation_invocation("Delegate To Agent", None));
+        assert!(is_delegation_invocation("delegate-to-agent", None));
+    }
+
+    #[test]
+    fn matches_mcp_prefixed_method_in_title() {
+        assert!(is_delegation_invocation(
+            "mcp__codeg-delegate__delegate_to_agent",
+            None
+        ));
+        assert!(is_delegation_invocation(
+            "Run mcp__codeg__delegate_to_agent",
+            None
+        ));
+    }
+
+    #[test]
+    fn matches_via_raw_input_shape_when_title_is_unrecognized() {
+        let raw = r#"{"agent_type":"codex","task":"smoke test"}"#;
+        assert!(is_delegation_invocation("Delegate to codex", Some(raw)));
+        assert!(is_delegation_invocation("anything", Some(raw)));
+    }
+
+    #[test]
+    fn rejects_unrelated_tools() {
+        assert!(!is_delegation_invocation("write", None));
+        assert!(!is_delegation_invocation("agent", None));
+        assert!(!is_delegation_invocation("delegate_other_thing", None));
+        assert!(!is_delegation_invocation(
+            "write",
+            Some(r#"{"path":"/tmp/x","content":"y"}"#)
+        ));
+    }
+}
+
 /// Per-connection worker that owns the cache for one connection and
 /// serializes its DB writes. Multiple connections run in parallel; within a
 /// connection, ordering is preserved by the mpsc FIFO. Decouples the bus
@@ -286,6 +499,7 @@ async fn connection_worker_loop(
     connection_id: String,
     db: DatabaseConnection,
     manager: ConnectionManager,
+    broker: Option<Arc<DelegationBroker>>,
     mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
 ) {
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
@@ -306,9 +520,15 @@ async fn connection_worker_loop(
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     eprintln!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
+                // If this connection owned a delegation child, surface a
+                // terminal outcome to the broker so the parent's pending
+                // tool_use_id doesn't dangle.
+                if let Some(b) = broker.as_ref() {
+                    forward_disconnect_to_broker(b.as_ref(), &connection_id).await;
+                }
             }
             _ => {
-                handle_event_with_retry(&db, &manager, envelope).await;
+                handle_event_with_retry(&db, &manager, envelope, broker.as_ref()).await;
             }
         }
     }
@@ -337,6 +557,7 @@ pub fn lifecycle_subscriber_task(
     db_conn: DatabaseConnection,
     manager: ConnectionManager,
     bus: Arc<InternalEventBus>,
+    broker: Option<Arc<DelegationBroker>>,
 ) -> impl Future<Output = ()> + Send + 'static {
     let mut rx = bus.subscribe();
     let metrics = Arc::clone(bus.metrics());
@@ -369,9 +590,14 @@ pub fn lifecycle_subscriber_task(
                             mpsc::channel::<Arc<EventEnvelope>>(WORKER_QUEUE_CAPACITY);
                         let db_clone = db_conn.clone();
                         let mgr_clone = manager.clone_ref();
+                        let broker_clone = broker.clone();
                         let id_clone = conn_id.clone();
                         tokio::spawn(connection_worker_loop(
-                            id_clone, db_clone, mgr_clone, worker_rx,
+                            id_clone,
+                            db_clone,
+                            mgr_clone,
+                            broker_clone,
+                            worker_rx,
                         ));
                         tx
                     });
@@ -490,7 +716,7 @@ mod tests {
                 session_id: "ext-99".into(),
             },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
             .await
             .unwrap();
@@ -519,7 +745,7 @@ mod tests {
                 session_id: "should-not-write".into(),
             },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
 
         // Sentinel row must still have no external_id — dispatcher correctly
         // skipped the write because the connection had no conversation_id.
@@ -581,7 +807,7 @@ mod tests {
                 agent_type: "claude_code".into(),
             },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview
@@ -627,7 +853,7 @@ mod tests {
                     agent_type: "open_code".into(),
                 },
             };
-            handle_event(&db.conn, &mgr, &env).await.unwrap();
+            handle_event(&db.conn, &mgr, &env, None).await.unwrap();
             assert_eq!(
                 read_row_status(&db, conv.id).await,
                 ConversationStatus::Cancelled,
@@ -665,7 +891,7 @@ mod tests {
                 agent_type: "claude_code".into(),
             },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
             read_row_status(&db, conv.id).await,
             ConversationStatus::InProgress,
@@ -699,7 +925,7 @@ mod tests {
                 agent_type: "claude_code".into(),
             },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
             read_row_status(&db, sentinel.id).await,
             ConversationStatus::InProgress,
@@ -916,7 +1142,7 @@ mod tests {
             connection_id: "c1".to_string(),
             payload: AcpEvent::ContentDelta { text: "hi".into() },
         };
-        handle_event(&db.conn, &mgr, &env).await.unwrap();
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
 
         let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
             .await
@@ -953,6 +1179,23 @@ mod tests {
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,
             folder_id: 1,
+            parent_conversation_id: None,
+            parent_tool_use_id: None,
+        }));
+        // ToolCall must enter the queue so the delegation broker's
+        // pending tool_call_id capture (see `handle_event`'s ToolCall
+        // arm) actually runs.
+        assert!(is_lifecycle_relevant(&AcpEvent::ToolCall {
+            tool_call_id: "tc-1".into(),
+            title: "delegate_to_agent".into(),
+            kind: "other".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Disconnected,
@@ -1042,6 +1285,7 @@ mod tests {
             db.conn.clone(),
             mgr.clone_ref(),
             bus.clone(),
+            None,
         ));
 
         // Subscribe AFTER spawn would race; the bus's broadcast channel
@@ -1105,6 +1349,7 @@ mod tests {
             db.conn.clone(),
             mgr.clone_ref(),
             bus.clone(),
+            None,
         ));
 
         bus.send(Arc::new(EventEnvelope {
@@ -1177,6 +1422,7 @@ mod tests {
             db.conn.clone(),
             mgr.clone_ref(),
             bus.clone(),
+            None,
         ));
 
         // Burst of 200 SessionStarted events (each writes external_id).

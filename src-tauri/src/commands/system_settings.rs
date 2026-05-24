@@ -139,7 +139,7 @@ pub(crate) fn normalize_terminal_settings(
 
 /// Build the per-platform option list shown in the "default shell" picker.
 /// The frontend renders these verbatim, looking each `label_key` up under its
-/// `SystemSettings` namespace — so adding a new shell here requires zero
+/// `GeneralSettings` namespace — so adding a new shell here requires zero
 /// frontend code changes (only a new translation key).
 pub(crate) fn build_available_terminal_shells() -> AvailableTerminalShells {
     let mut options: Vec<TerminalShellOption> = Vec::new();

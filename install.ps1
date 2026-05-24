@@ -15,9 +15,17 @@ $ErrorActionPreference = "Stop"
 $Repo = "xintaofei/codeg"
 $Artifact = "codeg-server-windows-x64"
 
-# Stale codeg-server binaries elsewhere in PATH are removed by default so the
-# user's `codeg-server` command always runs the freshly installed binary. Pass
-# -NoCleanup (or set CODEG_NO_CLEANUP=1) to disable.
+# Names of binaries this installer manages. codeg-server is the user-facing
+# entry point; codeg-mcp is the stdio MCP companion that the server's ACP
+# layer spawns per session for delegation. Both must live in the same
+# directory — `locate_codeg_mcp_binary()` in src-tauri/src/acp/connection.rs
+# resolves the companion as a sibling of the running server executable.
+$ManagedBins = @("codeg-server", "codeg-mcp")
+
+# Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
+# default so the user's `codeg-server` command always runs the freshly
+# installed binary AND the runtime locates the matching companion via the
+# exe-sibling lookup. Pass -NoCleanup (or set CODEG_NO_CLEANUP=1) to disable.
 $Cleanup = -not $NoCleanup
 if ($env:CODEG_NO_CLEANUP -eq "1") {
     $Cleanup = $false
@@ -87,6 +95,10 @@ $PathConflicts = @()
 $seenReal = @{}
 $pathDirs = @()
 if ($env:Path) { $pathDirs = $env:Path.Split(';') }
+# Scan PATH for both managed binaries — a stale `codeg-mcp.exe` in an earlier
+# PATH entry would be picked by the runtime's `which` fallback once
+# `codeg-server.exe` was upgraded out from under it, breaking delegation in
+# subtle ways. Track conflicts uniformly for cleanup.
 foreach ($dir in $pathDirs) {
     if (-not $dir) { continue }
     # Match by canonical path string so the destination is recognized even when
@@ -95,13 +107,15 @@ foreach ($dir in $pathDirs) {
     if ($dirReal -eq $InstallDirReal) {
         break
     }
-    foreach ($leaf in @("codeg-server.exe", "codeg-server")) {
-        $bin = Join-Path $dir $leaf
-        if (Test-Path -LiteralPath $bin -PathType Leaf) {
-            $real = Get-CanonicalPath $bin
-            if ($seenReal.ContainsKey($real)) { continue }
-            $seenReal[$real] = $true
-            $PathConflicts += $bin
+    foreach ($name in $ManagedBins) {
+        foreach ($leaf in @("$name.exe", $name)) {
+            $bin = Join-Path $dir $leaf
+            if (Test-Path -LiteralPath $bin -PathType Leaf) {
+                $real = Get-CanonicalPath $bin
+                if ($seenReal.ContainsKey($real)) { continue }
+                $seenReal[$real] = $true
+                $PathConflicts += $bin
+            }
         }
     }
 }
@@ -199,15 +213,25 @@ Write-Host "Extracting..."
 Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 
 # ── Install ──
+#
+# Verify both binaries are present in the archive BEFORE writing anything
+# to InstallDir. Without the companion, delegation degrades silently on
+# every new ACP session — fail fast instead.
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-$BinarySrc = Join-Path $TmpDir $Artifact "codeg-server.exe"
-if (-not (Test-Path $BinarySrc)) {
-    Write-Error "Binary not found in archive"
-    exit 1
+foreach ($name in $ManagedBins) {
+    $src = Join-Path $TmpDir $Artifact "$name.exe"
+    if (-not (Test-Path $src)) {
+        Write-Error "$name.exe not found in archive $Artifact.zip — release is incomplete, please report."
+        exit 1
+    }
 }
-Copy-Item $BinarySrc -Destination (Join-Path $InstallDir "codeg-server.exe") -Force
+foreach ($name in $ManagedBins) {
+    $src = Join-Path $TmpDir $Artifact "$name.exe"
+    $dst = Join-Path $InstallDir "$name.exe"
+    Copy-Item $src -Destination $dst -Force
+}
 
 # Re-canonicalize destination now that the file exists. Pre-install canon may
 # leave the final non-existent component unresolved, which would mis-compare
@@ -279,7 +303,20 @@ if (-not $InstalledVer) { $InstalledVer = $TargetVer }
 
 Write-Host ""
 Write-Host "codeg-server installed to $InstallDir\codeg-server.exe"
+Write-Host "codeg-mcp    installed to $InstallDir\codeg-mcp.exe"
 Write-Host "Version: $InstalledVer"
+
+# Final smoke: codeg-mcp.exe must exist next to codeg-server.exe so the
+# runtime's `locate_codeg_mcp_binary()` exe-sibling lookup hits. A failure
+# here means the zip was malformed or a previous Copy-Item was silently
+# blocked — surface it loudly rather than ship a half-broken install.
+$McpPath = Join-Path $InstallDir "codeg-mcp.exe"
+if (-not (Test-Path -LiteralPath $McpPath)) {
+    Write-Host ""
+    Write-Host "Error: $McpPath missing after install."
+    Write-Host "       Delegation (sub-agent tooling) will not work. Re-run the installer."
+    $ExitStatus = 1
+}
 
 # Verify the user's `codeg-server` command actually resolves to the new binary.
 $ActiveBinAfter = ""

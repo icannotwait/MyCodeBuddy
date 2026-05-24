@@ -21,10 +21,19 @@ pub async fn list_all_conversations_core(
     search: Option<String>,
     sort_by: Option<String>,
     status: Option<String>,
+    include_children: bool,
 ) -> Result<Vec<DbConversationSummary>, AppCommandError> {
-    conversation_service::list_all(conn, folder_ids, agent_type, search, sort_by, status)
-        .await
-        .map_err(AppCommandError::from)
+    conversation_service::list_all(
+        conn,
+        folder_ids,
+        agent_type,
+        search,
+        sort_by,
+        status,
+        include_children,
+    )
+    .await
+    .map_err(AppCommandError::from)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -36,8 +45,36 @@ pub async fn list_all_conversations(
     search: Option<String>,
     sort_by: Option<String>,
     status: Option<String>,
+    include_children: Option<bool>,
 ) -> Result<Vec<DbConversationSummary>, AppCommandError> {
-    list_all_conversations_core(&db.conn, folder_ids, agent_type, search, sort_by, status).await
+    list_all_conversations_core(
+        &db.conn,
+        folder_ids,
+        agent_type,
+        search,
+        sort_by,
+        status,
+        include_children.unwrap_or(false),
+    )
+    .await
+}
+
+pub async fn list_child_conversations_core(
+    conn: &sea_orm::DatabaseConnection,
+    parent_conversation_id: i32,
+) -> Result<Vec<DbConversationSummary>, AppCommandError> {
+    conversation_service::list_children(conn, parent_conversation_id)
+        .await
+        .map_err(AppCommandError::from)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_child_conversations(
+    db: tauri::State<'_, AppDatabase>,
+    parent_conversation_id: i32,
+) -> Result<Vec<DbConversationSummary>, AppCommandError> {
+    list_child_conversations_core(&db.conn, parent_conversation_id).await
 }
 
 pub async fn list_opened_tabs_core(
@@ -665,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn list_all_conversations_core_empty_db_returns_empty() {
         let db = fresh_in_memory_db().await;
-        let rows = list_all_conversations_core(&db.conn, None, None, None, None, None)
+        let rows = list_all_conversations_core(&db.conn, None, None, None, None, None, false)
             .await
             .expect("list");
         assert!(rows.is_empty(), "fresh db must have zero conversations");
@@ -770,12 +807,72 @@ mod tests {
             .await
             .expect("delete");
         // After soft delete the row should no longer show up in list_all.
-        let remaining = list_all_conversations_core(&db.conn, None, None, None, None, None)
+        let remaining = list_all_conversations_core(&db.conn, None, None, None, None, None, false)
             .await
             .expect("list");
         assert!(
             remaining.iter().all(|c| c.id != conv_id),
             "soft-deleted conversation must not appear in list_all"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Phase 7 — delegation list filter + child lookup wrappers.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_child_conversations_core_returns_empty_for_no_parent() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-list-children-empty").await;
+        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+            .await
+            .expect("create parent");
+        let rows = list_child_conversations_core(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_child_conversations_core_returns_only_matching_children() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        use crate::db::service::conversation_service;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-list-children-match").await;
+        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+            .await
+            .expect("create parent");
+
+        // Two delegation children — both should come back, oldest-first.
+        for (i, tool_use) in ["tu-A", "tu-B"].iter().enumerate() {
+            let link = DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: (*tool_use).into(),
+                delegation_call_id: format!("call-{i}"),
+            };
+            conversation_service::create_with_delegation(
+                &db.conn,
+                folder_id,
+                AgentType::Codex,
+                Some(format!("child-{i}")),
+                None,
+                Some(link),
+            )
+            .await
+            .expect("create child");
+        }
+        // Sibling root conversation that must NOT appear.
+        let _other = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None)
+            .await
+            .expect("unrelated root");
+
+        let rows = list_child_conversations_core(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 2, "expected 2 children, got {}", rows.len());
+        assert!(rows.iter().all(|r| r.parent_id == Some(parent_id)));
+        // Oldest-first ordering (created_at ascending).
+        assert!(rows[0].created_at <= rows[1].created_at);
     }
 }

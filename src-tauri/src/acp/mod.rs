@@ -1,5 +1,6 @@
 pub mod binary_cache;
 pub mod connection;
+pub mod delegation;
 pub mod error;
 pub mod event_stream;
 pub mod file_system_runtime;

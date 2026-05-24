@@ -20,6 +20,7 @@ import {
   PlugZap,
   Server,
   Settings,
+  SlidersHorizontal,
   Sparkles,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
@@ -36,6 +37,7 @@ import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 interface SettingsNavItem {
   href: string
   labelKey:
+    | "general"
     | "appearance"
     | "agents"
     | "model_providers"
@@ -56,6 +58,11 @@ const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
     href: "/settings/appearance",
     labelKey: "appearance",
     icon: Palette,
+  },
+  {
+    href: "/settings/general",
+    labelKey: "general",
+    icon: SlidersHorizontal,
   },
   {
     href: "/settings/mcp",

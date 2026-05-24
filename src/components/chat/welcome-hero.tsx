@@ -98,20 +98,6 @@ export function WelcomeHero() {
   )
 }
 
-export function WelcomeBackdrop() {
-  return (
-    <div
-      aria-hidden
-      className="pointer-events-none absolute inset-0 -z-10 overflow-hidden"
-    >
-      <div className="absolute -top-48 -left-48 h-[36rem] w-[36rem] rounded-full bg-gradient-to-br from-primary/8 via-primary/3 to-transparent blur-[120px]" />
-      <div className="absolute -top-56 -right-48 h-[32rem] w-[32rem] rounded-full bg-gradient-to-bl from-chart-3/8 via-chart-3/3 to-transparent blur-[120px]" />
-      <div className="absolute -bottom-56 -left-48 h-[32rem] w-[32rem] rounded-full bg-gradient-to-tr from-chart-3/6 via-chart-3/2 to-transparent blur-[120px]" />
-      <div className="absolute -bottom-48 -right-48 h-[36rem] w-[36rem] rounded-full bg-gradient-to-tl from-primary/7 via-primary/3 to-transparent blur-[120px]" />
-    </div>
-  )
-}
-
 export function WelcomeTip() {
   const t = useTranslations("Folder.chat.welcomePanel")
   const { shortcuts } = useShortcutSettings()
@@ -137,7 +123,7 @@ export function WelcomeTip() {
 
   return (
     <div className="flex max-w-full justify-center">
-      <div className="flex max-w-full items-start gap-2 rounded-full border border-border/40 bg-gradient-to-r from-primary/5 via-muted/40 to-chart-3/5 px-4 py-1.5 text-center text-xs text-muted-foreground/90 backdrop-blur-sm">
+      <div className="flex max-w-full items-start gap-2 rounded-full border border-border/40 bg-muted/40 px-4 py-1.5 text-center text-xs text-muted-foreground/90">
         <span className="flex h-[1.375em] shrink-0 items-center">
           <Lightbulb aria-hidden className="h-3.5 w-3.5 text-primary" />
         </span>

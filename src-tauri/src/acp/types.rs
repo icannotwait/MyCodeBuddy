@@ -134,9 +134,17 @@ pub enum AcpEvent {
     /// once per connection lifetime, on first prompt that creates the row.
     /// Frontend uses this to associate the connection_id with conversation_id
     /// without polling the DB.
+    ///
+    /// `parent_conversation_id` / `parent_tool_use_id` are set when the row was
+    /// created as a delegation child (see `DelegationLink` in
+    /// `acp::delegation`); they are `None` for normal top-level conversations.
     ConversationLinked {
         conversation_id: i32,
         folder_id: i32,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        parent_conversation_id: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        parent_tool_use_id: Option<String>,
     },
     /// Backend has transitioned the conversation row's `status` column.
     /// Emitted by `send_prompt_linked` (`InProgress`) and the lifecycle
@@ -192,6 +200,33 @@ pub enum AcpEvent {
     AvailableCommands { commands: Vec<AvailableCommandInfo> },
     /// Session usage/context window updated during conversation
     UsageUpdate { used: u64, size: u64 },
+    /// A `delegate_to_agent` MCP tool call from the parent agent has spawned a
+    /// child sub-session and the child's prompt is in flight. Emitted as soon
+    /// as the broker registers the pending call. The frontend uses this to
+    /// build the parent ↔ child mapping for inline rendering.
+    DelegationStarted {
+        parent_connection_id: String,
+        parent_tool_use_id: String,
+        child_connection_id: String,
+        child_conversation_id: i32,
+        agent_type: crate::models::agent::AgentType,
+    },
+    /// The child sub-session has finished (or errored / timed out / been
+    /// canceled). The MCP tool_result has been delivered to the parent agent.
+    DelegationCompleted {
+        parent_connection_id: String,
+        parent_tool_use_id: String,
+        child_connection_id: String,
+        child_conversation_id: i32,
+        result: DelegationResultSummary,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DelegationResultSummary {
+    Ok { duration_ms: u64 },
+    Err { error_code: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

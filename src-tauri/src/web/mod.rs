@@ -652,6 +652,21 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<crate::pet_state_mapper::PetStateHandle>()
             .inner()
             .clone(),
+        // Reuse the live broker / token registry / socket path from the
+        // Tauri-managed state so HTTP-side delegation commands target the
+        // same listener the desktop process is already running.
+        delegation_broker: app
+            .state::<Arc<crate::acp::delegation::broker::DelegationBroker>>()
+            .inner()
+            .clone(),
+        delegation_tokens: app
+            .state::<Arc<crate::acp::delegation::listener::TokenRegistry>>()
+            .inner()
+            .clone(),
+        delegation_socket_path: app
+            .state::<crate::commands::delegation::DelegationSocketPath>()
+            .0
+            .clone(),
     });
 
     // See do_start_web_server_with_state for rationale on the reset.

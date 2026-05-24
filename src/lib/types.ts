@@ -135,6 +135,14 @@ export type ContentBlock =
       tool_use_id: string | null
       tool_name: string
       input_preview: string | null
+      /**
+       * ACP extensibility metadata for this tool call. Opaque pass-through
+       * — both the live snapshot (`ToolCallState.meta`) and the persisted
+       * message-row variant carry the same shape. Delegation writes
+       * `meta["codeg.delegation"] = { status, child_connection_id,
+       * child_conversation_id, error_code? }` here.
+       */
+      meta?: Record<string, unknown> | null
     }
   | {
       type: "tool_result"
@@ -248,6 +256,9 @@ export interface DbConversationSummary {
   message_count: number
   created_at: string
   updated_at: string
+  parent_id?: number | null
+  parent_tool_use_id?: string | null
+  delegation_call_id?: string | null
 }
 
 export interface ImportResult {
@@ -580,6 +591,42 @@ export type AcpEvent =
       used: number
       size: number
     }
+  /**
+   * A `delegate_to_agent` MCP tool call from the parent agent has spawned a
+   * child sub-session and the child's prompt is in flight. Emitted as soon as
+   * the broker registers the pending call. Frontend uses this to build the
+   * parent ↔ child mapping for inline ToolCallBlock rendering.
+   */
+  | {
+      type: "delegation_started"
+      parent_connection_id: string
+      parent_tool_use_id: string
+      child_connection_id: string
+      child_conversation_id: number
+      agent_type: AgentType
+    }
+  /**
+   * The child sub-session has finished (or errored / timed out / been
+   * canceled). The MCP tool_result has been delivered to the parent agent;
+   * frontend updates the ToolCallBlock badge from "running" to ok/err.
+   */
+  | {
+      type: "delegation_completed"
+      parent_connection_id: string
+      parent_tool_use_id: string
+      child_connection_id: string
+      child_conversation_id: number
+      result: DelegationResultSummary
+    }
+
+/**
+ * Mirror of Rust `DelegationResultSummary`. `kind` discriminates Ok vs Err;
+ * Ok carries `duration_ms` (broker-measured), Err carries a stable code from
+ * the `DelegationError` taxonomy (e.g. `"timeout"`, `"canceled"`).
+ */
+export type DelegationResultSummary =
+  | { kind: "ok"; duration_ms: number }
+  | { kind: "err"; error_code: string }
 
 /**
  * Wire envelope for all ACP events. JSON shape is flat via Rust's serde

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { inferLiveToolName } from "./tool-call-normalization"
+import { inferLiveToolName, normalizeToolName } from "./tool-call-normalization"
 
 describe("inferLiveToolName meta.claudeCode.toolName override", () => {
   it("returns memory_recall for synthesized recall events without rawInput", () => {
@@ -83,5 +83,30 @@ describe("inferLiveToolName meta.claudeCode.toolName override", () => {
         meta: { claudeCode: { toolName: "   " } },
       })
     ).not.toBe("memory_recall")
+  })
+})
+
+describe("normalizeToolName collapses delegate_to_agent across hosts", () => {
+  // The codeg multi-agent delegation MCP tool is named the same across hosts
+  // (`delegate_to_agent`) but each host serializes the server prefix
+  // differently: Claude Code uses `mcp__<server>__`, Codex live ACP uses
+  // `<server>/`, others use `.` or `:`. All forms must collapse to the
+  // canonical name so the renderer routes them into DelegatedSubThread.
+  it.each([
+    "delegate_to_agent",
+    "mcp__codeg-delegate__delegate_to_agent",
+    "mcp__codeg__delegate_to_agent",
+    "codeg-delegate/delegate_to_agent",
+    "codeg-delegate.delegate_to_agent",
+    "codeg-delegate:delegate_to_agent",
+    "codeg_delegate__delegate_to_agent",
+  ])("%s -> delegate_to_agent", (input) => {
+    expect(normalizeToolName(input)).toBe("delegate_to_agent")
+  })
+
+  it("does not match suffixes without a separator", () => {
+    expect(normalizeToolName("xdelegate_to_agent")).not.toBe(
+      "delegate_to_agent"
+    )
   })
 })

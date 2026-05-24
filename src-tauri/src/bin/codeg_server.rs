@@ -149,9 +149,12 @@ async fn async_main() {
 
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
+    let connection_manager = codeg_lib::app_state::default_connection_manager();
+    let (delegation_broker, delegation_tokens, delegation_socket_path) =
+        codeg_lib::app_state::build_delegation_stack(&connection_manager, db.conn.clone());
     let state = Arc::new(AppState {
         db,
-        connection_manager: codeg_lib::app_state::default_connection_manager(),
+        connection_manager,
         terminal_manager: codeg_lib::app_state::default_terminal_manager(),
         event_broadcaster: broadcaster,
         acp_event_bus: acp_event_bus.clone(),
@@ -163,7 +166,35 @@ async fn async_main() {
             codeg_lib::workspace_transfer::WorkspaceTransferManager::new_from_env(),
         ),
         pet_state: pet_state_handle.clone(),
+        delegation_broker: delegation_broker.clone(),
+        delegation_tokens: delegation_tokens.clone(),
+        delegation_socket_path: delegation_socket_path.clone(),
     });
+
+    // Apply persisted delegation settings (depth, timeout, enabled) before
+    // the listener starts accepting so even the first companion request
+    // sees the operator's configured behavior.
+    codeg_lib::commands::delegation::apply_persisted_config(&state.db.conn, &delegation_broker)
+        .await;
+
+    // Spawn the delegation listener so companion processes can round-trip
+    // through the broker. Path is PID-scoped, so the listener owns it for
+    // the lifetime of the process.
+    {
+        let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
+            delegation_broker,
+            delegation_tokens,
+            Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
+                manager: Arc::new(state.connection_manager.clone_ref()),
+            }),
+        );
+        let socket = delegation_socket_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listener.run(socket).await {
+                eprintln!("[delegation] listener exited: {e}");
+            }
+        });
+    }
 
     // Install bundled expert skills into the central store
     // (`~/.codeg/skills/`). Runs in the background; failures are logged
@@ -198,11 +229,15 @@ async fn async_main() {
         )
         .await;
 
-    // Spawn the LifecycleSubscriber for cross-connection DB writes.
+    // Spawn the LifecycleSubscriber for cross-connection DB writes. The
+    // broker is supplied so TurnComplete on a delegation child resolves the
+    // parent's pending `delegate_to_agent` tool_use_id and emits
+    // `DelegationCompleted`.
     tokio::spawn(codeg_lib::lifecycle_subscriber_task(
         state.db.conn.clone(),
         state.connection_manager.clone_ref(),
         state.acp_event_bus.clone(),
+        Some(state.delegation_broker.clone()),
     ));
 
     // Spawn the desktop pet state mapper so server-mode browsers viewing

@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod chat_channel;
 pub mod conversations;
+pub mod delegation;
 pub mod experts;
 #[cfg(feature = "tauri-runtime")]
 pub mod file_io;

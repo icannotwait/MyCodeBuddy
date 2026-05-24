@@ -103,6 +103,19 @@ pub enum ContentBlock {
         tool_use_id: Option<String>,
         tool_name: String,
         input_preview: Option<String>,
+        /// ACP extensibility metadata associated with the tool call. The
+        /// `delegate_to_agent` lifecycle writes
+        /// `meta["codeg.delegation"] = { status, child_connection_id,
+        /// child_conversation_id, error_code? }` here so a snapshot or DB
+        /// re-fetch can re-bind the parent UI to the child conversation
+        /// without depending on the live event stream having survived.
+        ///
+        /// `None` for tool uses without any meta (the agent didn't emit
+        /// one, or the field predates the meta-on-ToolUse schema change).
+        /// The shape is intentionally opaque — `serde_json::Value` —
+        /// because the convention is agent-defined and may grow.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<serde_json::Value>,
     },
     ToolResult {
         tool_use_id: Option<String>,

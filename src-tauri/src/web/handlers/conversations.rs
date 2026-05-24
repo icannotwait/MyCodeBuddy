@@ -16,6 +16,7 @@ pub struct ListAllConversationsParams {
     pub search: Option<String>,
     pub sort_by: Option<String>,
     pub status: Option<String>,
+    pub include_children: Option<bool>,
 }
 
 pub async fn list_all_conversations(
@@ -30,8 +31,25 @@ pub async fn list_all_conversations(
             params.search,
             params.sort_by,
             params.status,
+            params.include_children.unwrap_or(false),
         )
         .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListChildConversationsParams {
+    pub parent_conversation_id: i32,
+}
+
+pub async fn list_child_conversations(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ListChildConversationsParams>,
+) -> Result<Json<Vec<DbConversationSummary>>, AppCommandError> {
+    Ok(Json(
+        conv_commands::list_child_conversations_core(&state.db.conn, params.parent_conversation_id)
+            .await?,
     ))
 }
 

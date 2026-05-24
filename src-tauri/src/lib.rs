@@ -41,11 +41,11 @@ mod tauri_app {
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
         acp as acp_commands, chat_channel as chat_channel_commands, conversations,
-        experts as experts_commands, file_io, folder_commands, folders, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
-        quick_messages as quick_messages_commands, remote_proxy as remote_proxy_commands,
-        remote_workspace as remote_workspace_commands, system_settings,
-        terminal as terminal_commands, version_control, windows,
+        delegation as delegation_commands, experts as experts_commands, file_io, folder_commands,
+        folders, mcp as mcp_commands, model_provider as model_provider_commands, notification,
+        pet as pet_commands, project_boot, quick_messages as quick_messages_commands,
+        remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
+        system_settings, terminal as terminal_commands, version_control, windows,
         workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
@@ -363,6 +363,52 @@ mod tauri_app {
                     );
                 }
 
+                // Delegation broker + UDS listener. Built from the managed
+                // ConnectionManager + DB so spawn / depth-lookup work against
+                // live state. Managed alongside the existing per-resource
+                // states so commands (Tauri + web) can resolve them by type.
+                // MUST run before the LifecycleSubscriber spawn below so the
+                // broker handle is available to it.
+                let broker_for_lifecycle = {
+                    let cm_state = app.state::<ConnectionManager>();
+                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let (broker, tokens, socket_path) =
+                        crate::app_state::build_delegation_stack(&cm_state, db_conn.clone());
+                    app.manage(broker.clone());
+                    app.manage(tokens.clone());
+                    app.manage(crate::commands::delegation::DelegationSocketPath(
+                        socket_path.clone(),
+                    ));
+
+                    // Push persisted settings into the broker before listener accept.
+                    let broker_for_init = broker.clone();
+                    let db_for_init = db_conn.clone();
+                    tauri::async_runtime::block_on(async move {
+                        delegation_commands::apply_persisted_config(
+                            &db_for_init,
+                            &broker_for_init,
+                        )
+                        .await;
+                    });
+
+                    let listener_broker = broker.clone();
+                    let listener = crate::acp::delegation::listener::DelegationListener::new(
+                        listener_broker,
+                        tokens,
+                        std::sync::Arc::new(
+                            crate::acp::manager::ConnectionManagerParentLookup {
+                                manager: std::sync::Arc::new(cm_state.clone_ref()),
+                            },
+                        ),
+                    );
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = listener.run(socket_path).await {
+                            eprintln!("[delegation] listener exited: {e}");
+                        }
+                    });
+                    broker
+                };
+
                 // Spawn the LifecycleSubscriber: persists cross-connection DB state
                 // (currently `external_id` on conversation rows when SessionStarted fires)
                 // off the emit hot path. `subscribe()` runs synchronously inside
@@ -377,7 +423,10 @@ mod tauri_app {
                         .inner()
                         .clone();
                     tauri::async_runtime::spawn(crate::acp::lifecycle_subscriber_task(
-                        db_conn, cm, bus,
+                        db_conn,
+                        cm,
+                        bus,
+                        Some(broker_for_lifecycle),
                     ));
                 }
 
@@ -607,6 +656,7 @@ mod tauri_app {
                 conversations::list_conversations,
                 conversations::get_conversation,
                 conversations::list_all_conversations,
+                conversations::list_child_conversations,
                 conversations::list_opened_tabs,
                 conversations::save_opened_tabs,
                 conversations::import_local_conversations,
@@ -754,6 +804,8 @@ mod tauri_app {
                 system_settings::probe_terminal_shell_path,
                 system_settings::get_system_rendering_settings,
                 system_settings::update_system_rendering_settings,
+                delegation_commands::get_delegation_settings,
+                delegation_commands::set_delegation_settings,
                 version_control::detect_git,
                 version_control::test_git_path,
                 version_control::get_git_settings,

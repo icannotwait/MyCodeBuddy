@@ -28,6 +28,8 @@ pub struct Model {
     pub git_branch: Option<String>,
     pub external_id: Option<String>,
     pub parent_id: Option<i32>,
+    pub parent_tool_use_id: Option<String>,
+    pub delegation_call_id: Option<String>,
     pub message_count: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

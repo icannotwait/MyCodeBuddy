@@ -171,39 +171,41 @@ export function ConversationShell({
       <QuestionDialog question={pendingQuestion} onAnswer={onAnswerQuestion} />
 
       {!hideInput && (
-        <ChatInput
-          status={status}
-          promptCapabilities={promptCapabilities}
-          defaultPath={defaultPath}
-          agentName={agentName}
-          onFocus={onFocus}
-          onSend={onSend}
-          onCancel={onCancel}
-          modes={modes}
-          configOptions={configOptions}
-          modeLoading={modeLoading}
-          configOptionsLoading={configOptionsLoading}
-          selectorsLoading={selectorsLoading}
-          selectedModeId={selectedModeId}
-          onModeChange={onModeChange}
-          onConfigOptionChange={onConfigOptionChange}
-          agentType={agentType}
-          availableCommands={availableCommands}
-          attachmentTabId={attachmentTabId}
-          draftStorageKey={draftStorageKey}
-          isActive={isActive}
-          queue={queue}
-          onEnqueue={onEnqueue}
-          onQueueReorder={onQueueReorder}
-          onQueueEdit={onQueueEdit}
-          onQueueDelete={onQueueDelete}
-          editingItemId={editingItemId}
-          editingDraftText={editingDraftText}
-          isEditingQueueItem={isEditingQueueItem}
-          onSaveQueueEdit={onSaveQueueEdit}
-          onCancelQueueEdit={onCancelQueueEdit}
-          onForkSend={onForkSend}
-        />
+        <div className="mx-auto w-full max-w-3xl">
+          <ChatInput
+            status={status}
+            promptCapabilities={promptCapabilities}
+            defaultPath={defaultPath}
+            agentName={agentName}
+            onFocus={onFocus}
+            onSend={onSend}
+            onCancel={onCancel}
+            modes={modes}
+            configOptions={configOptions}
+            modeLoading={modeLoading}
+            configOptionsLoading={configOptionsLoading}
+            selectorsLoading={selectorsLoading}
+            selectedModeId={selectedModeId}
+            onModeChange={onModeChange}
+            onConfigOptionChange={onConfigOptionChange}
+            agentType={agentType}
+            availableCommands={availableCommands}
+            attachmentTabId={attachmentTabId}
+            draftStorageKey={draftStorageKey}
+            isActive={isActive}
+            queue={queue}
+            onEnqueue={onEnqueue}
+            onQueueReorder={onQueueReorder}
+            onQueueEdit={onQueueEdit}
+            onQueueDelete={onQueueDelete}
+            editingItemId={editingItemId}
+            editingDraftText={editingDraftText}
+            isEditingQueueItem={isEditingQueueItem}
+            onSaveQueueEdit={onSaveQueueEdit}
+            onCancelQueueEdit={onCancelQueueEdit}
+            onForkSend={onForkSend}
+          />
+        </div>
       )}
 
       {retryLineText && (

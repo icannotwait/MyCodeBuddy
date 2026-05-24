@@ -377,6 +377,7 @@ pub async fn spawn_agent_connection(
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
+    delegation_injection: Option<DelegationInjection>,
 ) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -452,6 +453,7 @@ pub async fn spawn_agent_connection(
             connection_id: cleanup_connection_id,
         };
 
+        let delegation_for_cleanup = delegation_injection.clone();
         let result = run_connection(
             agent,
             conn_id.clone(),
@@ -464,8 +466,24 @@ pub async fn spawn_agent_connection(
             terminal_base_env,
             preferred_mode_id,
             preferred_config_values,
+            delegation_injection,
         )
         .await;
+
+        // Revoke the per-launch token + cascade cancel any still-pending
+        // delegations owned by this parent connection. Both are best-effort:
+        // a missing token entry is a no-op, and `cancel_by_parent` is safe
+        // to call on an empty pending map.
+        if let Some(inj) = delegation_for_cleanup {
+            let token = {
+                let snap = state_clone.read().await;
+                snap.delegation_token.clone()
+            };
+            if let Some(tok) = token {
+                inj.tokens.revoke(&tok).await;
+            }
+            inj.broker.cancel_by_parent(&conn_id).await;
+        }
 
         if let Err(e) = result {
             let code = e.code().map(String::from);
@@ -815,6 +833,141 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
     out
 }
 
+/// Context the connection layer needs to inject the built-in `codeg-delegate`
+/// MCP entry. Built once per `run_connection` from the live AppState pieces
+/// (broker config, token registry, UDS path) and passed through.
+///
+/// Optional because some test paths spin up `run_connection` without a
+/// full delegation stack — those just skip injection.
+#[derive(Clone)]
+pub struct DelegationInjection {
+    pub broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+    pub tokens: Arc<crate::acp::delegation::listener::TokenRegistry>,
+    pub socket_path: PathBuf,
+}
+
+/// Locate the `codeg-mcp` companion binary across the supported deployment
+/// shapes:
+///
+/// 1. `CODEG_MCP_BIN` env override — explicit absolute path. Lets dev shells,
+///    custom installs, and integration tests point at a freshly compiled
+///    binary without touching the install layout.
+/// 2. Sibling of the running executable — the production layout for every
+///    shipping target. Tauri sidecar (`Contents/MacOS/codeg-mcp` on macOS,
+///    next to `codeg.exe` on Windows, next to the unix binary on Linux
+///    deb/rpm), `install.sh`/`install.ps1` (drops `codeg-mcp` next to
+///    `codeg-server`), Docker image (`/usr/local/bin/codeg-mcp` next to
+///    `codeg-server`), and `cargo build` dev output
+///    (`target/<profile>/codeg-mcp`).
+/// 3. `PATH` lookup — last-resort for atypical layouts where ops moved the
+///    two binaries apart but kept both reachable on `PATH`.
+///
+/// Returns `None` when no candidate is an executable file. Callers MUST
+/// treat `None` as "delegation is unavailable at this site" and skip
+/// injection — never paper over with a phantom path, because that fails
+/// inside the agent's MCP spawn loop and may take the entire ACP session
+/// down on stricter agents.
+fn locate_codeg_mcp_binary() -> Option<PathBuf> {
+    let filename = if cfg!(windows) {
+        "codeg-mcp.exe"
+    } else {
+        "codeg-mcp"
+    };
+
+    if let Some(raw) = std::env::var_os("CODEG_MCP_BIN") {
+        let candidate = PathBuf::from(raw);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        let candidate = dir.join(filename);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    which::which(filename)
+        .ok()
+        .filter(|p| is_executable_file(p))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Append the built-in `codeg-delegate` MCP entry if delegation is enabled
+/// AND the companion binary is present on disk. Returns the per-launch token
+/// that was registered, or `None` when injection was skipped (disabled by
+/// config, or binary missing).
+///
+/// When the binary is missing we log a single-line warning and skip
+/// injection rather than register the token + emit a phantom McpServerStdio
+/// pointing at a non-existent path. Phantom injection would have made every
+/// new ACP session ship a guaranteed-to-fail MCP server entry: stricter
+/// agents (Claude Code) refuse the whole session; lax agents lose the
+/// delegate tool silently. Skipping leaves the agent fully functional minus
+/// `delegate_to_agent`, which is the right degradation when codeg-mcp didn't
+/// make it into the install.
+async fn inject_codeg_delegate_mcp(
+    servers: &mut Vec<McpServer>,
+    injection: &DelegationInjection,
+    parent_connection_id: &str,
+    working_dir: &Path,
+) -> Option<String> {
+    let cfg = injection.broker.config_snapshot().await;
+    if !cfg.enabled {
+        return None;
+    }
+    let Some(binary_path) = locate_codeg_mcp_binary() else {
+        eprintln!(
+            "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
+             exe sibling, and PATH); skipping delegate_to_agent tool injection for \
+             connection {parent_connection_id}. Reinstall codeg or set CODEG_MCP_BIN to fix."
+        );
+        return None;
+    };
+    let token = uuid::Uuid::new_v4().to_string();
+    injection
+        .tokens
+        .register(
+            token.clone(),
+            crate::acp::delegation::listener::TokenEntry {
+                parent_connection_id: parent_connection_id.to_string(),
+                working_dir: working_dir.to_path_buf(),
+            },
+        )
+        .await;
+    let mut server = McpServerStdio::new("codeg-delegate", binary_path);
+    server = server.args(vec![
+        "--parent-connection-id".to_string(),
+        parent_connection_id.to_string(),
+        "--socket-path".to_string(),
+        injection.socket_path.to_string_lossy().to_string(),
+        "--token".to_string(),
+        token.clone(),
+    ]);
+    servers.push(McpServer::Stdio(server));
+    Some(token)
+}
+
 /// Resolve an MCP server `command` to an absolute path.
 ///
 /// The ACP spec requires `McpServerStdio.command` to be an absolute path.
@@ -925,6 +1078,7 @@ async fn run_connection(
     terminal_base_env: BTreeMap<String, String>,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
+    delegation_injection: Option<DelegationInjection>,
 ) -> Result<(), AcpError> {
     let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // `terminal_base_env` already filtered to just the credential helper
@@ -1129,7 +1283,7 @@ async fn run_connection(
             // capabilities the agent just declared. Stdio is mandatory per
             // ACP spec; HTTP/SSE are gated on `mcp_capabilities.{http,sse}`.
             let mcp_caps = &init_resp.agent_capabilities.mcp_capabilities;
-            let mcp_servers: Vec<McpServer> = load_mcp_servers_for_agent(agent_type)
+            let mut mcp_servers: Vec<McpServer> = load_mcp_servers_for_agent(agent_type)
                 .into_iter()
                 .filter(|s| match s {
                     McpServer::Stdio(_) => true,
@@ -1158,6 +1312,20 @@ async fn run_connection(
                     _ => false,
                 })
                 .collect();
+
+            // Inject the built-in `codeg-delegate` MCP server. Stdio is
+            // unconditionally supported by the ACP wire — no `mcp_caps`
+            // filter needed. The returned token is stashed on the session
+            // state so connection teardown can revoke it.
+            let delegate_token = if let Some(inj) = delegation_injection.as_ref() {
+                inject_codeg_delegate_mcp(&mut mcp_servers, inj, &conn_id, &cwd).await
+            } else {
+                None
+            };
+            if let Some(ref tok) = delegate_token {
+                let mut s = state.write().await;
+                s.delegation_token = Some(tok.clone());
+            }
 
             // Emit fork support capability
             emit_with_state(
@@ -1290,6 +1458,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            delegation_injection.as_ref(),
                         )
                         .await;
                         terminal_runtime.release_all_for_session(&sid).await;
@@ -1305,6 +1474,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            delegation_injection.as_ref(),
                         )
                         .await
                     }
@@ -1427,6 +1597,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            delegation_injection.as_ref(),
                         )
                         .await;
                         terminal_runtime
@@ -1444,6 +1615,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            delegation_injection.as_ref(),
                         )
                         .await
                     }
@@ -1499,6 +1671,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    delegation_injection.as_ref(),
                 )
                 .await;
                 terminal_runtime.release_all_for_session(&sid).await;
@@ -1514,6 +1687,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    delegation_injection.as_ref(),
                 )
                 .await
             }
@@ -2356,6 +2530,10 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    // Threaded through from run_connection so the forked session's
+    // run_conversation_loop call has the same delegation cascade
+    // capability as the original.
+    delegation_injection: Option<&DelegationInjection>,
 ) -> Result<(), sacp::Error> {
     let fork_info = match loop_result {
         Ok(Some(info)) => info,
@@ -2419,6 +2597,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        delegation_injection,
     )
     .await;
     terminal_runtime.release_all_for_session(&new_sid).await;
@@ -2436,6 +2615,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        delegation_injection,
     ))
     .await
 }
@@ -2535,6 +2715,10 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    // Source of the broker reference used to cascade-cancel pending
+    // delegations on parent prompt cancel / non-success TurnComplete.
+    // `None` for test paths that don't wire delegation.
+    delegation_injection: Option<&DelegationInjection>,
 ) -> Result<Option<ForkExitInfo>, sacp::Error> {
     // Session-scoped cache for diffing cumulative `raw_output` snapshots
     // into incremental deltas. Shared across the idle loop and the active
@@ -2719,6 +2903,33 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
+                                    // Cascade-cancel any pending delegations
+                                    // whenever the parent's turn ended for a
+                                    // reason other than clean `end_turn`. The
+                                    // `end_turn` path lets the legitimate
+                                    // delegation completion drain naturally;
+                                    // every other reason (cancelled / refusal /
+                                    // max_tokens / max_turn_requests / empty /
+                                    // unknown) means the parent will never
+                                    // consume the in-flight result, so the
+                                    // child must be torn down.
+                                    //
+                                    // Fire-and-forget: the cascade per child
+                                    // does spawner.cancel + spawner.disconnect,
+                                    // which can block on slow agents — keep the
+                                    // parent's message loop unblocked and rely
+                                    // on the broker's idempotent drain so the
+                                    // cleanup-guard cascade at run_connection
+                                    // exit can't race-double-drain.
+                                    if reason_str != "end_turn" {
+                                        if let Some(inj) = delegation_injection {
+                                            let broker = inj.broker.clone();
+                                            let parent_id = conn_id.to_string();
+                                            tokio::spawn(async move {
+                                                broker.cancel_by_parent(&parent_id).await;
+                                            });
+                                        }
+                                    }
                                     break;
                                 }
                                 _ => {}
@@ -2759,6 +2970,21 @@ async fn run_conversation_loop<'a>(
                                 },
                             )
                             .await;
+                            // Mirror the StopReason-message branch above:
+                            // cascade-cancel on any non-`end_turn` reason
+                            // so in-flight delegations don't dangle when
+                            // the parent's turn ended without consuming
+                            // their result. Fire-and-forget for the same
+                            // reason as the StopReason branch — see above.
+                            if reason_str != "end_turn" {
+                                if let Some(inj) = delegation_injection {
+                                    let broker = inj.broker.clone();
+                                    let parent_id = conn_id.to_string();
+                                    tokio::spawn(async move {
+                                        broker.cancel_by_parent(&parent_id).await;
+                                    });
+                                }
+                            }
                             break;
                         }
                         _ = terminal_poll_interval.tick(), if !tracked_terminal_tool_calls.is_empty() => {
@@ -2862,6 +3088,7 @@ async fn run_conversation_loop<'a>(
                                             RequestPermissionOutcome::Cancelled,
                                         ));
                                     }
+                                    drop(locked);
                                     // Immediately emit TurnComplete so the frontend
                                     // transitions out of "prompting" and the user can
                                     // send new messages.  Don't wait for the agent --
@@ -2876,6 +3103,27 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
+                                    // Cascade-cancel any in-flight delegations owned by
+                                    // this parent connection. Idempotent with the
+                                    // cleanup-guard cancel_by_parent at the end of
+                                    // run_connection (#1: empty pending → no-op).
+                                    // Without this, a user-initiated cancel of a parent
+                                    // prompt mid-delegation leaves the child agent
+                                    // running indefinitely until broker timeout.
+                                    //
+                                    // Fire-and-forget so the user-visible Cancel
+                                    // path doesn't wait on (potentially slow)
+                                    // child agent teardown — the user already
+                                    // sees the parent's TurnComplete above and
+                                    // the broker's drain-first lock guarantees
+                                    // no double DelegationCompleted emit.
+                                    if let Some(inj) = delegation_injection {
+                                        let broker = inj.broker.clone();
+                                        let parent_id = conn_id.to_string();
+                                        tokio::spawn(async move {
+                                            broker.cancel_by_parent(&parent_id).await;
+                                        });
+                                    }
                                     // Drain the prompt response in the background so
                                     // the SACP library doesn't log "receiver dropped"
                                     // errors when the agent eventually responds.
@@ -2989,6 +3237,22 @@ async fn run_conversation_loop<'a>(
                     let _ = responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
                     ));
+                }
+                drop(locked);
+                // Cascade-cancel any pending delegations owned by this parent.
+                // Reached when Cancel arrives between prompts (idle path); the
+                // inner Cancel handler covers mid-prompt. Both must trigger
+                // because the per-prompt cancel path doesn't tear down the
+                // parent connection, so the cleanup-guard cancel_by_parent
+                // at run_connection's exit wouldn't fire.
+                //
+                // Fire-and-forget: see inner Cancel handler above for rationale.
+                if let Some(inj) = delegation_injection {
+                    let broker = inj.broker.clone();
+                    let parent_id = conn_id.to_string();
+                    tokio::spawn(async move {
+                        broker.cancel_by_parent(&parent_id).await;
+                    });
                 }
             }
             Some(ConnectionCommand::Fork { reply }) => {

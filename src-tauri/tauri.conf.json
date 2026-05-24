@@ -4,9 +4,9 @@
   "version": "0.13.10",
   "identifier": "app.codeg",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm tauri:before-dev",
     "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm tauri:before-build",
     "frontendDist": "../out"
   },
   "app": {
@@ -29,7 +29,8 @@
     ],
     "resources": {
       "../out": "web/"
-    }
+    },
+    "externalBin": ["binaries/codeg-mcp"]
   },
   "plugins": {
     "updater": {

@@ -167,6 +167,31 @@ export interface ConnectionState {
    * Phase 3b initialises to 0 on CONNECTION_CREATED.
    */
   lastAppliedSeq: number
+  /**
+   * True when this entry was synthesized for a backend connection that
+   * was spawned by the delegation broker (not via a user-driven
+   * `connect()`). Such entries piggy-back on the same reducer pipeline
+   * as real connections so the child's live message, tool calls, and
+   * permission requests reach the UI, but they MUST be hidden from any
+   * user-facing connection list / picker, and they MUST NOT be reaped
+   * by the idle sweep — their lifetime is governed by the parent's
+   * delegation_started / delegation_completed events.
+   */
+  isDelegationChild: boolean
+  /**
+   * For delegation-child entries: the parent's `tool_use_id` that owns
+   * this child. The DelegatedSubThread component uses this to resolve
+   * the child connection state from its parent-side identifier. Null
+   * for non-delegation connections.
+   */
+  parentToolUseId: string | null
+  /**
+   * For delegation-child entries: the parent connection that spawned
+   * this child. Carried for diagnostic / cascade-cancel purposes; not
+   * required for the rendering path. Null for non-delegation
+   * connections.
+   */
+  parentConnectionId: string | null
 }
 
 type ConnectRequest = {
@@ -349,6 +374,30 @@ type Action =
       type: "EVENT_APPLIED"
       contextKey: string
       seq: number
+    }
+  | {
+      /**
+       * Synthesize a ConnectionState for a delegation-spawned child so
+       * its acp://event stream lands in the reducer the same way a
+       * user-driven connect() does. contextKey == connectionId for these
+       * entries — the child has no user-facing tab to anchor a separate
+       * key against.
+       */
+      type: "DELEGATION_CHILD_ATTACH"
+      contextKey: string
+      connectionId: string
+      agentType: AgentType
+      parentConnectionId: string
+      parentToolUseId: string
+    }
+  | {
+      /**
+       * Remove the synthetic child entry once the delegation has wound
+       * down (delegation_completed) and any grace window has elapsed.
+       * No-op when the entry is already gone.
+       */
+      type: "DELEGATION_CHILD_DETACH"
+      contextKey: string
     }
 
 type StreamingAction =
@@ -761,7 +810,65 @@ function connectionsReducer(
         error: null,
         loadError: null,
         lastAppliedSeq: 0,
+        isDelegationChild: false,
+        parentToolUseId: null,
+        parentConnectionId: null,
       })
+      return next
+    }
+
+    case "DELEGATION_CHILD_ATTACH": {
+      // Idempotent: if an entry already exists for this key with the
+      // same connectionId, leave it untouched so a duplicate
+      // delegation_started (e.g. replayed from snapshot hydration after
+      // a refresh) doesn't blow away the live stream that has already
+      // populated. If the connectionId differs we replace, since a new
+      // spawn won the race.
+      const existing = state.get(action.contextKey)
+      if (existing && existing.connectionId === action.connectionId) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        connectionId: action.connectionId,
+        contextKey: action.contextKey,
+        agentType: action.agentType,
+        workingDir: null,
+        // The child is already alive in the backend by the time
+        // delegation_started fires; treat it as connected so any UI
+        // surface that gates on status reflects reality.
+        status: "connected",
+        promptCapabilities: {
+          image: false,
+          audio: false,
+          embedded_context: false,
+        },
+        supportsFork: false,
+        selectorsReady: true,
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingQuestion: null,
+        claudeApiRetry: null,
+        error: null,
+        loadError: null,
+        lastAppliedSeq: 0,
+        isDelegationChild: true,
+        parentToolUseId: action.parentToolUseId,
+        parentConnectionId: action.parentConnectionId,
+      })
+      return next
+    }
+
+    case "DELEGATION_CHILD_DETACH": {
+      const existing = state.get(action.contextKey)
+      if (!existing || !existing.isDelegationChild) return state
+      const next = new Map(state)
+      next.delete(action.contextKey)
       return next
     }
 
@@ -1579,6 +1686,31 @@ export interface AcpActionsValue {
    * the conversation detail panel.
    */
   clearAcpLoadError(contextKey: string): void
+  /**
+   * Register a delegation-spawned child connection so its acp://event
+   * stream lands in the reducer (live message, tool calls, permission
+   * requests). The child connection is already alive on the backend —
+   * this is a frontend-only attach. Idempotent on connectionId.
+   *
+   * Routing:
+   *   * Tauri: registers the connectionId in the global event router
+   *     and drains any envelopes that arrived before registration.
+   *   * Web/remote: opens a per-connection WS attach so the snapshot +
+   *     replay + live events arrive on a dedicated stream.
+   */
+  attachDelegationChild(args: {
+    connectionId: string
+    parentConnectionId: string
+    parentToolUseId: string
+    agentType: AgentType
+  }): void
+  /**
+   * Tear down a previously-attached delegation child. Releases the
+   * synthetic ConnectionState and any per-connection WS attach. Does
+   * NOT call acpDisconnect — the broker owns the child's backend
+   * lifecycle. No-op when the child isn't attached.
+   */
+  detachDelegationChild(connectionId: string): void
 }
 
 const AcpActionsContext = createContext<AcpActionsValue | null>(null)
@@ -2692,6 +2824,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           continue
         }
         if (conn.status !== "connected") continue
+        // Delegation children are owned by the broker — the
+        // delegation_completed event is the only signal that should
+        // tear them down (via detachDelegationChild). The idle sweep
+        // would otherwise call acpDisconnect on a backend connection
+        // still mid-prompt for the parent's tool_use.
+        if (conn.isDelegationChild) continue
         const lastActive = lastActivityRef.current.get(contextKey) ?? 0
         if (now - lastActive > CONNECTION_IDLE_TIMEOUT_MS) {
           toDisconnect.push({
@@ -2718,8 +2856,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const reverseMap = reverseMapRef.current
     const attachSubs = attachSubscriptionsRef.current
+    // Capture the store ref at effect-setup time so the cleanup
+    // function doesn't read a moving target (`storeRef.current` is the
+    // same object across renders by design, but the lint rule
+    // `react-hooks/exhaustive-deps` flags reading it inside cleanup
+    // because in the general case a ref's `.current` can be replaced).
+    const store = storeRef.current
     return () => {
-      for (const [connectionId] of reverseMap) {
+      for (const [connectionId, contextKey] of reverseMap) {
+        // Delegation-child entries are not real user-facing
+        // connections — the broker owns their backend lifecycle and
+        // will tear them down when the parent's delegation resolves.
+        // Calling acpDisconnect on them here would race the broker's
+        // own one-shot teardown and emit a benign-but-noisy "unknown
+        // connection" error from the backend.
+        const conn = store.connections.get(contextKey)
+        if (conn?.isDelegationChild) continue
         acpDisconnect(connectionId).catch(() => {})
       }
       for (const [, sub] of attachSubs) {
@@ -3166,6 +3318,76 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [dispatch]
   )
 
+  const attachDelegationChild = useCallback(
+    (args: {
+      connectionId: string
+      parentConnectionId: string
+      parentToolUseId: string
+      agentType: AgentType
+    }) => {
+      const { connectionId, parentConnectionId, parentToolUseId, agentType } =
+        args
+      const existing = storeRef.current.connections.get(connectionId)
+      if (
+        existing &&
+        existing.isDelegationChild &&
+        existing.connectionId === connectionId
+      ) {
+        // Already attached; just refresh activity so the idle sweep
+        // doesn't trip on a duplicate delegation_started event.
+        lastActivityRef.current.set(connectionId, Date.now())
+        return
+      }
+      dispatch({
+        type: "DELEGATION_CHILD_ATTACH",
+        contextKey: connectionId,
+        connectionId,
+        agentType,
+        parentConnectionId,
+        parentToolUseId,
+      })
+      lastActivityRef.current.set(connectionId, Date.now())
+
+      const stream = getEventStream()
+      if (stream) {
+        // Web / remote transport: open a per-connection attach so the
+        // child's snapshot + replay + live events flow through the
+        // standard handlers. This is independent of any user-driven
+        // tab attach because contextKey == connectionId for children.
+        setupAttachSubscription(connectionId, connectionId, undefined)
+        return
+      }
+
+      // Tauri desktop: the global acp://event listener routes by
+      // reverseMap. Register the identity mapping and drain any
+      // envelopes that arrived between the child's spawn and now.
+      reverseMapRef.current.set(connectionId, connectionId)
+      const buffered = consumeBufferedEvents(connectionId)
+      for (const env of buffered) {
+        applyMappedEnvelope(connectionId, env)
+      }
+    },
+    [
+      applyMappedEnvelope,
+      consumeBufferedEvents,
+      dispatch,
+      setupAttachSubscription,
+    ]
+  )
+
+  const detachDelegationChild = useCallback(
+    (connectionId: string) => {
+      const existing = storeRef.current.connections.get(connectionId)
+      if (!existing || !existing.isDelegationChild) return
+      teardownAttachSubscription(connectionId)
+      reverseMapRef.current.delete(connectionId)
+      pendingUnmappedEventsRef.current.delete(connectionId)
+      lastActivityRef.current.delete(connectionId)
+      dispatch({ type: "DELEGATION_CHILD_DETACH", contextKey: connectionId })
+    },
+    [dispatch, teardownAttachSubscription]
+  )
+
   const actions = useMemo<AcpActionsValue>(
     () => ({
       connect,
@@ -3180,6 +3402,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       touchActivity,
       registerOpenTabKeys,
       clearAcpLoadError,
+      attachDelegationChild,
+      detachDelegationChild,
     }),
     [
       connect,
@@ -3194,6 +3418,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       touchActivity,
       registerOpenTabKeys,
       clearAcpLoadError,
+      attachDelegationChild,
+      detachDelegationChild,
     ]
   )
 

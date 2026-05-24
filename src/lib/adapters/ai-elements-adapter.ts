@@ -27,6 +27,13 @@ export type AdaptedToolCallPart = {
   output?: string | null
   errorText?: string
   agentStats?: AgentExecutionStats | null
+  /**
+   * ACP extensibility metadata forwarded from `ContentBlock.tool_use.meta`.
+   * Opaque pass-through; the only consumer today is `<DelegatedSubThread>`
+   * which reads `meta["codeg.delegation"]` as a binding fallback when the
+   * live DelegationContext entry is missing (page refresh, late mount).
+   */
+  meta?: Record<string, unknown> | null
 }
 
 /**
@@ -586,10 +593,12 @@ function adaptContentBlock(
     case "tool_use":
       return {
         type: "tool-call",
-        toolCallId: generateToolCallId(messageId, blockIndex),
+        toolCallId:
+          block.tool_use_id ?? generateToolCallId(messageId, blockIndex),
         toolName: block.tool_name,
         input: block.input_preview,
         state: "input-available",
+        meta: block.meta ?? null,
       }
 
     case "tool_result":
@@ -792,6 +801,7 @@ export function adaptMessageTurn(
             ? matchedResult.output_preview || undefined
             : undefined,
           agentStats: matchedResult.agent_stats ?? undefined,
+          meta: block.meta ?? null,
         })
       } else {
         // Position-based matching: if this tool_use has no ID, check next block
@@ -818,6 +828,7 @@ export function adaptMessageTurn(
               ? positionalResult.output_preview || undefined
               : undefined,
             agentStats: positionalResult.agent_stats ?? undefined,
+            meta: block.meta ?? null,
           })
         } else {
           // For live streaming, unmatched tools are still running.
@@ -829,6 +840,7 @@ export function adaptMessageTurn(
             toolName: block.tool_name,
             input: block.input_preview,
             state: isStreaming ? "input-available" : "output-available",
+            meta: block.meta ?? null,
           })
         }
       }

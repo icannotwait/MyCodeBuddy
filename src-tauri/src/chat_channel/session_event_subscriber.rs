@@ -164,6 +164,18 @@ async fn handle_acp_envelope(
             raw_input,
             ..
         } => {
+            // Emit a "delegation started" placeholder to the channel so
+            // remote users see something happen as soon as the parent agent
+            // fires `delegate_to_agent`, not only when the child wraps up.
+            let delegation_announce = if is_delegation_title(title) {
+                raw_input
+                    .as_deref()
+                    .and_then(extract_agent_type)
+                    .map(|agent| format!("🤖 Delegating to {agent}…"))
+            } else {
+                None
+            };
+
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
                 // Store title for progress indicator; store raw_input for later
@@ -173,6 +185,12 @@ async fn handle_acp_envelope(
                         .tool_call_inputs
                         .insert(tool_call_id.clone(), input.to_string());
                 }
+                if let Some(text) = delegation_announce {
+                    let channel_id = session.channel_id;
+                    drop(guard);
+                    let msg = RichMessage::info(text);
+                    let _ = manager.send_to_channel(channel_id, &msg).await;
+                }
             }
         }
 
@@ -181,6 +199,7 @@ async fn handle_acp_envelope(
             title,
             status,
             raw_input,
+            raw_output,
             ..
         } => {
             let mut guard = bridge.lock().await;
@@ -196,11 +215,20 @@ async fn handle_acp_envelope(
                     let stored_input = session.tool_call_inputs.remove(tool_call_id);
                     let effective_title = title.as_deref().unwrap_or("tool");
                     let input_ref = stored_input.as_deref().or(raw_input.as_deref());
-                    let detail = format_tool_call_detail(effective_title, input_ref);
                     let channel_id = session.channel_id;
+
+                    let body = if is_delegation_title(effective_title)
+                        || input_ref
+                            .map(|s| extract_agent_type(s).is_some())
+                            .unwrap_or(false)
+                    {
+                        format_delegation_outcome(input_ref, raw_output.as_deref())
+                    } else {
+                        format!(">> {}", format_tool_call_detail(effective_title, input_ref))
+                    };
                     drop(guard);
 
-                    let msg = RichMessage::info(format!(">> {detail}"));
+                    let msg = RichMessage::info(body);
                     let _ = manager.send_to_channel(channel_id, &msg).await;
                 }
             }
@@ -690,5 +718,137 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+/// Title-side match for `delegate_to_agent`. Title is free-form text the
+/// host agent composes; some hosts copy the bare MCP method, some prefix
+/// it with `mcp__<server>__`, some rephrase it. Match by substring so any
+/// of those forms get the delegation-announcement path. The completion-
+/// side callsite already pairs this with a raw_input shape check, so a
+/// rare false-positive here just sends one announce message that gets
+/// overwritten by the completion's actual outcome.
+fn is_delegation_title(title: &str) -> bool {
+    let normalized = title.to_lowercase().replace([' ', '-'], "_");
+    normalized.contains("delegate_to_agent")
+}
+
+/// Pull `agent_type` out of the raw_input JSON (e.g. `{"agent_type":"codex",
+/// "task":"..."}`). Returns the canonical string the agent supplied so the
+/// announce message matches what the user wrote, not a re-mapped label.
+fn extract_agent_type(raw_input: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw_input).ok()?;
+    parsed
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Build the chat-channel summary for a finished `delegate_to_agent` call.
+/// Receives the broker's wire payload (already a JSON-serialized
+/// `DelegationOutcome`) and renders a compact ✅/❌ line plus the short
+/// preview text the user can act on.
+fn format_delegation_outcome(raw_input: Option<&str>, raw_output: Option<&str>) -> String {
+    let agent = raw_input
+        .and_then(extract_agent_type)
+        .unwrap_or_else(|| "agent".to_string());
+
+    // Try to parse the MCP-style structured output Phase 5 emits:
+    //   `{ "kind": "ok", "text": "…", … }` or `{ "kind": "err", "code": "…" }`.
+    // Fall back to the plain text body if the agent already collapsed it.
+    if let Some(out) = raw_output {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(out) {
+            let kind = value.get("kind").and_then(|v| v.as_str());
+            match kind {
+                Some("ok") => {
+                    let text = value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if text.is_empty() {
+                        return format!("✅ {agent} done");
+                    }
+                    let preview = truncate_str(text, 200);
+                    return format!("✅ {agent}: {preview}");
+                }
+                Some("err") => {
+                    let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("err");
+                    return format!("❌ {agent} failed ({code})");
+                }
+                _ => {}
+            }
+        }
+        let preview = truncate_str(out.trim(), 200);
+        if !preview.is_empty() {
+            return format!("✅ {agent}: {preview}");
+        }
+    }
+    format!("✅ {agent} done")
+}
+
+#[cfg(test)]
+mod delegation_relay_tests {
+    use super::*;
+
+    #[test]
+    fn is_delegation_title_matches_variants() {
+        assert!(is_delegation_title("delegate_to_agent"));
+        assert!(is_delegation_title("Delegate To Agent"));
+        assert!(is_delegation_title("delegate-to-agent"));
+        assert!(is_delegation_title(
+            "mcp__codeg-delegate__delegate_to_agent"
+        ));
+        assert!(is_delegation_title("Run mcp__codeg__delegate_to_agent"));
+        assert!(!is_delegation_title("agent"));
+        assert!(!is_delegation_title("write"));
+    }
+
+    #[test]
+    fn extract_agent_type_pulls_canonical_string() {
+        assert_eq!(
+            extract_agent_type(r#"{"agent_type":"codex","task":"x"}"#),
+            Some("codex".into())
+        );
+        assert_eq!(extract_agent_type(r#"{"task":"x"}"#), None);
+        assert_eq!(extract_agent_type("not json"), None);
+    }
+
+    #[test]
+    fn format_delegation_outcome_renders_ok_with_preview() {
+        let out = r#"{"kind":"ok","text":"  hello world  "}"#;
+        let body = format_delegation_outcome(Some(r#"{"agent_type":"codex"}"#), Some(out));
+        assert_eq!(body, "✅ codex: hello world");
+    }
+
+    #[test]
+    fn format_delegation_outcome_renders_err_with_code() {
+        let out = r#"{"kind":"err","code":"timeout"}"#;
+        let body = format_delegation_outcome(Some(r#"{"agent_type":"gemini"}"#), Some(out));
+        assert_eq!(body, "❌ gemini failed (timeout)");
+    }
+
+    #[test]
+    fn format_delegation_outcome_falls_back_to_plain_text() {
+        let body =
+            format_delegation_outcome(Some(r#"{"agent_type":"cline"}"#), Some("plain reply body"));
+        assert_eq!(body, "✅ cline: plain reply body");
+    }
+
+    #[test]
+    fn format_delegation_outcome_empty_output_marks_done() {
+        let body = format_delegation_outcome(Some(r#"{"agent_type":"open_code"}"#), None);
+        assert_eq!(body, "✅ open_code done");
+    }
+
+    #[test]
+    fn format_delegation_outcome_truncates_long_ok_text() {
+        let long_text = "x".repeat(400);
+        let out = format!(r#"{{"kind":"ok","text":"{long_text}"}}"#);
+        let body = format_delegation_outcome(Some(r#"{"agent_type":"codex"}"#), Some(&out));
+        // 200-char cap + "..."
+        assert!(body.len() < 300);
+        assert!(body.starts_with("✅ codex: "));
+        assert!(body.ends_with("..."));
     }
 }

@@ -1,0 +1,37 @@
+{
+  "name": "delegate_to_agent",
+  "description": "Delegate a self-contained task to another local AI coding agent and wait for its result. The sub-agent runs as an independent session with no access to this conversation's history; pass everything it needs in `task`. Use sparingly — each call spawns a full agent process and may take minutes.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["agent_type", "task"],
+    "properties": {
+      "agent_type": {
+        "type": "string",
+        "enum": [
+          "claude_code",
+          "codex",
+          "open_code",
+          "gemini",
+          "cline",
+          "open_claw"
+        ],
+        "description": "Which agent type to spawn for this sub-task."
+      },
+      "task": {
+        "type": "string",
+        "description": "Complete, self-contained task description. The sub-agent does NOT see this conversation's prior messages."
+      },
+      "working_dir": {
+        "type": "string",
+        "description": "Optional absolute path. Defaults to the parent session's working directory."
+      },
+      "timeout_seconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 3600,
+        "default": 600,
+        "description": "Per-call timeout. Defaults to 600 seconds."
+      }
+    }
+  }
+}

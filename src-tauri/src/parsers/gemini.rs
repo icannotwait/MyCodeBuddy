@@ -423,6 +423,9 @@ impl GeminiParser {
             message_count: messages.len() as u32,
             model,
             git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
         })
     }
 
@@ -537,6 +540,7 @@ impl GeminiParser {
                     tool_use_id: tool_use_id.clone(),
                     tool_name,
                     input_preview,
+                    meta: None,
                 });
 
                 let output_preview = Self::result_display_preview(call.get("resultDisplay"))

@@ -130,34 +130,34 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Codex CLI",
             description: "ACP adapter for OpenAI's coding assistant",
             distribution: AgentDistribution::Binary {
-                version: "0.14.0",
+                version: "0.15.0",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-aarch64-apple-darwin.tar.gz",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-aarch64-apple-darwin.tar.gz",
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-x86_64-apple-darwin.tar.gz",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-x86_64-apple-darwin.tar.gz",
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-aarch64-unknown-linux-gnu.tar.gz",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-aarch64-unknown-linux-gnu.tar.gz",
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-x86_64-unknown-linux-gnu.tar.gz",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-x86_64-unknown-linux-gnu.tar.gz",
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-aarch64-pc-windows-msvc.zip",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-aarch64-pc-windows-msvc.zip",
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.14.0/codex-acp-0.14.0-x86_64-pc-windows-msvc.zip",
+                        url: "https://github.com/zed-industries/codex-acp/releases/download/v0.15.0/codex-acp-0.15.0-x86_64-pc-windows-msvc.zip",
                     },
                 ],
             },
@@ -206,34 +206,34 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenCode",
             description: "The open source coding agent",
             distribution: AgentDistribution::Binary {
-                version: "1.15.7",
+                version: "1.15.10",
                 cmd: "opencode",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-darwin-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-darwin-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-darwin-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-darwin-x64.zip",
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-linux-arm64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-linux-arm64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-linux-x64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-linux-x64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-windows-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-windows-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.7/opencode-windows-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.15.10/opencode-windows-x64.zip",
                     },
                 ],
             },
@@ -270,6 +270,33 @@ mod tests {
         }
     }
 
+    fn assert_binary_version(
+        agent_type: AgentType,
+        expected_version: &str,
+        expected_release_path: &str,
+    ) {
+        let meta = get_agent_meta(agent_type);
+        match meta.distribution {
+            AgentDistribution::Binary {
+                version, platforms, ..
+            } => {
+                assert_eq!(version, expected_version);
+                assert_eq!(meta.registry_version(), Some(expected_version));
+                for platform in platforms {
+                    assert!(
+                        platform.url.contains(expected_release_path),
+                        "{} URL did not use {expected_release_path}: {}",
+                        platform.platform,
+                        platform.url
+                    );
+                }
+            }
+            AgentDistribution::Npx { .. } => {
+                panic!("expected binary distribution for {agent_type:?}");
+            }
+        }
+    }
+
     #[test]
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
@@ -285,26 +312,11 @@ mod tests {
             Some("22.19.0"),
         );
         assert_npx_version(AgentType::Cline, "3.0.9", "cline@3.0.9", None);
-
-        let meta = get_agent_meta(AgentType::OpenCode);
-        match meta.distribution {
-            AgentDistribution::Binary {
-                version, platforms, ..
-            } => {
-                assert_eq!(version, "1.15.7");
-                assert_eq!(meta.registry_version(), Some("1.15.7"));
-                for platform in platforms {
-                    assert!(
-                        platform.url.contains("/releases/download/v1.15.7/"),
-                        "{} URL did not use v1.15.7: {}",
-                        platform.platform,
-                        platform.url
-                    );
-                }
-            }
-            AgentDistribution::Npx { .. } => {
-                panic!("expected binary distribution for OpenCode");
-            }
-        }
+        assert_binary_version(AgentType::Codex, "0.15.0", "/releases/download/v0.15.0/");
+        assert_binary_version(
+            AgentType::OpenCode,
+            "1.15.10",
+            "/releases/download/v1.15.10/",
+        );
     }
 }

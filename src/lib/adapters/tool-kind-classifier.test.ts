@@ -50,10 +50,26 @@ describe("isAgentLikeToolName", () => {
     expect(isAgentLikeToolName("  agent ")).toBe(true)
   })
 
+  it("matches delegate_to_agent across host naming conventions", () => {
+    expect(isAgentLikeToolName("delegate_to_agent")).toBe(true)
+    // Claude Code style
+    expect(isAgentLikeToolName("mcp__codeg-delegate__delegate_to_agent")).toBe(
+      true
+    )
+    expect(isAgentLikeToolName("mcp__codeg__delegate_to_agent")).toBe(true)
+    // Codex live ACP style (server/tool)
+    expect(isAgentLikeToolName("codeg-delegate/delegate_to_agent")).toBe(true)
+    // Dot- and colon-separated forms other hosts may emit
+    expect(isAgentLikeToolName("codeg-delegate.delegate_to_agent")).toBe(true)
+    expect(isAgentLikeToolName("codeg-delegate:delegate_to_agent")).toBe(true)
+  })
+
   it("does not match other tools", () => {
     expect(isAgentLikeToolName("task")).toBe(false)
     expect(isAgentLikeToolName("subagent")).toBe(false)
     expect(isAgentLikeToolName("")).toBe(false)
+    // No separator before the suffix — must not match.
+    expect(isAgentLikeToolName("xdelegate_to_agent")).toBe(false)
   })
 })
 

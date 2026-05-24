@@ -15,11 +15,35 @@ pub async fn create(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_with_delegation(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Mirror of [`create`] plus optional delegation linkage. Used by the
+/// multi-agent broker when spawning a child sub-session — populates
+/// `parent_id` / `parent_tool_use_id` / `delegation_call_id` so the lifecycle
+/// subscriber and frontend can rebuild the parent ↔ child binding without
+/// inspecting the live broker state.
+pub async fn create_with_delegation(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+) -> Result<conversation::Model, DbError> {
     let at_str = serde_json::to_value(agent_type)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     let now = Utc::now();
+    let (parent_id, parent_tool_use_id, delegation_call_id) = match delegation {
+        Some(link) => (
+            Some(link.parent_conversation_id),
+            Some(link.parent_tool_use_id),
+            Some(link.delegation_call_id),
+        ),
+        None => (None, None, None),
+    };
     let model = conversation::ActiveModel {
         id: NotSet,
         folder_id: Set(folder_id),
@@ -29,7 +53,9 @@ pub async fn create(
         model: Set(None),
         git_branch: Set(git_branch),
         external_id: Set(None),
-        parent_id: Set(None),
+        parent_id: Set(parent_id),
+        parent_tool_use_id: Set(parent_tool_use_id),
+        delegation_call_id: Set(delegation_call_id),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
@@ -152,6 +178,9 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         message_count: r.message_count as u32,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        parent_id: r.parent_id,
+        parent_tool_use_id: r.parent_tool_use_id,
+        delegation_call_id: r.delegation_call_id,
     }
 }
 
@@ -221,6 +250,11 @@ pub async fn list_by_folder(
 /// List conversations across folders. When `folder_ids` is `None`, queries all
 /// When `folder_ids` is provided, results are scoped to that set. Otherwise
 /// returns conversations across every non-deleted folder (open or not).
+///
+/// `include_children` controls visibility of delegation sub-sessions. When
+/// `false` (the default for the top-level list), rows whose `parent_id` is
+/// non-null are filtered out — they belong to their parent's tool-call view,
+/// not the workspace conversation list.
 pub async fn list_all(
     conn: &DatabaseConnection,
     folder_ids: Option<Vec<i32>>,
@@ -228,8 +262,13 @@ pub async fn list_all(
     search: Option<String>,
     sort_by: Option<String>,
     status: Option<String>,
+    include_children: bool,
 ) -> Result<Vec<DbConversationSummary>, DbError> {
     let mut query = conversation::Entity::find().filter(conversation::Column::DeletedAt.is_null());
+
+    if !include_children {
+        query = query.filter(conversation::Column::ParentId.is_null());
+    }
 
     match folder_ids {
         Some(ids) if !ids.is_empty() => {
@@ -280,4 +319,125 @@ pub async fn list_all(
 
     let rows = query.all(conn).await?;
     Ok(rows.into_iter().map(conv_to_summary).collect())
+}
+
+/// List delegation children of a single parent conversation, oldest first.
+/// Returns rows where `parent_id == parent_conversation_id`. Soft-deleted
+/// children are filtered out so a removed sub-session stays hidden in the
+/// parent's tool-call view too.
+pub async fn list_children(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+) -> Result<Vec<DbConversationSummary>, DbError> {
+    let rows = conversation::Entity::find()
+        .filter(conversation::Column::ParentId.eq(parent_conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .order_by_asc(conversation::Column::CreatedAt)
+        .all(conn)
+        .await?;
+    Ok(rows.into_iter().map(conv_to_summary).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::delegation::spawner::DelegationLink;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+    /// Build a parent + a delegation child for filter assertions.
+    async fn seed_parent_with_child(conn: &DatabaseConnection, folder_id: i32) -> (i32, i32) {
+        let parent = create(
+            conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("P".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let link = DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-1".into(),
+            delegation_call_id: "call-1".into(),
+        };
+        let child = create_with_delegation(
+            conn,
+            folder_id,
+            AgentType::Codex,
+            Some("C".into()),
+            None,
+            Some(link),
+        )
+        .await
+        .expect("child");
+        (parent.id, child.id)
+    }
+
+    #[tokio::test]
+    async fn list_all_excludes_children_by_default() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-list-children-default").await;
+        let (parent, _child) = seed_parent_with_child(&db.conn, folder).await;
+
+        let rows = list_all(&db.conn, None, None, None, None, None, false)
+            .await
+            .expect("list");
+        let ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&parent), "parent must remain visible: {ids:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected only the parent, got {} rows: {ids:?}",
+            rows.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_includes_children_when_requested() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-list-children-on").await;
+        let (parent, child) = seed_parent_with_child(&db.conn, folder).await;
+
+        let rows = list_all(&db.conn, None, None, None, None, None, true)
+            .await
+            .expect("list");
+        let ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&parent) && ids.contains(&child),
+            "both parent + child must appear when include_children=true, got: {ids:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_children_returns_only_matching_parent() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-list-children-only").await;
+        let (parent_a, child_a) = seed_parent_with_child(&db.conn, folder).await;
+        let (_parent_b, _child_b) = seed_parent_with_child(&db.conn, folder).await;
+
+        let rows = list_children(&db.conn, parent_a).await.expect("list");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected 1 child of parent_a, got {}",
+            rows.len()
+        );
+        assert_eq!(rows[0].id, child_a);
+        assert_eq!(rows[0].parent_id, Some(parent_a));
+    }
+
+    #[tokio::test]
+    async fn list_children_excludes_soft_deleted() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-list-children-soft-del").await;
+        let (parent, child) = seed_parent_with_child(&db.conn, folder).await;
+
+        soft_delete(&db.conn, child).await.expect("soft delete");
+
+        let rows = list_children(&db.conn, parent).await.expect("list");
+        assert!(
+            rows.is_empty(),
+            "soft-deleted child must not appear: {rows:?}"
+        );
+    }
 }

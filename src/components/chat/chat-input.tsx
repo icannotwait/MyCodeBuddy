@@ -89,7 +89,7 @@ export const ChatInput = memo(function ChatInput({
 
   return (
     <div
-      className="p-4 pb-1.5 pt-0"
+      className="px-4 pt-0 pb-1"
       onContextMenu={(event) => event.stopPropagation()}
     >
       {queue &&
@@ -138,7 +138,7 @@ export const ChatInput = memo(function ChatInput({
               ? t("agentResponding", { agent: agentName ?? "Agent" })
               : t("sendMessage")
         }
-        className="min-h-28 max-h-60"
+        className="min-h-24 max-h-60"
       />
     </div>
   )

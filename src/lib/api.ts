@@ -683,6 +683,7 @@ export async function listAllConversations(params?: {
   search?: string | null
   sort_by?: string | null
   status?: string | null
+  include_children?: boolean | null
 }): Promise<DbConversationSummary[]> {
   return getTransport().call("list_all_conversations", {
     folderIds: params?.folder_ids ?? null,
@@ -690,6 +691,15 @@ export async function listAllConversations(params?: {
     search: params?.search ?? null,
     sortBy: params?.sort_by ?? null,
     status: params?.status ?? null,
+    includeChildren: params?.include_children ?? null,
+  })
+}
+
+export async function listChildConversations(
+  parentConversationId: number
+): Promise<DbConversationSummary[]> {
+  return getTransport().call("list_child_conversations", {
+    parentConversationId,
   })
 }
 
@@ -2408,4 +2418,22 @@ export async function updateModelProvider(params: {
 
 export async function deleteModelProvider(id: number): Promise<void> {
   return getTransport().call("delete_model_provider", { id })
+}
+
+// ─── Delegation settings ───────────────────────────────────────────────
+
+export interface DelegationSettings {
+  enabled: boolean
+  depth_limit: number
+  default_timeout_seconds: number
+}
+
+export async function getDelegationSettings(): Promise<DelegationSettings> {
+  return getTransport().call("get_delegation_settings")
+}
+
+export async function setDelegationSettings(
+  settings: DelegationSettings
+): Promise<DelegationSettings> {
+  return getTransport().call("set_delegation_settings", { settings })
 }

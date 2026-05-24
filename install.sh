@@ -11,13 +11,22 @@ set -euo pipefail
 REPO="xintaofei/codeg"
 INSTALL_DIR="${CODEG_INSTALL_DIR:-/usr/local/bin}"
 VERSION=""
-# Stale codeg-server binaries elsewhere in PATH are removed by default so the
-# user's `codeg-server` command always runs the freshly installed binary. Set
-# CODEG_NO_CLEANUP=1 (or pass --no-cleanup) to disable.
+# Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
+# default so the user's `codeg-server` command always runs the freshly
+# installed binary AND the runtime locates the matching companion via the
+# exe-sibling lookup. Set CODEG_NO_CLEANUP=1 (or pass --no-cleanup) to
+# disable.
 CLEANUP_CONFLICTS=1
 if [ "${CODEG_NO_CLEANUP:-0}" = "1" ]; then
   CLEANUP_CONFLICTS=0
 fi
+
+# Names of binaries this installer manages. `codeg-server` is the user-facing
+# entry point; `codeg-mcp` is the stdio MCP companion that the server's ACP
+# layer spawns per session for delegation. Both must live in the same
+# directory — `locate_codeg_mcp_binary()` in src-tauri/src/acp/connection.rs
+# resolves the companion as a sibling of the running server executable.
+MANAGED_BINS=(codeg-server codeg-mcp)
 
 # ── Parse arguments ──
 
@@ -119,6 +128,10 @@ DEST_BIN="${INSTALL_DIR}/codeg-server"
 DEST_BIN_REAL="$(canon_path "$DEST_BIN")"
 INSTALL_DIR_REAL="$(canon_path "$INSTALL_DIR")"
 
+# Scan PATH for both managed binaries — a stale `codeg-mcp` in an earlier
+# PATH entry would be picked by the runtime's `which` fallback once
+# `codeg-server` was upgraded out from under it, breaking delegation in
+# subtle ways. Track conflicts uniformly for cleanup.
 PATH_CONFLICTS=()
 DEST_IN_PATH=0
 _SEEN_REAL=":"
@@ -131,15 +144,17 @@ for _dir in "${_PATH_DIRS[@]}"; do
     DEST_IN_PATH=1
     break
   fi
-  _bin="$_dir/codeg-server"
-  if [ -f "$_bin" ] && [ -x "$_bin" ]; then
-    _real="$(canon_path "$_bin")"
-    case "$_SEEN_REAL" in
-      *":$_real:"*) continue ;;
-    esac
-    _SEEN_REAL="${_SEEN_REAL}${_real}:"
-    PATH_CONFLICTS+=("$_bin")
-  fi
+  for _name in "${MANAGED_BINS[@]}"; do
+    _bin="$_dir/$_name"
+    if [ -f "$_bin" ] && [ -x "$_bin" ]; then
+      _real="$(canon_path "$_bin")"
+      case "$_SEEN_REAL" in
+        *":$_real:"*) continue ;;
+      esac
+      _SEEN_REAL="${_SEEN_REAL}${_real}:"
+      PATH_CONFLICTS+=("$_bin")
+    fi
+  done
 done
 
 # If the destination directory isn't on PATH, nothing "shadows" the install —
@@ -249,23 +264,40 @@ fi
 echo "Extracting..."
 tar xzf "${TMP_DIR}/${ARTIFACT}.tar.gz" -C "$TMP_DIR"
 
-# ── Install binary ──
+# ── Install binaries ──
+#
+# Verify both binaries are present in the archive BEFORE writing anything
+# to INSTALL_DIR. Without the companion, delegation degrades silently on
+# every new ACP session — fail fast instead.
 
-BINARY_SRC="${TMP_DIR}/${ARTIFACT}/codeg-server"
-if [ ! -f "$BINARY_SRC" ]; then
-  echo "Error: binary not found in archive"
-  exit 1
-fi
+for _name in "${MANAGED_BINS[@]}"; do
+  if [ ! -f "${TMP_DIR}/${ARTIFACT}/${_name}" ]; then
+    echo "Error: ${_name} not found in archive ${ARTIFACT}.tar.gz"
+    echo "       This release tarball is incomplete; please report it."
+    exit 1
+  fi
+done
 
 mkdir -p "$INSTALL_DIR"
-if [ -w "$INSTALL_DIR" ]; then
-  cp "$BINARY_SRC" "${INSTALL_DIR}/codeg-server"
-  chmod +x "${INSTALL_DIR}/codeg-server"
-else
+_install_one() {
+  local name="$1"
+  local src="${TMP_DIR}/${ARTIFACT}/${name}"
+  local dst="${INSTALL_DIR}/${name}"
+  if [ -w "$INSTALL_DIR" ]; then
+    cp "$src" "$dst"
+    chmod +x "$dst"
+  else
+    sudo cp "$src" "$dst"
+    sudo chmod +x "$dst"
+  fi
+}
+
+if [ ! -w "$INSTALL_DIR" ]; then
   echo "Need sudo to install to ${INSTALL_DIR}"
-  sudo cp "$BINARY_SRC" "${INSTALL_DIR}/codeg-server"
-  sudo chmod +x "${INSTALL_DIR}/codeg-server"
 fi
+for _name in "${MANAGED_BINS[@]}"; do
+  _install_one "$_name"
+done
 
 # Re-canonicalize destination now that the file exists. Pre-install canon may
 # leave the final non-existent component unresolved (notably macOS readlink -f),
@@ -325,8 +357,20 @@ fi
 
 echo ""
 echo "codeg-server installed to ${INSTALL_DIR}/codeg-server"
+echo "codeg-mcp    installed to ${INSTALL_DIR}/codeg-mcp"
 INSTALLED_VER=$("${INSTALL_DIR}/codeg-server" --version 2>/dev/null || echo "${TARGET_VER}")
 echo "Version: ${INSTALLED_VER}"
+
+# Final smoke: codeg-mcp must exist next to codeg-server so the runtime's
+# `locate_codeg_mcp_binary()` exe-sibling lookup hits. A failure here means
+# the tarball was malformed or a previous `_install_one` was silently
+# blocked — surface it loudly rather than ship a half-broken install.
+if [ ! -x "${INSTALL_DIR}/codeg-mcp" ]; then
+  echo ""
+  echo "Error: ${INSTALL_DIR}/codeg-mcp missing or not executable after install."
+  echo "       Delegation (sub-agent tooling) will not work. Re-run the installer."
+  EXIT_STATUS=1
+fi
 
 # Verify the user's `codeg-server` command actually resolves to the new binary.
 ACTIVE_BIN_AFTER=""
