@@ -9,6 +9,7 @@ import {
   useRef,
   useMemo,
   type ReactNode,
+  type SetStateAction,
 } from "react"
 import { useTranslations } from "next-intl"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
@@ -176,6 +177,22 @@ interface TabProviderProps {
   children: ReactNode
 }
 
+interface DraftRetargetRequest {
+  tabId: string
+  expectedAgent: AgentType
+  folderId: number
+  workingDir: string
+  agentType: AgentType
+  provisional: boolean
+}
+
+interface TabState {
+  rawTabs: TabItemInternal[]
+  activeTabId: string | null
+  previewReplacedTabIds: string[]
+  draftRetargetRequests: DraftRetargetRequest[]
+}
+
 const TILE_MODE_STORAGE_KEY = "workspace:tile-mode"
 
 export function TabProvider({ children }: TabProviderProps) {
@@ -185,9 +202,36 @@ export function TabProvider({ children }: TabProviderProps) {
     useAppWorkspace()
   const { disconnect: acpDisconnect } = useAcpActions()
 
-  const [rawTabs, setTabs] = useState<TabItemInternal[]>([])
-  const [activeTabId, setActiveTabId] = useState<string | null>(null)
+  const [tabState, setTabState] = useState<TabState>({
+    rawTabs: [],
+    activeTabId: null,
+    previewReplacedTabIds: [],
+    draftRetargetRequests: [],
+  })
+  const { rawTabs, activeTabId, previewReplacedTabIds, draftRetargetRequests } =
+    tabState
   const [tabsHydrated, setTabsHydrated] = useState(false)
+
+  const setTabs = useCallback((action: SetStateAction<TabItemInternal[]>) => {
+    setTabState((prev) => {
+      const nextRawTabs =
+        typeof action === "function" ? action(prev.rawTabs) : action
+      if (nextRawTabs === prev.rawTabs) return prev
+      return { ...prev, rawTabs: nextRawTabs }
+    })
+  }, [])
+
+  const setActiveTabId = useCallback(
+    (action: SetStateAction<string | null>) => {
+      setTabState((prev) => {
+        const nextActiveTabId =
+          typeof action === "function" ? action(prev.activeTabId) : action
+        if (nextActiveTabId === prev.activeTabId) return prev
+        return { ...prev, activeTabId: nextActiveTabId }
+      })
+    },
+    []
+  )
 
   // Refs for volatile state
   const activeTabIdRef = useRef(activeTabId)
@@ -271,6 +315,85 @@ export function TabProvider({ children }: TabProviderProps) {
     []
   )
 
+  useEffect(() => {
+    if (previewReplacedTabIds.length === 0) return
+
+    const consumedIds = previewReplacedTabIds
+    for (const tabId of consumedIds) {
+      for (const cb of previewReplacedCallbacksRef.current) {
+        cb(tabId)
+      }
+    }
+
+    setTabState((prev) => {
+      const matchesPrefix = consumedIds.every(
+        (tabId, index) => prev.previewReplacedTabIds[index] === tabId
+      )
+      if (!matchesPrefix) return prev
+      return {
+        ...prev,
+        previewReplacedTabIds: prev.previewReplacedTabIds.slice(
+          consumedIds.length
+        ),
+      }
+    })
+  }, [previewReplacedTabIds])
+
+  useEffect(() => {
+    if (draftRetargetRequests.length === 0) return
+
+    const consumedRequests = draftRetargetRequests
+    setTabState((prev) => {
+      const matchesPrefix = consumedRequests.every(
+        (request, index) => prev.draftRetargetRequests[index] === request
+      )
+      if (!matchesPrefix) return prev
+      return {
+        ...prev,
+        draftRetargetRequests: prev.draftRetargetRequests.slice(
+          consumedRequests.length
+        ),
+      }
+    })
+
+    for (const request of consumedRequests) {
+      void (async () => {
+        try {
+          await acpDisconnect(request.tabId)
+        } catch (err) {
+          console.error("[TabProvider] disconnect draft tab:", err)
+        }
+
+        setTabState((prev) => {
+          const target = prev.rawTabs.find((tab) => tab.id === request.tabId)
+          if (!target) return prev
+          if (target.conversationId != null) return prev
+          if (
+            target.agentType !== request.expectedAgent &&
+            !target.agentTypeProvisional
+          ) {
+            return prev
+          }
+
+          return {
+            ...prev,
+            rawTabs: prev.rawTabs.map((tab) =>
+              tab.id === request.tabId
+                ? {
+                    ...tab,
+                    folderId: request.folderId,
+                    workingDir: request.workingDir,
+                    agentType: request.agentType,
+                    agentTypeProvisional: request.provisional,
+                  }
+                : tab
+            ),
+          }
+        })
+      })()
+    }
+  }, [acpDisconnect, draftRetargetRequests])
+
   // Hydrate from persisted opened_tabs on mount
   useEffect(() => {
     let cancelled = false
@@ -319,7 +442,7 @@ export function TabProvider({ children }: TabProviderProps) {
     return () => {
       cancelled = true
     }
-  }, [t])
+  }, [setActiveTabId, setTabs, t])
 
   // Debounced save to DB
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -391,28 +514,29 @@ export function TabProvider({ children }: TabProviderProps) {
       pin = false,
       title?: string
     ) => {
-      let activateTabId: string | undefined
-      let replacedPreviewTabId: string | undefined
-
-      setTabs((prev) => {
+      setTabState((prevState) => {
         const existingIndex = findTabIndexForConversation(
-          prev,
+          prevState.rawTabs,
           folderId,
           agentType,
           conversationId
         )
 
         if (existingIndex >= 0) {
-          activateTabId = prev[existingIndex].id
-          if (pin && !prev[existingIndex].isPinned) {
-            const updated = [...prev]
+          const activateTabId = prevState.rawTabs[existingIndex].id
+          if (pin && !prevState.rawTabs[existingIndex].isPinned) {
+            const updated = [...prevState.rawTabs]
             updated[existingIndex] = {
               ...updated[existingIndex],
               isPinned: true,
             }
-            return updated
+            return {
+              ...prevState,
+              rawTabs: updated,
+              activeTabId: activateTabId,
+            }
           }
-          return prev
+          return { ...prevState, activeTabId: activateTabId }
         }
 
         const resolvedTitle =
@@ -426,7 +550,6 @@ export function TabProvider({ children }: TabProviderProps) {
           t("untitledConversation")
 
         const tabId = makeConversationTabId(folderId, agentType, conversationId)
-        activateTabId = tabId
         const newTab: TabItemInternal = {
           id: tabId,
           kind: "conversation",
@@ -438,29 +561,36 @@ export function TabProvider({ children }: TabProviderProps) {
         }
 
         if (pin) {
-          return [...prev, newTab]
+          return {
+            ...prevState,
+            rawTabs: [...prevState.rawTabs, newTab],
+            activeTabId: tabId,
+          }
         }
 
-        const previewIndex = prev.findIndex((t) => !t.isPinned)
+        const previewIndex = prevState.rawTabs.findIndex((t) => !t.isPinned)
         if (previewIndex >= 0) {
-          replacedPreviewTabId = prev[previewIndex].id
-          const updated = [...prev]
+          const updated = [...prevState.rawTabs]
+          const replacedPreviewTabId = updated[previewIndex].id
           updated[previewIndex] = newTab
-          return updated
+          return {
+            ...prevState,
+            rawTabs: updated,
+            activeTabId: tabId,
+            previewReplacedTabIds: [
+              ...prevState.previewReplacedTabIds,
+              replacedPreviewTabId,
+            ],
+          }
         }
 
-        return [...prev, newTab]
+        return {
+          ...prevState,
+          rawTabs: [...prevState.rawTabs, newTab],
+          activeTabId: tabId,
+        }
       })
 
-      if (replacedPreviewTabId) {
-        for (const cb of previewReplacedCallbacksRef.current) {
-          cb(replacedPreviewTabId)
-        }
-      }
-
-      if (activateTabId) {
-        setActiveTabId(activateTabId)
-      }
       activateConversationPane()
     },
     [activateConversationPane, t]
@@ -517,41 +647,36 @@ export function TabProvider({ children }: TabProviderProps) {
 
   const closeTab = useCallback(
     (tabId: string) => {
-      let neighborToSync: TabItemInternal | undefined
-      let shouldReplaceWithEmpty = false
+      const shouldActivateConversation = tabId === activeTabIdRef.current
 
-      setTabs((prev) => {
-        const index = prev.findIndex((t) => t.id === tabId)
-        if (index < 0) return prev
+      setTabState((prevState) => {
+        const index = prevState.rawTabs.findIndex((t) => t.id === tabId)
+        if (index < 0) return prevState
 
-        const closingTab = prev[index]
-        const next = prev.filter((t) => t.id !== tabId)
+        const closingTab = prevState.rawTabs[index]
+        const next = prevState.rawTabs.filter((t) => t.id !== tabId)
 
         if (next.length === 0) {
           if (foldersRef.current.length === 0) {
-            shouldReplaceWithEmpty = true
-            return []
+            return { ...prevState, rawTabs: [], activeTabId: null }
           }
           const replacementTab = makeReplacementDraftTab(closingTab)
-          neighborToSync = replacementTab
-          return [replacementTab]
+          return {
+            ...prevState,
+            rawTabs: [replacementTab],
+            activeTabId: replacementTab.id,
+          }
         }
 
-        if (tabId === activeTabIdRef.current) {
+        if (tabId === prevState.activeTabId) {
           const newIndex = Math.min(index, next.length - 1)
-          neighborToSync = next[newIndex]
+          return { ...prevState, rawTabs: next, activeTabId: next[newIndex].id }
         }
 
-        return next
+        return { ...prevState, rawTabs: next }
       })
 
-      if (shouldReplaceWithEmpty) {
-        setActiveTabId(null)
-        return
-      }
-
-      if (neighborToSync) {
-        setActiveTabId(neighborToSync.id)
+      if (shouldActivateConversation) {
         activateConversationPane()
       }
     },
@@ -573,46 +698,66 @@ export function TabProvider({ children }: TabProviderProps) {
   )
 
   const closeOtherTabs = useCallback((tabId: string) => {
-    setTabs((prev) => {
-      const kept = prev.filter((t) => t.id === tabId)
-      return kept.length === prev.length ? prev : kept
+    setTabState((prevState) => {
+      const target = prevState.rawTabs.find((tab) => tab.id === tabId)
+      if (!target) return prevState
+      if (
+        prevState.rawTabs.length === 1 &&
+        prevState.rawTabs[0]?.id === tabId &&
+        prevState.activeTabId === tabId
+      ) {
+        return prevState
+      }
+      return {
+        ...prevState,
+        rawTabs: [target],
+        activeTabId: tabId,
+      }
     })
-    setActiveTabId(tabId)
   }, [])
 
   const closeAllTabs = useCallback(() => {
-    const seedTab =
-      rawTabsRef.current.find(
-        (t) => t.conversationId == null && t.workingDir
-      ) ??
-      rawTabsRef.current.find((t) => t.id === activeTabIdRef.current) ??
-      rawTabsRef.current[0]
-
     if (foldersRef.current.length === 0) {
-      setTabs([])
-      setActiveTabId(null)
+      setTabState((prevState) => {
+        if (prevState.rawTabs.length === 0 && prevState.activeTabId == null) {
+          return prevState
+        }
+        return { ...prevState, rawTabs: [], activeTabId: null }
+      })
       return
     }
 
-    const replacementTab = makeReplacementDraftTab(seedTab)
-    setTabs([replacementTab])
-    setActiveTabId(replacementTab.id)
+    setTabState((prevState) => {
+      const seedTab =
+        prevState.rawTabs.find(
+          (t) => t.conversationId == null && t.workingDir
+        ) ??
+        prevState.rawTabs.find((t) => t.id === prevState.activeTabId) ??
+        prevState.rawTabs[0]
+      const replacementTab = makeReplacementDraftTab(seedTab)
+      return {
+        ...prevState,
+        rawTabs: [replacementTab],
+        activeTabId: replacementTab.id,
+      }
+    })
     activateConversationPane()
   }, [activateConversationPane, makeReplacementDraftTab])
 
   const closeTabsByFolder = useCallback((folderId: number) => {
-    setTabs((prev) => {
-      const remaining = prev.filter((t) => t.folderId !== folderId)
-      if (remaining.length === prev.length) return prev
+    setTabState((prevState) => {
+      const remaining = prevState.rawTabs.filter((t) => t.folderId !== folderId)
+      if (remaining.length === prevState.rawTabs.length) return prevState
 
-      // If active tab is being closed, move to first remaining tab
-      const currentActive = activeTabIdRef.current
+      const currentActive = prevState.activeTabId
       const stillActive =
         currentActive != null && remaining.some((t) => t.id === currentActive)
-      if (!stillActive) {
-        setActiveTabId(remaining.length > 0 ? remaining[0].id : null)
+
+      return {
+        ...prevState,
+        rawTabs: remaining,
+        activeTabId: stillActive ? currentActive : (remaining[0]?.id ?? null),
       }
-      return remaining
     })
   }, [])
 
@@ -621,17 +766,26 @@ export function TabProvider({ children }: TabProviderProps) {
       const tab = rawTabsRef.current.find((t) => t.id === tabId)
       if (!tab) return
 
-      setActiveTabId(tabId)
+      setTabState((prevState) => {
+        if (!prevState.rawTabs.some((t) => t.id === tabId)) {
+          return prevState
+        }
+        if (prevState.activeTabId === tabId) return prevState
+        return { ...prevState, activeTabId: tabId }
+      })
       activateConversationPane()
     },
     [activateConversationPane]
   )
 
-  const pinTab = useCallback((tabId: string) => {
-    setTabs((prev) =>
-      prev.map((t) => (t.id === tabId ? { ...t, isPinned: true } : t))
-    )
-  }, [])
+  const pinTab = useCallback(
+    (tabId: string) => {
+      setTabs((prev) =>
+        prev.map((t) => (t.id === tabId ? { ...t, isPinned: true } : t))
+      )
+    },
+    [setTabs]
+  )
 
   const toggleTileMode = useCallback(() => {
     setIsTileMode((prev) => !prev)
@@ -639,7 +793,7 @@ export function TabProvider({ children }: TabProviderProps) {
 
   const reorderTabs = useCallback(
     (reorderedTabs: TabItem[]) => setTabs(reorderedTabs),
-    []
+    [setTabs]
   )
 
   const openNewConversationTab = useCallback(
@@ -680,102 +834,81 @@ export function TabProvider({ children }: TabProviderProps) {
         inherit
       )
 
-      // Singleton: reuse any existing draft tab regardless of folder,
-      // so only one new-conversation tab can exist at a time.
-      const existingTab = rawTabsRef.current.find(
-        (t) => t.conversationId == null
-      )
+      const tabId = makeNewConversationTabId()
+      setTabState((prevState) => {
+        // Singleton: reuse any existing draft tab regardless of folder,
+        // so only one new-conversation tab can exist at a time. Read from
+        // committed state here so batched closes cannot leave activeTabId
+        // pointing at a draft that no longer exists.
+        const existingTab = prevState.rawTabs.find(
+          (t) => t.conversationId == null
+        )
 
-      if (existingTab) {
+        if (!existingTab) {
+          const newTab: TabItemInternal = {
+            id: tabId,
+            kind: "conversation",
+            folderId,
+            conversationId: null,
+            agentType: targetAgent,
+            title: t("newConversation"),
+            isPinned: true,
+            workingDir,
+            agentTypeProvisional: provisional,
+          }
+          return {
+            ...prevState,
+            rawTabs: [...prevState.rawTabs, newTab],
+            activeTabId: tabId,
+          }
+        }
+
         const folderChanged = existingTab.folderId !== folderId
         const workingDirChanged = existingTab.workingDir !== workingDir
         const agentChanged = existingTab.agentType !== targetAgent
         const provisionalChanged =
           (existingTab.agentTypeProvisional ?? false) !== provisional
 
-        setActiveTabId(existingTab.id)
-        activateConversationPane()
-
         if (folderChanged || agentChanged) {
-          // Tear down the old ACP connection (bound to the old
-          // workingDir/agent) before patching tab fields. The
-          // connection-lifecycle effect watches workingDir and
-          // agentType; once status has settled to disconnected and
-          // either flips, it auto-reconnects against the new params.
-          const expectedAgent = existingTab.agentType
-          void (async () => {
-            try {
-              await acpDisconnect(existingTab.id)
-            } catch (err) {
-              console.error("[TabProvider] disconnect draft tab:", err)
-            }
-            // Race guard: if the tab was bound to a real conversation
-            // during the await (e.g. the user sent a message just before
-            // we got the disconnect callback), leave it alone. If the
-            // agent was changed during the await, the meaning depends on
-            // who changed it:
-            //   - User click (`confirmDraftAgent`) clears `provisional`
-            //     — explicit choice, bail.
-            //   - AgentSelector auto-fallback (`setDraftAgentFromFallback`)
-            //     keeps `provisional` true — system pick, we should
-            //     still apply this folder switch on top of it.
-            setTabs((prev) => {
-              const target = prev.find((tab) => tab.id === existingTab.id)
-              if (!target) return prev
-              if (target.conversationId != null) return prev
-              if (
-                target.agentType !== expectedAgent &&
-                !target.agentTypeProvisional
-              ) {
-                return prev
-              }
-              return prev.map((tab) =>
-                tab.id === existingTab.id
-                  ? {
-                      ...tab,
-                      folderId,
-                      workingDir,
-                      agentType: targetAgent,
-                      agentTypeProvisional: provisional,
-                    }
-                  : tab
-              )
-            })
-          })()
-        } else if (workingDirChanged || provisionalChanged) {
-          setTabs((prev) =>
-            prev.map((t) =>
-              t.id === existingTab.id
+          return {
+            ...prevState,
+            activeTabId: existingTab.id,
+            draftRetargetRequests: [
+              ...prevState.draftRetargetRequests,
+              {
+                tabId: existingTab.id,
+                expectedAgent: existingTab.agentType,
+                folderId,
+                workingDir,
+                agentType: targetAgent,
+                provisional,
+              },
+            ],
+          }
+        }
+
+        if (workingDirChanged || provisionalChanged) {
+          return {
+            ...prevState,
+            rawTabs: prevState.rawTabs.map((tab) =>
+              tab.id === existingTab.id
                 ? {
-                    ...t,
+                    ...tab,
                     workingDir,
                     agentTypeProvisional: provisional,
                   }
-                : t
-            )
-          )
+                : tab
+            ),
+            activeTabId: existingTab.id,
+          }
         }
-        return
-      }
 
-      const tabId = makeNewConversationTabId()
-      const newTab: TabItemInternal = {
-        id: tabId,
-        kind: "conversation",
-        folderId,
-        conversationId: null,
-        agentType: targetAgent,
-        title: t("newConversation"),
-        isPinned: true,
-        workingDir,
-        agentTypeProvisional: provisional,
-      }
-
-      setTabs((prev) => [...prev, newTab])
-      setActiveTabId(tabId)
+        if (prevState.activeTabId === existingTab.id) return prevState
+        return { ...prevState, activeTabId: existingTab.id }
+      })
       activateConversationPane()
     },
-    [acpDisconnect, activateConversationPane, resolveAgentForFolder, t]
+    [activateConversationPane, resolveAgentForFolder, t]
   )
 
   const confirmDraftAgent = useCallback(
@@ -789,7 +922,7 @@ export function TabProvider({ children }: TabProviderProps) {
         })
       )
     },
-    []
+    [setTabs]
   )
 
   const setDraftAgentFromFallback = useCallback(
@@ -806,7 +939,7 @@ export function TabProvider({ children }: TabProviderProps) {
         })
       )
     },
-    []
+    [setTabs]
   )
 
   const bindConversationTab = useCallback(
@@ -817,9 +950,8 @@ export function TabProvider({ children }: TabProviderProps) {
       title: string,
       runtimeConversationId?: number
     ) => {
-      let nextActiveTabId: string | null = null
-      setTabs((prev) =>
-        prev.flatMap((tab) => {
+      setTabState((prevState) => {
+        const nextTabs = prevState.rawTabs.flatMap((tab) => {
           if (tab.id === tabId) {
             const nextTab: TabItemInternal = {
               ...tab,
@@ -844,18 +976,25 @@ export function TabProvider({ children }: TabProviderProps) {
             tab.conversationId === conversationId &&
             tab.agentType === agentType
           ) {
-            if (activeTabIdRef.current === tabId) {
-              nextActiveTabId = tab.id
-            }
             return []
           }
 
           return [tab]
         })
-      )
-      if (nextActiveTabId) {
-        setActiveTabId(nextActiveTabId)
-      }
+
+        const activeStillExists =
+          prevState.activeTabId != null &&
+          nextTabs.some((tab) => tab.id === prevState.activeTabId)
+        const boundTab = nextTabs.find((tab) => tab.id === tabId)
+
+        return {
+          ...prevState,
+          rawTabs: nextTabs,
+          activeTabId: activeStillExists
+            ? prevState.activeTabId
+            : (boundTab?.id ?? nextTabs[0]?.id ?? null),
+        }
+      })
     },
     []
   )
@@ -872,7 +1011,7 @@ export function TabProvider({ children }: TabProviderProps) {
         )
       })
     },
-    []
+    [setTabs]
   )
 
   // Once the agent list is fresh for the first time this session, fix up
@@ -969,7 +1108,7 @@ export function TabProvider({ children }: TabProviderProps) {
         })
       })()
     }
-  }, [acpDisconnect, resolveAgentForFolder])
+  }, [acpDisconnect, resolveAgentForFolder, setTabs])
 
   // Correction must wait for ALL THREE of:
   //   1. `agentsFresh` — the sorted agent list is real (not localStorage seed).
