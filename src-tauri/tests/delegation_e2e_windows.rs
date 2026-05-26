@@ -85,6 +85,7 @@ async fn end_to_end_named_pipe_happy_path() {
         .set_config(DelegationConfig {
             enabled: true,
             depth_limit: 8,
+            ..DelegationConfig::default()
         })
         .await;
 
@@ -173,6 +174,7 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
         .set_config(DelegationConfig {
             enabled: true,
             depth_limit: 8,
+            ..DelegationConfig::default()
         })
         .await;
 
