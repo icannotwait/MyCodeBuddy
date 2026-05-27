@@ -365,8 +365,41 @@ async fn handle_acp_envelope(
         AcpEvent::Error {
             message,
             agent_type,
+            terminal,
             ..
         } => {
+            // Non-terminal Errors (`turn_failure_error_event`,
+            // `session/load` fallback, empty-prompt rejection, SetMode /
+            // SetConfigOption failures) leave the ACP connection alive —
+            // the next prompt on the same session will still work. Posting
+            // the error to the channel is useful, but tearing down the
+            // bridge session and flipping the conversation row to
+            // Cancelled would break remote chat-channel users (their next
+            // message would spawn a brand-new session, losing context).
+            // The lifecycle worker mirrors this gating; see F2 in the
+            // v0.14.3 sub-agent delegation post-mortem.
+            let lang = get_lang(db).await;
+            let msg = RichMessage {
+                title: Some(match lang {
+                    Lang::ZhCn | Lang::ZhTw => "Agent 错误".to_string(),
+                    _ => "Agent Error".to_string(),
+                }),
+                body: format!("[{agent_type}] {message}"),
+                fields: Vec::new(),
+                level: MessageLevel::Error,
+            };
+
+            if !*terminal {
+                let channel_id = {
+                    let guard = bridge.lock().await;
+                    guard.get(connection_id).map(|s| s.channel_id)
+                };
+                if let Some(channel_id) = channel_id {
+                    let _ = manager.send_to_channel(channel_id, &msg).await;
+                }
+                return;
+            }
+
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.remove(connection_id) {
                 let channel_id = session.channel_id;
@@ -374,16 +407,6 @@ async fn handle_acp_envelope(
                 let conv_id = session.conversation_id;
                 drop(guard);
 
-                let lang = get_lang(db).await;
-                let msg = RichMessage {
-                    title: Some(match lang {
-                        Lang::ZhCn | Lang::ZhTw => "Agent 错误".to_string(),
-                        _ => "Agent Error".to_string(),
-                    }),
-                    body: format!("[{agent_type}] {message}"),
-                    fields: Vec::new(),
-                    level: MessageLevel::Error,
-                };
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
                 let _ = conversation_service::update_status(
@@ -850,5 +873,125 @@ mod delegation_relay_tests {
         assert!(body.len() < 300);
         assert!(body.starts_with("✅ codex: "));
         assert!(body.ends_with("..."));
+    }
+}
+
+#[cfg(test)]
+mod error_terminal_gate_tests {
+    //! Regression coverage for the F2-aligned `AcpEvent::Error` gating —
+    //! non-terminal Errors must leave the chat-channel session and the
+    //! conversation row untouched, so a recoverable failure (turn refusal,
+    //! `session/load` fallback, idle SetMode failure) doesn't kill the
+    //! remote user's bridge session. Terminal Errors continue to tear the
+    //! session down as before. (P2 follow-up to the v0.14.3 sub-agent
+    //! delegation post-mortem.)
+    use super::*;
+    use crate::acp::manager::ConnectionManager;
+    use crate::acp::types::{AcpEvent, EventEnvelope};
+    use crate::chat_channel::manager::ChatChannelManager;
+    use crate::chat_channel::session_bridge::{ActiveSession, SessionBridge};
+    use crate::db::entities::conversation::ConversationStatus;
+    use crate::db::test_helpers;
+    use crate::models::agent::AgentType;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    async fn read_row_status(db: &crate::db::AppDatabase, id: i32) -> ConversationStatus {
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        conversation::Entity::find_by_id(id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("conversation row exists")
+            .status
+    }
+
+    async fn seed_session(
+        db: &crate::db::AppDatabase,
+        connection_id: &str,
+    ) -> (Arc<Mutex<SessionBridge>>, i32) {
+        let folder_id = test_helpers::seed_folder(db, "/tmp/chat-error-gate").await;
+        let conv_id = test_helpers::seed_conversation(db, folder_id, AgentType::ClaudeCode).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            connection_id.to_string(),
+            ActiveSession {
+                channel_id: 7,
+                sender_id: "u1".into(),
+                conversation_id: conv_id,
+                connection_id: connection_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: std::collections::HashMap::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: None,
+                permission_pending: None,
+            },
+        );
+        (bridge, conv_id)
+    }
+
+    #[tokio::test]
+    async fn non_terminal_error_keeps_session_and_conversation_intact() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (bridge, conv_id) = seed_session(&db, "c-nonterm").await;
+        let chat_mgr = ChatChannelManager::new();
+        let conn_mgr = ConnectionManager::new();
+
+        let envelope = EventEnvelope {
+            seq: 1,
+            connection_id: "c-nonterm".to_string(),
+            payload: AcpEvent::Error {
+                message: "Failed to set mode: bad id".into(),
+                agent_type: "claude_code".into(),
+                code: None,
+                terminal: false,
+            },
+        };
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn).await;
+
+        // Session bridge entry is preserved — the next user message on the
+        // same connection can still flow through it.
+        assert!(
+            bridge.lock().await.get("c-nonterm").is_some(),
+            "non-terminal Error must leave the bridge session in place"
+        );
+        assert_eq!(
+            read_row_status(&db, conv_id).await,
+            ConversationStatus::InProgress,
+            "non-terminal Error must not flip the conversation to Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_tears_down_session_and_writes_cancelled() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (bridge, conv_id) = seed_session(&db, "c-term").await;
+        let chat_mgr = ChatChannelManager::new();
+        let conn_mgr = ConnectionManager::new();
+
+        let envelope = EventEnvelope {
+            seq: 1,
+            connection_id: "c-term".to_string(),
+            payload: AcpEvent::Error {
+                message: "transport closed".into(),
+                agent_type: "claude_code".into(),
+                code: None,
+                terminal: true,
+            },
+        };
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn).await;
+
+        assert!(
+            bridge.lock().await.get("c-term").is_none(),
+            "terminal Error must remove the bridge session so the next message starts fresh"
+        );
+        assert_eq!(
+            read_row_status(&db, conv_id).await,
+            ConversationStatus::Cancelled
+        );
     }
 }

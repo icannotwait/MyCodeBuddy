@@ -65,6 +65,31 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     )
 }
 
+/// Whether the dispatcher should tear down (drop the sender for) the per-
+/// connection worker after forwarding this event. Two cases:
+///
+///   - `Disconnected` — the normal teardown signal, always emitted by
+///     `connection.rs` after `run_connection` returns.
+///   - `Error { terminal: true }` — defense-in-depth for the case where
+///     the bus drops the trailing `Disconnected` (`Lagged`) or the
+///     `run_connection` task aborts between emit sites. The worker
+///     dispatches terminal work on whichever lands first (P1); without
+///     also dropping the sender here, a missed `Disconnected` would leak
+///     the worker task + its `CachedConn` for the lifetime of the process.
+///
+/// Non-terminal `Error` is NOT terminal at the dispatcher level — it also
+/// fires mid-turn from `turn_failure_error_event` while the child connection
+/// stays alive, and the worker must survive to process the trailing
+/// `TurnComplete`. (P2 follow-up in the v0.14.3 post-mortem review.)
+fn is_dispatcher_terminal(event: &AcpEvent) -> bool {
+    matches!(
+        event,
+        AcpEvent::StatusChanged {
+            status: ConnectionStatus::Disconnected
+        } | AcpEvent::Error { terminal: true, .. }
+    )
+}
+
 /// Per-connection state that survives `ConnectionCleanupGuard::drop` so
 /// `Disconnected` / `Error` handlers can still emit a derived
 /// `ConversationStatusChanged` after the manager entry has been removed.
@@ -529,16 +554,17 @@ async fn connection_worker_loop(
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
     let mut cache: HashMap<String, CachedConn> = HashMap::new();
-    // Buffer the latest `AcpEvent::Error` payload for this connection. The
-    // broker drain MUST be deferred to `Disconnected` because `Error` also
-    // fires from the in-turn `turn_failure_error_event` path (refusal /
-    // max_tokens / empty / unknown) before the trailing `TurnComplete` —
-    // draining on Error there would race-cancel a pending delegation that
-    // the upcoming `complete_call` would have mapped to a proper child-side
-    // error code (`ChildRefusal` / `ChildMaxTokens` / …). On the genuinely
-    // terminal path (`connection.rs:488`), `Error` is followed immediately
-    // by `Disconnected`, so the buffered detail still reaches the broker.
-    let mut last_error: Option<String> = None;
+    // True once we've already invoked `handle_terminal_event` +
+    // `forward_disconnect_to_broker` for this connection. Terminal `Error`
+    // and `Disconnected` ARE both expected on the genuine teardown path
+    // (`connection.rs:493` → `run_connection` unwind → `Disconnected`), and
+    // either one alone is also valid: a `Disconnected` without preceding
+    // Error fires for clean transport close, and a terminal Error in
+    // theory could be the last event if the bus drops the trailing
+    // Disconnected (broadcast `Lagged`). Whichever lands first dispatches
+    // the terminal work; the second one is a no-op so the broker / DB
+    // aren't double-touched.
+    let mut terminal_dispatched = false;
     while let Some(envelope_arc) = rx.recv().await {
         let envelope: &EventEnvelope = envelope_arc.as_ref();
         match &envelope.payload {
@@ -550,17 +576,16 @@ async fn connection_worker_loop(
             AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected,
             } => {
+                if terminal_dispatched {
+                    continue;
+                }
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     eprintln!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
                 if let Some(b) = broker.as_ref() {
-                    forward_disconnect_to_broker(
-                        b.as_ref(),
-                        &connection_id,
-                        last_error.as_deref(),
-                    )
-                    .await;
+                    forward_disconnect_to_broker(b.as_ref(), &connection_id, None).await;
                 }
+                terminal_dispatched = true;
             }
             AcpEvent::Error {
                 message,
@@ -568,31 +593,42 @@ async fn connection_worker_loop(
                 terminal,
                 ..
             } => {
-                // Only TRULY terminal Errors (the `run_connection` failure
-                // path at `connection.rs:493`) get to flip the conversation
-                // row and buffer the detail for the upcoming Disconnected.
-                //
                 // Non-terminal Errors (`turn_failure_error_event`,
                 // `session/load` fallback, empty-prompt rejection, SetMode
                 // / SetConfigOption failures) leave the connection alive:
                 // - flipping the row InProgress → Cancelled would briefly
                 //   show "Cancelled" in the UI before the next TurnComplete
                 //   corrects it (cosmetic but jumpy).
-                // - buffering a stale detail risks stitching it into the
-                //   broker's cancel reason on an unrelated future
-                //   Disconnected.
+                // - draining the broker would race-cancel a pending
+                //   delegation that the upcoming `TurnComplete` →
+                //   `complete_call` would have mapped to a proper child-side
+                //   error code (`ChildRefusal` / `ChildMaxTokens` / …).
                 //
                 // F2 in the v0.14.3 sub-agent delegation post-mortem.
                 if !*terminal {
                     continue;
                 }
+                if terminal_dispatched {
+                    continue;
+                }
+                // Genuinely terminal (the `run_connection` failure path at
+                // `connection.rs:493`). Drain the broker NOW with the error
+                // detail instead of waiting for the trailing `Disconnected`.
+                // If `Disconnected` never arrives (bus `Lagged`, task
+                // abort, a future emit site that forgets to follow up) the
+                // parent's `delegate_to_agent` would otherwise block on
+                // `rx.await` forever. The drain itself is idempotent
+                // (`cancel_by_child_connection` no-ops on empty pending),
+                // so the subsequent Disconnected will short-circuit on
+                // `terminal_dispatched`.
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     eprintln!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
-                // Only buffer the detail for the eventual `Disconnected`.
-                // Do NOT call `forward_disconnect_to_broker` here — see the
-                // `last_error` comment above for the turn-failure race.
-                last_error = Some(format_terminal_error(message, code.as_deref()));
+                if let Some(b) = broker.as_ref() {
+                    let detail = format_terminal_error(message, code.as_deref());
+                    forward_disconnect_to_broker(b.as_ref(), &connection_id, Some(&detail)).await;
+                }
+                terminal_dispatched = true;
             }
             _ => {
                 handle_event_with_retry(&db, &manager, envelope, broker.as_ref()).await;
@@ -645,20 +681,7 @@ pub fn lifecycle_subscriber_task(
                     }
 
                     let conn_id = envelope_arc.connection_id.clone();
-                    // Only `Disconnected` tears the worker down. `Error` is
-                    // NOT terminal at the dispatcher level: it also fires
-                    // mid-turn from `turn_failure_error_event` while the
-                    // child connection stays alive, and the worker must
-                    // survive to buffer the detail and process the trailing
-                    // `TurnComplete`. On a genuinely terminal failure,
-                    // `connection.rs` emits `Disconnected` right after
-                    // `Error`, so the worker still exits promptly.
-                    let is_terminal = matches!(
-                        &envelope_arc.payload,
-                        AcpEvent::StatusChanged {
-                            status: ConnectionStatus::Disconnected
-                        }
-                    );
+                    let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
 
                     let tx = workers.entry(conn_id.clone()).or_insert_with(|| {
                         let (tx, worker_rx) =
@@ -1322,6 +1345,53 @@ mod tests {
         }));
     }
 
+    /// Dispatcher must drop the per-connection worker sender on either
+    /// `Disconnected` or a `terminal: true` Error. Non-terminal Errors and
+    /// other ConnectionStatus values must NOT trigger teardown — the
+    /// worker is still expected to receive a trailing TurnComplete /
+    /// Disconnected. (P2 regression in v0.14.3 post-mortem review:
+    /// without the `Error { terminal: true }` arm, the worker that
+    /// dispatched terminal work in lifecycle_subscriber_task would leak
+    /// when the bus drops the trailing Disconnected.)
+    #[test]
+    fn is_dispatcher_terminal_drops_worker_on_disconnected_and_terminal_error() {
+        assert!(is_dispatcher_terminal(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Disconnected,
+        }));
+        assert!(is_dispatcher_terminal(&AcpEvent::Error {
+            message: "transport closed".into(),
+            agent_type: "claude_code".into(),
+            code: None,
+            terminal: true,
+        }));
+
+        // Non-terminal Error: worker must survive.
+        assert!(!is_dispatcher_terminal(&AcpEvent::Error {
+            message: "turn refusal".into(),
+            agent_type: "claude_code".into(),
+            code: Some("turn_failed_refusal".into()),
+            terminal: false,
+        }));
+
+        // Other StatusChanged values: worker must survive.
+        assert!(!is_dispatcher_terminal(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Connected,
+        }));
+        assert!(!is_dispatcher_terminal(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        }));
+        assert!(!is_dispatcher_terminal(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Error,
+        }));
+
+        // Other event arms must never trigger teardown.
+        assert!(!is_dispatcher_terminal(&AcpEvent::TurnComplete {
+            session_id: "s".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "claude_code".into(),
+        }));
+    }
+
     /// Poll the conversation row's status until it matches `expected` or
     /// the timeout elapses. Used because the dispatcher exits as soon as
     /// the bus closes, but its workers may still be draining queued events
@@ -1577,15 +1647,21 @@ mod tests {
 
     // ── Broker-cancel routing regression ─────────────────────────────────
     //
-    // The lifecycle worker MUST defer `broker.cancel_by_child_connection`
-    // to `StatusChanged{Disconnected}`. `AcpEvent::Error` also fires
-    // mid-turn from `turn_failure_error_event` (refusal / max_tokens /
-    // empty / unknown) immediately before `TurnComplete`, while the child
-    // connection stays alive. Cancelling at Error there would race-drain
-    // the pending broker entry before `complete_call` could map the real
-    // stop reason — surfacing "canceled" to the parent agent instead of
+    // The lifecycle worker MUST gate `broker.cancel_by_child_connection`
+    // on `terminal == true`. `AcpEvent::Error` also fires mid-turn from
+    // `turn_failure_error_event` (refusal / max_tokens / empty / unknown)
+    // immediately before `TurnComplete`, while the child connection stays
+    // alive. Cancelling at Error there would race-drain the pending
+    // broker entry before `complete_call` could map the real stop reason
+    // — surfacing "canceled" to the parent agent instead of
     // `ChildRefusal` / `ChildMaxTokens` / …. (See F1 in the v0.14.3
     // sub-agent delegation post-mortem.)
+    //
+    // On the truly terminal path (`connection.rs:493`) the worker drains
+    // the broker on Error directly with the detail, then dedupes the
+    // trailing Disconnected. This avoids the "Error reaches us but the
+    // bus drops Disconnected" hang where `handle_request`'s `rx.await`
+    // would block forever.
     //
     // These tests drive `lifecycle_subscriber_task` end-to-end with a real
     // `DelegationBroker` + `MockSpawner` so the dispatcher → worker →
@@ -1705,11 +1781,69 @@ mod tests {
         let _ = dispatcher.await;
     }
 
+    /// Defense-in-depth: a terminal `Error` alone (no trailing
+    /// `Disconnected`) must still drain the broker. In production
+    /// `Disconnected` always follows, but the in-process bus is a
+    /// `broadcast` channel — a `Lagged` event or a task abort between
+    /// emit sites would otherwise leave the broker's `rx.await` blocked
+    /// forever and hang the parent's `delegate_to_agent` call. (See P1
+    /// in the v0.14.3 post-mortem follow-up review.)
+    #[tokio::test]
+    async fn dispatcher_terminal_error_alone_drains_broker_with_detail() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let (broker, driver) = stage_pending_delegation("c-error-alone", 51).await;
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+            Some(broker.clone()),
+        ));
+
+        bus.send(Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "c-error-alone".to_string(),
+            payload: AcpEvent::Error {
+                message: "transport closed".into(),
+                agent_type: "claude_code".into(),
+                code: None,
+                terminal: true,
+            },
+        }));
+        // Deliberately no Disconnected — simulates the bus dropping it
+        // (Lagged) or the run_connection task aborting after Error.
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("terminal Error alone must drain the broker (no hang)")
+            .unwrap();
+        match &outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "canceled");
+                assert_eq!(
+                    message,
+                    "canceled: child session ended without TurnComplete: transport closed",
+                    "terminal Error detail must reach the broker without waiting for Disconnected"
+                );
+            }
+            other => panic!("expected Err{{canceled}}, got {other:?}"),
+        }
+
+        drop(bus);
+        let _ = dispatcher.await;
+    }
+
     /// `Error` → `Disconnected` (the genuinely terminal path emitted by
-    /// `connection.rs:488` → 514) must drain the broker on Disconnected
-    /// AND thread the buffered Error detail into the canceled reason, so
-    /// the parent agent's `delegate_to_agent` tool result reads with the
-    /// real failure cause instead of the opaque default.
+    /// `connection.rs:488` → 514) must drain the broker AND thread the
+    /// Error detail into the canceled reason, so the parent agent's
+    /// `delegate_to_agent` tool result reads with the real failure cause
+    /// instead of the opaque default. The drain happens on Error; the
+    /// trailing Disconnected is a no-op (verified by the absence of a
+    /// double-emit elsewhere — `cancel_by_child_connection` is
+    /// idempotent).
     #[tokio::test]
     async fn dispatcher_error_then_disconnected_threads_buffered_detail_to_broker() {
         let db = test_helpers::fresh_in_memory_db().await;
