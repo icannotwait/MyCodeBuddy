@@ -343,6 +343,84 @@ pub async fn import_local_conversations(
     import_local_conversations_core(&db.conn, folder_id).await
 }
 
+/// Build the `meta["codeg.delegation"]` value for a delegation child loaded
+/// from the DB. Mirrors the shape produced at runtime by
+/// `acp::delegation::meta_writer::build_delegation_meta`, but only includes
+/// the fields the DB can vouch for: `status` and `child_conversation_id`.
+/// `child_connection_id` is omitted (no live connection for a historical
+/// view; the frontend's parser treats it as optional).
+///
+/// Status mapping:
+///  - `in_progress` → `running` (still streaming or about to)
+///  - `pending_review` → `completed` (set by `TurnComplete { stop_reason:
+///    "end_turn" }` — the success path; the live broker writes `completed`
+///    for this same outcome, see `acp/delegation/broker.rs` Ok arm).
+///  - `completed` → `completed`
+///  - `cancelled` → `failed` with NO `error_code`. The DB's `Cancelled`
+///    variant covers both user-cancel and turn-failure modes (refusal,
+///    max_tokens, max_turn_requests, empty, unknown — see
+///    `acp/lifecycle.rs` TurnComplete branch), and the broker writes a
+///    distinct `error_code` per failure mode at runtime. Since the DB
+///    persists only the bucket and not the specific code, we cannot
+///    truthfully label the failure here — emit `failed` without a code
+///    rather than mislabel non-cancel failures as `"canceled"`.
+///  - other (defensive) → `running`
+fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json::Value {
+    let status: &str = match child.status.as_str() {
+        "in_progress" => "running",
+        "pending_review" | "completed" => "completed",
+        "cancelled" => "failed",
+        _ => "running",
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".into(), serde_json::Value::String(status.into()));
+    obj.insert(
+        "child_conversation_id".into(),
+        serde_json::Value::Number(child.id.into()),
+    );
+    serde_json::Value::Object(obj)
+}
+
+/// Walk every `delegate_to_agent` ToolUse block in `turns` and, when its
+/// `tool_use_id` matches a child conversation in `children`, set
+/// `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
+/// whose meta is already populated so the live-broker write (when present)
+/// always wins. Tool-name match is by substring to cover the
+/// MCP-prefixed (`mcp__codeg-delegate__delegate_to_agent`) and bare forms
+/// the host may have emitted.
+fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
+    if children.is_empty() {
+        return;
+    }
+    let by_parent_tool_use_id: HashMap<&str, &DbConversationSummary> = children
+        .iter()
+        .filter_map(|c| c.parent_tool_use_id.as_deref().map(|tu| (tu, c)))
+        .collect();
+    for turn in turns.iter_mut() {
+        for block in turn.blocks.iter_mut() {
+            if let ContentBlock::ToolUse {
+                tool_use_id: Some(tu),
+                tool_name,
+                meta,
+                ..
+            } = block
+            {
+                if meta.is_some() {
+                    continue;
+                }
+                if !tool_name.contains("delegate_to_agent") {
+                    continue;
+                }
+                if let Some(child) = by_parent_tool_use_id.get(tu.as_str()) {
+                    *meta = Some(serde_json::json!({
+                        "codeg.delegation": build_historical_delegation_meta(child),
+                    }));
+                }
+            }
+        }
+    }
+}
+
 /// Core logic for loading a folder conversation with full OpenClaw fallback.
 /// Shared by both the Tauri command and the web handler.
 pub async fn get_folder_conversation_core(
@@ -353,7 +431,8 @@ pub async fn get_folder_conversation_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let (turns, session_stats, resolved_ext_id) = if let Some(ref ext_id) = summary.external_id {
+    let (mut turns, session_stats, resolved_ext_id) = if let Some(ref ext_id) = summary.external_id
+    {
         let at = summary.agent_type;
         let eid = ext_id.clone();
         let db_created_at = summary.created_at;
@@ -436,6 +515,17 @@ pub async fn get_folder_conversation_core(
 
     let mut summary = summary;
     summary.message_count = turns.len() as u32;
+
+    // Historical recovery for the read-only sub-agent viewer: JSONL parsers
+    // don't carry `meta["codeg.delegation"]`, so a reloaded conversation
+    // can't drive the parent UI's child-conversation lookup. Join on
+    // `parent_id = summary.id` to repopulate it from the DB. Failure to
+    // fetch children silently degrades to "no button on the card" (the
+    // pre-fix behavior), never to a failed detail load.
+    let children = conversation_service::list_children(conn, conversation_id)
+        .await
+        .unwrap_or_default();
+    inject_delegation_meta(&mut turns, &children);
 
     Ok(DbConversationDetail {
         summary,
@@ -615,6 +705,227 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Delegation meta injection for historical reload. Parsers always emit
+    // `ContentBlock::ToolUse { meta: None }`; without this helper, a
+    // conversation reloaded from JSONL has no way to surface its
+    // sub-agent children to the parent UI's read-only viewer.
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn summary_child(
+        id: i32,
+        parent_tool_use_id: &str,
+        status: &str,
+    ) -> DbConversationSummary {
+        let now = chrono::Utc::now();
+        DbConversationSummary {
+            id,
+            folder_id: 1,
+            title: None,
+            agent_type: AgentType::Codex,
+            status: status.into(),
+            model: None,
+            git_branch: None,
+            external_id: None,
+            message_count: 0,
+            created_at: now,
+            updated_at: now,
+            parent_id: Some(1),
+            parent_tool_use_id: Some(parent_tool_use_id.into()),
+            delegation_call_id: Some("call-1".into()),
+        }
+    }
+
+    fn tool_use_turn(tool_use_id: Option<&str>, tool_name: &str) -> MessageTurn {
+        MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                tool_use_id: tool_use_id.map(String::from),
+                tool_name: tool_name.into(),
+                input_preview: None,
+                meta: None,
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }
+    }
+
+    fn first_block_meta(turn: &MessageTurn) -> Option<&serde_json::Value> {
+        turn.blocks.first().and_then(|b| match b {
+            ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn inject_delegation_meta_populates_completed_child() {
+        let mut turns = vec![tool_use_turn(
+            Some("tu-1"),
+            "mcp__codeg-delegate__delegate_to_agent",
+        )];
+        let children = vec![summary_child(42, "tu-1", "completed")];
+        inject_delegation_meta(&mut turns, &children);
+        let meta = first_block_meta(&turns[0]).expect("meta should be set");
+        let inner = meta.get("codeg.delegation").expect("codeg.delegation key");
+        assert_eq!(inner["status"], "completed");
+        assert_eq!(inner["child_conversation_id"], 42);
+        assert!(inner.get("error_code").is_none(), "completed has no error_code");
+    }
+
+    #[test]
+    fn inject_delegation_meta_maps_in_progress_to_running() {
+        let mut turns = vec![tool_use_turn(Some("tu-1"), "delegate_to_agent")];
+        let children = vec![summary_child(7, "tu-1", "in_progress")];
+        inject_delegation_meta(&mut turns, &children);
+        let inner = first_block_meta(&turns[0]).unwrap().get("codeg.delegation").unwrap();
+        assert_eq!(inner["status"], "running");
+        assert_eq!(inner["child_conversation_id"], 7);
+    }
+
+    #[test]
+    fn inject_delegation_meta_maps_pending_review_to_completed() {
+        // `pending_review` is the DB status written after a successful
+        // `TurnComplete { stop_reason: "end_turn" }` (see acp/lifecycle.rs).
+        // The live broker maps that same child outcome to delegation meta
+        // `status: "completed"` (see broker.rs Ok arm). Historical reload
+        // must agree, otherwise a finished sub-agent shows a stale
+        // "running" badge until the user reloads again.
+        let mut turns = vec![tool_use_turn(Some("tu-1"), "delegate_to_agent")];
+        let children = vec![summary_child(11, "tu-1", "pending_review")];
+        inject_delegation_meta(&mut turns, &children);
+        let inner = first_block_meta(&turns[0]).unwrap().get("codeg.delegation").unwrap();
+        assert_eq!(inner["status"], "completed");
+        assert_eq!(inner["child_conversation_id"], 11);
+    }
+
+    #[test]
+    fn inject_delegation_meta_maps_cancelled_to_failed_without_error_code() {
+        // `Cancelled` covers both user-cancel and turn-failure outcomes
+        // (refusal, max_tokens, max_turn_requests, empty, unknown — see
+        // acp/lifecycle.rs TurnComplete branch). The DB does not persist
+        // the broker's distinct `error_code` per failure mode, so a
+        // hard-coded `"canceled"` would mislabel every non-cancel failure
+        // as user-cancel. Emit `failed` without a code instead.
+        let mut turns = vec![tool_use_turn(Some("tu-1"), "delegate_to_agent")];
+        let children = vec![summary_child(9, "tu-1", "cancelled")];
+        inject_delegation_meta(&mut turns, &children);
+        let inner = first_block_meta(&turns[0]).unwrap().get("codeg.delegation").unwrap();
+        assert_eq!(inner["status"], "failed");
+        assert!(
+            inner.get("error_code").is_none(),
+            "DB cannot distinguish cancel from other failures, must not claim 'canceled'"
+        );
+    }
+
+    #[test]
+    fn inject_delegation_meta_skips_non_delegation_tool_calls() {
+        let mut turns = vec![tool_use_turn(Some("tu-1"), "bash")];
+        let children = vec![summary_child(42, "tu-1", "completed")];
+        inject_delegation_meta(&mut turns, &children);
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "non-delegation tool_name must not get meta even on tool_use_id match"
+        );
+    }
+
+    #[test]
+    fn inject_delegation_meta_skips_blocks_without_tool_use_id() {
+        let mut turns = vec![tool_use_turn(None, "delegate_to_agent")];
+        let children = vec![summary_child(42, "tu-1", "completed")];
+        inject_delegation_meta(&mut turns, &children);
+        assert!(first_block_meta(&turns[0]).is_none());
+    }
+
+    #[test]
+    fn inject_delegation_meta_preserves_live_broker_meta() {
+        // Defensive: even though parsers always emit `meta: None`, a future
+        // snapshot path could carry a live broker write. Don't clobber it.
+        let pre_existing = serde_json::json!({ "codeg.delegation": { "status": "running", "child_conversation_id": 999 } });
+        let mut turns = vec![MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                tool_use_id: Some("tu-1".into()),
+                tool_name: "delegate_to_agent".into(),
+                input_preview: None,
+                meta: Some(pre_existing.clone()),
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+        let children = vec![summary_child(42, "tu-1", "completed")];
+        inject_delegation_meta(&mut turns, &children);
+        // The 999 (broker-written) survives — DB-derived 42 is not used here.
+        let inner = first_block_meta(&turns[0]).unwrap().get("codeg.delegation").unwrap();
+        assert_eq!(inner["child_conversation_id"], 999);
+        assert_eq!(inner["status"], "running");
+    }
+
+    #[test]
+    fn inject_delegation_meta_no_op_when_children_empty() {
+        let mut turns = vec![tool_use_turn(Some("tu-1"), "delegate_to_agent")];
+        inject_delegation_meta(&mut turns, &[]);
+        assert!(first_block_meta(&turns[0]).is_none());
+    }
+
+    #[test]
+    fn inject_delegation_meta_unmatched_tool_use_id_left_alone() {
+        let mut turns = vec![tool_use_turn(Some("tu-other"), "delegate_to_agent")];
+        let children = vec![summary_child(42, "tu-1", "completed")];
+        inject_delegation_meta(&mut turns, &children);
+        assert!(first_block_meta(&turns[0]).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_folder_conversation_core_injects_meta_for_real_child() {
+        // Seed a parent and a delegation child; the parent has no external_id
+        // (no JSONL on disk), so `turns` returns empty — but we still want to
+        // exercise the children-fetch + injection short-circuit cleanly.
+        // The richer end-to-end (with parser turns) is covered by the unit
+        // tests above; here we just verify the wiring inside the _core fn
+        // doesn't error on the join path.
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-inject-test").await;
+        let parent_id = create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("parent".into()),
+        )
+        .await
+        .expect("parent");
+        // Attach a child to this parent via the delegation-link path.
+        let link = crate::acp::delegation::spawner::DelegationLink {
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: "tu-historical".into(),
+            delegation_call_id: "call-historical".into(),
+        };
+        conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("child".into()),
+            None,
+            Some(link),
+        )
+        .await
+        .expect("child");
+        // Parent has no external_id → no JSONL → no turns to inject into.
+        // The call must still succeed without error.
+        let detail = get_folder_conversation_core(&db.conn, parent_id)
+            .await
+            .expect("load");
+        assert_eq!(detail.summary.id, parent_id);
+        assert!(detail.turns.is_empty());
+    }
 
     #[tokio::test]
     async fn create_conversation_core_happy_path() {
