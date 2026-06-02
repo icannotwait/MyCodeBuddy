@@ -1047,6 +1047,18 @@
   }
 }
 
+/* Streamdown loose-list markers.
+   Our markdown wrappers render lists with `list-style-position: inside`
+   ([&_ol]:list-inside / [&_ul]:list-inside). In a loose list, Streamdown wraps
+   each item's text in a block <p>; an inside marker followed by a block box is
+   forced onto its own line above the text. Streamdown bundles `[&>p]:inline`
+   on its <li> for this, but those utilities live in node_modules and are not
+   picked up by our Tailwind content scan, so re-create the rule here keyed on
+   Streamdown's stable list-item data attribute. */
+[data-streamdown="list-item"] > p {
+  display: inline;
+}
+
 /* Streamdown table overrides */
 [data-streamdown="table-wrapper"] {
   position: relative;
