@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "Eingabe",
         "agentModelLabel": "Modell",
         "agentRunning": "Läuft...",
+        "agentFallbackTitle": "Sub-Agent wird gestartet…",
         "agentStatsBash": "Befehle",
         "agentStatsRead": "Dateien gelesen",
         "agentStatsSearch": "Suchen",

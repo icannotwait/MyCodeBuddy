@@ -111,9 +111,9 @@ export const AgentToolCallPart = memo(function AgentToolCallPart({
   )
 
   const title = useMemo(() => {
-    const prefix = subagentType ?? "Agent"
+    const prefix = subagentType ?? t("agentFallbackTitle")
     return description ? `${prefix}: ${description}` : prefix
-  }, [subagentType, description])
+  }, [subagentType, description, t])
 
   const statusLabel =
     part.state === "input-available"

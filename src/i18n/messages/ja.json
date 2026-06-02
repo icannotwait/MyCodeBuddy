@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "プロンプト",
         "agentModelLabel": "モデル",
         "agentRunning": "実行中...",
+        "agentFallbackTitle": "サブエージェント起動中…",
         "agentStatsBash": "コマンド",
         "agentStatsRead": "ファイル読取",
         "agentStatsSearch": "検索",

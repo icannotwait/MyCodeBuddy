@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "المطالبة",
         "agentModelLabel": "النموذج",
         "agentRunning": "قيد التشغيل...",
+        "agentFallbackTitle": "جارٍ تشغيل الوكيل الفرعي…",
         "agentStatsBash": "الأوامر",
         "agentStatsRead": "الملفات المقروءة",
         "agentStatsSearch": "عمليات البحث",

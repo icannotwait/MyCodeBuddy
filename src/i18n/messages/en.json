@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "Prompt",
         "agentModelLabel": "Model",
         "agentRunning": "Running...",
+        "agentFallbackTitle": "Sub-agent starting…",
         "agentStatsBash": "Commands",
         "agentStatsRead": "Files read",
         "agentStatsSearch": "Searches",

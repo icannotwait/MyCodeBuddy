@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "Instrução",
         "agentModelLabel": "Modelo",
         "agentRunning": "Em execução...",
+        "agentFallbackTitle": "Iniciando subagente…",
         "agentStatsBash": "Comandos",
         "agentStatsRead": "Arquivos lidos",
         "agentStatsSearch": "Pesquisas",

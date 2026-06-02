@@ -1941,6 +1941,7 @@
         "agentPromptLabel": "提示词",
         "agentModelLabel": "模型",
         "agentRunning": "运行中...",
+        "agentFallbackTitle": "子智能体启动中…",
         "agentStatsBash": "命令",
         "agentStatsRead": "读取文件",
         "agentStatsSearch": "搜索",
