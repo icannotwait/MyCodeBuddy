@@ -599,7 +599,7 @@ export function DelegatedSubThread({
   return (
     <div
       data-testid="delegated-sub-thread"
-      className="rounded-lg border border-border bg-card"
+      className="@container/delegcard rounded-lg border border-border bg-card"
     >
       <div className="flex w-full items-stretch rounded-lg overflow-hidden">
         <div className="flex flex-1 min-w-0 items-center gap-3 px-3 py-2.5 text-left">
@@ -641,7 +641,9 @@ export function DelegatedSubThread({
             aria-label={t("openDetail")}
           >
             <Eye className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">{t("openDetail")}</span>
+            <span className="hidden @[24rem]/delegcard:inline">
+              {t("openDetail")}
+            </span>
           </button>
         )}
       </div>
