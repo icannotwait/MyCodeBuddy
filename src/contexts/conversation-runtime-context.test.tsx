@@ -1016,4 +1016,171 @@ describe("ConversationRuntimeProvider viewer user-turn synthesis", () => {
       .filter((t) => t.turn.role === "user")
     expect(users.map((u) => u.turn.id)).toEqual(["u-old", "user-c-9"])
   })
+
+  it("suppresses the synthesized turn when the SAME prompt is already persisted under a different id (mid-stream cross-client duplicate)", async () => {
+    // The reported bug: a viewer opens the conversation mid-stream AFTER the
+    // owner's prompt was already written to the JSONL transcript. History
+    // (`detail.turns`) carries it under the parser-assigned id, while the live
+    // broadcast synthesizes the same prompt under the unrelated `message_id`.
+    // Same content, different ids → without content dedup the user message
+    // renders twice. The fetch lands BEFORE the synthesized turn here.
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        {
+          id: "jsonl-xyz",
+          role: "user",
+          blocks: [{ type: "text", text: "hello" }],
+          timestamp: "2026-05-28T00:00:00.000Z",
+        },
+      ])
+    )
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    await act(async () => {
+      api().refetchDetail(99)
+      await Promise.resolve()
+    })
+    act(() => {
+      api().appendViewerUserTurn(99, {
+        id: "msg-abc",
+        role: "user",
+        blocks: [{ type: "text", text: "hello" }],
+        timestamp: "2026-05-28T00:00:01.000Z",
+      })
+    })
+    const users = api()
+      .getTimelineTurns(99)
+      .filter((t) => t.turn.role === "user")
+    expect(users).toHaveLength(1)
+    expect(users[0].turn.id).toBe("jsonl-xyz")
+  })
+
+  it("does not duplicate when the synthesized turn is added BEFORE the persisted copy lands (fetch clears the viewer's ephemeral turn)", async () => {
+    // The complementary ordering: the viewer synthesizes the user turn first
+    // (from the snapshot/event), THEN the history fetch resolves with the same
+    // prompt under its parser id. FETCH_DETAIL_SUCCESS clears the viewer's
+    // ephemeral optimistic turn (it never sets awaiting_persist), so the
+    // persisted copy cleanly replaces it — exactly one user turn remains.
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        {
+          id: "jsonl-xyz",
+          role: "user",
+          blocks: [{ type: "text", text: "hello" }],
+          timestamp: "2026-05-28T00:00:00.000Z",
+        },
+      ])
+    )
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    act(() => {
+      api().appendViewerUserTurn(99, {
+        id: "msg-abc",
+        role: "user",
+        blocks: [{ type: "text", text: "hello" }],
+        timestamp: "2026-05-28T00:00:01.000Z",
+      })
+    })
+    await act(async () => {
+      api().refetchDetail(99)
+      await Promise.resolve()
+    })
+    const users = api()
+      .getTimelineTurns(99)
+      .filter((t) => t.turn.role === "user")
+    expect(users).toHaveLength(1)
+    expect(users[0].turn.id).toBe("jsonl-xyz")
+  })
+
+  it("keeps a NEW in-flight prompt visible when an earlier COMPLETED turn has identical text (repeated 'continue', not yet persisted)", async () => {
+    // Codex review case: a prior 'continue' was already answered (its assistant
+    // reply is persisted right after it), then the owner sends ANOTHER
+    // 'continue'. While that new prompt is still streaming, the transcript ends
+    // at the COMPLETED reply and has not captured the new prompt yet. The viewer
+    // must keep the synthesized turn — only a prompt sitting as the LAST turn is
+    // treated as the persisted copy, so a completed earlier twin never suppresses
+    // it. Suppressing here would hide a message the user actually sent.
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        {
+          id: "jsonl-u1",
+          role: "user",
+          blocks: [{ type: "text", text: "continue" }],
+          timestamp: "2026-05-28T00:00:00.000Z",
+        },
+        {
+          id: "jsonl-a1",
+          role: "assistant",
+          blocks: [{ type: "text", text: "done" }],
+          timestamp: "2026-05-28T00:00:01.000Z",
+        },
+      ])
+    )
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    await act(async () => {
+      api().refetchDetail(99)
+      await Promise.resolve()
+    })
+    act(() => {
+      api().appendViewerUserTurn(99, {
+        id: "msg-new",
+        role: "user",
+        blocks: [{ type: "text", text: "continue" }],
+        timestamp: "2026-05-28T00:00:02.000Z",
+      })
+    })
+    const users = api()
+      .getTimelineTurns(99)
+      .filter((t) => t.turn.role === "user")
+    expect(users.map((u) => u.turn.id)).toEqual(["jsonl-u1", "msg-new"])
+  })
+
+  it("suppresses the synthesized copy of a repeated prompt once it is itself persisted as the trailing turn", async () => {
+    // The complement to the case above: the SAME 'continue' is repeated, but the
+    // new prompt has now landed in the transcript as the trailing user turn. The
+    // synthesized copy is redundant and must be dropped — even though an
+    // identical earlier 'continue' also exists in history — so the timeline shows
+    // the two persisted prompts and no third (synthesized) duplicate.
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        {
+          id: "jsonl-u1",
+          role: "user",
+          blocks: [{ type: "text", text: "continue" }],
+          timestamp: "2026-05-28T00:00:00.000Z",
+        },
+        {
+          id: "jsonl-a1",
+          role: "assistant",
+          blocks: [{ type: "text", text: "done" }],
+          timestamp: "2026-05-28T00:00:01.000Z",
+        },
+        {
+          id: "jsonl-u2",
+          role: "user",
+          blocks: [{ type: "text", text: "continue" }],
+          timestamp: "2026-05-28T00:00:02.000Z",
+        },
+      ])
+    )
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+    await act(async () => {
+      api().refetchDetail(99)
+      await Promise.resolve()
+    })
+    act(() => {
+      api().appendViewerUserTurn(99, {
+        id: "msg-new",
+        role: "user",
+        blocks: [{ type: "text", text: "continue" }],
+        timestamp: "2026-05-28T00:00:03.000Z",
+      })
+    })
+    const users = api()
+      .getTimelineTurns(99)
+      .filter((t) => t.turn.role === "user")
+    expect(users.map((u) => u.turn.id)).toEqual(["jsonl-u1", "jsonl-u2"])
+  })
 })

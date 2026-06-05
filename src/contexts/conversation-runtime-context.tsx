@@ -782,6 +782,36 @@ function updateSessionInState(
   return { ...state, byConversationId: nextByConversationId }
 }
 
+/**
+ * Stable content signature for a USER turn. The same prompt surfaces under two
+ * unrelated id namespaces: a cross-client viewer's synthesized turn uses the
+ * broadcast `message_id`, while the SAME prompt, once the agent has written it
+ * to its JSONL transcript, comes back from the parser (in `detail.turns`) under
+ * a parser-assigned id. Id-based dedup therefore can't recognize the two as one
+ * message — only content can. Ids and timestamps are deliberately excluded.
+ * The encoding is structurally unambiguous (JSON, so block boundaries can't
+ * collide) and compares FULL payload — text verbatim and full image data — so a
+ * genuinely different prompt is never mistaken for a match. That matters because
+ * a match SUPPRESSES a visible user turn (see `APPEND_VIEWER_USER_TURN`), and it
+ * runs only on the rare cross-client viewer append, so comparing full data is
+ * fine. Unknown block types are serialized whole rather than collapsed to their
+ * tag, so no distinguishing content is silently dropped.
+ */
+function userTurnContentKey(turn: MessageTurn): string {
+  return JSON.stringify(
+    turn.blocks.map((b) => {
+      switch (b.type) {
+        case "text":
+          return { t: b.text }
+        case "image":
+          return { i: b.mime_type, d: b.data }
+        default:
+          return b
+      }
+    })
+  )
+}
+
 function reducer(
   state: ConversationRuntimeState,
   action: Action
@@ -969,6 +999,43 @@ function reducer(
       if (
         current.optimisticTurns.some((t) => t.id === id) ||
         current.localTurns.some((t) => t.id === id)
+      ) {
+        return state
+      }
+      // CONTENT dedup against persisted history. The exact-id guard above is
+      // blind to the prompt once the agent has written it to its JSONL
+      // transcript and it has been reloaded into `detail.turns`: the parser
+      // assigns it an unrelated id there, so the synthesized turn (keyed by the
+      // broadcast message_id) and the persisted turn never share an id. Without
+      // this, a viewer that attaches mid-stream after the prompt was persisted
+      // renders the user message twice.
+      //
+      // Suppress ONLY when the synthesized prompt equals the LAST persisted turn
+      // AND that turn is a user turn — i.e. the transcript currently ends exactly
+      // at the in-flight prompt, its reply still streaming in `liveMessage` and
+      // not yet written (the normal mid-stream shape for Claude/Codex, whose
+      // assistant turn is appended to the JSONL only on completion). We must NOT
+      // look past a trailing assistant turn: a PREVIOUS, already-answered user
+      // turn with identical text (e.g. a repeated "continue") ends with its
+      // completed assistant reply, so doing so would wrongly suppress a genuinely
+      // new prompt the transcript hasn't captured yet. When in doubt we keep the
+      // synthesized turn visible — a transient duplicate is recoverable, a hidden
+      // prompt is not. (Agents that persist a PARTIAL assistant turn mid-stream,
+      // e.g. OpenCode/Gemini, fall into the "keep visible" branch; their separate
+      // partial-render behavior is out of scope here.)
+      //
+      // Invariant: a trailing persisted user turn is the in-flight prompt. If a
+      // prior run instead left a bare trailing user turn (crash/cancel before any
+      // reply) and the user re-sends identical text, this self-corrects — the new
+      // prompt is written to the transcript near-instantly, becoming the trailing
+      // turn, at which point suppression of the (now redundant) synthesized copy
+      // is correct. The only-suppress-on-exact-trailing-match keeps the worst case
+      // a sub-second transient, never a stuck hidden prompt.
+      const persistedTurns = current.detail?.turns
+      const lastPersisted = persistedTurns?.[persistedTurns.length - 1]
+      if (
+        lastPersisted?.role === "user" &&
+        userTurnContentKey(lastPersisted) === userTurnContentKey(action.turn)
       ) {
         return state
       }
