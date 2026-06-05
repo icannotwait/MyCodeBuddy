@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "當你傳送訊息時——通知中會包含訊息內容",
       "saved": "事件篩選已更新。",
       "saveFailed": "儲存事件篩選失敗。",
+      "loadFailed": "載入設定失敗。",
+      "retry": "重試",
       "webhooksTitle": "Webhook",
       "webhooksDescription": "事件觸發時，向一個或多個位址 POST 一份 JSON。上方的事件篩選同樣作用於 Webhook。",
       "webhookUrlPlaceholder": "https://example.com/webhook",

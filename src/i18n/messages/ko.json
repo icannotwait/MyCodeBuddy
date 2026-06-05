@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "메시지를 보낼 때 — 알림에 메시지 내용이 포함됩니다",
       "saved": "이벤트 필터가 업데이트되었습니다.",
       "saveFailed": "이벤트 필터 저장에 실패했습니다.",
+      "loadFailed": "설정을 불러오지 못했습니다.",
+      "retry": "다시 시도",
       "webhooksTitle": "Webhook",
       "webhooksDescription": "활성화된 이벤트가 발생하면 하나 이상의 URL로 JSON을 POST합니다. 위의 이벤트 필터는 Webhook에도 적용됩니다.",
       "webhookUrlPlaceholder": "https://example.com/webhook",

@@ -2328,6 +2328,8 @@
       "userPromptSentDesc": "When you send a message — the message text is included in the notification",
       "saved": "Event filter updated.",
       "saveFailed": "Failed to save event filter.",
+      "loadFailed": "Failed to load settings.",
+      "retry": "Retry",
       "webhooksTitle": "Webhooks",
       "webhooksDescription": "POST a JSON payload to one or more URLs when an enabled event fires. The event filter above also applies to webhooks.",
       "webhookUrlPlaceholder": "https://example.com/webhook",

@@ -2328,6 +2328,8 @@
       "userPromptSentDesc": "当你发送消息时——通知中会包含消息内容",
       "saved": "事件过滤已更新。",
       "saveFailed": "保存事件过滤失败。",
+      "loadFailed": "加载设置失败。",
+      "retry": "重试",
       "webhooksTitle": "Webhook",
       "webhooksDescription": "事件触发时，向一个或多个地址 POST 一份 JSON。上方的事件过滤同样作用于 Webhook。",
       "webhookUrlPlaceholder": "https://example.com/webhook",

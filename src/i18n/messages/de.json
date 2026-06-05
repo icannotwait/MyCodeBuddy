@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "Wenn du eine Nachricht sendest – der Nachrichtentext ist in der Benachrichtigung enthalten",
       "saved": "Ereignisfilter aktualisiert.",
       "saveFailed": "Fehler beim Speichern des Ereignisfilters.",
+      "loadFailed": "Einstellungen konnten nicht geladen werden.",
+      "retry": "Erneut versuchen",
       "webhooksTitle": "Webhooks",
       "webhooksDescription": "Sendet bei einem aktivierten Ereignis eine JSON-Nutzlast per POST an eine oder mehrere URLs. Der Ereignisfilter oben gilt auch für Webhooks.",
       "webhookUrlPlaceholder": "https://example.com/webhook",

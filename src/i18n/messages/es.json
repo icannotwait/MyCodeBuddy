@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "Cuando envías un mensaje (el texto del mensaje se incluye en la notificación)",
       "saved": "Filtro de eventos actualizado.",
       "saveFailed": "Error al guardar el filtro de eventos.",
+      "loadFailed": "No se pudo cargar la configuración.",
+      "retry": "Reintentar",
       "webhooksTitle": "Webhooks",
       "webhooksDescription": "Envía una carga JSON por POST a una o varias URL cuando se activa un evento habilitado. El filtro de eventos anterior también se aplica a los webhooks.",
       "webhookUrlPlaceholder": "https://example.com/webhook",

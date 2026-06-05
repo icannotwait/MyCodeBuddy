@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "عند إرسالك رسالة — يُضمَّن نص الرسالة في الإشعار",
       "saved": "تم تحديث فلتر الأحداث.",
       "saveFailed": "فشل حفظ فلتر الأحداث.",
+      "loadFailed": "فشل تحميل الإعدادات.",
+      "retry": "إعادة المحاولة",
       "webhooksTitle": "Webhooks",
       "webhooksDescription": "يرسل حمولة JSON عبر POST إلى عنوان واحد أو أكثر عند تشغيل حدث مُفعَّل. ينطبق فلتر الأحداث أعلاه على Webhooks أيضًا.",
       "webhookUrlPlaceholder": "https://example.com/webhook",

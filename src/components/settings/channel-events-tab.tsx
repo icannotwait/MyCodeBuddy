@@ -132,6 +132,11 @@ export function ChannelEventsTab() {
   )
   const [webhooks, setWebhooks] = useState<WebhookConfig[]>([])
   const [loading, setLoading] = useState(true)
+  // True when the initial config fetch failed. We then refuse to render the
+  // controls and surface a retry instead — saving from the still-default state
+  // would persist a stale snapshot and clobber the real (unread) config, e.g.
+  // overwrite the stored event filter or drop existing webhooks.
+  const [loadError, setLoadError] = useState(false)
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState("webhooks")
 
@@ -149,15 +154,22 @@ export function ChannelEventsTab() {
   const [webhooksSaving, setWebhooksSaving] = useState(false)
   const savingRef = useRef(false)
 
-  useEffect(() => {
+  const loadConfig = useCallback(() => {
+    setLoading(true)
+    setLoadError(false)
     Promise.all([getChatEventFilter(), getChatEventWebhooks()])
       .then(([filter, hooks]) => {
         setEnabledEvents(parseFilter(filter))
         setWebhooks(hooks)
+        setLoadError(false)
       })
-      .catch(() => {})
+      .catch(() => setLoadError(true))
       .finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    loadConfig()
+  }, [loadConfig])
 
   const handleToggle = useCallback(
     async (eventId: string, checked: boolean) => {
@@ -280,6 +292,17 @@ export function ChannelEventsTab() {
     return (
       <div className="h-full flex items-center justify-center text-sm text-muted-foreground gap-2">
         <Loader2 className="h-4 w-4 animate-spin" />
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+        <p>{t("loadFailed")}</p>
+        <Button type="button" variant="outline" size="sm" onClick={loadConfig}>
+          {t("retry")}
+        </Button>
       </div>
     )
   }

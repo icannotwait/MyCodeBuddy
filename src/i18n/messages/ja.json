@@ -2316,6 +2316,8 @@
       "userPromptSentDesc": "メッセージを送信したとき（通知に本文が含まれます）",
       "saved": "イベントフィルターを更新しました。",
       "saveFailed": "イベントフィルターの保存に失敗しました。",
+      "loadFailed": "設定の読み込みに失敗しました。",
+      "retry": "再試行",
       "webhooksTitle": "Webhook",
       "webhooksDescription": "有効なイベントの発生時に、1 つ以上の URL へ JSON を POST します。上のイベントフィルターは Webhook にも適用されます。",
       "webhookUrlPlaceholder": "https://example.com/webhook",

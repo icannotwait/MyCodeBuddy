@@ -106,6 +106,45 @@ describe("ChannelEventsTab event filter (opt-in user_prompt_sent)", () => {
   })
 })
 
+describe("ChannelEventsTab load failure", () => {
+  it("shows a retry affordance and hides controls when the config fails to load", async () => {
+    mockGetFilter.mockRejectedValue(new Error("boom"))
+    renderTab()
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument()
+    )
+    // No event/webhook controls render, so a save can't persist a stale default
+    // snapshot over the real (unread) config.
+    expect(
+      screen.queryByRole("switch", { name: "User Message" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Add Webhook" })
+    ).not.toBeInTheDocument()
+    expect(mockSetFilter).not.toHaveBeenCalled()
+    expect(mockSetWebhooks).not.toHaveBeenCalled()
+  })
+
+  it("retrying after a failed load fetches the config again and renders it", async () => {
+    mockGetFilter.mockRejectedValueOnce(new Error("boom"))
+    mockGetFilter.mockResolvedValue([
+      "turn_complete",
+      "error",
+      "permission_request",
+      "user_prompt_sent",
+    ])
+    renderTab()
+
+    const retry = await screen.findByRole("button", { name: "Retry" })
+    fireEvent.click(retry)
+
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "User Message" })).toBeChecked()
+    )
+  })
+})
+
 describe("isValidWebhookUrl", () => {
   it("accepts http(s) and rejects others/empty", () => {
     expect(isValidWebhookUrl("https://a.test/h")).toBe(true)
