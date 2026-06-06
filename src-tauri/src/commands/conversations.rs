@@ -534,16 +534,191 @@ pub async fn get_folder_conversation_core(
         summary,
         turns,
         session_stats,
+        in_flight_user_turn_id: None,
     })
+}
+
+/// A normalized, comparable view of a user turn's renderable content. Used to
+/// match the live in-flight prompt (`UserMessageBlock`s) against a parser-built
+/// user turn (`ContentBlock`s), whose two id namespaces never line up. Mirrors
+/// the frontend `userTurnContentKey`: only text and image carry identity, text
+/// is compared verbatim, images by `(mime_type, data)`, and block order is
+/// preserved so a rearrangement of the same pieces is not a match.
+#[derive(PartialEq)]
+enum UserContentSig {
+    Text(String),
+    Image { mime_type: String, data: String },
+}
+
+fn sig_from_user_message_blocks(
+    blocks: &[crate::acp::types::UserMessageBlock],
+) -> Vec<UserContentSig> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            crate::acp::types::UserMessageBlock::Text { text } => {
+                UserContentSig::Text(text.clone())
+            }
+            crate::acp::types::UserMessageBlock::Image { data, mime_type } => {
+                UserContentSig::Image {
+                    mime_type: mime_type.clone(),
+                    data: data.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// `Some(sig)` only for a plain user prompt (text/image blocks). Any other block
+/// type means this isn't a prompt we can match by content, so we return `None`
+/// and the caller leaves the turn untouched.
+fn sig_from_turn_blocks(blocks: &[ContentBlock]) -> Option<Vec<UserContentSig>> {
+    let mut sig = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } => sig.push(UserContentSig::Text(text.clone())),
+            ContentBlock::Image {
+                data, mime_type, ..
+            } => sig.push(UserContentSig::Image {
+                mime_type: mime_type.clone(),
+                data: data.clone(),
+            }),
+            _ => return None,
+        }
+    }
+    Some(sig)
+}
+
+/// Stamp the persisted in-flight user turn with the broadcast `message_id`.
+///
+/// A cross-client viewer renders the in-flight prompt from two sources that use
+/// different ids: the live broadcast/snapshot keys it by `pending.message_id`,
+/// while the reloaded transcript carries the same prompt under a parser-assigned
+/// `turn-N` id. Rewriting the persisted turn's id to the broadcast id lets the
+/// frontend's id-dedup collapse the two into one instead of showing the prompt
+/// twice.
+///
+/// The in-flight prompt is located tail-bounded:
+///   - the trailing user turn (Claude/Codex write the assistant turn only on
+///     completion, so mid-stream the transcript ends exactly at the prompt); or
+///   - the user turn immediately before a *single* trailing assistant turn
+///     (OpenCode and Gemini persist a partial assistant turn mid-stream, so the
+///     transcript tail is `[.., user X, partial assistant Y]`).
+///
+/// A recency check then disambiguates: the in-flight prompt was persisted by the
+/// agent CLI at/after `started_at` (the agent — a local subprocess sharing this
+/// machine's clock — writes the prompt on receiving it), whereas a *prior*
+/// identical prompt was persisted during an earlier turn and so predates
+/// `started_at`. Without it, a repeated identical prompt whose tail is
+/// `[user X, COMPLETED assistant]` (the new copy not yet persisted) would be
+/// mistaken for the in-flight prompt and stamped, which — combined with the
+/// frontend's keep-first user dedup — would HIDE the genuinely new prompt.
+/// Neither agent exposes a per-turn "still streaming" flag in its transcript
+/// (OpenCode falls back to the creation timestamp and folds completed tool
+/// rows; Gemini always stamps a completion time), so this wall-clock recency is
+/// the reliable signal. `started_at` is captured when the backend broadcasts the
+/// `UserMessage` event — strictly before the agent request is issued — so the
+/// in-flight prompt is always persisted at/after it and no backward tolerance is
+/// needed; allowing one would risk mis-stamping a fast prior identical prompt
+/// and hiding the new one.
+///
+/// The match also requires identical content, so an unrelated prompt is never
+/// stamped; on no match the turns are left untouched and the viewer keeps
+/// showing its synthesized copy — a recoverable transient duplicate, never a
+/// hidden prompt. When `started_at` is unknown the recency check can't run, so
+/// nothing is stamped (the safe, keep-visible default).
+///
+/// Returns the stamped turn's (new) id when a stamp is applied, so the caller can
+/// surface it on the detail response as `in_flight_user_turn_id`. The frontend
+/// uses that to locate the in-flight prompt and, while the live reply is in hand,
+/// hide the partial assistant turn OpenCode/Gemini persist after it mid-stream
+/// (which would otherwise double-render against the live reply). Returning the id
+/// rather than truncating here is deliberate: removing the partial server-side
+/// could hide a *completed* reply in the end-of-turn race (the agent may persist
+/// the final assistant row before the backend processes `TurnComplete` and clears
+/// the live state, after which an attaching client's snapshot can't recover it).
+fn apply_in_flight_message_id(
+    turns: &mut [MessageTurn],
+    pending: &crate::acp::session_state::PendingUserMessage,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<String> {
+    let n = turns.len();
+    if n == 0 {
+        return None;
+    }
+    let started_at = started_at?;
+    let target_idx = match turns[n - 1].role {
+        TurnRole::User => n - 1,
+        TurnRole::Assistant if n >= 2 && matches!(turns[n - 2].role, TurnRole::User) => n - 2,
+        _ => return None,
+    };
+    // Recency gate. `started_at` is recorded when the backend broadcasts the
+    // `UserMessage` event, which happens *before* the agent request is issued
+    // (see `connection.rs`), so the agent — a local subprocess on this machine's
+    // clock — necessarily persists the in-flight prompt at a wall-clock instant
+    // at or after `started_at`. A *prior* identical prompt was persisted during
+    // an earlier turn and is therefore strictly older. We allow no backward
+    // tolerance: any window before `started_at` could admit a fast prior
+    // identical prompt (a turn can complete and be re-sent in well under a
+    // second), and stamping it would HIDE the genuinely new prompt via the
+    // frontend's keep-first user dedup. Erring the other way only ever yields a
+    // recoverable visible duplicate, so the strict bound is the safe one.
+    if turns[target_idx].timestamp < started_at {
+        return None;
+    }
+    let want = sig_from_user_message_blocks(&pending.blocks);
+    if sig_from_turn_blocks(&turns[target_idx].blocks) == Some(want) {
+        // Never create a duplicate id. The broadcast id is normally disjoint from
+        // parser `turn-N` ids (and `is_reserved_turn_id` in the manager rejects a
+        // client id of that shape), but defend the invariant here too: if the id
+        // already exists on another turn, stamping would make two turns share an
+        // id and the frontend's id-keyed dedup could hide one. Leave the turn
+        // under its parser id — a recoverable visible duplicate, never a hidden
+        // prompt — and report nothing.
+        let collides = turns
+            .iter()
+            .enumerate()
+            .any(|(i, t)| i != target_idx && t.id == pending.message_id);
+        if collides {
+            return None;
+        }
+        turns[target_idx].id = pending.message_id.clone();
+        return Some(pending.message_id.clone());
+    }
+    None
+}
+
+/// `get_folder_conversation_core` plus live in-flight correlation: when a turn is
+/// currently running on the conversation's connection, stamp the persisted
+/// in-flight user turn with the broadcast `message_id` so a cross-client viewer
+/// dedups it against its synthesized copy, and report that turn's id on the detail
+/// as `in_flight_user_turn_id` so the frontend can hide the partial assistant
+/// reply persisted after it mid-stream. A no-op (one cheap lock pass) when no turn
+/// is in flight. Shared by the Tauri command and the web handler.
+pub async fn get_folder_conversation_with_live_core(
+    conn: &sea_orm::DatabaseConnection,
+    manager: &crate::acp::manager::ConnectionManager,
+    conversation_id: i32,
+) -> Result<DbConversationDetail, AppCommandError> {
+    let mut detail = get_folder_conversation_core(conn, conversation_id).await?;
+    if let Some((pending, started_at)) = manager
+        .pending_user_message_for_conversation(conversation_id)
+        .await
+    {
+        detail.in_flight_user_turn_id =
+            apply_in_flight_message_id(&mut detail.turns, &pending, started_at);
+    }
+    Ok(detail)
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_folder_conversation(
     db: tauri::State<'_, AppDatabase>,
+    manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    get_folder_conversation_core(&db.conn, conversation_id).await
+    get_folder_conversation_with_live_core(&db.conn, &manager, conversation_id).await
 }
 
 /// Emit a `conversation://changed` Upsert for `conversation_id` so every
@@ -820,6 +995,274 @@ mod tests {
             ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
             _ => None,
         })
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // In-flight user-turn stamping (cross-client viewer dedup). See
+    // `apply_in_flight_message_id`.
+    // ──────────────────────────────────────────────────────────────────────
+
+    // A fixed reference instant for the in-flight turn's start, and a helper for
+    // building turn timestamps relative to it (positive = after the turn began,
+    // negative = a turn that started earlier).
+    fn turn_started() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-28T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn at(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
+        turn_started() + chrono::Duration::seconds(offset_secs)
+    }
+
+    fn user_text_turn(id: &str, text: &str, ts: chrono::DateTime<chrono::Utc>) -> MessageTurn {
+        MessageTurn {
+            id: id.into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: ts,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }
+    }
+
+    fn assistant_text_turn(
+        id: &str,
+        text: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+        completed: bool,
+    ) -> MessageTurn {
+        MessageTurn {
+            id: id.into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: ts,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: completed.then_some(ts),
+        }
+    }
+
+    fn pending_text(message_id: &str, text: &str) -> crate::acp::session_state::PendingUserMessage {
+        crate::acp::session_state::PendingUserMessage {
+            message_id: message_id.into(),
+            blocks: vec![crate::acp::types::UserMessageBlock::Text { text: text.into() }],
+        }
+    }
+
+    #[test]
+    fn stamps_trailing_user_turn() {
+        // Claude/Codex mid-stream: the transcript ends exactly at the in-flight
+        // prompt (the assistant turn is written only on completion).
+        let mut turns = vec![
+            user_text_turn("turn-0", "first", at(-30)),
+            assistant_text_turn("turn-1", "reply", at(-29), true),
+            user_text_turn("turn-2", "hello", at(1)),
+        ];
+        let stamped =
+            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(stamped.as_deref(), Some("msg-live"), "reports the stamped id");
+        assert_eq!(turns[2].id, "msg-live");
+        assert_eq!(turns[0].id, "turn-0", "earlier identical-position turn intact");
+        assert_eq!(turns[1].id, "turn-1");
+    }
+
+    #[test]
+    fn stamps_user_turn_before_partial_trailing_assistant_regardless_of_completion() {
+        // OpenCode/Gemini mid-stream: a partial assistant turn is persisted, so
+        // the tail is [user X, partial assistant Y]. The recency of the user turn
+        // — not the assistant's completion flag — is what identifies the prompt,
+        // so it stamps even when the trailing assistant carries a completion time
+        // (as Gemini's partial always does). The partial reply is left in place
+        // and its id reported: dropping it on the backend could hide a
+        // just-completed reply in the end-of-turn race, so the frontend hides the
+        // duplicate at render time (keyed off the reported id) while the live
+        // stream is in hand instead.
+        let mut turns = vec![
+            user_text_turn("turn-0", "hello", at(1)),
+            assistant_text_turn("turn-1", "partial...", at(2), true),
+        ];
+        let stamped =
+            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(stamped.as_deref(), Some("msg-live"));
+        assert_eq!(turns[0].id, "msg-live");
+        assert_eq!(turns.len(), 2, "the partial reply is preserved (not dropped)");
+        assert_eq!(turns[1].id, "turn-1", "the partial reply is untouched");
+    }
+
+    #[test]
+    fn does_not_stamp_when_content_differs() {
+        let mut turns = vec![
+            user_text_turn("turn-0", "hello", at(1)),
+            assistant_text_turn("turn-1", "partial...", at(2), false),
+        ];
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "something else"),
+            Some(turn_started()),
+        );
+        assert_eq!(stamped, None, "no match → nothing reported");
+        assert_eq!(turns[0].id, "turn-0", "no match → left untouched");
+    }
+
+    #[test]
+    fn does_not_stamp_when_message_id_collides_with_another_turn() {
+        // Defense in depth: an (untrusted) broadcast id equal to an existing
+        // parser turn id must not be stamped onto the in-flight prompt — two turns
+        // sharing an id could let the frontend's id-keyed dedup hide one. Here the
+        // broadcast id "turn-0" already names the first turn, so the in-flight
+        // prompt is left under its parser id and nothing is reported.
+        let mut turns = vec![
+            user_text_turn("turn-0", "earlier", at(-30)),
+            assistant_text_turn("turn-1", "reply", at(-29), true),
+            user_text_turn("turn-2", "hello", at(1)),
+        ];
+        let stamped =
+            apply_in_flight_message_id(&mut turns, &pending_text("turn-0", "hello"), Some(turn_started()));
+        assert_eq!(stamped, None, "colliding broadcast id → no stamp");
+        assert_eq!(turns[2].id, "turn-2", "the in-flight prompt keeps its parser id");
+        assert_eq!(turns[0].id, "turn-0", "the colliding turn is untouched");
+    }
+
+    #[test]
+    fn does_not_reach_back_past_the_last_two_turns() {
+        // The matching prompt sits buried before another full user/assistant
+        // round; only the trailing user turn or the user-before-trailing-
+        // assistant are eligible, so it is never stamped.
+        let mut turns = vec![
+            user_text_turn("turn-0", "hello", at(-30)),
+            assistant_text_turn("turn-1", "a", at(-29), true),
+            user_text_turn("turn-2", "ok", at(1)),
+            assistant_text_turn("turn-3", "b", at(2), false),
+        ];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(turns[0].id, "turn-0");
+        assert_eq!(turns[2].id, "turn-2", "non-matching tail user turn untouched");
+    }
+
+    #[test]
+    fn does_not_stamp_with_two_trailing_assistant_turns() {
+        // Bounded to a single trailing assistant: a deeper assistant tail means
+        // we can't be sure the user prompt is the in-flight one, so bail.
+        let mut turns = vec![
+            user_text_turn("turn-0", "hello", at(1)),
+            assistant_text_turn("turn-1", "a", at(2), false),
+            assistant_text_turn("turn-2", "b", at(3), false),
+        ];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(turns[0].id, "turn-0", "left untouched");
+    }
+
+    #[test]
+    fn stamps_image_user_turn_only_on_exact_match() {
+        let image_turn = |id: &str, data: &str| MessageTurn {
+            id: id.into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Image {
+                data: data.into(),
+                mime_type: "image/png".into(),
+                uri: Some("file:///shot.png".into()),
+            }],
+            timestamp: at(1),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        };
+        let pending_image = |message_id: &str, data: &str| {
+            crate::acp::session_state::PendingUserMessage {
+                message_id: message_id.into(),
+                blocks: vec![crate::acp::types::UserMessageBlock::Image {
+                    data: data.into(),
+                    mime_type: "image/png".into(),
+                }],
+            }
+        };
+
+        let mut turns = vec![image_turn("turn-0", "AAAA")];
+        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "AAAA"), Some(turn_started()));
+        assert_eq!(turns[0].id, "msg-live", "uri difference is ignored, data matches");
+
+        let mut turns = vec![image_turn("turn-0", "AAAA")];
+        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "BBBB"), Some(turn_started()));
+        assert_eq!(turns[0].id, "turn-0", "different image bytes → no stamp");
+    }
+
+    #[test]
+    fn empty_turns_is_a_noop() {
+        let mut turns: Vec<MessageTurn> = vec![];
+        let stamped =
+            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(stamped, None);
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn does_not_stamp_a_prior_identical_prompt_by_recency() {
+        // The repeated-identical-prompt case: a prior 'continue' is already
+        // answered, and a new identical 'continue' is in flight but not yet
+        // persisted. The prior prompt predates the turn start, so the recency
+        // gate refuses to stamp it — otherwise the new prompt (whose optimistic
+        // copy shares the broadcast id) would be hidden by the frontend's
+        // keep-first user dedup. A completed trailing reply makes no difference;
+        // recency, not completion, is the signal.
+        let mut turns = vec![
+            user_text_turn("turn-0", "continue", at(-60)),
+            assistant_text_turn("turn-1", "done", at(-58), true),
+        ];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
+        assert_eq!(turns[0].id, "turn-0", "older identical prompt → untouched");
+    }
+
+    #[test]
+    fn does_not_stamp_when_started_at_is_unknown() {
+        // Without a turn-start reference the recency gate can't run, so nothing
+        // is stamped (keep-visible default).
+        let mut turns = vec![user_text_turn("turn-0", "hello", at(1))];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), None);
+        assert_eq!(turns[0].id, "turn-0");
+    }
+
+    #[test]
+    fn stamps_user_turn_persisted_at_turn_start() {
+        // The in-flight prompt is persisted at/after the recorded turn start (the
+        // backend broadcasts `UserMessage` before issuing the agent request), so
+        // a turn exactly at the start qualifies — the boundary is inclusive.
+        let mut turns = vec![user_text_turn("turn-0", "hello", at(0))];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(turns[0].id, "msg-live", "persisted exactly at the start is in-flight");
+    }
+
+    #[test]
+    fn does_not_stamp_user_turn_persisted_before_turn_start() {
+        // Strict gate, no backward tolerance: a turn even one second before the
+        // start belongs to an earlier turn, never the in-flight prompt.
+        let mut turns = vec![user_text_turn("turn-0", "hello", at(-1))];
+        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        assert_eq!(turns[0].id, "turn-0", "one second before the start is not in-flight");
+    }
+
+    #[test]
+    fn does_not_stamp_fast_prior_prompt_before_completed_trailing_reply() {
+        // The dangerous repeated-prompt race: a prior 'continue' completed within
+        // a second, the user re-sends 'continue', and a refetch lands before the
+        // new copy is persisted — so the tail is [prior user, completed assistant]
+        // (the OpenCode/Gemini n-2 shape). The prior user turn predates the turn
+        // start, so it is left alone; stamping it would let the frontend's
+        // keep-first dedup hide the genuinely new prompt. A backward tolerance
+        // would reopen exactly this hole.
+        let mut turns = vec![
+            user_text_turn("turn-0", "continue", at(-1)),
+            assistant_text_turn("turn-1", "done", at(0), true),
+        ];
+        let stamped =
+            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
+        assert_eq!(stamped, None, "fast prior identical prompt → nothing reported");
+        assert_eq!(turns[0].id, "turn-0", "fast prior identical prompt → untouched");
+        assert_eq!(turns.len(), 2, "the prior completed reply is preserved");
     }
 
     #[test]

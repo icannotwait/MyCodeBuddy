@@ -304,6 +304,16 @@ pub struct SessionState {
     /// replay for it. `None` outside an active turn.
     pub pending_user_message: Option<PendingUserMessage>,
 
+    /// Backend wall-clock instant the in-flight turn started, captured alongside
+    /// `pending_user_message` from `AcpEvent::UserMessage` and cleared on
+    /// `TurnComplete`. The detail endpoint uses it to tell the in-flight prompt
+    /// — persisted at/after this instant by the agent CLI, a local subprocess
+    /// sharing this machine's clock — apart from a prior identical prompt
+    /// persisted during an earlier turn (see `apply_in_flight_message_id`). Not
+    /// serialized: backend-internal, like `turn_in_flight`. `None` outside an
+    /// active turn.
+    pub pending_user_message_started_at: Option<DateTime<Utc>>,
+
     /// True between a prompt being accepted (enqueued to the connection loop)
     /// and that turn completing. Set by the manager BEFORE the enqueue (so it
     /// is guaranteed set before the loop can dequeue) and cleared on
@@ -354,6 +364,7 @@ impl SessionState {
             delegation_token: None,
             last_assistant_text: None,
             pending_user_message: None,
+            pending_user_message_started_at: None,
             turn_in_flight: false,
         }
     }
@@ -587,6 +598,7 @@ impl SessionState {
                 // truth. Clear it so a post-turn snapshot doesn't carry a stale
                 // pending user message into a fresh attach.
                 self.pending_user_message = None;
+                self.pending_user_message_started_at = None;
                 // Turn finished: release the concurrency gate so the next prompt
                 // is accepted. (All connection-alive turn endings — normal,
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
@@ -609,6 +621,10 @@ impl SessionState {
                     message_id: message_id.clone(),
                     blocks: blocks.clone(),
                 });
+                // Reference instant for the in-flight prompt's recency check in
+                // `apply_in_flight_message_id`. Set here (not at manager enqueue)
+                // so it tracks `pending_user_message` exactly.
+                self.pending_user_message_started_at = Some(Utc::now());
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -1135,6 +1151,10 @@ mod tests {
                 text: "hello agent".into()
             }]
         );
+        assert!(
+            s.pending_user_message_started_at.is_some(),
+            "the turn-start instant is captured alongside the pending prompt"
+        );
     }
 
     #[test]
@@ -1150,6 +1170,10 @@ mod tests {
         assert!(
             s.pending_user_message.is_none(),
             "a completed turn must clear the pending user message (no stale snapshot)"
+        );
+        assert!(
+            s.pending_user_message_started_at.is_none(),
+            "the turn-start instant is cleared in lockstep with the pending prompt"
         );
     }
 

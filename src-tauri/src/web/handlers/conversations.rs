@@ -122,8 +122,12 @@ pub async fn get_folder_conversation(
     Json(params): Json<GetFolderConversationParams>,
 ) -> Result<Json<DbConversationDetail>, AppCommandError> {
     let db = &state.db;
-    let result =
-        conv_commands::get_folder_conversation_core(&db.conn, params.conversation_id).await?;
+    let result = conv_commands::get_folder_conversation_with_live_core(
+        &db.conn,
+        &state.connection_manager,
+        params.conversation_id,
+    )
+    .await?;
     Ok(Json(result))
 }
 

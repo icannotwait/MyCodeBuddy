@@ -280,6 +280,14 @@ export interface DbConversationDetail {
   summary: DbConversationSummary
   turns: MessageTurn[]
   session_stats?: SessionStats | null
+  /**
+   * Id of the persisted user turn the backend identified as the in-flight prompt
+   * (present only while a turn is running on this conversation's connection). The
+   * timeline uses it to locate — and, while the live reply is in hand, hide — the
+   * partial assistant turn some agents (OpenCode, Gemini) persist after the prompt
+   * mid-stream, which would otherwise double-render against the live reply.
+   */
+  in_flight_user_turn_id?: string | null
 }
 
 export type ConversationStatus =

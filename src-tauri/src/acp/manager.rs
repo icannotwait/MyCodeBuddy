@@ -29,6 +29,16 @@ use crate::web::event_bridge::{emit_with_state, EventEmitter};
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
+/// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
+/// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
+/// never land here: it would collide with a persisted transcript turn id and let
+/// id-keyed cross-client dedup suppress or hide a prompt. Used to reject an
+/// untrusted client-supplied `message_id` of that shape.
+fn is_reserved_turn_id(id: &str) -> bool {
+    matches!(id.strip_prefix("turn-"), Some(rest)
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Build the bounded preview string for a `user_prompt_sent` notification from
 /// the `Text` blocks of a user prompt. Joins the (trimmed, non-empty) text
 /// blocks with a space and caps the kept text at `USER_PROMPT_PREVIEW_MAX_CHARS`
@@ -895,9 +905,16 @@ impl ConnectionManager {
                 if user_blocks.is_empty() {
                     None
                 } else {
+                    // A client-supplied id in the parsers' turn-id namespace
+                    // (`turn-<digits>`, which every parser assigns) would collide
+                    // with a persisted transcript turn id and break id-keyed dedup
+                    // — a colliding id can suppress or hide a prompt. The id is
+                    // untrusted (the web/Tauri prompt API accepts it verbatim), so
+                    // reject that shape and fall back to a connection-scoped id;
+                    // legitimate UI senders use `optimistic-<uuid>`.
                     let message_id = match client_message_id {
-                        Some(id) => id,
-                        None => format!("user-{}-{}", conn_id, state_arc.read().await.event_seq),
+                        Some(id) if !is_reserved_turn_id(&id) => id,
+                        _ => format!("user-{}-{}", conn_id, state_arc.read().await.event_seq),
                     };
                     Some((message_id, user_blocks))
                 }
@@ -1581,6 +1598,39 @@ impl ConnectionManager {
         None
     }
 
+    /// The in-flight user prompt for `conversation_id` and the instant its turn
+    /// started, if a turn is currently running on its live connection. `Some`
+    /// exactly between `UserMessage` and `TurnComplete` (see
+    /// `SessionState.pending_user_message` / `pending_user_message_started_at`);
+    /// `None` when no connection is bound to the conversation or no turn is in
+    /// flight.
+    ///
+    /// Used by the detail endpoint to stamp the persisted in-flight user turn
+    /// with the broadcast `message_id`, so a cross-client viewer's synthesized
+    /// turn (keyed by that same id) dedups against it instead of rendering a
+    /// second copy. The start instant lets the matcher tell the in-flight prompt
+    /// apart from a prior identical one. One lock pass over the connections map,
+    /// mirroring `find_connection_by_conversation_id`.
+    pub async fn pending_user_message_for_conversation(
+        &self,
+        conversation_id: i32,
+    ) -> Option<(
+        crate::acp::session_state::PendingUserMessage,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> {
+        let connections = self.connections.lock().await;
+        for conn in connections.values() {
+            let state = conn.state.read().await;
+            if state.conversation_id == Some(conversation_id) {
+                return state
+                    .pending_user_message
+                    .clone()
+                    .map(|pending| (pending, state.pending_user_message_started_at));
+            }
+        }
+        None
+    }
+
     /// Resolve an `(external_id, agent_type)` (agent session) to its
     /// currently-active connection id, if any. Sibling to
     /// `find_connection_by_conversation_id`, used as the discovery fallback for
@@ -1796,6 +1846,22 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
+
+    #[test]
+    fn is_reserved_turn_id_matches_only_the_parser_namespace() {
+        // Rejected: the parsers' `turn-<digits>` ids (an untrusted client id of
+        // this shape would collide with a persisted transcript turn).
+        assert!(is_reserved_turn_id("turn-0"));
+        assert!(is_reserved_turn_id("turn-42"));
+        // Accepted: anything else, including the real UI sender id shape and the
+        // connection-scoped fallback shape.
+        assert!(!is_reserved_turn_id("optimistic-9f3c1a2b"));
+        assert!(!is_reserved_turn_id("user-conn-7"));
+        assert!(!is_reserved_turn_id("turn-")); // no number
+        assert!(!is_reserved_turn_id("turn-1a")); // not all digits
+        assert!(!is_reserved_turn_id("turnabout-1"));
+        assert!(!is_reserved_turn_id(""));
+    }
 
     fn fake_connection(id: &str, conv_id: Option<i32>) -> AgentConnection {
         let (tx, _rx) = mpsc::channel(1);
