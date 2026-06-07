@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 use sea_orm::DatabaseConnection;
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    window::{Effect, EffectState, EffectsBuilder},
+    AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
+};
 
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
@@ -1462,6 +1465,12 @@ fn open_pet_panel_window(app: &AppHandle) -> Result<(), AppCommandError> {
         .transparent(true)
         .shadow(false)
         .visible(false)
+        .effects(
+            EffectsBuilder::new()
+                .effect(Effect::Popover)
+                .state(EffectState::Active)
+                .build(),
+        )
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(true)
@@ -1504,6 +1513,7 @@ pub async fn resize_pet_panel(app: AppHandle, height: f64) -> Result<(), AppComm
     let _ = panel.set_size(LogicalSize::new(PET_PANEL_WIDTH, panel_h));
     let _ = panel.set_position(LogicalPosition::new(panel_x, panel_y));
     let _ = panel.show();
+    let _ = panel.set_focus();
     Ok(())
 }
 
