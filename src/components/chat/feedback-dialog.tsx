@@ -70,7 +70,14 @@ function FeedbackDialogForm({
         onCompositionStart={() => (composingRef.current = true)}
         onCompositionEnd={() => (composingRef.current = false)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey && !composingRef.current) {
+          if (
+            e.nativeEvent.isComposing ||
+            composingRef.current ||
+            e.key === "Process" ||
+            e.keyCode === 229
+          )
+            return
+          if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault()
             handleSubmit()
           }
