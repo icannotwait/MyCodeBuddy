@@ -908,6 +908,8 @@
       "completing": "جارٍ الإكمال...",
       "toasts": {
         "importedSessions": "تم استيراد {imported, plural, one {# جلسة} other {# جلسات}}، وتم تخطي {skipped}",
+        "importedAndUpdated": "تم استيراد {imported, plural, one {# جلسة} other {# جلسات}}، وتم تحديث {updated, plural, one {# عنوان} other {# عناوين}}، وتم تخطي {skipped}",
+        "updatedTitles": "تم تحديث {updated, plural, one {# عنوان} other {# عناوين}}، وتم تخطي {skipped}",
         "noNewSessionsFound": "لم يتم العثور على جلسات جديدة (تم تخطي {skipped})",
         "importFailed": "فشل الاستيراد: {message}",
         "reviewCompleted": "تم وضع علامة مكتمل على {count, plural, one {# جلسة مراجعة} other {# جلسات مراجعة}}",

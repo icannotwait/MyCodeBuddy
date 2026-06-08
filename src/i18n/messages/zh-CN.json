@@ -908,6 +908,8 @@
       "completing": "处理中...",
       "toasts": {
         "importedSessions": "已导入 {imported} 个会话，跳过 {skipped} 个",
+        "importedAndUpdated": "已导入 {imported} 个会话，更新 {updated} 个标题，跳过 {skipped} 个",
+        "updatedTitles": "已更新 {updated} 个标题，跳过 {skipped} 个",
         "noNewSessionsFound": "没有新会话（已跳过 {skipped} 个）",
         "importFailed": "导入失败：{message}",
         "reviewCompleted": "已将 {count} 个复查会话标记为已完成",

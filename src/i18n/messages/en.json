@@ -908,6 +908,8 @@
       "completing": "Completing...",
       "toasts": {
         "importedSessions": "Imported {imported, plural, one {# session} other {# sessions}}, skipped {skipped}",
+        "importedAndUpdated": "Imported {imported, plural, one {# session} other {# sessions}}, updated {updated, plural, one {# title} other {# titles}}, skipped {skipped}",
+        "updatedTitles": "Updated {updated, plural, one {# title} other {# titles}}, skipped {skipped}",
         "noNewSessionsFound": "No new sessions found (skipped {skipped})",
         "importFailed": "Import failed: {message}",
         "reviewCompleted": "Marked {count, plural, one {# review session} other {# review sessions}} as completed",

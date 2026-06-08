@@ -354,6 +354,7 @@ fn compute_folders(all_conversations: &[ConversationSummary]) -> Vec<FolderInfo>
 
 pub async fn import_local_conversations_core(
     conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
     let folder = folder_service::get_folder_by_id(conn, folder_id)
@@ -364,18 +365,29 @@ pub async fn import_local_conversations_core(
                 .with_detail(format!("folder_id={folder_id}"))
         })?;
 
-    import_service::import_local_conversations(conn, folder_id, &folder.path)
-        .await
-        .map_err(AppCommandError::from)
+    let (result, updated_ids) =
+        import_service::import_local_conversations(conn, folder_id, &folder.path)
+            .await
+            .map_err(AppCommandError::from)?;
+
+    // Broadcast a sidebar upsert for every title refreshed in place, so other
+    // windows and web clients converge live. The importing client refetches the
+    // list itself, which also covers the newly imported rows.
+    for id in updated_ids {
+        emit_conversation_upsert(emitter, conn, id).await;
+    }
+
+    Ok(result)
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn import_local_conversations(
+    app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
-    import_local_conversations_core(&db.conn, folder_id).await
+    import_local_conversations_core(&db.conn, &EventEmitter::Tauri(app), folder_id).await
 }
 
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
@@ -2035,7 +2047,7 @@ mod tests {
     #[tokio::test]
     async fn import_local_conversations_core_missing_folder_errors() {
         let db = fresh_in_memory_db().await;
-        let err = import_local_conversations_core(&db.conn, 999_999)
+        let err = import_local_conversations_core(&db.conn, &EventEmitter::Noop, 999_999)
             .await
             .expect_err("missing folder must surface as error");
         let msg = format!("{err:?}");

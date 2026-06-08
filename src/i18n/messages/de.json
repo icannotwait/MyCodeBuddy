@@ -908,6 +908,8 @@
       "completing": "Abschließen...",
       "toasts": {
         "importedSessions": "{imported, plural, one {# Sitzung} other {# Sitzungen}} importiert, {skipped} übersprungen",
+        "importedAndUpdated": "{imported, plural, one {# Sitzung} other {# Sitzungen}} importiert, {updated, plural, one {# Titel} other {# Titel}} aktualisiert, {skipped} übersprungen",
+        "updatedTitles": "{updated, plural, one {# Titel} other {# Titel}} aktualisiert, {skipped} übersprungen",
         "noNewSessionsFound": "Keine neuen Sitzungen gefunden ({skipped} übersprungen)",
         "importFailed": "Import fehlgeschlagen: {message}",
         "reviewCompleted": "{count, plural, one {# Review-Sitzung} other {# Review-Sitzungen}} als abgeschlossen markiert",

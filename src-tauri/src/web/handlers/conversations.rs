@@ -168,7 +168,12 @@ pub async fn import_local_conversations(
     Json(params): Json<ImportLocalConversationsParams>,
 ) -> Result<Json<ImportResult>, AppCommandError> {
     Ok(Json(
-        conv_commands::import_local_conversations_core(&state.db.conn, params.folder_id).await?,
+        conv_commands::import_local_conversations_core(
+            &state.db.conn,
+            &state.emitter,
+            params.folder_id,
+        )
+        .await?,
     ))
 }
 

@@ -908,6 +908,8 @@
       "completing": "완료 처리 중...",
       "toasts": {
         "importedSessions": "{imported, plural, one {#개 세션} other {#개 세션}}을 가져오고 {skipped}개를 건너뛰었습니다",
+        "importedAndUpdated": "{imported, plural, one {#개 세션} other {#개 세션}}을 가져오고 {updated, plural, one {#개 제목} other {#개 제목}}을 업데이트하고 {skipped}개를 건너뛰었습니다",
+        "updatedTitles": "{updated, plural, one {#개 제목} other {#개 제목}}을 업데이트하고 {skipped}개를 건너뛰었습니다",
         "noNewSessionsFound": "새 세션이 없습니다 ({skipped}개 건너뜀)",
         "importFailed": "가져오기 실패: {message}",
         "reviewCompleted": "{count, plural, one {#개 검토 세션} other {#개 검토 세션}}을 완료로 표시했습니다",

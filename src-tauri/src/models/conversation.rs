@@ -116,5 +116,9 @@ pub struct SidebarData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportResult {
     pub imported: u32,
+    /// Already-imported conversations whose title was refreshed from the
+    /// agent's session file (e.g. an AI-generated title that did not yet exist
+    /// at first import). Manual renames are never touched.
+    pub updated: u32,
     pub skipped: u32,
 }

@@ -319,6 +319,7 @@ export interface SaveTabsOutcome {
 
 export interface ImportResult {
   imported: number
+  updated: number
   skipped: number
 }
 

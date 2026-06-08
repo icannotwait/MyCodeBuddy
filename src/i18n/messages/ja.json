@@ -908,6 +908,8 @@
       "completing": "完了処理中...",
       "toasts": {
         "importedSessions": "{imported, plural, one {# 件のセッション} other {# 件のセッション}} をインポートし、{skipped} 件をスキップしました",
+        "importedAndUpdated": "{imported, plural, one {# 件のセッション} other {# 件のセッション}} をインポートし、{updated, plural, one {# 件のタイトル} other {# 件のタイトル}} を更新し、{skipped} 件をスキップしました",
+        "updatedTitles": "{updated, plural, one {# 件のタイトル} other {# 件のタイトル}} を更新し、{skipped} 件をスキップしました",
         "noNewSessionsFound": "新しいセッションは見つかりませんでした（{skipped} 件をスキップ）",
         "importFailed": "インポートに失敗しました: {message}",
         "reviewCompleted": "{count, plural, one {# 件のレビューセッション} other {# 件のレビューセッション}} を完了にしました",

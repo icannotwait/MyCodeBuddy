@@ -1109,10 +1109,25 @@ export function SidebarConversationList({
         const result = await importLocalConversations(folderId)
         updateTask(taskId, { status: "completed" })
         refreshConversations()
-        if (result.imported > 0) {
+        if (result.imported > 0 && result.updated > 0) {
+          toast.success(
+            t("toasts.importedAndUpdated", {
+              imported: result.imported,
+              updated: result.updated,
+              skipped: result.skipped,
+            })
+          )
+        } else if (result.imported > 0) {
           toast.success(
             t("toasts.importedSessions", {
               imported: result.imported,
+              skipped: result.skipped,
+            })
+          )
+        } else if (result.updated > 0) {
+          toast.success(
+            t("toasts.updatedTitles", {
+              updated: result.updated,
               skipped: result.skipped,
             })
           )
