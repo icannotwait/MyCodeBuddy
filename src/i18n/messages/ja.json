@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "質問",
+        "answeredLabel": "質問と回答：",
         "awaiting": "回答をお待ちしています…",
         "declined": "この質問をスキップしました — エージェントが独自に判断して進めました。",
         "noSelection": "選択なし"

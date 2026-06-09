@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "Question",
+        "answeredLabel": "Q&A:",
         "awaiting": "Waiting for your answer…",
         "declined": "You dismissed this — the agent used its own judgment.",
         "noSelection": "No selection"

@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "Question",
+        "answeredLabel": "Question et réponse :",
         "awaiting": "En attente de ta réponse…",
         "declined": "Tu as ignoré cette question — l’agent a utilisé son propre jugement.",
         "noSelection": "Aucune sélection"

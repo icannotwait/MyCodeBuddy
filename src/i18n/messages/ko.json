@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "질문",
+        "answeredLabel": "질문과 답변:",
         "awaiting": "답변을 기다리는 중…",
         "declined": "이 질문을 건너뛰었습니다 — 에이전트가 자체 판단으로 진행했습니다.",
         "noSelection": "선택 없음"

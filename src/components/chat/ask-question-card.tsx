@@ -248,6 +248,9 @@ export function AskQuestionCard({
   const skip = () => void run({ answers: [], declined: true })
 
   const isMulti = questions.length > 1
+  // The read-only/answered view passes an empty subtitle; with no second line the
+  // header row centers the icon, title and count instead of top-aligning them.
+  const resolvedSubtitle = subtitle ?? t("subtitle")
   const activeIndex = questions.findIndex((q) => q.id === activeId)
   const nextId =
     activeIndex >= 0 && activeIndex < questions.length - 1
@@ -430,15 +433,20 @@ export function AskQuestionCard({
 
       <div className="flex min-h-0 flex-col gap-3 p-3">
         {/* Header */}
-        <div className="flex shrink-0 items-start gap-2.5">
+        <div
+          className={cn(
+            "flex shrink-0 gap-2.5",
+            resolvedSubtitle ? "items-start" : "items-center"
+          )}
+        >
           <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-primary">
             <MessageCircleQuestionMark className="size-4" />
           </span>
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">{title ?? t("title")}</p>
-            {(subtitle ?? t("subtitle")) && (
+            {resolvedSubtitle && (
               <p className="text-xs text-muted-foreground">
-                {subtitle ?? t("subtitle")}
+                {resolvedSubtitle}
               </p>
             )}
           </div>

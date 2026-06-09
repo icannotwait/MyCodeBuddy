@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "Pergunta",
+        "answeredLabel": "Pergunta e resposta:",
         "awaiting": "Aguardando sua resposta…",
         "declined": "Você ignorou isto — o agente usou o próprio julgamento.",
         "noSelection": "Sem seleção"

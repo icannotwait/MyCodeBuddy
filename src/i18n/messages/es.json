@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "Pregunta",
+        "answeredLabel": "Pregunta y respuesta:",
         "awaiting": "Esperando tu respuesta…",
         "declined": "Descartaste esto: el agente usó su propio criterio.",
         "noSelection": "Sin selección"

@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "سؤال",
+        "answeredLabel": "سؤال وجواب:",
         "awaiting": "في انتظار إجابتك…",
         "declined": "لقد تجاهلت هذا — استخدم الوكيل حكمه الخاص.",
         "noSelection": "لا يوجد اختيار"

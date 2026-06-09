@@ -57,7 +57,9 @@ describe("AskQuestionResultCard", () => {
       />
     )
 
-    // Capsule shows the chosen value; the full option controls stay hidden.
+    // Capsule shows the localized label + the chosen value; the full option
+    // controls stay hidden.
+    expect(screen.getByText(result.answeredLabel)).toBeInTheDocument()
     expect(screen.getByText("Incremental (Recommended)")).toBeInTheDocument()
     expect(screen.queryByRole("radio")).toBeNull()
     expect(screen.queryByText("Which approach?")).toBeNull()

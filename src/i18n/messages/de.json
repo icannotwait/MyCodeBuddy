@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "Frage",
+        "answeredLabel": "Frage & Antwort:",
         "awaiting": "Warten auf deine Antwort…",
         "declined": "Du hast dies verworfen – der Agent hat nach eigenem Ermessen entschieden.",
         "noSelection": "Keine Auswahl"

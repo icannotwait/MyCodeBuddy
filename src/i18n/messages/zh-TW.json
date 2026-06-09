@@ -2114,6 +2114,7 @@
       },
       "askQuestionResult": {
         "title": "提問",
+        "answeredLabel": "提問回答：",
         "awaiting": "等待你的回答…",
         "declined": "你已略過此問題 — 代理已自行判斷。",
         "noSelection": "未選擇"
