@@ -5,12 +5,14 @@ import type {
   TurnUsage,
   AgentExecutionStats,
   ToolCallStatus,
+  PlanEntryInfo,
 } from "@/lib/types"
 import {
   isAgentLikeToolName,
   isDelegationStatusToolName,
 } from "@/lib/adapters/tool-kind-classifier"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
+import { isPlanLikeToolName, parseTodosFromJson } from "@/lib/plan-parse"
 
 /**
  * Adapted content part types for AI SDK Elements components
@@ -68,6 +70,21 @@ export type AdaptedGoalRunPart = {
   isRunning: boolean
 }
 
+/**
+ * A plan / todo checklist, rendered by the dedicated `<PlanCard>` instead of
+ * the generic tool card (and never as a `reasoning`/thinking block). Produced
+ * from two converging sources:
+ *   - the LIVE synthetic `ContentBlock.plan` (ACP PlanUpdate → reducer), and
+ *   - a persisted plan-like `TodoWrite` tool_use (converted in
+ *     `adaptMessageTurn` so live and historical render identically).
+ * `isStreaming` is set on the last block of an actively streaming turn.
+ */
+export type AdaptedPlanPart = {
+  type: "plan"
+  entries: PlanEntryInfo[]
+  isStreaming: boolean
+}
+
 export type AdaptedContentPart =
   | { type: "text"; text: string }
   | AdaptedToolCallPart
@@ -98,6 +115,7 @@ export type AdaptedContentPart =
     }
   | AdaptedGoalRunPart
   | AdaptedGeneratedImagePart
+  | AdaptedPlanPart
 
 export interface UserResourceDisplay {
   name: string
@@ -849,6 +867,13 @@ function adaptContentBlock(
       }
     }
 
+    case "plan":
+      return {
+        type: "plan",
+        entries: block.entries,
+        isStreaming,
+      }
+
     default:
       return null
   }
@@ -1291,6 +1316,41 @@ export function adaptMessageTurn(
     }
 
     if (block.type === "tool_use") {
+      // Persisted plan-like tool calls (TodoWrite, *plan*) render as the same
+      // dedicated <PlanCard> the live stream produces, so live and historical
+      // look identical. Gated on `!isStreaming`: while streaming, the plan's
+      // single source of truth is the synthetic `plan` block (ACP PlanUpdate),
+      // so converting a live TodoWrite tool call here would double-render it.
+      // Gated on BOTH a plan-like name AND successfully parsed entries so
+      // unrelated tools (e.g. "explain") never convert — unparsable input
+      // falls through to the normal tool-card path below.
+      const planEntries =
+        !isStreaming && isPlanLikeToolName(block.tool_name)
+          ? parseTodosFromJson(block.input_preview ?? "")
+          : []
+      if (planEntries.length > 0) {
+        // Consume the paired tool_result so its "Todos modified" text does not
+        // render as an orphan tool-result part.
+        if (block.tool_use_id && resultMap.get(block.tool_use_id)) {
+          matchedResultIds.add(block.tool_use_id)
+        } else {
+          const nextBlock = turn.blocks[index + 1]
+          if (
+            !block.tool_use_id &&
+            nextBlock?.type === "tool_result" &&
+            !nextBlock.tool_use_id
+          ) {
+            positionMatchedIndices.add(index + 1)
+          }
+        }
+        adaptedContent.push({
+          type: "plan",
+          entries: planEntries,
+          isStreaming: false,
+        })
+        continue
+      }
+
       const toolCallId = block.tool_use_id || generateToolCallId(turn.id, index)
       const matchedResult = block.tool_use_id
         ? resultMap.get(block.tool_use_id)
@@ -1377,10 +1437,11 @@ export function adaptMessageTurn(
     }
   }
 
-  // Mark the last reasoning block as streaming if the turn is actively streaming
+  // Mark the last reasoning/plan block as streaming if the turn is actively
+  // streaming (a live plan is always re-appended at the end of content).
   if (isStreaming) {
     const last = adaptedContent[adaptedContent.length - 1]
-    if (last?.type === "reasoning") {
+    if (last?.type === "reasoning" || last?.type === "plan") {
       last.isStreaming = true
     }
   }

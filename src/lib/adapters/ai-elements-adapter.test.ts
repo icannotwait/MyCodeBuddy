@@ -517,3 +517,127 @@ describe("mergeAdjacentDelegationStatusGroups", () => {
     ])
   })
 })
+
+describe("adaptMessageTurn plan handling", () => {
+  const msgText = {
+    attachedResources: "Attached resources",
+    toolCallFailed: "Tool failed",
+  }
+
+  it("renders a live synthetic plan block as a plan part (not reasoning) and marks the last block streaming", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "live-plan",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "plan",
+            entries: [
+              { content: "Step A", status: "in_progress", priority: "high" },
+              { content: "Step B", status: "completed", priority: "low" },
+            ],
+          },
+        ],
+      },
+      msgText,
+      true
+    )
+
+    expect(adapted.content.map((p) => p.type)).toEqual(["plan"])
+    const plan = adapted.content[0]
+    if (plan.type !== "plan") throw new Error("expected a plan part")
+    expect(plan.isStreaming).toBe(true)
+    expect(plan.entries).toEqual([
+      { content: "Step A", status: "in_progress", priority: "high" },
+      { content: "Step B", status: "completed", priority: "low" },
+    ])
+  })
+
+  it("converts a persisted TodoWrite tool_use (+ its result) into a single plan part with no orphan tool-result", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "hist-plan",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "todo-1",
+            tool_name: "TodoWrite",
+            input_preview: JSON.stringify({
+              todos: [
+                { content: "X", status: "pending", priority: "medium" },
+                { content: "Y", status: "completed", priority: "high" },
+              ],
+            }),
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "todo-1",
+            output_preview: "Todos have been modified successfully",
+            is_error: false,
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    expect(adapted.content.map((p) => p.type)).toEqual(["plan"])
+    expect(adapted.content.some((p) => p.type === "tool-result")).toBe(false)
+    const plan = adapted.content[0]
+    if (plan.type !== "plan") throw new Error("expected a plan part")
+    expect(plan.isStreaming).toBe(false)
+    expect(plan.entries).toEqual([
+      { content: "X", status: "pending", priority: "medium" },
+      { content: "Y", status: "completed", priority: "high" },
+    ])
+  })
+
+  it("does NOT convert a TodoWrite tool_use while streaming (live plan source is the synthetic block)", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "live-todo",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "todo-1",
+            tool_name: "TodoWrite",
+            input_preview: JSON.stringify({
+              todos: [{ content: "X", status: "pending", priority: "medium" }],
+            }),
+          },
+        ],
+      },
+      msgText,
+      true
+    )
+
+    expect(adapted.content.every((p) => p.type !== "plan")).toBe(true)
+  })
+
+  it("falls back to a normal tool card when a plan-like tool has unparsable input", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "hist-bad",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "todo-1",
+            tool_name: "TodoWrite",
+            input_preview: "not json",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    expect(adapted.content.every((p) => p.type !== "plan")).toBe(true)
+  })
+})

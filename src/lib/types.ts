@@ -152,6 +152,17 @@ export type ContentBlock =
       agent_stats?: AgentExecutionStats | null
     }
   | { type: "thinking"; text: string }
+  /**
+   * Frontend-only, LIVE-stream synthetic block. It is NEVER persisted and
+   * NEVER emitted by the Rust JSONL parsers — the persisted plan path is a
+   * `TodoWrite` tool_use block. It exists purely so a live plan can survive
+   * `buildStreamingTurnsFromLiveMessage` → `adaptContentBlock` without being
+   * down-converted into a `thinking`/reasoning block. Mirrors the reducer's
+   * `LiveContentBlock` plan variant in `acp-connections-context.tsx` (NOT the
+   * `kind`-tagged snapshot type lower in this file). Because it is live-only,
+   * persistence/export switches over `ContentBlock` never receive it.
+   */
+  | { type: "plan"; entries: PlanEntryInfo[] }
 
 export type TurnRole = "user" | "assistant" | "system"
 

@@ -2,100 +2,13 @@ import type {
   AdaptedContentPart,
   AdaptedMessage,
 } from "@/lib/adapters/ai-elements-adapter"
+import {
+  isPlanLikeToolName,
+  normalizePriority,
+  normalizeStatus,
+  parseTodosFromJson,
+} from "@/lib/plan-parse"
 import type { PlanEntryInfo } from "@/lib/types"
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null
-  }
-  return value as Record<string, unknown>
-}
-
-function normalizeStatus(raw: string | null | undefined): string {
-  const normalized = (raw ?? "").trim().toLowerCase()
-  if (normalized === "completed" || normalized === "done") return "completed"
-  if (
-    normalized === "in_progress" ||
-    normalized === "in-progress" ||
-    normalized === "in progress" ||
-    normalized === "running" ||
-    normalized === "active"
-  ) {
-    return "in_progress"
-  }
-  return "pending"
-}
-
-function normalizePriority(raw: string | null | undefined): string {
-  const normalized = (raw ?? "").trim().toLowerCase()
-  if (normalized === "high" || normalized === "urgent") return "high"
-  if (normalized === "low") return "low"
-  return "medium"
-}
-
-function parseTodosFromJson(input: string): PlanEntryInfo[] {
-  try {
-    const parsed: unknown = JSON.parse(input)
-    const obj = asRecord(parsed)
-    if (!obj) return []
-
-    const candidateLists: unknown[][] = []
-    if (Array.isArray(obj.todos)) {
-      candidateLists.push(obj.todos)
-    }
-    if (Array.isArray(obj.entries)) {
-      candidateLists.push(obj.entries)
-    }
-    if (Array.isArray(obj.plan)) {
-      candidateLists.push(obj.plan)
-    }
-
-    for (const list of candidateLists) {
-      const parsedEntries = parsePlanEntriesArray(list)
-      if (parsedEntries.length > 0) {
-        return parsedEntries
-      }
-    }
-
-    return []
-  } catch {
-    return []
-  }
-}
-
-function parsePlanEntriesArray(items: unknown[]): PlanEntryInfo[] {
-  const entries: PlanEntryInfo[] = []
-
-  for (const item of items) {
-    const record = asRecord(item)
-    if (!record) continue
-
-    const contentCandidate =
-      typeof record.content === "string"
-        ? record.content
-        : typeof record.step === "string"
-          ? record.step
-          : typeof record.title === "string"
-            ? record.title
-            : typeof record.name === "string"
-              ? record.name
-              : ""
-    const content = contentCandidate.trim()
-    if (!content) continue
-
-    entries.push({
-      content,
-      status: normalizeStatus(
-        typeof record.status === "string" ? record.status : undefined
-      ),
-      priority: normalizePriority(
-        typeof record.priority === "string" ? record.priority : undefined
-      ),
-    })
-  }
-
-  return entries
-}
 
 function parseEntriesFromReasoningText(text: string): PlanEntryInfo[] {
   const lines = text
@@ -139,17 +52,11 @@ function parseEntriesFromReasoningText(text: string): PlanEntryInfo[] {
   return entries
 }
 
-function normalizeToolName(toolName: string): string {
-  return toolName.toLowerCase().replace(/[^a-z0-9]/g, "")
-}
-
-function isPlanLikeToolName(toolName: string): boolean {
-  const normalized = normalizeToolName(toolName)
-  if (normalized === "todowrite") return true
-  return normalized.includes("plan")
-}
-
 function extractPlanEntriesFromPart(part: AdaptedContentPart): PlanEntryInfo[] {
+  if (part.type === "plan") {
+    return part.entries
+  }
+
   if (part.type === "tool-call") {
     if (!isPlanLikeToolName(part.toolName)) return []
     if (!part.input) return []

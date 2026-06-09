@@ -3,6 +3,11 @@
 import { memo, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
+import {
+  getPriorityClassName,
+  getPriorityKey,
+  getStatusKey,
+} from "@/components/message/plan-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
@@ -36,57 +41,6 @@ function getLatestPlanEntries(message: LiveMessage | null): PlanEntryInfo[] {
   }
 
   return []
-}
-
-function getStatusKey(
-  status: string
-):
-  | "status.completed"
-  | "status.inProgress"
-  | "status.pending"
-  | "status.unknown" {
-  switch (status) {
-    case "completed":
-      return "status.completed"
-    case "in_progress":
-      return "status.inProgress"
-    case "pending":
-      return "status.pending"
-    default:
-      return "status.unknown"
-  }
-}
-
-type PriorityKey =
-  | "priority.high"
-  | "priority.medium"
-  | "priority.low"
-  | "priority.unknown"
-
-function getPriorityKey(priority: string): PriorityKey {
-  switch (priority) {
-    case "high":
-      return "priority.high"
-    case "medium":
-      return "priority.medium"
-    case "low":
-      return "priority.low"
-    default:
-      return "priority.unknown"
-  }
-}
-
-function getPriorityClassName(priority: string): string {
-  switch (priority) {
-    case "high":
-      return "text-red-700 bg-red-500/10 border-red-500/20 dark:text-red-300"
-    case "medium":
-      return "text-amber-700 bg-amber-500/10 border-amber-500/20 dark:text-amber-300"
-    case "low":
-      return "text-slate-700 bg-slate-500/10 border-slate-500/20 dark:text-slate-300"
-    default:
-      return "text-muted-foreground"
-  }
 }
 
 function StatusIcon({
