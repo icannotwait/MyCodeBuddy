@@ -108,6 +108,37 @@ function VirtualizedMessageThreadImpl<T>({
     }
   }, [scrollApiRef, scrollContextValue])
 
+  // Make the scroll viewport focusable so the browser's native keyboard
+  // scrolling (Arrow keys, PageUp/PageDown, Home/End, Space) works — matching
+  // the sidebar conversation list, whose card <button>s are focusable and let
+  // the browser scroll their scrollable ancestor. A left-click on
+  // non-interactive transcript content focuses the viewport so the keys engage,
+  // without stealing focus from interactive controls (links, buttons, inputs)
+  // or breaking text selection (focus() doesn't clear a selection).
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    el.tabIndex = 0
+    const onPointerDown = (e: PointerEvent) => {
+      // Ignore right-click and macOS ctrl-click (both open the context menu).
+      if (e.button !== 0 || e.ctrlKey) return
+      const target = e.target as HTMLElement | null
+      // Don't steal focus from interactive/editable elements — they manage
+      // their own focus (some do it in pointerdown). We deliberately do NOT
+      // match a bare `[tabindex]` here: the viewport itself has tabIndex=0, so
+      // an ancestor match would suppress focusing on every transcript click.
+      if (
+        target?.closest(
+          'a[href],button,input,textarea,select,summary,[contenteditable]:not([contenteditable="false"]),[role="button"],[role="link"],[role="checkbox"],[role="switch"],[role="radio"],[role="tab"],[role="textbox"],[role="menuitem"],[role="option"],[role="combobox"],[role="slider"]'
+        )
+      )
+        return
+      el.focus({ preventScroll: true })
+    }
+    el.addEventListener("pointerdown", onPointerDown)
+    return () => el.removeEventListener("pointerdown", onPointerDown)
+  }, [scrollRef])
+
   const handleScroll = useCallback(
     (offset: number) => {
       if (!onVisibleStartIndexChange) return
@@ -142,7 +173,7 @@ function VirtualizedMessageThreadImpl<T>({
     <MessageScrollProvider value={scrollContextValue}>
       <MessageThreadContent
         className={cn("mx-0 max-w-none p-0", contentClassName)}
-        scrollClassName="scrollbar-thin overscroll-contain [overflow-anchor:none]"
+        scrollClassName="scrollbar-thin overscroll-contain [overflow-anchor:none] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
         {...contentProps}
       >
         {items.length === 0 ? (
