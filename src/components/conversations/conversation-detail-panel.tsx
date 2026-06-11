@@ -16,8 +16,8 @@ import {
   FileImage,
   FileText,
   Focus,
-  Plus,
   RefreshCw,
+  SquarePen,
   X,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
@@ -1691,7 +1691,7 @@ export function ConversationDetailPanel() {
           disabled={!folder?.path}
           onSelect={handleNewConversation}
         >
-          <Plus className="h-4 w-4" />
+          <SquarePen className="h-4 w-4" />
           {t("newConversation")}
         </ContextMenuItem>
         <ContextMenuSub>

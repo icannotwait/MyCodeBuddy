@@ -5,7 +5,7 @@ import {
   Pencil,
   Trash2,
   Circle,
-  Plus,
+  SquarePen,
   Loader2,
   XCircle,
   Pin,
@@ -321,7 +321,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
               <ContextMenuItem
                 onSelect={() => onNewConversation(conversation.folder_id)}
               >
-                <Plus className="h-4 w-4" />
+                <SquarePen className="h-4 w-4" />
                 {t("newConversation")}
               </ContextMenuItem>
               <ContextMenuSeparator />

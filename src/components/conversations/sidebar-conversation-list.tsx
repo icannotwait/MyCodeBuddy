@@ -28,8 +28,8 @@ import {
   Loader2,
   MoreHorizontal,
   Palette,
-  Plus,
   Rocket,
+  SquarePen,
   XCircle,
 } from "lucide-react"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -363,7 +363,7 @@ const FolderHeader = memo(function FolderHeader({
               aria-label={t("moreOptions")}
               aria-haspopup="menu"
               className={cn(
-                "mr-[0.125rem] flex h-7 w-7 shrink-0 items-center justify-center",
+                "flex h-7 w-7 shrink-0 items-center justify-center",
                 // Shares the card action-icon palette: default /90 is the lightest
                 // muted shade clearing 3:1 non-text contrast (incl. on touch, where
                 // this stays visible); hover deepens to full foreground.
@@ -374,12 +374,32 @@ const FolderHeader = memo(function FolderHeader({
             >
               <MoreHorizontal className="h-[0.875rem] w-[0.875rem]" />
             </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                onNewConversation(folderId)
+              }}
+              title={t("newConversation")}
+              aria-label={t("newConversation")}
+              className={cn(
+                // Mirrors the ⋯ button's action-icon palette and hover-reveal so
+                // the two read as one trailing control cluster. As the rightmost
+                // control it carries the small right-edge margin.
+                "mr-[0.125rem] flex h-7 w-7 shrink-0 items-center justify-center",
+                "rounded-[0.375rem] cursor-pointer outline-none text-muted-foreground/90",
+                "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100",
+                "transition-[opacity,color] duration-150 hover:text-sidebar-foreground"
+              )}
+            >
+              <SquarePen className="h-[0.875rem] w-[0.875rem]" />
+            </button>
           </div>
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => onNewConversation(folderId)}>
-          <Plus className="h-4 w-4" />
+          <SquarePen className="h-4 w-4" />
           {t("newConversation")}
         </ContextMenuItem>
         <ContextMenuItem
@@ -1862,7 +1882,7 @@ export function SidebarConversationList({
               onSelect={handleNewConversation}
               disabled={!activeFolder}
             >
-              <Plus className="h-4 w-4" />
+              <SquarePen className="h-4 w-4" />
               {t("newConversation")}
             </ContextMenuItem>
             <ContextMenuSeparator />
