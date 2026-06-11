@@ -87,6 +87,7 @@ import { resolveFolderDisplayName } from "@/lib/folder-display"
 import { useSwitchToBranch } from "@/hooks/use-switch-to-branch"
 import type { GitBranchList, GitConflictInfo } from "@/lib/types"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useTaskContext } from "@/contexts/task-context"
@@ -122,6 +123,7 @@ export function BranchDropdown() {
   const t = useTranslations("Folder.branchDropdown")
   const tCommon = useTranslations("Folder.common")
   const { activeFolder } = useActiveFolder()
+  const isChatMode = useIsActiveChatMode()
   const { allFolders, branches, refreshFolder, openWorktreeFolder } =
     useAppWorkspace()
   const { openNewConversationTab } = useTabContext()
@@ -586,7 +588,9 @@ export function BranchDropdown() {
     )
   }
 
-  if (!activeFolder) return null
+  // Folderless chat conversations have no git branch — hide the top-bar
+  // selector entirely (covers both the mobile and desktop title-bar instances).
+  if (!activeFolder || isChatMode) return null
 
   // Worktree folders display their parent (root repo) name; paths/ids/git ops
   // below still use `activeFolder` (the worktree) unchanged.

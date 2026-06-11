@@ -34,6 +34,19 @@ export function filterTopLevelFolders<
 }
 
 /**
+ * Drop hidden chat-mode folders (`is_chat`) from a folder list. These back
+ * folderless "chat mode" conversations and must never appear in user-facing
+ * folder surfaces (the sidebar "文件夹" group, the input-box folder picker). They
+ * stay in the full `allFolders` set so by-id lookups (cwd, active-folder, theme
+ * color) keep resolving — only list rendering excludes them.
+ */
+export function excludeChatFolders<T extends Pick<FolderDetail, "is_chat">>(
+  folders: readonly T[]
+): T[] {
+  return folders.filter((f) => !f.is_chat)
+}
+
+/**
  * The folder id the input-box picker highlights for a conversation's folder:
  * the parent repo for a worktree (since the worktree itself isn't listed), or
  * the folder itself for a top-level repo. Display-only — never used for the

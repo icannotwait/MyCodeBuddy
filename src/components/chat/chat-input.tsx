@@ -49,6 +49,14 @@ interface ChatInputProps {
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
+  /**
+   * Keep the composer usable even while disconnected. Set for a folderless chat
+   * draft: it has no working dir yet (so it never auto-connects), and the FIRST
+   * send is precisely what lazily creates its conversation + scratch dir and
+   * triggers the connection. Without this the composer would be permanently
+   * disabled and the chat could never be started.
+   */
+  allowOfflineCompose?: boolean
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -85,6 +93,7 @@ export const ChatInput = memo(function ChatInput({
   onForkSend,
   onAddFeedback,
   feedbackAddDisabled,
+  allowOfflineCompose = false,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -114,7 +123,11 @@ export const ChatInput = memo(function ChatInput({
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
-        disabled={(!isConnected && !isPrompting) || selectorsLoading}
+        disabled={
+          allowOfflineCompose
+            ? false
+            : (!isConnected && !isPrompting) || selectorsLoading
+        }
         isPrompting={isPrompting}
         onCancel={onCancel}
         modes={modes}

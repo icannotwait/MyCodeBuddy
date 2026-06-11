@@ -14,6 +14,7 @@ import {
   pointerYToTargetIndex,
   reuseSelected,
   reuseSet,
+  selectChatConversationsWithReuse,
   selectPinnedWithReuse,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
@@ -226,7 +227,10 @@ describe("buildRows", () => {
     ({ kind: "section", section: "folders", expanded: true, count }) as const
 
   // Folder-only convenience wrapper (no pinned section), matching the original
-  // positional tests but through the new options-object signature.
+  // positional tests but through the new options-object signature. The Chat
+  // section is always present now (a permanent entry point), but it is exercised
+  // by its own tests below — so this wrapper trims it off to keep the focused
+  // folder assertions exact.
   function folderRows(
     orderedFolderIds: number[],
     byFolder: Map<number, DbConversationSummary[]>,
@@ -234,7 +238,7 @@ describe("buildRows", () => {
     folderTotalCounts: Map<number, number>,
     foldersExpanded = true
   ): SidebarRow[] {
-    return buildRows({
+    const rows = buildRows({
       pinned: [],
       pinnedExpanded: true,
       orderedFolderIds,
@@ -242,7 +246,13 @@ describe("buildRows", () => {
       folderExpanded,
       folderTotalCounts,
       foldersExpanded,
+      chatConversations: [],
+      chatsExpanded: true,
     })
+    const chatsIdx = rows.findIndex(
+      (r) => r.kind === "section" && r.section === "chats"
+    )
+    return chatsIdx === -1 ? rows : rows.slice(0, chatsIdx)
   }
 
   it("emits a Folders section header above the folder rows", () => {
@@ -351,6 +361,8 @@ describe("buildRows", () => {
       folderExpanded: { 10: true },
       folderTotalCounts: new Map([[10, 1]]),
       foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
     })
     expect(rows[0]).toEqual({
       kind: "section",
@@ -377,9 +389,15 @@ describe("buildRows", () => {
       folderExpanded: {},
       folderTotalCounts: new Map(),
       foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
     })
+    // Pinned section collapsed → header only; the always-present Chat section
+    // trails (empty → header + hint).
     expect(rows).toEqual([
       { kind: "section", section: "pinned", expanded: false, count: 1 },
+      { kind: "section", section: "chats", expanded: true, count: 0 },
+      { kind: "chats-empty" },
     ])
   })
 
@@ -389,6 +407,149 @@ describe("buildRows", () => {
     expect(
       rows.some((r) => r.kind === "section" && r.section === "pinned")
     ).toBe(false)
+  })
+
+  it("emits a flat Chat section below the folders section", () => {
+    const c1 = conv(1, 99)
+    const c2 = conv(2, 99)
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([[10, [conv(3, 10)]]]),
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 1]]),
+      foldersExpanded: true,
+      chatConversations: [c1, c2],
+      chatsExpanded: true,
+    })
+    const foldersIdx = rows.findIndex(
+      (r) => r.kind === "section" && r.section === "folders"
+    )
+    const chatsIdx = rows.findIndex(
+      (r) => r.kind === "section" && r.section === "chats"
+    )
+    expect(foldersIdx).toBeGreaterThanOrEqual(0)
+    expect(chatsIdx).toBeGreaterThan(foldersIdx)
+    expect(rows[chatsIdx]).toEqual({
+      kind: "section",
+      section: "chats",
+      expanded: true,
+      count: 2,
+    })
+    expect(rows[chatsIdx + 1]).toEqual({
+      kind: "conversation",
+      conversation: c1,
+    })
+    expect(rows[chatsIdx + 2]).toEqual({
+      kind: "conversation",
+      conversation: c2,
+    })
+    // Flat — no folder headers inside the chat section.
+    expect(rows.slice(chatsIdx + 1).some((r) => r.kind === "folder")).toBe(
+      false
+    )
+  })
+
+  it("always emits the Chat section, with an empty hint when there are no chat conversations", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([[10, [conv(1, 10)]]]),
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 1]]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+    })
+    const chatsIdx = rows.findIndex(
+      (r) => r.kind === "section" && r.section === "chats"
+    )
+    // The header is present (count 0) even with no chat conversations — it is a
+    // permanent entry point — and an expanded empty section shows a single hint.
+    expect(rows[chatsIdx]).toEqual({
+      kind: "section",
+      section: "chats",
+      expanded: true,
+      count: 0,
+    })
+    expect(rows[chatsIdx + 1]).toEqual({ kind: "chats-empty" })
+  })
+
+  it("shows only the Chat header (no empty hint) when the empty section is collapsed", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [],
+      byFolder: new Map(),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: false,
+    })
+    expect(rows).toEqual([
+      { kind: "section", section: "chats", expanded: false, count: 0 },
+    ])
+  })
+
+  it("hides chat conversations when the Chat section is collapsed", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [],
+      byFolder: new Map(),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [conv(1, 99)],
+      chatsExpanded: false,
+    })
+    expect(rows).toEqual([
+      { kind: "section", section: "chats", expanded: false, count: 1 },
+    ])
+  })
+})
+
+describe("selectChatConversationsWithReuse", () => {
+  it("selects only chat-folder conversations, newest-updated first, excluding pinned", () => {
+    const chatIds = new Set([99])
+    const a = conv(1, 99)
+    const b = conv(2, 99) // higher id → later updated_at
+    const pinnedChat = conv(3, 99, { pinned_at: new Date(5000).toISOString() })
+    const folderConv = conv(4, 10)
+    const out = selectChatConversationsWithReuse(
+      [a, b, pinnedChat, folderConv],
+      chatIds,
+      true,
+      []
+    )
+    expect(out.map((c) => c.id)).toEqual([2, 1])
+  })
+
+  it("excludes completed conversations unless showCompleted", () => {
+    const chatIds = new Set([99])
+    const done = conv(1, 99, { status: "completed" })
+    const active = conv(2, 99)
+    expect(
+      selectChatConversationsWithReuse([done, active], chatIds, false, []).map(
+        (c) => c.id
+      )
+    ).toEqual([2])
+    expect(
+      selectChatConversationsWithReuse([done, active], chatIds, true, [])
+        .map((c) => c.id)
+        .sort()
+    ).toEqual([1, 2])
+  })
+
+  it("returns the prev array when membership is referentially unchanged", () => {
+    const chatIds = new Set([99])
+    const a = conv(1, 99)
+    const first = selectChatConversationsWithReuse([a], chatIds, true, [])
+    const second = selectChatConversationsWithReuse([a], chatIds, true, first)
+    expect(second).toBe(first)
   })
 })
 

@@ -1001,7 +1001,10 @@
         "toastOpFailed": "작업 실패: {message}"
       },
       "sectionPinned": "고정됨",
-      "sectionFolders": "폴더"
+      "sectionFolders": "폴더",
+      "sectionChats": "채팅",
+      "noChats": "채팅 없음",
+      "newChatAction": "새 채팅"
     },
     "conversation": {
       "reloadFailed": "대화 다시 불러오기 실패: {message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "{path}을(를) 열어 설치를 관리하세요.",
         "autoConnectAppend": "{message}. {path}을(를) 열어 설치를 관리하세요.",
         "enableAgentFirstPlaceholder": "세션을 시작하기 전에 최소 한 개의 에이전트를 활성화하세요...",
+        "prepareSessionFailed": "채팅 세션을 준비하지 못했습니다. 다시 시도해 주세요.",
+        "createConversationFailed": "대화를 만들지 못했습니다. 다시 시도해 주세요.",
         "askAnythingPlaceholder": "무엇이든 물어보세요..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "폴더 없음 모드",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "채팅 모드로 전환했습니다",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }

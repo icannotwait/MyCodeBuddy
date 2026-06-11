@@ -42,11 +42,19 @@ import { AgentSelector } from "@/components/chat/agent-selector"
 import { ChatInput } from "@/components/chat/chat-input"
 import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { acpFork, createConversation, openSettingsWindow } from "@/lib/api"
+import {
+  acpFork,
+  createChatConversation,
+  createChatDir,
+  createConversation,
+  openSettingsWindow,
+} from "@/lib/api"
 import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
+  isConnectionReady,
   shouldQueueDirectSend,
+  shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { useConversationRuntime } from "@/contexts/conversation-runtime-context"
@@ -74,6 +82,7 @@ import {
   buildConversationDraftStorageKey,
   buildNewConversationDraftStorageKey,
   clearMessageInputDraft,
+  saveMessageInputDraft,
 } from "@/lib/message-input-draft"
 import {
   ContextMenu,
@@ -180,11 +189,12 @@ const ConversationTabView = memo(function ConversationTabView({
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
   const sharedT = useTranslations("Folder.chat.shared")
   const { activeFolder: folder, activeFolderId } = useActiveFolder()
-  const { refreshConversations } = useAppWorkspace()
+  const { refreshConversations, upsertFolder } = useAppWorkspace()
   const folderId = activeFolderId ?? 0
   const {
     tabs,
     bindConversationTab,
+    setChatDraftWorkingDir,
     setTabRuntimeConversationId,
     pinTab,
     openNewConversationTab,
@@ -245,6 +255,16 @@ const ConversationTabView = memo(function ConversationTabView({
 
   const hasPersistedConversation = dbConversationId != null
 
+  // A folderless chat draft before its first send (chat tab, not yet persisted).
+  // Used to trigger the eager scratch-dir prepare below, which gives the draft a
+  // real workingDir so the ACP connection can spawn BEFORE the first send — the
+  // composer is gated on `connected` like any normal conversation (no offline
+  // compose). Once bound it has a persisted row + workingDir and this is false.
+  const isChatDraft = useMemo(() => {
+    const ownTab = tabs.find((tab) => tab.id === tabId)
+    return ownTab?.isChat === true && !hasPersistedConversation
+  }, [tabs, tabId, hasPersistedConversation])
+
   // Expose the runtime session key to the tab so the aux panel (Diff sidebar)
   // can look up live turns even before the DB conversation is created.
   useEffect(() => {
@@ -272,6 +292,8 @@ const ConversationTabView = memo(function ConversationTabView({
   const mountedRef = useRef(true)
   const selectedAgentRef = useRef(selectedAgent)
   const createConversationPendingRef = useRef(false)
+  // Single-flight guard for the eager scratch-dir prepare (on chat-mode select).
+  const prepareChatDirPendingRef = useRef(false)
   const sessionIdRef = useRef<string | null>(null)
   const syncCancelRef = useRef<(() => void) | null>(null)
 
@@ -282,6 +304,47 @@ const ConversationTabView = memo(function ConversationTabView({
   useEffect(() => {
     selectedAgentRef.current = selectedAgent
   }, [selectedAgent])
+
+  // Eagerly create the chat-mode scratch dir the moment this becomes an unbound
+  // chat draft, so the ACP connection can spawn at a real cwd BEFORE the first
+  // send — picking "no-folder mode" no longer leaves the agent unconnected.
+  // Filesystem-only (writes no DB rows), so the lazy-conversation invariant
+  // holds; the first send reuses this dir via createChatConversation(existingDir),
+  // keeping the connection's cwd put across the bind. Single-flight and
+  // self-disarming: once workingDir lands the guard flips false. openChatModeTab
+  // clears workingDir on re-entry, so a fresh dir is prepared each time.
+  useEffect(() => {
+    if (!isActive || !isChatDraft || workingDir) return
+    if (prepareChatDirPendingRef.current) return
+    prepareChatDirPendingRef.current = true
+    void (async () => {
+      try {
+        const res = await createChatDir()
+        if (mountedRef.current) {
+          setChatDraftWorkingDir(tabId, res.path)
+        }
+      } catch (e) {
+        // The composer is gated on a live connection (no offline compose), and
+        // the connection needs this scratch dir. If the mkdir fails the draft
+        // would otherwise sit with a permanently disabled composer and no
+        // explanation — surface it on the welcome screen's error banner so the
+        // user can re-enter chat mode to retry.
+        console.error("[ConversationTabView] prepare chat dir:", e)
+        if (mountedRef.current) {
+          setAgentConnectError(tWelcome("prepareSessionFailed"))
+        }
+      } finally {
+        prepareChatDirPendingRef.current = false
+      }
+    })()
+  }, [
+    isActive,
+    isChatDraft,
+    workingDir,
+    tabId,
+    setChatDraftWorkingDir,
+    tWelcome,
+  ])
 
   // Sync the agentType prop into draftAgentType for draft tabs. The prop
   // changes when openNewConversationTab re-points an existing draft at a
@@ -400,6 +463,22 @@ const ConversationTabView = memo(function ConversationTabView({
     isViewerRef.current = conn.isViewer
   }, [conn.isViewer])
   const isConnecting = connStatus === "connecting"
+  // The live connection is ready for THIS tab only when it's connected AND its
+  // cwd matches the tab's intended working dir. A just-retargeted chat draft (or
+  // any mid-reconnect) can briefly read a stale "connected" for the PREVIOUS cwd;
+  // sending then would deliver the prompt to the wrong agent/workspace. Every
+  // direct send gates on this (handleSend), mirroring the flush effect's guard.
+  // No-op for normal conversations, whose connected cwd always equals intended.
+  const connectionReady = isConnectionReady(
+    connStatus,
+    conn.connectedWorkingDir,
+    workingDirForConnection
+  )
+  // Present "connecting" to the composer while connected-but-not-ready, so it
+  // disables its send affordance instead of inviting a submit handleSend rejects.
+  // Only ever differs from connStatus during that transient mismatch window.
+  const composerConnStatus =
+    connStatus === "connected" && !connectionReady ? "connecting" : connStatus
   const connectionModes = useMemo(
     () => conn.modes?.available_modes ?? [],
     [conn.modes?.available_modes]
@@ -507,6 +586,18 @@ const ConversationTabView = memo(function ConversationTabView({
   const runtimeSyncState = runtimeSession?.syncState ?? "idle"
   useEffect(() => {
     if (connStatus !== "connected") return
+    // Don't flush onto a connection whose cwd doesn't match the tab's intended
+    // working dir. This matters for a just-bound chat conversation: bind switches
+    // the tab's workingDir from the draft's previous folder to the scratch dir,
+    // and for one render `connStatus` can still read the stale "connected" of the
+    // old-folder session before the reconnect lands. Flushing then would deliver
+    // the queued prompt to the wrong folder's agent. (No-op for normal
+    // conversations, whose connection cwd always equals the intended one.)
+    if (
+      (conn.connectedWorkingDir ?? null) !== (workingDirForConnection ?? null)
+    ) {
+      return
+    }
     if (runtimeSyncState === "awaiting_persist") return
     if (msgQueue.length === 0) return
     // setTimeout (not microtask) so a COMPLETE_TURN commit settles first AND so
@@ -522,7 +613,13 @@ const ConversationTabView = memo(function ConversationTabView({
       }
     }, wait)
     return () => clearTimeout(timer)
-  }, [connStatus, runtimeSyncState, msgQueue.length])
+  }, [
+    connStatus,
+    runtimeSyncState,
+    msgQueue.length,
+    conn.connectedWorkingDir,
+    workingDirForConnection,
+  ])
 
   useEffect(() => {
     // Only sync non-null liveMessage updates to state. When conn.liveMessage
@@ -662,11 +759,24 @@ const ConversationTabView = memo(function ConversationTabView({
       // re-queues at the TAIL.
       opts?: { fromQueueFlush?: boolean }
     ) => {
+      // Capture the tab's chat-draft state + eager scratch dir synchronously,
+      // before any await. A folderless chat draft is NOT special-cased here:
+      // its first send takes the exact same gated, inline path as a normal new
+      // conversation (the new-tab branch below just creates the row via
+      // createChatConversation, reusing this eager dir). The composer is gated
+      // on `connected` for chat drafts too, so by the time we get here the agent
+      // is live and the prompt is delivered inline — never parked in the queue.
+      const sendOwnTab = tabs.find((tab) => tab.id === tabId)
+
       if (!hasPersistedConversation && !canAutoConnect) {
         setAgentConnectError(tWelcome("enableAgentFirstPlaceholder"))
         return
       }
-      if (connStatus !== "connected") return
+      // Connected AND the connection's cwd matches this tab's working dir. Bare
+      // `connStatus === "connected"` is not enough: a chat draft mid-reconnect can
+      // read a stale "connected" for the old cwd, and an inline send then would
+      // deliver to the wrong workspace. Same predicate the flush effect uses.
+      if (!connectionReady) return
 
       const fromQueueFlush = opts?.fromQueueFlush ?? false
       // Preserve FIFO: a direct send issued while the queue is non-empty joins
@@ -674,6 +784,23 @@ const ConversationTabView = memo(function ConversationTabView({
       // queue length synchronously (it reflects a same-tick bounce requeue).
       if (shouldQueueDirectSend(fromQueueFlush, mqGetQueueLength())) {
         mqEnqueue(draft, selectedModeIdArg ?? null)
+        return
+      }
+
+      // Single-flight the unbound new-tab create. A second direct submit fired
+      // before the first create resolves (a double Enter / double click) would
+      // otherwise append an optimistic turn it can never deliver: the
+      // createConversationPendingRef guard further down returns AFTER the
+      // optimistic append. Reject the duplicate here, before any optimistic
+      // mutation. Only the unbound path (no persisted id yet) is single-flighted,
+      // so persisted sends keep their concurrent queued-send behavior. Applies
+      // equally to chat and normal new conversations.
+      if (
+        shouldRejectDuplicateCreate(
+          dbConvIdRef.current != null,
+          createConversationPendingRef.current
+        )
+      ) {
         return
       }
 
@@ -733,44 +860,86 @@ const ConversationTabView = memo(function ConversationTabView({
 
       // New-tab path: create the DB row first, then send with the new id
       // pinned. This prevents the backend's send_prompt_linked from racing
-      // us to create its own conversation row.
+      // us to create its own conversation row. A folderless chat draft creates
+      // via createChatConversation (reusing the eager scratch dir) and binds to
+      // its hidden is_chat folder; every other step — the optimistic turn
+      // appended above, the inline lifecycleSend, the rollback — is identical to
+      // a normal new conversation. This is the whole point of the fix: after the
+      // scratch dir exists, chat mode shares the normal send path and never
+      // depends on the flush-on-connect queue to deliver its first prompt.
       if (createConversationPendingRef.current) return
       createConversationPendingRef.current = true
       const title = getPromptDraftDisplayText(
         draft,
         sharedT("attachedResources")
       ).slice(0, 80)
+      const chatSend = sendOwnTab?.isChat === true
+      const chatExistingDir = sendOwnTab?.workingDir
 
       void (async () => {
         try {
-          const newConversationId = await createConversation(
-            folderId,
-            selectedAgent,
-            title
-          )
-          dbConvIdRef.current = newConversationId
-          // Set external ID on the stable virtual session (no migration needed —
-          // effectiveConversationId never changes, so the session stays in place).
-          // DB persistence of external_id is now backend-driven from
-          // send_prompt_linked once the row is linked, so no explicit DB write here.
-          setExternalId(effectiveConversationId, sessionIdRef.current ?? null)
-
-          if (!mountedRef.current) {
-            // Component unmounted while creating — mark for deferred cleanup
-            // so the background turn_complete handler can clean up later.
-            setPendingCleanup(effectiveConversationId, true)
-            refreshConversations()
-            return
+          let newConversationId: number
+          // The send's folderId defaults to the active folder; a chat send
+          // overrides it with the backend-created hidden is_chat folder.
+          let sendFolderId = folderId
+          if (chatSend) {
+            const res = await createChatConversation(
+              selectedAgent,
+              title,
+              chatExistingDir
+            )
+            newConversationId = res.conversationId
+            sendFolderId = res.folderId
+            dbConvIdRef.current = newConversationId
+            setExternalId(effectiveConversationId, sessionIdRef.current ?? null)
+            if (!mountedRef.current) {
+              setPendingCleanup(effectiveConversationId, true)
+              refreshConversations()
+              return
+            }
+            // Seed allFolders with the hidden chat folder so the tab's new
+            // folderId resolves (cwd / active-folder) on the next render. bind
+            // reuses the eager scratch dir as workingDir, so the connection's
+            // cwd does not move and no reconnect is triggered.
+            upsertFolder(res.folder)
+            setCreatedConversationId(newConversationId)
+            bindConversationTab(
+              tabId,
+              newConversationId,
+              selectedAgent,
+              title,
+              effectiveConversationId,
+              res.folderId,
+              res.folder.path
+            )
+          } else {
+            newConversationId = await createConversation(
+              folderId,
+              selectedAgent,
+              title
+            )
+            dbConvIdRef.current = newConversationId
+            // Set external ID on the stable virtual session (no migration needed —
+            // effectiveConversationId never changes, so the session stays in place).
+            // DB persistence of external_id is now backend-driven from
+            // send_prompt_linked once the row is linked, so no explicit DB write here.
+            setExternalId(effectiveConversationId, sessionIdRef.current ?? null)
+            if (!mountedRef.current) {
+              // Component unmounted while creating — mark for deferred cleanup
+              // so the background turn_complete handler can clean up later.
+              setPendingCleanup(effectiveConversationId, true)
+              refreshConversations()
+              return
+            }
+            setCreatedConversationId(newConversationId)
+            bindConversationTab(
+              tabId,
+              newConversationId,
+              selectedAgent,
+              title,
+              effectiveConversationId
+            )
           }
-
-          setCreatedConversationId(newConversationId)
-          bindConversationTab(
-            tabId,
-            newConversationId,
-            selectedAgent,
-            title,
-            effectiveConversationId
-          )
           clearMessageInputDraft(buildNewConversationDraftStorageKey())
           refreshConversations()
 
@@ -778,13 +947,35 @@ const ConversationTabView = memo(function ConversationTabView({
           // conversation_id pinned so the backend adopts our row instead of
           // creating a duplicate one.
           lifecycleSend(draft, selectedModeIdArg, {
-            folderId,
+            folderId: sendFolderId,
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
           })
         } catch (e) {
           console.error("[ConversationTabView] create conversation:", e)
+          // A failed create (chat OR normal) must fully restore the pre-send
+          // state, not strand the user behind a blank panel:
+          //   1. drop the optimistic turn (no ghost stuck in awaiting_persist),
+          //   2. return syncState to idle,
+          //   3. setHasSentMessage(false) → re-enters welcome mode (otherwise the
+          //      welcome screen never returns and the list is empty),
+          //   4. re-seed the draft text — message-input clears it synchronously on
+          //      send, so without this the user's prompt is lost on failure,
+          //   5. surface the error on the welcome banner so it isn't silent.
+          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          setSyncState(effectiveConversationId, "idle")
+          setHasSentMessage(false)
+          const draftText = draft.displayText.trim()
+          if (draftText) {
+            saveMessageInputDraft(
+              buildNewConversationDraftStorageKey(),
+              draftText
+            )
+          }
+          if (mountedRef.current) {
+            setAgentConnectError(tWelcome("createConversationFailed"))
+          }
         } finally {
           createConversationPendingRef.current = false
         }
@@ -798,7 +989,7 @@ const ConversationTabView = memo(function ConversationTabView({
       mqGetQueueLength,
       bindConversationTab,
       canAutoConnect,
-      connStatus,
+      connectionReady,
       effectiveConversationId,
       folderId,
       hasPersistedConversation,
@@ -813,6 +1004,7 @@ const ConversationTabView = memo(function ConversationTabView({
       tabs,
       tWelcome,
       tabId,
+      upsertFolder,
     ]
   )
 
@@ -1209,7 +1401,10 @@ const ConversationTabView = memo(function ConversationTabView({
               </button>
             ) : null}
             <ChatInput
-              status={connStatus}
+              // composerConnStatus (not connStatus): a chat draft mid-reconnect
+              // reads "connecting" until the connection's cwd matches, so the
+              // send affordance stays disabled until handleSend would accept it.
+              status={composerConnStatus}
               promptCapabilities={conn.promptCapabilities}
               defaultPath={workingDirForConnection}
               agentName={AGENT_LABELS[selectedAgent]}

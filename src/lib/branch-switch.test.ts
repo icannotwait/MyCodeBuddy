@@ -16,6 +16,7 @@ function mkFolder(p: Partial<FolderDetail> & { id: number }): FolderDetail {
     sort_order: p.id,
     color: "blue",
     parent_id: null,
+    is_chat: false,
     ...p,
   }
 }

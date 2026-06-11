@@ -45,6 +45,7 @@ vi.mock("@/contexts/app-workspace-context", () => ({
   useAppWorkspace: () => ({
     conversations: conversationsMock,
     folders: foldersMock,
+    allFolders: allFoldersMock,
     foldersHydrated: true,
     setActiveFolderId: setActiveFolderIdMock,
   }),
@@ -80,6 +81,7 @@ const defaultFoldersMock: FolderDetail[] = [
     sort_order: 0,
     color: "blue",
     parent_id: null,
+    is_chat: false,
   },
   {
     id: 2,
@@ -91,10 +93,14 @@ const defaultFoldersMock: FolderDetail[] = [
     sort_order: 1,
     color: "green",
     parent_id: null,
+    is_chat: false,
   },
 ]
 
 let foldersMock: FolderDetail[] = defaultFoldersMock
+// `allFolders` includes hidden chat folders that the user-facing `folders` list
+// excludes; defaults to the same set (no chat folders) for most tests.
+let allFoldersMock: FolderDetail[] = defaultFoldersMock
 
 const conversationsMock: DbConversationSummary[] = [
   {
@@ -190,6 +196,7 @@ describe("TabProvider tab state transitions", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     foldersMock = defaultFoldersMock
+    allFoldersMock = defaultFoldersMock
     listOpenedTabsMock.mockReturnValue(new Promise(() => {}))
     saveOpenedTabsMock.mockResolvedValue({
       accepted: true,
@@ -343,6 +350,72 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent(tabsText)
   })
 
+  it("redirects a new-conversation action targeting a hidden chat folder to chat mode", () => {
+    // The open-folder list (`folders`) excludes chat folders after refetch, but
+    // `allFolders` keeps them — chat detection must read `allFolders`, else a
+    // "new conversation" from an active chat conversation would pile a normal
+    // draft onto the hidden per-conversation chat folder.
+    const chatFolder: FolderDetail = {
+      id: 42,
+      name: "Chat",
+      path: "/data/chat-sessions/x",
+      git_branch: null,
+      default_agent_type: null,
+      last_opened_at: "2026-06-11T00:00:00Z",
+      sort_order: 99,
+      color: "inherit",
+      parent_id: null,
+      is_chat: true,
+    }
+    foldersMock = defaultFoldersMock
+    allFoldersMock = [...defaultFoldersMock, chatFolder]
+    renderTabs()
+    expect(latestContext).not.toBeNull()
+
+    act(() => {
+      latestContext?.openNewConversationTab(42, "/data/chat-sessions/x")
+    })
+
+    const activeId = latestContext?.activeTabId ?? ""
+    const draft = latestContext?.tabs.find((t) => t.id === activeId)
+    expect(activeId).toMatch(/^new-/)
+    expect(draft?.isChat).toBe(true)
+    expect(draft?.folderId).toBe(0)
+  })
+
+  it("seeds a non-chat replacement draft when closing a bound chat tab whose folder is filtered from the open list", () => {
+    const chatFolder: FolderDetail = {
+      id: 42,
+      name: "Chat",
+      path: "/data/chat-sessions/x",
+      git_branch: null,
+      default_agent_type: null,
+      last_opened_at: "2026-06-11T00:00:00Z",
+      sort_order: 99,
+      color: "inherit",
+      parent_id: null,
+      is_chat: true,
+    }
+    foldersMock = defaultFoldersMock // open list excludes the chat folder
+    allFoldersMock = [...defaultFoldersMock, chatFolder]
+    renderTabs()
+    expect(latestContext).not.toBeNull()
+
+    act(() => {
+      latestContext?.openTab(42, 5, "codex", true, "chat conversation")
+    })
+    act(() => {
+      latestContext?.closeTab("conv-42-codex-5")
+    })
+
+    const replId = latestContext?.activeTabId ?? ""
+    const repl = latestContext?.tabs.find((t) => t.id === replId)
+    expect(replId).toMatch(/^new-/)
+    expect(repl?.conversationId).toBeNull()
+    expect(repl?.folderId).not.toBe(42)
+    expect(repl?.isChat ?? false).toBe(false)
+  })
+
   it("retargets the replacement draft when reopening a closed draft for another folder in the same batch", async () => {
     renderTabs()
 
@@ -482,6 +555,7 @@ describe("TabProvider cross-client sync", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     foldersMock = defaultFoldersMock
+    allFoldersMock = defaultFoldersMock
     listOpenedTabsMock.mockResolvedValue({ items: [], version: 0 })
     saveOpenedTabsMock.mockResolvedValue({
       accepted: true,
@@ -518,6 +592,37 @@ describe("TabProvider cross-client sync", () => {
     })
 
     expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-1")
+  })
+
+  it("preserves an active chat-mode draft across an inbound remote snapshot", async () => {
+    await renderHydrated()
+    expect(tabsChangedHandler).not.toBeNull()
+
+    // Enter folderless chat mode → a device-local chat draft (folderId 0).
+    act(() => {
+      latestContext?.openChatModeTab()
+    })
+    const chatDraftId = latestContext?.activeTabId ?? ""
+    expect(chatDraftId).toMatch(/^new-/)
+    expect(latestContext?.tabs.find((t) => t.id === chatDraftId)?.isChat).toBe(
+      true
+    )
+
+    // A remote snapshot arrives. The chat draft's folderId 0 is in no folder
+    // list, so it must be preserved by its `isChat` flag — never silently
+    // dropped — keeping the user on their unsent folderless draft.
+    act(() => {
+      tabsChangedHandler?.({
+        version: 1,
+        origin: "other-device",
+        tabs: [tabItem(1, 1)],
+      })
+    })
+
+    const draft = latestContext?.tabs.find((t) => t.id === chatDraftId)
+    expect(draft).toBeDefined()
+    expect(draft?.isChat).toBe(true)
+    expect(draft?.conversationId).toBeNull()
   })
 
   it("does not save when applying a remote snapshot (no echo back)", async () => {

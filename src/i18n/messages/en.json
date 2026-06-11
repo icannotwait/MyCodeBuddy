@@ -1001,7 +1001,10 @@
         "toastOpFailed": "Operation failed: {message}"
       },
       "sectionPinned": "Pinned",
-      "sectionFolders": "Folders"
+      "sectionFolders": "Folders",
+      "sectionChats": "Chat",
+      "noChats": "No chats",
+      "newChatAction": "New chat"
     },
     "conversation": {
       "reloadFailed": "Failed to reload conversation: {message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "Click to open {path} and manage installation.",
         "autoConnectAppend": "{message}. Click to open {path} and manage installation.",
         "enableAgentFirstPlaceholder": "Enable at least one agent before starting a session...",
+        "prepareSessionFailed": "Couldn't prepare the chat session. Please try again.",
+        "createConversationFailed": "Couldn't create the conversation. Please try again.",
         "askAnythingPlaceholder": "Ask anything..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "No-folder mode",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "Switched to chat mode",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }

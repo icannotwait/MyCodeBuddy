@@ -24,6 +24,10 @@ pub struct FolderDetail {
     /// Root folder this one was created under (worktree folders only); NULL for
     /// top-level folders. Drives sidebar merge + worktree-branch detection.
     pub parent_id: Option<i32>,
+    /// True for a hidden chat-mode folder. The frontend keeps it in `allFolders`
+    /// (so cwd / active-folder resolve) but hides it from folder lists and routes
+    /// its conversations to the sidebar "Chat" group.
+    pub is_chat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

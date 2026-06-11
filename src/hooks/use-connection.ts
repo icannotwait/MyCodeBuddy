@@ -46,6 +46,10 @@ export interface UseConnectionReturn {
   selectorsReady: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
+  /** The working directory the live connection was established with (null when
+   *  not connected). Lets callers detect a connection that is mid-reconnect to a
+   *  different cwd and avoid acting on the stale one. */
+  connectedWorkingDir: string | null
   modes: SessionModeStateInfo | null
   configOptions: SessionConfigOptionInfo[] | null
   availableCommands: AvailableCommandInfo[] | null
@@ -126,6 +130,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     ? getCachedSelectors(connection.agentType)
     : null
   const hasCachedSelectors = cached !== null
+  const connectedWorkingDir = connection?.workingDir ?? null
   const modes = connection?.modes ?? cached?.modes ?? null
   const configOptions =
     connection?.configOptions ?? cached?.configOptions ?? null
@@ -225,6 +230,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       selectorsReady,
       hasCachedSelectors,
       sessionId,
+      connectedWorkingDir,
       modes,
       configOptions,
       availableCommands,
@@ -260,6 +266,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       selectorsReady,
       hasCachedSelectors,
       sessionId,
+      connectedWorkingDir,
       modes,
       configOptions,
       availableCommands,

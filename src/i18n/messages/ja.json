@@ -1001,7 +1001,10 @@
         "toastOpFailed": "操作に失敗しました: {message}"
       },
       "sectionPinned": "ピン留め",
-      "sectionFolders": "フォルダ"
+      "sectionFolders": "フォルダ",
+      "sectionChats": "チャット",
+      "noChats": "チャットがありません",
+      "newChatAction": "新しいチャット"
     },
     "conversation": {
       "reloadFailed": "会話の再読み込みに失敗しました: {message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "{path} を開いてインストールを管理してください。",
         "autoConnectAppend": "{message}。{path} を開いてインストールを管理してください。",
         "enableAgentFirstPlaceholder": "セッション開始前に少なくとも1つのエージェントを有効化してください...",
+        "prepareSessionFailed": "チャットセッションを準備できませんでした。もう一度お試しください。",
+        "createConversationFailed": "会話を作成できませんでした。もう一度お試しください。",
         "askAnythingPlaceholder": "何でも質問してください..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "フォルダーなしモード",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "チャットモードに切り替えました",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }

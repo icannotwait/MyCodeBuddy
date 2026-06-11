@@ -955,6 +955,147 @@ pub async fn create_conversation(
     Ok(id)
 }
 
+/// Result of [`create_chat_conversation_core`]: the new conversation id plus the
+/// hidden chat folder backing it, so the frontend can drop the folder straight
+/// into `allFolders` (resolving cwd / active-folder) without a refetch.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChatConversationResult {
+    pub conversation_id: i32,
+    pub folder_id: i32,
+    pub folder: FolderDetail,
+}
+
+/// Result of [`create_chat_dir`]: the freshly created scratch directory path.
+/// Handed to the frontend so a chat draft can point its ACP connection at a real
+/// cwd *before* any conversation row exists.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChatDirResult {
+    pub path: String,
+}
+
+/// Create a fresh dated scratch directory for a chat-mode conversation and
+/// return its absolute path. Mirrors Codex's date-grouped session dirs:
+/// `<data_dir>/chat-sessions/<YYYY-MM-DD>/<uuid>/`.
+///
+/// This is a pure filesystem operation — it writes NO database rows — so it can
+/// run eagerly the moment the user picks "no-folder mode" (giving the ACP
+/// connection a cwd to spawn in) without breaching the lazy-conversation
+/// invariant. The row-creating [`create_chat_conversation_core`] later reuses
+/// this directory via its `existing_dir` parameter, so the connection's cwd
+/// never moves across the first send.
+pub fn create_chat_dir_core(data_dir: &std::path::Path) -> Result<String, AppCommandError> {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let dir = data_dir.join("chat-sessions").join(date).join(unique);
+    std::fs::create_dir_all(&dir).map_err(AppCommandError::io)?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// Core logic for creating a folderless "chat mode" conversation. Mirrors
+/// Codex's date-grouped session dirs: each chat conversation gets its own
+/// scratch directory under `<data_dir>/chat-sessions/<YYYY-MM-DD>/<uuid>/` plus a
+/// dedicated hidden `is_chat` folder pointing at it, so the NOT-NULL `folder_id`
+/// FK stays satisfied. Called lazily on first prompt send — never before — so
+/// merely selecting "no-folder mode" writes nothing to the DB. Shared by the
+/// Tauri command and the web handler.
+///
+/// `existing_dir`: when the frontend already eagerly created a scratch dir (to
+/// connect ACP before sending), pass it here so this reuses it instead of
+/// minting a second one — keeping the connection's cwd put across the lazy
+/// create. `None` mints a fresh dir (the send-before-dir-ready fallback).
+/// `create_dir_all` is idempotent, so re-ensuring an existing dir is harmless.
+pub async fn create_chat_conversation_core(
+    conn: &sea_orm::DatabaseConnection,
+    data_dir: &std::path::Path,
+    agent_type: AgentType,
+    title: Option<String>,
+    existing_dir: Option<&str>,
+) -> Result<CreateChatConversationResult, AppCommandError> {
+    let path = match existing_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(AppCommandError::io)?;
+            dir.to_string()
+        }
+        None => create_chat_dir_core(data_dir)?,
+    };
+
+    let folder = folder_service::add_chat_folder(conn, &path)
+        .await
+        .map_err(AppCommandError::from)?;
+
+    // A fresh empty scratch dir has no git repo, so skip branch detection — this
+    // also keeps the composer/top-bar branch pickers hidden in chat mode. No
+    // transaction spans the folder + conversation inserts (the service calls take
+    // a plain connection), so if the conversation insert fails, compensate by
+    // soft-deleting the just-created hidden folder — otherwise it would linger as
+    // an orphan (active, conversation-less, never reached by the delete path) and
+    // pollute the active-folder scope.
+    let model = match conversation_service::create(conn, folder.id, agent_type, title, None).await {
+        Ok(model) => model,
+        Err(create_err) => {
+            if let Err(cleanup_err) = folder_service::remove_folder(conn, &folder.path).await {
+                eprintln!(
+                    "[conversations] failed to clean up orphan chat folder {} after conversation create error: {cleanup_err}",
+                    folder.id
+                );
+            }
+            return Err(AppCommandError::from(create_err));
+        }
+    };
+
+    Ok(CreateChatConversationResult {
+        conversation_id: model.id,
+        folder_id: folder.id,
+        folder,
+    })
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn create_chat_conversation(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    agent_type: AgentType,
+    title: Option<String>,
+    existing_dir: Option<String>,
+) -> Result<CreateChatConversationResult, AppCommandError> {
+    use tauri::Manager;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| crate::paths::resolve_effective_data_dir(&p))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let result = create_chat_conversation_core(
+        &db.conn,
+        &data_dir,
+        agent_type,
+        title,
+        existing_dir.as_deref(),
+    )
+    .await?;
+    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, result.conversation_id).await;
+    Ok(result)
+}
+
+/// Eagerly create a chat-mode scratch directory (no DB rows) and return its
+/// path, so the frontend can connect ACP at a real cwd the instant the user
+/// selects "no-folder mode" — before any first prompt. The hidden folder +
+/// conversation are still created lazily on first send (reusing this dir).
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn create_chat_dir(app: tauri::AppHandle) -> Result<CreateChatDirResult, AppCommandError> {
+    use tauri::Manager;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| crate::paths::resolve_effective_data_dir(&p))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path = create_chat_dir_core(&data_dir)?;
+    Ok(CreateChatDirResult { path })
+}
+
 async fn detect_git_branch(path: &str) -> Option<String> {
     let output = crate::process::tokio_command("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1056,6 +1197,46 @@ pub async fn delete_conversation_core(
         .map_err(AppCommandError::from)
 }
 
+/// When the deleted conversation was backed by a dedicated hidden chat folder,
+/// soft-delete that folder too so it stops counting toward `list_all`'s active
+/// folder scope. The per-conversation scratch dir on disk is intentionally left
+/// in place (symmetric with conversation soft-delete keeping session files; a
+/// future GC can prune dirs whose folder is soft-deleted). Best effort —
+/// failures are logged, never propagated. `folder_id` must be captured BEFORE
+/// the conversation soft-delete.
+pub async fn cleanup_chat_folder_for_deleted_conversation(
+    conn: &sea_orm::DatabaseConnection,
+    folder_id: i32,
+) {
+    match folder_service::get_folder_by_id(conn, folder_id).await {
+        Ok(Some(folder)) if folder.is_chat => {
+            // Only retire the hidden folder once it backs no remaining
+            // (non-deleted) conversations, so deleting one chat conversation can
+            // never hide another that happens to share the folder. (Normally a
+            // chat folder backs exactly one conversation, but this keeps the
+            // delete path safe regardless.)
+            match conversation_service::list_by_folder(conn, folder_id, None, None, None, None).await
+            {
+                Ok(remaining) if remaining.is_empty() => {
+                    if let Err(e) = folder_service::remove_folder(conn, &folder.path).await {
+                        eprintln!(
+                            "[conversations] chat folder cleanup failed (folder {folder_id}): {e}"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "[conversations] chat folder conversation check failed (folder {folder_id}): {e}"
+                ),
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("[conversations] chat folder lookup failed (folder {folder_id}): {e}")
+        }
+    }
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn delete_conversation(
@@ -1063,10 +1244,19 @@ pub async fn delete_conversation(
     db: tauri::State<'_, AppDatabase>,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
+    // Capture the backing folder before the soft-delete so a hidden chat folder
+    // can be cleaned up afterward.
+    let folder_id = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .ok()
+        .map(|c| c.folder_id);
     delete_conversation_core(&db.conn, conversation_id).await?;
     let emitter = EventEmitter::Tauri(app);
     emit_conversation_deleted(&emitter, conversation_id);
     cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, conversation_id).await;
+    if let Some(folder_id) = folder_id {
+        cleanup_chat_folder_for_deleted_conversation(&db.conn, folder_id).await;
+    }
     Ok(())
 }
 
@@ -1681,6 +1871,215 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn create_chat_conversation_core_creates_dir_folder_and_conversation() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let result = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::ClaudeCode,
+            Some("hello chat".into()),
+            None,
+        )
+        .await
+        .expect("create chat conversation");
+
+        // The backing folder is a hidden, top-level chat folder.
+        assert!(result.folder.is_chat, "folder must be is_chat");
+        assert_eq!(result.folder.parent_id, None);
+        assert_eq!(result.folder_id, result.folder.id);
+        assert!(
+            result
+                .folder
+                .path
+                .starts_with(&*data_dir.path().to_string_lossy()),
+            "scratch path under data dir: {}",
+            result.folder.path
+        );
+        // The dated scratch dir exists on disk.
+        assert!(
+            std::path::Path::new(&result.folder.path).is_dir(),
+            "scratch dir created"
+        );
+
+        // The conversation points at the hidden folder, with no git branch.
+        let summary = conversation_service::get_by_id(&db.conn, result.conversation_id)
+            .await
+            .expect("read back");
+        assert_eq!(summary.folder_id, result.folder_id);
+        assert_eq!(summary.agent_type, AgentType::ClaudeCode);
+        assert!(summary.git_branch.is_none());
+
+        // It surfaces in the default sidebar query (active-folder scope).
+        let rows =
+            list_all_conversations_core(&db.conn, None, None, None, None, None, false)
+                .await
+                .expect("list");
+        assert!(rows.iter().any(|c| c.id == result.conversation_id));
+    }
+
+    #[tokio::test]
+    async fn create_chat_dir_core_creates_dated_dir_without_db_rows() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let path = create_chat_dir_core(data_dir.path()).expect("create chat dir");
+
+        assert!(std::path::Path::new(&path).is_dir(), "scratch dir exists");
+        assert!(
+            path.starts_with(&*data_dir.path().to_string_lossy()),
+            "under data dir: {path}"
+        );
+        assert!(
+            path.contains("chat-sessions"),
+            "date-grouped under chat-sessions: {path}"
+        );
+        // Two calls mint distinct directories (uuid segment).
+        let other = create_chat_dir_core(data_dir.path()).expect("second chat dir");
+        assert_ne!(path, other, "each prepare gets its own dir");
+    }
+
+    #[tokio::test]
+    async fn create_chat_conversation_core_reuses_existing_dir() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        // Eager step: mint the scratch dir first (as the frontend does on select).
+        let prepared = create_chat_dir_core(data_dir.path()).expect("prepare dir");
+
+        let result = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::ClaudeCode,
+            None,
+            Some(prepared.as_str()),
+        )
+        .await
+        .expect("create chat conversation reusing dir");
+
+        // The conversation's hidden folder points at the SAME pre-created dir —
+        // no second directory was minted, so the ACP cwd never moved.
+        assert_eq!(
+            result.folder.path, prepared,
+            "reuses the eagerly-created scratch dir"
+        );
+
+        // Exactly one uuid dir exists under that date bucket.
+        let date_dir = std::path::Path::new(&prepared)
+            .parent()
+            .expect("date dir")
+            .to_path_buf();
+        let count = std::fs::read_dir(&date_dir)
+            .expect("read date dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(count, 1, "no duplicate scratch dir created");
+    }
+
+    #[tokio::test]
+    async fn cleanup_chat_folder_soft_deletes_hidden_folder() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let res =
+            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
+                .await
+                .expect("create");
+
+        // Before cleanup the hidden folder is active.
+        assert!(folder_service::get_folder_by_id(&db.conn, res.folder_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        delete_conversation_core(&db.conn, res.conversation_id)
+            .await
+            .expect("delete conversation");
+        cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
+
+        // After cleanup the hidden folder is soft-deleted (no longer returned),
+        // so it stops counting toward the active-folder scope. The on-disk dir is
+        // intentionally left in place.
+        assert!(folder_service::get_folder_by_id(&db.conn, res.folder_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            std::path::Path::new(&res.folder.path).is_dir(),
+            "scratch dir is intentionally retained on delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_chat_folder_keeps_folder_with_remaining_conversations() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let res =
+            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
+                .await
+                .expect("create");
+        // Simulate a second conversation that happens to share the hidden folder.
+        let second =
+            conversation_service::create(&db.conn, res.folder_id, AgentType::Codex, None, None)
+                .await
+                .expect("second conversation");
+
+        // Deleting the first must NOT retire the folder — the second remains.
+        delete_conversation_core(&db.conn, res.conversation_id)
+            .await
+            .expect("delete first");
+        cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
+        assert!(
+            folder_service::get_folder_by_id(&db.conn, res.folder_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "folder retained while a sibling conversation remains"
+        );
+
+        // Deleting the last one retires the now-empty folder.
+        delete_conversation_core(&db.conn, second.id)
+            .await
+            .expect("delete second");
+        cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
+        assert!(
+            folder_service::get_folder_by_id(&db.conn, res.folder_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "folder retired once empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_folders_excluded_from_user_facing_lists_but_in_all_details() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let normal_id = seed_folder(&db, "/tmp/codeg-chat-list-test").await;
+        let chat_id =
+            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
+                .await
+                .expect("chat")
+                .folder_id;
+
+        // Folder history excludes the hidden chat folder, keeps the normal one.
+        let history = folder_service::list_folders(&db.conn).await.unwrap();
+        assert!(history.iter().any(|f| f.id == normal_id));
+        assert!(!history.iter().any(|f| f.id == chat_id));
+
+        // Open-folder surfaces exclude it too.
+        let open_details = folder_service::list_open_folder_details(&db.conn)
+            .await
+            .unwrap();
+        assert!(!open_details.iter().any(|f| f.id == chat_id));
+        let open_entries = folder_service::list_open_folders(&db.conn).await.unwrap();
+        assert!(!open_entries.iter().any(|f| f.id == chat_id));
+
+        // But the full set keeps it (internal cwd / active-folder resolution).
+        let all = folder_service::list_all_folder_details(&db.conn)
+            .await
+            .unwrap();
+        assert!(all.iter().any(|f| f.id == chat_id && f.is_chat));
     }
 
     #[tokio::test]

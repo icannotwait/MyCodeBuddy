@@ -3,7 +3,14 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Check, ChevronDown, Folder, GitBranch, Loader2 } from "lucide-react"
+import {
+  Check,
+  ChevronDown,
+  Folder,
+  GitBranch,
+  Loader2,
+  MessageSquare,
+} from "lucide-react"
 import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
@@ -23,11 +30,13 @@ import {
   CommandInput,
   CommandItem,
   CommandList,
+  CommandSeparator,
 } from "@/components/ui/command"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 import { toErrorMessage } from "@/lib/app-error"
 import {
+  excludeChatFolders,
   filterTopLevelFolders,
   resolveFolderDisplayName,
   resolvePickerSelectedFolderId,
@@ -114,7 +123,8 @@ export const ConversationFolderBranchPicker = memo(
   }: ConversationFolderBranchPickerProps) {
     const t = useTranslations("Folder.conversationContextBar")
     const tBd = useTranslations("Folder.branchDropdown")
-    const { tabs, activeTabId, openNewConversationTab } = useTabContext()
+    const { tabs, activeTabId, openNewConversationTab, openChatModeTab } =
+      useTabContext()
     const { folders, allFolders, branches, setBranch, refreshFolder } =
       useAppWorkspace()
     const { addTask, updateTask } = useTaskContext()
@@ -135,26 +145,40 @@ export const ConversationFolderBranchPicker = memo(
 
     // The folder picker lists only top-level repos — worktree folders
     // (`parent_id != null`) are reached through the branch picker, not here, so
-    // they're hidden to keep this picker a clean repo switcher.
+    // they're hidden to keep this picker a clean repo switcher. Hidden chat
+    // folders are excluded too (they're a per-conversation implementation
+    // detail, not a switchable repo).
     const topLevelFolders = useMemo(
-      () => filterTopLevelFolders(folders),
+      () => excludeChatFolders(filterTopLevelFolders(folders)),
       [folders]
     )
 
-    if (!ownTab || !ownFolder) return null
+    if (!ownTab) return null
+    // Chat mode: either a draft flagged `isChat` (no folder yet) or a bound
+    // conversation whose folder is a hidden `is_chat` folder. Show the folder
+    // chip (so the user can switch back to a real folder while drafting) but
+    // suppress the branch picker — a folderless chat has no git branch.
+    const isChatMode = ownTab.isChat === true || ownFolder?.is_chat === true
+    if (!ownFolder && !isChatMode) return null
 
     const isNewConversation = ownTab.conversationId == null
     const currentBranch =
-      branches.get(ownFolder.id) ?? ownFolder.git_branch ?? null
+      isChatMode || !ownFolder
+        ? null
+        : (branches.get(ownFolder.id) ?? ownFolder.git_branch ?? null)
     const showBranchPicker = currentBranch != null
     // Worktree folders surface their parent (root repo) name here; the picker's
     // own list below keeps real folder names/paths for selection, and every
     // git/path operation still uses `ownFolder` (the worktree) unchanged.
-    const displayFolderName = resolveFolderDisplayName(ownFolder, allFolders)
+    const displayFolderName = isChatMode
+      ? t("chatModeLabel")
+      : resolveFolderDisplayName(ownFolder!, allFolders)
     // When the conversation lives in a worktree, the picker highlights its
     // parent repo (the worktree itself isn't listed). Display-only — the tab's
-    // real folder/working dir is untouched.
-    const pickerSelectedId = resolvePickerSelectedFolderId(ownFolder)
+    // real folder/working dir is untouched. Chat mode has no real folder, so
+    // `-1` (no row) is highlighted.
+    const pickerSelectedId =
+      isChatMode || !ownFolder ? -1 : resolvePickerSelectedFolderId(ownFolder)
 
     return (
       <>
@@ -189,9 +213,23 @@ export const ConversationFolderBranchPicker = memo(
           }}
           labelEmpty={t("noFolders")}
           labelSearch={t("searchFolder")}
+          labelChatMode={t("chatModeLabel")}
+          isChatMode={isChatMode}
+          onSelectChatMode={() => {
+            try {
+              openChatModeTab()
+              toast.success(t("toasts.switchedToChatMode"))
+            } catch (err) {
+              console.error(
+                "[ConversationFolderBranchPicker] switch to chat mode failed:",
+                err
+              )
+              toast.error(t("toasts.openFolderFailed"))
+            }
+          }}
         />
 
-        {showBranchPicker && (
+        {showBranchPicker && ownFolder && (
           <BranchPicker
             folderId={ownFolder.id}
             folderPath={ownFolder.path}
@@ -252,7 +290,9 @@ export function useConversationFolderBranchPickerVisible(
   const ownFolder = ownTab
     ? (allFolders.find((f) => f.id === ownTab.folderId) ?? null)
     : null
-  return Boolean(ownTab && ownFolder)
+  // Chat-mode drafts have no resolvable folder yet, but the picker row must
+  // still show so the folder chip (and the "no-folder mode" item) are reachable.
+  return Boolean(ownTab && (ownFolder || ownTab.isChat))
 }
 
 // ============================================================================
@@ -268,6 +308,12 @@ interface FolderPickerProps {
   onSelect: (folderId: number) => void | Promise<void>
   labelEmpty: string
   labelSearch: string
+  /** Label for the pinned "no-folder (chat) mode" item at the bottom. */
+  labelChatMode: string
+  /** Whether the draft is currently in chat mode (shows the check mark). */
+  isChatMode: boolean
+  /** Select folderless chat mode. */
+  onSelectChatMode: () => void
 }
 
 const FolderPicker = memo(function FolderPicker({
@@ -279,6 +325,9 @@ const FolderPicker = memo(function FolderPicker({
   onSelect,
   labelEmpty,
   labelSearch,
+  labelChatMode,
+  isChatMode,
+  onSelectChatMode,
 }: FolderPickerProps) {
   const [open, setOpen] = useState(false)
 
@@ -335,6 +384,26 @@ const FolderPicker = memo(function FolderPicker({
                   )}
                 </CommandItem>
               ))}
+            </CommandGroup>
+            <CommandSeparator />
+            {/* Pinned to the bottom: folderless "chat mode". A stable, plain
+                `value` (no folder name/path) keeps it visible under any search
+                filter so the entry point is always reachable. */}
+            <CommandGroup forceMount>
+              <CommandItem
+                value="__chat_mode__ no folder chat mode"
+                forceMount
+                onSelect={() => {
+                  setOpen(false)
+                  onSelectChatMode()
+                }}
+              >
+                <MessageSquare className="h-4 w-4" />
+                <span className="flex-1 truncate font-medium">
+                  {labelChatMode}
+                </span>
+                {isChatMode && <Check className="h-4 w-4 shrink-0" />}
+              </CommandItem>
             </CommandGroup>
           </CommandList>
         </Command>

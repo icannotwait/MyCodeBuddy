@@ -1001,7 +1001,10 @@
         "toastOpFailed": "操作失败：{message}"
       },
       "sectionPinned": "已置顶",
-      "sectionFolders": "文件夹"
+      "sectionFolders": "文件夹",
+      "sectionChats": "聊天",
+      "noChats": "没有聊天",
+      "newChatAction": "新建聊天"
     },
     "conversation": {
       "reloadFailed": "会话重新加载失败：{message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "点击前往 {path} 管理安装。",
         "autoConnectAppend": "{message}，点击前往 {path} 管理安装。",
         "enableAgentFirstPlaceholder": "请先启用至少一个 Agent 后开始会话...",
+        "prepareSessionFailed": "无法准备聊天会话，请重试。",
+        "createConversationFailed": "无法创建会话，请重试。",
         "askAnythingPlaceholder": "请开始输入..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "暂无文件夹",
       "noBranches": "暂无分支",
       "noBranch": "（无分支）",
+      "chatModeLabel": "无文件夹模式",
       "commit": "提交",
       "push": "推送",
       "merge": "合并",
       "toasts": {
         "folderChanged": "已切换到 {name}",
         "openFolderFailed": "打开文件夹失败",
+        "switchedToChatMode": "已切换到聊天模式",
         "openStashFailed": "打开贮藏窗口失败",
         "openMergeFailed": "打开合并窗口失败"
       }

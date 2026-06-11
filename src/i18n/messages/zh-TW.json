@@ -1001,7 +1001,10 @@
         "toastOpFailed": "操作失敗：{message}"
       },
       "sectionPinned": "已置頂",
-      "sectionFolders": "資料夾"
+      "sectionFolders": "資料夾",
+      "sectionChats": "聊天",
+      "noChats": "沒有聊天",
+      "newChatAction": "新增聊天"
     },
     "conversation": {
       "reloadFailed": "會話重新載入失敗：{message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "點擊前往 {path} 管理安裝。",
         "autoConnectAppend": "{message}，點擊前往 {path} 管理安裝。",
         "enableAgentFirstPlaceholder": "請先啟用至少一個 Agent 後開始會話...",
+        "prepareSessionFailed": "無法準備聊天工作階段，請重試。",
+        "createConversationFailed": "無法建立會話，請重試。",
         "askAnythingPlaceholder": "請開始輸入..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "無資料夾模式",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "已切換到聊天模式",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }

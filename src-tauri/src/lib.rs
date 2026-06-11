@@ -740,6 +740,8 @@ mod tauri_app {
                 conversations::get_stats,
                 conversations::get_sidebar_data,
                 conversations::create_conversation,
+                conversations::create_chat_conversation,
+                conversations::create_chat_dir,
                 conversations::update_conversation_status,
                 conversations::update_conversation_title,
                 conversations::update_conversation_pinned,

@@ -21,6 +21,10 @@ pub struct Model {
     /// top-level folders. Flattened: a worktree of a worktree still points at the
     /// original root, never an intermediate worktree.
     pub parent_id: Option<i32>,
+    /// True for the dedicated hidden folder backing a single chat-mode
+    /// (folderless) conversation. Excluded from user-facing folder lists; its
+    /// conversations route to the sidebar "Chat" group.
+    pub is_chat: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

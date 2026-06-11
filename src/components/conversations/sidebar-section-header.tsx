@@ -1,7 +1,7 @@
 "use client"
 
 import { memo } from "react"
-import { ChevronRight } from "lucide-react"
+import { ChevronRight, SquarePen } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 
@@ -23,11 +23,20 @@ export const SidebarSectionHeader = memo(function SidebarSectionHeader({
   section,
   expanded,
   onToggle,
+  onNewChat,
   topGap = false,
 }: {
-  section: "pinned" | "folders"
+  section: "pinned" | "folders" | "chats"
   expanded: boolean
-  onToggle: (section: "pinned" | "folders") => void
+  onToggle: (section: "pinned" | "folders" | "chats") => void
+  /**
+   * When provided on the "chats" section, renders a New-chat action button at
+   * the row's right edge, revealed only while the row is hovered/focused (and
+   * always on touch, which has no hover). A sibling of — not nested in — the
+   * toggle button (nesting buttons is invalid HTML), so clicking it never
+   * toggles the section. Must be referentially stable to preserve the memo.
+   */
+  onNewChat?: () => void
   /**
    * Adds breathing room above the header so the "Folders" section reads as
    * visually separated from the "Pinned" section above it. Implemented as
@@ -38,10 +47,16 @@ export const SidebarSectionHeader = memo(function SidebarSectionHeader({
   topGap?: boolean
 }) {
   const t = useTranslations("Folder.sidebar")
-  const label = section === "pinned" ? t("sectionPinned") : t("sectionFolders")
+  const label =
+    section === "pinned"
+      ? t("sectionPinned")
+      : section === "chats"
+        ? t("sectionChats")
+        : t("sectionFolders")
+  const showNewChat = section === "chats" && onNewChat != null
   return (
     <div className={cn(topGap && "pt-[0.75rem]")}>
-      <div className="relative h-[2rem]">
+      <div className="group/header relative h-[2rem]">
         <button
           type="button"
           onClick={() => onToggle(section)}
@@ -81,6 +96,38 @@ export const SidebarSectionHeader = memo(function SidebarSectionHeader({
             )}
           />
         </button>
+        {showNewChat && (
+          <button
+            type="button"
+            // Stop the click from reaching the row (defensive — the button is a
+            // sibling, not nested, so it never triggers the toggle anyway).
+            onClick={(e) => {
+              e.stopPropagation()
+              onNewChat?.()
+            }}
+            title={t("newChatAction")}
+            aria-label={t("newChatAction")}
+            className={cn(
+              "absolute top-1/2 right-[0.375rem] -translate-y-1/2",
+              "flex h-6 w-6 items-center justify-center rounded-[0.375rem]",
+              // Revealed only while the row is hovered (group/header on the row
+              // container, NOT the toggle button — so moving onto the button to
+              // click it keeps the row hovered and the button from flickering).
+              // Stays shown on keyboard focus and on touch (no hover). /90 clears
+              // the 3:1 non-text bar; hover deepens to full foreground.
+              "cursor-pointer text-muted-foreground/90 outline-none",
+              "opacity-0 group-hover/header:opacity-100 focus-visible:opacity-100",
+              "[@media(hover:none)]:opacity-100",
+              "transition-[color,opacity] duration-150 hover:text-sidebar-foreground",
+              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            )}
+          >
+            {/* Sized to match the folder rows' right-edge ⋯ action icon
+                (`h-[0.875rem]`, 14px) so the two affordances read as one
+                family — a hair smaller than the default `h-4` glyph. */}
+            <SquarePen className="h-[0.875rem] w-[0.875rem]" />
+          </button>
+        )}
       </div>
     </div>
   )

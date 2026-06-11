@@ -20,6 +20,7 @@ mod m20260522_000001_delegation_columns;
 mod m20260607_000001_folder_parent_id;
 mod m20260608_000001_conversation_title_locked;
 mod m20260610_000001_conversation_pinned_at;
+mod m20260611_000001_folder_is_chat;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -46,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260607_000001_folder_parent_id::Migration),
             Box::new(m20260608_000001_conversation_title_locked::Migration),
             Box::new(m20260610_000001_conversation_pinned_at::Migration),
+            Box::new(m20260611_000001_folder_is_chat::Migration),
         ]
     }
 }

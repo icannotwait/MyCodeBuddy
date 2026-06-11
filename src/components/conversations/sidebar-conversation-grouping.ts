@@ -206,6 +206,37 @@ export function selectPinnedWithReuse(
   return arraysShallowEqual(prev, next) ? prev : next
 }
 
+/**
+ * Select the folderless "chat mode" conversations — those whose `folder_id` is a
+ * hidden `is_chat` folder — for the flat "Chat" sidebar section. Sorted
+ * most-recently-updated first, with reference reuse (same motivation as
+ * {@link selectPinnedWithReuse}).
+ *
+ * Excludes pinned conversations (they surface in the Pinned section, an explicit
+ * override) and — unless `showCompleted` — completed ones, matching how
+ * `folderConversations` is filtered for the folders section.
+ *
+ * `chatFolderIds` is the set of hidden chat folder ids (from
+ * `allFolders.filter(f => f.is_chat)`). `prev` is the array returned last call
+ * (threaded via a ref by the caller).
+ */
+export function selectChatConversationsWithReuse(
+  conversations: readonly DbConversationSummary[],
+  chatFolderIds: ReadonlySet<number>,
+  showCompleted: boolean,
+  prev: DbConversationSummary[]
+): DbConversationSummary[] {
+  const next: DbConversationSummary[] = []
+  for (const conv of conversations) {
+    if (conv.pinned_at != null) continue
+    if (!chatFolderIds.has(conv.folder_id)) continue
+    if (!showCompleted && conv.status === "completed") continue
+    next.push(conv)
+  }
+  next.sort(compareByUpdatedAtDesc)
+  return arraysShallowEqual(prev, next) ? prev : next
+}
+
 // ── Flat row model (Phase 2 virtualization) ─────────────────────────────────
 // The sidebar tree (folders → their conversation rows) is flattened into a
 // single linear array so it can be windowed by `virtua`. Each visible folder
@@ -240,16 +271,28 @@ export interface EmptyHintRow {
 }
 
 /**
- * A collapsible section heading. Two exist: "pinned" (above the folders, shown
- * only when there are pinned conversations) and "folders" (wraps the whole
- * folder list). Both live in the same flat row array so the single Virtualizer
- * windows them like any other row — there is no separate, un-virtualized list.
+ * The single empty-state hint shown under an expanded but empty "Chat" section
+ * ("No chats yet"). Unlike {@link EmptyHintRow} it is folderless — chat
+ * conversations are a flat list — so it carries no folder id and renders with a
+ * flat (non-rail) indent.
+ */
+export interface ChatsEmptyRow {
+  kind: "chats-empty"
+}
+
+/**
+ * A collapsible section heading. Three exist: "pinned" (above the folders, shown
+ * only when there are pinned conversations), "folders" (wraps the whole folder
+ * list), and "chats" (below the folders, a flat list of folderless chat-mode
+ * conversations, shown only when there are any). All live in the same flat row
+ * array so the single Virtualizer windows them like any other row — there is no
+ * separate, un-virtualized list.
  */
 export interface SectionHeaderRow {
   kind: "section"
-  section: "pinned" | "folders"
+  section: "pinned" | "folders" | "chats"
   expanded: boolean
-  /** Pinned conversation count, or folder count — shown beside the title. */
+  /** Pinned count, folder count, or chat-conversation count — shown beside the title. */
   count: number
 }
 
@@ -258,6 +301,7 @@ export type SidebarRow =
   | FolderHeaderRow
   | ConversationRow
   | EmptyHintRow
+  | ChatsEmptyRow
 
 /**
  * Flatten the (optional) pinned section and the folders section into a single
@@ -279,6 +323,12 @@ export type SidebarRow =
  *   non-empty folder contributes header + its (already sorted) bucket. `byFolder`
  *   / `folderTotalCounts` exclude pinned conversations (they live in the Pinned
  *   section), so a folder whose only conversations are pinned reads as empty.
+ * - The "Chat" section header ALWAYS appears (even with zero chat
+ *   conversations), so the section is a permanent entry point — its New-chat
+ *   affordance and an empty hint stay reachable. When expanded and empty it
+ *   contributes a single `chats-empty` hint row; otherwise its (flat, folderless)
+ *   conversation rows. Pinned chat conversations live in the Pinned section, so
+ *   they are excluded from `chatConversations`.
  */
 export function buildRows(args: {
   pinned: readonly DbConversationSummary[]
@@ -288,6 +338,8 @@ export function buildRows(args: {
   folderExpanded: Record<number, boolean>
   folderTotalCounts: Map<number, number>
   foldersExpanded: boolean
+  chatConversations: readonly DbConversationSummary[]
+  chatsExpanded: boolean
 }): SidebarRow[] {
   const {
     pinned,
@@ -297,6 +349,8 @@ export function buildRows(args: {
     folderExpanded,
     folderTotalCounts,
     foldersExpanded,
+    chatConversations,
+    chatsExpanded,
   } = args
   const rows: SidebarRow[] = []
 
@@ -338,6 +392,24 @@ export function buildRows(args: {
         for (const conv of convs) {
           rows.push({ kind: "conversation", conversation: conv })
         }
+      }
+    }
+  }
+
+  // The Chat section header is always present (a permanent entry point), unlike
+  // the conditional Pinned/Folders headers above.
+  rows.push({
+    kind: "section",
+    section: "chats",
+    expanded: chatsExpanded,
+    count: chatConversations.length,
+  })
+  if (chatsExpanded) {
+    if (chatConversations.length === 0) {
+      rows.push({ kind: "chats-empty" })
+    } else {
+      for (const conv of chatConversations) {
+        rows.push({ kind: "conversation", conversation: conv })
       }
     }
   }

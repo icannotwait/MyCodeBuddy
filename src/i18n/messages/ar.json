@@ -1001,7 +1001,10 @@
         "toastOpFailed": "فشلت العملية: {message}"
       },
       "sectionPinned": "مثبّتة",
-      "sectionFolders": "المجلدات"
+      "sectionFolders": "المجلدات",
+      "sectionChats": "محادثة",
+      "noChats": "لا توجد محادثات",
+      "newChatAction": "محادثة جديدة"
     },
     "conversation": {
       "reloadFailed": "فشل إعادة تحميل المحادثة: {message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "انقر لفتح {path} وإدارة التثبيت.",
         "autoConnectAppend": "{message}. انقر لفتح {path} وإدارة التثبيت.",
         "enableAgentFirstPlaceholder": "فعّل وكيلًا واحدًا على الأقل قبل بدء جلسة...",
+        "prepareSessionFailed": "تعذّر تحضير جلسة الدردشة. يرجى المحاولة مرة أخرى.",
+        "createConversationFailed": "تعذّر إنشاء المحادثة. يرجى المحاولة مرة أخرى.",
         "askAnythingPlaceholder": "اسأل أي شيء..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "وضع بدون مجلد",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "تم التبديل إلى وضع المحادثة",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }

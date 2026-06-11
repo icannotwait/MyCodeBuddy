@@ -15,6 +15,7 @@ import { openSettingsWindow } from "@/lib/api"
 import { getPetSettings, openPetWindow } from "@/lib/pet/api"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { Button } from "@/components/ui/button"
@@ -49,6 +50,7 @@ export function FolderTitleBar() {
   const tPet = useTranslations("Pet")
   const { openFolder } = useAppWorkspace()
   const { activeFolder } = useActiveFolder()
+  const isChatMode = useIsActiveChatMode()
   const { isOpen, toggle } = useSidebarContext()
   const { isOpen: auxPanelOpen, toggle: toggleAuxPanel } = useAuxPanelContext()
   const { isOpen: terminalOpen, toggle: toggleTerminal } = useTerminalContext()
@@ -127,6 +129,9 @@ export function FolderTitleBar() {
         return
       }
       if (matchShortcutEvent(e, shortcuts.toggle_aux_panel)) {
+        // Chat mode hides the aux panel + its toggle; the shortcut must not
+        // re-open it either.
+        if (isChatMode) return
         e.preventDefault()
         toggleAuxPanel()
         return
@@ -159,6 +164,7 @@ export function FolderTitleBar() {
     toggle,
     toggleAuxPanel,
     toggleTerminal,
+    isChatMode,
   ])
 
   const isMobile = useIsMobile()
@@ -229,13 +235,16 @@ export function FolderTitleBar() {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onClick={toggleAuxPanel}
-                    disabled={!activeFolder}
-                  >
-                    <PanelRight className="h-3.5 w-3.5" />
-                    {tTitleBar("toggleAuxPanel")}
-                  </DropdownMenuItem>
+                  {/* Folderless chat conversations hide the aux panel entirely. */}
+                  {!isChatMode && (
+                    <DropdownMenuItem
+                      onClick={toggleAuxPanel}
+                      disabled={!activeFolder}
+                    >
+                      <PanelRight className="h-3.5 w-3.5" />
+                      {tTitleBar("toggleAuxPanel")}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     onClick={() => toggleTerminal()}
                     disabled={!activeFolder}
@@ -272,22 +281,25 @@ export function FolderTitleBar() {
                 >
                   <SquareTerminal className="h-3.5 w-3.5" />
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className={`h-6 w-6 hover:text-foreground/80 ${auxPanelOpen ? "bg-accent" : ""}`}
-                  onClick={toggleAuxPanel}
-                  disabled={!activeFolder}
-                  title={tTitleBar("withShortcut", {
-                    label: tTitleBar("toggleAuxPanel"),
-                    shortcut: formatShortcutLabel(
-                      shortcuts.toggle_aux_panel,
-                      isMac
-                    ),
-                  })}
-                >
-                  <PanelRight className="h-3.5 w-3.5" />
-                </Button>
+                {/* Folderless chat conversations hide the aux panel entirely. */}
+                {!isChatMode && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={`h-6 w-6 hover:text-foreground/80 ${auxPanelOpen ? "bg-accent" : ""}`}
+                    onClick={toggleAuxPanel}
+                    disabled={!activeFolder}
+                    title={tTitleBar("withShortcut", {
+                      label: tTitleBar("toggleAuxPanel"),
+                      shortcut: formatShortcutLabel(
+                        shortcuts.toggle_aux_panel,
+                        isMac
+                      ),
+                    })}
+                  >
+                    <PanelRight className="h-3.5 w-3.5" />
+                  </Button>
+                )}
                 {/* Desktop search moved into the sidebar's fixed top region;
                     the dialog + ⌘K shortcut still live here. */}
                 <Button

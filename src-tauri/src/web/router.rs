@@ -111,6 +111,14 @@ pub fn build_router(
             post(handlers::conversations::create_conversation),
         )
         .route(
+            "/create_chat_conversation",
+            post(handlers::conversations::create_chat_conversation),
+        )
+        .route(
+            "/create_chat_dir",
+            post(handlers::conversations::create_chat_dir),
+        )
+        .route(
             "/update_conversation_status",
             post(handlers::conversations::update_conversation_status),
         )

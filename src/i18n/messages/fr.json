@@ -1001,7 +1001,10 @@
         "toastOpFailed": "Échec de l'opération : {message}"
       },
       "sectionPinned": "Épinglées",
-      "sectionFolders": "Dossiers"
+      "sectionFolders": "Dossiers",
+      "sectionChats": "Discussion",
+      "noChats": "Aucune discussion",
+      "newChatAction": "Nouvelle discussion"
     },
     "conversation": {
       "reloadFailed": "Échec du rechargement de la conversation : {message}",
@@ -1822,6 +1825,8 @@
         "autoConnectFallback": "Cliquez pour ouvrir {path} et gérer l'installation.",
         "autoConnectAppend": "{message}. Cliquez pour ouvrir {path} et gérer l'installation.",
         "enableAgentFirstPlaceholder": "Activez au moins un agent avant de démarrer une session...",
+        "prepareSessionFailed": "Impossible de préparer la session de chat. Veuillez réessayer.",
+        "createConversationFailed": "Impossible de créer la conversation. Veuillez réessayer.",
         "askAnythingPlaceholder": "Posez n'importe quelle question..."
       },
       "welcomePanel": {
@@ -2192,12 +2197,14 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
+      "chatModeLabel": "Mode sans dossier",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
       "toasts": {
         "folderChanged": "Switched to {name}",
         "openFolderFailed": "Failed to open folder",
+        "switchedToChatMode": "Basculé en mode discussion",
         "openStashFailed": "Failed to open stash window",
         "openMergeFailed": "Failed to open merge window"
       }
