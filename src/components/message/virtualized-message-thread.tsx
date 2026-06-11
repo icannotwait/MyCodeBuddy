@@ -48,25 +48,10 @@ interface VirtualizedMessageThreadProps<T> {
   /**
    * Publishes the virtualizer scroll handle to an ancestor so siblings that
    * live outside the `MessageScrollProvider` subtree (e.g. the conversation
-   * message navigator rail) can drive `scrollToIndex`.
+   * message navigator) can drive `scrollToIndex`.
    */
   scrollApiRef?: RefObject<MessageScrollContextValue | null>
-  /**
-   * Fires with the index of the item nearest the top of the viewport whenever
-   * the thread scrolls. Used to highlight the active entry in the navigator.
-   */
-  onVisibleStartIndexChange?: (index: number) => void
 }
-
-/**
- * Small top tolerance (px) when mapping scroll offset → "active" item index.
- * A click runs `scrollToIndex(N, {align: "start"})`, pinning message N to the
- * top, but the browser floors `scrollTop` a sub-pixel below `offsetOf(N)`, so
- * `findItemIndex` (largest i with `offsetOf(i) <= offset`) returns N-1. Because
- * user-message nav ticks are sparse, N-1 lands on the *previous* tick. Nudging
- * the query past that boundary maps the pinned message back to itself.
- */
-const ACTIVE_TOP_EPSILON_PX = 2
 
 function VirtualizedMessageThreadImpl<T>({
   items,
@@ -81,7 +66,6 @@ function VirtualizedMessageThreadImpl<T>({
   contentClassName,
   contentProps,
   scrollApiRef,
-  onVisibleStartIndexChange,
 }: VirtualizedMessageThreadProps<T>) {
   const { scrollRef } = useStickToBottomContext()
   const virtualizerHandleRef = useRef<VirtualizerHandle>(null)
@@ -139,17 +123,6 @@ function VirtualizedMessageThreadImpl<T>({
     return () => el.removeEventListener("pointerdown", onPointerDown)
   }, [scrollRef])
 
-  const handleScroll = useCallback(
-    (offset: number) => {
-      if (!onVisibleStartIndexChange) return
-      const index = virtualizerHandleRef.current?.findItemIndex(
-        offset + ACTIVE_TOP_EPSILON_PX
-      )
-      if (typeof index === "number") onVisibleStartIndexChange(index)
-    },
-    [onVisibleStartIndexChange]
-  )
-
   // Pre-compute the three possible padding styles so every render reuses
   // the same object references (avoids allocating per-item on each frame).
   const styles = useMemo(() => {
@@ -184,7 +157,6 @@ function VirtualizedMessageThreadImpl<T>({
             scrollRef={scrollRef as unknown as RefObject<HTMLElement | null>}
             itemSize={itemSize}
             bufferSize={bufferSize}
-            onScroll={onVisibleStartIndexChange ? handleScroll : undefined}
           >
             {items.map((item, index) => (
               <div

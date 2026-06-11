@@ -2128,9 +2128,8 @@
       },
       "messageNav": {
         "title": "Nachrichtennavigation",
-        "expand": "Nachrichtennavigation einblenden",
         "collapse": "Nachrichtennavigation ausblenden",
-        "jumpToMessage": "Springen zu: {label}",
+        "collapsedSummary": "Nachrichten {count}",
         "fileCount": "{count, plural, one {# Datei} other {# Dateien}}",
         "remove": "Entfernen",
         "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}"

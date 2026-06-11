@@ -2128,9 +2128,8 @@
       },
       "messageNav": {
         "title": "تنقل الرسائل",
-        "expand": "توسيع تنقل الرسائل",
         "collapse": "طي تنقل الرسائل",
-        "jumpToMessage": "الانتقال إلى: {label}",
+        "collapsedSummary": "الرسائل {count}",
         "fileCount": "{count, plural, one {# ملف} other {# ملفات}}",
         "remove": "إزالة",
         "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"

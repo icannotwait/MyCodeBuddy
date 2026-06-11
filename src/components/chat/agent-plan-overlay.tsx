@@ -135,12 +135,12 @@ export const AgentPlanOverlay = memo(function AgentPlanOverlay({
   }
 
   if (!isExpanded) {
-    // Positioning (absolute right-8 top-4 z-20) is owned by the shared
+    // Positioning (absolute start-0 top-4 z-20) is owned by the shared
     // overlay-stack container in MessageListView so this panel stacks with the
     // sub-agent overlay; the chip only declares layout + pointer behavior.
     return (
       <CollapsedOverlayChip
-        icon={<ListTodoIcon className="size-4" />}
+        icon={<ListTodoIcon className="size-3" />}
         summary={t("collapsedSummary", {
           completed: completedCount,
           total: resolvedEntries.length,

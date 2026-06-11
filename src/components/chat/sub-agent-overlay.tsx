@@ -1,11 +1,11 @@
 "use client"
 
 /**
- * Top-right overlay listing the sub-agents delegated in the LAST agent reply.
+ * Inline-start overlay listing the sub-agents delegated in the LAST agent reply.
  *
- * Mirrors `AgentPlanOverlay` (the "计划任务" panel): collapses to a pill,
+ * Mirrors `AgentPlanOverlay` (the "计划任务" panel): collapses to a bullet chip,
  * expands to a card, remembers collapse state per `overlayKey`, and renders
- * nothing when there's nothing to show. Positioning (absolute right/top) is
+ * nothing when there's nothing to show. Positioning (absolute inline-start/top) is
  * owned by the shared overlay-stack container in `MessageListView`, which
  * places this panel BELOW the plan panel when both are present.
  *
@@ -65,7 +65,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   if (!isExpanded) {
     return (
       <CollapsedOverlayChip
-        icon={<BotIcon className="size-4" />}
+        icon={<BotIcon className="size-3" />}
         summary={t("collapsedSummary", { count })}
         onClick={() =>
           setCollapsedByKey((prev) => ({ ...prev, [stateKey]: false }))

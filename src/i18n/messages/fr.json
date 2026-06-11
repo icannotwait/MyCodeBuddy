@@ -2128,9 +2128,8 @@
       },
       "messageNav": {
         "title": "Navigation des messages",
-        "expand": "Développer la navigation des messages",
         "collapse": "Réduire la navigation des messages",
-        "jumpToMessage": "Aller à : {label}",
+        "collapsedSummary": "Messages {count}",
         "fileCount": "{count, plural, one {# fichier} other {# fichiers}}",
         "remove": "Retirer",
         "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}"

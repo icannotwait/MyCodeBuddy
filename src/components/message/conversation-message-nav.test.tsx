@@ -7,11 +7,11 @@ import {
 } from "./conversation-message-nav"
 import type { MessageScrollContextValue } from "./message-scroll-context"
 
-// Stable `t` (per next-intl mock guidance) — interpolates {label} so marker
-// aria-labels stay distinguishable.
+// Stable `t` (per next-intl mock guidance) — returns the key verbatim, which is
+// enough to address every label in this component (the collapsed chip, the card
+// title/collapse button, the per-entry file-count toggle, etc.).
 const { stableT, mockOpenDiff } = vi.hoisted(() => {
-  const t = (key: string, params?: Record<string, unknown>) =>
-    params && "label" in params ? `${key}:${String(params.label)}` : key
+  const t = (key: string) => key
   return { stableT: t, mockOpenDiff: vi.fn() }
 })
 
@@ -22,8 +22,6 @@ vi.mock("@/contexts/workspace-context", () => ({
 vi.mock("@/contexts/active-folder-context", () => ({
   useActiveFolder: () => ({ activeFolder: { path: "/repo" } }),
 }))
-
-const STORAGE_KEY = "workspace:message-nav"
 
 const DELETION_DIFF = "*** Delete File: old.ts\n-a\n-b\n-c\n-d"
 
@@ -78,87 +76,117 @@ const entries: MessageNavEntry[] = [
   },
 ]
 
-function renderNav() {
+function makeScrollApi() {
   const scrollToIndex = vi.fn()
   const scrollApiRef = {
     current: { scrollToIndex },
   } as RefObject<MessageScrollContextValue | null>
-  render(
-    <ConversationMessageNav
-      entries={entries}
-      scrollApiRef={scrollApiRef}
-      activeThreadIndex={null}
-    />
-  )
-  return { scrollToIndex }
+  return { scrollToIndex, scrollApiRef }
 }
 
 describe("ConversationMessageNav", () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    window.localStorage.clear()
   })
 
-  it("renders one marker per user message, placeholders included", () => {
-    renderNav()
-    const markers = screen.getAllByRole("button", { name: /^jumpToMessage:/ })
-    expect(markers).toHaveLength(3)
-  })
-
-  it("scrolls to the message when a marker is clicked", () => {
-    const { scrollToIndex } = renderNav()
-    fireEvent.click(
-      screen.getByRole("button", { name: "jumpToMessage:edit something" })
-    )
-    expect(scrollToIndex).toHaveBeenCalledWith(3, {
-      align: "start",
-      smooth: true,
-    })
-  })
-
-  it("optimistically activates the clicked entry before scrolling", () => {
-    const onActivate = vi.fn()
-    const scrollToIndex = vi.fn()
-    const scrollApiRef = {
-      current: { scrollToIndex },
-    } as RefObject<MessageScrollContextValue | null>
-    render(
+  it("renders nothing when there are no user messages", () => {
+    const { scrollApiRef } = makeScrollApi()
+    const { container } = render(
       <ConversationMessageNav
-        entries={entries}
+        count={0}
+        expanded={false}
+        onToggle={vi.fn()}
+        entries={[]}
         scrollApiRef={scrollApiRef}
-        activeThreadIndex={null}
-        onActivate={onActivate}
       />
     )
-    fireEvent.click(
-      screen.getByRole("button", { name: "jumpToMessage:edit something" })
+    expect(container).toBeEmptyDOMElement()
+  })
+
+  it("collapsed: shows the count chip and expands on click", () => {
+    const { scrollApiRef } = makeScrollApi()
+    const onToggle = vi.fn()
+    render(
+      <ConversationMessageNav
+        count={3}
+        expanded={false}
+        onToggle={onToggle}
+        entries={[]}
+        scrollApiRef={scrollApiRef}
+      />
     )
-    // The parent gets the clicked threadIndex synchronously so it can highlight
-    // the tick before the (possibly clamped) smooth scroll settles.
-    expect(onActivate).toHaveBeenCalledWith(3)
+    // No card while collapsed.
+    expect(screen.queryByText("title")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "collapsedSummary" }))
+    expect(onToggle).toHaveBeenCalledWith(true)
+  })
+
+  it("expanded: clicking a message scrolls to its thread index", () => {
+    const { scrollToIndex, scrollApiRef } = makeScrollApi()
+    render(
+      <ConversationMessageNav
+        count={entries.length}
+        expanded
+        onToggle={vi.fn()}
+        entries={entries}
+        scrollApiRef={scrollApiRef}
+      />
+    )
+    fireEvent.click(screen.getByText("edit something"))
     expect(scrollToIndex).toHaveBeenCalledWith(3, {
       align: "start",
       smooth: true,
     })
+  })
+
+  it("expanded: the header collapse button collapses the panel", () => {
+    const { scrollApiRef } = makeScrollApi()
+    const onToggle = vi.fn()
+    render(
+      <ConversationMessageNav
+        count={entries.length}
+        expanded
+        onToggle={onToggle}
+        entries={entries}
+        scrollApiRef={scrollApiRef}
+      />
+    )
+    fireEvent.click(screen.getByRole("button", { name: "collapse" }))
+    expect(onToggle).toHaveBeenCalledWith(false)
   })
 
   it("always shows both +N and -N, including a zero side", () => {
-    renderNav()
-    fireEvent.click(screen.getByRole("button", { name: "expand" }))
+    const { scrollApiRef } = makeScrollApi()
+    render(
+      <ConversationMessageNav
+        count={entries.length}
+        expanded
+        onToggle={vi.fn()}
+        entries={entries}
+        scrollApiRef={scrollApiRef}
+      />
+    )
     // u2 added 5, deleted 0 — both rendered.
     expect(screen.getByText("+5")).toBeInTheDocument()
     expect(screen.getByText("-0")).toBeInTheDocument()
     // u3 added 0, deleted 4 — both rendered.
     expect(screen.getByText("+0")).toBeInTheDocument()
     expect(screen.getByText("-4")).toBeInTheDocument()
-    // Placeholder message still renders (its label) but no "no changes" text.
+    // Placeholder message still renders its label.
     expect(screen.getByText("first message")).toBeInTheDocument()
-    expect(screen.queryByText("noChanges")).not.toBeInTheDocument()
   })
 
   it("opens a file diff when a changed file is clicked", () => {
-    renderNav()
-    fireEvent.click(screen.getByRole("button", { name: "expand" }))
+    const { scrollApiRef } = makeScrollApi()
+    render(
+      <ConversationMessageNav
+        count={entries.length}
+        expanded
+        onToggle={vi.fn()}
+        entries={entries}
+        scrollApiRef={scrollApiRef}
+      />
+    )
     // Expand u2's file list (first changed group).
     fireEvent.click(screen.getAllByRole("button", { name: "fileCount" })[0])
     fireEvent.click(screen.getByTitle("src/a.ts"))
@@ -170,8 +198,16 @@ describe("ConversationMessageNav", () => {
   })
 
   it("opens the deletion diff when a deleted file is clicked", () => {
-    renderNav()
-    fireEvent.click(screen.getByRole("button", { name: "expand" }))
+    const { scrollApiRef } = makeScrollApi()
+    render(
+      <ConversationMessageNav
+        count={entries.length}
+        expanded
+        onToggle={vi.fn()}
+        entries={entries}
+        scrollApiRef={scrollApiRef}
+      />
+    )
     // Expand u3's file list (second changed group).
     fireEvent.click(screen.getAllByRole("button", { name: "fileCount" })[1])
     fireEvent.click(screen.getByTitle("old.ts"))
@@ -180,12 +216,5 @@ describe("ConversationMessageNav", () => {
       DELETION_DIFF,
       "msg-3-chg-1"
     )
-  })
-
-  it("hydrates the expanded state from localStorage after mount", async () => {
-    window.localStorage.setItem(STORAGE_KEY, "1")
-    renderNav()
-    // The popout (its header title) appears once the hydrate effect runs.
-    expect(await screen.findByText("title")).toBeInTheDocument()
   })
 })

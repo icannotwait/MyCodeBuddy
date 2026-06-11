@@ -2128,9 +2128,8 @@
       },
       "messageNav": {
         "title": "訊息導覽",
-        "expand": "展開訊息導覽",
         "collapse": "收合訊息導覽",
-        "jumpToMessage": "跳至：{label}",
+        "collapsedSummary": "訊息 {count}",
         "fileCount": "{count} 個檔案",
         "remove": "移除",
         "noDiffDataAvailable": "找不到 {filePath} 的差異資料"

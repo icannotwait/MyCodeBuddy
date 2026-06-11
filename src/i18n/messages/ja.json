@@ -2128,9 +2128,8 @@
       },
       "messageNav": {
         "title": "メッセージナビ",
-        "expand": "メッセージナビを開く",
         "collapse": "メッセージナビを閉じる",
-        "jumpToMessage": "移動: {label}",
+        "collapsedSummary": "メッセージ {count}",
         "fileCount": "{count, plural, one {# 個のファイル} other {# 個のファイル}}",
         "remove": "削除",
         "noDiffDataAvailable": "{filePath} の差分データがありません"
