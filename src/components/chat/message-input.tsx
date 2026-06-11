@@ -2294,6 +2294,7 @@ export function MessageInput({
             autoFocus={autoFocus}
             referenceSearch={referenceSearch}
             mentionUiLabels={mentionUiLabels}
+            tabLabels={referenceGroupLabels}
             onChange={handleComposerChange}
             onReady={handleComposerReady}
             onSubmit={handleSend}

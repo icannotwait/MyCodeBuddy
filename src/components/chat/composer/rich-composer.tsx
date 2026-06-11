@@ -31,7 +31,7 @@ import type {
   ReferenceSearch,
   SuggestionPopupHandle,
 } from "./suggestion/types"
-import type { ReferenceAttrs } from "./types"
+import type { ReferenceAttrs, ReferenceKind } from "./types"
 
 /**
  * Imperative handle exposed to the parent (e.g. the message input that owns
@@ -112,6 +112,11 @@ export interface RichComposerProps {
    */
   mentionUiLabels?: MentionUiLabels
   /**
+   * Localized per-kind tab labels for the `@` panel (Agents/Files/Sessions/
+   * Commits/Skills). English fallbacks apply when omitted. Render-only.
+   */
+  tabLabels?: Record<ReferenceKind, string>
+  /**
    * Key binding (matchShortcutEvent form) that sends the message. Default
    * `"enter"`. When set to a non-Enter binding, a plain Enter inserts a newline.
    */
@@ -163,6 +168,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onReady,
       referenceSearch,
       mentionUiLabels,
+      tabLabels,
       submitShortcut,
       newlineShortcut,
       isExternalMenuOpen,
@@ -462,6 +468,10 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         />
         {referenceSearch && mentionState && (
           <SuggestionPopup
+            // Remount per `@` session so panel state (active/pinned tab,
+            // selection) never leaks when one suggestion exits and another
+            // starts in the same React update (onExit + onStart batched).
+            key={mentionState.range.from}
             ref={popupRef}
             state={mentionState}
             search={referenceSearch}
@@ -473,6 +483,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             listboxLabel={mentionUiLabels?.listbox}
             moreLabel={mentionUiLabels?.more}
             countLabel={mentionUiLabels?.count}
+            tabLabels={tabLabels}
           />
         )}
       </div>

@@ -86,7 +86,11 @@ describe("RichComposer @ mention integration", () => {
     await waitFor(() => {
       expect(dom.getAttribute("aria-controls")).toBe("mention-listbox")
       expect(dom.getAttribute("aria-autocomplete")).toBe("list")
-      expect(dom.getAttribute("aria-activedescendant")).toBe("mention-option-0")
+      // The search returns only a file group, so the panel auto-targets the
+      // file tab; option ids are namespaced by tab kind.
+      expect(dom.getAttribute("aria-activedescendant")).toBe(
+        "mention-option-file-0"
+      )
     })
     act(() => {
       dom.dispatchEvent(
