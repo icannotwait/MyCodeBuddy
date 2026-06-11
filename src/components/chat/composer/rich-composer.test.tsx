@@ -113,6 +113,40 @@ describe("RichComposer imperative inserts (Phase 3)", () => {
       '"type":"reference"'
     )
   })
+
+  it("hydrates the document from a Tiptap JSON doc via setDoc", async () => {
+    const { ref } = await mount()
+    act(() =>
+      ref.current?.setDoc({
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "from json" }] },
+        ],
+      })
+    )
+    expect(ref.current?.getMarkdown()).toContain("from json")
+    expect(ref.current?.isEmpty()).toBe(false)
+  })
+
+  it("preserves a reference badge through a getJSON → setDoc round-trip", async () => {
+    const { ref } = await mount()
+    act(() =>
+      ref.current?.insertReference({
+        refType: "file",
+        id: "a.ts",
+        label: "a.ts",
+        uri: "file:///a.ts",
+        meta: null,
+      })
+    )
+    const doc = ref.current!.getJSON()
+    act(() => ref.current?.clear())
+    expect(ref.current?.isEmpty()).toBe(true)
+    act(() => ref.current?.setDoc(doc))
+    expect(JSON.stringify(ref.current?.getJSON())).toContain(
+      '"type":"reference"'
+    )
+  })
 })
 
 describe("RichComposer configurable submit / newline (Phase 3)", () => {

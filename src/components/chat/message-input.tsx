@@ -5,7 +5,6 @@ import { isDesktop } from "@/lib/platform"
 import Image from "next/image"
 import { useLocale, useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
-import { Textarea } from "@/components/ui/textarea"
 import {
   BookOpenText,
   Check,
@@ -45,7 +44,6 @@ import {
   clipboardHasText,
   imageFilesFromClipboardApi,
 } from "@/lib/clipboard-images"
-import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import {
   readFileBase64,
@@ -99,18 +97,25 @@ import {
   getExpertIcon,
   pickExpertLocalized,
 } from "@/components/chat/experts-command-menu"
-import { FileMentionMenu } from "@/components/chat/file-mention-menu"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
-import { useFileTree } from "@/hooks/use-file-tree"
 import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
 import { useAgentExperts } from "@/hooks/use-agent-experts"
 import { useAgentSkills } from "@/hooks/use-agent-skills"
-import { joinFsPath } from "@/lib/path-utils"
 import {
-  clearMessageInputDraft,
-  loadMessageInputDraft,
-  saveMessageInputDraft,
+  clearMessageInputDraftV2,
+  loadMessageInputDraftV2,
+  saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
+import {
+  RichComposer,
+  type RichComposerHandle,
+} from "@/components/chat/composer/rich-composer"
+import { docToPromptBlocks } from "@/components/chat/composer/to-prompt-blocks"
+import {
+  applyExpertPrefix,
+  isComposerEmpty,
+} from "@/components/chat/composer/composer-commands"
+import { useReferenceSearch } from "@/components/chat/composer/use-reference-search"
 import type {
   ImageInputAttachment,
   InputAttachment,
@@ -461,10 +466,13 @@ export function MessageInput({
   const { shortcuts } = useShortcutSettings()
   const effectiveDraftStorageKey = draftStorageKey ?? null
   const resolvedPlaceholder = placeholder ?? t("askAnything")
-  const [text, setText] = useState(() => {
-    if (!effectiveDraftStorageKey) return ""
-    return loadMessageInputDraft(effectiveDraftStorageKey) ?? ""
-  })
+  const editorRef = useRef<RichComposerHandle>(null)
+  // The editor owns the content now; this mirror of its empty state drives the
+  // send button and `hasSendableContent`.
+  const [composerEmpty, setComposerEmpty] = useState(true)
+  // Flips true once the RichComposer's async (immediatelyRender:false) editor has
+  // mounted, so the hydration effect can use the imperative handle.
+  const [composerReady, setComposerReady] = useState(false)
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
   const [isDragActive, setIsDragActive] = useState(false)
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
@@ -473,45 +481,26 @@ export function MessageInput({
     null
   )
   const containerRef = useRef<HTMLDivElement>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const lastDomDropAtRef = useRef(0)
-  const composingRef = useRef(false)
-  const cursorPosRef = useRef<number | null>(null)
-  const textRef = useRef(text)
   const disabledRef = useRef(disabled)
   const isPromptingRef = useRef(isPrompting)
+  const hydratedRef = useRef(false)
+  // Tracks the last queue-edit payload hydrated, so a re-edit of the *same* item
+  // doesn't clobber the user's in-progress changes.
+  const prevEditingDraftRef = useRef<string | null>(null)
+  const dragActiveRef = useRef(false)
+  // Bridge so the early `onChange` handler can call the editor-driven slash
+  // detection that is defined further down (after the slash state).
+  const detectSlashTriggerRef = useRef<(() => void) | null>(null)
+  const canAttachImages = promptCapabilities.image
 
   useEffect(() => {
     if (isActive && !disabled && !isPrompting) {
       requestAnimationFrame(() => {
-        textareaRef.current?.focus()
+        editorRef.current?.focus()
       })
     }
   }, [isActive, disabled, isPrompting])
-  const dragActiveRef = useRef(false)
-  const canAttachImages = promptCapabilities.image
-
-  useEffect(() => {
-    textRef.current = text
-  }, [text])
-
-  // `field-sizing-content` 触发的尺寸调整发生在浏览器布局阶段，原生 caret-
-  // into-view 滚动赶不上，导致光标停在末尾时新行被裁在可视区外。用 rAF 等
-  // 到本帧所有同步 `setSelectionRange` 调用之后再判断光标位置——程序化插入
-  // 路径（换行快捷键、快捷消息、斜杠命令等）都先 `setText` 再 rAF 设光标，
-  // 这里同样走 rAF 才能保证光标已经落到末尾。
-  useEffect(() => {
-    const ta = textareaRef.current
-    if (!ta) return
-    const id = requestAnimationFrame(() => {
-      const el = textareaRef.current
-      if (!el) return
-      if ((el.selectionStart ?? 0) >= el.value.length) {
-        el.scrollTop = el.scrollHeight
-      }
-    })
-    return () => cancelAnimationFrame(id)
-  }, [text])
 
   useEffect(() => {
     disabledRef.current = disabled
@@ -521,8 +510,74 @@ export function MessageInput({
     isPromptingRef.current = isPrompting
   }, [isPrompting])
 
-  // Load external draft text when editing a queue item
-  const prevEditingDraftRef = useRef<string | null>(null)
+  // Live data sources for the unified `@` mention panel. Pre-warmed only while
+  // this composer is the active one (`enabled`). Referentially stable.
+  const referenceSearch = useReferenceSearch({
+    defaultPath: defaultPath ?? null,
+    agentType: agentType ?? null,
+    enabled: isActive,
+  })
+
+  // Debounced v2 draft persistence. We snapshot the Tiptap *document* (JSON, not
+  // Markdown) ~300ms after the last change so inline reference badges survive a
+  // reload — a Markdown round-trip would downgrade them to plain links.
+  const draftSaveTimerRef = useRef<number | null>(null)
+  const scheduleDraftSave = useCallback(() => {
+    if (typeof window === "undefined") return
+    if (!effectiveDraftStorageKey || isEditingQueueItem) return
+    if (draftSaveTimerRef.current != null) {
+      window.clearTimeout(draftSaveTimerRef.current)
+    }
+    draftSaveTimerRef.current = window.setTimeout(() => {
+      draftSaveTimerRef.current = null
+      const ed = editorRef.current
+      if (!ed || !effectiveDraftStorageKey) return
+      if (ed.isEmpty()) {
+        clearMessageInputDraftV2(effectiveDraftStorageKey)
+      } else {
+        saveMessageInputDraftV2(effectiveDraftStorageKey, ed.getJSON())
+      }
+    }, 300)
+  }, [effectiveDraftStorageKey, isEditingQueueItem])
+
+  useEffect(() => {
+    return () => {
+      if (draftSaveTimerRef.current != null && typeof window !== "undefined") {
+        window.clearTimeout(draftSaveTimerRef.current)
+      }
+    }
+  }, [])
+
+  // One-time hydration once the editor is ready: a queue-edit payload, else a v2
+  // draft document (or a legacy v1 Markdown draft migrated forward). Guarded so
+  // it never re-runs and clobbers later user edits.
+  useEffect(() => {
+    if (!composerReady || hydratedRef.current) return
+    hydratedRef.current = true
+    const ed = editorRef.current
+    if (!ed) return
+    if (isEditingQueueItem && editingDraftText != null) {
+      ed.setMarkdown(editingDraftText)
+      prevEditingDraftRef.current = editingDraftText
+    } else if (effectiveDraftStorageKey) {
+      const loaded = loadMessageInputDraftV2(effectiveDraftStorageKey)
+      if (loaded?.kind === "doc") {
+        ed.setDoc(loaded.doc)
+      } else if (loaded?.kind === "legacyMarkdown") {
+        ed.setMarkdown(loaded.markdown)
+      }
+    }
+    const editor = ed.getEditor()
+    setComposerEmpty(editor ? isComposerEmpty(editor) : true)
+  }, [
+    composerReady,
+    isEditingQueueItem,
+    editingDraftText,
+    effectiveDraftStorageKey,
+  ])
+
+  // Re-hydrate when the user (re)edits a *different* queue item after the
+  // initial mount hydration above.
   useEffect(() => {
     if (
       isEditingQueueItem &&
@@ -530,9 +585,11 @@ export function MessageInput({
       editingDraftText !== prevEditingDraftRef.current
     ) {
       prevEditingDraftRef.current = editingDraftText
-      setText(editingDraftText)
+      editorRef.current?.setMarkdown(editingDraftText)
+      const editor = editorRef.current?.getEditor()
+      setComposerEmpty(editor ? isComposerEmpty(editor) : true)
       requestAnimationFrame(() => {
-        textareaRef.current?.focus()
+        editorRef.current?.focus()
       })
     } else if (!isEditingQueueItem) {
       prevEditingDraftRef.current = null
@@ -545,10 +602,20 @@ export function MessageInput({
     setIsDragActive(next)
   }, [])
 
-  useEffect(() => {
-    if (!effectiveDraftStorageKey || isEditingQueueItem) return
-    saveMessageInputDraft(effectiveDraftStorageKey, text)
-  }, [effectiveDraftStorageKey, text, isEditingQueueItem])
+  const syncComposerEmpty = useCallback(() => {
+    const ed = editorRef.current?.getEditor()
+    setComposerEmpty(ed ? isComposerEmpty(ed) : true)
+  }, [])
+
+  const handleComposerChange = useCallback(() => {
+    syncComposerEmpty()
+    scheduleDraftSave()
+    detectSlashTriggerRef.current?.()
+  }, [syncComposerEmpty, scheduleDraftSave])
+
+  const handleComposerReady = useCallback(() => {
+    setComposerReady(true)
+  }, [])
 
   const availableModes = useMemo(() => modes ?? [], [modes])
   const availableConfigOptions = useMemo(
@@ -602,7 +669,7 @@ export function MessageInput({
     [attachments]
   )
   const hasAttachments = attachments.length > 0
-  const hasSendableContent = text.trim().length > 0 || hasAttachments
+  const hasSendableContent = !composerEmpty || hasAttachments
 
   // ── Slash command autocomplete ──
   //
@@ -614,15 +681,13 @@ export function MessageInput({
   // command set is very small.
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0)
-  // Byte offset of the `/` or `$` character that opened the menu. Tracking the
-  // position lets the user invoke a slash command mid-text (e.g. after typing
-  // prose) and only replace the slash token on selection, leaving surrounding
-  // content intact.
-  const [slashTriggerPos, setSlashTriggerPos] = useState<number | null>(null)
-  const slashTriggerPosRef = useRef<number | null>(null)
-  useEffect(() => {
-    slashTriggerPosRef.current = slashTriggerPos
-  }, [slashTriggerPos])
+  // The trigger char (`/` for agent commands, `$` for Codex skills) and the
+  // typed filter token, both derived from the editor caret by
+  // `detectSlashTrigger` rather than from a raw string offset.
+  const [slashTriggerChar, setSlashTriggerChar] = useState<"/" | "$" | null>(
+    null
+  )
+  const [slashFilter, setSlashFilter] = useState("")
   const slashCommands = useMemo(
     () => (availableCommands ?? []).filter((cmd) => !expertIdSet.has(cmd.name)),
     [availableCommands, expertIdSet]
@@ -659,34 +724,20 @@ export function MessageInput({
     })
     return () => cancelAnimationFrame(id)
   }, [slashDropdownOpen])
-  const slashFilterText = useMemo(() => {
-    if (!slashMenuOpen || slashTriggerPos == null) return ""
-    const trigger = text[slashTriggerPos]
-    if (trigger !== "/" && trigger !== "$") return ""
-    const afterTrigger = text.slice(slashTriggerPos + 1)
-    const endIdx = afterTrigger.search(/\s/)
-    return endIdx === -1 ? afterTrigger : afterTrigger.slice(0, endIdx)
-  }, [slashMenuOpen, text, slashTriggerPos])
   const filteredSlashCommands = useMemo(() => {
-    if (!slashMenuOpen || slashCommands.length === 0 || slashTriggerPos == null)
-      return []
-    if (text[slashTriggerPos] !== "/") return []
-    const filter = slashFilterText.toLowerCase()
+    if (!slashMenuOpen || slashCommands.length === 0) return []
+    if (slashTriggerChar !== "/") return []
+    const filter = slashFilter.toLowerCase()
     return slashCommands.filter((cmd) =>
       cmd.name.toLowerCase().includes(filter)
     )
-  }, [slashMenuOpen, slashCommands, text, slashTriggerPos, slashFilterText])
+  }, [slashMenuOpen, slashCommands, slashTriggerChar, slashFilter])
   const filteredSlashSkills = useMemo(() => {
     // Skills autocomplete is Codex-only and triggered by `$`.
     if (agentType !== "codex") return []
-    if (
-      !slashMenuOpen ||
-      nonExpertSkills.length === 0 ||
-      slashTriggerPos == null
-    )
-      return []
-    if (text[slashTriggerPos] !== "$") return []
-    const filter = slashFilterText.toLowerCase()
+    if (!slashMenuOpen || nonExpertSkills.length === 0) return []
+    if (slashTriggerChar !== "$") return []
+    const filter = slashFilter.toLowerCase()
     if (!filter) return nonExpertSkills
     const nameMatches: typeof nonExpertSkills = []
     const idOnlyMatches: typeof nonExpertSkills = []
@@ -698,14 +749,7 @@ export function MessageInput({
       }
     }
     return [...nameMatches, ...idOnlyMatches]
-  }, [
-    slashMenuOpen,
-    nonExpertSkills,
-    text,
-    agentType,
-    slashTriggerPos,
-    slashFilterText,
-  ])
+  }, [slashMenuOpen, nonExpertSkills, agentType, slashTriggerChar, slashFilter])
   const slashAutocompleteCount =
     filteredSlashCommands.length + filteredSlashSkills.length
 
@@ -744,36 +788,50 @@ export function MessageInput({
     }
   }, [slashMenuOpen, slashSelectedIndex, slashAutocompleteCount])
 
-  // ── @ file mention autocomplete ──
-  const [atMenuOpen, setAtMenuOpen] = useState(false)
-  const [atSelectedIndex, setAtSelectedIndex] = useState(0)
-  const [atTriggerPos, setAtTriggerPos] = useState<number | null>(null)
-  const [atFileTreeEnabled, setAtFileTreeEnabled] = useState(false)
-
-  const { allFiles: atAllFiles } = useFileTree({
-    folderPath: defaultPath,
-    enabled: atFileTreeEnabled,
-  })
-
-  const filteredAtFiles = useMemo(() => {
-    if (!atMenuOpen || atTriggerPos == null) return []
-    // Extract the query after "@" up to the next space or end of text
-    const afterAt = text.slice(atTriggerPos + 1)
-    const spaceIdx = afterAt.indexOf(" ")
-    const filter =
-      spaceIdx === -1
-        ? afterAt.toLowerCase()
-        : afterAt.slice(0, spaceIdx).toLowerCase()
-    if (!filter) return atAllFiles.slice(0, 50)
-    const matched: typeof atAllFiles = []
-    for (const f of atAllFiles) {
-      if (f.lowerName.includes(filter) || f.lowerPath.includes(filter)) {
-        matched.push(f)
-        if (matched.length >= 50) break
-      }
+  // ── Editor-driven `/` (commands) and `$` (Codex skills) trigger detection ──
+  // The `@` mention panel is now owned by RichComposer; this only handles the
+  // runtime-command menus. We inspect the text before the collapsed caret in the
+  // current block: a `/` (any agent) or `$` (Codex) at the start or right after
+  // whitespace, and not inside inline code / a code block, opens the menu.
+  const detectSlashTrigger = useCallback(() => {
+    const editor = editorRef.current?.getEditor()
+    const hasSlashSource =
+      slashCommands.length > 0 ||
+      availableExperts.length > 0 ||
+      nonExpertSkills.length > 0
+    const close = () => {
+      setSlashMenuOpen(false)
+      setSlashTriggerChar(null)
     }
-    return matched
-  }, [atMenuOpen, atTriggerPos, text, atAllFiles])
+    if (!editor || !hasSlashSource) return close()
+    const { selection } = editor.state
+    if (!selection.empty) return close()
+    if (editor.isActive("code") || editor.isActive("codeBlock")) return close()
+    const { $from } = selection
+    const before = $from.parent.textBetween(
+      0,
+      $from.parentOffset,
+      undefined,
+      " "
+    )
+    const regex =
+      agentType === "codex" ? /(^|\s)([/$])(\S*)$/ : /(^|\s)(\/)(\S*)$/
+    const match = before.match(regex)
+    if (!match) return close()
+    setSlashTriggerChar(match[2] as "/" | "$")
+    setSlashFilter(match[3])
+    setSlashSelectedIndex(0)
+    setSlashMenuOpen(true)
+  }, [
+    slashCommands.length,
+    availableExperts.length,
+    nonExpertSkills.length,
+    agentType,
+  ])
+
+  useEffect(() => {
+    detectSlashTriggerRef.current = detectSlashTrigger
+  }, [detectSlashTrigger])
 
   const appendResourceLinks = useCallback(
     (
@@ -1273,16 +1331,17 @@ export function MessageInput({
     [appendFilesAsResources, appendImageAttachments, canAttachImages]
   )
 
-  const handlePaste = useCallback(
-    (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      if (disabled) return
+  // Routed from RichComposer's `onPasteFiles`. Returns true when the paste was
+  // consumed as an attachment (so the editor doesn't also insert it as text).
+  const handlePasteFiles = useCallback(
+    (event: ClipboardEvent): boolean => {
+      if (disabled) return false
       const files = filesFromClipboard(event.clipboardData)
       if (files.length > 0) {
-        event.preventDefault()
         void appendFilesFromInput(files).catch((error) => {
           console.error("[MessageInput] paste files failed:", error)
         })
-        return
+        return true
       }
 
       // Linux/Tauri (WebKitGTK) fallback: screenshot tools (e.g. WeChat) write
@@ -1292,9 +1351,7 @@ export function MessageInput({
       // (mirroring `filesFromClipboard`) so copying a spreadsheet cell or rich
       // web content isn't hijacked into an image attachment. Kept synchronous
       // so `imageFilesFromClipboardApi` runs inside the paste user gesture.
-      // No `preventDefault()`: the default paste of a textless clipboard is a
-      // no-op anyway, and it can't be cancelled after the async boundary.
-      if (clipboardHasText(event.clipboardData)) return
+      if (clipboardHasText(event.clipboardData)) return false
       void imageFilesFromClipboardApi()
         .then((imageFiles) => {
           if (imageFiles.length === 0) return
@@ -1303,6 +1360,8 @@ export function MessageInput({
         .catch((error) => {
           console.error("[MessageInput] clipboard image paste failed:", error)
         })
+      // The default paste of a textless clipboard is a no-op, so don't claim it.
+      return false
     },
     [appendFilesFromInput, disabled]
   )
@@ -1322,285 +1381,105 @@ export function MessageInput({
     [onModeChange]
   )
 
-  const handleSlashSearchChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const pos = slashTriggerPosRef.current
-      const current = textRef.current
-      if (pos == null || pos < 0 || pos >= current.length) return
-      const trigger = current[pos]
-      if (trigger !== "/" && trigger !== "$") return
-      const afterTrigger = current.slice(pos + 1)
-      const endIdx = afterTrigger.search(/\s/)
-      const tokenEnd = endIdx === -1 ? current.length : pos + 1 + endIdx
-      const before = current.slice(0, pos + 1)
-      const rest = current.slice(tokenEnd)
-      const sanitized = e.target.value.replace(/\s+/g, "")
-      setText(before + sanitized + rest)
-      setSlashSelectedIndex(0)
+  // Close the runtime-command menu and clear the trigger.
+  const closeSlashMenu = useCallback(() => {
+    setSlashMenuOpen(false)
+    setSlashTriggerChar(null)
+  }, [])
+
+  // Replace the live `/`-or-`$` token immediately before the caret with
+  // `insertion` (+ a trailing space unless one already follows), then close the
+  // menu. Used by both the command (`/`) and Codex-skill (`$`) selections.
+  const replaceTriggerToken = useCallback(
+    (insertion: string) => {
+      const editor = editorRef.current?.getEditor()
+      if (!editor) return
+      const { $from } = editor.state.selection
+      const before = $from.parent.textBetween(
+        0,
+        $from.parentOffset,
+        undefined,
+        " "
+      )
+      const match = before.match(/(^|\s)([/$])(\S*)$/)
+      const charAfter =
+        $from.parentOffset < $from.parent.content.size
+          ? $from.parent.textBetween(
+              $from.parentOffset,
+              $from.parentOffset + 1,
+              undefined,
+              " "
+            )
+          : ""
+      const suffix = charAfter && /\s/.test(charAfter) ? "" : " "
+      if (!match) {
+        // No live trigger token (shouldn't normally happen) — insert at caret.
+        editor.chain().focus().insertContent(`${insertion}${suffix}`).run()
+        closeSlashMenu()
+        return
+      }
+      const tokenLen = match[2].length + match[3].length
+      const from = $from.pos - tokenLen
+      editor
+        .chain()
+        .focus()
+        .deleteRange({ from, to: $from.pos })
+        .insertContent(`${insertion}${suffix}`)
+        .run()
+      closeSlashMenu()
     },
-    []
+    [closeSlashMenu]
   )
 
-  const handleSlashSelect = useCallback((cmd: AvailableCommandInfo) => {
-    const pos = slashTriggerPosRef.current
-    const current = textRef.current
-    const insertion = `/${cmd.name}`
-    if (
-      pos == null ||
-      pos < 0 ||
-      pos >= current.length ||
-      current[pos] !== "/"
-    ) {
-      // Fallback path: no tracked trigger (shouldn't normally happen). Behave
-      // like the legacy wholesale-replace so slash commands still work.
-      setText(`${insertion} `)
-      setSlashMenuOpen(false)
-      setSlashTriggerPos(null)
-      return
-    }
-    const before = current.slice(0, pos)
-    const afterSlash = current.slice(pos + 1)
-    const tokenMatch = afterSlash.match(/^\S*/)
-    const tokenLen = tokenMatch ? tokenMatch[0].length : 0
-    const rest = afterSlash.slice(tokenLen)
-    const needsSpace = !/^\s/.test(rest)
-    const newText = before + insertion + (needsSpace ? " " : "") + rest
-    setText(newText)
-    setSlashMenuOpen(false)
-    setSlashTriggerPos(null)
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current
-      if (ta) {
-        ta.focus()
-        const newPos = before.length + insertion.length + (needsSpace ? 1 : 0)
-        ta.setSelectionRange(newPos, newPos)
-      }
-    })
-  }, [])
+  const handleSlashSelect = useCallback(
+    (cmd: AvailableCommandInfo) => {
+      replaceTriggerToken(`/${cmd.name}`)
+    },
+    [replaceTriggerToken]
+  )
 
-  const handleSlashPopoverSelect = useCallback((cmd: AvailableCommandInfo) => {
-    const pos = cursorPosRef.current ?? textRef.current.length
-    const before = textRef.current.slice(0, pos)
-    const after = textRef.current.slice(pos)
-    const needsSpace = pos > 0 && !/\s$/.test(before)
-    const insertion = `${needsSpace ? " " : ""}/${cmd.name} `
-    const newText = before + insertion + after
-    setText(newText)
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current
-      if (ta) {
-        ta.focus()
-        const newPos = pos + insertion.length
-        ta.setSelectionRange(newPos, newPos)
-      }
-    })
-  }, [])
-
+  // Codex uses `$<id>`, other agents `/<id>` — matching the trigger prefix.
   const handleSkillAutocompleteSelect = useCallback(
     (skill: AgentSkillItem) => {
-      // Codex uses `$<id>`, other agents use `/<id>` — matching the prefix
-      // that triggered the autocomplete list.
-      const pos = slashTriggerPosRef.current
-      const current = textRef.current
-      const triggerChar = expertPrefix.length === 1 ? expertPrefix : "$"
-      const insertion = `${expertPrefix}${skill.id}`
-      if (
-        pos == null ||
-        pos < 0 ||
-        pos >= current.length ||
-        current[pos] !== triggerChar
-      ) {
-        setText(`${insertion} `)
-        setSlashMenuOpen(false)
-        setSlashTriggerPos(null)
-        return
-      }
-      const before = current.slice(0, pos)
-      const afterTrigger = current.slice(pos + 1)
-      const tokenMatch = afterTrigger.match(/^\S*/)
-      const tokenLen = tokenMatch ? tokenMatch[0].length : 0
-      const rest = afterTrigger.slice(tokenLen)
-      const needsSpace = !/^\s/.test(rest)
-      const newText = before + insertion + (needsSpace ? " " : "") + rest
-      setText(newText)
-      setSlashMenuOpen(false)
-      setSlashTriggerPos(null)
-      requestAnimationFrame(() => {
-        const ta = textareaRef.current
-        if (ta) {
-          ta.focus()
-          const newPos = before.length + insertion.length + (needsSpace ? 1 : 0)
-          ta.setSelectionRange(newPos, newPos)
-        }
-      })
+      replaceTriggerToken(`${expertPrefix}${skill.id}`)
     },
-    [expertPrefix]
+    [replaceTriggerToken, expertPrefix]
   )
 
-  const handleSlashSearchKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLInputElement>) => {
-      const total = filteredSlashCommands.length + filteredSlashSkills.length
-      if (e.key === "ArrowDown") {
-        e.preventDefault()
-        if (total === 0) return
-        setSlashSelectedIndex((i) => (i < total - 1 ? i + 1 : 0))
-        return
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault()
-        if (total === 0) return
-        setSlashSelectedIndex((i) => (i > 0 ? i - 1 : total - 1))
-        return
-      }
-      if (e.key === "Enter" || e.key === "Tab") {
-        if (total === 0) return
-        e.preventDefault()
-        if (slashSelectedIndex < filteredSlashCommands.length) {
-          handleSlashSelect(filteredSlashCommands[slashSelectedIndex])
-        } else {
-          const skillIndex = slashSelectedIndex - filteredSlashCommands.length
-          const skill = filteredSlashSkills[skillIndex]
-          if (skill) handleSkillAutocompleteSelect(skill)
-        }
-        return
-      }
-      if (e.key === "Escape") {
-        e.preventDefault()
-        setSlashMenuOpen(false)
-        setSlashTriggerPos(null)
-        requestAnimationFrame(() => textareaRef.current?.focus())
-      }
-    },
-    [
-      filteredSlashCommands,
-      filteredSlashSkills,
-      slashSelectedIndex,
-      handleSlashSelect,
-      handleSkillAutocompleteSelect,
-    ]
-  )
+  // The "+" → Slash commands picker inserts at the current caret (no trigger
+  // token to replace), adding a leading space if the caret isn't at a boundary.
+  const handleSlashPopoverSelect = useCallback((cmd: AvailableCommandInfo) => {
+    const editor = editorRef.current?.getEditor()
+    if (!editor) return
+    const { $from } = editor.state.selection
+    const charBefore =
+      $from.parentOffset > 0
+        ? $from.parent.textBetween(
+            $from.parentOffset - 1,
+            $from.parentOffset,
+            undefined,
+            " "
+          )
+        : ""
+    const needsSpace = charBefore !== "" && !/\s/.test(charBefore)
+    editor
+      .chain()
+      .focus()
+      .insertContent(`${needsSpace ? " " : ""}/${cmd.name} `)
+      .run()
+  }, [])
 
-  // Experts always inject `prefix + expert-id ` at the very front of the
-  // input, never at the cursor. The expert skill is a whole-turn directive
-  // that the agent inspects first, so prepending keeps semantics unambiguous
-  // regardless of what the user has already typed. If another expert prefix
-  // is already at the front (from a prior click), replace it instead of
-  // stacking — the agent only honors the first command, so a stacked prefix
-  // would silently drop the earlier choice.
+  // Experts always inject `prefix + expert-id ` at the very front of the input,
+  // never at the cursor — the expert skill is a whole-turn directive the agent
+  // inspects first. If an expert prefix is already at the front (from a prior
+  // click), replace it instead of stacking (the agent only honors the first).
   const handleExpertPopoverSelect = useCallback(
     (expert: ExpertListItem) => {
-      const current = textRef.current
-      const insertion = `${expertPrefix}${expert.metadata.id} `
-      const escapedPrefix = expertPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-      const existingPrefix = current.match(
-        new RegExp(`^${escapedPrefix}([A-Za-z0-9_-]+)\\s`)
-      )
-      let base = current
-      if (existingPrefix && expertIdSet.has(existingPrefix[1])) {
-        base = current.slice(existingPrefix[0].length)
-      }
-      const newText = base.length === 0 ? insertion : insertion + base
-      setText(newText)
-      requestAnimationFrame(() => {
-        const ta = textareaRef.current
-        if (ta) {
-          ta.focus()
-          // Place the caret just after the inserted prefix so the user can
-          // start (or continue) typing context for the expert.
-          const pos = insertion.length
-          ta.setSelectionRange(pos, pos)
-        }
-      })
+      const editor = editorRef.current?.getEditor()
+      if (!editor) return
+      applyExpertPrefix(editor, expertPrefix, expert.metadata.id, expertIdSet)
     },
     [expertIdSet, expertPrefix]
-  )
-
-  const atTriggerPosRef = useRef(atTriggerPos)
-  useEffect(() => {
-    atTriggerPosRef.current = atTriggerPos
-  }, [atTriggerPos])
-
-  const handleAtSelect = useCallback(
-    (entry: { relativePath: string }) => {
-      const pos = atTriggerPosRef.current
-      if (!defaultPath || pos == null) return
-
-      // Remove the @... token from text
-      const current = textRef.current
-      const beforeAt = current.slice(0, pos)
-      const afterAt = current.slice(pos)
-      const spaceIdx = afterAt.indexOf(" ", 1)
-      const afterToken = spaceIdx === -1 ? "" : afterAt.slice(spaceIdx)
-      setText(beforeAt + afterToken)
-
-      // Attach the file
-      const absPath = joinFsPath(defaultPath, entry.relativePath)
-      appendResourceAttachments([absPath])
-
-      setAtMenuOpen(false)
-      setAtTriggerPos(null)
-
-      requestAnimationFrame(() => textareaRef.current?.focus())
-    },
-    [defaultPath, appendResourceAttachments]
-  )
-
-  const handleTextChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      const value = e.target.value
-      setText(value)
-
-      const cursorPos = e.target.selectionStart ?? value.length
-      const beforeCursor = value.slice(0, cursorPos)
-
-      // Slash command detection. Allow the trigger at the very start of the
-      // input or immediately after whitespace, so users can still invoke a
-      // command after typing surrounding prose. Any of agent commands,
-      // agent-enabled experts, or (for Codex) skills can satisfy the prompt,
-      // so open the menu whenever at least one is available.
-      const hasSlashSource =
-        slashCommands.length > 0 ||
-        availableExperts.length > 0 ||
-        nonExpertSkills.length > 0
-      if (hasSlashSource) {
-        const slashRegex =
-          agentType === "codex" ? /(^|\s)([/$])(\S*)$/ : /(^|\s)(\/)(\S*)$/
-        const slashMatch = beforeCursor.match(slashRegex)
-        if (slashMatch) {
-          const triggerPos =
-            beforeCursor.length - slashMatch[0].length + slashMatch[1].length
-          setSlashTriggerPos(triggerPos)
-          setSlashSelectedIndex(0)
-          setSlashMenuOpen(true)
-          setAtMenuOpen(false)
-          return
-        }
-      }
-      setSlashMenuOpen(false)
-      setSlashTriggerPos(null)
-
-      // @ file mention detection (at any cursor position)
-      if (defaultPath) {
-        const atMatch = beforeCursor.match(/(^|[\s])@([^\s]*)$/)
-        if (atMatch) {
-          const atPos =
-            beforeCursor.length - atMatch[0].length + atMatch[1].length
-          setAtTriggerPos(atPos)
-          setAtSelectedIndex(0)
-          setAtMenuOpen(true)
-          setAtFileTreeEnabled(true)
-          return
-        }
-      }
-      setAtMenuOpen(false)
-    },
-    [
-      slashCommands.length,
-      availableExperts.length,
-      nonExpertSkills.length,
-      defaultPath,
-      agentType,
-    ]
   )
 
   const handlePickFiles = useCallback(async () => {
@@ -1663,7 +1542,8 @@ export function MessageInput({
   const handleAddMenuOpenChange = useCallback(
     (open: boolean) => {
       if (!open) return
-      cursorPosRef.current = textareaRef.current?.selectionStart ?? null
+      // The editor keeps its selection while the menu is open, so a quick
+      // message inserts back at the same caret without tracking an offset.
       loadQuickMessages().catch((error) => {
         console.error("[MessageInput] quick messages refresh failed:", error)
       })
@@ -1672,21 +1552,8 @@ export function MessageInput({
   )
 
   const handleQuickMessageSelect = useCallback((message: QuickMessage) => {
-    const insertion = message.content
-    if (!insertion) return
-    const current = textRef.current
-    const rawPos = cursorPosRef.current ?? current.length
-    const pos = Math.max(0, Math.min(rawPos, current.length))
-    const before = current.slice(0, pos)
-    const after = current.slice(pos)
-    setText(before + insertion + after)
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current
-      if (!ta) return
-      ta.focus()
-      const newPos = pos + insertion.length
-      ta.setSelectionRange(newPos, newPos)
-    })
+    if (!message.content) return
+    editorRef.current?.insertMarkdownAtCursor(message.content)
   }, [])
 
   useEffect(() => {
@@ -1713,13 +1580,17 @@ export function MessageInput({
       if (!customEvent.detail) return
       if (customEvent.detail.tabId !== attachmentTabId) return
       const appendText = customEvent.detail.text
-      setText((prev) => {
-        if (prev.length === 0) return appendText
-        return prev.endsWith(" ") ? prev + appendText : prev + " " + appendText
-      })
-      requestAnimationFrame(() => {
-        textareaRef.current?.focus()
-      })
+      const editor = editorRef.current?.getEditor()
+      if (!editor) return
+      // Append at the very end, separated by a space when the document isn't
+      // empty (and doesn't already end in whitespace).
+      const ed = editorRef.current
+      const needsSpace = ed != null && !ed.isEmpty()
+      editor
+        .chain()
+        .focus("end")
+        .insertContent(`${needsSpace ? " " : ""}${appendText}`)
+        .run()
     }
 
     window.addEventListener(APPEND_TEXT_TO_SESSION_EVENT, handleAppendText)
@@ -1855,13 +1726,14 @@ export function MessageInput({
   }, [])
 
   const buildDraft = useCallback((): PromptDraft | null => {
-    const trimmed = textRef.current.trim()
-    if (!trimmed && attachments.length === 0) return null
+    const editor = editorRef.current?.getEditor()
+    // Inline badges + prose → text/resource_link blocks (file mentions become
+    // first-class ResourceLinks; agent/session/commit/skill stay inline text).
+    const blocks: PromptInputBlock[] = editor ? docToPromptBlocks(editor) : []
+    const displayMarkdown = editorRef.current?.getMarkdown().trim() ?? ""
 
-    const blocks: PromptInputBlock[] = []
-    if (trimmed) {
-      blocks.push({ type: "text", text: trimmed })
-    }
+    if (blocks.length === 0 && attachments.length === 0) return null
+
     for (const attachment of attachments) {
       if (attachment.type === "resource") {
         if (attachment.kind === "link") {
@@ -1892,38 +1764,48 @@ export function MessageInput({
     }
 
     const displayText =
-      trimmed ||
+      displayMarkdown ||
       `Attached ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
     return { blocks, displayText }
   }, [attachments])
 
+  // Clear the editor + attachments after a send / enqueue / save.
+  const resetComposer = useCallback(() => {
+    editorRef.current?.clear()
+    setComposerEmpty(true)
+    setAttachments([])
+    closeSlashMenu()
+  }, [closeSlashMenu])
+
   const handleSend = useCallback(() => {
+    // The editor stays editable while `disabled` (the agent is busy) so the user
+    // can keep typing, but a plain send is blocked — only enqueue / queue-edit
+    // save go through. Mirrors the legacy textarea's keydown guard.
+    if (disabled && !isPrompting && !isEditingQueueItem) return
     const draft = buildDraft()
     if (!draft) return
 
     // Edit mode: save back to queue item
     if (isEditingQueueItem && onSaveQueueEdit) {
       onSaveQueueEdit(draft)
-      setText("")
-      setAttachments([])
+      resetComposer()
       return
     }
 
     // Prompting mode: enqueue instead of sending
     if (isPrompting && onEnqueue) {
       onEnqueue(draft, showModeSelector ? effectiveModeId : null)
-      setText("")
-      setAttachments([])
+      resetComposer()
       return
     }
 
     onSend(draft, showModeSelector ? effectiveModeId : null)
     if (effectiveDraftStorageKey) {
-      clearMessageInputDraft(effectiveDraftStorageKey)
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
     }
-    setText("")
-    setAttachments([])
+    resetComposer()
   }, [
+    disabled,
     buildDraft,
     isEditingQueueItem,
     isPrompting,
@@ -1933,6 +1815,7 @@ export function MessageInput({
     effectiveModeId,
     showModeSelector,
     effectiveDraftStorageKey,
+    resetComposer,
   ])
 
   const handleForkSendClick = useCallback(() => {
@@ -1945,134 +1828,87 @@ export function MessageInput({
     // failure) the parent re-queues the draft, so it is never lost.
     onForkSend(draft, showModeSelector ? effectiveModeId : null)
     if (effectiveDraftStorageKey) {
-      clearMessageInputDraft(effectiveDraftStorageKey)
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
     }
-    setText("")
-    setAttachments([])
+    resetComposer()
   }, [
     onForkSend,
     buildDraft,
     effectiveModeId,
     showModeSelector,
     effectiveDraftStorageKey,
+    resetComposer,
   ])
 
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (
-        e.nativeEvent.isComposing ||
-        composingRef.current ||
-        e.key === "Process" ||
-        e.keyCode === 229
-      ) {
-        return
+  // Navigation/confirm/escape keys for the `/` (commands) and `$` (Codex skills)
+  // runtime menu, routed from inside the editor (RichComposer.onExternalMenuKeyDown)
+  // because ProseMirror's DOM handler fires before a host capture handler could.
+  // Returns true for keys the menu consumed; false (e.g. a letter that filters)
+  // lets normal editing proceed.
+  const handleExternalMenuKeyDown = useCallback(
+    (event: KeyboardEvent): boolean => {
+      if (event.isComposing) return false
+      if (!slashMenuOpen || slashAutocompleteCount === 0) return false
+      if (event.key === "ArrowDown") {
+        setSlashSelectedIndex((i) =>
+          i < slashAutocompleteCount - 1 ? i + 1 : 0
+        )
+        return true
       }
-
-      if (slashMenuOpen && slashAutocompleteCount > 0) {
-        if (e.key === "ArrowDown") {
-          e.preventDefault()
-          setSlashSelectedIndex((i) =>
-            i < slashAutocompleteCount - 1 ? i + 1 : 0
-          )
-          return
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault()
-          setSlashSelectedIndex((i) =>
-            i > 0 ? i - 1 : slashAutocompleteCount - 1
-          )
-          return
-        }
-        if (e.key === "Enter" || e.key === "Tab") {
-          e.preventDefault()
-          // The merged list is [commands, skills].
-          if (slashSelectedIndex < filteredSlashCommands.length) {
-            handleSlashSelect(filteredSlashCommands[slashSelectedIndex])
-          } else {
-            const skillIndex = slashSelectedIndex - filteredSlashCommands.length
-            const skill = filteredSlashSkills[skillIndex]
-            if (skill) {
-              handleSkillAutocompleteSelect(skill)
-            }
-          }
-          return
-        }
-        if (e.key === "Escape") {
-          e.preventDefault()
-          setSlashMenuOpen(false)
-          setSlashTriggerPos(null)
-          return
-        }
+      if (event.key === "ArrowUp") {
+        setSlashSelectedIndex((i) =>
+          i > 0 ? i - 1 : slashAutocompleteCount - 1
+        )
+        return true
       }
-
-      if (atMenuOpen && filteredAtFiles.length > 0) {
-        if (e.key === "ArrowDown") {
-          e.preventDefault()
-          setAtSelectedIndex((i) =>
-            i < filteredAtFiles.length - 1 ? i + 1 : 0
-          )
-          return
+      if (event.key === "Enter" || event.key === "Tab") {
+        // The merged list is [commands, skills].
+        if (slashSelectedIndex < filteredSlashCommands.length) {
+          handleSlashSelect(filteredSlashCommands[slashSelectedIndex])
+        } else {
+          const skill =
+            filteredSlashSkills[
+              slashSelectedIndex - filteredSlashCommands.length
+            ]
+          if (skill) handleSkillAutocompleteSelect(skill)
         }
-        if (e.key === "ArrowUp") {
-          e.preventDefault()
-          setAtSelectedIndex((i) =>
-            i > 0 ? i - 1 : filteredAtFiles.length - 1
-          )
-          return
-        }
-        if (e.key === "Enter" || e.key === "Tab") {
-          e.preventDefault()
-          handleAtSelect(filteredAtFiles[atSelectedIndex])
-          return
-        }
-        if (e.key === "Escape") {
-          e.preventDefault()
-          setAtMenuOpen(false)
-          return
-        }
+        return true
       }
-
-      if (isEditingQueueItem && e.key === "Escape") {
-        e.preventDefault()
-        onCancelQueueEdit?.()
-        return
+      if (event.key === "Escape") {
+        closeSlashMenu()
+        return true
       }
-
-      if (matchShortcutEvent(e, shortcuts.send_message)) {
-        e.preventDefault()
-        if (!disabled || isPrompting || isEditingQueueItem) handleSend()
-      } else if (matchShortcutEvent(e, shortcuts.newline_in_message)) {
-        e.preventDefault()
-        const textarea = e.currentTarget as HTMLTextAreaElement
-        const start = textarea.selectionStart
-        const end = textarea.selectionEnd
-        const value = textarea.value
-        const newValue = value.substring(0, start) + "\n" + value.substring(end)
-        setText(newValue)
-        requestAnimationFrame(() => {
-          textarea.selectionStart = textarea.selectionEnd = start + 1
-        })
-      }
+      return false
     },
     [
-      disabled,
-      isPrompting,
-      isEditingQueueItem,
-      onCancelQueueEdit,
-      handleSend,
-      shortcuts,
       slashMenuOpen,
       slashAutocompleteCount,
+      slashSelectedIndex,
       filteredSlashCommands,
       filteredSlashSkills,
-      slashSelectedIndex,
       handleSlashSelect,
       handleSkillAutocompleteSelect,
-      atMenuOpen,
-      filteredAtFiles,
-      atSelectedIndex,
-      handleAtSelect,
+      closeSlashMenu,
     ]
+  )
+
+  // Escape cancels a queue edit. ProseMirror doesn't consume Escape, so it
+  // bubbles up to this container handler. Skipped while the slash menu is open
+  // (the editor handles that Escape to close the menu first).
+  const handleContainerKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.nativeEvent.isComposing) return
+      if (
+        isEditingQueueItem &&
+        e.key === "Escape" &&
+        !slashMenuOpen &&
+        onCancelQueueEdit
+      ) {
+        e.preventDefault()
+        onCancelQueueEdit()
+      }
+    },
+    [isEditingQueueItem, slashMenuOpen, onCancelQueueEdit]
   )
 
   const handleContainerDragOver = useCallback(
@@ -2249,27 +2085,15 @@ export function MessageInput({
     <div
       ref={containerRef}
       className="relative"
+      onKeyDown={handleContainerKeyDown}
       onDragOver={handleContainerDragOver}
       onDragLeave={handleContainerDragLeave}
       onDrop={handleContainerDrop}
     >
       {slashMenuOpen && slashAutocompleteCount > 0 && (
         <div className="absolute bottom-full left-0 right-0 mb-1 z-50 flex max-h-[min(16rem,40dvh)] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
-          <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
-            <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <input
-              type="text"
-              role="searchbox"
-              aria-label={t("slashSearchPlaceholder")}
-              value={slashFilterText}
-              onChange={handleSlashSearchChange}
-              onKeyDown={handleSlashSearchKeyDown}
-              placeholder={t("slashSearchPlaceholder")}
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </div>
+          {/* No search box: the user types the filter inline after `/` (like the
+              `@` panel); navigation is routed from the editor's keydown. */}
           <div ref={slashMenuListRef} className="flex-1 overflow-y-auto p-1">
             {filteredSlashCommands.map((cmd, i) => (
               <button
@@ -2326,13 +2150,6 @@ export function MessageInput({
             })}
           </div>
         </div>
-      )}
-      {atMenuOpen && filteredAtFiles.length > 0 && (
-        <FileMentionMenu
-          files={filteredAtFiles}
-          selectedIndex={atSelectedIndex}
-          onSelect={handleAtSelect}
-        />
       )}
       <div
         className={cn(
@@ -2414,18 +2231,22 @@ export function MessageInput({
               </>
             }
           />
-          <Textarea
-            ref={textareaRef}
-            value={text}
-            onChange={handleTextChange}
-            onKeyDown={handleKeyDown}
-            onCompositionStart={() => (composingRef.current = true)}
-            onCompositionEnd={() => (composingRef.current = false)}
-            onPaste={handlePaste}
-            onFocus={onFocus}
+          <RichComposer
+            ref={editorRef}
             placeholder={resolvedPlaceholder}
-            className="min-h-0 flex-1 overflow-y-auto rounded-none border-0 bg-transparent text-base md:text-sm shadow-none focus-visible:border-0 focus-visible:ring-0"
+            ariaLabel={resolvedPlaceholder}
             autoFocus={autoFocus}
+            referenceSearch={referenceSearch}
+            onChange={handleComposerChange}
+            onReady={handleComposerReady}
+            onSubmit={handleSend}
+            onFocus={onFocus}
+            onPasteFiles={handlePasteFiles}
+            submitShortcut={shortcuts.send_message}
+            newlineShortcut={shortcuts.newline_in_message}
+            isExternalMenuOpen={slashMenuOpen && slashAutocompleteCount > 0}
+            onExternalMenuKeyDown={handleExternalMenuKeyDown}
+            className="min-h-0 flex-1"
           />
           <div className="flex shrink-0 items-end justify-between gap-1 px-2 pb-2">
             <div className="flex min-w-0 items-end gap-1">
@@ -2605,10 +2426,6 @@ export function MessageInput({
                   >
                     <DropdownMenuSubTrigger
                       disabled={slashCommands.length === 0}
-                      onPointerDown={() => {
-                        cursorPosRef.current =
-                          textareaRef.current?.selectionStart ?? null
-                      }}
                     >
                       <Command className="size-4" />
                       {t("slashCommands")}

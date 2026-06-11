@@ -36,6 +36,12 @@ export interface RichComposerHandle {
   getMarkdown: () => string
   /** Replace the whole document from a Markdown string. */
   setMarkdown: (markdown: string) => void
+  /**
+   * Replace the whole document from a Tiptap JSON doc — used to hydrate a v2
+   * draft or a queue-edit payload, preserving reference badges that a Markdown
+   * round-trip would downgrade to plain links.
+   */
+  setDoc: (doc: JSONContent) => void
   /** Clear the document. */
   clear: () => void
   /** Focus the editor at the end of the document. */
@@ -80,6 +86,12 @@ export interface RichComposerProps {
   onFocus?: () => void
   onBlur?: () => void
   /**
+   * Fired once the (async, `immediatelyRender:false`) editor has mounted and any
+   * `defaultMarkdown` has been applied. The host uses this to hydrate a draft /
+   * queue-edit document via the imperative handle, which isn't usable earlier.
+   */
+  onReady?: () => void
+  /**
    * Enables the unified `@` mention panel. Resolves the typed query into
    * grouped suggestions (files/agents/sessions/commits/skills). MUST be
    * referentially stable (memoize it) — it is a dependency of the panel's fetch
@@ -99,6 +111,14 @@ export interface RichComposerProps {
    * while it is open. The internal `@` panel does not need this flag.
    */
   isExternalMenuOpen?: boolean
+  /**
+   * Called for every keydown while `isExternalMenuOpen` is true, BEFORE the
+   * editor acts. ProseMirror's DOM handler fires before a host capture handler
+   * could, so menu navigation has to be routed here. Return true for keys the
+   * menu consumed (Arrow/Enter/Tab/Escape) so the editor does nothing; return
+   * false (e.g. a letter that filters the list) to let normal editing proceed.
+   */
+  onExternalMenuKeyDown?: (event: KeyboardEvent) => boolean
   /**
    * Called on paste before the editor handles it. Return true when the paste was
    * consumed out-of-band (e.g. an image/file became an attachment) so the editor
@@ -127,10 +147,12 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onSubmit,
       onFocus,
       onBlur,
+      onReady,
       referenceSearch,
       submitShortcut,
       newlineShortcut,
       isExternalMenuOpen,
+      onExternalMenuKeyDown,
       onPasteFiles,
     },
     ref
@@ -141,6 +163,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const onSubmitRef = useRef(onSubmit)
     const onFocusRef = useRef(onFocus)
     const onBlurRef = useRef(onBlur)
+    const onReadyRef = useRef(onReady)
     // Latest referenceSearch, read at event time so the mention plugin (always
     // installed) is gated on whether mentions are currently enabled — robust to
     // the prop being added/removed after the editor is created once.
@@ -148,6 +171,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const submitShortcutRef = useRef(submitShortcut)
     const newlineShortcutRef = useRef(newlineShortcut)
     const isExternalMenuOpenRef = useRef(isExternalMenuOpen)
+    const onExternalMenuKeyDownRef = useRef(onExternalMenuKeyDown)
     const onPasteFilesRef = useRef(onPasteFiles)
     // The live editor, captured for command access inside editorProps handlers
     // (which are created before `editor` is assigned in this closure).
@@ -157,10 +181,12 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onSubmitRef.current = onSubmit
       onFocusRef.current = onFocus
       onBlurRef.current = onBlur
+      onReadyRef.current = onReady
       referenceSearchRef.current = referenceSearch
       submitShortcutRef.current = submitShortcut
       newlineShortcutRef.current = newlineShortcut
       isExternalMenuOpenRef.current = isExternalMenuOpen
+      onExternalMenuKeyDownRef.current = onExternalMenuKeyDown
       onPasteFilesRef.current = onPasteFiles
     })
 
@@ -218,11 +244,17 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           ...(ariaLabel ? { "aria-label": ariaLabel } : {}),
         },
         handleKeyDown: (view, event) => {
-          // A panel/menu owns its navigation/confirm keys while open: the `@`
-          // panel (internal, ref-tracked) and any external parent-driven menu
-          // (e.g. `/` runtime commands). Never submit or break while one is open.
-          if (mentionOpenRef.current || isExternalMenuOpenRef.current) {
-            return false
+          // The internal `@` panel's suggestion plugin owns its navigation keys;
+          // never submit/break while it is open.
+          if (mentionOpenRef.current) return false
+          // An external (host) menu — e.g. the `/` runtime command list — gets
+          // first refusal on keys while open. ProseMirror's DOM handler runs
+          // before any host capture handler could, so routing happens here: the
+          // host returns true for keys it consumed (Arrow/Enter/Tab/Escape) so
+          // the editor does nothing, or false (e.g. a letter that filters the
+          // list) to let the inline token keep growing.
+          if (isExternalMenuOpenRef.current) {
+            return onExternalMenuKeyDownRef.current?.(event) ?? false
           }
           // Bindings are free-form (Enter, Shift+Enter, Mod+Enter, Tab, …), so
           // we can't pre-filter by key. Instead, run a cheap first pass with no
@@ -296,6 +328,9 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             emitUpdate: false,
           })
         }
+        // The imperative handle is now usable; let the host hydrate a draft /
+        // queue-edit document that a Markdown `defaultMarkdown` can't represent.
+        onReadyRef.current?.()
       },
       onDestroy: () => {
         editorInstanceRef.current = null
@@ -319,6 +354,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         getMarkdown: () => editor?.getMarkdown() ?? "",
         setMarkdown: (markdown) =>
           editor?.commands.setContent(markdown, { contentType: "markdown" }),
+        setDoc: (doc) => editor?.commands.setContent(doc),
         clear: () => editor?.commands.clearContent(true),
         focus: () => editor?.commands.focus("end"),
         isEmpty: () => editor?.isEmpty ?? true,
