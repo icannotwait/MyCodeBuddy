@@ -553,7 +553,6 @@ export function MessageInput({
   // this composer is the active one (`enabled`). Referentially stable.
   const referenceSearch = useReferenceSearch({
     defaultPath: defaultPath ?? null,
-    agentType: agentType ?? null,
     enabled: isActive,
     labels: referenceGroupLabels,
   })

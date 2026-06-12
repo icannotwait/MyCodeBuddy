@@ -27,16 +27,18 @@ const FETCH_DEBOUNCE_MS = 150
 
 // Tab order in the panel: agent first (per product decision), then the rest in
 // their usual order. This is a *display* order; the search provider keeps its
-// own (file-first) group order, which other code/tests depend on.
+// own (file-first) group order, which other code/tests depend on. `skill` is
+// intentionally absent — skills/commands are inserted via the `/` and `$`
+// triggers (and experts via the expert menu), not the `@` panel.
 const TAB_ORDER: readonly ReferenceKind[] = [
   "agent",
   "file",
   "session",
   "commit",
-  "skill",
 ]
 
-// English fallbacks for the tab labels; the host injects localized ones.
+// English fallbacks for the tab labels; the host injects localized ones. `skill`
+// is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
 const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
   agent: "Agents",
   file: "Files",

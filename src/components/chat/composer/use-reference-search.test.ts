@@ -4,9 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import type {
   AcpAgentInfo,
-  AgentSkillItem,
   DbConversationSummary,
-  ExpertListItem,
   GitLogEntry,
 } from "@/lib/types"
 
@@ -74,36 +72,6 @@ function makeCommit(
   }
 }
 
-function makeSkill(id: string, name: string): AgentSkillItem {
-  return {
-    id,
-    name,
-    scope: "project",
-    description: `${name} skill`,
-  } as unknown as AgentSkillItem
-}
-
-function makeExpert(
-  id: string,
-  displayName: Record<string, string>,
-  over: { category?: string } = {}
-): ExpertListItem {
-  return {
-    metadata: {
-      id,
-      category: over.category ?? "review",
-      icon: null,
-      sort_order: 0,
-      display_name: displayName,
-      description: { en: `${id} description` },
-      bundled_hash: "hash",
-    },
-    installed_centrally: true,
-    user_modified: false,
-    central_path: "/experts/x",
-  }
-}
-
 function emptySources(
   over: Partial<ReferenceSearchSources> = {}
 ): ReferenceSearchSources {
@@ -114,10 +82,6 @@ function emptySources(
     sessions: [],
     commits: [],
     repoKey: null,
-    skills: [],
-    builtInExperts: [],
-    agentExperts: [],
-    locale: "en",
     ...over,
   }
 }
@@ -128,20 +92,19 @@ const itemsOf = (groups: SuggestionGroup[], kind: ReferenceKind) =>
 // --- pure builder -----------------------------------------------------------
 
 describe("buildReferenceGroups", () => {
-  it("returns the five groups in a fixed order", () => {
+  it("returns the four groups in a fixed order (no skill group)", () => {
     const groups = buildReferenceGroups("", emptySources())
     expect(groups.map((g) => g.kind)).toEqual([
       "file",
       "agent",
       "session",
       "commit",
-      "skill",
     ])
   })
 
   it("keeps every group present (empty groups are not dropped)", () => {
     const groups = buildReferenceGroups("", emptySources())
-    expect(groups).toHaveLength(5)
+    expect(groups).toHaveLength(4)
     expect(groups.every((g) => g.items.length === 0)).toBe(true)
   })
 
@@ -152,7 +115,6 @@ describe("buildReferenceGroups", () => {
       DEFAULT_GROUP_LABELS.agent,
       DEFAULT_GROUP_LABELS.session,
       DEFAULT_GROUP_LABELS.commit,
-      DEFAULT_GROUP_LABELS.skill,
     ])
   })
 
@@ -260,38 +222,6 @@ describe("buildReferenceGroups", () => {
     expect(commits[0].reference.uri).toBe("codeg://commit/%2Frepo@abc12340000")
   })
 
-  it("merges skills + experts into one group and dedupes by id (skill wins)", () => {
-    const groups = buildReferenceGroups(
-      "",
-      emptySources({
-        skills: [makeSkill("dup", "Skill Dup"), makeSkill("only-skill", "S")],
-        builtInExperts: [makeExpert("dup", { en: "Expert Dup" })],
-        agentExperts: [makeExpert("agent-only", { en: "Agent Expert" })],
-      })
-    )
-    const skills = itemsOf(groups, "skill")
-    expect(skills.map((s) => s.reference.id)).toEqual([
-      "dup",
-      "only-skill",
-      "agent-only",
-    ])
-    // The first occurrence (the project skill) wins the dedupe.
-    expect(skills[0].reference.label).toBe("Skill Dup")
-  })
-
-  it("localizes expert labels by the provided locale", () => {
-    const groups = buildReferenceGroups(
-      "",
-      emptySources({
-        builtInExperts: [
-          makeExpert("reviewer", { en: "Reviewer", "zh-CN": "评审员" }),
-        ],
-        locale: "zh-CN",
-      })
-    )
-    expect(itemsOf(groups, "skill")[0].reference.label).toBe("评审员")
-  })
-
   it("caps each group at 50 items and flags the overflow as truncated", () => {
     const files = Array.from({ length: 60 }, (_, i) => makeFile(`f${i}.ts`))
     const groups = buildReferenceGroups(
@@ -338,14 +268,10 @@ describe("buildReferenceGroups", () => {
 const mocks = vi.hoisted(() => ({
   agents: [] as AcpAgentInfo[],
   files: { allFiles: [] as FlatFileEntry[], loaded: false },
-  skills: [] as AgentSkillItem[],
-  builtInExperts: [] as ExpertListItem[],
-  agentExperts: [] as ExpertListItem[],
   listAllConversations: vi.fn(),
   gitLog: vi.fn(),
 }))
 
-vi.mock("next-intl", () => ({ useLocale: () => "en" }))
 vi.mock("@/hooks/use-file-tree", () => ({
   useFileTree: () => ({
     allFiles: mocks.files.allFiles,
@@ -357,15 +283,6 @@ vi.mock("@/hooks/use-file-tree", () => ({
 vi.mock("@/hooks/use-acp-agents", () => ({
   useAcpAgents: () => ({ agents: mocks.agents, fresh: true, refresh: vi.fn() }),
 }))
-vi.mock("@/hooks/use-agent-skills", () => ({
-  useAgentSkills: () => mocks.skills,
-}))
-vi.mock("@/hooks/use-built-in-experts", () => ({
-  useBuiltInExperts: () => mocks.builtInExperts,
-}))
-vi.mock("@/hooks/use-agent-experts", () => ({
-  useAgentExperts: () => mocks.agentExperts,
-}))
 vi.mock("@/lib/api", () => ({
   listAllConversations: (...args: unknown[]) =>
     mocks.listAllConversations(...args),
@@ -376,9 +293,6 @@ describe("useReferenceSearch", () => {
   beforeEach(() => {
     mocks.agents = []
     mocks.files = { allFiles: [], loaded: false }
-    mocks.skills = []
-    mocks.builtInExperts = []
-    mocks.agentExperts = []
     mocks.listAllConversations.mockReset().mockResolvedValue([])
     mocks.gitLog
       .mockReset()
@@ -481,9 +395,8 @@ describe("useReferenceSearch", () => {
     expect(groups).toEqual([])
   })
 
-  it("degrades gracefully with no workspace path: agents/skills resolve, files/commits stay empty (R8)", async () => {
+  it("degrades gracefully with no workspace path: agents resolve, files/commits stay empty (R8)", async () => {
     mocks.agents = [makeAgent("codex", { name: "Codex" })]
-    mocks.builtInExperts = [makeExpert("reviewer", { en: "Reviewer" })]
     mocks.files = { allFiles: [makeFile("a.ts")], loaded: true }
 
     const { result } = renderHook(() => useReferenceSearch({ enabled: true }))
@@ -495,7 +408,6 @@ describe("useReferenceSearch", () => {
     expect(itemsOf(groups, "file")).toHaveLength(0)
     expect(itemsOf(groups, "commit")).toHaveLength(0)
     expect(itemsOf(groups, "agent")).toHaveLength(1)
-    expect(itemsOf(groups, "skill")).toHaveLength(1)
     expect(mocks.gitLog).not.toHaveBeenCalled()
   })
 

@@ -86,15 +86,15 @@ describe("SuggestionPopup", () => {
     vi.restoreAllMocks()
   })
 
-  it("renders the active (agent-first) tab's options plus a five-tab strip", async () => {
+  it("renders the active (agent-first) tab's options plus a four-tab strip", async () => {
     mountPopup()
     // Agent is the first non-empty tab, so its options show by default.
     expect(await screen.findByText("Codex Helper")).toBeInTheDocument()
     expect(screen.getByText("Claude Helper")).toBeInTheDocument()
     // The file tab's option is hidden until that tab is active.
     expect(screen.queryByText("alpha.md")).toBeNull()
-    // Five fixed tabs, agent selected.
-    expect(screen.getAllByRole("tab")).toHaveLength(5)
+    // Four fixed tabs (no skill tab), agent selected.
+    expect(screen.getAllByRole("tab")).toHaveLength(4)
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Agents/
     )
@@ -104,7 +104,7 @@ describe("SuggestionPopup", () => {
     mountPopup({ search: emptySearch, emptyLabel: "Nothing" })
     const panel = screen.getByTestId("mention-popup")
     expect(await within(panel).findByText("Nothing")).toBeInTheDocument()
-    expect(screen.getAllByRole("tab")).toHaveLength(5)
+    expect(screen.getAllByRole("tab")).toHaveLength(4)
   })
 
   it("selects the active tab's highlighted row on Enter (default = first agent)", async () => {
@@ -152,9 +152,9 @@ describe("SuggestionPopup", () => {
     const { ref } = mountPopup()
     await screen.findByText("Codex Helper")
     act(() => ref.current?.onKeyDown(key("Tab", true)))
-    // agent (first) wraps backwards to skill (last in tab order); it's empty.
+    // agent (first) wraps backwards to commit (last in tab order); it's empty.
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
-      /Skills/
+      /Commits/
     )
   })
 

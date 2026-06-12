@@ -1,36 +1,27 @@
 "use client"
 
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
-import { useLocale } from "next-intl"
 
 import { useAcpAgents } from "@/hooks/use-acp-agents"
-import { useAgentExperts } from "@/hooks/use-agent-experts"
-import { useAgentSkills } from "@/hooks/use-agent-skills"
-import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
 import { gitLog, listAllConversations } from "@/lib/api"
 import type {
   AcpAgentInfo,
-  AgentType,
   DbConversationSummary,
-  ExpertListItem,
   GitLogEntry,
 } from "@/lib/types"
 
 import {
   agentToSuggestion,
   commitToSuggestion,
-  expertToSuggestion,
   fileToSuggestion,
   sessionToSuggestion,
-  skillToSuggestion,
 } from "./suggestion/adapters"
 import type {
   ReferenceSearch,
   SuggestionGroup,
   SuggestionItem,
 } from "./suggestion/types"
-import type { AgentSkillItem } from "@/lib/types"
 
 // Commit-synchronous on the client (so the guard-critical refs are updated
 // during commit, before any later macrotask/microtask can resolve a stale
@@ -76,10 +67,6 @@ export interface ReferenceSearchSources {
   commits: GitLogEntry[]
   /** Repo identity for commit URIs; null disables the commit group. */
   repoKey: string | null
-  skills: AgentSkillItem[]
-  builtInExperts: ExpertListItem[]
-  agentExperts: ExpertListItem[]
-  locale: string
 }
 
 /** Case-insensitive substring match against an adapted item's searchable text. */
@@ -96,8 +83,8 @@ function suggestionMatches(item: SuggestionItem, lowerQuery: string): boolean {
 
 /**
  * Pure: filter + adapt the raw sources into the fixed-order grouped suggestions
- * the `@` panel renders (files → agents → sessions → commits → skills). Each
- * group is independently capped at {@link MAX_PER_GROUP}; empty groups are kept
+ * the `@` panel renders (files → agents → sessions → commits). Each group is
+ * independently capped at {@link MAX_PER_GROUP}; empty groups are kept
  * (the popup hides them) so the order is always stable. Extracted from the hook
  * so the matching/ordering/dedup logic is testable without React.
  */
@@ -152,28 +139,6 @@ export function buildReferenceGroups(
     }
   }
 
-  // Skills + built-in experts + agent-linked experts share one group. An expert
-  // can surface from more than one source, so dedupe by reference id (skill id),
-  // keeping the first occurrence, before filtering.
-  const skillItems: SuggestionItem[] = []
-  let skillTruncated = false
-  const seenSkillIds = new Set<string>()
-  const skillCandidates: SuggestionItem[] = [
-    ...sources.skills.map(skillToSuggestion),
-    ...sources.builtInExperts.map((e) => expertToSuggestion(e, sources.locale)),
-    ...sources.agentExperts.map((e) => expertToSuggestion(e, sources.locale)),
-  ]
-  for (const item of skillCandidates) {
-    if (seenSkillIds.has(item.reference.id)) continue
-    seenSkillIds.add(item.reference.id)
-    if (!suggestionMatches(item, q)) continue
-    if (skillItems.length >= MAX_PER_GROUP) {
-      skillTruncated = true
-      break
-    }
-    skillItems.push(item)
-  }
-
   return [
     {
       kind: "file",
@@ -199,24 +164,16 @@ export function buildReferenceGroups(
       items: commitItems,
       truncated: commitTruncated,
     },
-    {
-      kind: "skill",
-      label: labels.skill,
-      items: skillItems,
-      truncated: skillTruncated,
-    },
   ]
 }
 
 export interface UseReferenceSearchOptions {
   /**
    * Workspace root for the file + commit groups (and the commit `repoKey`).
-   * When empty/null those two groups stay empty while agents/sessions/skills
-   * still resolve, so a brand-new draft tab degrades gracefully (R8).
+   * When empty/null those two groups stay empty while agents/sessions still
+   * resolve, so a brand-new draft tab degrades gracefully (R8).
    */
   defaultPath?: string | null
-  /** Active agent type, scoping the skill + expert lists. */
-  agentType?: AgentType | null
   /**
    * Gates loading. When false the search resolves to empty groups and the file
    * tree is never fetched — let the host pre-warm only the active composer.
@@ -227,9 +184,10 @@ export interface UseReferenceSearchOptions {
 }
 
 /**
- * Compose the live data sources (file tree, ACP agents, conversations, git log,
- * skills, experts) into a single {@link ReferenceSearch} for the composer's `@`
- * panel.
+ * Compose the live data sources (file tree, ACP agents, conversations, git log)
+ * into a single {@link ReferenceSearch} for the composer's `@` panel. (Skills,
+ * commands and experts are inserted via the `/` / `$` triggers and the expert
+ * menu, not this panel.)
  *
  * Referential stability is the contract: the suggestion popup re-runs its fetch
  * whenever the `search` identity changes (`suggestion-popup.tsx`), so the
@@ -238,28 +196,23 @@ export interface UseReferenceSearchOptions {
  * on window focus) updates the refs but leaves `search` identity untouched — the
  * open panel keeps its results and the user's selection (R7).
  *
- * Files/agents/skills/experts are hook-loaded (and pre-warmed via `enabled`).
- * Sessions and the git log are fetched lazily on the first `@`, key-cached in a
- * ref, and awaited by `search` so the first open is populated without an extra
- * keystroke; window focus busts those caches so they stay fresh.
+ * Files and agents are hook-loaded (and pre-warmed via `enabled`). Sessions and
+ * the git log are fetched lazily on the first `@`, key-cached in a ref, and
+ * awaited by `search` so the first open is populated without an extra keystroke;
+ * window focus busts those caches so they stay fresh.
  */
 export function useReferenceSearch({
   defaultPath,
-  agentType = null,
   enabled = true,
   labels,
 }: UseReferenceSearchOptions): ReferenceSearch {
   const path = defaultPath || null
-  const locale = useLocale()
 
   const { allFiles, loaded } = useFileTree({
     folderPath: path ?? undefined,
     enabled,
   })
   const { agents } = useAcpAgents()
-  const skills = useAgentSkills(agentType, path)
-  const builtInExperts = useBuiltInExperts()
-  const agentExperts = useAgentExperts(agentType)
 
   // Mirror every changing source into a ref so `search` can stay identity-stable
   // (see the doc comment). Initialized from the first render so the refs are
@@ -269,10 +222,6 @@ export function useReferenceSearch({
     files: [],
   })
   const agentsRef = useRef(agents)
-  const skillsRef = useRef(skills)
-  const builtInExpertsRef = useRef(builtInExperts)
-  const agentExpertsRef = useRef(agentExperts)
-  const localeRef = useRef(locale)
   const pathRef = useRef(path)
   const enabledRef = useRef(enabled)
   const labelsRef = useRef(labels)
@@ -297,22 +246,8 @@ export function useReferenceSearch({
         ? { root: path, files: allFiles }
         : { root: null, files: [] }
     agentsRef.current = agents
-    skillsRef.current = skills
-    builtInExpertsRef.current = builtInExperts
-    agentExpertsRef.current = agentExperts
-    localeRef.current = locale
     labelsRef.current = labels
-  }, [
-    allFiles,
-    loaded,
-    path,
-    agents,
-    skills,
-    builtInExperts,
-    agentExperts,
-    locale,
-    labels,
-  ])
+  }, [allFiles, loaded, path, agents, labels])
 
   // Lazily-fetched network sources, key-cached so repeat searches reuse the
   // in-flight/resolved promise while a folder switch refetches.
@@ -404,10 +339,6 @@ export function useReferenceSearch({
         sessions,
         commits,
         repoKey: path,
-        skills: skillsRef.current,
-        builtInExperts: builtInExpertsRef.current,
-        agentExperts: agentExpertsRef.current,
-        locale: localeRef.current,
       },
       labelsRef.current ?? DEFAULT_GROUP_LABELS
     )

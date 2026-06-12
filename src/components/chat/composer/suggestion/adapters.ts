@@ -2,9 +2,7 @@ import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import {
   AGENT_LABELS,
   type AcpAgentInfo,
-  type AgentSkillItem,
   type DbConversationSummary,
-  type ExpertListItem,
   type GitLogEntry,
 } from "@/lib/types"
 
@@ -123,42 +121,6 @@ export function commitToSuggestion(
   }
 }
 
-/** User/project skill → skill reference (serializes to `/id`). */
-export function skillToSuggestion(skill: AgentSkillItem): SuggestionItem {
-  return {
-    reference: {
-      refType: "skill",
-      id: skill.id,
-      label: skill.name,
-      uri: null,
-      meta: { scope: skill.scope, icon: null },
-    },
-    detail: skill.description,
-    keywords: `${skill.id} ${skill.name}`,
-  }
-}
-
-/** Built-in expert → skill reference, with the localized display name. */
-export function expertToSuggestion(
-  expert: ExpertListItem,
-  locale: string
-): SuggestionItem {
-  const { metadata } = expert
-  const label =
-    metadata.display_name[locale] ?? metadata.display_name.en ?? metadata.id
-  return {
-    reference: {
-      refType: "skill",
-      id: metadata.id,
-      label,
-      uri: null,
-      meta: {
-        scope: "expert",
-        category: metadata.category,
-        icon: metadata.icon,
-      },
-    },
-    detail: metadata.description[locale] ?? metadata.description.en ?? null,
-    keywords: `${metadata.id} ${label} ${metadata.category}`,
-  }
-}
+// Skills, commands and experts are no longer surfaced in the `@` panel — they
+// are inserted via the `/` / `$` triggers and the expert menu, which build their
+// reference attrs directly (see composer/invocation-reference.ts).

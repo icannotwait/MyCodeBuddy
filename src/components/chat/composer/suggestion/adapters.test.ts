@@ -3,20 +3,16 @@ import { describe, expect, it } from "vitest"
 import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import type {
   AcpAgentInfo,
-  AgentSkillItem,
   DbConversationSummary,
-  ExpertListItem,
   GitLogEntry,
 } from "@/lib/types"
 
 import {
   agentToSuggestion,
   commitToSuggestion,
-  expertToSuggestion,
   fileToSuggestion,
   pathToFileUri,
   sessionToSuggestion,
-  skillToSuggestion,
 } from "./adapters"
 
 describe("pathToFileUri", () => {
@@ -131,56 +127,6 @@ describe("commitToSuggestion", () => {
   })
 })
 
-describe("skillToSuggestion", () => {
-  it("maps a user/project skill to a skill reference", () => {
-    const skill = {
-      id: "code-review",
-      name: "Code Review",
-      scope: "project",
-      layout: "markdown_file",
-      path: "/skills/code-review.md",
-      description: "Review the diff",
-      read_only: false,
-    } as AgentSkillItem
-    expect(skillToSuggestion(skill).reference).toMatchObject({
-      refType: "skill",
-      id: "code-review",
-      label: "Code Review",
-      uri: null,
-      meta: { scope: "project" },
-    })
-  })
-})
-
-describe("expertToSuggestion", () => {
-  const expert: ExpertListItem = {
-    metadata: {
-      id: "deep-research",
-      category: "research",
-      icon: "Sparkles",
-      sort_order: 1,
-      display_name: { en: "Deep Research", "zh-CN": "深度研究" },
-      description: { en: "Research deeply", "zh-CN": "深入研究" },
-      bundled_hash: "x",
-    },
-    installed_centrally: true,
-    user_modified: false,
-    central_path: "/experts/deep-research",
-  }
-  it("uses the localized display name", () => {
-    expect(expertToSuggestion(expert, "zh-CN").reference.label).toBe("深度研究")
-  })
-  it("falls back to English then id when the locale is missing", () => {
-    expect(expertToSuggestion(expert, "ja").reference.label).toBe(
-      "Deep Research"
-    )
-  })
-  it("maps to a skill reference (experts invoke as /id)", () => {
-    expect(expertToSuggestion(expert, "en").reference).toMatchObject({
-      refType: "skill",
-      id: "deep-research",
-      uri: null,
-      meta: { scope: "expert", category: "research", icon: "Sparkles" },
-    })
-  })
-})
+// skillToSuggestion / expertToSuggestion were retired with the `@` panel's skill
+// tab — skills/commands/experts are now inserted via the `/` `$` triggers and the
+// expert menu (see composer/invocation-reference.ts), not adapted for the panel.
