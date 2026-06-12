@@ -61,7 +61,7 @@ export function Sidebar() {
   const t = useTranslations("Folder.sidebar")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
-  const { openNewConversationTab } = useTabContext()
+  const { openNewConversationTab, openChatModeTab } = useTabContext()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const isMac = useIsMac()
   const { shortcuts } = useShortcutSettings()
@@ -113,9 +113,15 @@ export function Sidebar() {
   }, [allExpanded])
 
   const handleNewConversation = useCallback(() => {
-    if (!activeFolder) return
+    // Defense-in-depth: with no active folder (e.g. a cold start that recovered
+    // to nothing, or all folders closed) fall back to folderless chat mode
+    // rather than no-op, so this entry point is never a dead end.
+    if (!activeFolder) {
+      openChatModeTab()
+      return
+    }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openNewConversationTab])
+  }, [activeFolder, openChatModeTab, openNewConversationTab])
 
   if (!isOpen) return null
 
@@ -201,14 +207,12 @@ export function Sidebar() {
         <button
           type="button"
           onClick={handleNewConversation}
-          disabled={!activeFolder}
           title={t("newChat")}
           className={cn(
             "group flex h-8 w-full items-center gap-[0.4375rem] rounded-full pl-[0.4375rem] pr-1.5",
             "text-[0.875rem] text-sidebar-foreground outline-none",
             "transition-colors duration-150 hover:bg-sidebar-accent",
-            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            "disabled:pointer-events-none disabled:opacity-50"
+            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
           )}
         >
           <SquarePen className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />

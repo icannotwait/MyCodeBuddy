@@ -9,6 +9,7 @@ import enMessages from "@/i18n/messages/en.json"
 // factories below (vi.mock is hoisted above imports).
 const spies = vi.hoisted(() => ({
   openNewConversationTab: vi.fn(),
+  openChatModeTab: vi.fn(),
   setSearchOpen: vi.fn(),
 }))
 const mockState = vi.hoisted(() => ({
@@ -29,6 +30,7 @@ vi.mock("@/contexts/active-folder-context", () => ({
 vi.mock("@/contexts/tab-context", () => ({
   useTabContext: () => ({
     openNewConversationTab: spies.openNewConversationTab,
+    openChatModeTab: spies.openChatModeTab,
   }),
 }))
 vi.mock("@/contexts/search-dialog-context", () => ({
@@ -53,6 +55,7 @@ function renderSidebar() {
 describe("Sidebar — fixed New chat / Search region", () => {
   beforeEach(() => {
     spies.openNewConversationTab.mockClear()
+    spies.openChatModeTab.mockClear()
     spies.setSearchOpen.mockClear()
     mockState.activeFolder = { id: 7, path: "/x" }
   })
@@ -77,12 +80,15 @@ describe("Sidebar — fixed New chat / Search region", () => {
     expect(getByText("Ctrl+K")).toBeTruthy()
   })
 
-  it("disables New chat when no folder is active", () => {
+  it("falls back to chat mode (never disabled) when no folder is active", () => {
     mockState.activeFolder = null
     const { getByText } = renderSidebar()
     const btn = getByText("New chat").closest("button") as HTMLButtonElement
-    expect(btn.disabled).toBe(true)
+    // Defense-in-depth: the button stays clickable so a workspace that recovered
+    // to no active folder is never a dead end — it opens folderless chat mode.
+    expect(btn.disabled).toBe(false)
     fireEvent.click(btn)
+    expect(spies.openChatModeTab).toHaveBeenCalled()
     expect(spies.openNewConversationTab).not.toHaveBeenCalled()
   })
 })

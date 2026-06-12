@@ -19,6 +19,9 @@ const activateConversationPaneMock = vi.fn()
 const disconnectMock = vi.fn()
 const subscribeMock = vi.fn()
 const onTransportReconnectMock = vi.fn()
+const loadLastActiveContextMock = vi.fn()
+const saveLastActiveContextMock = vi.fn()
+const clearLastActiveContextMock = vi.fn()
 // Captured `tabs://changed` handler so tests can simulate inbound broadcasts.
 let tabsChangedHandler: ((change: TabsChanged) => void) | null = null
 
@@ -68,6 +71,13 @@ vi.mock("@/hooks/use-sorted-available-agents", () => ({
     sortedTypes: ["codex" satisfies AgentType],
     fresh: true,
   }),
+}))
+
+vi.mock("@/lib/last-active-context-storage", () => ({
+  loadLastActiveContext: () => loadLastActiveContextMock(),
+  saveLastActiveContext: (...args: unknown[]) =>
+    saveLastActiveContextMock(...args),
+  clearLastActiveContext: () => clearLastActiveContextMock(),
 }))
 
 const defaultFoldersMock: FolderDetail[] = [
@@ -569,6 +579,7 @@ describe("TabProvider cross-client sync", () => {
         return Promise.resolve(() => {})
       }
     )
+    disconnectMock.mockResolvedValue(undefined)
     onTransportReconnectMock.mockReturnValue(() => {})
   })
 
@@ -756,7 +767,16 @@ describe("TabProvider cross-client sync", () => {
   })
 
   it("mirrors the focused tab from a remote snapshot", async () => {
+    // Seed real tabs so no recovery draft is synthesized on empty hydration — an
+    // active draft would legitimately hold focus (see "does not steal focus from
+    // an in-progress local draft"), which would mask the focus-mirror behavior
+    // this test isolates.
+    listOpenedTabsMock.mockResolvedValue({
+      items: [tabItem(1, 1, true), tabItem(1, 2)],
+      version: 0,
+    })
     await renderHydrated()
+    expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
 
     act(() => {
       tabsChangedHandler?.({
@@ -1066,5 +1086,153 @@ describe("TabProvider cross-client sync", () => {
     await waitFor(() => {
       expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-1")
     })
+  })
+})
+
+describe("TabProvider post-hydration recovery", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    foldersMock = defaultFoldersMock
+    allFoldersMock = defaultFoldersMock
+    // Draft-only sessions persist nothing, so a fresh launch hydrates empty.
+    listOpenedTabsMock.mockResolvedValue({ items: [], version: 0 })
+    saveOpenedTabsMock.mockResolvedValue({
+      accepted: true,
+      version: 1,
+      tabs: [],
+    })
+    disconnectMock.mockResolvedValue(undefined)
+    loadLastActiveContextMock.mockReturnValue(null)
+    tabsChangedHandler = null
+    subscribeMock.mockImplementation(
+      (event: string, handler: (change: TabsChanged) => void) => {
+        if (event === TABS_CHANGED_EVENT) tabsChangedHandler = handler
+        return Promise.resolve(() => {})
+      }
+    )
+    onTransportReconnectMock.mockReturnValue(() => {})
+  })
+
+  async function renderHydrated() {
+    renderTabs()
+    await act(async () => {})
+  }
+
+  function activeTab() {
+    return latestContext?.tabs.find((t) => t.id === latestContext?.activeTabId)
+  }
+
+  it("restores a draft on the hinted folder when it still exists", async () => {
+    loadLastActiveContextMock.mockReturnValue({
+      folderId: 2,
+      isChat: false,
+    })
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active-folder")).toHaveTextContent("2")
+    )
+    expect(activeTab()?.id).toMatch(/^new-/)
+    expect(activeTab()?.conversationId).toBeNull()
+  })
+
+  it("falls back to the first folder when the hinted folder is gone", async () => {
+    loadLastActiveContextMock.mockReturnValue({
+      folderId: 999,
+      isChat: false,
+    })
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active-folder")).toHaveTextContent("1")
+    )
+    expect(activeTab()?.conversationId).toBeNull()
+  })
+
+  it("restores chat mode when the hint is a chat draft", async () => {
+    loadLastActiveContextMock.mockReturnValue({
+      folderId: 0,
+      isChat: true,
+    })
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active")).not.toHaveTextContent("none")
+    )
+    expect(activeTab()?.isChat).toBe(true)
+    expect(activeTab()?.folderId).toBe(0)
+    expect(activeTab()?.conversationId).toBeNull()
+  })
+
+  it("synthesizes a first-folder draft when there is no hint", async () => {
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active-folder")).toHaveTextContent("1")
+    )
+    expect(activeTab()?.id).toMatch(/^new-/)
+    expect(activeTab()?.conversationId).toBeNull()
+  })
+
+  it("synthesizes a chat draft when there are no folders (never blank)", async () => {
+    foldersMock = []
+    allFoldersMock = []
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active")).not.toHaveTextContent("none")
+    )
+    // An active tab exists → the panel is not blank and the sidebar is enabled.
+    expect(screen.getByTestId("tabs").textContent ?? "").toMatch(/^new-/)
+    expect(activeTab()?.isChat).toBe(true)
+  })
+
+  it("recovers only once — a later remote snapshot adds no second draft", async () => {
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("active")).not.toHaveTextContent("none")
+    )
+    const draftId = latestContext?.activeTabId
+    act(() => {
+      tabsChangedHandler?.({ version: 1, origin: "x", tabs: [tabItem(1, 1)] })
+    })
+    const drafts =
+      latestContext?.tabs.filter((t) => t.conversationId == null) ?? []
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]?.id).toBe(draftId)
+  })
+
+  it("persists the active draft's context for the next launch", async () => {
+    await renderHydrated()
+    await waitFor(() =>
+      expect(saveLastActiveContextMock).toHaveBeenCalledWith(
+        expect.objectContaining({ folderId: 1, isChat: false })
+      )
+    )
+  })
+
+  it("clears the hint once a real conversation is focused", async () => {
+    await renderHydrated()
+    await waitFor(() => expect(saveLastActiveContextMock).toHaveBeenCalled())
+    clearLastActiveContextMock.mockClear()
+    act(() => {
+      latestContext?.openTab(1, 1, "codex", true, "First")
+      latestContext?.switchTab("conv-1-codex-1")
+    })
+    await waitFor(() => expect(clearLastActiveContextMock).toHaveBeenCalled())
+  })
+
+  it("does not recover when persisted tabs hydrate non-empty", async () => {
+    listOpenedTabsMock.mockResolvedValue({
+      items: [tabItem(1, 1, true)],
+      version: 1,
+    })
+    loadLastActiveContextMock.mockReturnValue({
+      folderId: 2,
+      isChat: false,
+    })
+    await renderHydrated()
+    await waitFor(() =>
+      expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-1")
+    )
+    const drafts =
+      latestContext?.tabs.filter((t) => t.conversationId == null) ?? []
+    expect(drafts).toHaveLength(0)
+    expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
   })
 })

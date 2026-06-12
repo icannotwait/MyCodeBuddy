@@ -20,6 +20,11 @@ import { listOpenedTabs, saveOpenedTabs } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { resolveDefaultAgent } from "@/lib/resolve-default-agent"
 import {
+  loadLastActiveContext,
+  saveLastActiveContext,
+  clearLastActiveContext,
+} from "@/lib/last-active-context-storage"
+import {
   TABS_CHANGED_EVENT,
   type AgentType,
   type ConversationStatus,
@@ -1720,6 +1725,73 @@ export function TabProvider({ children }: TabProviderProps) {
     correctionRanRef.current = true
     correctDraftAgents()
   }, [agentsFresh, tabsHydrated, foldersHydrated, correctDraftAgents])
+
+  // ── Post-hydration recovery ────────────────────────────────────────────────
+  // Drafts are device-local (never in `opened_tabs`), so a session that ends on
+  // a draft-only workspace hydrates to ZERO tabs. With no active tab there is no
+  // active folder, which leaves the conversation panel blank AND disables every
+  // "new conversation" affordance (all gated on the active folder) — a deadlock
+  // the user can't escape. `applyRemoteSnapshot` already synthesizes a draft when
+  // tabs go empty; the initial DB-hydration path must do the same. One-shot via a
+  // ref; only "consumed" when we actually recover (so a non-empty hydration that
+  // later empties via closeTab still relies on that path's own synthesis).
+  const recoveryRanRef = useRef(false)
+  const recoverActiveContext = useCallback(() => {
+    // Restore the user to where they left off, falling back progressively:
+    //   (a) the persisted last-active hint (chat mode, or a folder still open),
+    //   (b) the first open folder, else
+    //   (c) folderless chat mode (always available — needs no folder).
+    const hint = loadLastActiveContext()
+    if (hint?.isChat) {
+      openChatModeTabRef.current()
+      return
+    }
+    if (hint) {
+      const f = foldersRef.current.find((x) => x.id === hint.folderId)
+      if (f) {
+        // The agent isn't persisted: resolve it like any new conversation (the
+        // folder's default + availability fallback), not from a possibly-
+        // provisional hint. `f` is already in `foldersRef`, so the internal
+        // lookup finds its default — no need to pass `folderDefaultAgent`.
+        openNewConversationTab(f.id, f.path)
+        return
+      }
+    }
+    const first = foldersRef.current[0]
+    if (first) {
+      openNewConversationTab(first.id, first.path)
+      return
+    }
+    openChatModeTabRef.current()
+  }, [openNewConversationTab])
+
+  useEffect(() => {
+    if (recoveryRanRef.current) return
+    if (!tabsHydrated || !foldersHydrated) return
+    if (rawTabs.length > 0) return
+    recoveryRanRef.current = true
+    recoverActiveContext()
+  }, [tabsHydrated, foldersHydrated, rawTabs, recoverActiveContext])
+
+  // Persist the active draft's context (folder + agent, or chat mode) so the
+  // next cold start can restore it via `recoverActiveContext`. This is UI state
+  // only — it writes no conversation/folder DB row, preserving the
+  // delayed-persistence invariant. Cleared once the draft binds to a real
+  // conversation. Gated on `tabsHydrated` so the transient cold-start empty
+  // window (active === undefined) never clobbers a good hint.
+  useEffect(() => {
+    if (!tabsHydrated) return
+    const active = rawTabs.find((t) => t.id === activeTabId)
+    if (!active) return
+    if (active.conversationId == null) {
+      saveLastActiveContext({
+        folderId: active.folderId,
+        isChat: active.isChat === true,
+      })
+    } else {
+      clearLastActiveContext()
+    }
+  }, [rawTabs, activeTabId, tabsHydrated])
 
   const value = useMemo(
     () => ({
