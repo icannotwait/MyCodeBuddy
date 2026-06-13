@@ -503,6 +503,24 @@ mod tauri_app {
                     broker
                 };
 
+                // Build the loop engine and manage it so Tauri commands and the
+                // (optional) embedded web server share one instance, then kick
+                // off crash recovery. Mirrors the delegation-broker lifecycle.
+                {
+                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let cm = app.state::<ConnectionManager>().clone_ref();
+                    let loop_engine = crate::loop_engine::LoopEngine::new(
+                        db::AppDatabase { conn: db_conn },
+                        cm,
+                        effective_data_dir.clone(),
+                        web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                    );
+                    app.manage(loop_engine.clone());
+                    tauri::async_runtime::spawn(async move {
+                        loop_engine.recover_on_boot().await;
+                    });
+                }
+
                 // Spawn the LifecycleSubscriber: persists cross-connection DB state
                 // (currently `external_id` on conversation rows when SessionStarted fires)
                 // off the emit hot path. `subscribe()` runs synchronously inside

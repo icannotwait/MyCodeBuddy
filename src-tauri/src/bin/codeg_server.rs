@@ -238,6 +238,14 @@ async fn async_main() {
         db.conn.clone(),
         data_dir.clone(),
     );
+    let loop_engine = codeg_lib::loop_engine::LoopEngine::new(
+        codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        },
+        connection_manager.clone_ref(),
+        data_dir.clone(),
+        emitter.clone(),
+    );
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -259,6 +267,7 @@ async fn async_main() {
         question_config: question_config.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
+        loop_engine: loop_engine.clone(),
     });
 
     // Apply persisted delegation settings (depth, enabled) before
@@ -304,6 +313,15 @@ async fn async_main() {
             if let Err(e) = listener.run(socket).await {
                 eprintln!("[delegation] listener exited: {e}");
             }
+        });
+    }
+
+    // Reconcile interrupted loop iterations and restart drivers for every
+    // still-running issue. Idempotent (Task 1.7 fills the reconciliation).
+    {
+        let engine = loop_engine.clone();
+        tokio::spawn(async move {
+            engine.recover_on_boot().await;
         });
     }
 

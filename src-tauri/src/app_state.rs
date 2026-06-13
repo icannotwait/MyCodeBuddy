@@ -64,6 +64,10 @@ pub struct AppState {
     /// The upgrade UI subscribes to it and re-syncs from a snapshot on mount,
     /// so download progress survives settings-page navigation and reloads.
     pub update_state: crate::update::AppUpdateStateHandle,
+    /// Loop engineering engine. One instance per process; in desktop mode the
+    /// same `Arc` is also `app.manage`d so Tauri commands and HTTP handlers
+    /// drive identical drivers.
+    pub loop_engine: Arc<crate::loop_engine::LoopEngine>,
 }
 
 pub fn default_system_op_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -193,6 +197,15 @@ impl AppState {
             question_config,
         ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
+        let loop_engine = crate::loop_engine::LoopEngine::new(
+            crate::db::AppDatabase {
+                conn: db.conn.clone(),
+            },
+            connection_manager.clone_ref(),
+            data_dir.clone(),
+            emitter.clone(),
+        );
+
         Self {
             db,
             connection_manager,
@@ -216,6 +229,7 @@ impl AppState {
             question_config,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
+            loop_engine,
         }
     }
 }
