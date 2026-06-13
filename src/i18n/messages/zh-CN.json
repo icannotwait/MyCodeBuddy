@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "追加的 tokens 数",
       "submitAddBudget": "追加",
       "openConversation": "打开会话"
+    },
+    "iteration": {
+      "title": "迭代会话",
+      "description": "查看该循环迭代并回答它的提问。"
     }
   }
 }

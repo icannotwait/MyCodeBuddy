@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "رموز إضافية",
       "submitAddBudget": "إضافة",
       "openConversation": "فتح المحادثة"
+    },
+    "iteration": {
+      "title": "جلسة التكرار",
+      "description": "تابع هذه الدورة وأجب عن أسئلتها."
     }
   }
 }

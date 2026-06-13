@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "추가 토큰 수",
       "submitAddBudget": "추가",
       "openConversation": "대화 열기"
+    },
+    "iteration": {
+      "title": "이터레이션 세션",
+      "description": "이 루프 이터레이션을 확인하고 질문에 답합니다."
     }
   }
 }

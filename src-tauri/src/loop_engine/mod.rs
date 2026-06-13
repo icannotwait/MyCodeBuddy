@@ -33,6 +33,7 @@ pub mod driver;
 pub mod error;
 pub mod gates;
 pub mod ingest;
+pub mod questions;
 pub mod recovery;
 pub mod transitions;
 pub mod validation;
@@ -178,13 +179,32 @@ impl LoopEngine {
         async move {
             loop {
                 match rx.recv().await {
-                    Ok(envelope) => {
-                        if matches!(envelope.payload, AcpEvent::TurnComplete { .. }) {
+                    Ok(envelope) => match &envelope.payload {
+                        AcpEvent::TurnComplete { .. } => {
                             engine.on_turn_complete(&envelope.connection_id).await;
                         }
-                    }
+                        // A loop iteration's agent asked the operator a question:
+                        // surface it as a `question` inbox card. Cleared on the
+                        // matching QuestionResolved.
+                        AcpEvent::QuestionRequest {
+                            question_id,
+                            questions,
+                        } => {
+                            engine
+                                .on_question_request(
+                                    &envelope.connection_id,
+                                    question_id,
+                                    questions,
+                                )
+                                .await;
+                        }
+                        AcpEvent::QuestionResolved { question_id } => {
+                            engine.on_question_resolved(question_id).await;
+                        }
+                        _ => {}
+                    },
                     // Fell behind the broadcast buffer — keep going; a missed
-                    // TurnComplete is reconciled by crash recovery (Task 1.7).
+                    // event is reconciled by crash recovery (Task 1.7).
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

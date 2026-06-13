@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "追加的 tokens 數",
       "submitAddBudget": "追加",
       "openConversation": "開啟會話"
+    },
+    "iteration": {
+      "title": "疊代會話",
+      "description": "檢視該循環疊代並回答它的提問。"
     }
   }
 }

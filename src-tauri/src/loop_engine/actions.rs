@@ -501,7 +501,7 @@ impl LoopEngine {
     }
 
     /// Emit the coarse `loop://changed` refetch signal for an issue.
-    fn emit_changed(&self, space_id: i32, issue_id: i32, kind: &str) {
+    pub(crate) fn emit_changed(&self, space_id: i32, issue_id: i32, kind: &str) {
         emit_event(
             &self.emitter,
             LOOP_CHANGED_EVENT,

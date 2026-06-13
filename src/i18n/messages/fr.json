@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "Jetons supplémentaires",
       "submitAddBudget": "Ajouter",
       "openConversation": "Ouvrir la conversation"
+    },
+    "iteration": {
+      "title": "Session d'itération",
+      "description": "Observez cette itération de boucle et répondez à ses questions."
     }
   }
 }

@@ -1124,8 +1124,12 @@ async fn inject_codeg_mcp(
     // delegation `--token`) — the host reverse-looks it up in the database.
     let delegation_enabled = injection.broker.config_snapshot().await.enabled;
     let feedback_enabled = injection.feedback.is_enabled().await;
-    let ask_enabled = injection.ask.is_enabled().await;
     let loop_enabled = loop_capability_token.is_some();
+    // Loop iterations always expose `ask_user_question`: the "question" inbox
+    // category is a first-class part of the loop human-in-the-loop design, so a
+    // loop agent must be able to ask the operator regardless of the global ask
+    // toggle that governs ordinary / delegation sessions.
+    let ask_enabled = injection.ask.is_enabled().await || loop_enabled;
     // `None` (no feature enabled) short-circuits the whole injection.
     let features_arg =
         companion_features_arg(delegation_enabled, feedback_enabled, ask_enabled, loop_enabled)?;

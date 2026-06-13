@@ -1844,6 +1844,21 @@ export interface AcpActionsValue {
     conversationId?: number
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
+  /**
+   * Attach this client read-only to a backend connection owned by another
+   * producer (the loop engine, or another client) — viewer mode. Streams the
+   * connection's snapshot + live events into the store under `contextKey`
+   * WITHOUT owning its lifecycle: `disconnect(contextKey)` only detaches, never
+   * killing the producer's agent. Used by the loop iteration viewer to observe
+   * (and answer the `ask_user_question` of) an engine-driven iteration session.
+   * For an externally-owned session, pass `contextKey === connectionId`.
+   */
+  connectAsViewer(
+    contextKey: string,
+    connectionId: string,
+    agentType: AgentType,
+    workingDir: string | null
+  ): Promise<void>
   disconnectAll(): Promise<void>
   sendPrompt(
     contextKey: string,
@@ -3957,6 +3972,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     () => ({
       connect,
       disconnect,
+      connectAsViewer,
       disconnectAll,
       sendPrompt,
       setMode,
@@ -3976,6 +3992,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       connect,
       disconnect,
+      connectAsViewer,
       disconnectAll,
       sendPrompt,
       setMode,

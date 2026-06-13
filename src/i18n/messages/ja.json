@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "追加するトークン数",
       "submitAddBudget": "追加",
       "openConversation": "会話を開く"
+    },
+    "iteration": {
+      "title": "イテレーションセッション",
+      "description": "このループイテレーションを確認し、質問に回答します。"
     }
   }
 }

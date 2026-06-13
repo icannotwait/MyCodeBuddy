@@ -4,14 +4,39 @@ import { useState } from "react"
 import { useTranslations } from "next-intl"
 import { ChevronLeft } from "lucide-react"
 
-import type { LoopSpaceSummary } from "@/lib/types"
+import type { AgentType, LoopInboxItemRow, LoopSpaceSummary } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { IssueList } from "@/components/loops/issue-list"
 import { IssueDetail } from "@/components/loops/issue-detail"
 import { InboxPanel } from "@/components/loops/inbox-panel"
+import { IterationDialog } from "@/components/loops/iteration-dialog"
 
 type SpaceTab = "issues" | "iterations" | "artifacts" | "inbox" | "memory"
+
+/** The iteration session a `question` inbox card points at, parsed from its
+ *  payload (written by the engine's question router). */
+interface OpenIteration {
+  conversationId: number
+  connectionId: string | null
+  agentType: AgentType | null
+}
+
+function openIterationFromCard(item: LoopInboxItemRow): OpenIteration | null {
+  const p =
+    item.payload && typeof item.payload === "object"
+      ? (item.payload as Record<string, unknown>)
+      : {}
+  const conversationId =
+    typeof p.conversation_id === "number" ? p.conversation_id : 0
+  if (conversationId <= 0) return null
+  return {
+    conversationId,
+    connectionId: typeof p.connection_id === "string" ? p.connection_id : null,
+    agentType:
+      typeof p.agent_type === "string" ? (p.agent_type as AgentType) : null,
+  }
+}
 
 export function SpaceDetail({
   space,
@@ -23,6 +48,7 @@ export function SpaceDetail({
   const t = useTranslations("Loops.spaceDetail")
   const [tab, setTab] = useState<SpaceTab>("issues")
   const [selectedIssueId, setSelectedIssueId] = useState<number | null>(null)
+  const [openIteration, setOpenIteration] = useState<OpenIteration | null>(null)
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
@@ -75,7 +101,13 @@ export function SpaceDetail({
           value="inbox"
           className="min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden"
         >
-          <InboxPanel spaceId={space.id} />
+          <InboxPanel
+            spaceId={space.id}
+            onOpenQuestion={(item) => {
+              const target = openIterationFromCard(item)
+              if (target) setOpenIteration(target)
+            }}
+          />
         </TabsContent>
 
         {(["iterations", "artifacts", "memory"] as const).map((key) => (
@@ -90,6 +122,18 @@ export function SpaceDetail({
           </TabsContent>
         ))}
       </Tabs>
+
+      {openIteration && (
+        <IterationDialog
+          open={openIteration != null}
+          onOpenChange={(o) => {
+            if (!o) setOpenIteration(null)
+          }}
+          conversationId={openIteration.conversationId}
+          connectionId={openIteration.connectionId}
+          agentType={openIteration.agentType}
+        />
+      )}
     </div>
   )
 }

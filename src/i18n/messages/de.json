@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "Zusätzliche Tokens",
       "submitAddBudget": "Hinzufügen",
       "openConversation": "Konversation öffnen"
+    },
+    "iteration": {
+      "title": "Iterationssitzung",
+      "description": "Diese Schleifeniteration beobachten und ihre Fragen beantworten."
     }
   }
 }

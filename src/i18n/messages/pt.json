@@ -3065,6 +3065,10 @@
       "addBudgetPlaceholder": "Tokens adicionais",
       "submitAddBudget": "Adicionar",
       "openConversation": "Abrir conversa"
+    },
+    "iteration": {
+      "title": "Sessão de iteração",
+      "description": "Acompanhe esta iteração do loop e responda às suas perguntas."
     }
   }
 }
