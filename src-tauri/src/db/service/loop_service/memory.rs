@@ -9,7 +9,7 @@ use crate::db::entities::loop_memory::{self, MemoryKind, MemoryStatus};
 use crate::db::error::DbError;
 use crate::models::loops::LoopMemoryRow;
 
-fn to_row(m: loop_memory::Model) -> LoopMemoryRow {
+pub fn to_row(m: loop_memory::Model) -> LoopMemoryRow {
     LoopMemoryRow {
         id: m.id,
         kind: m.kind,

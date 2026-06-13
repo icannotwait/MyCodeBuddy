@@ -56,6 +56,34 @@ pub fn build_router(
             "/list_child_conversations",
             post(handlers::conversations::list_child_conversations),
         )
+        // ─── Loop engineering ───
+        .route("/list_loop_spaces", post(handlers::loops::list_loop_spaces))
+        .route("/create_loop_space", post(handlers::loops::create_loop_space))
+        .route("/update_loop_space", post(handlers::loops::update_loop_space))
+        .route("/delete_loop_space", post(handlers::loops::delete_loop_space))
+        .route("/list_loop_issues", post(handlers::loops::list_loop_issues))
+        .route("/get_loop_issue", post(handlers::loops::get_loop_issue))
+        .route("/create_loop_issue", post(handlers::loops::create_loop_issue))
+        .route("/delete_loop_issue", post(handlers::loops::delete_loop_issue))
+        .route(
+            "/update_loop_issue_config",
+            post(handlers::loops::update_loop_issue_config),
+        )
+        .route("/get_loop_dag", post(handlers::loops::get_loop_dag))
+        .route(
+            "/list_loop_artifacts",
+            post(handlers::loops::list_loop_artifacts),
+        )
+        .route("/get_loop_artifact", post(handlers::loops::get_loop_artifact))
+        .route(
+            "/list_loop_iterations",
+            post(handlers::loops::list_loop_iterations),
+        )
+        .route("/list_loop_inbox", post(handlers::loops::list_loop_inbox))
+        .route("/list_loop_memory", post(handlers::loops::list_loop_memory))
+        .route("/create_loop_memory", post(handlers::loops::create_loop_memory))
+        .route("/update_loop_memory", post(handlers::loops::update_loop_memory))
+        .route("/delete_loop_memory", post(handlers::loops::delete_loop_memory))
         .route(
             "/get_delegation_settings",
             post(handlers::delegation::get_delegation_settings),

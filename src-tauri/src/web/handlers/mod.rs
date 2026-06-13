@@ -12,6 +12,7 @@ pub mod files;
 pub mod folder_commands;
 pub mod folders;
 pub mod git;
+pub mod loops;
 pub mod mcp;
 pub mod model_provider;
 pub mod pet;
