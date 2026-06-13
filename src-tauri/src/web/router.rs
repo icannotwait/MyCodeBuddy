@@ -92,6 +92,10 @@ pub fn build_router(
             "/list_loop_iterations",
             post(handlers::loops::list_loop_iterations),
         )
+        .route(
+            "/list_loop_validations",
+            post(handlers::loops::list_loop_validations),
+        )
         .route("/list_loop_inbox", post(handlers::loops::list_loop_inbox))
         .route("/list_loop_memory", post(handlers::loops::list_loop_memory))
         .route("/create_loop_memory", post(handlers::loops::create_loop_memory))

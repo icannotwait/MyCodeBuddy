@@ -12,11 +12,14 @@ use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
 use crate::db::entities::loop_memory::{MemoryKind, MemoryStatus};
 use crate::db::service::folder_service;
-use crate::db::service::loop_service::{artifact, inbox, issue, iteration, memory, space};
+use crate::db::service::loop_service::{
+    artifact, inbox, issue, iteration, memory, space, validation,
+};
 use crate::loop_engine::transitions::cas_issue_status;
 use crate::models::loops::{
     IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopChanged, LoopDagView, LoopInboxItemRow,
-    LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary, LOOP_CHANGED_EVENT,
+    LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary, LoopValidationRunRow,
+    LOOP_CHANGED_EVENT,
 };
 use crate::loop_engine::LoopEngine;
 use crate::web::event_bridge::{emit_event, EventEmitter};
@@ -386,6 +389,13 @@ pub async fn list_loop_iterations_core(
     })
 }
 
+pub async fn list_loop_validations_core(
+    conn: &DatabaseConnection,
+    space_id: i32,
+) -> Result<Vec<LoopValidationRunRow>, AppCommandError> {
+    Ok(validation::list_for_space(conn, space_id).await?)
+}
+
 // ─── Inbox ─────────────────────────────────────────────────────────────────
 
 pub async fn list_loop_inbox_core(
@@ -699,6 +709,15 @@ pub async fn list_loop_iterations(
     issue_id: Option<i32>,
 ) -> Result<Vec<LoopIterationRow>, AppCommandError> {
     list_loop_iterations_core(&db.conn, space_id, issue_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_loop_validations(
+    db: tauri::State<'_, AppDatabase>,
+    space_id: i32,
+) -> Result<Vec<LoopValidationRunRow>, AppCommandError> {
+    list_loop_validations_core(&db.conn, space_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]

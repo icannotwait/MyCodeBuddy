@@ -580,6 +580,16 @@ export interface LoopIterationRow {
   ended_at: string | null
 }
 
+export interface LoopValidationRunRow {
+  id: number
+  task_artifact_id: number
+  iteration_id: number | null
+  commands: string[]
+  exit_codes: number[]
+  passed: boolean
+  created_at: string
+}
+
 export interface LoopInboxItemRow {
   id: number
   issue_id: number

@@ -12,6 +12,7 @@ use crate::db::entities::loop_memory::{MemoryKind, MemoryStatus};
 use crate::models::loops::{
     IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopDagView, LoopInboxItemRow,
     LoopIssueDetail, LoopIssueRow, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary,
+    LoopValidationRunRow,
 };
 
 #[derive(Deserialize)]
@@ -321,6 +322,15 @@ pub async fn list_loop_iterations(
 ) -> Result<Json<Vec<LoopIterationRow>>, AppCommandError> {
     Ok(Json(
         core::list_loop_iterations_core(&state.db.conn, p.space_id, p.issue_id).await?,
+    ))
+}
+
+pub async fn list_loop_validations(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<SpaceIdParam>,
+) -> Result<Json<Vec<LoopValidationRunRow>>, AppCommandError> {
+    Ok(Json(
+        core::list_loop_validations_core(&state.db.conn, p.space_id).await?,
     ))
 }
 

@@ -59,6 +59,22 @@ pub async fn list_for_task(
         .collect())
 }
 
+/// Every validation run in a space, newest first. Drives the iteration list's
+/// expansion, which groups them client-side by `iteration_id`.
+pub async fn list_for_space(
+    conn: &sea_orm::DatabaseConnection,
+    space_id: i32,
+) -> Result<Vec<LoopValidationRunRow>, DbError> {
+    Ok(loop_validation_run::Entity::find()
+        .filter(loop_validation_run::Column::SpaceId.eq(space_id))
+        .order_by_desc(loop_validation_run::Column::Id)
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(to_row)
+        .collect())
+}
+
 /// The most recent run for a task, as the full entity (the `LoopValidationRunRow`
 /// DTO omits `output`, which the implement briefing needs to feed a failure
 /// back to the next attempt).

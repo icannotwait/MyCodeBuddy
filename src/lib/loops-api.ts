@@ -15,6 +15,7 @@ import type {
   LoopMemoryRow,
   LoopMemoryStatus,
   LoopSpaceSummary,
+  LoopValidationRunRow,
 } from "./types"
 
 // ─── Spaces ──────────────────────────────────────────────────────────────
@@ -162,6 +163,12 @@ export function listLoopIterations(spaceId: number, issueId?: number) {
   return getTransport().call<LoopIterationRow[]>("list_loop_iterations", {
     spaceId,
     issueId: issueId ?? null,
+  })
+}
+
+export function listLoopValidations(spaceId: number) {
+  return getTransport().call<LoopValidationRunRow[]>("list_loop_validations", {
+    spaceId,
   })
 }
 
