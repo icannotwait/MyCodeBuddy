@@ -2,6 +2,7 @@ pub mod agent;
 pub mod chat_channel;
 pub mod conversation;
 pub mod folder;
+pub mod loops;
 pub mod message;
 pub mod model_provider;
 pub mod pet;
