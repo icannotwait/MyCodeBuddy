@@ -22,6 +22,7 @@ use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
 pub mod briefing;
+pub mod dispatch;
 pub mod error;
 pub mod ingest;
 pub mod transitions;
@@ -39,14 +40,10 @@ pub struct DriverHandle {
 /// The loop engineering engine. Cheaply shareable via `Arc`; all fields are
 /// either `Arc`-backed handles or cloned connection refs.
 pub struct LoopEngine {
-    // Read by dispatch / driver / recovery / worktree from Task 1.2 onward.
-    #[allow(dead_code)]
+    // Read by dispatch / driver / recovery / worktree.
     db: AppDatabase,
-    #[allow(dead_code)]
     manager: ConnectionManager,
-    #[allow(dead_code)]
     data_dir: PathBuf,
-    #[allow(dead_code)]
     emitter: EventEmitter,
     /// Process-internal single-instance guard: at most one driver task per
     /// issue. NOT the concurrency authority — that is the DB dispatch lease.
@@ -85,4 +82,31 @@ impl LoopEngine {
     /// On boot, reconcile interrupted iterations and restart a driver for every
     /// still-`running` issue. Idempotent. Reconciliation lands in Task 1.7.
     pub async fn recover_on_boot(self: &Arc<Self>) {}
+
+    /// Run the §4.3 seven-step dispatch for a single frontier decision. Returns
+    /// `Ok(None)` when the dispatch lease was already held (lost the race). The
+    /// driver (Task 1.6) chooses the [`dispatch::DispatchInput`]; this just
+    /// executes it against the live connection manager.
+    pub async fn dispatch_iteration(
+        &self,
+        input: dispatch::DispatchInput,
+    ) -> Result<Option<dispatch::DispatchHandle>, LoopError> {
+        dispatch::dispatch_iteration(
+            &self.db,
+            &self.data_dir,
+            &self.manager,
+            self.emitter.clone(),
+            input,
+        )
+        .await
+    }
+
+    /// §4.9 settlement for a finished iteration (token accounting + success CAS
+    /// + no-progress signal).
+    pub async fn settle_iteration(
+        &self,
+        iteration_id: i32,
+    ) -> Result<dispatch::SettleOutcome, LoopError> {
+        dispatch::settle_iteration(&self.db, iteration_id).await
+    }
 }

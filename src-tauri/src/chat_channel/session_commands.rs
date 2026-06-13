@@ -310,6 +310,7 @@ pub async fn handle_task(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            None, // not a loop iteration
         )
         .await
     {
@@ -491,6 +492,7 @@ pub async fn handle_resume(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            None, // not a loop iteration
         )
         .await
     {

@@ -4012,6 +4012,7 @@ pub async fn acp_connect(
             emitter,
             preferred_mode_id,
             preferred_config_values.unwrap_or_default(),
+            None, // not a loop iteration
         )
         .await
 }

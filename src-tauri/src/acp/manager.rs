@@ -345,6 +345,11 @@ impl ConnectionManager {
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        // Per-iteration loop capability token. `Some` only on the loop-engine
+        // dispatch path (see `loop_engine::dispatch`); it is threaded straight
+        // through to `inject_codeg_mcp`, turning on the companion's loop tools
+        // for this one connection. `None` for every ordinary session.
+        loop_capability_token: Option<String>,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -416,6 +421,7 @@ impl ConnectionManager {
             preferred_mode_id,
             preferred_config_values,
             self.delegation_snapshot(),
+            loop_capability_token,
         )
         .await?;
 
@@ -1493,6 +1499,7 @@ impl ConnectionManager {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                None, // not a loop iteration
             )
             .await?;
 
@@ -2226,6 +2233,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 emitter,
                 preferred_mode_id,
                 preferred_config_values,
+                None, // delegation children are not loop iterations
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))

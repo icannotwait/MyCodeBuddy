@@ -466,6 +466,9 @@ pub async fn spawn_agent_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    // Per-iteration loop capability token, threaded straight to `run_connection`
+    // → `inject_codeg_mcp`. `Some` only for loop-engine dispatch.
+    loop_capability_token: Option<String>,
 ) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -571,6 +574,7 @@ pub async fn spawn_agent_connection(
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
+            loop_capability_token,
         )
         .await;
 
@@ -1288,6 +1292,9 @@ async fn run_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    // Per-iteration loop capability token (see `loop_engine::dispatch`). `Some`
+    // turns on the codeg-mcp companion's loop tools for this connection only.
+    loop_capability_token: Option<String>,
 ) -> Result<(), AcpError> {
     let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // `terminal_base_env` already filtered to just the credential helper
@@ -1527,10 +1534,17 @@ async fn run_connection(
             // filter needed. The returned token is stashed on the session
             // state so connection teardown can revoke it.
             let delegate_injection = if let Some(inj) = delegation_injection.as_ref() {
-                // `loop_capability_token` is `None` here: ordinary sessions never
-                // expose the loop tools. The dispatch path (Task 1.5) threads a
-                // real token through this spawn site for loop iterations.
-                inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd, None).await
+                // For loop iterations the dispatch path threads a per-iteration
+                // capability token here, which turns on the companion's loop
+                // tools; ordinary sessions pass `None` and never see them.
+                inject_codeg_mcp(
+                    &mut mcp_servers,
+                    inj,
+                    &conn_id,
+                    &cwd,
+                    loop_capability_token.as_deref(),
+                )
+                .await
             } else {
                 None
             };
