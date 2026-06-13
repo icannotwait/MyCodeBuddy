@@ -19,15 +19,17 @@
 //! new attempt.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus};
+use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue;
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
-use crate::db::service::folder_service;
+use crate::db::service::{folder_service, loop_service};
 use crate::db::AppDatabase;
 use crate::models::loops::{IssueConfig, LoopArtifactRow, LoopDagView};
 use crate::web::event_bridge::EventEmitter;
@@ -36,15 +38,20 @@ use crate::loop_engine::dispatch::{dispatch_iteration, DispatchInput, LoopAgentS
 use crate::loop_engine::driver::resolve_agent;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::try_acquire_task_gate;
+use crate::loop_engine::validation::{self, ValidationOutcome};
 use crate::loop_engine::worktree;
 
-/// Outcome of checkpointing a settled implement iteration.
+/// Outcome of checkpointing + validating a settled implement iteration.
 enum ImplementOutcome {
-    /// Non-empty diff committed → task promoted to `in_progress` (implemented,
-    /// awaiting validation).
+    /// Non-empty diff committed and validation passed (or none configured) → task
+    /// promoted to `in_progress` (implemented, awaiting review).
     Advanced,
-    /// Empty diff → rework counter bumped; the caller re-dispatches implement.
+    /// Empty diff, or validation reported failures → rework counter bumped; the
+    /// caller re-dispatches implement at the next attempt.
     NoProgress,
+    /// Validation could not run (missing tool / timeout) → task blocked + inbox
+    /// card filed; the caller idles until a human intervenes.
+    Blocked,
 }
 
 /// Drive the implement stage for one tick. Returns `true` when it dispatched a
@@ -148,13 +155,16 @@ async fn advance_active_task(
         return Ok(false);
     }
 
-    // A succeeded implement at the current attempt is awaiting its checkpoint.
-    let settled_current = impls
+    // A succeeded implement at the current attempt is awaiting its checkpoint +
+    // validation.
+    let settled = impls
         .iter()
-        .any(|it| it.status == IterationStatus::Succeeded && it.attempt == task.attempt);
-    if settled_current {
-        match finish_implement(db, issue, worktree_folder_id, task).await? {
-            ImplementOutcome::Advanced => Ok(false),
+        .find(|it| it.status == IterationStatus::Succeeded && it.attempt == task.attempt);
+    if let Some(settled) = settled {
+        match finish_implement(db, issue, config, worktree_folder_id, task, settled.id).await? {
+            // Advanced (validated) or Blocked (validation can't run) both idle —
+            // review or a human takes over next.
+            ImplementOutcome::Advanced | ImplementOutcome::Blocked => Ok(false),
             ImplementOutcome::NoProgress => {
                 // The rework counter was bumped; retry implement at the new attempt.
                 dispatch_implement(
@@ -189,14 +199,16 @@ async fn advance_active_task(
     }
 }
 
-/// Checkpoint the worktree for a settled implement iteration. A committed diff
-/// promotes the task to `in_progress`; an empty diff is discarded and counted as
-/// no progress.
+/// Checkpoint, then validate, a settled implement iteration. An empty diff is
+/// discarded as no progress; a committed diff is handed to validation, whose
+/// outcome decides advance / rework / block.
 async fn finish_implement(
     db: &AppDatabase,
     issue: &loop_issue::Model,
+    config: &IssueConfig,
     worktree_folder_id: i32,
     task: &LoopArtifactRow,
+    iteration_id: i32,
 ) -> Result<ImplementOutcome, LoopError> {
     let conn = &db.conn;
     let folder = folder_service::get_folder_by_id(conn, worktree_folder_id)
@@ -207,8 +219,7 @@ async fn finish_implement(
     let message = format!("loop: implement #{} (issue #{})", task.id, issue.seq_no);
     match worktree::checkpoint(worktree_path, &message).await? {
         Some(_sha) => {
-            set_task_status(db, task.id, ArtifactStatus::InProgress).await?;
-            Ok(ImplementOutcome::Advanced)
+            validate_after_implement(db, issue, config, worktree_path, task, iteration_id).await
         }
         None => {
             // No diff to accept. Discard any stray uncommitted state and record
@@ -216,6 +227,78 @@ async fn finish_implement(
             worktree::reset_to_head(worktree_path).await?;
             bump_rework(db, task.id, "empty_diff:implement").await?;
             Ok(ImplementOutcome::NoProgress)
+        }
+    }
+}
+
+/// Run the issue's `validation_commands` against the freshly committed checkpoint
+/// and map the result onto an [`ImplementOutcome`]:
+///
+/// - no commands configured → straight to `in_progress` (nothing to check);
+/// - passed → `in_progress` (implemented, awaiting review);
+/// - failed → rework (bump attempt; the recorded output feeds the next briefing);
+/// - unrunnable → block the task + file a `blocked` inbox card.
+///
+/// The worktree is reset to HEAD afterward so build artifacts the commands
+/// produced don't leak into the next attempt — the checkpoint commit stays, as
+/// `reset_to_head` only clears uncommitted side-effects.
+async fn validate_after_implement(
+    db: &AppDatabase,
+    issue: &loop_issue::Model,
+    config: &IssueConfig,
+    worktree_path: &Path,
+    task: &LoopArtifactRow,
+    iteration_id: i32,
+) -> Result<ImplementOutcome, LoopError> {
+    let commands = &config.validation_commands;
+    if commands.is_empty() {
+        set_task_status(db, task.id, ArtifactStatus::InProgress).await?;
+        return Ok(ImplementOutcome::Advanced);
+    }
+
+    let timeout = config.iteration_timeout_secs.map(Duration::from_secs);
+    let report = validation::run_validation(worktree_path, commands, timeout).await?;
+    worktree::reset_to_head(worktree_path).await?;
+    loop_service::validation::record_validation_run(
+        &db.conn,
+        issue.space_id,
+        issue.id,
+        task.id,
+        Some(iteration_id),
+        commands,
+        &report.exit_codes,
+        &report.output,
+        report.passed(),
+    )
+    .await?;
+
+    match report.outcome {
+        ValidationOutcome::Passed => {
+            set_task_status(db, task.id, ArtifactStatus::InProgress).await?;
+            Ok(ImplementOutcome::Advanced)
+        }
+        ValidationOutcome::Failed => {
+            bump_rework(db, task.id, "validation_failed:implement").await?;
+            Ok(ImplementOutcome::NoProgress)
+        }
+        ValidationOutcome::Unrunnable => {
+            set_task_status(db, task.id, ArtifactStatus::Blocked).await?;
+            loop_service::inbox::upsert_inbox(
+                &db.conn,
+                issue.space_id,
+                issue.id,
+                Some(iteration_id),
+                InboxKind::Blocked,
+                &format!("validation_blocked:{}", task.id),
+                serde_json::json!({
+                    "task_artifact_id": task.id,
+                    "reason": "validation_unrunnable",
+                    "commands": commands,
+                    "exit_codes": report.exit_codes,
+                }),
+            )
+            .await?;
+            Ok(ImplementOutcome::Blocked)
         }
     }
 }
@@ -597,5 +680,136 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(running.attempt, 1);
+    }
+
+    // ---- Task 2.2: deterministic validation after implement ----
+
+    fn config_with_validation(cmds: &[&str]) -> IssueConfig {
+        IssueConfig {
+            validation_commands: cmds.iter().map(|s| s.to_string()).collect(),
+            ..IssueConfig::default()
+        }
+    }
+
+    async fn drive_with(h: &Harness, config: &IssueConfig) -> bool {
+        let issue = load_issue(h).await;
+        let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
+        drive_implement(
+            &h.db,
+            h.data.path(),
+            &StubSpawner,
+            &EventEmitter::Noop,
+            &issue,
+            &dag,
+            config,
+            h.worktree_folder_id,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Implement → checkpoint → validation passes → task implemented (in_progress).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_passing_validation_advances() {
+        let h = setup().await;
+        let task = add_task(&h, "Task 1").await;
+        let cfg = config_with_validation(&["true"]);
+
+        assert!(drive_with(&h, &cfg).await, "tick 1 dispatches implement");
+        let iter_id = running_implement_id(&h).await;
+        std::fs::write(h.worktree_path.join("feature.txt"), "code\n").unwrap();
+        settle_iteration(&h.db, &EventEmitter::Noop, iter_id)
+            .await
+            .unwrap();
+
+        // Tick 2: checkpoint + validation(pass) → advance (not a dispatch).
+        assert!(!drive_with(&h, &cfg).await);
+        assert_eq!(task_node(&h, task).await.status, ArtifactStatus::InProgress);
+        let runs = loop_service::validation::list_for_task(&h.db.conn, task)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "one validation run recorded");
+        assert!(runs[0].passed, "run passed");
+    }
+
+    /// Implement → checkpoint → validation fails → rework (attempt++, re-dispatch).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_failing_validation_reworks() {
+        let h = setup().await;
+        let task = add_task(&h, "Task 1").await;
+        let cfg = config_with_validation(&["false"]);
+
+        assert!(drive_with(&h, &cfg).await);
+        let iter_id = running_implement_id(&h).await;
+        std::fs::write(h.worktree_path.join("feature.txt"), "code\n").unwrap();
+        settle_iteration(&h.db, &EventEmitter::Noop, iter_id)
+            .await
+            .unwrap();
+
+        // Tick 2: checkpoint + validation(fail) → rework + re-dispatch implement.
+        assert!(drive_with(&h, &cfg).await, "validation failure retries implement");
+        let node = task_node(&h, task).await;
+        assert_eq!(node.attempt, 1, "rework counter bumped");
+        assert_eq!(
+            node.status,
+            ArtifactStatus::Pending,
+            "back to awaiting implement"
+        );
+        assert_eq!(
+            task_model(&h, task).await.last_failure_sig.as_deref(),
+            Some("validation_failed:implement")
+        );
+        let runs = loop_service::validation::list_for_task(&h.db.conn, task)
+            .await
+            .unwrap();
+        assert!(!runs[0].passed, "failing run recorded");
+        // The retry is a fresh implement iteration at the new attempt.
+        let running = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Implement))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .one(&h.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.attempt, 1);
+    }
+
+    /// Implement → checkpoint → validation can't run (missing tool) → task blocked
+    /// + inbox card; no rework (not the agent's fault), no further dispatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_unrunnable_validation_blocks() {
+        let h = setup().await;
+        let task = add_task(&h, "Task 1").await;
+        let cfg = config_with_validation(&["codeg-no-such-tool-xyzzy"]);
+
+        assert!(drive_with(&h, &cfg).await);
+        let iter_id = running_implement_id(&h).await;
+        std::fs::write(h.worktree_path.join("feature.txt"), "code\n").unwrap();
+        settle_iteration(&h.db, &EventEmitter::Noop, iter_id)
+            .await
+            .unwrap();
+
+        // Tick 2: checkpoint + validation(unrunnable) → block (not a dispatch).
+        assert!(
+            !drive_with(&h, &cfg).await,
+            "unrunnable validation does not retry"
+        );
+        let node = task_node(&h, task).await;
+        assert_eq!(node.status, ArtifactStatus::Blocked);
+        assert_eq!(node.attempt, 0, "config error does not consume a rework");
+        // A blocked inbox card was filed for the task.
+        let inbox = loop_service::inbox::list_inbox(&h.db.conn, h.space_id, None)
+            .await
+            .unwrap();
+        assert!(
+            inbox.iter().any(|i| i.kind == InboxKind::Blocked
+                && i.subject_key == format!("validation_blocked:{task}")),
+            "blocked inbox card filed"
+        );
+        // The gate is still held by the task; no new implement was dispatched.
+        assert_eq!(load_issue(&h).await.active_task_artifact_id, Some(task));
     }
 }

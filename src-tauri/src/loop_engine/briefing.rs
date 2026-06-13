@@ -167,6 +167,17 @@ fn first_paragraph(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Keep the last `max_chars` characters of `s` (failures surface at the end of a
+/// transcript), prefixing an ellipsis when truncated. Char-boundary safe.
+fn tail(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = chars[chars.len() - max_chars..].iter().collect();
+    format!("…{kept}")
+}
+
 fn render_memories(mems: &[loop_memory::Model]) -> String {
     let mut s = String::new();
     for m in mems {
@@ -301,6 +312,25 @@ pub async fn assemble_briefing(
             if !crit.is_empty() {
                 sections.push(format!("# Acceptance criteria\n{}", crit.trim_end()));
                 components.push(json!({ "section": "acceptance_criteria" }));
+            }
+        }
+    }
+
+    // ⑤a Rework feedback — on an implement retry, surface the most recent
+    // validation failure so the agent fixes forward instead of repeating it.
+    // (Review findings will join this section in Task 2.3.)
+    if stage == Stage::Implement {
+        if let Some(target) = target_artifact_id {
+            if let Some(run) = loop_service::validation::latest_for_task(conn, target).await? {
+                if !run.passed {
+                    sections.push(format!(
+                        "# Previous validation failure\nYour last attempt did not pass the \
+                         deterministic validation commands. Fix the problems below, then make \
+                         the change again.\n\n```\n{}\n```",
+                        tail(run.output.trim(), 4000)
+                    ));
+                    components.push(json!({ "section": "validation_feedback", "run_id": run.id }));
+                }
             }
         }
     }

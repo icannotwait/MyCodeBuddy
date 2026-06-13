@@ -35,6 +35,7 @@ pub mod gates;
 pub mod ingest;
 pub mod recovery;
 pub mod transitions;
+pub mod validation;
 pub mod worktree;
 
 pub use error::LoopError;

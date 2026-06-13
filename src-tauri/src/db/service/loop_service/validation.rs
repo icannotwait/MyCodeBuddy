@@ -58,3 +58,17 @@ pub async fn list_for_task(
         .map(to_row)
         .collect())
 }
+
+/// The most recent run for a task, as the full entity (the `LoopValidationRunRow`
+/// DTO omits `output`, which the implement briefing needs to feed a failure
+/// back to the next attempt).
+pub async fn latest_for_task(
+    conn: &sea_orm::DatabaseConnection,
+    task_artifact_id: i32,
+) -> Result<Option<loop_validation_run::Model>, DbError> {
+    Ok(loop_validation_run::Entity::find()
+        .filter(loop_validation_run::Column::TaskArtifactId.eq(task_artifact_id))
+        .order_by_desc(loop_validation_run::Column::Id)
+        .one(conn)
+        .await?)
+}
