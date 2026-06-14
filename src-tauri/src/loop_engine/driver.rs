@@ -677,13 +677,29 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
         {
             Ok(TickOutcome::Stop) => break,
             Ok(TickOutcome::AutoMerge) => {
-                // Land the finalized work without a human gate. `merge_issue`
-                // moves the issue to a terminal (or blocked) state, so re-tick
-                // immediately — the next tick observes the new status and stops.
-                // On error, fall through and park to avoid busy-spinning on a
-                // transient failure (a later wake retries).
+                // Land the finalized work without a human gate. On success, only
+                // re-tick immediately if the merge actually advanced the issue out
+                // of `running` (→ Done, or → Blocked on a merge fault); the next
+                // tick then observes that state and stops. If it returned Ok yet
+                // left the issue `running` (a lost-CAS race, or a future merge
+                // variant that defers), DON'T `continue` — that would re-attempt
+                // the same merge every tick with no wait. Fall through to park
+                // instead. On error, park too (a later wake retries).
                 match engine.merge_issue(issue_id).await {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        let still_running = loop_issue::Entity::find_by_id(issue_id)
+                            .one(&engine.db.conn)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|i| i.status == IssueStatus::Running);
+                        if !still_running {
+                            continue; // advanced (or gone) → re-tick to stop
+                        }
+                        eprintln!(
+                            "[loop][driver] auto-merge for issue {issue_id} returned Ok but it is still running; parking instead of busy-looping"
+                        );
+                    }
                     Err(e) => {
                         eprintln!("[loop][driver] auto-merge failed for issue {issue_id}: {e}");
                     }
