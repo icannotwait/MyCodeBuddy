@@ -58,7 +58,7 @@ impl LoopEngine {
             Ok(Some(it)) => it,
             Ok(None) => return,
             Err(e) => {
-                eprintln!("[loop] on_question_request iteration lookup failed: {e}");
+                tracing::warn!(error = %e, "on_question_request: iteration lookup failed");
                 return;
             }
         };
@@ -101,7 +101,7 @@ impl LoopEngine {
         )
         .await
         {
-            eprintln!("[loop] on_question_request upsert_inbox failed: {e}");
+            tracing::warn!(error = %e, "on_question_request: upsert_inbox failed");
             return;
         }
         self.emit_changed(iter.space_id, iter.issue_id, "question_raised");
@@ -123,7 +123,7 @@ impl LoopEngine {
             Ok(Some(c)) => c,
             Ok(None) => return,
             Err(e) => {
-                eprintln!("[loop] on_question_resolved lookup failed: {e}");
+                tracing::warn!(error = %e, "on_question_resolved: lookup failed");
                 return;
             }
         };
@@ -134,7 +134,7 @@ impl LoopEngine {
         )
         .await
         {
-            eprintln!("[loop] on_question_resolved handle_inbox failed: {e}");
+            tracing::warn!(error = %e, "on_question_resolved: handle_inbox failed");
             return;
         }
         self.emit_changed(card.space_id, card.issue_id, "question_resolved");

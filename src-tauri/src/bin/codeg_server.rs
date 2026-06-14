@@ -38,6 +38,10 @@ fn main() {
         return;
     }
 
+    // Structured logging (§2.10a). After the early-exit fast paths so
+    // `--version` output stays clean; idempotent `try_init`.
+    codeg_lib::observability::init_tracing();
+
     // PATH initialisation MUST happen before the tokio runtime is created.
     // std::env::set_var is not thread-safe (unsafe in Rust edition 2024);
     // #[tokio::main] would spawn worker threads before we reach this point.

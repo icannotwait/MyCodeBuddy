@@ -85,7 +85,7 @@ async fn restore_worktree_clean(db: &AppDatabase, issue: &loop_issue::Model) {
         Ok(Some(f)) => f,
         Ok(None) => return,
         Err(e) => {
-            eprintln!("[loop] recover: worktree folder {folder_id} lookup failed: {e}");
+            tracing::warn!(folder_id, error = %e, "recover: worktree folder lookup failed");
             return;
         }
     };
@@ -94,7 +94,7 @@ async fn restore_worktree_clean(db: &AppDatabase, issue: &loop_issue::Model) {
         return;
     }
     if let Err(e) = worktree::reset_to_head(path).await {
-        eprintln!("[loop] recover: reset worktree {} failed: {e}", folder.path);
+        tracing::warn!(path = %folder.path, error = %e, "recover: reset worktree failed");
     }
 }
 

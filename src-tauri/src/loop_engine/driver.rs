@@ -22,6 +22,7 @@ use chrono::Utc;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration, MissedTickBehavior};
+use tracing::Instrument;
 
 use crate::acp::manager::{ConnectionManager, TurnLiveness};
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
@@ -322,28 +323,32 @@ pub(crate) async fn reconcile_orphaned_iterations<L: IterationLiveness>(
                 // can decide; the iteration itself is left untouched.
                 if let Some(threshold) = stall_alert_secs {
                     if let Err(e) = maybe_file_stall_alert(db, emitter, &it, threshold).await {
-                        eprintln!("[loop][reconcile] stall alert for {} failed: {e}", it.id);
+                        tracing::warn!(iteration_id = it.id, error = %e, "reconcile: stall alert failed");
                     }
                 }
             }
             TurnLiveness::Idle => {
-                eprintln!(
-                    "[loop][reconcile] settling idle-but-unsettled iteration {} (issue {issue_id}, conv {cid}): turn finished, event missed",
-                    it.id
+                tracing::debug!(
+                    iteration_id = it.id,
+                    issue_id,
+                    conv = cid,
+                    "reconcile: settling idle-but-unsettled iteration (turn finished, event missed)"
                 );
                 if let Err(e) = settle_iteration(db, emitter, it.id).await {
-                    eprintln!("[loop][reconcile] settle {} failed: {e}", it.id);
+                    tracing::warn!(iteration_id = it.id, error = %e, "reconcile: settle failed");
                 }
             }
             TurnLiveness::Missing => {
-                eprintln!(
-                    "[loop][reconcile] abandoning orphaned iteration {} (issue {issue_id}, conv {cid}): no live connection",
-                    it.id
+                tracing::warn!(
+                    iteration_id = it.id,
+                    issue_id,
+                    conv = cid,
+                    "reconcile: abandoning orphaned iteration (no live connection)"
                 );
                 if let Err(e) =
                     settle_iteration_as(db, emitter, it.id, SettleResolution::Abandoned).await
                 {
-                    eprintln!("[loop][reconcile] abandon {} failed: {e}", it.id);
+                    tracing::warn!(iteration_id = it.id, error = %e, "reconcile: abandon failed");
                 }
             }
         }
@@ -416,7 +421,7 @@ pub(crate) async fn tick_once(
     let Some(worktree_folder_id) = issue.worktree_folder_id else {
         // No worktree yet (trigger sets it up before starting the driver). Can't
         // make progress; idle until a wake.
-        eprintln!("[loop][driver] issue {issue_id} has no worktree folder; idling");
+        tracing::debug!(issue_id, "driver: issue has no worktree folder; idling");
         return Ok(TickOutcome::Idle);
     };
 
@@ -595,9 +600,10 @@ async fn recover_undecided_triage(
     let attempts = triage.len() as i32;
     let max = config.max_attempts as i32; // 0 = unlimited
     if max == 0 || attempts < max {
-        eprintln!(
-            "[loop][triage] issue {} undecided after {attempts} triage attempt(s); re-dispatching",
-            issue.id
+        tracing::debug!(
+            issue_id = issue.id,
+            attempts,
+            "triage: undecided; re-dispatching"
         );
         let spec = resolve_agent_spec(config, Stage::Triage);
         let dispatched = dispatch_iteration(
@@ -626,9 +632,10 @@ async fn recover_undecided_triage(
         });
     }
     // Bound hit → block + inbox card (the human can retry or cancel).
-    eprintln!(
-        "[loop][triage] issue {} gave up after {attempts} triage attempts with no route; blocking",
-        issue.id
+    tracing::warn!(
+        issue_id = issue.id,
+        attempts,
+        "triage: gave up with no route; blocking"
     );
     cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
     inbox::upsert_inbox(
@@ -672,7 +679,7 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
             reconcile_orphaned_iterations(&engine.db, &engine.emitter, &engine.manager, issue_id)
                 .await
         {
-            eprintln!("[loop][driver] reconcile failed for issue {issue_id}: {e}");
+            tracing::warn!(issue_id, error = %e, "driver: reconcile failed");
         }
         // §2.7 backfill: re-read and charge any iterations whose token total was
         // left pending (session file wasn't flushed at settle time). Cheap —
@@ -684,7 +691,7 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
         )
         .await
         {
-            eprintln!("[loop][tokens] reconcile failed for issue {issue_id}: {e}");
+            tracing::warn!(issue_id, error = %e, "driver: pending-token reconcile failed");
         }
         match tick_once(
             &engine.db,
@@ -693,6 +700,7 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
             &engine.emitter,
             issue_id,
         )
+        .instrument(tracing::info_span!("loop_tick", issue_id))
         .await
         {
             Ok(TickOutcome::Stop) => break,
@@ -716,18 +724,19 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
                         if !still_running {
                             continue; // advanced (or gone) → re-tick to stop
                         }
-                        eprintln!(
-                            "[loop][driver] auto-merge for issue {issue_id} returned Ok but it is still running; parking instead of busy-looping"
+                        tracing::warn!(
+                            issue_id,
+                            "driver: auto-merge returned Ok but issue still running; parking instead of busy-looping"
                         );
                     }
                     Err(e) => {
-                        eprintln!("[loop][driver] auto-merge failed for issue {issue_id}: {e}");
+                        tracing::warn!(issue_id, error = %e, "driver: auto-merge failed");
                     }
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[loop][driver] tick failed for issue {issue_id}: {e}");
+                tracing::warn!(issue_id, error = %e, "driver: tick failed");
             }
         }
         // Park until an iteration settles (the completion watcher fires `wake`)

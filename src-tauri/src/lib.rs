@@ -14,6 +14,7 @@ pub mod keyring_store;
 pub mod loop_engine;
 pub mod models;
 mod network;
+pub mod observability;
 pub mod parsers;
 pub mod paths;
 pub mod pet_sessions;
@@ -197,6 +198,7 @@ mod tauri_app {
             // same download progress; lets the upgrade UI survive navigation.
             .manage(crate::update::new_update_state_handle())
             .setup(|app| {
+                crate::observability::init_tracing();
                 let app_data_dir = app.path().app_data_dir()?;
 
                 // Unify the data root across every consumer:

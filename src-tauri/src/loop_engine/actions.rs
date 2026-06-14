@@ -194,7 +194,7 @@ impl LoopEngine {
         if let Err(e) =
             worktree::remove_worktree(Path::new(&repo.path), Path::new(&folder.path)).await
         {
-            eprintln!("[loop] cancel: remove worktree {} failed: {e}", folder.path);
+            tracing::warn!(path = %folder.path, error = %e, "cancel: remove worktree failed");
         }
     }
 
@@ -215,7 +215,7 @@ impl LoopEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                eprintln!("[loop] cancel: load in-flight iterations failed: {e}");
+                tracing::warn!(error = %e, "cancel: load in-flight iterations failed");
                 return;
             }
         };
@@ -225,7 +225,7 @@ impl LoopEngine {
             };
             if let Some(conn_id) = self.manager.find_connection_by_conversation_id(cid).await {
                 if let Err(e) = self.manager.disconnect(&conn_id).await {
-                    eprintln!("[loop] cancel: disconnect {conn_id} failed: {e}");
+                    tracing::warn!(conn_id = %conn_id, error = %e, "cancel: disconnect failed");
                 }
             }
         }

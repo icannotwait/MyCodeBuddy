@@ -405,8 +405,11 @@ async fn set_task_status_cas(
 ) -> Result<bool, LoopError> {
     let applied = cas_artifact_status(&db.conn, task_id, from, to).await?;
     if !applied {
-        eprintln!(
-            "[loop][gates] task {task_id} status CAS {from:?} → {to:?} did not apply (unexpected current status)"
+        tracing::warn!(
+            task_id,
+            from = ?from,
+            to = ?to,
+            "task status CAS did not apply (unexpected current status)"
         );
     }
     Ok(applied)

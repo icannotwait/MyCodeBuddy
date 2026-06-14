@@ -167,7 +167,7 @@ impl LoopEngine {
                     self.start_issue(issue_id).await;
                 }
             }
-            Err(e) => eprintln!("[loop] recover_on_boot failed: {e}"),
+            Err(e) => tracing::error!(error = %e, "recover_on_boot failed"),
         }
     }
 
@@ -187,7 +187,7 @@ impl LoopEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                eprintln!("[loop][supervisor] failed to list running issues: {e}");
+                tracing::warn!(error = %e, "supervisor: listing running issues failed");
                 return;
             }
         };
@@ -199,9 +199,9 @@ impl LoopEngine {
             match drivers.get(&issue.id) {
                 Some(h) if !h.abort.is_finished() => {} // a live driver is already on it
                 _ => {
-                    eprintln!(
-                        "[loop][supervisor] (re)spawning driver for running issue {}",
-                        issue.id
+                    tracing::warn!(
+                        issue_id = issue.id,
+                        "supervisor: (re)spawning driver for running issue"
                     );
                     self.spawn_driver_into(&mut drivers, issue.id);
                 }
@@ -243,7 +243,7 @@ impl LoopEngine {
         {
             Ok(ids) => ids,
             Err(e) => {
-                eprintln!("[loop][lag-sweep] listing in-flight issues failed: {e}");
+                tracing::warn!(error = %e, "lag sweep: listing in-flight issues failed");
                 return;
             }
         };
@@ -252,7 +252,7 @@ impl LoopEngine {
                 driver::reconcile_orphaned_iterations(&self.db, &self.emitter, &self.manager, issue_id)
                     .await
             {
-                eprintln!("[loop][lag-sweep] reconcile failed for issue {issue_id}: {e}");
+                tracing::warn!(issue_id, error = %e, "lag sweep: reconcile failed");
             }
         }
     }
@@ -307,8 +307,9 @@ impl LoopEngine {
                     // in-flight iterations so settlement stays timely without
                     // waiting for the per-issue heartbeat cadence (§2.1).
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!(
-                            "[loop][watcher] lagged; dropped {n} events, running in-flight reconcile sweep"
+                        tracing::warn!(
+                            dropped = n,
+                            "completion watcher lagged; running in-flight reconcile sweep"
                         );
                         engine.reconcile_all_inflight().await;
                     }
@@ -327,12 +328,12 @@ impl LoopEngine {
         let Some((state, _)) = self.manager.get_state_and_emitter(connection_id).await else {
             // Connection state already gone (e.g. teardown raced this event); the
             // driver's periodic reconcile will settle the iteration instead.
-            eprintln!("[loop][turn] no connection state for {connection_id} (already torn down?)");
+            tracing::debug!(connection_id, "turn complete: no connection state (already torn down?)");
             return;
         };
         let conversation_id = state.read().await.conversation_id;
         let Some(cid) = conversation_id else {
-            eprintln!("[loop][turn] connection {connection_id} has no conversation_id");
+            tracing::debug!(connection_id, "turn complete: connection has no conversation_id");
             return;
         };
         // DB-authoritative: is this conversation a running loop iteration?
@@ -347,16 +348,17 @@ impl LoopEngine {
             // settled by the reconcile) — nothing to do.
             Ok(None) => return,
             Err(e) => {
-                eprintln!("[loop] on_turn_complete iteration lookup failed: {e}");
+                tracing::warn!(error = %e, "on_turn_complete: iteration lookup failed");
                 return;
             }
         };
         if let Err(e) = self.settle_iteration(iter.id).await {
-            eprintln!("[loop] settle iteration {} failed: {e}", iter.id);
+            tracing::warn!(iteration_id = iter.id, error = %e, "settle iteration failed");
         } else {
-            eprintln!(
-                "[loop][turn] settled iteration {} (issue {})",
-                iter.id, iter.issue_id
+            tracing::debug!(
+                iteration_id = iter.id,
+                issue_id = iter.issue_id,
+                "settled iteration on turn complete"
             );
         }
         self.wake(iter.issue_id).await;
