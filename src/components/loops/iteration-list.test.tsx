@@ -20,7 +20,9 @@ vi.mock("@/lib/loops-api", () => ({
   listLoopValidations: (...a: unknown[]) => listLoopValidations(...a),
 }))
 
-vi.mock("@/hooks/use-loop-changed", () => ({ useLoopChanged: () => {} }))
+vi.mock("@/components/loops/loop-realtime-context", () => ({
+  useLoopRealtime: () => ({ register: () => () => {} }),
+}))
 
 // The viewer is exercised by its own tests; here we only assert it is opened
 // with the right conversation id.

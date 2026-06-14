@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useState } from "react"
 import { useTranslations } from "next-intl"
 import { ChevronLeft, Settings2 } from "lucide-react"
 
@@ -11,7 +11,7 @@ import type {
   LoopInboxItemRow,
   LoopSpaceSummary,
 } from "@/lib/types"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { IssueList } from "@/components/loops/issue-list"
@@ -63,27 +63,15 @@ export function SpaceDetail({
   const [defaultsOpen, setDefaultsOpen] = useState(false)
   const [selectedIssueId, setSelectedIssueId] = useState<number | null>(null)
   const [openIteration, setOpenIteration] = useState<OpenIteration | null>(null)
-  const [artifacts, setArtifacts] = useState<LoopArtifactRow[]>([])
   const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(
     null
   )
 
-  const refreshArtifacts = useCallback(() => {
-    // setState lives in the promise callback, never the synchronous effect body.
-    listLoopArtifacts(space.id)
-      .then(setArtifacts)
-      .catch(() => {
-        // non-fatal; the list's empty state covers it
-      })
-  }, [space.id])
-
-  useEffect(() => {
-    refreshArtifacts()
-  }, [refreshArtifacts])
-
-  useLoopChanged(() => {
-    refreshArtifacts()
-  }, space.id)
+  // The space-wide artifact list, kept live by the realtime provider.
+  const { data: artifacts } = useLoopResource<LoopArtifactRow[]>(
+    () => listLoopArtifacts(space.id),
+    { match: (e) => e.space_id === space.id, initial: [], deps: [space.id] }
+  )
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">

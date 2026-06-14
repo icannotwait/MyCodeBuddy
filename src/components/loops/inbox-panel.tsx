@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Loader2 } from "lucide-react"
@@ -17,7 +17,7 @@ import {
 } from "@/lib/loops-api"
 import type { LoopInboxItemRow } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -107,31 +107,24 @@ export function InboxPanel({
   const tToasts = useTranslations("Loops.toasts")
   const tCommon = useTranslations("Loops.common")
 
-  const [items, setItems] = useState<LoopInboxItemRow[]>([])
-  const [loading, setLoading] = useState(true)
   const [busyId, setBusyId] = useState<number | null>(null)
   const [rejecting, setRejecting] = useState<LoopInboxItemRow | null>(null)
   const [comment, setComment] = useState("")
   const [budgeting, setBudgeting] = useState<LoopInboxItemRow | null>(null)
   const [budgetAmount, setBudgetAmount] = useState("")
 
-  const refresh = useCallback(async () => {
-    try {
-      setItems(await listLoopInbox(spaceId, "pending"))
-    } catch {
-      // listing failures are non-fatal here; the empty state covers it
-    } finally {
-      setLoading(false)
-    }
-  }, [spaceId])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
-  }, spaceId)
+  // Pending inbox for this space, kept live by the realtime provider. This is
+  // load-bearing: the engine ARCHIVES cards (resolving a question, unblocking),
+  // which must disappear here at once; and a reconnect re-syncs the pane so
+  // cards filed or cleared during a disconnect window aren't missed.
+  const {
+    data: items,
+    loading,
+    refetch,
+  } = useLoopResource<LoopInboxItemRow[]>(
+    () => listLoopInbox(spaceId, "pending"),
+    { match: (e) => e.space_id === spaceId, initial: [], deps: [spaceId] }
+  )
 
   // Split into the two panes, deduping defensively (the backend's partial unique
   // index already forbids two pending cards with the same issue/kind/subject).
@@ -154,7 +147,7 @@ export function InboxPanel({
     try {
       await fn()
       toast.success(tToasts("inboxResolved"))
-      await refresh()
+      refetch()
     } catch (err) {
       toast.error(tToasts("actionFailed", { message: toErrorMessage(err) }))
     } finally {

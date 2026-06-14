@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Loader2, MoreVertical, Play, Plus, Trash2 } from "lucide-react"
@@ -17,7 +17,7 @@ import type {
   LoopIssueStatus,
 } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -83,8 +83,6 @@ export function IssueList({
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const [issues, setIssues] = useState<LoopIssueRow[]>([])
-  const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState<Set<LoopIssueStatus>>(
     () => new Set(DEFAULT_FILTER)
   )
@@ -92,25 +90,20 @@ export function IssueList({
   const [deleting, setDeleting] = useState<LoopIssueRow | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
 
-  const refresh = useCallback(async () => {
-    try {
-      const statuses = filter.size > 0 ? [...filter] : undefined
-      const list = await listLoopIssues(spaceId, statuses)
-      setIssues(list)
-    } catch {
-      // listing failures are non-fatal here; the empty state covers it
-    } finally {
-      setLoading(false)
+  // Issues for this space + status filter, kept live by the realtime provider.
+  // Refetches when an event lands in this space or the filter changes.
+  const {
+    data: issues,
+    loading,
+    refetch,
+  } = useLoopResource<LoopIssueRow[]>(
+    () => listLoopIssues(spaceId, filter.size > 0 ? [...filter] : undefined),
+    {
+      match: (e) => e.space_id === spaceId,
+      initial: [],
+      deps: [spaceId, filter],
     }
-  }, [spaceId, filter])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
-  }, spaceId)
+  )
 
   const toggleStatus = (status: LoopIssueStatus) => {
     setFilter((prev) => {
@@ -136,7 +129,7 @@ export function IssueList({
     try {
       await deleteLoopIssue(deleting.id)
       setDeleting(null)
-      await refresh()
+      refetch()
     } catch (err) {
       toast.error(
         tToasts("issueDeleteFailed", { message: toErrorMessage(err) })
@@ -266,7 +259,7 @@ export function IssueList({
         open={createOpen}
         onOpenChange={setCreateOpen}
         onCreated={(issue) => {
-          void refresh()
+          refetch()
           onSelectIssue(issue.id)
         }}
       />

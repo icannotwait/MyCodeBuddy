@@ -13,6 +13,10 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }))
 
+vi.mock("@/components/loops/loop-realtime-context", () => ({
+  useLoopRealtime: () => ({ register: () => () => {} }),
+}))
+
 // MessageResponse (Streamdown) pulls in the link-safety hook (workspace
 // context) and heavy markdown deps jsdom lacks; stub it to a passthrough that
 // renders the raw content so content assertions stay simple.

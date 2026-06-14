@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { Ban, Loader2, Pause, Play, Settings2 } from "lucide-react"
 import { toast } from "sonner"
@@ -22,7 +22,7 @@ import type {
   LoopLinkRow,
 } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { DagGraph } from "@/components/loops/dag-graph"
@@ -47,6 +47,20 @@ import {
   IssueStatusBadge,
 } from "@/components/loops/issue-badges"
 
+interface IssueDetailData {
+  detail: LoopIssueDetail | null
+  artifacts: LoopArtifactRow[]
+  links: LoopLinkRow[]
+  iterations: LoopIterationRow[]
+}
+
+const EMPTY_ISSUE_DETAIL: IssueDetailData = {
+  detail: null,
+  artifacts: [],
+  links: [],
+  iterations: [],
+}
+
 export function IssueDetail({
   issueId,
   spaceDefaultConfig = null,
@@ -61,11 +75,6 @@ export function IssueDetail({
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const [issue, setIssue] = useState<LoopIssueDetail | null>(null)
-  const [artifacts, setArtifacts] = useState<LoopArtifactRow[]>([])
-  const [links, setLinks] = useState<LoopLinkRow[]>([])
-  const [iterations, setIterations] = useState<LoopIterationRow[]>([])
-  const [loading, setLoading] = useState(false)
   const [actionBusy, setActionBusy] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -73,36 +82,36 @@ export function IssueDetail({
     null
   )
 
-  const refresh = useCallback(async () => {
-    if (issueId == null) {
-      setIssue(null)
-      setArtifacts([])
-      setLinks([])
-      setIterations([])
-      return
-    }
-    setLoading(true)
-    try {
+  // Issue detail + DAG + this issue's iterations, kept live by the realtime
+  // provider. Scope is the STABLE `issueId` prop — never derived from the async
+  // detail — and the match keys on this issue's id (every engine event carries
+  // it), structurally eliminating the old "subscribe filtered by a value loaded
+  // asynchronously" bug that left the board frozen.
+  const { data, loading } = useLoopResource<IssueDetailData>(
+    async () => {
+      if (issueId == null) return EMPTY_ISSUE_DETAIL
       const [detail, dag] = await Promise.all([
         getLoopIssue(issueId),
         getLoopDag(issueId),
       ])
-      setIssue(detail)
-      setArtifacts(dag.artifacts)
-      setLinks(dag.links)
+      if (!detail) return EMPTY_ISSUE_DETAIL
       // Iterations drive the "executing now" highlight (read-stage artifacts
-      // land done/pending, so status alone can't show a live node). A failure
-      // here is non-fatal — the graph still renders without the highlight.
-      const iters = detail
-        ? await listLoopIterations(detail.space_id, issueId).catch(
-            () => [] as LoopIterationRow[]
-          )
-        : []
-      setIterations(iters)
-    } finally {
-      setLoading(false)
+      // land done/pending, so status alone can't show a live node). Non-fatal:
+      // the graph still renders without the highlight.
+      const iterations = await listLoopIterations(
+        detail.space_id,
+        issueId
+      ).catch(() => [] as LoopIterationRow[])
+      return { detail, artifacts: dag.artifacts, links: dag.links, iterations }
+    },
+    {
+      match: (e) => e.issue_id === issueId,
+      initial: EMPTY_ISSUE_DETAIL,
+      deps: [issueId],
     }
-  }, [issueId])
+  )
+  const issue = data.detail
+  const { artifacts, links, iterations } = data
 
   // Artifact ids with a live iteration: a target node for non-triage stages, or
   // the issue root while triage runs (triage targets the whole issue).
@@ -116,14 +125,6 @@ export function IssueDetail({
     }
     return ids
   }, [iterations, artifacts])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
-  }, issue?.space_id)
 
   // Run an engine action; the resulting `loop://changed` event refreshes the
   // view. `onOk` carries any success-only side effect (e.g. a toast).

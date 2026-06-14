@@ -15,7 +15,12 @@ const { stableT, listLoopSpaces, deleteLoopSpace } = vi.hoisted(() => ({
 
 vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
-vi.mock("@/hooks/use-loop-changed", () => ({ useLoopChanged: () => {} }))
+// LoopsWorkbench now mounts the real LoopRealtimeProvider, whose effect calls
+// the platform transport. Stub it so no real WS/IPC is touched in the test.
+vi.mock("@/lib/platform", () => ({
+  subscribe: vi.fn().mockResolvedValue(() => {}),
+  onTransportReconnect: vi.fn(() => null),
+}))
 vi.mock("@/lib/loops-api", () => ({ listLoopSpaces, deleteLoopSpace }))
 vi.mock("@/components/loops/space-detail", () => ({
   SpaceDetail: ({ space }: { space: LoopSpaceSummary }) => (

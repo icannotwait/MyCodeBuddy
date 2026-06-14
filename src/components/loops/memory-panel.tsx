@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Archive, ArchiveRestore, Loader2, Plus, Trash2 } from "lucide-react"
@@ -13,7 +13,7 @@ import {
 } from "@/lib/loops-api"
 import type { LoopMemoryKind, LoopMemoryRow } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -57,8 +57,6 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const [items, setItems] = useState<LoopMemoryRow[]>([])
-  const [loading, setLoading] = useState(true)
   const [busyId, setBusyId] = useState<number | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [kind, setKind] = useState<LoopMemoryKind>("decision")
@@ -66,23 +64,17 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
   const [content, setContent] = useState("")
   const [creating, setCreating] = useState(false)
 
-  const refresh = useCallback(async () => {
-    try {
-      setItems(await listLoopMemory(spaceId))
-    } catch {
-      // non-fatal; the empty state covers it
-    } finally {
-      setLoading(false)
-    }
-  }, [spaceId])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
-  }, spaceId)
+  // Space memory, kept live by the realtime provider (agent-proposed entries
+  // arrive via the iteration that wrote them, which carries this space id).
+  const {
+    data: items,
+    loading,
+    refetch,
+  } = useLoopResource<LoopMemoryRow[]>(() => listLoopMemory(spaceId), {
+    match: (e) => e.space_id === spaceId,
+    initial: [],
+    deps: [spaceId],
+  })
 
   const create = async () => {
     if (!title.trim()) return
@@ -99,7 +91,7 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
       setTitle("")
       setContent("")
       setKind("decision")
-      await refresh()
+      refetch()
     } catch (err) {
       toast.error(tToasts("actionFailed", { message: toErrorMessage(err) }))
     } finally {
@@ -112,7 +104,7 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
     try {
       await fn()
       toast.success(ok)
-      await refresh()
+      refetch()
     } catch (err) {
       toast.error(tToasts("actionFailed", { message: toErrorMessage(err) }))
     } finally {

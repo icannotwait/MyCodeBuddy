@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { ChevronDown, ChevronRight, Loader2, MessageSquare } from "lucide-react"
 
@@ -14,13 +14,25 @@ import type {
   LoopIterationRow,
   LoopValidationRunRow,
 } from "@/lib/types"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import {
   ArtifactStatusBadge,
   IterationStatusBadge,
 } from "@/components/loops/issue-badges"
 import { IterationDialog } from "@/components/loops/iteration-dialog"
+
+interface IterationListData {
+  iterations: LoopIterationRow[]
+  artifacts: LoopArtifactRow[]
+  validations: LoopValidationRunRow[]
+}
+
+const EMPTY_ITER_DATA: IterationListData = {
+  iterations: [],
+  artifacts: [],
+  validations: [],
+}
 
 /**
  * List of loop iterations — every iteration in a space, or one issue's when
@@ -38,39 +50,31 @@ export function IterationList({
   const t = useTranslations("Loops.iterationList")
   const tStage = useTranslations("Loops.stage")
 
-  const [iterations, setIterations] = useState<LoopIterationRow[]>([])
-  const [artifacts, setArtifacts] = useState<LoopArtifactRow[]>([])
-  const [validations, setValidations] = useState<LoopValidationRunRow[]>([])
-  const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [openConversationId, setOpenConversationId] = useState<number | null>(
     null
   )
 
-  const refresh = useCallback(async () => {
-    try {
-      const [its, arts, vals] = await Promise.all([
+  // Iterations + their produced artifacts + validation runs, kept live by the
+  // realtime provider. When scoped to one issue, match on its id; otherwise on
+  // the whole space.
+  const { data, loading } = useLoopResource<IterationListData>(
+    async () => {
+      const [iterations, artifacts, validations] = await Promise.all([
         listLoopIterations(spaceId, issueId),
         listLoopArtifacts(spaceId),
         listLoopValidations(spaceId),
       ])
-      setIterations(its)
-      setArtifacts(arts)
-      setValidations(vals)
-    } catch {
-      // non-fatal; the empty state covers a listing failure
-    } finally {
-      setLoading(false)
+      return { iterations, artifacts, validations }
+    },
+    {
+      match: (e) =>
+        issueId != null ? e.issue_id === issueId : e.space_id === spaceId,
+      initial: EMPTY_ITER_DATA,
+      deps: [spaceId, issueId],
     }
-  }, [spaceId, issueId])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
-  }, spaceId)
+  )
+  const { iterations, artifacts, validations } = data
 
   // Group produced artifacts + validation runs by iteration for the expansions.
   const byIteration = useMemo(() => {

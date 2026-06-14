@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
@@ -16,7 +16,8 @@ import {
 import { deleteLoopSpace, listLoopSpaces } from "@/lib/loops-api"
 import type { LoopSpaceSummary } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
-import { useLoopChanged } from "@/hooks/use-loop-changed"
+import { LoopRealtimeProvider } from "@/components/loops/loop-realtime-context"
+import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -38,36 +39,36 @@ import {
 import { SpaceFormDialog } from "@/components/loops/space-form-dialog"
 import { SpaceDetail } from "@/components/loops/space-detail"
 
+/** Roots the single loop realtime subscription for every loop surface below. */
 export function LoopsWorkbench() {
+  return (
+    <LoopRealtimeProvider>
+      <LoopsWorkbenchInner />
+    </LoopRealtimeProvider>
+  )
+}
+
+function LoopsWorkbenchInner() {
   const t = useTranslations("Loops.workbench")
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const [spaces, setSpaces] = useState<LoopSpaceSummary[]>([])
-  const [loading, setLoading] = useState(true)
   const [selectedSpaceId, setSelectedSpaceId] = useState<number | null>(null)
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<LoopSpaceSummary | null>(null)
   const [deleting, setDeleting] = useState<LoopSpaceSummary | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
 
-  const refresh = useCallback(async () => {
-    try {
-      const list = await listLoopSpaces()
-      setSpaces(list)
-    } catch (err) {
-      toast.error(t("loadFailed", { message: toErrorMessage(err) }))
-    } finally {
-      setLoading(false)
-    }
-  }, [t])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
-  useLoopChanged(() => {
-    void refresh()
+  // Space summaries (issue/running counts, detached flag) change on any loop
+  // event, so the space list invalidates on all of them. A failed refetch keeps
+  // the last good list (the hook never blanks); reconnect re-syncs it.
+  const {
+    data: spaces,
+    loading,
+    refetch,
+  } = useLoopResource<LoopSpaceSummary[]>(() => listLoopSpaces(), {
+    match: () => true,
+    initial: [],
   })
 
   const selectedSpace = useMemo(
@@ -89,7 +90,7 @@ export function LoopsWorkbench() {
       await deleteLoopSpace(deleting.id)
       if (selectedSpaceId === deleting.id) setSelectedSpaceId(null)
       setDeleting(null)
-      await refresh()
+      refetch()
     } catch (err) {
       toast.error(
         tToasts("spaceDeleteFailed", { message: toErrorMessage(err) })
@@ -161,7 +162,7 @@ export function LoopsWorkbench() {
         onOpenChange={setFormOpen}
         space={editing}
         onSaved={(saved) => {
-          void refresh()
+          refetch()
           if (!editing) setSelectedSpaceId(saved.id)
         }}
       />

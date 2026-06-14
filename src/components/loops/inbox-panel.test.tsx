@@ -30,7 +30,9 @@ const {
 
 vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
-vi.mock("@/hooks/use-loop-changed", () => ({ useLoopChanged: () => {} }))
+vi.mock("@/components/loops/loop-realtime-context", () => ({
+  useLoopRealtime: () => ({ register: () => () => {} }),
+}))
 vi.mock("@/lib/loops-api", () => ({
   listLoopInbox,
   approveLoopDesign,
