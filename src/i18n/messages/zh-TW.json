@@ -3011,7 +3011,8 @@
       "inboxResolved": "已處理。",
       "configSaved": "設定已儲存。",
       "memorySaved": "已儲存。",
-      "memoryDeleted": "已刪除。"
+      "memoryDeleted": "已刪除。",
+      "spaceDefaultSaved": "已儲存空間預設設定。"
     },
     "common": {
       "cancel": "取消",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "每回合 Token 預算",
       "tokenBudget": "總 Token 預算",
       "unlimitedPlaceholder": "不限",
-      "save": "儲存"
+      "save": "儲存",
+      "useSpaceDefault": "使用空間預設",
+      "custom": "自訂",
+      "inheritHint": "此議題沿用空間的預設設定。"
     },
     "stage": {
       "triage": "分診",
@@ -3175,6 +3179,32 @@
       "restore": "還原",
       "archived": "已封存",
       "empty": "暫無記憶。"
+    },
+    "config": {
+      "tabAgents": "智能體",
+      "tabReview": "評審",
+      "tabValidation": "驗證",
+      "tabLimits": "限制"
+    },
+    "reviewers": {
+      "heading": "評審員",
+      "hint": "每個評審員使用各自的智能體與設定執行一次評審。",
+      "empty": "尚無評審員——回退到預設評審智能體。",
+      "add": "新增評審員",
+      "remove": "移除評審員",
+      "rowLabel": "#{n}",
+      "modeLabel": "模式",
+      "defaultOption": "預設（{value}）",
+      "probing": "正在探測選項…",
+      "probeFailed": "無法載入該智能體的選項。",
+      "noConfig": "無可設定項目。"
+    },
+    "spaceDefaults": {
+      "button": "空間預設設定",
+      "title": "空間預設設定",
+      "description": "新議題預設繼承此設定，除非使用自訂設定。",
+      "save": "儲存預設",
+      "resetToDefault": "重設為引擎預設"
     }
   }
 }

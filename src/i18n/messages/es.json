@@ -3011,7 +3011,8 @@
       "inboxResolved": "Hecho.",
       "configSaved": "Configuración guardada.",
       "memorySaved": "Guardado.",
-      "memoryDeleted": "Eliminado."
+      "memoryDeleted": "Eliminado.",
+      "spaceDefaultSaved": "Valores del espacio guardados."
     },
     "common": {
       "cancel": "Cancelar",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "Presupuesto de tokens por turno",
       "tokenBudget": "Presupuesto total de tokens",
       "unlimitedPlaceholder": "Sin límite",
-      "save": "Guardar"
+      "save": "Guardar",
+      "useSpaceDefault": "Usar valor predeterminado del espacio",
+      "custom": "Personalizado",
+      "inheritHint": "Este problema sigue la configuración predeterminada del espacio."
     },
     "stage": {
       "triage": "Triaje",
@@ -3175,6 +3179,32 @@
       "restore": "Restaurar",
       "archived": "Archivada",
       "empty": "Aún no hay memoria."
+    },
+    "config": {
+      "tabAgents": "Agentes",
+      "tabReview": "Revisión",
+      "tabValidation": "Validación",
+      "tabLimits": "Límites"
+    },
+    "reviewers": {
+      "heading": "Revisores",
+      "hint": "Cada revisor ejecuta una revisión con su propio agente y configuración.",
+      "empty": "Aún no hay revisores: se usa el agente de revisión predeterminado.",
+      "add": "Agregar revisor",
+      "remove": "Quitar revisor",
+      "rowLabel": "#{n}",
+      "modeLabel": "Modo",
+      "defaultOption": "Predeterminado ({value})",
+      "probing": "Detectando opciones…",
+      "probeFailed": "No se pudieron cargar las opciones de este agente.",
+      "noConfig": "No hay opciones configurables."
+    },
+    "spaceDefaults": {
+      "button": "Valores del espacio",
+      "title": "Configuración predeterminada del espacio",
+      "description": "Los nuevos problemas la heredan salvo que usen una configuración personalizada.",
+      "save": "Guardar valores",
+      "resetToDefault": "Restablecer al valor del motor"
     }
   }
 }

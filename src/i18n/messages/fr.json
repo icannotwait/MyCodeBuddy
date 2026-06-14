@@ -3011,7 +3011,8 @@
       "inboxResolved": "Terminé.",
       "configSaved": "Paramètres enregistrés.",
       "memorySaved": "Enregistré.",
-      "memoryDeleted": "Supprimé."
+      "memoryDeleted": "Supprimé.",
+      "spaceDefaultSaved": "Valeurs de l'espace enregistrées."
     },
     "common": {
       "cancel": "Annuler",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "Budget de jetons par tour",
       "tokenBudget": "Budget total de jetons",
       "unlimitedPlaceholder": "Illimité",
-      "save": "Enregistrer"
+      "save": "Enregistrer",
+      "useSpaceDefault": "Utiliser la valeur par défaut de l'espace",
+      "custom": "Personnalisé",
+      "inheritHint": "Ce problème suit la configuration par défaut de l'espace."
     },
     "stage": {
       "triage": "Tri",
@@ -3175,6 +3179,32 @@
       "restore": "Restaurer",
       "archived": "Archivée",
       "empty": "Aucune mémoire pour le moment."
+    },
+    "config": {
+      "tabAgents": "Agents",
+      "tabReview": "Relecture",
+      "tabValidation": "Validation",
+      "tabLimits": "Limites"
+    },
+    "reviewers": {
+      "heading": "Relecteurs",
+      "hint": "Chaque relecteur effectue une relecture avec son propre agent et sa configuration.",
+      "empty": "Aucun relecteur — repli sur l'agent de relecture par défaut.",
+      "add": "Ajouter un relecteur",
+      "remove": "Supprimer le relecteur",
+      "rowLabel": "#{n}",
+      "modeLabel": "Mode",
+      "defaultOption": "Par défaut ({value})",
+      "probing": "Détection des options…",
+      "probeFailed": "Impossible de charger les options de cet agent.",
+      "noConfig": "Aucune option configurable."
+    },
+    "spaceDefaults": {
+      "button": "Valeurs de l'espace",
+      "title": "Configuration par défaut de l'espace",
+      "description": "Les nouveaux problèmes en héritent sauf s'ils utilisent une configuration personnalisée.",
+      "save": "Enregistrer les valeurs",
+      "resetToDefault": "Réinitialiser au défaut du moteur"
     }
   }
 }

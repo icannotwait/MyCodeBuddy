@@ -38,6 +38,7 @@ function makeSpace(over: Partial<LoopSpaceSummary> = {}): LoopSpaceSummary {
     running_count: 1,
     last_activity_at: null,
     created_at: "2026-06-13T00:00:00Z",
+    default_config: null,
     ...over,
   }
 }

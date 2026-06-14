@@ -127,6 +127,7 @@ function issue(status: LoopIssueDetail["status"]): LoopIssueDetail {
       token_budget_per_turn: null,
       reviewers: [],
     },
+    config_inherits: false,
     worktree_folder_id: null,
     base_branch: null,
     base_commit: null,

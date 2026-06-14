@@ -3011,7 +3011,8 @@
       "inboxResolved": "완료되었습니다.",
       "configSaved": "설정이 저장되었습니다.",
       "memorySaved": "저장되었습니다.",
-      "memoryDeleted": "삭제되었습니다."
+      "memoryDeleted": "삭제되었습니다.",
+      "spaceDefaultSaved": "스페이스 기본 설정을 저장했습니다."
     },
     "common": {
       "cancel": "취소",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "턴당 토큰 예산",
       "tokenBudget": "총 토큰 예산",
       "unlimitedPlaceholder": "무제한",
-      "save": "저장"
+      "save": "저장",
+      "useSpaceDefault": "스페이스 기본값 사용",
+      "custom": "사용자 지정",
+      "inheritHint": "이 이슈는 스페이스의 기본 설정을 따릅니다."
     },
     "stage": {
       "triage": "트리아지",
@@ -3175,6 +3179,32 @@
       "restore": "복원",
       "archived": "보관됨",
       "empty": "아직 메모리가 없습니다."
+    },
+    "config": {
+      "tabAgents": "에이전트",
+      "tabReview": "검토",
+      "tabValidation": "검증",
+      "tabLimits": "제한"
+    },
+    "reviewers": {
+      "heading": "검토자",
+      "hint": "각 검토자는 자체 에이전트와 설정으로 검토를 한 번 실행합니다.",
+      "empty": "검토자가 없습니다 — 기본 검토 에이전트로 대체됩니다.",
+      "add": "검토자 추가",
+      "remove": "검토자 제거",
+      "rowLabel": "#{n}",
+      "modeLabel": "모드",
+      "defaultOption": "기본값 ({value})",
+      "probing": "옵션 확인 중…",
+      "probeFailed": "이 에이전트의 옵션을 불러올 수 없습니다.",
+      "noConfig": "구성 가능한 옵션이 없습니다."
+    },
+    "spaceDefaults": {
+      "button": "스페이스 기본값",
+      "title": "스페이스 기본 설정",
+      "description": "새 이슈는 사용자 지정 설정을 사용하지 않는 한 이를 상속합니다.",
+      "save": "기본값 저장",
+      "resetToDefault": "엔진 기본값으로 재설정"
     }
   }
 }

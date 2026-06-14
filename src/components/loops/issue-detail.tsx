@@ -15,6 +15,7 @@ import {
   triggerLoopIssue,
 } from "@/lib/loops-api"
 import type {
+  IssueConfig,
   LoopArtifactRow,
   LoopIssueDetail,
   LoopIterationRow,
@@ -46,7 +47,15 @@ import {
   IssueStatusBadge,
 } from "@/components/loops/issue-badges"
 
-export function IssueDetail({ issueId }: { issueId: number | null }) {
+export function IssueDetail({
+  issueId,
+  spaceDefaultConfig = null,
+}: {
+  issueId: number | null
+  /** The space's default config, threaded into the per-issue settings dialog so
+   *  an inheriting issue can preview what it resolves to. */
+  spaceDefaultConfig?: IssueConfig | null
+}) {
   const t = useTranslations("Loops.issueDetail")
   const tList = useTranslations("Loops.issueList")
   const tCommon = useTranslations("Loops.common")
@@ -359,6 +368,7 @@ export function IssueDetail({ issueId }: { issueId: number | null }) {
         open={settingsOpen}
         onOpenChange={setSettingsOpen}
         issue={issue}
+        spaceDefaultConfig={spaceDefaultConfig}
       />
     </div>
   )

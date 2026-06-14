@@ -3011,7 +3011,8 @@
       "inboxResolved": "Done.",
       "configSaved": "Settings saved.",
       "memorySaved": "Saved.",
-      "memoryDeleted": "Deleted."
+      "memoryDeleted": "Deleted.",
+      "spaceDefaultSaved": "Space defaults saved."
     },
     "common": {
       "cancel": "Cancel",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "Token budget per turn",
       "tokenBudget": "Total token budget",
       "unlimitedPlaceholder": "Unlimited",
-      "save": "Save"
+      "save": "Save",
+      "useSpaceDefault": "Use space default",
+      "custom": "Custom",
+      "inheritHint": "This issue follows the space's default config."
     },
     "stage": {
       "triage": "Triage",
@@ -3175,6 +3179,32 @@
       "restore": "Restore",
       "archived": "Archived",
       "empty": "No memory yet."
+    },
+    "config": {
+      "tabAgents": "Agents",
+      "tabReview": "Review",
+      "tabValidation": "Validation",
+      "tabLimits": "Limits"
+    },
+    "reviewers": {
+      "heading": "Reviewers",
+      "hint": "Each reviewer runs one review with its own agent and config.",
+      "empty": "No reviewers yet — falls back to the default review agent.",
+      "add": "Add reviewer",
+      "remove": "Remove reviewer",
+      "rowLabel": "#{n}",
+      "modeLabel": "Mode",
+      "defaultOption": "Default ({value})",
+      "probing": "Probing options…",
+      "probeFailed": "Couldn't load this agent's options.",
+      "noConfig": "No configurable options."
+    },
+    "spaceDefaults": {
+      "button": "Space defaults",
+      "title": "Space default config",
+      "description": "New issues inherit this unless they use a custom config.",
+      "save": "Save defaults",
+      "resetToDefault": "Reset to engine default"
     }
   }
 }

@@ -14,8 +14,19 @@ vi.mock("@/lib/loops-api", () => ({
   updateLoopIssueConfig: (...a: unknown[]) => updateLoopIssueConfig(...a),
 }))
 
-// Dialog/Select/Switch portal + need browser APIs jsdom lacks — stub Dialog as
-// an open-honoring wrapper, Select as a native <select>, Switch as a checkbox.
+// The tabbed form is unit-tested in loop-config-form.test.tsx; here we stub the
+// component (keeping the real config↔form helpers) and focus on the dialog's
+// own logic: inherit/custom toggle, total budget, and the save wiring.
+vi.mock("./loop-config-form", async (orig) => {
+  const real = await orig<typeof import("./loop-config-form")>()
+  return {
+    ...real,
+    LoopConfigForm: ({ disabled }: { disabled?: boolean }) => (
+      <div data-testid="config-form" data-disabled={String(!!disabled)} />
+    ),
+  }
+})
+
 vi.mock("@/components/ui/dialog", () => ({
   Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
     open ? <div>{children}</div> : null,
@@ -33,52 +44,6 @@ vi.mock("@/components/ui/dialog", () => ({
   ),
   DialogDescription: ({ children }: { children: React.ReactNode }) => (
     <div>{children}</div>
-  ),
-}))
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-  }: {
-    value: string
-    onValueChange: (v: string) => void
-    children: React.ReactNode
-  }) => (
-    <select value={value} onChange={(e) => onValueChange(e.target.value)}>
-      {children}
-    </select>
-  ),
-  SelectTrigger: () => null,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: React.ReactNode }) => (
-    <>{children}</>
-  ),
-  SelectItem: ({
-    value,
-    children,
-  }: {
-    value: string
-    children: React.ReactNode
-  }) => <option value={value}>{children}</option>,
-}))
-vi.mock("@/components/ui/switch", () => ({
-  Switch: ({
-    id,
-    checked,
-    onCheckedChange,
-  }: {
-    id?: string
-    checked: boolean
-    onCheckedChange: (v: boolean) => void
-  }) => (
-    <input
-      type="checkbox"
-      role="switch"
-      id={id}
-      checked={checked}
-      onChange={(e) => onCheckedChange(e.target.checked)}
-    />
   ),
 }))
 
@@ -114,6 +79,7 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
     updated_at: "2026-06-14T00:00:00Z",
     description: "",
     config: fullConfig(),
+    config_inherits: false,
     worktree_folder_id: null,
     base_branch: null,
     base_commit: null,
@@ -125,46 +91,19 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
 beforeEach(() => vi.clearAllMocks())
 
 describe("IssueSettingsDialog", () => {
-  it("round-trips the config and total budget on save with no edits", async () => {
+  it("saves a custom config with config_inherits=false", async () => {
     render(
       <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
     )
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig).toHaveBeenCalledWith(5, fullConfig(), 50000)
+      expect(updateLoopIssueConfig).toHaveBeenCalledWith(
+        5,
+        fullConfig(),
+        50000,
+        false
+      )
     )
-  })
-
-  it("persists an edited reviewer count and toggled auto-merge", async () => {
-    render(
-      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
-    )
-    fireEvent.change(screen.getByLabelText("reviewerCount"), {
-      target: { value: "3" },
-    })
-    fireEvent.click(screen.getByRole("switch")) // auto_merge: true -> false
-    fireEvent.click(screen.getByText("save"))
-
-    await waitFor(() => expect(updateLoopIssueConfig).toHaveBeenCalled())
-    const [, config] = updateLoopIssueConfig.mock.calls[0]
-    expect(config.reviewer_count).toBe(3)
-    expect(config.auto_merge).toBe(false)
-  })
-
-  it("adds a validation command", async () => {
-    render(
-      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
-    )
-    fireEvent.click(screen.getByText("addCommand"))
-    const inputs = screen.getAllByPlaceholderText("commandPlaceholder")
-    fireEvent.change(inputs[inputs.length - 1], {
-      target: { value: "pnpm build" },
-    })
-    fireEvent.click(screen.getByText("save"))
-
-    await waitFor(() => expect(updateLoopIssueConfig).toHaveBeenCalled())
-    const [, config] = updateLoopIssueConfig.mock.calls[0]
-    expect(config.validation_commands).toEqual(["pnpm test", "pnpm build"])
   })
 
   it("clears the total budget to unlimited (null)", async () => {
@@ -176,7 +115,57 @@ describe("IssueSettingsDialog", () => {
     })
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig).toHaveBeenCalledWith(5, fullConfig(), null)
+      expect(updateLoopIssueConfig).toHaveBeenCalledWith(
+        5,
+        fullConfig(),
+        null,
+        false
+      )
+    )
+  })
+
+  it("saves with config_inherits=true and a disabled form when inheriting", async () => {
+    render(
+      <IssueSettingsDialog
+        open
+        onOpenChange={() => {}}
+        issue={makeIssue({ config_inherits: true })}
+      />
+    )
+    expect(screen.getByTestId("config-form").dataset.disabled).toBe("true")
+    fireEvent.click(screen.getByText("save"))
+    await waitFor(() => {
+      const call = updateLoopIssueConfig.mock.calls[0]
+      expect(call[0]).toBe(5)
+      expect(call[2]).toBe(50000)
+      expect(call[3]).toBe(true)
+    })
+  })
+
+  it("switches an inheriting issue to custom and saves false", async () => {
+    render(
+      <IssueSettingsDialog
+        open
+        onOpenChange={() => {}}
+        issue={makeIssue({ config_inherits: true })}
+      />
+    )
+    fireEvent.click(screen.getByText("custom"))
+    expect(screen.getByTestId("config-form").dataset.disabled).toBe("false")
+    fireEvent.click(screen.getByText("save"))
+    await waitFor(() =>
+      expect(updateLoopIssueConfig.mock.calls[0][3]).toBe(false)
+    )
+  })
+
+  it("switches a custom issue to space default and saves true", async () => {
+    render(
+      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
+    )
+    fireEvent.click(screen.getByText("useSpaceDefault"))
+    fireEvent.click(screen.getByText("save"))
+    await waitFor(() =>
+      expect(updateLoopIssueConfig.mock.calls[0][3]).toBe(true)
     )
   })
 

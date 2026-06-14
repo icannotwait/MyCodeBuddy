@@ -3011,7 +3011,8 @@
       "inboxResolved": "完了しました。",
       "configSaved": "設定を保存しました。",
       "memorySaved": "保存しました。",
-      "memoryDeleted": "削除しました。"
+      "memoryDeleted": "削除しました。",
+      "spaceDefaultSaved": "スペースの既定設定を保存しました。"
     },
     "common": {
       "cancel": "キャンセル",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "ターンごとのトークン予算",
       "tokenBudget": "トークン予算の合計",
       "unlimitedPlaceholder": "無制限",
-      "save": "保存"
+      "save": "保存",
+      "useSpaceDefault": "スペースの既定を使用",
+      "custom": "カスタム",
+      "inheritHint": "この課題はスペースの既定設定に従います。"
     },
     "stage": {
       "triage": "トリアージ",
@@ -3175,6 +3179,32 @@
       "restore": "復元",
       "archived": "アーカイブ済み",
       "empty": "メモリはまだありません。"
+    },
+    "config": {
+      "tabAgents": "エージェント",
+      "tabReview": "レビュー",
+      "tabValidation": "検証",
+      "tabLimits": "制限"
+    },
+    "reviewers": {
+      "heading": "レビュアー",
+      "hint": "各レビュアーは独自のエージェントと設定で1回レビューを実行します。",
+      "empty": "レビュアーがいません — 既定のレビューエージェントにフォールバックします。",
+      "add": "レビュアーを追加",
+      "remove": "レビュアーを削除",
+      "rowLabel": "#{n}",
+      "modeLabel": "モード",
+      "defaultOption": "既定（{value}）",
+      "probing": "オプションを取得中…",
+      "probeFailed": "このエージェントのオプションを読み込めませんでした。",
+      "noConfig": "設定可能な項目はありません。"
+    },
+    "spaceDefaults": {
+      "button": "スペースの既定設定",
+      "title": "スペースの既定設定",
+      "description": "新しい課題は、カスタム設定を使用しない限りこれを継承します。",
+      "save": "既定を保存",
+      "resetToDefault": "エンジンの既定にリセット"
     }
   }
 }

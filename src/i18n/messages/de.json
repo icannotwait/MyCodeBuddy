@@ -3011,7 +3011,8 @@
       "inboxResolved": "Erledigt.",
       "configSaved": "Einstellungen gespeichert.",
       "memorySaved": "Gespeichert.",
-      "memoryDeleted": "Gelöscht."
+      "memoryDeleted": "Gelöscht.",
+      "spaceDefaultSaved": "Space-Standards gespeichert."
     },
     "common": {
       "cancel": "Abbrechen",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "Token-Budget pro Zug",
       "tokenBudget": "Gesamtes Token-Budget",
       "unlimitedPlaceholder": "Unbegrenzt",
-      "save": "Speichern"
+      "save": "Speichern",
+      "useSpaceDefault": "Space-Standard verwenden",
+      "custom": "Benutzerdefiniert",
+      "inheritHint": "Diese Aufgabe folgt der Standardkonfiguration des Space."
     },
     "stage": {
       "triage": "Sichtung",
@@ -3175,6 +3179,32 @@
       "restore": "Wiederherstellen",
       "archived": "Archiviert",
       "empty": "Noch kein Speicher."
+    },
+    "config": {
+      "tabAgents": "Agenten",
+      "tabReview": "Prüfung",
+      "tabValidation": "Validierung",
+      "tabLimits": "Limits"
+    },
+    "reviewers": {
+      "heading": "Prüfer",
+      "hint": "Jeder Prüfer führt eine Prüfung mit eigenem Agenten und eigener Konfiguration aus.",
+      "empty": "Noch keine Prüfer — Rückfall auf den Standard-Prüfagenten.",
+      "add": "Prüfer hinzufügen",
+      "remove": "Prüfer entfernen",
+      "rowLabel": "#{n}",
+      "modeLabel": "Modus",
+      "defaultOption": "Standard ({value})",
+      "probing": "Optionen werden ermittelt…",
+      "probeFailed": "Optionen dieses Agenten konnten nicht geladen werden.",
+      "noConfig": "Keine konfigurierbaren Optionen."
+    },
+    "spaceDefaults": {
+      "button": "Space-Standards",
+      "title": "Space-Standardkonfiguration",
+      "description": "Neue Aufgaben erben sie, sofern sie keine benutzerdefinierte Konfiguration verwenden.",
+      "save": "Standards speichern",
+      "resetToDefault": "Auf Engine-Standard zurücksetzen"
     }
   }
 }

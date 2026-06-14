@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
-import { ChevronLeft } from "lucide-react"
+import { ChevronLeft, Settings2 } from "lucide-react"
 
 import { listLoopArtifacts } from "@/lib/loops-api"
 import type {
@@ -22,6 +22,7 @@ import { IterationList } from "@/components/loops/iteration-list"
 import { ArtifactList } from "@/components/loops/artifact-list"
 import { MemoryPanel } from "@/components/loops/memory-panel"
 import { ArtifactDrawer } from "@/components/loops/artifact-drawer"
+import { SpaceDefaultsDialog } from "@/components/loops/space-defaults-dialog"
 
 type SpaceTab = "issues" | "iterations" | "artifacts" | "inbox" | "memory"
 
@@ -57,7 +58,9 @@ export function SpaceDetail({
   onBack: () => void
 }) {
   const t = useTranslations("Loops.spaceDetail")
+  const tDefaults = useTranslations("Loops.spaceDefaults")
   const [tab, setTab] = useState<SpaceTab>("issues")
+  const [defaultsOpen, setDefaultsOpen] = useState(false)
   const [selectedIssueId, setSelectedIssueId] = useState<number | null>(null)
   const [openIteration, setOpenIteration] = useState<OpenIteration | null>(null)
   const [artifacts, setArtifacts] = useState<LoopArtifactRow[]>([])
@@ -103,13 +106,24 @@ export function SpaceDetail({
         onValueChange={(v) => setTab(v as SpaceTab)}
         className="flex min-h-0 flex-1 flex-col"
       >
-        <TabsList className="mx-4 mt-2 self-start">
-          <TabsTrigger value="issues">{t("tabIssues")}</TabsTrigger>
-          <TabsTrigger value="iterations">{t("tabIterations")}</TabsTrigger>
-          <TabsTrigger value="artifacts">{t("tabArtifacts")}</TabsTrigger>
-          <TabsTrigger value="inbox">{t("tabInbox")}</TabsTrigger>
-          <TabsTrigger value="memory">{t("tabMemory")}</TabsTrigger>
-        </TabsList>
+        <div className="mx-4 mt-2 flex items-center gap-2 self-start">
+          <TabsList>
+            <TabsTrigger value="issues">{t("tabIssues")}</TabsTrigger>
+            <TabsTrigger value="iterations">{t("tabIterations")}</TabsTrigger>
+            <TabsTrigger value="artifacts">{t("tabArtifacts")}</TabsTrigger>
+            <TabsTrigger value="inbox">{t("tabInbox")}</TabsTrigger>
+            <TabsTrigger value="memory">{t("tabMemory")}</TabsTrigger>
+          </TabsList>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-8 w-8"
+            onClick={() => setDefaultsOpen(true)}
+          >
+            <Settings2 className="h-4 w-4" />
+            <span className="sr-only">{tDefaults("button")}</span>
+          </Button>
+        </div>
 
         <TabsContent
           value="issues"
@@ -124,7 +138,10 @@ export function SpaceDetail({
               />
             </div>
             <div className="min-w-0 flex-1">
-              <IssueDetail issueId={selectedIssueId} />
+              <IssueDetail
+                issueId={selectedIssueId}
+                spaceDefaultConfig={space.default_config}
+              />
             </div>
           </div>
         </TabsContent>
@@ -182,6 +199,13 @@ export function SpaceDetail({
       <ArtifactDrawer
         artifactId={selectedArtifactId}
         onClose={() => setSelectedArtifactId(null)}
+      />
+
+      <SpaceDefaultsDialog
+        spaceId={space.id}
+        current={space.default_config}
+        open={defaultsOpen}
+        onOpenChange={setDefaultsOpen}
       />
     </div>
   )

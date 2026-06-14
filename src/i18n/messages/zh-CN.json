@@ -3011,7 +3011,8 @@
       "inboxResolved": "已处理。",
       "configSaved": "设置已保存。",
       "memorySaved": "已保存。",
-      "memoryDeleted": "已删除。"
+      "memoryDeleted": "已删除。",
+      "spaceDefaultSaved": "已保存空间默认配置。"
     },
     "common": {
       "cancel": "取消",
@@ -3115,7 +3116,10 @@
       "tokenBudgetPerTurn": "每回合 Token 预算",
       "tokenBudget": "总 Token 预算",
       "unlimitedPlaceholder": "不限",
-      "save": "保存"
+      "save": "保存",
+      "useSpaceDefault": "使用空间默认",
+      "custom": "自定义",
+      "inheritHint": "该议题沿用空间的默认配置。"
     },
     "stage": {
       "triage": "分诊",
@@ -3175,6 +3179,32 @@
       "restore": "恢复",
       "archived": "已归档",
       "empty": "暂无记忆。"
+    },
+    "config": {
+      "tabAgents": "智能体",
+      "tabReview": "评审",
+      "tabValidation": "验证",
+      "tabLimits": "限制"
+    },
+    "reviewers": {
+      "heading": "评审员",
+      "hint": "每个评审员使用各自的智能体和配置执行一次评审。",
+      "empty": "暂无评审员——回退到默认评审智能体。",
+      "add": "添加评审员",
+      "remove": "移除评审员",
+      "rowLabel": "#{n}",
+      "modeLabel": "模式",
+      "defaultOption": "默认（{value}）",
+      "probing": "正在探测选项…",
+      "probeFailed": "无法加载该智能体的选项。",
+      "noConfig": "无可配置项。"
+    },
+    "spaceDefaults": {
+      "button": "空间默认设置",
+      "title": "空间默认配置",
+      "description": "新建议题默认继承此配置，除非使用自定义配置。",
+      "save": "保存默认配置",
+      "resetToDefault": "重置为引擎默认"
     }
   }
 }

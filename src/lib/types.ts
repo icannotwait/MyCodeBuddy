@@ -498,6 +498,10 @@ export interface LoopSpaceSummary {
   running_count: number
   last_activity_at: string | null
   created_at: string
+  /** The space's default issue config, inherited by issues with
+   *  `config_inherits`. `null` when unset (inheritors fall back to the engine
+   *  default). Set via `setLoopSpaceDefaultConfig`. */
+  default_config: IssueConfig | null
 }
 
 export interface LoopIssueRow {
@@ -519,6 +523,10 @@ export interface LoopIssueRow {
 export interface LoopIssueDetail extends LoopIssueRow {
   description: string
   config: IssueConfig
+  /** When true, the engine resolves this issue's effective config from the
+   *  space default (at read time); `config` is kept as the last custom value
+   *  for when the user switches back to a custom config. */
+  config_inherits: boolean
   worktree_folder_id: number | null
   base_branch: string | null
   base_commit: string | null
