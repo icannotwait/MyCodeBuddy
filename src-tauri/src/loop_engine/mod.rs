@@ -219,10 +219,14 @@ impl LoopEngine {
         // Resolve the conversation backing this connection (in-memory, same as
         // the delegation lifecycle path).
         let Some((state, _)) = self.manager.get_state_and_emitter(connection_id).await else {
+            // Connection state already gone (e.g. teardown raced this event); the
+            // driver's periodic reconcile will settle the iteration instead.
+            eprintln!("[loop][turn] no connection state for {connection_id} (already torn down?)");
             return;
         };
         let conversation_id = state.read().await.conversation_id;
         let Some(cid) = conversation_id else {
+            eprintln!("[loop][turn] connection {connection_id} has no conversation_id");
             return;
         };
         // DB-authoritative: is this conversation a running loop iteration?
@@ -233,6 +237,8 @@ impl LoopEngine {
             .await
         {
             Ok(Some(it)) => it,
+            // Not a running loop iteration (ordinary/delegation turn, or already
+            // settled by the reconcile) — nothing to do.
             Ok(None) => return,
             Err(e) => {
                 eprintln!("[loop] on_turn_complete iteration lookup failed: {e}");
@@ -241,6 +247,11 @@ impl LoopEngine {
         };
         if let Err(e) = self.settle_iteration(iter.id).await {
             eprintln!("[loop] settle iteration {} failed: {e}", iter.id);
+        } else {
+            eprintln!(
+                "[loop][turn] settled iteration {} (issue {})",
+                iter.id, iter.issue_id
+            );
         }
         self.wake(iter.issue_id).await;
     }

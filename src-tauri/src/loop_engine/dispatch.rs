@@ -56,7 +56,13 @@ use crate::loop_engine::transitions::{
 /// DAG. The autonomous pipeline (dispatch + settle) is the engine's own write
 /// path — distinct from the command layer's CRUD emits — so without this a
 /// triggered issue would grow its DAG silently until something else refetched.
-fn emit_changed(emitter: &EventEmitter, space_id: i32, issue_id: i32, subject_id: i32, kind: &str) {
+pub(crate) fn emit_changed(
+    emitter: &EventEmitter,
+    space_id: i32,
+    issue_id: i32,
+    subject_id: i32,
+    kind: &str,
+) {
     emit_event(
         emitter,
         LOOP_CHANGED_EVENT,

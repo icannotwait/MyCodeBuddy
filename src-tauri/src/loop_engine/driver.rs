@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
 use tokio::sync::Notify;
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
+use crate::acp::manager::ConnectionManager;
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssueRoute, IssueStatus};
@@ -30,9 +32,12 @@ use crate::models::agent::AgentType;
 use crate::models::loops::{IssueConfig, LoopArtifactRow, LoopDagView};
 use crate::web::event_bridge::EventEmitter;
 
-use crate::loop_engine::dispatch::{dispatch_iteration, DispatchInput, LoopAgentSpawner};
+use crate::loop_engine::dispatch::{
+    dispatch_iteration, emit_changed, settle_iteration, DispatchInput, LoopAgentSpawner,
+};
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::gates;
+use crate::loop_engine::transitions::cas_issue_status;
 use crate::loop_engine::LoopEngine;
 
 /// Result of a single tick.
@@ -242,6 +247,41 @@ async fn ensure_design_gate_card(
     Ok(())
 }
 
+/// Liveness backstop (DB-authoritative): settle any of this issue's `running`
+/// iterations whose backing agent connection no longer exists. The completion
+/// watcher settles on `TurnComplete`, but that single in-process event can be
+/// missed or race the connection teardown — and the driver is event-driven with
+/// no other periodic settle — so without this an iteration (e.g. triage) can
+/// park at `running` forever. Idempotent: `settle_iteration` is a CAS, so a
+/// double settle (event + reconcile) is a no-op the second time.
+pub(crate) async fn reconcile_orphaned_iterations(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    manager: &ConnectionManager,
+    issue_id: i32,
+) -> Result<(), LoopError> {
+    let running = loop_iteration::Entity::find()
+        .filter(loop_iteration::Column::IssueId.eq(issue_id))
+        .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+        .all(&db.conn)
+        .await?;
+    for it in running {
+        let Some(cid) = it.conversation_id else {
+            continue;
+        };
+        if manager.find_connection_by_conversation_id(cid).await.is_none() {
+            eprintln!(
+                "[loop][reconcile] settling orphaned iteration {} (issue {issue_id}, conv {cid}): no live connection",
+                it.id
+            );
+            if let Err(e) = settle_iteration(db, emitter, it.id).await {
+                eprintln!("[loop][reconcile] settle {} failed: {e}", it.id);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One scheduling tick for a single issue: ensure triage, then dispatch the
 /// ready frontier. Idempotent and side-effect-guarded by the DB leases, so it
 /// is safe to call repeatedly. Takes explicit handles (not `&LoopEngine`) so it
@@ -297,12 +337,24 @@ pub(crate) async fn tick_once(
         });
     }
 
-    // Route is written by triage; honor a human force_route override, and idle
-    // while it is still undecided (triage in flight).
+    // Route is written by triage; honor a human force_route override. While the
+    // route is still undecided, recover instead of parking forever: wait if a
+    // triage is in flight, else re-dispatch (bounded) or block.
     let route = match issue.route {
         IssueRoute::Undecided => match config.force_route {
             Some(r) => r,
-            None => return Ok(TickOutcome::Idle),
+            None => {
+                return recover_undecided_triage(
+                    db,
+                    data_dir,
+                    spawner,
+                    emitter,
+                    &issue,
+                    &config,
+                    worktree_folder_id,
+                )
+                .await;
+            }
         },
         r => r,
     };
@@ -391,11 +443,113 @@ pub(crate) async fn tick_once(
     Ok(TickOutcome::Idle)
 }
 
+/// Recover a triage that finished without producing a route. Triage decides the
+/// pipeline's route; if its agent's turn ended without `loop_submit_route`, the
+/// issue would otherwise idle forever on `route = undecided`. While a triage is
+/// still in flight we keep waiting; once all triage iterations have settled and
+/// the route is still undecided we re-dispatch a fresh triage (bounded by
+/// `max_attempts`, 0 = unlimited), and give up into `blocked` + an inbox card
+/// once the bound is hit. Never parks silently.
+#[allow(clippy::too_many_arguments)]
+async fn recover_undecided_triage(
+    db: &AppDatabase,
+    data_dir: &Path,
+    spawner: &dyn LoopAgentSpawner,
+    emitter: &EventEmitter,
+    issue: &loop_issue::Model,
+    config: &IssueConfig,
+    worktree_folder_id: i32,
+) -> Result<TickOutcome, LoopError> {
+    let conn = &db.conn;
+    let triage: Vec<loop_iteration::Model> = loop_iteration::Entity::find()
+        .filter(loop_iteration::Column::IssueId.eq(issue.id))
+        .filter(loop_iteration::Column::Stage.eq(Stage::Triage))
+        .all(conn)
+        .await?;
+    // Still deciding → keep waiting.
+    if triage
+        .iter()
+        .any(|it| matches!(it.status, IterationStatus::Queued | IterationStatus::Running))
+    {
+        return Ok(TickOutcome::Idle);
+    }
+    // All triage settled but no route. Bounded recovery.
+    let attempts = triage.len() as i32;
+    let max = config.max_attempts as i32; // 0 = unlimited
+    if max == 0 || attempts < max {
+        eprintln!(
+            "[loop][triage] issue {} undecided after {attempts} triage attempt(s); re-dispatching",
+            issue.id
+        );
+        let dispatched = dispatch_iteration(
+            db,
+            data_dir,
+            spawner,
+            emitter.clone(),
+            DispatchInput {
+                space_id: issue.space_id,
+                issue_id: issue.id,
+                stage: Stage::Triage,
+                target_artifact_id: None,
+                slot_no: None,
+                attempt: attempts,
+                agent_type: resolve_agent(config, Stage::Triage),
+                worktree_folder_id,
+            },
+        )
+        .await?;
+        return Ok(if dispatched.is_some() {
+            TickOutcome::Dispatched
+        } else {
+            TickOutcome::Idle
+        });
+    }
+    // Bound hit → block + inbox card (the human can retry or cancel).
+    eprintln!(
+        "[loop][triage] issue {} gave up after {attempts} triage attempts with no route; blocking",
+        issue.id
+    );
+    cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
+    inbox::upsert_inbox(
+        conn,
+        issue.space_id,
+        issue.id,
+        None,
+        InboxKind::Blocked,
+        &format!("triage_no_route:{}", issue.id),
+        serde_json::json!({
+            "v": 1,
+            "reason": "triage produced no route",
+            "attempts": attempts,
+        }),
+    )
+    .await?;
+    emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+    Ok(TickOutcome::Idle)
+}
+
+/// How often the driver re-ticks absent a wake, so the liveness reconcile runs.
+/// A poll cadence for a real signal (connection liveness), not a cap on work.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The per-issue driver task body: tick, then park on the wake `Notify` until a
 /// completion (or external nudge) arrives. Exits when the issue leaves
 /// `running`, deregistering itself from the engine's driver registry.
 pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc<Notify>) {
+    // Periodic liveness heartbeat: re-tick even without a wake so the reconcile
+    // below catches iterations whose turn-complete event was missed or raced.
+    let mut heartbeat = interval(RECONCILE_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the immediate first fire
     loop {
+        // DB-authoritative backstop before each tick: settle iterations whose
+        // agent connection is gone (the event-driven settle alone can wedge).
+        if let Err(e) =
+            reconcile_orphaned_iterations(&engine.db, &engine.emitter, &engine.manager, issue_id)
+                .await
+        {
+            eprintln!("[loop][driver] reconcile failed for issue {issue_id}: {e}");
+        }
         match tick_once(
             &engine.db,
             &engine.data_dir,
@@ -425,9 +579,12 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
             }
         }
         // Park until an iteration settles (the completion watcher fires `wake`)
-        // or an external action nudges us. `notify_one` buffers a permit, so a
-        // wake that races ahead of this await is never lost.
-        wake.notified().await;
+        // or the periodic heartbeat elapses (which runs the reconcile above).
+        // `notify_one` buffers a permit, so a wake that races ahead is not lost.
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = heartbeat.tick() => {}
+        }
     }
     engine.deregister_driver(issue_id).await;
 }
@@ -437,7 +594,7 @@ mod tests {
     use super::*;
     use crate::acp::error::AcpError;
     use crate::db::entities::loop_artifact::ArtifactKind;
-    use crate::db::entities::loop_inbox_item::InboxStatus;
+    use crate::db::entities::loop_inbox_item::{self, InboxStatus};
     use crate::db::entities::loop_issue::IssuePriority;
     use crate::db::service::loop_service::{issue, space};
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
@@ -525,6 +682,103 @@ mod tests {
             .await
             .unwrap();
         (db, PathBuf::from("/tmp/data"), issue.row.id)
+    }
+
+    /// Settle every currently-running triage iteration WITHOUT submitting a
+    /// route (simulates a triage agent whose turn ended without
+    /// `loop_submit_route`), leaving `issue.route` undecided.
+    async fn settle_running_triage_without_route(db: &AppDatabase) {
+        let running = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Triage))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        for it in running {
+            settle_iteration(db, &EventEmitter::Noop, it.id)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_settles_running_iteration_without_live_connection() {
+        let (db, data_dir, issue_id) = setup().await;
+        let spawner = StubSpawner;
+        let mgr = ConnectionManager::new();
+        // One tick dispatches triage → a running iteration with a conversation_id.
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            .await
+            .unwrap();
+        let running = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::IssueId.eq(issue_id))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 1, "triage dispatched and running");
+        // No live connection exists for it → reconcile settles the orphan.
+        reconcile_orphaned_iterations(&db, &EventEmitter::Noop, &mgr, issue_id)
+            .await
+            .unwrap();
+        let it = loop_iteration::Entity::find_by_id(running[0].id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(it.status, IterationStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn undecided_triage_redispatches_then_blocks() {
+        let (db, data_dir, issue_id) = setup().await;
+        // max_attempts = 2 → one re-dispatch, then block.
+        let cfg = IssueConfig {
+            max_attempts: 2,
+            ..IssueConfig::default()
+        };
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Config,
+                Expr::value(serde_json::to_string(&cfg).unwrap()),
+            )
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        let spawner = StubSpawner;
+
+        // Tick 1: dispatch triage, then settle it with no route.
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            .await
+            .unwrap();
+        settle_running_triage_without_route(&db).await;
+
+        // Tick 2: triage settled but undecided → re-dispatch (attempt 1).
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            .await
+            .unwrap();
+        assert_eq!(out, TickOutcome::Dispatched);
+        settle_running_triage_without_route(&db).await;
+
+        // Tick 3: attempts hit max → block + inbox card.
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            .await
+            .unwrap();
+        assert_eq!(out, TickOutcome::Idle);
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.status, IssueStatus::Blocked);
+        let card = loop_inbox_item::Entity::find()
+            .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+            .filter(loop_inbox_item::Column::SubjectKey.eq(format!("triage_no_route:{issue_id}")))
+            .one(&db.conn)
+            .await
+            .unwrap();
+        assert!(card.is_some(), "blocked triage files an inbox card");
     }
 
     /// Simulate the dispatched iteration's agent: submit the stage-appropriate
