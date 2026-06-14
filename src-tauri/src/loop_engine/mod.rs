@@ -96,14 +96,25 @@ impl LoopEngine {
         )
     }
 
-    /// Start the per-issue driver task (no-op if one is already registered —
-    /// the registry is the in-process single-instance guard). The task ticks,
-    /// then parks on its wake `Notify` until a completion or external nudge.
+    /// Ensure a live driver backs `issue_id`, holding the registry lock across the
+    /// whole check-evict-spawn-register so no concurrent path can interleave
+    /// (§2.5): a finished handle is evicted and replaced; a live one is left
+    /// untouched. The single atomic owner for both external triggers and the
+    /// periodic supervisor backstop — so a dead handle self-heals on *any* start
+    /// path, not only via the 15s supervisor.
     pub async fn start_issue(self: &Arc<Self>, issue_id: i32) {
         let mut drivers = self.drivers.lock().await;
-        if drivers.contains_key(&issue_id) {
-            return;
+        match drivers.get(&issue_id) {
+            Some(h) if !h.abort.is_finished() => return, // live driver already on it
+            _ => {}                                       // absent or finished → (re)spawn
         }
+        self.spawn_driver_into(&mut drivers, issue_id);
+    }
+
+    /// Spawn a per-issue driver task and register its handle in the held
+    /// `drivers` map. The caller MUST hold the `drivers` lock (passed in by
+    /// `&mut`), so the check-and-spawn stays atomic against a concurrent start.
+    fn spawn_driver_into(self: &Arc<Self>, drivers: &mut HashMap<i32, DriverHandle>, issue_id: i32) {
         let wake = Arc::new(Notify::new());
         let engine = Arc::clone(self);
         let wake_for_task = Arc::clone(&wake);
@@ -181,25 +192,19 @@ impl LoopEngine {
             }
         };
         for issue in running {
-            let needs_spawn = {
-                let mut drivers = self.drivers.lock().await;
-                match drivers.get(&issue.id) {
-                    None => true,
-                    Some(h) if h.abort.is_finished() => {
-                        // Drop the stale handle while still holding the lock so
-                        // `start_issue`'s `contains_key` guard sees a clean slot.
-                        drivers.remove(&issue.id);
-                        true
-                    }
-                    Some(_) => false, // a live driver is already on it
+            // Same single-lock ensure as the trigger path: check-evict-spawn under
+            // one acquisition, so a finished handle is replaced and a live one is
+            // never evicted out from under a concurrent legitimate start.
+            let mut drivers = self.drivers.lock().await;
+            match drivers.get(&issue.id) {
+                Some(h) if !h.abort.is_finished() => {} // a live driver is already on it
+                _ => {
+                    eprintln!(
+                        "[loop][supervisor] (re)spawning driver for running issue {}",
+                        issue.id
+                    );
+                    self.spawn_driver_into(&mut drivers, issue.id);
                 }
-            };
-            if needs_spawn {
-                eprintln!(
-                    "[loop][supervisor] respawning driver for running issue {}",
-                    issue.id
-                );
-                self.start_issue(issue.id).await;
             }
         }
     }
@@ -473,5 +478,55 @@ mod tests {
             .get(&issue.row.id)
             .map(|h| h.abort.id());
         assert_eq!(first, second, "live driver is not respawned");
+    }
+
+    #[tokio::test]
+    async fn start_issue_replaces_a_finished_handle() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/loop-ensure").await;
+        let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &db.conn,
+            space.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        cas_issue_status(&db.conn, issue.row.id, IssueStatus::Pending, IssueStatus::Running)
+            .await
+            .unwrap();
+        let engine = LoopEngine::new(
+            db,
+            ConnectionManager::new(),
+            std::path::PathBuf::from("/tmp/loop-ensure-data"),
+            EventEmitter::Noop,
+        );
+
+        // Register a *finished* handle (simulates a driver that returned/panicked
+        // but whose registry entry was never evicted).
+        let done = tokio::spawn(async {});
+        let abort = done.abort_handle();
+        done.await.unwrap();
+        assert!(abort.is_finished());
+        engine.drivers.lock().await.insert(
+            issue.row.id,
+            DriverHandle {
+                abort,
+                wake: Arc::new(Notify::new()),
+            },
+        );
+
+        // A direct start must evict the finished handle and spawn a live one (the
+        // old `contains_key` guard would have no-opped on the stale entry).
+        engine.start_issue(issue.row.id).await;
+        let drivers = engine.drivers.lock().await;
+        let handle = drivers.get(&issue.row.id).expect("driver present");
+        assert!(
+            !handle.abort.is_finished(),
+            "finished handle replaced by a live driver"
+        );
     }
 }
