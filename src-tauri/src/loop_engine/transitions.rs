@@ -7,18 +7,22 @@
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveEnum, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveEnum, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
+    SqlErr,
+};
 
 use crate::db::entities::loop_artifact::{self, ArtifactStatus};
 use crate::db::entities::loop_issue::{self, IssueStatus};
 use crate::db::entities::loop_iteration::{self, IterationStatus, LaunchedBy, Stage};
 use crate::loop_engine::error::LoopError;
 
-/// A SQLite UNIQUE-constraint failure — i.e. a dispatch lease was already held
-/// by a concurrent claimer. Matched on the message because sqlx surfaces it as
-/// an opaque `DbErr`.
+/// A SQLite UNIQUE-constraint failure — a dispatch lease was already held by a
+/// concurrent claimer. Classified through SeaORM's driver-typed `sql_err()`
+/// (`SqlErr::UniqueConstraintViolation`) rather than matching the message text,
+/// which silently breaks when a driver reworded its error.
 fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
-    e.to_string().to_lowercase().contains("unique")
+    matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
 }
 
 /// CAS an issue's status: write `new` only if it currently equals `expected`.
@@ -248,5 +252,17 @@ mod tests {
         // Correct release frees the gate.
         assert!(release_task_gate(&db.conn, issue_id, 100).await.unwrap());
         assert!(try_acquire_task_gate(&db.conn, issue_id, 200).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn duplicate_token_is_typed_unique_violation() {
+        let (db, space_id, issue_id) = seed().await;
+        let c = |t: &str| claim(space_id, issue_id, Stage::Triage, None, None, t);
+        // First claim wins.
+        assert!(try_claim_iteration(&db.conn, c("dup")).await.unwrap().is_some());
+        // Second claim with the SAME capability_token hits uniq_loop_iteration_token
+        // → classified as a lost race (Ok(None)), not an Err.
+        let again = try_claim_iteration(&db.conn, c("dup")).await.unwrap();
+        assert!(again.is_none(), "duplicate token is a typed unique violation → Ok(None)");
     }
 }
