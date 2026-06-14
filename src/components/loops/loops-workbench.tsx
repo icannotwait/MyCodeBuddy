@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/alert-dialog"
 import { SpaceFormDialog } from "@/components/loops/space-form-dialog"
 import { SpaceDetail } from "@/components/loops/space-detail"
+import { EngineHealthBadge } from "@/components/loops/engine-health-badge"
 
 /** Roots the single loop realtime subscription for every loop surface below. */
 export function LoopsWorkbench() {
@@ -118,16 +119,18 @@ function LoopsWorkbenchInner() {
             {t("subtitle")}
           </p>
         </div>
-        <Button
-          onClick={() => {
-            setEditing(null)
-            setFormOpen(true)
-          }}
-          className="shrink-0"
-        >
-          <Plus className="mr-1.5 h-4 w-4" />
-          {t("newSpace")}
-        </Button>
+        <div className="flex shrink-0 items-center gap-3">
+          <EngineHealthBadge />
+          <Button
+            onClick={() => {
+              setEditing(null)
+              setFormOpen(true)
+            }}
+          >
+            <Plus className="mr-1.5 h-4 w-4" />
+            {t("newSpace")}
+          </Button>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">

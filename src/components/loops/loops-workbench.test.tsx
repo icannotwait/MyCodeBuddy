@@ -8,11 +8,13 @@ import type { LoopSpaceSummary } from "@/lib/types"
 // Stable `t` — the workbench's `refresh` callback depends on `t`, so an
 // unstable identity would loop the load effect forever (per next-intl mock
 // guidance). Returns the key verbatim; enough to address every label here.
-const { stableT, listLoopSpaces, deleteLoopSpace } = vi.hoisted(() => ({
-  stableT: (key: string) => key,
-  listLoopSpaces: vi.fn(),
-  deleteLoopSpace: vi.fn(),
-}))
+const { stableT, listLoopSpaces, deleteLoopSpace, getLoopEngineHealth } =
+  vi.hoisted(() => ({
+    stableT: (key: string) => key,
+    listLoopSpaces: vi.fn(),
+    deleteLoopSpace: vi.fn(),
+    getLoopEngineHealth: vi.fn(),
+  }))
 
 vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
@@ -22,7 +24,11 @@ vi.mock("@/lib/platform", () => ({
   subscribe: vi.fn().mockResolvedValue(() => {}),
   onTransportReconnect: vi.fn(() => null),
 }))
-vi.mock("@/lib/loops-api", () => ({ listLoopSpaces, deleteLoopSpace }))
+vi.mock("@/lib/loops-api", () => ({
+  listLoopSpaces,
+  deleteLoopSpace,
+  getLoopEngineHealth,
+}))
 vi.mock("@/components/loops/space-detail", () => ({
   SpaceDetail: ({ space }: { space: LoopSpaceSummary }) => (
     <div data-testid="space-detail">{space.name}</div>
@@ -51,6 +57,16 @@ function makeSpace(over: Partial<LoopSpaceSummary> = {}): LoopSpaceSummary {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The header mounts EngineHealthBadge, which polls getLoopEngineHealth on
+  // mount. Resolve a quiet fixture so the effect doesn't throw or hit transport
+  // (the badge renders null until this resolves and never affects assertions).
+  getLoopEngineHealth.mockResolvedValue({
+    runningIssues: 0,
+    inFlightIterations: 0,
+    pendingTokenIterations: 0,
+    activeDrivers: 0,
+    metrics: { settleEventsTotal: 0, lagSweepTotal: 0 },
+  })
 })
 
 describe("LoopsWorkbench", () => {

@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "استخدام الوكيل الافتراضي",
       "useDefaultHint": "تُشغّل هذه المرحلة الوكيل الافتراضي."
+    },
+    "engineHealth": {
+      "summary": "{issues} قيد التشغيل · {iters} قيد التنفيذ",
+      "pending": "{n} رمز معلّق"
     }
   }
 }

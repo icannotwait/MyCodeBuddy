@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "Use default agent",
       "useDefaultHint": "This stage runs the default agent."
+    },
+    "engineHealth": {
+      "summary": "{issues} running · {iters} in flight",
+      "pending": "{n} token-pending"
     }
   }
 }

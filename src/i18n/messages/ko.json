@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "기본 에이전트 사용",
       "useDefaultHint": "이 단계는 기본 에이전트로 실행됩니다."
+    },
+    "engineHealth": {
+      "summary": "실행 중 {issues}개 · 진행 중 {iters}개",
+      "pending": "토큰 대기 {n}개"
     }
   }
 }

@@ -672,6 +672,24 @@ export interface LoopChanged {
   kind: string
 }
 
+/** Process-since-boot engine counters (camelCase: backend uses
+ *  `rename_all = "camelCase"`). Mirrors `loop_engine::metrics::MetricsSnapshot`. */
+export interface LoopEngineMetrics {
+  settleEventsTotal: number
+  lagSweepTotal: number
+}
+
+/** Live engine health for the workbench badge + ops. Counts are authoritative
+ *  *now* (issues/iterations from the DB, drivers from the in-process registry);
+ *  `metrics` is the since-boot tally. Mirrors `loop_engine::health::LoopEngineHealth`. */
+export interface LoopEngineHealth {
+  runningIssues: number
+  inFlightIterations: number
+  pendingTokenIterations: number
+  activeDrivers: number
+  metrics: LoopEngineMetrics
+}
+
 export const STATUS_ORDER: ConversationStatus[] = [
   "in_progress",
   "pending_review",

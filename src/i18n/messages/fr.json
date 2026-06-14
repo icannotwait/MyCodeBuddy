@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "Utiliser l'agent par défaut",
       "useDefaultHint": "Cette étape utilise l'agent par défaut."
+    },
+    "engineHealth": {
+      "summary": "{issues} en exécution · {iters} en cours",
+      "pending": "{n} jetons en attente"
     }
   }
 }

@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "使用預設智能體",
       "useDefaultHint": "此階段使用預設智能體執行。"
+    },
+    "engineHealth": {
+      "summary": "{issues} 個執行中 · {iters} 個進行中",
+      "pending": "{n} 個 token 待結算"
     }
   }
 }

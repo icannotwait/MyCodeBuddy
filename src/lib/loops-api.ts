@@ -4,6 +4,7 @@ import type {
   LoopArtifactDetail,
   LoopArtifactRow,
   LoopDagView,
+  LoopEngineHealth,
   LoopInboxItemRow,
   LoopInboxStatus,
   LoopIssueDetail,
@@ -219,4 +220,12 @@ export function updateLoopMemory(params: {
 
 export function deleteLoopMemory(spaceId: number, id: number) {
   return getTransport().call<void>("delete_loop_memory", { spaceId, id })
+}
+
+// ─── Engine health ───────────────────────────────────────────────────────────
+
+/** Live engine health snapshot (running issues, in-flight iterations,
+ *  pending-token iterations, active drivers, since-boot counters). */
+export function getLoopEngineHealth() {
+  return getTransport().call<LoopEngineHealth>("get_loop_engine_health", {})
 }

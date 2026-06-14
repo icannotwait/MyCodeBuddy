@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "デフォルトのエージェントを使用",
       "useDefaultHint": "このステージはデフォルトのエージェントで実行されます。"
+    },
+    "engineHealth": {
+      "summary": "実行中 {issues} 件 · 処理中 {iters} 件",
+      "pending": "トークン保留 {n} 件"
     }
   }
 }

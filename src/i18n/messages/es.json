@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "Usar agente predeterminado",
       "useDefaultHint": "Esta etapa ejecuta el agente predeterminado."
+    },
+    "engineHealth": {
+      "summary": "{issues} en ejecución · {iters} en curso",
+      "pending": "{n} con tokens pendientes"
     }
   }
 }

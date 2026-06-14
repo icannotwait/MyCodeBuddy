@@ -3214,6 +3214,10 @@
     "agentConfig": {
       "useDefault": "Standard-Agent verwenden",
       "useDefaultHint": "Diese Phase verwendet den Standard-Agenten."
+    },
+    "engineHealth": {
+      "summary": "{issues} laufend · {iters} in Bearbeitung",
+      "pending": "{n} Token ausstehend"
     }
   }
 }
