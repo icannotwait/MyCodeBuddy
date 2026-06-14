@@ -125,6 +125,7 @@ const UP: &[&str] = &[
         launched_by TEXT NOT NULL CHECK (launched_by IN ('engine','human')),
         attempt INTEGER NOT NULL DEFAULT 0,
         tokens_used BIGINT NOT NULL DEFAULT 0,
+        tokens_pending INTEGER NOT NULL DEFAULT 0 CHECK (tokens_pending IN (0,1)),
         context_manifest TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
@@ -132,6 +133,7 @@ const UP: &[&str] = &[
     )",
     "CREATE UNIQUE INDEX uniq_loop_iteration_token ON loop_iteration(capability_token)",
     "CREATE INDEX idx_loop_iteration_issue ON loop_iteration(issue_id)",
+    "CREATE INDEX idx_loop_iteration_issue_status ON loop_iteration(issue_id, status)",
     "CREATE INDEX idx_loop_iteration_space ON loop_iteration(space_id)",
     "CREATE INDEX idx_loop_iteration_conv ON loop_iteration(conversation_id)",
     // Dispatch leases (DB-authoritative double-dispatch guards). Partial unique
@@ -273,6 +275,7 @@ mod tests {
             "uniq_review_slot",
             "uniq_inbox_pending",
             // Plain lookup indexes.
+            "idx_loop_iteration_issue_status",
             "idx_loop_artifact_produced_by",
             "idx_loop_link_to",
             "idx_loop_criterion_artifact",

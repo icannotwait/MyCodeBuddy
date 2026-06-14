@@ -90,6 +90,7 @@ pub async fn try_claim_iteration(
         launched_by: Set(LaunchedBy::Engine),
         attempt: Set(claim.attempt),
         tokens_used: Set(0),
+        tokens_pending: Set(false),
         context_manifest: Set(None),
         created_at: Set(now),
         started_at: Set(None),

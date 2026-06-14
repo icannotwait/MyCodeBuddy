@@ -75,6 +75,10 @@ pub struct Model {
     pub launched_by: LaunchedBy,
     pub attempt: i32,
     pub tokens_used: i64,
+    /// `true` when settlement could not read the session file's token total and
+    /// left it uncharged; a backfill sweep re-reads and clears this. Never
+    /// charged as `0` against the budget while pending (§2.7).
+    pub tokens_pending: bool,
     /// JSON-encoded briefing manifest (audit).
     pub context_manifest: Option<String>,
     pub created_at: DateTimeUtc,
