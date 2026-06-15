@@ -155,6 +155,11 @@ async fn cleanup_issue_artifacts(conn: &DatabaseConnection, issue: &loop_issue::
                     eprintln!("[loop] delete: remove worktree {} failed: {e}", folder.path);
                 }
             }
+            // Drop any per-task / integrate worktrees + their branches too
+            // (permanent delete discards everything by user intent).
+            let _ =
+                worktree::remove_issue_subtree(Path::new(repo_path), Path::new(&folder.path), true)
+                    .await;
         }
         // Permanent delete discards everything → drop the branch too. Force (`-D`):
         // it may carry unmerged WIP the user is intentionally deleting, and a DB

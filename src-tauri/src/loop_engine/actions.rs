@@ -199,6 +199,11 @@ impl LoopEngine {
         {
             tracing::warn!(path = %folder.path, error = %e, "cancel: remove worktree failed");
         }
+        // Also remove any per-task / integrate worktrees of a parallel issue. Keep
+        // their branches for audit — cancel is not a permanent delete.
+        let _ =
+            worktree::remove_issue_subtree(Path::new(&repo.path), Path::new(&folder.path), false)
+                .await;
     }
 
     /// Tear down the OS processes of an issue's in-flight iterations. Each live
@@ -366,6 +371,9 @@ impl LoopEngine {
         // Merged. Best-effort teardown; the DB update below is the source of truth —
         // a merged issue never restarts, so a stale folder/worktree is inert.
         let _ = worktree::remove_worktree(&repo_path, &worktree_path).await;
+        // Drop any per-task / integrate worktrees + their branches (a parallel
+        // issue's task work is now in base via the fan-in, so they are merged).
+        let _ = worktree::remove_issue_subtree(&repo_path, &worktree_path, true).await;
         // The loop branch is now in base behind the --no-ff merge commit, so drop
         // it. Safe `-d`: git refuses if it is somehow not merged, so this can never
         // discard unlanded work.

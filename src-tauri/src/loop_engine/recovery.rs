@@ -29,7 +29,7 @@ use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::db::entities::loop_issue::{self, IssueStatus};
 use crate::db::entities::loop_iteration::{self, IterationStatus};
-use crate::db::service::folder_service;
+use crate::db::service::{folder_service, loop_service};
 use crate::db::AppDatabase;
 
 use crate::loop_engine::error::LoopError;
@@ -89,12 +89,27 @@ async fn restore_worktree_clean(db: &AppDatabase, issue: &loop_issue::Model) {
             return;
         }
     };
-    let path = Path::new(&folder.path);
-    if !path.exists() {
-        return;
+    // The space repo — needed to enumerate a parallel issue's per-task /
+    // integrate worktrees (resolved best-effort; absence just skips the subtree).
+    let repo_path = match loop_service::space::get_space(&db.conn, issue.space_id).await {
+        Ok(Some(space)) => folder_service::get_folder_by_id(&db.conn, space.folder_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|repo| repo.path),
+        _ => None,
+    };
+
+    let issue_wt = Path::new(&folder.path);
+    if issue_wt.exists() {
+        if let Err(e) = worktree::reset_to_head(issue_wt).await {
+            tracing::warn!(path = %folder.path, error = %e, "recover: reset worktree failed");
+        }
     }
-    if let Err(e) = worktree::reset_to_head(path).await {
-        tracing::warn!(path = %folder.path, error = %e, "recover: reset worktree failed");
+    // Parallel issues also have per-task / integrate worktrees to restore (discard
+    // crash-time uncommitted residue; committed task checkpoints survive).
+    if let Some(repo) = repo_path {
+        let _ = worktree::reset_issue_subtree(Path::new(&repo), issue_wt).await;
     }
 }
 

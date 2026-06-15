@@ -771,6 +771,90 @@ pub async fn delete_branch(repo_path: &Path, branch: &str, force: bool) -> Resul
     Ok(())
 }
 
+/// `(path, branch)` for every worktree registered in `repo_path`
+/// (`git worktree list --porcelain`); `branch` is `None` for a detached worktree.
+/// Backs the per-issue subtree sweeps below.
+pub async fn list_worktrees(repo_path: &Path) -> Result<Vec<(String, Option<String>)>, LoopError> {
+    let out = run_git(repo_path, &["worktree", "list", "--porcelain"]).await?;
+    if !out.status.success() {
+        return Err(LoopError::Git(format!("worktree list: {}", stderr_of(&out))));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_branch: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if let Some(path) = cur_path.take() {
+                result.push((path, cur_branch.take()));
+            }
+            cur_path = Some(p.to_string());
+            cur_branch = None;
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur_branch = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+        }
+    }
+    if let Some(path) = cur_path.take() {
+        result.push((path, cur_branch.take()));
+    }
+    Ok(result)
+}
+
+/// Best-effort canonical path (resolves symlinks like macOS `/var`→`/private/var`,
+/// so `git worktree list`'s real paths compare equal to our data-dir paths);
+/// falls back to the raw string when the path no longer exists.
+fn canon(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+/// Whether `path` is one of an issue's per-task / integrate worktrees — a sibling
+/// of `issue_worktree` at `{issue_worktree}-tasks*` or `{issue_worktree}-integrate`.
+/// The `-` after the seq disambiguates `issue-1` from `issue-10`. Both sides are
+/// canonicalized so a symlinked temp/data dir doesn't defeat the prefix match.
+fn is_issue_subtree(path: &str, issue_worktree: &Path) -> bool {
+    let base = canon(&issue_worktree.to_string_lossy());
+    let p = canon(path);
+    p.starts_with(&format!("{base}-tasks")) || p.starts_with(&format!("{base}-integrate"))
+}
+
+/// Reset every per-task + integrate worktree of an issue to its branch HEAD —
+/// boot recovery's clean-tree restore for parallel work (discards only
+/// uncommitted crash residue; committed task checkpoints survive). Best-effort.
+pub async fn reset_issue_subtree(repo_path: &Path, issue_worktree: &Path) -> Result<(), LoopError> {
+    for (path, _) in list_worktrees(repo_path).await? {
+        if is_issue_subtree(&path, issue_worktree) {
+            let p = Path::new(&path);
+            if p.exists() {
+                let _ = reset_to_head(p).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove every per-task + integrate worktree of an issue and (when
+/// `delete_branches`) force-delete their branches. Best-effort — used by cancel
+/// (keep branches for audit) / merge teardown / permanent delete (drop branches).
+pub async fn remove_issue_subtree(
+    repo_path: &Path,
+    issue_worktree: &Path,
+    delete_branches: bool,
+) -> Result<(), LoopError> {
+    for (path, branch) in list_worktrees(repo_path).await? {
+        if is_issue_subtree(&path, issue_worktree) {
+            let _ = remove_worktree(repo_path, Path::new(&path)).await;
+            if delete_branches {
+                if let Some(b) = branch {
+                    let _ = delete_branch(repo_path, &b, true).await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,6 +1601,65 @@ mod tests {
             git_out(dir.path(), &["rev-parse", "target"]),
             new,
             "ref unchanged after a CAS miss"
+        );
+    }
+
+    // ---- Per-issue subtree lifecycle (Phase 1) ----
+
+    #[tokio::test]
+    async fn remove_issue_subtree_removes_task_and_integrate() {
+        let (db, repo, data, issue_id, space_id, _seq) = setup().await;
+        let issue_ctx = ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        let t1 = mk_task(&db, space_id, issue_id, "T1").await;
+        let task_ctx = ensure_task_worktree(&db.conn, data.path(), issue_id, t1)
+            .await
+            .unwrap();
+        let integ_ctx =
+            ensure_integrate_worktree(&db.conn, data.path(), issue_id, &issue_ctx.base_commit)
+                .await
+                .unwrap();
+        assert!(task_ctx.worktree_path.is_dir() && integ_ctx.worktree_path.is_dir());
+
+        remove_issue_subtree(repo.path(), &issue_ctx.worktree_path, true)
+            .await
+            .unwrap();
+
+        assert!(!task_ctx.worktree_path.exists(), "task worktree removed");
+        assert!(!integ_ctx.worktree_path.exists(), "integrate worktree removed");
+        assert!(issue_ctx.worktree_path.is_dir(), "issue worktree untouched");
+        assert!(!branch_exists(repo.path(), &task_ctx.branch));
+        assert!(!branch_exists(repo.path(), &integ_ctx.branch));
+        assert!(
+            branch_exists(repo.path(), &issue_ctx.branch),
+            "issue branch kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_issue_subtree_restores_task_worktrees() {
+        let (db, repo, data, issue_id, space_id, _seq) = setup().await;
+        let issue_ctx = ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        let t1 = mk_task(&db, space_id, issue_id, "T1").await;
+        let task_ctx = ensure_task_worktree(&db.conn, data.path(), issue_id, t1)
+            .await
+            .unwrap();
+        // Commit work, then leave uncommitted residue (simulating a crash).
+        loop_commit(&task_ctx.worktree_path, "kept.txt", "keep\n").await;
+        std::fs::write(task_ctx.worktree_path.join("kept.txt"), "dirty\n").unwrap();
+        std::fs::write(task_ctx.worktree_path.join("scratch.txt"), "tmp\n").unwrap();
+
+        reset_issue_subtree(repo.path(), &issue_ctx.worktree_path)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(task_ctx.worktree_path.join("kept.txt")).unwrap(),
+            "keep\n",
+            "committed work restored to HEAD"
+        );
+        assert!(
+            !task_ctx.worktree_path.join("scratch.txt").exists(),
+            "uncommitted residue discarded"
         );
     }
 }

@@ -114,7 +114,7 @@ pub(crate) async fn run_parallel_finalize(
     let manifest = match &issue.fan_in_manifest {
         Some(j) => parse_manifest(j)?,
         None => {
-            let m = build_manifest(db, issue, dag, issue_worktree_folder_id).await?;
+            let m = build_manifest(db, dag, issue_worktree_folder_id).await?;
             let json = serde_json::to_string(&m)
                 .map_err(|e| LoopError::InvalidInput(format!("fan-in manifest encode: {e}")))?;
             if try_claim_fan_in(conn, issue.id, &json).await? {
@@ -262,7 +262,6 @@ async fn land_integration(
 /// `(sort, id)` with their frozen commits.
 async fn build_manifest(
     db: &AppDatabase,
-    issue: &loop_issue::Model,
     dag: &LoopDagView,
     issue_worktree_folder_id: i32,
 ) -> Result<FanInManifest, LoopError> {
