@@ -8,6 +8,7 @@ import {
   configToFormState,
   formStateToConfig,
 } from "./loop-config-form"
+import { __resetSnapshotCacheForTests } from "@/components/loops/loop-config/snapshot-cache"
 import type { AgentOptionsSnapshot, IssueConfig } from "@/lib/types"
 
 // Stable `t` (same instance every render) so any t-dependent effect can't loop.
@@ -128,6 +129,7 @@ function Harness({ initial }: { initial: LoopConfigFormState }) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  __resetSnapshotCacheForTests()
   describeAgentOptions.mockResolvedValue(emptySnapshot)
 })
 
