@@ -46,6 +46,8 @@ const UP: &[&str] = &[
         pause_reason TEXT CHECK (pause_reason IS NULL OR pause_reason IN ('manual','budget')),
         route TEXT NOT NULL DEFAULT 'undecided'
             CHECK (route IN ('undecided','full','skip_design','direct')),
+        execution_mode TEXT
+            CHECK (execution_mode IS NULL OR execution_mode IN ('serial','parallel')),
         config TEXT,
         worktree_folder_id INTEGER,
         base_branch TEXT,
@@ -97,7 +99,7 @@ const UP: &[&str] = &[
         from_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         to_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         kind TEXT NOT NULL
-            CHECK (kind IN ('derives_from','skips_to','reviews','results_from')),
+            CHECK (kind IN ('derives_from','skips_to','reviews','depends_on','results_from')),
         created_at TEXT NOT NULL
     )",
     "CREATE UNIQUE INDEX uniq_loop_link ON loop_link(from_artifact_id, to_artifact_id, kind)",

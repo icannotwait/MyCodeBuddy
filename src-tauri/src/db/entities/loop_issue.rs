@@ -79,6 +79,11 @@ pub struct Model {
     pub status: IssueStatus,
     pub pause_reason: Option<PauseReason>,
     pub route: IssueRoute,
+    /// Whether this issue's tasks run concurrently. `serial` / `parallel`,
+    /// decided once from the task DAG after planning settles (see
+    /// `driver::dag_has_parallelism`); `NULL` until then. Write-once — never
+    /// recomputed, so a half-built DAG can't latch the wrong mode.
+    pub execution_mode: Option<String>,
     /// JSON-encoded `models::loops::IssueConfig`, or `NULL` to inherit the
     /// space's `default_config`. The single source of truth for inheritance —
     /// there is no separate flag.

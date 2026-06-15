@@ -2,9 +2,10 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// DAG edge kind. Canonical direction: `from` = the dependent node
-/// (derived/review/result), `to` = the referenced node (its source/parent/
-/// subject). So `derives_from`: child→parent; `skips_to`: reached-node→
-/// skipped-over ancestor; `reviews`: review→task; `results_from`: result→task.
+/// (derived/review/result/successor), `to` = the referenced node (its source/
+/// parent/subject/predecessor). So `derives_from`: child→parent; `skips_to`:
+/// reached-node→skipped-over ancestor; `reviews`: review→task; `depends_on`:
+/// successor task→predecessor task; `results_from`: result→task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,8 @@ pub enum LinkKind {
     SkipsTo,
     #[sea_orm(string_value = "reviews")]
     Reviews,
+    #[sea_orm(string_value = "depends_on")]
+    DependsOn,
     #[sea_orm(string_value = "results_from")]
     ResultsFrom,
 }
