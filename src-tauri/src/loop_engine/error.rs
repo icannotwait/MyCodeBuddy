@@ -23,6 +23,11 @@ pub enum LoopError {
     NotGitRepo,
     #[error("merge conflict")]
     MergeConflict,
+    /// A merge attempt could not land for a concrete reason (dirty base, conflict,
+    /// failed re-validation, missing base). `message` is the user-facing summary;
+    /// `detail` carries the git/validation output for diagnosis.
+    #[error("merge failed: {message}")]
+    MergeFailed { message: String, detail: String },
     #[error("git command failed: {0}")]
     Git(String),
     #[error("invalid input: {0}")]
@@ -75,6 +80,11 @@ impl From<LoopError> for AppCommandError {
                 AppErrorCode::ExternalCommandFailed,
                 "Merge conflict while integrating the issue branch",
             ),
+            // The merge could not land; surface the concrete reason (never a silent
+            // success). `detail` carries the git/validation output.
+            LoopError::MergeFailed { message, detail } => {
+                AppCommandError::new(AppErrorCode::ExternalCommandFailed, message).with_detail(detail)
+            }
             LoopError::Git(m) => {
                 AppCommandError::new(AppErrorCode::ExternalCommandFailed, "Git command failed")
                     .with_detail(m)

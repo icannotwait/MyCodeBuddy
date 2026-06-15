@@ -255,6 +255,27 @@ pub async fn is_clean(worktree_path: &Path) -> Result<bool, LoopError> {
     Ok(stdout_trimmed(&out).is_empty())
 }
 
+/// Like [`is_clean`], but ignores untracked files (`--untracked-files=no`). Used
+/// as the BASE-repo precondition before a `--no-ff` landing: untracked files are
+/// harmless to a merge (git itself refuses if an incoming file would clobber an
+/// untracked one, surfacing as a `Conflict`), so refusing on them would block
+/// every merge in a normal dev checkout. Modified or staged TRACKED files remain
+/// a real hazard — a checkout/merge could clobber them — and still report dirty.
+pub async fn is_clean_tracked(repo_path: &Path) -> Result<bool, LoopError> {
+    let out = run_git(
+        repo_path,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(LoopError::Git(format!(
+            "status --porcelain -uno: {}",
+            stderr_of(&out)
+        )));
+    }
+    Ok(stdout_trimmed(&out).is_empty())
+}
+
 /// Outcome of attempting to land an issue's loop branch onto its base branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -347,13 +368,20 @@ pub async fn merge_issue(
     }
 
     // 3. Land the loop branch on the base branch, in the base repo's working tree.
-    //    Refuse a dirty tree outright — never clobber uncommitted human state.
-    if !is_clean(repo_path).await? {
+    //    Refuse modified/staged TRACKED files — never clobber uncommitted human
+    //    state — but tolerate untracked files (harmless to the merge; git itself
+    //    refuses if an incoming file would overwrite one).
+    if !is_clean_tracked(repo_path).await? {
         return Ok(MergeOutcome::BaseDirty);
     }
     let original_branch = current_branch(repo_path).await?;
     if original_branch != base_branch {
-        let checkout = run_git(repo_path, &["checkout", base_branch]).await?;
+        // `--no-overwrite-ignore`: abort rather than silently clobber a locally
+        // gitignored file if the base branch tracks that path (git's default would
+        // overwrite ignored files on checkout). Non-ignored untracked files are
+        // refused by git regardless.
+        let checkout =
+            run_git(repo_path, &["checkout", "--no-overwrite-ignore", base_branch]).await?;
         if !checkout.status.success() {
             return Err(LoopError::Git(format!(
                 "checkout {base_branch}: {}",
@@ -792,8 +820,9 @@ mod tests {
             .await
             .unwrap();
         loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
-        // Leave the base repo working tree dirty.
-        std::fs::write(repo.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        // Modify a TRACKED file in the base repo (README.md is committed by
+        // init_repo) — a real hazard a merge could clobber.
+        std::fs::write(repo.path().join("README.md"), "locally modified\n").unwrap();
 
         let outcome = merge_issue(
             repo.path(),
@@ -809,6 +838,35 @@ mod tests {
 
         assert!(matches!(outcome, MergeOutcome::BaseDirty));
         assert!(!repo.path().join("feature.txt").exists(), "nothing landed");
+    }
+
+    #[tokio::test]
+    async fn merge_untracked_base_lands() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+        // An UNTRACKED file in the base repo must NOT block the merge — it is
+        // harmless to a --no-ff landing (the common dev-checkout case).
+        std::fs::write(repo.path().join("scratch.txt"), "untracked\n").unwrap();
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::Merged { .. }));
+        assert!(repo.path().join("feature.txt").exists(), "loop work landed");
+        // The untracked file is left untouched.
+        assert!(repo.path().join("scratch.txt").exists());
     }
 
     #[tokio::test]

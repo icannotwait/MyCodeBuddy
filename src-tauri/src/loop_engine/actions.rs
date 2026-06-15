@@ -239,7 +239,9 @@ impl LoopEngine {
     /// (auto-merge); both take the same per-repo lock and run the same stale-base
     /// checks. A clean landing closes the issue (`done`) and removes its
     /// worktree; any fault (conflict / dirty base / failed re-validation / missing
-    /// base) blocks the issue with an inbox card naming the cause.
+    /// base) blocks the issue with an inbox card naming the cause AND returns a
+    /// [`LoopError::MergeFailed`] carrying the reason — never a silent success that
+    /// would leave the issue stuck "running" with no visible explanation.
     ///
     /// **Idempotent and race-free.** Preconditions are evaluated *under* the
     /// per-repo lock (not before it), so two actors — the human gate and the
@@ -329,47 +331,15 @@ impl LoopEngine {
         )
         .await?;
 
-        let merged = matches!(outcome, MergeOutcome::Merged { .. });
-        if merged {
-            // Best-effort teardown; the DB closure below is the source of truth —
-            // a merged issue never restarts, so a stale folder/worktree is inert.
-            let _ = worktree::remove_worktree(&repo_path, &worktree_path).await;
-            // The loop branch is now in base behind the --no-ff merge commit, so
-            // drop it. Safe `-d`: git refuses if it is somehow not merged, so this
-            // can never discard unlanded work.
-            let _ = worktree::delete_branch(&repo_path, &branch, false).await;
-            let _ = folder_service::remove_folder(conn, &folder.path).await;
-            resolve_approval_card(
-                conn,
-                issue_id,
-                &format!("merge:{issue_id}"),
-                serde_json::json!({ "action": "merged" }),
-            )
-            .await?;
-            let now = Utc::now();
-            let landed = loop_issue::Entity::update_many()
-                .col_expr(
-                    loop_issue::Column::Status,
-                    Expr::value(IssueStatus::Done.to_value()),
-                )
-                .col_expr(loop_issue::Column::EndedAt, Expr::value(now))
-                .col_expr(loop_issue::Column::UpdatedAt, Expr::value(now))
-                .filter(loop_issue::Column::Id.eq(issue_id))
-                .filter(loop_issue::Column::Status.eq(IssueStatus::Running))
-                .exec(conn)
-                .await?;
-            if landed.rows_affected != 1 {
-                // Unreachable under the lock (status was a freshly-confirmed
-                // `running` re-read); the git work already landed, so warn rather
-                // than fail — failing would falsely imply nothing merged.
-                tracing::warn!(
-                    issue_id,
-                    rows = landed.rows_affected,
-                    "merge: status CAS to done affected an unexpected row count after landing"
-                );
-            }
-        } else {
-            let (reason, detail) = describe_merge_fault(&outcome);
+        // A non-`Merged` outcome means the landing could not happen. Surface the
+        // concrete reason as an error — NEVER a silent success that leaves the
+        // issue stuck "running" with no visible cause. Block the issue + file a
+        // durable card so the fault is visible to BOTH the human gate and the
+        // driver's auto-merge (which only logs the error) — no silent stall on
+        // "running". Supersede any pending merge-approval card so the blocked
+        // issue shows only the retry path, not a now-dead "approve".
+        if !matches!(outcome, MergeOutcome::Merged { .. }) {
+            let (reason, message, detail) = merge_fault_report(&outcome);
             cas_issue_status(conn, issue_id, IssueStatus::Running, IssueStatus::Blocked).await?;
             inbox::upsert_inbox(
                 conn,
@@ -378,14 +348,60 @@ impl LoopEngine {
                 None,
                 InboxKind::Blocked,
                 &format!("merge_blocked:{issue_id}"),
-                serde_json::json!({ "reason": reason, "detail": detail }),
+                serde_json::json!({ "reason": reason, "detail": detail.clone() }),
             )
             .await?;
+            resolve_approval_card(
+                conn,
+                issue_id,
+                &format!("merge:{issue_id}"),
+                serde_json::json!({ "action": "merge_failed", "reason": reason }),
+            )
+            .await?;
+            self.emit_changed(issue.space_id, issue_id, "blocked");
+            self.wake(issue_id).await;
+            return Err(LoopError::MergeFailed { message, detail });
         }
 
-        self.emit_changed(issue.space_id, issue_id, if merged { "merged" } else { "blocked" });
-        // Nudge the driver: on a merge it re-ticks and stops (issue terminal); on
-        // a block it re-ticks, sees a non-running status, and exits.
+        // Merged. Best-effort teardown; the DB update below is the source of truth —
+        // a merged issue never restarts, so a stale folder/worktree is inert.
+        let _ = worktree::remove_worktree(&repo_path, &worktree_path).await;
+        // The loop branch is now in base behind the --no-ff merge commit, so drop
+        // it. Safe `-d`: git refuses if it is somehow not merged, so this can never
+        // discard unlanded work.
+        let _ = worktree::delete_branch(&repo_path, &branch, false).await;
+        let _ = folder_service::remove_folder(conn, &folder.path).await;
+        resolve_approval_card(
+            conn,
+            issue_id,
+            &format!("merge:{issue_id}"),
+            serde_json::json!({ "action": "merged" }),
+        )
+        .await?;
+        let now = Utc::now();
+        let landed = loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Status,
+                Expr::value(IssueStatus::Done.to_value()),
+            )
+            .col_expr(loop_issue::Column::EndedAt, Expr::value(now))
+            .col_expr(loop_issue::Column::UpdatedAt, Expr::value(now))
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .filter(loop_issue::Column::Status.eq(IssueStatus::Running))
+            .exec(conn)
+            .await?;
+        if landed.rows_affected != 1 {
+            // Unreachable under the lock (status was a freshly-confirmed `running`
+            // re-read); the git work already landed, so warn rather than fail —
+            // failing would falsely imply nothing merged.
+            tracing::warn!(
+                issue_id,
+                rows = landed.rows_affected,
+                "merge: status CAS to done affected an unexpected row count after landing"
+            );
+        }
+        self.emit_changed(issue.space_id, issue_id, "merged");
+        // Nudge the driver: it re-ticks, sees the terminal status, and stops.
         self.wake(issue_id).await;
         Ok(())
     }
@@ -629,25 +645,43 @@ async fn resolve_cards_of_kind(
     Ok(())
 }
 
-/// Map a non-`Merged` outcome to an inbox `(reason, detail)` pair.
-fn describe_merge_fault(outcome: &MergeOutcome) -> (&'static str, String) {
+/// Map a non-`Merged` outcome to `(inbox reason code, user-facing message,
+/// diagnostic detail)`. The reason code keys the inbox card; the message is the
+/// error toast the user sees; the detail carries the git/validation output.
+fn merge_fault_report(outcome: &MergeOutcome) -> (&'static str, String, String) {
     match outcome {
-        MergeOutcome::BaseGone => ("base_gone", "base branch no longer exists".to_string()),
+        MergeOutcome::BaseGone => (
+            "base_gone",
+            "The base branch no longer exists.".to_string(),
+            "base branch no longer exists".to_string(),
+        ),
         MergeOutcome::BaseDirty => (
             "base_dirty",
-            "base repo working tree has uncommitted changes".to_string(),
+            "The base repository has uncommitted changes to tracked files. Commit or stash them, then merge again."
+                .to_string(),
+            "base repo working tree has uncommitted tracked changes".to_string(),
         ),
         MergeOutcome::Conflict { stage, detail } => {
-            let reason = if *stage == "integrate" {
-                "merge_conflict_integrate"
+            let (reason, message) = if *stage == "integrate" {
+                (
+                    "merge_conflict_integrate",
+                    "Merge conflict while integrating the latest base into the issue branch.",
+                )
             } else {
-                "merge_conflict"
+                (
+                    "merge_conflict",
+                    "Merge conflict while landing the issue branch onto the base branch.",
+                )
             };
-            (reason, detail.clone())
+            (reason, message.to_string(), detail.clone())
         }
-        MergeOutcome::RevalidationFailed { output } => ("revalidation_failed", output.clone()),
+        MergeOutcome::RevalidationFailed { output } => (
+            "revalidation_failed",
+            "Re-validation failed on the merged result.".to_string(),
+            output.clone(),
+        ),
         // Not reached: the success arm is handled before this is called.
-        MergeOutcome::Merged { .. } => ("merged", String::new()),
+        MergeOutcome::Merged { .. } => ("merged", "Merge failed.".to_string(), String::new()),
     }
 }
 
@@ -1065,12 +1099,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_issue_dirty_base_blocks_with_inbox() {
+    async fn merge_issue_dirty_base_blocks_and_errors() {
         let (engine, conn, repo, _data, issue_id, _folder_id) = setup_repo().await;
-        std::fs::write(repo.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        // Modify a TRACKED file in the base repo (untracked files no longer block).
+        std::fs::write(repo.path().join("README.md"), "locally modified\n").unwrap();
 
-        engine.merge_issue(issue_id).await.unwrap();
+        // The fault surfaces as an error — not a silent "Ok" success.
+        let err = engine.merge_issue(issue_id).await.unwrap_err();
+        assert!(matches!(err, LoopError::MergeFailed { .. }));
 
+        // The issue is blocked + carries a durable card so the fault is visible
+        // (also covers the auto-merge path, which only logs the error).
         let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
         assert_eq!(issue.status, IssueStatus::Blocked);
         let cards = inbox::list_inbox(&conn, issue.space_id, Some(InboxStatus::Pending))
@@ -1078,8 +1117,36 @@ mod tests {
             .unwrap();
         assert!(cards.iter().any(|c| c.kind == InboxKind::Blocked
             && c.subject_key == format!("merge_blocked:{issue_id}")));
-        // Nothing landed on the base branch.
-        assert!(!repo.path().join("feature.txt").exists());
+        assert!(!repo.path().join("feature.txt").exists(), "nothing landed");
+    }
+
+    #[tokio::test]
+    async fn merge_issue_conflict_blocks_with_inbox_and_errors() {
+        let (engine, conn, repo, _data, issue_id, _folder_id) = setup_repo().await;
+        // Advance the base branch with a CONFLICTING change to feature.txt (the
+        // loop branch added feature.txt too), so integrating the base conflicts.
+        std::fs::write(repo.path().join("feature.txt"), "base conflicting\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base feature"]);
+
+        // The fault surfaces as an error (never a silent success)...
+        let err = engine.merge_issue(issue_id).await.unwrap_err();
+        assert!(matches!(err, LoopError::MergeFailed { .. }));
+
+        // ...AND a branch/integration fault blocks the issue + files a card so it
+        // is visible (also covers the auto-merge path, which only logs the error).
+        let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+        assert_eq!(issue.status, IssueStatus::Blocked);
+        let cards = inbox::list_inbox(&conn, issue.space_id, Some(InboxStatus::Pending))
+            .await
+            .unwrap();
+        assert!(cards.iter().any(|c| c.kind == InboxKind::Blocked
+            && c.subject_key == format!("merge_blocked:{issue_id}")));
+        // The loop's work never landed: the base still holds its own version.
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("feature.txt")).unwrap(),
+            "base conflicting\n"
+        );
     }
 
     #[tokio::test]
