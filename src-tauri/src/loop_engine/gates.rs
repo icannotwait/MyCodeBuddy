@@ -578,6 +578,12 @@ async fn dispatch_implement(
     Ok(handle.is_some())
 }
 
+/// All implement iterations for **one task** — keyed by `(issue, target)`, never
+/// "the issue's single write". So once `uniq_active_write` is dropped (phase 2)
+/// and several tasks implement concurrently, this still resolves exactly this
+/// task's iterations. (P2-invariant audit: no in-flight-write lookup assumes a
+/// per-issue singleton — they key on `(issue, target)` here / `(issue, finalize)`
+/// for the issue-level finalize, or iterate all in-flight rows.)
 async fn implement_iterations(
     db: &AppDatabase,
     issue_id: i32,
@@ -1129,6 +1135,9 @@ async fn dispatch_finalize(
     Ok(handle.is_some())
 }
 
+/// All finalize iterations for the issue — keyed by `(issue, finalize)`. Finalize
+/// is issue-level (`target = None`) and stays singular under the parallel model
+/// (`uniq_active_finalize` admits one), so no target key is needed.
 async fn finalize_iterations(
     db: &AppDatabase,
     issue_id: i32,
