@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "疊代會話",
-      "description": "檢視該循環疊代並回答它的提問。"
+      "description": "檢視該循環疊代並回答它的提問。",
+      "openIssue": "開啟議題"
     },
     "reviewVerdict": {
       "pass": "通過",

@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "Iterationssitzung",
-      "description": "Diese Schleifeniteration beobachten und ihre Fragen beantworten."
+      "description": "Diese Schleifeniteration beobachten und ihre Fragen beantworten.",
+      "openIssue": "Aufgabe öffnen"
     },
     "reviewVerdict": {
       "pass": "Bestanden",

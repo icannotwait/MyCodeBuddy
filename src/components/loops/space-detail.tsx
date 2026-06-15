@@ -143,6 +143,11 @@ export function SpaceDetail({
                 openIteration({
                   conversationId: target.conversationId,
                   agentType: target.agentType,
+                  issueContext: {
+                    spaceId: space.id,
+                    issueId: item.issue_id,
+                    issueSeq: item.issue_seq,
+                  },
                 })
             }}
           />

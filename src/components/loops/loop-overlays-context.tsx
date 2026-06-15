@@ -9,12 +9,23 @@ import {
   type ReactNode,
 } from "react"
 
-import type { AgentType } from "@/lib/types"
+import type { AgentType, LoopStage } from "@/lib/types"
 import { IterationDialog } from "@/components/loops/iteration-dialog"
+
+/** Issue identity carried from an opener so the iteration viewer can show it and
+ *  offer "open issue" without a lookup. The iteration list supplies the full
+ *  set; a `question` inbox card has no stage column, so `stage` is optional. */
+export interface IterationIssueContext {
+  spaceId: number
+  issueId: number
+  issueSeq: number
+  stage?: LoopStage
+}
 
 interface OpenIterationArgs {
   conversationId: number
   agentType?: AgentType | null
+  issueContext?: IterationIssueContext | null
 }
 
 interface LoopOverlaysValue {
@@ -45,6 +56,7 @@ export function LoopOverlaysProvider({ children }: { children: ReactNode }) {
         }}
         conversationId={iteration?.conversationId ?? 0}
         agentType={iteration?.agentType ?? null}
+        issueContext={iteration?.issueContext ?? null}
       />
     </Ctx.Provider>
   )

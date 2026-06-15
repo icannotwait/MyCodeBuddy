@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "イテレーションセッション",
-      "description": "このループイテレーションを確認し、質問に回答します。"
+      "description": "このループイテレーションを確認し、質問に回答します。",
+      "openIssue": "課題を開く"
     },
     "reviewVerdict": {
       "pass": "合格",

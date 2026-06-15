@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "Session d'itération",
-      "description": "Observez cette itération de boucle et répondez à ses questions."
+      "description": "Observez cette itération de boucle et répondez à ses questions.",
+      "openIssue": "Ouvrir le problème"
     },
     "reviewVerdict": {
       "pass": "Validé",

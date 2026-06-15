@@ -108,12 +108,19 @@ describe("IterationList", () => {
     expect(screen.getByText("pnpm test")).toBeInTheDocument() // run command
   })
 
-  it("opens the conversation viewer for an iteration with a conversation", async () => {
-    listLoopIterations.mockResolvedValue([iter({ id: 1, conversation_id: 55 })])
+  it("opens the conversation viewer with the iteration's issue context (incl. stage)", async () => {
+    // The `stage` field is optional on IterationIssueContext, so it is NOT
+    // type-enforced here — assert it explicitly (review NB3).
+    listLoopIterations.mockResolvedValue([
+      iter({ id: 1, conversation_id: 55, issue_id: 7, issue_seq: 3 }),
+    ])
     render(<IterationList spaceId={1} />)
 
     fireEvent.click(await screen.findByLabelText("openConversation"))
-    expect(openIteration).toHaveBeenCalledWith({ conversationId: 55 })
+    expect(openIteration).toHaveBeenCalledWith({
+      conversationId: 55,
+      issueContext: { spaceId: 1, issueId: 7, issueSeq: 3, stage: "implement" },
+    })
   })
 
   it("scopes the fetch to one issue when issueId is given", async () => {

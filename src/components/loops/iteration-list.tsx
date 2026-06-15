@@ -165,7 +165,15 @@ export function IterationList({
                     variant="ghost"
                     className="h-7 w-7 shrink-0"
                     onClick={() =>
-                      openIteration({ conversationId: it.conversation_id! })
+                      openIteration({
+                        conversationId: it.conversation_id!,
+                        issueContext: {
+                          spaceId,
+                          issueId: it.issue_id,
+                          issueSeq: it.issue_seq,
+                          stage: it.stage,
+                        },
+                      })
                     }
                     aria-label={t("openConversation")}
                   >

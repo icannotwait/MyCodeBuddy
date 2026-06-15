@@ -27,6 +27,9 @@ import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
+import { Button } from "@/components/ui/button"
+import { useLoopNav } from "@/hooks/use-loop-nav"
+import type { IterationIssueContext } from "@/components/loops/loop-overlays-context"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
   useChildConnectionState,
@@ -56,6 +59,9 @@ interface Props {
    * dialog derives the agent type from the conversation itself.
    */
   agentType?: AgentType | null
+  /** Issue identity from the opener; when present the header shows it and offers
+   *  an "open issue" back-link. */
+  issueContext?: IterationIssueContext | null
 }
 
 export function IterationDialog({
@@ -63,6 +69,7 @@ export function IterationDialog({
   onOpenChange,
   conversationId,
   agentType,
+  issueContext,
 }: Props) {
   const t = useTranslations("Loops.iteration")
 
@@ -80,6 +87,8 @@ export function IterationDialog({
           <IterationSessionBody
             conversationId={conversationId}
             agentTypeHint={agentType ?? null}
+            issueContext={issueContext ?? null}
+            onClose={() => onOpenChange(false)}
           />
         ) : null}
       </DialogContent>
@@ -90,11 +99,17 @@ export function IterationDialog({
 function IterationSessionBody({
   conversationId,
   agentTypeHint,
+  issueContext,
+  onClose,
 }: {
   conversationId: number
   agentTypeHint: AgentType | null
+  issueContext: IterationIssueContext | null
+  onClose: () => void
 }) {
   const t = useTranslations("Loops.iteration")
+  const tStage = useTranslations("Loops.stage")
+  const { gotoIssue } = useLoopNav()
   const { connectAsViewer, disconnect, answerQuestion, respondPermission } =
     useAcpActions()
   const { refetchDetail, setLiveOwnsActiveTurn } = useConversationRuntime()
@@ -201,9 +216,34 @@ function IterationSessionBody({
             <span className="h-2 w-2 rounded-sm bg-muted-foreground/60" />
           )}
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
-          {agentType ? AGENT_LABELS[agentType] : t("title")}
-        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-semibold text-foreground">
+            {agentType ? AGENT_LABELS[agentType] : t("title")}
+          </div>
+          {issueContext && (
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="font-mono">#{issueContext.issueSeq}</span>
+              {issueContext.stage && (
+                <span className="rounded bg-muted px-1.5 py-0.5">
+                  {tStage(issueContext.stage)}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        {issueContext && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 shrink-0"
+            onClick={() => {
+              gotoIssue(issueContext.spaceId, issueContext.issueId)
+              onClose()
+            }}
+          >
+            {t("openIssue")}
+          </Button>
+        )}
       </div>
       <div className="min-h-0 flex-1 px-4 py-3">
         <MessageListView

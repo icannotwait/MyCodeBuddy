@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "Iteration session",
-      "description": "Watch this loop iteration and answer its questions."
+      "description": "Watch this loop iteration and answer its questions.",
+      "openIssue": "Open issue"
     },
     "reviewVerdict": {
       "pass": "Pass",

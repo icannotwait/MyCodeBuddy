@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "이터레이션 세션",
-      "description": "이 루프 이터레이션을 확인하고 질문에 답합니다."
+      "description": "이 루프 이터레이션을 확인하고 질문에 답합니다.",
+      "openIssue": "이슈 열기"
     },
     "reviewVerdict": {
       "pass": "통과",

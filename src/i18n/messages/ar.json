@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "جلسة التكرار",
-      "description": "تابع هذه الدورة وأجب عن أسئلتها."
+      "description": "تابع هذه الدورة وأجب عن أسئلتها.",
+      "openIssue": "فتح المسألة"
     },
     "reviewVerdict": {
       "pass": "ناجح",

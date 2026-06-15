@@ -3081,7 +3081,8 @@
     },
     "iteration": {
       "title": "迭代会话",
-      "description": "查看该循环迭代并回答它的提问。"
+      "description": "查看该循环迭代并回答它的提问。",
+      "openIssue": "打开议题"
     },
     "reviewVerdict": {
       "pass": "通过",
