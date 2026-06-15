@@ -40,8 +40,8 @@ use crate::loop_engine::dispatch::{dispatch_iteration, emit_changed, DispatchInp
 use crate::loop_engine::driver::resolve_agent_spec;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
-    cas_artifact_status, cas_issue_status, cas_iteration_status, release_task_gate,
-    try_acquire_task_gate,
+    cas_artifact_status, cas_issue_status, cas_iteration_status, cas_task_done_with_freeze,
+    release_task_gate, try_acquire_task_gate,
 };
 use crate::loop_engine::validation::{self, ValidationOutcome};
 use crate::loop_engine::worktree;
@@ -629,6 +629,23 @@ async fn set_task_status_cas(
     Ok(applied)
 }
 
+/// Read the task's accepted tip — HEAD of the worktree it ran in (the task branch
+/// in parallel mode, the issue branch in serial mode) — and atomically mark the
+/// task `Done` while freezing that commit as its `fan_in_commit`. The single CAS
+/// (see [`cas_task_done_with_freeze`]) guarantees no "Done but unfrozen" window
+/// the fan-in could observe. Returns whether the CAS applied.
+async fn freeze_and_done(
+    db: &AppDatabase,
+    worktree_folder_id: i32,
+    task_id: i32,
+) -> Result<bool, LoopError> {
+    let folder = folder_service::get_folder_by_id(&db.conn, worktree_folder_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("worktree folder {worktree_folder_id}")))?;
+    let sha = worktree::head_commit(Path::new(&folder.path)).await?;
+    cas_task_done_with_freeze(&db.conn, task_id, &sha).await
+}
+
 async fn bump_rework(db: &AppDatabase, task_id: i32, sig: &str) -> Result<(), LoopError> {
     loop_artifact::Entity::update_many()
         .col_expr(
@@ -803,14 +820,13 @@ async fn drive_reviews(
     match aggregate(config.review_pass_rule, reviewers, &decided) {
         ReviewDecision::Pass => {
             cancel_active_reviews(db, spawner, &iters).await?;
-            // Only a CAS that actually applied (task was InProgress → Done) is
-            // durable progress; otherwise the snapshot was stale (a prior tick
-            // already settled this task), so don't report Advanced — that would
-            // re-enter this same arm on stale verdicts and hot-spin. Idle instead;
-            // a real wake re-ticks against fresh state.
-            if set_task_status_cas(db, task.id, ArtifactStatus::InProgress, ArtifactStatus::Done)
-                .await?
-            {
+            // Atomically freeze the task's accepted tip and mark it Done. Only a
+            // CAS that applied (task was InProgress) is durable progress;
+            // otherwise the snapshot was stale (a prior tick already settled this
+            // task), so don't report Advanced — that would re-enter this arm on
+            // stale verdicts and hot-spin. Idle instead; a real wake re-ticks
+            // against fresh state.
+            if freeze_and_done(db, worktree_folder_id, task.id).await? {
                 release_task_gate(&db.conn, issue.id, task.id).await?;
                 Ok(StepOutcome::Advanced)
             } else {
@@ -2307,6 +2323,36 @@ mod tests {
             "review pass → task done"
         );
         assert_eq!(task_node(h, task).await.status, ArtifactStatus::Done);
+    }
+
+    fn git_head(dir: &Path) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn task_done_records_frozen_commit() {
+        let h = setup().await;
+        let task = add_task(&h, "T").await;
+        let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
+        complete_task(&h, &cfg, "feature.txt", task).await;
+
+        // Done ⟹ fan_in_commit set, equal to the accepted worktree tip (serial
+        // mode → the issue branch tip the checkpoint landed on).
+        let model = task_model(&h, task).await;
+        assert_eq!(model.status, ArtifactStatus::Done);
+        let frozen = model
+            .fan_in_commit
+            .expect("a Done task carries a frozen integration commit");
+        assert_eq!(
+            frozen,
+            git_head(&h.worktree_path),
+            "frozen commit == accepted worktree tip"
+        );
     }
 
     /// All tasks done → finalize dispatches; the agent submits a result; the DAG

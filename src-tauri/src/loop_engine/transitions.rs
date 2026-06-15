@@ -156,6 +156,34 @@ pub async fn cas_artifact_status_from(
     Ok(res.rows_affected == 1)
 }
 
+/// Atomically mark a task `Done` AND freeze its integration commit in a single
+/// CAS (`status='done', fan_in_commit=<sha> WHERE id=? AND status='in_progress'`).
+/// Establishes the invariant **"a Done task always carries a non-null
+/// fan_in_commit"** — there is no observable "Done but unfrozen" intermediate the
+/// parallel fan-in could trip over. Returns whether the CAS applied (a miss means
+/// the task was no longer `in_progress` — a stale snapshot, not an error).
+pub async fn cas_task_done_with_freeze(
+    conn: &DatabaseConnection,
+    task_id: i32,
+    fan_in_commit: &str,
+) -> Result<bool, LoopError> {
+    let res = loop_artifact::Entity::update_many()
+        .col_expr(
+            loop_artifact::Column::Status,
+            Expr::value(ArtifactStatus::Done.to_value()),
+        )
+        .col_expr(
+            loop_artifact::Column::FanInCommit,
+            Expr::value(fan_in_commit.to_string()),
+        )
+        .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_artifact::Column::Id.eq(task_id))
+        .filter(loop_artifact::Column::Status.eq(ArtifactStatus::InProgress))
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
 /// Inputs for a dispatch claim. `conversation_id` is intentionally absent — the
 /// lease row is inserted first (conversation attached afterwards by the winner).
 pub struct IterationClaim {
@@ -371,6 +399,66 @@ mod tests {
         // Correct release frees the gate.
         assert!(release_task_gate(&db.conn, issue_id, 100).await.unwrap());
         assert!(try_acquire_task_gate(&db.conn, issue_id, 200).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cas_task_done_with_freeze_sets_both_atomically() {
+        let (db, space_id, issue_id) = seed().await;
+        let task = artifact::create_artifact(
+            &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
+            ArtifactStatus::InProgress, ActorKind::Agent, None,
+        )
+        .await
+        .unwrap();
+
+        // From InProgress: applies, setting status=Done AND fan_in_commit together.
+        assert!(cas_task_done_with_freeze(&db.conn, task.id, "deadbeef")
+            .await
+            .unwrap());
+        let row = loop_artifact::Entity::find_by_id(task.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ArtifactStatus::Done);
+        assert_eq!(
+            row.fan_in_commit.as_deref(),
+            Some("deadbeef"),
+            "Done ⟹ frozen, no unfrozen window"
+        );
+
+        // A second call (now Done, not InProgress) is a CAS miss — no overwrite.
+        assert!(!cas_task_done_with_freeze(&db.conn, task.id, "other")
+            .await
+            .unwrap());
+        let row = loop_artifact::Entity::find_by_id(task.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.fan_in_commit.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn cas_task_done_with_freeze_misses_when_not_in_progress() {
+        let (db, space_id, issue_id) = seed().await;
+        // A Pending task is not yet eligible → CAS misses, no partial freeze.
+        let task = artifact::create_artifact(
+            &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
+            ArtifactStatus::Pending, ActorKind::Agent, None,
+        )
+        .await
+        .unwrap();
+        assert!(!cas_task_done_with_freeze(&db.conn, task.id, "abc")
+            .await
+            .unwrap());
+        let row = loop_artifact::Entity::find_by_id(task.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ArtifactStatus::Pending);
+        assert!(row.fan_in_commit.is_none(), "no freeze on a CAS miss");
     }
 
     #[tokio::test]

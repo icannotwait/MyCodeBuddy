@@ -101,7 +101,8 @@ async fn current_branch(repo: &Path) -> Result<String, LoopError> {
     Err(LoopError::Git("could not resolve current branch".into()))
 }
 
-async fn head_commit(repo: &Path) -> Result<String, LoopError> {
+/// The commit OID at a worktree's HEAD (its branch tip).
+pub async fn head_commit(repo: &Path) -> Result<String, LoopError> {
     let out = run_git(repo, &["rev-parse", "HEAD"]).await?;
     if !out.status.success() {
         return Err(LoopError::Git(format!("rev-parse HEAD: {}", stderr_of(&out))));
