@@ -369,6 +369,14 @@ async fn validate_after_implement(
         ValidationOutcome::Unrunnable => {
             set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::Blocked)
                 .await?;
+            // Block the issue too (consistent with the no-progress breaker's
+            // `mark_blocked`), so the human `retry` escape hatch — which requires a
+            // `blocked` issue — can reach this stall and re-arm the task. Without
+            // this the issue would sit `running` with a blocked task: the driver
+            // parks and `retry_issue` rejects it as not-blocked, an unrecoverable
+            // dead end.
+            cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked)
+                .await?;
             loop_service::inbox::upsert_inbox(
                 &db.conn,
                 issue.space_id,
@@ -1509,8 +1517,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Tick 2: checkpoint + validation(unrunnable) → block the task (an advance,
-        // not a dispatch; issue stays running so the next drive parks).
+        // Tick 2: checkpoint + validation(unrunnable) → block the task AND the
+        // issue (an advance, not a dispatch); the driver then re-ticks and stops,
+        // and the now-blocked issue is reachable by the human `retry`.
         assert_eq!(
             drive_with(&h, &cfg).await,
             StepOutcome::Advanced,
@@ -1519,6 +1528,11 @@ mod tests {
         let node = task_node(&h, task).await;
         assert_eq!(node.status, ArtifactStatus::Blocked);
         assert_eq!(node.attempt, 0, "config error does not consume a rework");
+        assert_eq!(
+            load_issue(&h).await.status,
+            IssueStatus::Blocked,
+            "issue blocked too, so the human retry can reach it"
+        );
         // A blocked inbox card was filed for the task.
         let inbox = loop_service::inbox::list_inbox(&h.db.conn, h.space_id, None)
             .await
