@@ -53,6 +53,7 @@ const UP: &[&str] = &[
         base_branch TEXT,
         base_commit TEXT,
         active_task_artifact_id INTEGER,
+        fan_in_manifest TEXT,
         token_used BIGINT NOT NULL DEFAULT 0,
         token_budget BIGINT,
         created_at TEXT NOT NULL,
@@ -76,6 +77,7 @@ const UP: &[&str] = &[
         verdict TEXT CHECK (verdict IS NULL OR verdict IN ('pass','fail')),
         attempt INTEGER NOT NULL DEFAULT 0,
         last_failure_sig TEXT,
+        fan_in_commit TEXT,
         sort INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -83,6 +85,8 @@ const UP: &[&str] = &[
     "CREATE INDEX idx_loop_artifact_issue_kind ON loop_artifact(issue_id, kind)",
     "CREATE INDEX idx_loop_artifact_space ON loop_artifact(space_id)",
     "CREATE INDEX idx_loop_artifact_produced_by ON loop_artifact(produced_by_iteration_id)",
+    // At most one result artifact per issue (the engine-synthesized capstone).
+    "CREATE UNIQUE INDEX uniq_result_per_issue ON loop_artifact(issue_id) WHERE kind = 'result'",
     "CREATE TABLE loop_artifact_revision (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
@@ -276,6 +280,7 @@ mod tests {
             "uniq_active_node",
             "uniq_review_slot",
             "uniq_inbox_pending",
+            "uniq_result_per_issue",
             // Plain lookup indexes.
             "idx_loop_iteration_issue_status",
             "idx_loop_artifact_produced_by",

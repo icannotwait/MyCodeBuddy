@@ -72,6 +72,10 @@ pub struct Model {
     /// Node-level rework counter (no-progress circuit breaker reads this).
     pub attempt: i32,
     pub last_failure_sig: Option<String>,
+    /// Frozen integration commit SHA, recorded atomically when a `task` turns
+    /// `Done` (its accepted tip). The parallel result-stage fan-in merges these
+    /// SHAs, never live branch tips. `NULL` for non-task kinds / not-yet-done.
+    pub fan_in_commit: Option<String>,
     pub sort: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
