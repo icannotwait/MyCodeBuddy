@@ -24,10 +24,10 @@ pub enum LoopError {
     #[error("merge conflict")]
     MergeConflict,
     /// A merge attempt could not land for a concrete reason (dirty base, conflict,
-    /// failed re-validation, missing base). `message` is the user-facing summary;
-    /// `detail` carries the git/validation output for diagnosis.
-    #[error("merge failed: {message}")]
-    MergeFailed { message: String, detail: String },
+    /// failed re-validation, missing base). Carries the user-facing, actionable
+    /// message; the verbose git/validation output lives on the issue's inbox card.
+    #[error("merge failed: {0}")]
+    MergeFailed(String),
     #[error("git command failed: {0}")]
     Git(String),
     #[error("invalid input: {0}")]
@@ -80,10 +80,12 @@ impl From<LoopError> for AppCommandError {
                 AppErrorCode::ExternalCommandFailed,
                 "Merge conflict while integrating the issue branch",
             ),
-            // The merge could not land; surface the concrete reason (never a silent
-            // success). `detail` carries the git/validation output.
-            LoopError::MergeFailed { message, detail } => {
-                AppCommandError::new(AppErrorCode::ExternalCommandFailed, message).with_detail(detail)
+            // The merge could not land; surface the concrete, actionable reason
+            // (never a silent success). No `with_detail` — the frontend's
+            // `toErrorMessage` prefers `detail` over `message`, and we want the
+            // actionable sentence in the toast (the verbose output is on the card).
+            LoopError::MergeFailed(message) => {
+                AppCommandError::new(AppErrorCode::ExternalCommandFailed, message)
             }
             LoopError::Git(m) => {
                 AppCommandError::new(AppErrorCode::ExternalCommandFailed, "Git command failed")

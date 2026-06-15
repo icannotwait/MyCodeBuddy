@@ -348,7 +348,7 @@ impl LoopEngine {
                 None,
                 InboxKind::Blocked,
                 &format!("merge_blocked:{issue_id}"),
-                serde_json::json!({ "reason": reason, "detail": detail.clone() }),
+                serde_json::json!({ "reason": reason, "detail": detail }),
             )
             .await?;
             resolve_approval_card(
@@ -360,7 +360,7 @@ impl LoopEngine {
             .await?;
             self.emit_changed(issue.space_id, issue_id, "blocked");
             self.wake(issue_id).await;
-            return Err(LoopError::MergeFailed { message, detail });
+            return Err(LoopError::MergeFailed(message));
         }
 
         // Merged. Best-effort teardown; the DB update below is the source of truth —
@@ -1106,7 +1106,7 @@ mod tests {
 
         // The fault surfaces as an error — not a silent "Ok" success.
         let err = engine.merge_issue(issue_id).await.unwrap_err();
-        assert!(matches!(err, LoopError::MergeFailed { .. }));
+        assert!(matches!(err, LoopError::MergeFailed(_)));
 
         // The issue is blocked + carries a durable card so the fault is visible
         // (also covers the auto-merge path, which only logs the error).
@@ -1131,7 +1131,7 @@ mod tests {
 
         // The fault surfaces as an error (never a silent success)...
         let err = engine.merge_issue(issue_id).await.unwrap_err();
-        assert!(matches!(err, LoopError::MergeFailed { .. }));
+        assert!(matches!(err, LoopError::MergeFailed(_)));
 
         // ...AND a branch/integration fault blocks the issue + files a card so it
         // is visible (also covers the auto-merge path, which only logs the error).
