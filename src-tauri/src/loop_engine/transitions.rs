@@ -80,6 +80,9 @@ pub(crate) fn is_legal_artifact(from: ArtifactStatus, to: ArtifactStatus) -> boo
             | (AwaitingApproval, Superseded)
             | (AwaitingApproval, Cancelled)
             | (Done, Superseded)
+            // Coverage loop-back supersedes still-`pending` plan tasks to replan
+            // (driver.rs `maybe_coverage_loopback`).
+            | (Pending, Superseded)
             | (Blocked, InProgress)
             | (Blocked, Pending)
             | (Pending, Cancelled)

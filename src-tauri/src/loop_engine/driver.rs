@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::Instrument;
@@ -32,7 +32,7 @@ use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssueRoute, IssueStatus};
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
 use crate::db::entities::loop_link::LinkKind;
-use crate::db::service::loop_service::{artifact, inbox, link};
+use crate::db::service::loop_service::{artifact, coverage, inbox, link};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::loops::{AgentSpec, IssueConfig, LoopArtifactRow, LoopDagView};
@@ -165,11 +165,13 @@ pub(crate) fn ready_nodes(dag: &LoopDagView, route: IssueRoute) -> Vec<FrontierI
         }
     }
 
-    // 2. Design → design (derives from a requirement, or the root if none).
+    // 2. Design → design. Anchored at the issue root (a stable target); the
+    //    design's real lineage — `derives_from` edges to EVERY requirement, each
+    //    bound to its revision — is wired by ingest's design fan-in, not by this
+    //    single dispatch target.
     if needs_design {
         if designs.is_empty() {
-            let target = reqs.last().map(|r| r.id).unwrap_or(root);
-            return one(Stage::Design, target);
+            return one(Stage::Design, root);
         }
         if !all_done(&designs) {
             return Vec::new();
@@ -483,6 +485,101 @@ async fn maybe_file_stall_alert(
     Ok(())
 }
 
+/// Coverage loop-back (spec §3.3). When a plan leaves some requirement
+/// acceptance criterion unclaimed by any live task, supersede the under-covering
+/// tasks so the read frontier re-emits Plan (whose briefing then carries the
+/// gap) — a bounded feedback edge, not a dead end. Bounded by `max_attempts`
+/// (0 = unlimited): on exhaustion, block the issue and file a `coverage_gap`
+/// card for a human (raise the cap / fix the requirements / retry).
+///
+/// Returns `Some(Advanced)` when it acted (caller returns it and re-ticks),
+/// `None` when coverage is complete so the caller proceeds to the write pipeline.
+///
+/// The transient replan does NOT file an inbox card: it is the engine converging
+/// as designed, not a state needing human action, and the churn is already
+/// visible via `emit_changed` (superseded tasks + a fresh plan attempt). Only the
+/// terminal blocked state is an inbox item.
+async fn maybe_coverage_loopback(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    issue: &loop_issue::Model,
+    config: &IssueConfig,
+    dag: &LoopDagView,
+) -> Result<Option<TickOutcome>, LoopError> {
+    let conn = &db.conn;
+
+    // Live (non-superseded/cancelled) tasks. If none exist the read frontier
+    // would have re-emitted Plan, so there is nothing to gate here.
+    let live_tasks: std::collections::HashSet<i32> = dag
+        .artifacts
+        .iter()
+        .filter(|a| {
+            a.kind == ArtifactKind::Task
+                && !matches!(a.status, ArtifactStatus::Superseded | ArtifactStatus::Cancelled)
+        })
+        .map(|a| a.id)
+        .collect();
+    if live_tasks.is_empty() {
+        return Ok(None);
+    }
+
+    let ordinals = coverage::acceptance_ordinals_for_issue(conn, issue.id).await?;
+    let uncovered = coverage::uncovered_ordinals(&ordinals, &dag.coverage, &live_tasks);
+    if uncovered.is_empty() {
+        return Ok(None); // every acceptance criterion is covered → proceed
+    }
+
+    // Bound the replan loop by the rework cap. Every plan dispatch (initial +
+    // each replan) is one plan iteration on record; once that count reaches the
+    // cap, stop churning and ask a human.
+    let plan_attempts = loop_iteration::Entity::find()
+        .filter(loop_iteration::Column::IssueId.eq(issue.id))
+        .filter(loop_iteration::Column::Stage.eq(Stage::Plan))
+        .count(conn)
+        .await? as u32;
+
+    if config.max_attempts != 0 && plan_attempts >= config.max_attempts {
+        cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
+        inbox::upsert_inbox(
+            conn,
+            issue.space_id,
+            issue.id,
+            None,
+            InboxKind::Blocked,
+            &format!("coverage_gap:{}", issue.id),
+            serde_json::json!({
+                "v": 1,
+                "reason": "coverage_gap_exhausted",
+                "uncovered": uncovered,
+                "plan_attempts": plan_attempts,
+            }),
+        )
+        .await?;
+        emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+        return Ok(Some(TickOutcome::Advanced));
+    }
+
+    // Supersede the under-covering plan tasks (all still `pending` — the gate
+    // runs before any implement) so the read frontier re-emits Plan next tick.
+    for &tid in &live_tasks {
+        crate::loop_engine::transitions::cas_artifact_status_from(
+            conn,
+            tid,
+            &[ArtifactStatus::Pending],
+            ArtifactStatus::Superseded,
+        )
+        .await?;
+    }
+    tracing::info!(
+        issue_id = issue.id,
+        plan_attempts,
+        uncovered = ?uncovered,
+        "coverage gap: superseding tasks and replanning"
+    );
+    emit_changed(emitter, issue.space_id, issue.id, issue.id, "issue");
+    Ok(Some(TickOutcome::Advanced))
+}
+
 /// One scheduling tick for a single issue: ensure triage, then dispatch the
 /// ready frontier. Idempotent and side-effect-guarded by the DB leases, so it
 /// is safe to call repeatedly. Takes explicit handles (not `&LoopEngine`) so it
@@ -608,6 +705,18 @@ pub(crate) async fn tick_once(
         } else {
             TickOutcome::Idle
         });
+    }
+
+    // Coverage gate (spec §3.3): on a route that produces requirements, a plan
+    // that leaves any requirement acceptance criterion unclaimed is incomplete —
+    // implementing it would let a verifier pass a partial solution (Goodhart).
+    // Supersede the under-covering tasks and replan (bounded by `max_attempts`),
+    // before latching the execution mode or driving the write pipeline. Runs only
+    // once live tasks exist (otherwise the read frontier above re-emits Plan).
+    if matches!(route, IssueRoute::Full | IssueRoute::SkipDesign) {
+        if let Some(outcome) = maybe_coverage_loopback(db, emitter, &issue, &config, &dag).await? {
+            return Ok(outcome);
+        }
     }
 
     // Decide the issue's execution mode once the task DAG exists (write-once;
@@ -1532,6 +1641,142 @@ mod tests {
             issue.status,
             IssueStatus::Blocked,
             "an abandoned triage must bound via recovery, not redispatch unbounded"
+        );
+    }
+
+    /// Build a post-plan DAG with a coverage gap: route=full, two done
+    /// requirements (each one acceptance criterion), a done design, a settled
+    /// plan iteration on record, and two pending tasks — but coverage only for
+    /// R1.AC1 (R2.AC1 left uncovered). Returns (db, data_dir, issue_id, task_ids).
+    async fn seed_coverage_gap() -> (AppDatabase, PathBuf, i32, Vec<i32>) {
+        use crate::db::entities::loop_criterion::CriterionKind;
+        use crate::loop_engine::transitions::{
+            cas_iteration_status, try_claim_iteration, IterationClaim,
+        };
+
+        let (db, data_dir, issue_id) = setup().await;
+        let conn = &db.conn;
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let space_id = issue.space_id;
+
+        // Route = full (the gate only runs on routes that produce requirements).
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Route,
+                Expr::value(IssueRoute::Full.to_value()),
+            )
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .exec(conn)
+            .await
+            .unwrap();
+
+        // A triage iteration on record so tick_once doesn't dispatch the initial one.
+        try_claim_iteration(
+            conn,
+            IterationClaim {
+                space_id,
+                issue_id,
+                stage: Stage::Triage,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "triage-tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Two done requirements, each with one acceptance criterion.
+        let r1 = artifact::create_artifact(conn, space_id, issue_id, ArtifactKind::Requirement, "R1", ArtifactStatus::Done, ActorKind::Agent, None).await.unwrap();
+        artifact::add_criterion(conn, r1.id, CriterionKind::Acceptance, "r1 ac").await.unwrap();
+        let r2 = artifact::create_artifact(conn, space_id, issue_id, ArtifactKind::Requirement, "R2", ArtifactStatus::Done, ActorKind::Agent, None).await.unwrap();
+        artifact::add_criterion(conn, r2.id, CriterionKind::Acceptance, "r2 ac").await.unwrap();
+
+        // A done design fanning into both requirements.
+        let d = artifact::create_artifact(conn, space_id, issue_id, ArtifactKind::Design, "D", ArtifactStatus::Done, ActorKind::Agent, None).await.unwrap();
+        link::create_link(conn, space_id, d.id, r1.id, LinkKind::DerivesFrom, None).await.unwrap();
+        link::create_link(conn, space_id, d.id, r2.id, LinkKind::DerivesFrom, None).await.unwrap();
+
+        // One settled plan iteration on record (the plan that produced the tasks).
+        let plan_it = try_claim_iteration(
+            conn,
+            IterationClaim {
+                space_id,
+                issue_id,
+                stage: Stage::Plan,
+                target_artifact_id: Some(d.id),
+                slot_no: None,
+                capability_token: "plan-tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cas_iteration_status(conn, plan_it.id, IterationStatus::Queued, IterationStatus::Running).await.unwrap();
+        cas_iteration_status(conn, plan_it.id, IterationStatus::Running, IterationStatus::Succeeded).await.unwrap();
+
+        // Two pending tasks; coverage only for R1's acceptance criterion.
+        let t1 = artifact::create_artifact(conn, space_id, issue_id, ArtifactKind::Task, "T1", ArtifactStatus::Pending, ActorKind::Agent, None).await.unwrap();
+        let t2 = artifact::create_artifact(conn, space_id, issue_id, ArtifactKind::Task, "T2", ArtifactStatus::Pending, ActorKind::Agent, None).await.unwrap();
+        let r1ac = artifact::get_artifact_detail(conn, r1.id).await.unwrap().unwrap().criteria[0].id;
+        coverage::create_coverage(conn, space_id, t1.id, r1ac).await.unwrap();
+
+        (db, data_dir, issue_id, vec![t1.id, t2.id])
+    }
+
+    #[tokio::test]
+    async fn coverage_gap_supersedes_tasks_and_replans() {
+        let (db, data_dir, issue_id, tasks) = seed_coverage_gap().await;
+        let spawner = StubSpawner;
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(out, TickOutcome::Advanced, "coverage gap is durable progress");
+        // Both under-covering tasks superseded.
+        for t in &tasks {
+            let node = artifact::get_artifact_detail(&db.conn, *t).await.unwrap().unwrap();
+            assert_eq!(node.row.status, ArtifactStatus::Superseded, "task {t} superseded");
+        }
+        // Issue still running (bounded replan, not exhausted) and the read frontier
+        // now re-emits Plan (live tasks empty).
+        let issue = loop_issue::Entity::find_by_id(issue_id).one(&db.conn).await.unwrap().unwrap();
+        assert_eq!(issue.status, IssueStatus::Running);
+        let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
+        let frontier = ready_nodes(&dag, IssueRoute::Full);
+        assert_eq!(frontier.len(), 1);
+        assert_eq!(frontier[0].stage, Stage::Plan, "re-emits Plan to replan");
+    }
+
+    #[tokio::test]
+    async fn coverage_gap_exhausts_to_blocked_with_card() {
+        let (db, data_dir, issue_id, tasks) = seed_coverage_gap().await;
+        // Tighten the rework cap to 1: the single plan iteration on record already
+        // meets it, so the gap blocks instead of replanning.
+        let mut cfg = IssueConfig::default();
+        cfg.max_attempts = 1;
+        write_config(&db, issue_id, &cfg).await;
+
+        let spawner = StubSpawner;
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(out, TickOutcome::Advanced);
+        // Issue blocked; tasks left untouched; a coverage_gap card filed.
+        let issue = loop_issue::Entity::find_by_id(issue_id).one(&db.conn).await.unwrap().unwrap();
+        assert_eq!(issue.status, IssueStatus::Blocked);
+        let node = artifact::get_artifact_detail(&db.conn, tasks[0]).await.unwrap().unwrap();
+        assert_eq!(node.row.status, ArtifactStatus::Pending, "tasks untouched on exhaustion");
+        let cards = inbox::list_inbox(&db.conn, issue.space_id, None).await.unwrap();
+        assert!(
+            cards.iter().any(|c| c.subject_key == format!("coverage_gap:{issue_id}")
+                && c.kind == InboxKind::Blocked),
+            "coverage_gap card filed"
         );
     }
 

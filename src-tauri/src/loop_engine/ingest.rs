@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use crate::acp::delegation::listener::LoopIngestAccess;
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::{self, ActorKind};
-use crate::db::entities::loop_criterion::{self, CriterionKind};
+use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssuePriority, IssueRoute};
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
@@ -465,31 +465,17 @@ async fn submit_artifacts(
         Vec::new()
     };
 
-    // Plan stage: the stable `R{i}.AC{j}` → criterion_id map over the issue's
-    // done requirements and their acceptance criteria (both ordered by sort,id),
-    // so a task's `covers` references acceptance criteria by ordinal without the
-    // agent ever seeing a DB id. Ordering matches the design fan-in and the
-    // briefing enumeration.
+    // Plan stage: the stable `R{i}.AC{j}` → criterion_id map, built from the
+    // single shared ordinal source so a task's `covers` references acceptance
+    // criteria by the same ordinals the driver's coverage gate and the planner
+    // briefing use. The agent never sees a DB id.
     let covers_ordinals: HashMap<String, i32> = if kind == ArtifactKind::Task {
-        let reqs = loop_artifact::Entity::find()
-            .filter(loop_artifact::Column::IssueId.eq(it.issue_id))
-            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Requirement))
-            .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Done))
-            .order_by_asc(loop_artifact::Column::Sort)
-            .order_by_asc(loop_artifact::Column::Id)
-            .all(conn)
-            .await?;
+        let ordered =
+            loop_service::coverage::acceptance_ordinals_for_issue(conn, it.issue_id).await?;
         let mut map = HashMap::new();
-        for (ri, r) in reqs.iter().enumerate() {
-            let crits = loop_criterion::Entity::find()
-                .filter(loop_criterion::Column::ArtifactId.eq(r.id))
-                .filter(loop_criterion::Column::Kind.eq(CriterionKind::Acceptance))
-                .order_by_asc(loop_criterion::Column::Sort)
-                .order_by_asc(loop_criterion::Column::Id)
-                .all(conn)
-                .await?;
-            for (ci, c) in crits.iter().enumerate() {
-                map.insert(format!("R{}.AC{}", ri + 1, ci + 1), c.id);
+        for (ri, (_req, crits)) in ordered.iter().enumerate() {
+            for (ci, cid) in crits.iter().enumerate() {
+                map.insert(format!("R{}.AC{}", ri + 1, ci + 1), *cid);
             }
         }
         map
