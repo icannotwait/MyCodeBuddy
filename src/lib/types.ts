@@ -588,11 +588,20 @@ export interface LoopRevision {
   created_at: string
 }
 
+/** Criterion category — the typed unit of traceability. Requirements/tasks
+ * carry `acceptance`; designs carry `constraint`/`invariant`/`obligation`. */
+export type CriterionKind =
+  | "acceptance"
+  | "constraint"
+  | "invariant"
+  | "obligation"
+
 export interface LoopCriterionRow {
   id: number
   label: string
   text: string
   sort: number
+  kind: CriterionKind
 }
 
 export interface LoopLinkRow {
@@ -600,6 +609,17 @@ export interface LoopLinkRow {
   from_artifact_id: number
   to_artifact_id: number
   kind: LoopLinkKind
+  /** For design→requirement `derives_from` edges: the bound requirement
+   * revision (lineage content snapshot); null for other edges. */
+  source_revision_id: number | null
+}
+
+/** One criterion-level coverage edge: `task_artifact_id` satisfies
+ * `criterion_id` (an acceptance criterion on some requirement). */
+export interface LoopCoverageRow {
+  id: number
+  task_artifact_id: number
+  criterion_id: number
 }
 
 export interface LoopArtifactDetail extends LoopArtifactRow {
@@ -611,6 +631,7 @@ export interface LoopArtifactDetail extends LoopArtifactRow {
 export interface LoopDagView {
   artifacts: LoopArtifactRow[]
   links: LoopLinkRow[]
+  coverage: LoopCoverageRow[]
 }
 
 export interface LoopIterationRow {

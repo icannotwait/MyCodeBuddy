@@ -9,12 +9,19 @@ import {
   approveLoopDesign,
   approveLoopMerge,
   getLoopArtifact,
+  getLoopDag,
   getLoopIssue,
   rejectLoopDesign,
   rejectLoopMerge,
 } from "@/lib/loops-api"
 import { toErrorMessage } from "@/lib/app-error"
 import { diffLines, type DiffLine } from "@/lib/line-diff"
+import {
+  acceptanceOrdinalMap,
+  coveringTaskTitles,
+  taskCovers,
+  type CriterionOrdinal,
+} from "@/lib/loop-coverage"
 import type {
   LoopArtifactDetail,
   LoopIssueDetail,
@@ -44,14 +51,29 @@ import { MessageResponse } from "@/components/ai-elements/message"
 
 type Gate = "design" | "merge"
 
+/** Criterion-level coverage view for the drawer (computed from the issue DAG). */
+interface CoverageView {
+  // Requirement drawer: acceptance criterion id → covering task titles
+  // (empty array ⇒ that criterion is uncovered).
+  coveredBy: Record<number, string[]>
+  // Task drawer: the acceptance criteria this task covers (ordinal + text).
+  covers: CriterionOrdinal[]
+}
+
 interface ArtifactDrawerData {
   detail: LoopArtifactDetail | null
   // Loaded only for a `result`, to tell a live merge gate (issue running) from
   // an already-merged or blocked one.
   issue: LoopIssueDetail | null
+  // Loaded for requirement/task artifacts to render the coverage matrix.
+  coverage: CoverageView | null
 }
 
-const EMPTY_DRAWER: ArtifactDrawerData = { detail: null, issue: null }
+const EMPTY_DRAWER: ArtifactDrawerData = {
+  detail: null,
+  issue: null,
+  coverage: null,
+}
 
 /**
  * Read-only drawer for a single artifact, plus the two human gates the loop
@@ -107,6 +129,8 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
   const tStatus = useTranslations("Loops.artifactStatus")
   const tVerdict = useTranslations("Loops.reviewVerdict")
   const tActor = useTranslations("Loops.actorKind")
+  const tCriterionKind = useTranslations("Loops.criterionKind")
+  const tCoverage = useTranslations("Loops.coverage")
   const tGate = useTranslations("Loops.inbox")
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
@@ -128,10 +152,46 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
       const detail = await getLoopArtifact(artifactId)
       if (detail) issueRef.current = detail.issue_id // immutable → narrow now
       let issue: LoopIssueDetail | null = null
+      let coverage: CoverageView | null = null
       if (detail && detail.kind === "result") {
         issue = await getLoopIssue(detail.issue_id).catch(() => null)
       }
-      return { detail, issue }
+      // Coverage matrix: requirements show which task covers each acceptance
+      // criterion (and warn on gaps); tasks show which criteria they cover.
+      if (detail && (detail.kind === "requirement" || detail.kind === "task")) {
+        const dag = await getLoopDag(detail.issue_id).catch(() => null)
+        if (dag && detail.kind === "requirement") {
+          const coveredBy: Record<number, string[]> = {}
+          for (const c of detail.criteria) {
+            if (c.kind === "acceptance") {
+              coveredBy[c.id] = coveringTaskTitles(
+                c.id,
+                dag.coverage,
+                dag.artifacts
+              )
+            }
+          }
+          coverage = { coveredBy, covers: [] }
+        } else if (dag && detail.kind === "task") {
+          const reqIds = dag.artifacts
+            .filter((a) => a.kind === "requirement")
+            .map((a) => a.id)
+          const reqDetails = (
+            await Promise.all(
+              reqIds.map((id) => getLoopArtifact(id).catch(() => null))
+            )
+          ).filter((d): d is LoopArtifactDetail => d != null)
+          coverage = {
+            coveredBy: {},
+            covers: taskCovers(
+              detail.id,
+              dag.coverage,
+              acceptanceOrdinalMap(reqDetails)
+            ),
+          }
+        }
+      }
+      return { detail, issue, coverage }
     },
     {
       match: (e) => issueRef.current == null || e.issue_id === issueRef.current,
@@ -248,21 +308,61 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
 
             {detail.criteria.length > 0 && (
               <Section title={t("criteriaHeading")}>
-                <ul className="space-y-1.5">
-                  {detail.criteria.map((c) => (
-                    <li key={c.id} className="text-sm">
-                      <span className="font-medium">{c.label}</span>
-                      {c.text ? (
+                <ul className="space-y-2">
+                  {detail.criteria.map((c) => {
+                    // Coverage line: only meaningful for a requirement's
+                    // acceptance criteria (which tasks claim them).
+                    const tasks =
+                      detail.kind === "requirement" && c.kind === "acceptance"
+                        ? data.coverage?.coveredBy[c.id]
+                        : undefined
+                    return (
+                      <li key={c.id} className="text-sm">
+                        <div className="flex items-center gap-1.5">
+                          <Badge variant="outline" className="text-[10px]">
+                            {tCriterionKind(c.kind)}
+                          </Badge>
+                          <span className="font-medium">{c.label}</span>
+                        </div>
+                        {c.text ? (
+                          <p className="text-muted-foreground">{c.text}</p>
+                        ) : null}
+                        {tasks !== undefined &&
+                          (tasks.length > 0 ? (
+                            <p className="text-xs text-muted-foreground">
+                              {tCoverage("coveredBy", {
+                                tasks: tasks.join(", "),
+                              })}
+                            </p>
+                          ) : (
+                            <p className="text-xs text-amber-600 dark:text-amber-400">
+                              {tCoverage("uncovered")}
+                            </p>
+                          ))}
+                      </li>
+                    )
+                  })}
+                </ul>
+              </Section>
+            )}
+
+            {detail.kind === "task" &&
+              data.coverage &&
+              data.coverage.covers.length > 0 && (
+                <Section title={tCoverage("covers")}>
+                  <ul className="space-y-1">
+                    {data.coverage.covers.map((c) => (
+                      <li key={c.ordinal} className="text-sm">
+                        <span className="font-medium">{c.ordinal}</span>
                         <span className="text-muted-foreground">
                           {" — "}
                           {c.text}
                         </span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              </Section>
-            )}
+                      </li>
+                    ))}
+                  </ul>
+                </Section>
+              )}
 
             {revisions.length > 1 && (
               <Section title={t("revisionsHeading")}>

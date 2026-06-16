@@ -36,7 +36,13 @@ function link(
   to: number,
   kind: LoopLinkKind = "derives_from"
 ): LoopLinkRow {
-  return { id: nextId++, from_artifact_id: from, to_artifact_id: to, kind }
+  return {
+    id: nextId++,
+    from_artifact_id: from,
+    to_artifact_id: to,
+    kind,
+    source_revision_id: null,
+  }
 }
 
 describe("buildDag", () => {

@@ -28,6 +28,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 const getLoopArtifact = vi.fn()
 const getLoopIssue = vi.fn()
+const getLoopDag = vi.fn()
 const approveLoopDesign = vi.fn().mockResolvedValue(undefined)
 const rejectLoopDesign = vi.fn().mockResolvedValue(undefined)
 const approveLoopMerge = vi.fn().mockResolvedValue(undefined)
@@ -35,6 +36,7 @@ const rejectLoopMerge = vi.fn().mockResolvedValue(undefined)
 vi.mock("@/lib/loops-api", () => ({
   getLoopArtifact: (...a: unknown[]) => getLoopArtifact(...a),
   getLoopIssue: (...a: unknown[]) => getLoopIssue(...a),
+  getLoopDag: (...a: unknown[]) => getLoopDag(...a),
   approveLoopDesign: (...a: unknown[]) => approveLoopDesign(...a),
   rejectLoopDesign: (...a: unknown[]) => rejectLoopDesign(...a),
   approveLoopMerge: (...a: unknown[]) => approveLoopMerge(...a),
@@ -128,6 +130,7 @@ function issue(status: LoopIssueDetail["status"]): LoopIssueDetail {
 beforeEach(() => {
   vi.clearAllMocks()
   getLoopIssue.mockResolvedValue(issue("running"))
+  getLoopDag.mockResolvedValue({ artifacts: [], links: [], coverage: [] })
 })
 
 describe("ArtifactDrawer", () => {
@@ -147,7 +150,15 @@ describe("ArtifactDrawer", () => {
             created_at: "2026-06-14T00:00:00Z",
           },
         ],
-        criteria: [{ id: 1, label: "C1", text: "must compile", sort: 0 }],
+        criteria: [
+          {
+            id: 1,
+            label: "C1",
+            text: "must compile",
+            sort: 0,
+            kind: "acceptance",
+          },
+        ],
       })
     )
     render(<ArtifactDrawer artifactId={1} onClose={() => {}} />)
@@ -159,6 +170,38 @@ describe("ArtifactDrawer", () => {
     // A review is not a gate — no approve/merge controls.
     expect(screen.queryByText("approve")).not.toBeInTheDocument()
     expect(screen.queryByText("merge")).not.toBeInTheDocument()
+  })
+
+  it("shows covered-by and an uncovered warning on a requirement", async () => {
+    getLoopArtifact.mockResolvedValue(
+      artifact({
+        id: 7,
+        kind: "requirement",
+        title: "R1",
+        criteria: [
+          {
+            id: 100,
+            label: "AC-1",
+            text: "alpha",
+            sort: 0,
+            kind: "acceptance",
+          },
+          { id: 101, label: "AC-2", text: "beta", sort: 1, kind: "acceptance" },
+        ],
+      })
+    )
+    getLoopDag.mockResolvedValue({
+      artifacts: [{ id: 200, title: "Build alpha", kind: "task" }],
+      links: [],
+      // AC-1 (id 100) is covered; AC-2 (id 101) is not.
+      coverage: [{ id: 1, task_artifact_id: 200, criterion_id: 100 }],
+    })
+    render(<ArtifactDrawer artifactId={7} onClose={() => {}} />)
+
+    expect(await screen.findByText("coveredBy")).toBeInTheDocument() // AC-1
+    expect(screen.getByText("uncovered")).toBeInTheDocument() // AC-2
+    // Each criterion shows its typed kind badge (echoed key under the mock).
+    expect(screen.getAllByText("acceptance").length).toBeGreaterThan(0)
   })
 
   it("renders a colored line diff between adjacent revisions", async () => {
