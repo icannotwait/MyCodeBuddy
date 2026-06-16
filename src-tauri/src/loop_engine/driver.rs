@@ -1758,8 +1758,10 @@ mod tests {
         let (db, data_dir, issue_id, tasks) = seed_coverage_gap().await;
         // Tighten the rework cap to 1: the single plan iteration on record already
         // meets it, so the gap blocks instead of replanning.
-        let mut cfg = IssueConfig::default();
-        cfg.max_attempts = 1;
+        let cfg = IssueConfig {
+            max_attempts: 1,
+            ..IssueConfig::default()
+        };
         write_config(&db, issue_id, &cfg).await;
 
         let spawner = StubSpawner;
