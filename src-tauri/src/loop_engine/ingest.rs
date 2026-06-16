@@ -12,6 +12,8 @@
 //! transport / listener layers only ferry the `(token, tool, payload)` triple
 //! here.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
@@ -22,7 +24,7 @@ use serde_json::{json, Value};
 use crate::acp::delegation::listener::LoopIngestAccess;
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::{self, ActorKind};
-use crate::db::entities::loop_criterion::CriterionKind;
+use crate::db::entities::loop_criterion::{self, CriterionKind};
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssuePriority, IssueRoute};
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
@@ -207,6 +209,36 @@ fn parse_criteria(
             )));
         }
         out.push((ck, text));
+    }
+    Ok(out)
+}
+
+/// Resolve one task item's `covers` ordinals (e.g. `"R1.AC1"`) into the
+/// criterion ids they name, against the issue's stable ordinal map (spec §3.3).
+/// Up-front validation: an unknown or malformed ordinal is rejected so the
+/// caller can abort the whole batch with no partial coverage rows. `None` /
+/// null / empty array means the task covers nothing.
+fn parse_covers(item: &Value, ordinals: &HashMap<String, i32>) -> Result<Vec<i32>, LoopError> {
+    let Some(raw) = item.get("covers") else {
+        return Ok(Vec::new());
+    };
+    if raw.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| invalid("covers must be an array"))?;
+    let mut out = Vec::new();
+    for c in arr {
+        let key = c
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("covers entry must be a non-empty ordinal like \"R1.AC1\""))?;
+        let cid = ordinals.get(key).copied().ok_or_else(|| {
+            invalid(format!("covers references unknown criterion ordinal '{key}'"))
+        })?;
+        out.push(cid);
     }
     Ok(out)
 }
@@ -433,6 +465,38 @@ async fn submit_artifacts(
         Vec::new()
     };
 
+    // Plan stage: the stable `R{i}.AC{j}` → criterion_id map over the issue's
+    // done requirements and their acceptance criteria (both ordered by sort,id),
+    // so a task's `covers` references acceptance criteria by ordinal without the
+    // agent ever seeing a DB id. Ordering matches the design fan-in and the
+    // briefing enumeration.
+    let covers_ordinals: HashMap<String, i32> = if kind == ArtifactKind::Task {
+        let reqs = loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(it.issue_id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Requirement))
+            .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Done))
+            .order_by_asc(loop_artifact::Column::Sort)
+            .order_by_asc(loop_artifact::Column::Id)
+            .all(conn)
+            .await?;
+        let mut map = HashMap::new();
+        for (ri, r) in reqs.iter().enumerate() {
+            let crits = loop_criterion::Entity::find()
+                .filter(loop_criterion::Column::ArtifactId.eq(r.id))
+                .filter(loop_criterion::Column::Kind.eq(CriterionKind::Acceptance))
+                .order_by_asc(loop_criterion::Column::Sort)
+                .order_by_asc(loop_criterion::Column::Id)
+                .all(conn)
+                .await?;
+            for (ci, c) in crits.iter().enumerate() {
+                map.insert(format!("R{}.AC{}", ri + 1, ci + 1), c.id);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
     // Validate every item's `depends_on` up-front, before any artifact is
     // written — a bad reference must abort the whole batch with no partial rows
     // (a partial write would then look "done" to the idempotency replay guard).
@@ -455,6 +519,17 @@ async fn submit_artifacts(
         .iter()
         .map(|item| parse_criteria(item, kind))
         .collect::<Result<_, _>>()?;
+
+    // Validate every task's `covers` ordinals up-front — an unknown ordinal
+    // aborts the batch before any coverage row is written.
+    let covers_per_item: Vec<Vec<i32>> = if kind == ArtifactKind::Task {
+        items
+            .iter()
+            .map(|item| parse_covers(item, &covers_ordinals))
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![Vec::new(); items.len()]
+    };
 
     let status = default_status_for_kind(kind);
     let mut ids = Vec::new();
@@ -533,6 +608,12 @@ async fn submit_artifacts(
                 None,
             )
             .await?;
+        }
+        // Criterion-level coverage: this task claims the acceptance criteria its
+        // `covers` ordinals named (resolved + validated up-front). Idempotent on
+        // replay via `uniq_loop_coverage`.
+        for &cid in &covers_per_item[idx] {
+            loop_service::coverage::create_coverage(conn, it.space_id, art.id, cid).await?;
         }
     }
 
@@ -939,6 +1020,112 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn plan_covers_creates_criterion_coverage() {
+        let (db, space, issue, root) = seed().await;
+        // Refine: two requirements, each with one acceptance criterion.
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-r").await;
+        ingest(
+            &db.conn,
+            "tok-r",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [
+                    {"title": "Req A", "content": "shall A", "criteria": ["A1"]},
+                    {"title": "Req B", "content": "shall B", "criteria": ["B1"]}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Resolve each requirement's acceptance criterion id (ordered by sort,id).
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        let mut reqs: Vec<_> = dag
+            .artifacts
+            .iter()
+            .filter(|a| matches!(a.kind, ArtifactKind::Requirement))
+            .collect();
+        reqs.sort_by_key(|a| (a.sort, a.id));
+        let ac1 = loop_service::artifact::get_artifact_detail(&db.conn, reqs[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .criteria[0]
+            .id;
+        let ac2 = loop_service::artifact::get_artifact_detail(&db.conn, reqs[1].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .criteria[0]
+            .id;
+
+        // Plan: two tasks, each covering one requirement's acceptance criterion.
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-p").await;
+        ingest(
+            &db.conn,
+            "tok-p",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [
+                    {"title": "T1", "content": "do A", "covers": ["R1.AC1"]},
+                    {"title": "T2", "content": "do B", "covers": ["R2.AC1"]}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        assert_eq!(dag.coverage.len(), 2);
+        let covered: std::collections::HashSet<i32> =
+            dag.coverage.iter().map(|c| c.criterion_id).collect();
+        assert_eq!(covered, [ac1, ac2].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn plan_covers_unknown_ordinal_aborts_batch() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-r").await;
+        ingest(
+            &db.conn,
+            "tok-r",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [{"title": "Req A", "content": "shall A", "criteria": ["A1"]}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Plan references a non-existent ordinal → whole batch rejected, no rows.
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-p").await;
+        let err = ingest(
+            &db.conn,
+            "tok-p",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [
+                    {"title": "T1", "content": "do A", "covers": ["R1.AC1"]},
+                    {"title": "T2", "content": "do B", "covers": ["R9.AC1"]}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        assert_eq!(
+            dag.artifacts
+                .iter()
+                .filter(|a| matches!(a.kind, ArtifactKind::Task))
+                .count(),
+            0,
+            "no tasks written"
+        );
+        assert_eq!(dag.coverage.len(), 0, "no coverage written");
     }
 
     #[tokio::test]
