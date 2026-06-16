@@ -8,6 +8,7 @@ import type {
   LoopArtifactRow,
   LoopArtifactStatus,
   LoopLinkRow,
+  LoopReviewVerdict,
 } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -22,7 +23,7 @@ const PAD = 8
 const LANE_GAP = 22
 const REVIEW_H = 22
 const REVIEW_PAD = 6
-const REVIEW_GAP = 6
+const REVIEW_DIVIDER = 1 // border-t between the task header and its reviews
 
 const STATUS_DOT: Record<LoopArtifactStatus, string> = {
   pending: "bg-muted-foreground/40",
@@ -38,7 +39,7 @@ const STATUS_DOT: Record<LoopArtifactStatus, string> = {
 function reviewsBlockHeight(reviews: LoopArtifactRow[]): number {
   const { latest, olderCount } = foldReviews(reviews)
   const rows = latest.length + (olderCount > 0 ? 1 : 0)
-  return rows === 0 ? 0 : REVIEW_GAP + REVIEW_PAD * 2 + rows * REVIEW_H
+  return rows === 0 ? 0 : REVIEW_DIVIDER + REVIEW_PAD * 2 + rows * REVIEW_H
 }
 
 const clusterHeight = (c: DagCluster) =>
@@ -64,6 +65,7 @@ export function DagGraph({
 }) {
   const tKind = useTranslations("Loops.artifactKind")
   const tStatus = useTranslations("Loops.artifactStatus")
+  const tVerdict = useTranslations("Loops.reviewVerdict")
   const tDetail = useTranslations("Loops.issueDetail")
 
   const layout = useMemo(() => buildDag(artifacts, links), [artifacts, links])
@@ -220,6 +222,7 @@ export function DagGraph({
           kindLabel={tKind(cluster.task.kind)}
           reviewKindLabel={tKind("review")}
           statusLabelOf={(s) => tStatus(s)}
+          verdictLabelOf={(v) => tVerdict(v)}
           executingLabel={tDetail("executingNow")}
           olderLabelOf={(count) => tDetail("reviewsOlder", { count })}
           onSelect={onSelect}
@@ -306,6 +309,7 @@ function ClusterCard({
   kindLabel,
   reviewKindLabel,
   statusLabelOf,
+  verdictLabelOf,
   executingLabel,
   olderLabelOf,
   onSelect,
@@ -319,6 +323,7 @@ function ClusterCard({
   kindLabel: string
   reviewKindLabel: string
   statusLabelOf: (s: LoopArtifactStatus) => string
+  verdictLabelOf: (v: LoopReviewVerdict) => string
   executingLabel: string
   olderLabelOf: (count: number) => string
   onSelect: (artifactId: number) => void
@@ -361,26 +366,53 @@ function ClusterCard({
         >
           {fold.latest.map((review) => {
             const executing = executingIds.has(review.id)
+            // Row text keeps the artifact title so sibling reviews stay distinct;
+            // the pass/fail outcome shows as a shape glyph (✓/✗) — not color alone
+            // — and is named in the accessible label + tooltip.
+            const verdictLabel = review.verdict
+              ? verdictLabelOf(review.verdict)
+              : null
+            const statusLabel = executing
+              ? executingLabel
+              : statusLabelOf(review.status)
             return (
               <button
                 key={review.id}
                 type="button"
                 onClick={() => onSelect(review.id)}
                 style={{ height: REVIEW_H }}
-                aria-label={`${reviewKindLabel}: ${review.title}`}
+                aria-label={
+                  verdictLabel
+                    ? `${reviewKindLabel}: ${review.title} — ${verdictLabel}`
+                    : `${reviewKindLabel}: ${review.title}`
+                }
+                title={verdictLabel ?? statusLabel}
                 className="flex items-center gap-1.5 px-3 text-left outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
-                <StatusDot
-                  status={review.status}
-                  executing={executing}
-                  title={
-                    executing ? executingLabel : statusLabelOf(review.status)
-                  }
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    executing
+                      ? "animate-pulse bg-sky-500"
+                      : STATUS_DOT[review.status]
+                  )}
                 />
-                <span className="truncate text-xs text-muted-foreground">
-                  {reviewKindLabel}
-                  {review.verdict ? ` · ${review.verdict}` : ""}
+                <span className="flex-1 truncate text-xs text-muted-foreground">
+                  {review.title}
                 </span>
+                {review.verdict && (
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "shrink-0 text-xs font-semibold leading-none",
+                      review.verdict === "pass"
+                        ? "text-emerald-600"
+                        : "text-destructive"
+                    )}
+                  >
+                    {review.verdict === "pass" ? "✓" : "✗"}
+                  </span>
+                )}
               </button>
             )
           })}
