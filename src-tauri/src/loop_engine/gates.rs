@@ -1503,6 +1503,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_dispatches_all_ready_tasks_concurrently() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        add_task(&h, "A").await;
+        add_task(&h, "B").await;
+
+        // One drive launches BOTH independent tasks' implement iterations at once —
+        // true concurrency, not the old one-at-a-time gate.
+        assert_eq!(drive(&h).await, StepOutcome::Dispatched);
+        let running = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Implement))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .all(&h.db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            running.len(),
+            2,
+            "both ready tasks have a running implement in the same tick"
+        );
+    }
+
+    #[tokio::test]
     async fn dead_dependency_blocks_issue() {
         let h = setup().await;
         let t1 = add_task(&h, "T1").await;
