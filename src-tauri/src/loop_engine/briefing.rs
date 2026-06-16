@@ -110,13 +110,15 @@ fn stage_instruction(stage: Stage) -> &'static str {
              engine commits your work — you do not need to commit."
         }
         Stage::Review => {
-            "Review the implementation against the acceptance criteria below. Go \
-             through them ONE BY ONE: for each, state its ordinal, a pass/fail, and \
-             the specific evidence (the code, behavior, or test that proves it). \
-             Also check the design obligations and look for defects, omissions, and \
-             regressions. Return a single verdict: `pass` only if every criterion \
-             and obligation holds, otherwise `fail` with specific, actionable \
-             findings keyed to the criteria that failed."
+            "Review the implementation against the acceptance-criteria checklist \
+             below. Go through the handles ONE BY ONE: for EACH handle, decide \
+             pass or fail and cite the specific evidence (the code, behavior, or \
+             test that proves it) — a fail MUST name the concrete defect. The \
+             design obligations are listed for context only; do not score them \
+             here (the assembled result is gated on them at integration). Also \
+             surface any defects, omissions, or regressions in your overall \
+             findings. The engine derives the gate decision from your per-criterion \
+             checks, so submit exactly one check per listed handle."
         }
         Stage::Finalize => {
             "Summarize the completed work for this issue: what was built, how it \
@@ -165,8 +167,13 @@ fn tool_contract(stage: Stage) -> &'static str {
              worktree changes. If you are blocked, call `loop_report_blocked`."
         }
         Stage::Review => {
-            "Call `loop_submit_review` exactly once with your `verdict` \
-             (pass / fail) and `findings`."
+            "Call `loop_submit_review` exactly once. Put one entry in `checks` for \
+             EACH acceptance-criterion handle in the checklist above: \
+             `{\"criterion\": \"R1.AC1\", \"verdict\": \"pass\"|\"fail\", \
+             \"evidence\": \"...\"}`. Submit exactly one check per listed handle — \
+             no more, no fewer — and a `fail` check MUST cite specific evidence. Do \
+             NOT submit checks for the design obligations (they are context only). \
+             Add overall `findings` so a failed criterion guides the next attempt."
         }
         Stage::Finalize => {
             "Call `loop_submit_artifacts` exactly once with the result summary."
@@ -413,6 +420,55 @@ async fn acceptance_closure(
     Ok(if body.is_empty() { None } else { Some(body) })
 }
 
+/// The per-criterion review checklist for a TASK review (§3.4, D9). Returns the
+/// "# Acceptance criteria" section body (the exact handles the reviewer must
+/// submit one check each for, plus design obligations shown as awareness-only
+/// context) AND the `{ handle: criterion_id }` manifest the gate resolves
+/// submitted checks against. The two are built from the SAME ordinal source, so
+/// what the reviewer is shown is exactly what ingest accepts.
+async fn review_checklist_section(
+    conn: &DatabaseConnection,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<(Option<String>, Value), LoopError> {
+    let entries =
+        loop_service::criterion_ordinals::task_review_ordinals(conn, issue_id, task_id).await?;
+    let obligations =
+        loop_service::criterion_ordinals::obligation_ordinals(conn, issue_id).await?;
+
+    let mut manifest = serde_json::Map::new();
+    for e in &entries {
+        manifest.insert(e.handle.clone(), json!(e.criterion_id));
+    }
+
+    if entries.is_empty() {
+        // No task-verifiable criteria (a degenerate direct task). Emit no
+        // checklist; the empty manifest tells the gate there is nothing to check.
+        return Ok((None, Value::Object(manifest)));
+    }
+
+    let mut body = String::from(
+        "Submit one check per handle below (use the EXACT handle in brackets), each \
+         with a pass/fail and concrete evidence:\n",
+    );
+    for e in &entries {
+        body.push_str(&format!("- [{}] {}\n", e.handle, e.text));
+    }
+    if !obligations.is_empty() {
+        body.push_str(
+            "\nDesign obligations — context only (the assembled result is gated on these at \
+             integration, NOT in this task review; do not submit checks for them):\n",
+        );
+        for o in &obligations {
+            body.push_str(&format!("- ({}) {}\n", criterion_kind_label(o.kind), o.text));
+        }
+    }
+    Ok((
+        Some(format!("# Acceptance criteria\n{}", body.trim_end())),
+        Value::Object(manifest),
+    ))
+}
+
 /// Assemble the briefing for one iteration. `issue` is the loaded issue row;
 /// `target_artifact_id` is the node the iteration derives its output from (the
 /// issue root for triage/refine, a requirement for design, etc.) — `None` only
@@ -425,6 +481,10 @@ pub async fn assemble_briefing(
 ) -> Result<BriefingOutput, LoopError> {
     let mut sections: Vec<String> = Vec::new();
     let mut components: Vec<Value> = Vec::new();
+    // For a review iteration: the `{ handle: criterion_id }` map the gate resolves
+    // submitted checks against, persisted into the iteration's `context_manifest`
+    // at dispatch (D10). `None` for non-review stages.
+    let mut criteria_manifest: Option<Value> = None;
 
     // ① Space constitution — human-authored, always first.
     let constitution = loop_service::memory::list_constitution(conn, issue.space_id).await?;
@@ -567,14 +627,28 @@ pub async fn assemble_briefing(
             sections.push(format!("# Lineage\n{}", lineage.trim_end()));
             components.push(json!({ "section": "lineage", "depth": details.len() }));
 
-            // ⑤ Criteria. Implement/review get the AC closure (coverage + design
-            // obligations + fallback); other staged targets get the target's +
-            // direct parent's criteria verbatim.
-            if matches!(stage, Stage::Implement | Stage::Review) {
+            // ⑤ Criteria.
+            //   • implement gets the AC closure (coverage + design obligations +
+            //     fallback) as guidance;
+            //   • review gets the per-criterion CHECKLIST (the exact handles it
+            //     must submit one check each for) + the manifest the gate resolves
+            //     against — design obligations shown as awareness-only;
+            //   • other staged targets get the target's + parent's criteria verbatim.
+            if stage == Stage::Implement {
                 if let Some(closure) = acceptance_closure(conn, issue.id, target, &dag).await? {
                     sections.push(format!("# Acceptance criteria\n{closure}"));
                     components.push(json!({ "section": "acceptance_criteria", "closure": true }));
                 }
+            } else if stage == Stage::Review {
+                let (section, manifest) =
+                    review_checklist_section(conn, issue.id, target).await?;
+                if let Some(s) = section {
+                    sections.push(s);
+                    let count = manifest.as_object().map(|m| m.len()).unwrap_or(0);
+                    components
+                        .push(json!({ "section": "review_checklist", "count": count }));
+                }
+                criteria_manifest = Some(manifest);
             } else {
                 let mut crit = String::new();
                 if !head.criteria.is_empty() {
@@ -722,11 +796,16 @@ pub async fn assemble_briefing(
     ));
     components.push(json!({ "section": "tool_contract", "stage": stage_label(stage) }));
 
-    let manifest = json!({
+    let mut manifest = json!({
         "v": 1,
         "template": format!("{}@v1", stage_label(stage)),
         "components": components,
     });
+    // A review iteration carries its injected criterion manifest (D10) — the
+    // single source ingest resolves submitted check handles against.
+    if let Some(criteria) = criteria_manifest {
+        manifest["criteria"] = criteria;
+    }
 
     Ok(BriefingOutput {
         text: sections.join("\n\n"),
@@ -981,6 +1060,38 @@ mod tests {
         assert!(out2.text.contains("alpha holds"));
         assert!(out2.text.contains("beta holds"));
         assert!(out2.text.contains("(invariant) stays O(1)"));
+    }
+
+    #[tokio::test]
+    async fn review_briefing_emits_checklist_and_manifest() {
+        let (db, space, issue, root) = seed().await;
+        let r1 = add_node(&db, space, issue.id, ArtifactKind::Requirement, "R1", "first", &["alpha holds"], root).await;
+        // A design with a cross-cutting obligation.
+        let design = loop_service::artifact::create_artifact(&db.conn, space, issue.id, ArtifactKind::Design, "D", ArtifactStatus::Done, ActorKind::Agent, None).await.unwrap();
+        loop_service::artifact::add_criterion(&db.conn, design.id, CriterionKind::Invariant, "stays O(1)").await.unwrap();
+        // A task that covers R1.AC1 AND has its own acceptance.
+        let t1 = loop_service::artifact::create_artifact(&db.conn, space, issue.id, ArtifactKind::Task, "T1", ArtifactStatus::InProgress, ActorKind::Agent, None).await.unwrap();
+        loop_service::artifact::add_criterion(&db.conn, t1.id, CriterionKind::Acceptance, "task own ac").await.unwrap();
+        let r1ac = loop_service::artifact::get_artifact_detail(&db.conn, r1).await.unwrap().unwrap().criteria[0].id;
+        loop_service::coverage::create_coverage(&db.conn, space, t1.id, r1ac).await.unwrap();
+        loop_service::link::create_link(&db.conn, space, t1.id, root, LinkKind::DerivesFrom, None).await.unwrap();
+
+        let out = assemble_briefing(&db.conn, &issue, Stage::Review, Some(t1.id)).await.unwrap();
+        let t = &out.text;
+        // Checklist prints the covered requirement AC handle + the task's own T1.
+        assert!(t.contains("[R1.AC1] alpha holds"), "covered AC is in the checklist");
+        assert!(t.contains("[T1] task own ac"), "task's own acceptance is in the checklist");
+        // The design obligation is shown as awareness-only context, not a handle.
+        assert!(t.contains("(invariant) stays O(1)"));
+        assert!(t.contains("context only"));
+        assert!(t.contains("one check per handle"));
+
+        // The manifest carries the resolution map (handle → criterion id), and ONLY
+        // the task-verifiable criteria — never a design obligation.
+        let crit = out.manifest.get("criteria").unwrap().as_object().unwrap();
+        assert_eq!(crit.len(), 2, "only task-verifiable criteria are injected");
+        assert_eq!(crit["R1.AC1"], json!(r1ac));
+        assert!(crit.contains_key("T1"));
     }
 
     #[tokio::test]

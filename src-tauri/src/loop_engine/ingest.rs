@@ -25,6 +25,7 @@ use crate::acp::delegation::listener::LoopIngestAccess;
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::{self, ActorKind};
 use crate::db::entities::loop_criterion::CriterionKind;
+use crate::db::entities::loop_criterion_check::CheckVerdict;
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssuePriority, IssueRoute};
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
@@ -643,6 +644,20 @@ async fn submit_artifacts(
     Ok(json!({ "ok": true, "ids": ids }))
 }
 
+/// A single resolved check, validated against the iteration's injected manifest.
+struct ResolvedCheck {
+    criterion_id: i32,
+    verdict: CheckVerdict,
+    evidence: String,
+}
+
+/// Review submission (§3.4): the reviewer emits ONE structured check per injected
+/// acceptance-criterion handle (`{criterion, verdict, evidence}`), NOT a holistic
+/// verdict. Each handle is resolved against the **persisted** criterion manifest
+/// (D10) the briefing showed at dispatch — so a concurrent replan can't drift the
+/// handles — and the batch is rejected (no write) unless it has exactly one check
+/// per injected criterion. The review artifact's `verdict` is derived (`pass` iff
+/// all checks pass) for DISPLAY only; the gate decides per-criterion (P2.3).
 async fn submit_review(
     conn: &DatabaseConnection,
     it: &loop_iteration::Model,
@@ -655,7 +670,9 @@ async fn submit_review(
         .target_artifact_id
         .ok_or_else(|| invalid("review iteration has no target task"))?;
 
-    // Idempotency: this review slot already submitted its verdict.
+    // Idempotency: this review slot already submitted (its artifact + checks are
+    // committed atomically below, so an existing review artifact means the whole
+    // submission landed).
     if let Some(existing) = loop_artifact::Entity::find()
         .filter(loop_artifact::Column::ProducedByIterationId.eq(it.id))
         .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Review))
@@ -665,18 +682,95 @@ async fn submit_review(
         return Ok(json!({ "ok": true, "idempotent": true, "id": existing.id }));
     }
 
-    let verdict_str = payload
-        .get("verdict")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| invalid("missing verdict"))?;
-    let verdict: ReviewVerdict =
-        serde_json::from_value(json!(verdict_str)).map_err(|_| invalid("invalid verdict"))?;
+    // The injected criterion manifest (D10): handle → criterion id, persisted into
+    // `context_manifest` at dispatch. Every submitted handle resolves against THIS,
+    // never a recompute, so a replan after dispatch can't change what's accepted.
+    let injected = injected_criteria(it)?;
+    if injected.is_empty() {
+        return Err(invalid(
+            "this review has no criteria to check; nothing to submit",
+        ));
+    }
+
+    // Parse + resolve each check against the manifest. Unknown/duplicate handle,
+    // an invalid verdict, or a fail without evidence aborts the whole batch with
+    // no write — same all-or-nothing contract as artifact submission.
+    let raw = payload
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| invalid("missing checks array"))?;
+    if raw.is_empty() {
+        return Err(invalid("checks array is empty"));
+    }
+    let mut resolved: Vec<ResolvedCheck> = Vec::new();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for c in raw {
+        let handle = c
+            .get("criterion")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("each check needs a non-empty `criterion` handle"))?;
+        let criterion_id = injected.get(handle).copied().ok_or_else(|| {
+            invalid(format!(
+                "check references unknown criterion handle '{handle}' (not in this review's checklist)"
+            ))
+        })?;
+        if seen.insert(handle.to_string(), ()).is_some() {
+            return Err(invalid(format!("duplicate check for criterion '{handle}'")));
+        }
+        let verdict_str = c
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid(format!("check '{handle}' is missing a verdict")))?;
+        let verdict: CheckVerdict = serde_json::from_value(json!(verdict_str))
+            .map_err(|_| invalid(format!("check '{handle}' has an invalid verdict '{verdict_str}'")))?;
+        let evidence = c
+            .get("evidence")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if verdict == CheckVerdict::Fail && evidence.is_empty() {
+            return Err(invalid(format!(
+                "check '{handle}' is a fail but cites no evidence; name the specific defect"
+            )));
+        }
+        resolved.push(ResolvedCheck {
+            criterion_id,
+            verdict,
+            evidence: truncate(&evidence),
+        });
+    }
+
+    // Require exactly one check per injected criterion (the injected set = the
+    // manifest's keys); a missing handle aborts the batch.
+    let missing: Vec<&str> = injected
+        .keys()
+        .filter(|h| !seen.contains_key(*h))
+        .map(|s| s.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(invalid(format!(
+            "missing checks for: {}. Submit exactly one check per listed criterion handle.",
+            missing.join(", ")
+        )));
+    }
+
+    // Derived display verdict (DISPLAY ONLY — the gate decides per-criterion).
+    let all_pass = resolved.iter().all(|c| c.verdict == CheckVerdict::Pass);
+    let display_verdict = if all_pass {
+        ReviewVerdict::Pass
+    } else {
+        ReviewVerdict::Fail
+    };
     let findings = truncate(payload.get("findings").and_then(|v| v.as_str()).unwrap_or(""));
 
     let title = format!("Review (slot {})", it.slot_no.unwrap_or(0));
-    // Atomic: the review artifact, its verdict, its findings revision, and the
-    // `reviews` edge land all-or-nothing, so the idempotency guard above (a review
-    // by this iteration exists → skip) is correct under crash replay.
+    // Atomic: the review artifact, its derived verdict, the findings revision, the
+    // `reviews` edge, and every per-criterion check land all-or-nothing, so the
+    // idempotency guard above (a review by this iteration exists → skip) is correct
+    // under crash replay.
     let txn = conn.begin().await?;
     let art = loop_service::artifact::create_artifact(
         &txn,
@@ -690,16 +784,66 @@ async fn submit_review(
     )
     .await?;
     let mut active = art.clone().into_active_model();
-    active.verdict = Set(Some(verdict));
+    active.verdict = Set(Some(display_verdict));
     active.update(&txn).await?;
 
     loop_service::artifact::add_revision(&txn, art.id, &findings, ActorKind::Agent, Some(it.id))
         .await?;
     loop_service::link::create_link(&txn, it.space_id, art.id, target, LinkKind::Reviews, None)
         .await?;
+    // One criterion_check per check; the scope is the reviewed target, the
+    // iteration is this reviewer slot's stable per-attempt identity (the gate's
+    // digest key). Idempotent on `(criterion, iteration, scope)`.
+    for c in &resolved {
+        loop_service::criterion_check::create_check(
+            &txn,
+            it.space_id,
+            c.criterion_id,
+            it.id,
+            target,
+            c.verdict,
+            &c.evidence,
+        )
+        .await?;
+    }
     txn.commit().await?;
 
-    Ok(json!({ "ok": true, "id": art.id, "verdict": verdict_str }))
+    Ok(json!({
+        "ok": true,
+        "id": art.id,
+        "verdict": review_verdict_str(display_verdict),
+        "checks": resolved.len(),
+    }))
+}
+
+/// Parse the iteration's persisted criterion manifest (D10) into a `handle →
+/// criterion id` map. `context_manifest` is the briefing manifest stashed at
+/// dispatch; review iterations carry a `"criteria"` object. Absent/malformed ⇒
+/// empty map (the caller rejects an empty injected set).
+fn injected_criteria(it: &loop_iteration::Model) -> Result<HashMap<String, i32>, LoopError> {
+    let Some(raw) = it.context_manifest.as_deref() else {
+        return Ok(HashMap::new());
+    };
+    let manifest: Value =
+        serde_json::from_str(raw).map_err(|_| invalid("review manifest is unreadable"))?;
+    let Some(obj) = manifest.get("criteria").and_then(|v| v.as_object()) else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (handle, v) in obj {
+        if let Some(id) = v.as_i64() {
+            out.insert(handle.clone(), id as i32);
+        }
+    }
+    Ok(out)
+}
+
+/// Lowercase wire token for a derived review verdict.
+fn review_verdict_str(v: ReviewVerdict) -> &'static str {
+    match v {
+        ReviewVerdict::Pass => "pass",
+        ReviewVerdict::Fail => "fail",
+    }
 }
 
 async fn report_blocked(
@@ -1233,33 +1377,74 @@ mod tests {
         assert!(matches!(err, LoopError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn review_records_verdict_and_edge() {
-        let (db, space, issue, root) = seed().await;
-        // Make a task to review (refine stage abused here just to mint a node).
-        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-plan").await;
-        let plan_out = ingest(
+    /// Mint a task with one acceptance criterion + a running review iteration whose
+    /// persisted manifest injects `{ "T1": <criterion id> }` (what dispatch would
+    /// stash). Created directly (not via a Plan iteration) so it can be called
+    /// repeatedly for one issue without colliding on the Plan node lease. Returns
+    /// `(task_id, criterion_id)`.
+    async fn seed_task_under_review(
+        db: &crate::db::AppDatabase,
+        space: i32,
+        issue: i32,
+        _root: i32,
+        token: &str,
+    ) -> (i32, i32) {
+        let task = loop_service::artifact::create_artifact(
             &db.conn,
-            "tok-plan",
-            "loop_submit_artifacts",
-            &json!({"artifacts":[{"title":"Task 1","content":"do"}]}),
+            space,
+            issue,
+            ArtifactKind::Task,
+            "Task 1",
+            ArtifactStatus::InProgress,
+            ActorKind::Agent,
+            None,
         )
         .await
         .unwrap();
-        let task_id = plan_out["ids"][0].as_i64().unwrap() as i32;
+        let task_id = task.id;
+        let t1 = loop_service::artifact::add_criterion(
+            &db.conn,
+            task_id,
+            CriterionKind::Acceptance,
+            "does the thing",
+        )
+        .await
+        .unwrap()
+        .id;
 
-        let _ = running_iter(&db.conn, space, issue, Stage::Review, Some(task_id), "tok-review")
-            .await;
+        let iter_id = running_iter(&db.conn, space, issue, Stage::Review, Some(task_id), token).await;
+        // Stash the injected criterion manifest (D10) — what assemble_briefing emits.
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::ContextManifest,
+                sea_orm::sea_query::Expr::value(json!({ "criteria": { "T1": t1 } }).to_string()),
+            )
+            .filter(loop_iteration::Column::Id.eq(iter_id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        (task_id, t1)
+    }
+
+    #[tokio::test]
+    async fn review_records_checks_verdict_and_edge() {
+        let (db, space, issue, root) = seed().await;
+        let (task_id, t1) =
+            seed_task_under_review(&db, space, issue, root, "tok-review").await;
+
         let out = ingest(
             &db.conn,
             "tok-review",
             "loop_submit_review",
-            &json!({"verdict":"pass","findings":"looks good"}),
+            &json!({"checks":[{"criterion":"T1","verdict":"pass","evidence":"it works"}],
+                    "findings":"looks good"}),
         )
         .await
         .unwrap();
         let review_id = out["id"].as_i64().unwrap() as i32;
+        assert_eq!(out["checks"], json!(1));
 
+        // Display verdict derived = pass; the reviews edge points at the task.
         let detail = loop_service::artifact::get_artifact_detail(&db.conn, review_id)
             .await
             .unwrap()
@@ -1269,6 +1454,142 @@ mod tests {
             .links
             .iter()
             .any(|l| matches!(l.kind, LinkKind::Reviews) && l.to_artifact_id == task_id));
+        // A criterion_check row landed for T1, scoped to the task.
+        let checks = loop_service::criterion_check::list_for_issue(&db.conn, issue)
+            .await
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].criterion_id, t1);
+        assert_eq!(checks[0].scope_artifact_id, task_id);
+
+        // Replay → idempotent, no second review / check.
+        let again = ingest(
+            &db.conn,
+            "tok-review",
+            "loop_submit_review",
+            &json!({"checks":[{"criterion":"T1","verdict":"pass","evidence":"it works"}]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["idempotent"], json!(true));
+        assert_eq!(
+            loop_service::criterion_check::list_for_issue(&db.conn, issue)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn review_fail_check_derives_fail_verdict() {
+        let (db, space, issue, root) = seed().await;
+        let (_task, _t1) = seed_task_under_review(&db, space, issue, root, "tok-rev").await;
+        let out = ingest(
+            &db.conn,
+            "tok-rev",
+            "loop_submit_review",
+            &json!({"checks":[{"criterion":"T1","verdict":"fail","evidence":"crashes on empty input"}]}),
+        )
+        .await
+        .unwrap();
+        let detail = loop_service::artifact::get_artifact_detail(&db.conn, out["id"].as_i64().unwrap() as i32)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.row.verdict, Some(ReviewVerdict::Fail), "any failing check → fail verdict");
+    }
+
+    #[tokio::test]
+    async fn review_rejects_unknown_missing_duplicate_and_evidenceless_fail() {
+        let (db, space, issue, root) = seed().await;
+
+        // Unknown handle → rejected, no write.
+        let (_task, _t1) = seed_task_under_review(&db, space, issue, root, "tok-a").await;
+        let err = ingest(
+            &db.conn,
+            "tok-a",
+            "loop_submit_review",
+            &json!({"checks":[{"criterion":"R9.AC9","verdict":"pass","evidence":"x"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        assert!(
+            loop_service::criterion_check::list_for_issue(&db.conn, issue).await.unwrap().is_empty(),
+            "rejected batch wrote no checks"
+        );
+
+        // Missing a required handle (empty checks for a non-empty injected set).
+        let (_t2, _) = seed_task_under_review(&db, space, issue, root, "tok-b").await;
+        let err = ingest(&db.conn, "tok-b", "loop_submit_review", &json!({"checks":[]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+
+        // Duplicate check for the same handle.
+        let (_t3, _) = seed_task_under_review(&db, space, issue, root, "tok-c").await;
+        let err = ingest(
+            &db.conn,
+            "tok-c",
+            "loop_submit_review",
+            &json!({"checks":[
+                {"criterion":"T1","verdict":"pass","evidence":"a"},
+                {"criterion":"T1","verdict":"pass","evidence":"b"}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+
+        // A fail with no evidence is rejected.
+        let (_t4, _) = seed_task_under_review(&db, space, issue, root, "tok-d").await;
+        let err = ingest(
+            &db.conn,
+            "tok-d",
+            "loop_submit_review",
+            &json!({"checks":[{"criterion":"T1","verdict":"fail","evidence":""}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn review_resolves_against_persisted_manifest_not_current_state() {
+        // D10: ingest resolves handles against the manifest stashed at dispatch,
+        // so a requirement set that changes AFTER dispatch can't drift the handles.
+        let (db, space, issue, root) = seed().await;
+        let (task_id, t1) = seed_task_under_review(&db, space, issue, root, "tok-drift").await;
+
+        // Simulate a concurrent refine adding a new requirement+criterion AFTER the
+        // review was dispatched (the live ordinals would now differ from T1).
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-late").await;
+        ingest(
+            &db.conn,
+            "tok-late",
+            "loop_submit_artifacts",
+            &json!({"artifacts":[{"title":"R late","content":"x","criteria":["new ac"]}]}),
+        )
+        .await
+        .unwrap();
+
+        // The reviewer still submits against the DISPATCHED handle T1 → resolves to
+        // the same criterion id the manifest froze.
+        ingest(
+            &db.conn,
+            "tok-drift",
+            "loop_submit_review",
+            &json!({"checks":[{"criterion":"T1","verdict":"pass","evidence":"ok"}]}),
+        )
+        .await
+        .unwrap();
+        let checks = loop_service::criterion_check::list_for_issue(&db.conn, issue)
+            .await
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].criterion_id, t1, "resolved against the frozen manifest");
+        assert_eq!(checks[0].scope_artifact_id, task_id);
     }
 
     #[tokio::test]

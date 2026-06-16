@@ -5,6 +5,7 @@
 pub mod artifact;
 pub mod coverage;
 pub mod criterion_check;
+pub mod criterion_ordinals;
 pub mod gate_decision;
 pub mod inbox;
 pub mod issue;

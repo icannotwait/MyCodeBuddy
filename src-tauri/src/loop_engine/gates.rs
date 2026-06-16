@@ -1426,6 +1426,16 @@ mod tests {
         )
         .await
         .unwrap();
+        // A real plan attaches the task's own acceptance criterion; the review
+        // gate injects it as the `T1` check handle.
+        artifact::add_criterion(
+            &h.db.conn,
+            task.id,
+            crate::db::entities::loop_criterion::CriterionKind::Acceptance,
+            "the task is implemented correctly",
+        )
+        .await
+        .unwrap();
         link::create_link(&h.db.conn, h.space_id, task.id, root, LinkKind::DerivesFrom, None)
             .await
             .unwrap();
@@ -2155,19 +2165,40 @@ mod tests {
         v
     }
 
-    /// A reviewer submits its verdict through the real ingest path (token →
-    /// running iteration → review artifact + verdict + link).
+    /// A reviewer submits its per-criterion checks through the real ingest path
+    /// (token → running iteration → review artifact + checks + link). Submits one
+    /// check with `verdict` for EACH handle in the iteration's injected manifest
+    /// (what dispatch stashed), so the reviewed task's whole checklist is answered.
     async fn submit_verdict(h: &Harness, review_iter_id: i32, verdict: &str, findings: &str) {
         let it = loop_iteration::Entity::find_by_id(review_iter_id)
             .one(&h.db.conn)
             .await
             .unwrap()
             .unwrap();
+        let manifest: serde_json::Value = it
+            .context_manifest
+            .as_deref()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .unwrap_or(serde_json::Value::Null);
+        let criteria = manifest
+            .get("criteria")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let evidence = if verdict == "fail" {
+            if findings.is_empty() { "defect found" } else { findings }
+        } else {
+            "verified"
+        };
+        let checks: Vec<serde_json::Value> = criteria
+            .keys()
+            .map(|handle| serde_json::json!({ "criterion": handle, "verdict": verdict, "evidence": evidence }))
+            .collect();
         crate::loop_engine::ingest::ingest(
             &h.db.conn,
             &it.capability_token,
             "loop_submit_review",
-            &serde_json::json!({ "verdict": verdict, "findings": findings }),
+            &serde_json::json!({ "checks": checks, "findings": findings }),
         )
         .await
         .unwrap();

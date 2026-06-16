@@ -184,19 +184,38 @@
   },
   {
     "name": "loop_submit_review",
-    "description": "Loop engineering — REVIEW stage only. Record your verdict on the task implementation you were briefed to review. Submit exactly once. A 'fail' verdict feeds your findings back to the implementer.",
+    "description": "Loop engineering — REVIEW stage only. Submit ONE structured check per acceptance-criterion handle from your briefing's checklist (each with a pass/fail verdict and concrete evidence), plus overall findings. Submit exactly once. The engine derives the gate decision from your per-criterion checks; a failing check feeds its evidence back to the implementer. Submit exactly one check per listed handle — no more, no fewer — and do NOT submit checks for the design obligations (they are context only).",
     "inputSchema": {
       "type": "object",
-      "required": ["verdict"],
+      "required": ["checks"],
       "properties": {
-        "verdict": {
-          "type": "string",
-          "enum": ["pass", "fail"],
-          "description": "pass = the implementation meets every acceptance criterion; fail = at least one defect or missing criterion (explain in findings)."
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "description": "One entry per acceptance-criterion handle from the briefing checklist (e.g. R1.AC1, T1).",
+          "items": {
+            "type": "object",
+            "required": ["criterion", "verdict"],
+            "properties": {
+              "criterion": {
+                "type": "string",
+                "description": "The EXACT criterion handle from the briefing checklist, e.g. \"R1.AC1\" or \"T1\"."
+              },
+              "verdict": {
+                "type": "string",
+                "enum": ["pass", "fail"],
+                "description": "pass = the implementation satisfies this criterion; fail = it does not."
+              },
+              "evidence": {
+                "type": "string",
+                "description": "The specific code, behavior, or test that proves your verdict. REQUIRED for a fail (name the concrete defect)."
+              }
+            }
+          }
         },
         "findings": {
           "type": "string",
-          "description": "Markdown findings. For a fail, be specific and actionable so the implementer can fix it on the next attempt."
+          "description": "Overall markdown findings for the implementer. Be specific and actionable for any failing criterion so it can be fixed on the next attempt."
         }
       }
     }
