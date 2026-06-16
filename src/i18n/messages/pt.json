@@ -2977,7 +2977,8 @@
       "noIterations": "Ainda não há iterações.",
       "noArtifacts": "Até agora, apenas o artefato raiz do problema.",
       "executingNow": "Executando agora",
-      "iterationsError": "Não foi possível carregar as iterações"
+      "iterationsError": "Não foi possível carregar as iterações",
+      "reviewsOlder": "+{count} anteriores"
     },
     "status": {
       "pending": "Pendente",

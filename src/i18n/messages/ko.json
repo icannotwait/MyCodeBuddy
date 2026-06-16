@@ -2977,7 +2977,8 @@
       "noIterations": "아직 이터레이션이 없습니다.",
       "noArtifacts": "아직 루트 이슈 아티팩트만 있습니다.",
       "executingNow": "실행 중",
-      "iterationsError": "이터레이션을 불러올 수 없습니다"
+      "iterationsError": "이터레이션을 불러올 수 없습니다",
+      "reviewsOlder": "이전 {count}건"
     },
     "status": {
       "pending": "대기 중",

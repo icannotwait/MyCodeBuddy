@@ -2977,7 +2977,8 @@
       "noIterations": "No iterations yet.",
       "noArtifacts": "Only the root issue artifact so far.",
       "executingNow": "Executing now",
-      "iterationsError": "Couldn't load iterations"
+      "iterationsError": "Couldn't load iterations",
+      "reviewsOlder": "+{count} earlier"
     },
     "status": {
       "pending": "Pending",

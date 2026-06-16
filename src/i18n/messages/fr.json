@@ -2977,7 +2977,8 @@
       "noIterations": "Aucune itération pour le moment.",
       "noArtifacts": "Pour l'instant, seul l'artefact racine du problème.",
       "executingNow": "En cours d'exécution",
-      "iterationsError": "Impossible de charger les itérations"
+      "iterationsError": "Impossible de charger les itérations",
+      "reviewsOlder": "+{count} antérieures"
     },
     "status": {
       "pending": "En attente",

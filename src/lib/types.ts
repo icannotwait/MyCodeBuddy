@@ -450,6 +450,7 @@ export type LoopLinkKind =
   | "skips_to"
   | "reviews"
   | "results_from"
+  | "depends_on"
 export type LoopInboxKind =
   | "approval"
   | "blocked"

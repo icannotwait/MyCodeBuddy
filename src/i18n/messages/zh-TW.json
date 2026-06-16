@@ -2977,7 +2977,8 @@
       "noIterations": "還沒有迭代。",
       "noArtifacts": "目前只有根議題工件。",
       "executingNow": "本輪執行中",
-      "iterationsError": "無法載入疊代"
+      "iterationsError": "無法載入疊代",
+      "reviewsOlder": "另 {count} 條更早"
     },
     "status": {
       "pending": "待觸發",

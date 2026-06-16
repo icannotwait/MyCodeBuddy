@@ -2977,7 +2977,8 @@
       "noIterations": "イテレーションはまだありません。",
       "noArtifacts": "今のところルート課題アーティファクトのみです。",
       "executingNow": "実行中",
-      "iterationsError": "イテレーションを読み込めませんでした"
+      "iterationsError": "イテレーションを読み込めませんでした",
+      "reviewsOlder": "以前の{count}件"
     },
     "status": {
       "pending": "保留中",

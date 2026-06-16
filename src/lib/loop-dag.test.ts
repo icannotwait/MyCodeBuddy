@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { buildDag, DAG_COLUMNS } from "@/lib/loop-dag"
+import { buildDag, foldReviews, STAGE_COLUMNS } from "@/lib/loop-dag"
 import type {
   LoopArtifactKind,
   LoopArtifactRow,
@@ -40,31 +40,95 @@ function link(
 }
 
 describe("buildDag", () => {
-  it("assigns each artifact kind to its fixed column (all six)", () => {
-    const arts = DAG_COLUMNS.map((kind) => artifact(kind))
-    const { nodes, colCount } = buildDag(arts, [])
+  it("groups a task with its reviews into one cluster (reviews are not nodes)", () => {
+    const issue = artifact("issue")
+    const task = artifact("task", { status: "in_progress" })
+    const r1 = artifact("review", { attempt: 0 })
+    const r2 = artifact("review", { attempt: 0, sort: 1 })
+    const { clusters, stageNodes } = buildDag(
+      [issue, task, r1, r2],
+      [link(r1.id, task.id, "reviews"), link(r2.id, task.id, "reviews")]
+    )
 
-    expect(colCount).toBe(6)
-    for (const node of nodes) {
-      expect(node.col).toBe(DAG_COLUMNS.indexOf(node.artifact.kind))
-    }
+    expect(clusters).toHaveLength(1)
+    expect(clusters[0].task.id).toBe(task.id)
+    expect(clusters[0].reviews.map((r) => r.id)).toEqual([r1.id, r2.id])
+    // Reviews never appear as standalone stage nodes.
+    expect(stageNodes.some((n) => n.artifact.kind === "review")).toBe(false)
   })
 
-  it("keeps the first four columns' positions when later stages are absent", () => {
-    // M2.1 reaches plan (tasks) but never produces review/result.
+  it("places independent tasks in parallel lanes at the same column", () => {
+    const issue = artifact("issue")
+    const a = artifact("task", { sort: 0 })
+    const b = artifact("task", { sort: 1 })
+    const { clusters, laneCount } = buildDag([issue, a, b], [])
+
+    const ca = clusters.find((c) => c.task.id === a.id)!
+    const cb = clusters.find((c) => c.task.id === b.id)!
+    expect(ca.col).toBe(cb.col) // both at the base task column
+    expect(ca.lane).not.toBe(cb.lane) // but distinct lanes
+    expect(laneCount).toBe(2)
+  })
+
+  it("runs a depends_on chain rightward in a shared lane and keeps the edge", () => {
+    const issue = artifact("issue")
+    const a = artifact("task", { sort: 0 })
+    const b = artifact("task", { sort: 1 })
+    // b depends_on a: edge tail = dependent (b), head = predecessor (a).
+    const { clusters, edges } = buildDag(
+      [issue, a, b],
+      [link(b.id, a.id, "depends_on")]
+    )
+
+    const ca = clusters.find((c) => c.task.id === a.id)!
+    const cb = clusters.find((c) => c.task.id === b.id)!
+    expect(cb.col).toBe(ca.col + 1) // chain runs one column rightward
+    expect(cb.lane).toBe(ca.lane) // same lane (horizontal chain)
+
+    const dep = edges.find((e) => e.kind === "depends_on")
+    expect(dep).toBeDefined()
+    expect(dep!.from).toBe(b.id)
+    expect(dep!.to).toBe(a.id)
+  })
+
+  it("fans out a parent's extra children into new lanes at the next column", () => {
+    const issue = artifact("issue")
+    const a = artifact("task", { sort: 0 })
+    const b = artifact("task", { sort: 1 })
+    const c = artifact("task", { sort: 2 })
+    // b and c both depend_on a (fan-out).
+    const { clusters } = buildDag(
+      [issue, a, b, c],
+      [link(b.id, a.id, "depends_on"), link(c.id, a.id, "depends_on")]
+    )
+    const ca = clusters.find((x) => x.task.id === a.id)!
+    const cb = clusters.find((x) => x.task.id === b.id)!
+    const cc = clusters.find((x) => x.task.id === c.id)!
+
+    expect(cb.col).toBe(ca.col + 1)
+    expect(cc.col).toBe(ca.col + 1)
+    expect(ca.lane).toBe(cb.lane) // parent aligns with its first child
+    expect(cc.lane).not.toBe(cb.lane) // the second child gets its own lane
+  })
+
+  it("places read stages in fixed columns and result at the trailing column", () => {
     const issue = artifact("issue")
     const req = artifact("requirement")
     const design = artifact("design")
-    const task = artifact("task", { status: "pending" })
-    const { colCount } = buildDag([issue, req, design, task], [])
+    const task = artifact("task")
+    const result = artifact("result")
+    const { stageNodes, result: res } = buildDag(
+      [issue, req, design, task, result],
+      []
+    )
 
-    expect(colCount).toBe(4) // issue/requirement/design/task — no trailing gap
-    expect(DAG_COLUMNS.slice(0, 4)).toEqual([
-      "issue",
-      "requirement",
-      "design",
-      "task",
-    ])
+    const colOf = (id: number) =>
+      stageNodes.find((n) => n.artifact.id === id)?.col
+    expect(colOf(issue.id)).toBe(STAGE_COLUMNS.indexOf("issue"))
+    expect(colOf(req.id)).toBe(STAGE_COLUMNS.indexOf("requirement"))
+    expect(colOf(design.id)).toBe(STAGE_COLUMNS.indexOf("design"))
+    // result closes after the task column (3) → column 4.
+    expect(res?.col).toBe(4)
   })
 
   it("marks skips_to edges dashed and derivation edges solid", () => {
@@ -75,16 +139,13 @@ describe("buildDag", () => {
       [link(task.id, issue.id, "skips_to"), link(task.id, issue.id)]
     )
 
-    const skip = edges.find((e) => e.kind === "skips_to")
-    const derive = edges.find((e) => e.kind === "derives_from")
-    expect(skip?.dashed).toBe(true)
-    expect(derive?.dashed).toBe(false)
+    expect(edges.find((e) => e.kind === "skips_to")?.dashed).toBe(true)
+    expect(edges.find((e) => e.kind === "derives_from")?.dashed).toBe(false)
   })
 
   it("preserves edge direction: tail = dependent, head = referenced", () => {
     const issue = artifact("issue")
     const req = artifact("requirement")
-    // A requirement derives_from the issue root: tail = req, head = issue.
     const { edges } = buildDag([issue, req], [link(req.id, issue.id)])
 
     expect(edges).toHaveLength(1)
@@ -92,30 +153,39 @@ describe("buildDag", () => {
     expect(edges[0].to).toBe(issue.id)
   })
 
-  it("orders nodes within a column by sort then id", () => {
+  it("drops edges that dangle or touch a folded review", () => {
     const issue = artifact("issue")
-    const t1 = artifact("task", { sort: 2 })
-    const t2 = artifact("task", { sort: 1 })
-    const t3 = artifact("task", { sort: 1 })
-    const { nodes, rowCount } = buildDag([issue, t1, t2, t3], [])
-
-    const tasks = nodes
-      .filter((n) => n.artifact.kind === "task")
-      .sort((a, b) => a.row - b.row)
-    // sort=1 (t2,t3 by id) before sort=2 (t1).
-    expect(tasks.map((n) => n.artifact.id)).toEqual([t2.id, t3.id, t1.id])
-    expect(rowCount).toBe(3) // tallest column (task) has three rows
-  })
-
-  it("drops edges whose endpoints are missing from the DAG", () => {
-    const issue = artifact("issue")
-    const req = artifact("requirement")
+    const task = artifact("task")
+    const review = artifact("review")
     const { edges } = buildDag(
-      [issue, req],
-      [link(req.id, issue.id), link(req.id, 9999)]
+      [issue, task, review],
+      [
+        link(task.id, issue.id), // kept
+        link(task.id, 9999), // dangling → dropped
+        link(review.id, task.id, "reviews"), // touches a review → dropped
+      ]
     )
 
     expect(edges).toHaveLength(1)
+    expect(edges[0].from).toBe(task.id)
     expect(edges[0].to).toBe(issue.id)
+  })
+})
+
+describe("foldReviews", () => {
+  it("expands the latest attempt and folds older attempts into a count", () => {
+    const reviews = [
+      artifact("review", { attempt: 0 }),
+      artifact("review", { attempt: 0 }),
+      artifact("review", { attempt: 1 }),
+    ]
+    const { latest, olderCount } = foldReviews(reviews)
+    expect(latest.every((r) => r.attempt === 1)).toBe(true)
+    expect(latest).toHaveLength(1)
+    expect(olderCount).toBe(2)
+  })
+
+  it("returns empty for a task with no reviews", () => {
+    expect(foldReviews([])).toEqual({ latest: [], olderCount: 0 })
   })
 })
