@@ -27,12 +27,14 @@ use serde_json::{json, Value};
 
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
 use crate::db::entities::loop_artifact_revision::ActorKind;
+use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_iteration::Stage;
 use crate::db::entities::loop_link::LinkKind;
 use crate::db::entities::loop_memory::{self, MemoryKind};
 use crate::db::entities::loop_issue;
 use crate::db::service::loop_service;
 use crate::loop_engine::LoopError;
+use crate::models::loops::{LoopArtifactDetail, LoopArtifactRow, LoopDagView};
 
 /// Assembled briefing text plus the manifest auditing which components it carried.
 #[derive(Debug, Clone)]
@@ -84,10 +86,13 @@ fn stage_instruction(stage: Stage) -> &'static str {
              can prove they are met."
         }
         Stage::Design => {
-            "Produce the design that satisfies the requirement you were given. \
+            "Produce ONE design that satisfies ALL the requirements listed below. \
              Describe the approach, the components and their responsibilities, the \
              data flow, and the trade-offs you weighed. Stay within the issue's \
-             scope; do not invent new requirements."
+             scope; do not invent new requirements. Capture any cross-cutting \
+             property the implementation must uphold — a constraint, an invariant, \
+             or an obligation — as a typed design criterion so later stages gate \
+             on it (these are NOT acceptance criteria; those live on requirements)."
         }
         Stage::Plan => {
             "Break the work into a set of small, self-contained implementation \
@@ -105,10 +110,13 @@ fn stage_instruction(stage: Stage) -> &'static str {
              engine commits your work — you do not need to commit."
         }
         Stage::Review => {
-            "Review the implementation against its acceptance criteria. Verify each \
-             criterion is met and look for defects, omissions, and regressions. \
-             Return a single verdict: `pass` only if every criterion holds, \
-             otherwise `fail` with specific, actionable findings."
+            "Review the implementation against the acceptance criteria below. Go \
+             through them ONE BY ONE: for each, state its ordinal, a pass/fail, and \
+             the specific evidence (the code, behavior, or test that proves it). \
+             Also check the design obligations and look for defects, omissions, and \
+             regressions. Return a single verdict: `pass` only if every criterion \
+             and obligation holds, otherwise `fail` with specific, actionable \
+             findings keyed to the criteria that failed."
         }
         Stage::Finalize => {
             "Summarize the completed work for this issue: what was built, how it \
@@ -132,18 +140,23 @@ fn tool_contract(stage: Stage) -> &'static str {
              criteria in each artifact's `criteria`."
         }
         Stage::Design => {
-            "Call `loop_submit_artifacts` exactly once with your design(s) (the kind \
-             is inferred as `design`)."
+            "Call `loop_submit_artifacts` exactly once with your single design (the \
+             kind is inferred as `design`). A design carries NO acceptance criteria; \
+             put any cross-cutting properties in `criteria` as typed objects \
+             `{\"text\": \"...\", \"kind\": \"constraint\"|\"invariant\"|\"obligation\"}`."
         }
         Stage::Plan => {
             "Call `loop_submit_artifacts` exactly once with the task breakdown (the \
              kind is inferred as `task`). List tasks in dependency order and put \
-             per-task acceptance criteria in each artifact's `criteria`. To make a \
-             task depend on an earlier one, set its `depends_on` to a one-element \
-             array holding that earlier task's 0-based index in this same \
-             submission (e.g. a task waiting on the first → `\"depends_on\": [0]`). \
-             A reference may only point to an earlier task, and a task may declare \
-             at most one."
+             each task's own acceptance criteria in its `criteria`. Declare which \
+             requirement acceptance criteria each task delivers by listing their \
+             ordinals from the Requirements section in `covers` (e.g. \
+             `\"covers\": [\"R1.AC1\", \"R2.AC1\"]`) — EVERY listed ordinal must be \
+             covered by some task, or planning is redone. To make a task depend on \
+             an earlier one, set its `depends_on` to a one-element array holding \
+             that earlier task's 0-based index in this same submission (e.g. a task \
+             waiting on the first → `\"depends_on\": [0]`). A reference may only \
+             point to an earlier task, and a task may declare at most one."
         }
         Stage::Implement => {
             "Do not call a submit tool — the engine detects and commits your \
@@ -245,6 +258,132 @@ fn build_lineage(links: &[crate::models::loops::LoopLinkRow], target: i32) -> Ve
     chain
 }
 
+/// Lowercase token for a criterion kind (obligation rendering + manifest).
+fn criterion_kind_label(kind: CriterionKind) -> &'static str {
+    match kind {
+        CriterionKind::Acceptance => "acceptance",
+        CriterionKind::Constraint => "constraint",
+        CriterionKind::Invariant => "invariant",
+        CriterionKind::Obligation => "obligation",
+    }
+}
+
+/// The issue's done requirements with full details (criteria), ordered by
+/// `(sort, id)` — the same order ingest and the driver use for the `R{i}.AC{j}`
+/// coverage ordinals, so an ordinal printed in a briefing matches what was stored
+/// and gated on.
+async fn done_requirement_details(
+    conn: &DatabaseConnection,
+    dag: &LoopDagView,
+) -> Result<Vec<LoopArtifactDetail>, LoopError> {
+    let mut reqs: Vec<&LoopArtifactRow> = dag
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::Requirement && a.status == ArtifactStatus::Done)
+        .collect();
+    reqs.sort_by_key(|a| (a.sort, a.id));
+    let mut out = Vec::with_capacity(reqs.len());
+    for r in reqs {
+        if let Some(d) = loop_service::artifact::get_artifact_detail(conn, r.id).await? {
+            out.push(d);
+        }
+    }
+    Ok(out)
+}
+
+/// Render all requirements + their acceptance criteria for the design/plan
+/// briefing. Plan annotates each criterion with its `R{i}.AC{j}` ordinal (so the
+/// planner can declare `covers`); design omits ordinals (it satisfies them all).
+fn render_requirements(reqs: &[LoopArtifactDetail], with_ordinals: bool) -> String {
+    let mut body = String::new();
+    for (ri, r) in reqs.iter().enumerate() {
+        let rbody = r.revisions.last().map(|x| x.content.trim()).unwrap_or("");
+        body.push_str(&format!("## R{}: {}\n{}\n", ri + 1, r.row.title, rbody));
+        let mut j = 0;
+        for c in &r.criteria {
+            if c.kind == CriterionKind::Acceptance {
+                j += 1;
+                if with_ordinals {
+                    body.push_str(&format!("- [R{}.AC{}] {}\n", ri + 1, j, c.text));
+                } else {
+                    body.push_str(&format!("- {}\n", c.text));
+                }
+            }
+        }
+        body.push('\n');
+    }
+    body.trim_end().to_string()
+}
+
+/// The acceptance closure for a task (implement/review): the acceptance criteria
+/// the task covers (by ordinal), plus the design's cross-cutting obligations
+/// (constraint/invariant/obligation), plus — when the task declared no coverage —
+/// a fallback to every requirement acceptance criterion, so the agent is never
+/// blind to what its work must satisfy. Returns `None` only when the issue has no
+/// criteria of any kind.
+async fn acceptance_closure(
+    conn: &DatabaseConnection,
+    task_id: i32,
+    dag: &LoopDagView,
+) -> Result<Option<String>, LoopError> {
+    let reqs = done_requirement_details(conn, dag).await?;
+    // criterion id -> (ordinal, text) over acceptance criteria.
+    let mut by_id: HashMap<i32, (String, String)> = HashMap::new();
+    for (ri, r) in reqs.iter().enumerate() {
+        let mut j = 0;
+        for c in &r.criteria {
+            if c.kind == CriterionKind::Acceptance {
+                j += 1;
+                by_id.insert(c.id, (format!("R{}.AC{}", ri + 1, j), c.text.clone()));
+            }
+        }
+    }
+    let covered: Vec<i32> = dag
+        .coverage
+        .iter()
+        .filter(|cv| cv.task_artifact_id == task_id)
+        .map(|cv| cv.criterion_id)
+        .collect();
+
+    let mut body = String::new();
+    if !covered.is_empty() {
+        body.push_str("This task is responsible for these acceptance criteria:\n");
+        for cid in &covered {
+            if let Some((ord, text)) = by_id.get(cid) {
+                body.push_str(&format!("- [{ord}] {text}\n"));
+            }
+        }
+    } else if !by_id.is_empty() {
+        body.push_str(
+            "This task declared no specific coverage, so it must respect ALL of the \
+             issue's acceptance criteria:\n",
+        );
+        body.push_str(&render_requirements(&reqs, true));
+        body.push('\n');
+    }
+
+    // Design obligations apply to the whole solution, on every task.
+    let mut obligations = String::new();
+    for a in dag
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::Design && a.status == ArtifactStatus::Done)
+    {
+        if let Some(d) = loop_service::artifact::get_artifact_detail(conn, a.id).await? {
+            for c in &d.criteria {
+                obligations.push_str(&format!("- ({}) {}\n", criterion_kind_label(c.kind), c.text));
+            }
+        }
+    }
+    if !obligations.is_empty() {
+        body.push_str("\nDesign obligations (must hold across the whole solution):\n");
+        body.push_str(&obligations);
+    }
+
+    let body = body.trim_end().to_string();
+    Ok(if body.is_empty() { None } else { Some(body) })
+}
+
 /// Assemble the briefing for one iteration. `issue` is the loaded issue row;
 /// `target_artifact_id` is the node the iteration derives its output from (the
 /// issue root for triage/refine, a requirement for design, etc.) — `None` only
@@ -292,8 +431,65 @@ pub async fn assemble_briefing(
     ));
     components.push(json!({ "section": "issue", "issue_seq": issue.seq_no }));
 
-    // ④ Lineage + ⑤ acceptance criteria — both need the target's chain details.
-    if let Some(target) = target_artifact_id {
+    // ④/⑤ Stage-shaped requirement context:
+    //   • design & plan see ALL requirements (design satisfies them all; plan
+    //     declares `covers` against their ordinals, and on a replan sees the gap);
+    //   • implement & review get their task's acceptance closure (covered criteria
+    //     + design obligations + fallback);
+    //   • other staged targets get single-target lineage + its criteria verbatim.
+    if matches!(stage, Stage::Design | Stage::Plan) {
+        let dag = loop_service::artifact::list_dag(conn, issue.id).await?;
+        let reqs = done_requirement_details(conn, &dag).await?;
+        if !reqs.is_empty() {
+            sections.push(format!(
+                "# Requirements\n{}",
+                render_requirements(&reqs, stage == Stage::Plan)
+            ));
+            components.push(json!({ "section": "requirements", "count": reqs.len() }));
+        }
+        // On a plan replan (a prior plan's tasks were superseded by the coverage
+        // gate), call out the criteria still uncovered by ANY task so the new plan
+        // closes them.
+        if stage == Stage::Plan
+            && dag
+                .artifacts
+                .iter()
+                .any(|a| a.kind == ArtifactKind::Task && a.status == ArtifactStatus::Superseded)
+        {
+            let ordinals: Vec<(i32, Vec<i32>)> = reqs
+                .iter()
+                .map(|r| {
+                    (
+                        r.row.id,
+                        r.criteria
+                            .iter()
+                            .filter(|c| c.kind == CriterionKind::Acceptance)
+                            .map(|c| c.id)
+                            .collect(),
+                    )
+                })
+                .collect();
+            let all_tasks: HashSet<i32> = dag
+                .artifacts
+                .iter()
+                .filter(|a| a.kind == ArtifactKind::Task)
+                .map(|a| a.id)
+                .collect();
+            let gap = loop_service::coverage::uncovered_ordinals(&ordinals, &dag.coverage, &all_tasks);
+            if !gap.is_empty() {
+                let list = gap
+                    .iter()
+                    .map(|o| format!("- {o}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                sections.push(format!(
+                    "# Coverage gap\nA previous plan left these acceptance criteria uncovered by \
+                     any task. The new plan MUST cover them:\n{list}"
+                ));
+                components.push(json!({ "section": "coverage_gap", "count": gap.len() }));
+            }
+        }
+    } else if let Some(target) = target_artifact_id {
         let dag = loop_service::artifact::list_dag(conn, issue.id).await?;
         let chain = build_lineage(&dag.links, target);
 
@@ -320,25 +516,34 @@ pub async fn assemble_briefing(
             sections.push(format!("# Lineage\n{}", lineage.trim_end()));
             components.push(json!({ "section": "lineage", "depth": details.len() }));
 
-            // ⑤ Acceptance criteria: target + its direct parent, verbatim.
-            let mut crit = String::new();
-            if !head.criteria.is_empty() {
-                crit.push_str(&format!("From {}:\n", head.row.title));
-                for c in &head.criteria {
-                    crit.push_str(&format!("- [{}] {}\n", c.label, c.text));
+            // ⑤ Criteria. Implement/review get the AC closure (coverage + design
+            // obligations + fallback); other staged targets get the target's +
+            // direct parent's criteria verbatim.
+            if matches!(stage, Stage::Implement | Stage::Review) {
+                if let Some(closure) = acceptance_closure(conn, target, &dag).await? {
+                    sections.push(format!("# Acceptance criteria\n{closure}"));
+                    components.push(json!({ "section": "acceptance_criteria", "closure": true }));
                 }
-            }
-            if let Some(parent) = ancestors.first() {
-                if !parent.criteria.is_empty() {
-                    crit.push_str(&format!("\nFrom {} (parent):\n", parent.row.title));
-                    for c in &parent.criteria {
+            } else {
+                let mut crit = String::new();
+                if !head.criteria.is_empty() {
+                    crit.push_str(&format!("From {}:\n", head.row.title));
+                    for c in &head.criteria {
                         crit.push_str(&format!("- [{}] {}\n", c.label, c.text));
                     }
                 }
-            }
-            if !crit.is_empty() {
-                sections.push(format!("# Acceptance criteria\n{}", crit.trim_end()));
-                components.push(json!({ "section": "acceptance_criteria" }));
+                if let Some(parent) = ancestors.first() {
+                    if !parent.criteria.is_empty() {
+                        crit.push_str(&format!("\nFrom {} (parent):\n", parent.row.title));
+                        for c in &parent.criteria {
+                            crit.push_str(&format!("- [{}] {}\n", c.label, c.text));
+                        }
+                    }
+                }
+                if !crit.is_empty() {
+                    sections.push(format!("# Acceptance criteria\n{}", crit.trim_end()));
+                    components.push(json!({ "section": "acceptance_criteria" }));
+                }
             }
         }
     }
@@ -632,15 +837,14 @@ mod tests {
         // ③ issue full text.
         assert!(t.contains("Add login"));
         assert!(t.contains("Users must be able to authenticate."));
-        // ④ lineage: requirement (target) verbatim + issue-root ancestor summary.
-        assert!(t.contains("R1: credential check (direct parent)"));
+        // ④ requirements: design sees ALL requirements (title + body + criteria),
+        // not a single-target lineage.
+        assert!(t.contains("# Requirements"));
+        assert!(t.contains("R1: credential check"));
         assert!(t.contains("The system must verify a username/password pair."));
-        assert!(t.contains("(ancestor)"));
-        // ⑤ acceptance criteria from the requirement.
-        assert!(t.contains("Acceptance criteria"));
         assert!(t.contains("Rejects an unknown user"));
         // ⑥ stage instruction (design-specific) + ⑦ tool contract.
-        assert!(t.contains("Produce the design"));
+        assert!(t.contains("Produce ONE design"));
         assert!(t.contains("loop_submit_artifacts"));
 
         // Manifest lists every emitted component + the stage template.
@@ -655,13 +859,71 @@ mod tests {
             "constitution",
             "memory_matrix",
             "issue",
-            "lineage",
-            "acceptance_criteria",
+            "requirements",
             "stage_instruction",
             "tool_contract",
         ] {
             assert!(sections.contains(&expected), "manifest missing {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn design_briefing_shows_all_requirements() {
+        let (db, space, issue, root) = seed().await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "Alpha", "req alpha", &[], root).await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "Beta", "req beta", &[], root).await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "Gamma", "req gamma", &[], root).await;
+        let out = assemble_briefing(&db.conn, &issue, Stage::Design, Some(root))
+            .await
+            .unwrap();
+        let t = &out.text;
+        assert!(
+            t.contains("Alpha") && t.contains("Beta") && t.contains("Gamma"),
+            "design must see every requirement, not just one"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_briefing_enumerates_criterion_ordinals() {
+        let (db, space, issue, root) = seed().await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "R1", "first req", &["alpha holds"], root).await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "R2", "second req", &["beta holds"], root).await;
+        let out = assemble_briefing(&db.conn, &issue, Stage::Plan, Some(root))
+            .await
+            .unwrap();
+        let t = &out.text;
+        assert!(t.contains("# Requirements"));
+        assert!(t.contains("[R1.AC1] alpha holds"), "plan enumerates ordinals");
+        assert!(t.contains("[R2.AC1] beta holds"));
+        assert!(t.contains("covers"), "plan tool contract explains covers");
+    }
+
+    #[tokio::test]
+    async fn implement_briefing_ac_closure_covered_and_fallback() {
+        let (db, space, issue, root) = seed().await;
+        let r1 = add_node(&db, space, issue.id, ArtifactKind::Requirement, "R1", "first", &["alpha holds"], root).await;
+        add_node(&db, space, issue.id, ArtifactKind::Requirement, "R2", "second", &["beta holds"], root).await;
+        // A design carrying a cross-cutting obligation (invariant).
+        let design = loop_service::artifact::create_artifact(&db.conn, space, issue.id, ArtifactKind::Design, "D", ArtifactStatus::Done, ActorKind::Agent, None).await.unwrap();
+        loop_service::artifact::add_criterion(&db.conn, design.id, CriterionKind::Invariant, "stays O(1)").await.unwrap();
+        // Task 1 covers R1.AC1; task 2 covers nothing.
+        let t1 = loop_service::artifact::create_artifact(&db.conn, space, issue.id, ArtifactKind::Task, "T1", ArtifactStatus::Pending, ActorKind::Agent, None).await.unwrap();
+        let t2 = loop_service::artifact::create_artifact(&db.conn, space, issue.id, ArtifactKind::Task, "T2", ArtifactStatus::Pending, ActorKind::Agent, None).await.unwrap();
+        let r1ac = loop_service::artifact::get_artifact_detail(&db.conn, r1).await.unwrap().unwrap().criteria[0].id;
+        loop_service::coverage::create_coverage(&db.conn, space, t1.id, r1ac).await.unwrap();
+
+        // Covered task: its criterion (by ordinal) + the design obligation, NOT
+        // the unrelated R2.AC1.
+        let out1 = assemble_briefing(&db.conn, &issue, Stage::Implement, Some(t1.id)).await.unwrap();
+        assert!(out1.text.contains("[R1.AC1] alpha holds"));
+        assert!(out1.text.contains("(invariant) stays O(1)"));
+        assert!(!out1.text.contains("beta holds"), "covered task isn't shown unrelated criteria");
+
+        // Uncovered task: falls back to ALL requirement acceptance criteria.
+        let out2 = assemble_briefing(&db.conn, &issue, Stage::Implement, Some(t2.id)).await.unwrap();
+        assert!(out2.text.contains("alpha holds"));
+        assert!(out2.text.contains("beta holds"));
+        assert!(out2.text.contains("(invariant) stays O(1)"));
     }
 
     #[tokio::test]
@@ -685,42 +947,19 @@ mod tests {
         assert!(sections.contains(&"issue"));
     }
 
-    #[tokio::test]
-    async fn lineage_is_cycle_protected() {
+    #[test]
+    fn lineage_is_cycle_protected() {
         // A → B → A: build_lineage must terminate rather than loop forever.
-        let (db, space, issue, root) = seed().await;
-        let a = add_node(
-            &db,
-            space,
-            issue.id,
-            ArtifactKind::Requirement,
-            "A",
-            "node a",
-            &[],
-            root,
-        )
-        .await;
-        let b = add_node(
-            &db,
-            space,
-            issue.id,
-            ArtifactKind::Design,
-            "B",
-            "node b",
-            &[],
-            a,
-        )
-        .await;
-        // Add the back-edge A→B to close the cycle (A derives_from B as well).
-        loop_service::link::create_link(&db.conn, space, a, b, LinkKind::DerivesFrom, None)
-            .await
-            .unwrap();
-
-        // Should return promptly with a bounded chain, not hang.
-        let out = assemble_briefing(&db.conn, &issue, Stage::Design, Some(a))
-            .await
-            .unwrap();
-        assert!(out.text.contains("Lineage"));
+        let link = |from, to| crate::models::loops::LoopLinkRow {
+            id: 0,
+            from_artifact_id: from,
+            to_artifact_id: to,
+            kind: LinkKind::DerivesFrom,
+            source_revision_id: None,
+        };
+        let links = vec![link(1, 2), link(2, 1)];
+        // Walk from 1: 1 → 2 → (1 already seen) stops. Bounded chain, no hang.
+        assert_eq!(build_lineage(&links, 1), vec![1, 2]);
     }
 
     #[test]
