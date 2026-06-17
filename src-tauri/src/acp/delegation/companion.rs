@@ -180,7 +180,8 @@ impl CompanionFeatures {
             "ask_user_question" => self.ask,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
             "loop_submit_route" | "loop_submit_artifacts" | "loop_submit_review"
-            | "loop_report_blocked" | "loop_record_memory" | "loop_read_memory" => self.loop_tools,
+            | "loop_report_blocked" | "loop_record_memory" | "loop_read_memory"
+            | "loop_submit_reflection" => self.loop_tools,
             _ => false,
         }
     }
@@ -515,7 +516,8 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_ask_result).await
         }
         "loop_submit_route" | "loop_submit_artifacts" | "loop_submit_review"
-        | "loop_report_blocked" | "loop_record_memory" | "loop_read_memory" => {
+        | "loop_report_blocked" | "loop_record_memory" | "loop_read_memory"
+        | "loop_submit_reflection" => {
             // The loop tools authenticate with the per-iteration capability
             // token, NOT the delegation launch token. Its absence means this
             // companion wasn't launched for a loop iteration — a configuration
@@ -1954,6 +1956,7 @@ mod tests {
                 "loop_record_memory",
                 "loop_report_blocked",
                 "loop_submit_artifacts",
+                "loop_submit_reflection",
                 "loop_submit_review",
                 "loop_submit_route",
             ]

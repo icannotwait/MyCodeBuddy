@@ -32,6 +32,7 @@ use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
 use crate::db::entities::loop_link::LinkKind;
 use crate::db::entities::loop_memory::{MemoryKind, TrustTier};
 use crate::db::service::loop_service;
+use crate::loop_engine::transitions;
 use crate::loop_engine::LoopError;
 
 /// Hard ceiling on any single persisted text field (defense against a runaway
@@ -263,6 +264,7 @@ pub async fn ingest(
         "loop_report_blocked" => report_blocked(conn, &it, payload).await,
         "loop_record_memory" => record_memory(conn, &it, payload).await,
         "loop_read_memory" => read_memory(conn, &it, payload).await,
+        "loop_submit_reflection" => submit_reflection(conn, &it, payload).await,
         other => Err(invalid(format!("unknown loop tool: {other}"))),
     }
 }
@@ -1031,6 +1033,225 @@ async fn record_memory(
     )
     .await?;
     Ok(json!({ "ok": true, "id": m.id }))
+}
+
+/// reflect write path (§4.4): build the retrospective `reflection` artifact and
+/// distill memories in ONE transaction. The reflection-artifact insert is the
+/// atomic idempotency gate (uniq_reflection_per_issue): a UNIQUE violation means
+/// another submit/replay already consolidated → roll back + return idempotent.
+/// Every `supersedes` [M{n}] handle is resolved up-front against the STORED
+/// manifest + a live/in-space/active lookup; unknown / cross-space / constitution
+/// / duplicate handles abort the whole batch with no partial write.
+async fn submit_reflection(
+    conn: &DatabaseConnection,
+    it: &loop_iteration::Model,
+    payload: &Value,
+) -> Result<Value, LoopError> {
+    if it.stage != Stage::Reflect {
+        return Err(invalid("loop_submit_reflection is only valid during reflect"));
+    }
+    // Fast-path idempotency: a reflection for this issue already exists.
+    if loop_artifact::Entity::find()
+        .filter(loop_artifact::Column::IssueId.eq(it.issue_id))
+        .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Reflection))
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Ok(json!({ "ok": true, "idempotent": true }));
+    }
+
+    let refl = payload
+        .get("reflection")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| invalid("loop_submit_reflection requires a `reflection` object"))?;
+    let refl_title = refl
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Reflection");
+    let refl_content = refl.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    if refl_content.trim().is_empty() {
+        return Err(invalid("reflection content is empty"));
+    }
+
+    let mem_items: Vec<&Value> = payload
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let index = injected_memory_index(it)?; // empty map if no memory_index in manifest
+
+    struct PendingMemory {
+        kind: MemoryKind,
+        title: String,
+        summary: Option<String>,
+        content: String,
+        supersede_ids: Vec<i32>,
+    }
+    let mut pending: Vec<PendingMemory> = Vec::with_capacity(mem_items.len());
+    // (memory index, handle, resolved id) for every supersede across the batch.
+    let mut all_supersede: Vec<(usize, String, i32)> = Vec::new();
+    let mut seen_supersede: HashSet<i32> = HashSet::new();
+    for (idx, item) in mem_items.iter().enumerate() {
+        let kind = match item.get("kind").and_then(|v| v.as_str()) {
+            Some(k) => serde_json::from_value::<MemoryKind>(json!(k))
+                .map_err(|_| invalid(format!("memory {idx}: unknown kind `{k}`")))?,
+            None => return Err(invalid(format!("memory {idx}: missing kind"))),
+        };
+        if matches!(kind, MemoryKind::Constitution) {
+            return Err(invalid(format!(
+                "memory {idx}: agents may not record a constitution memory"
+            )));
+        }
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Note")
+            .to_string();
+        let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.trim().is_empty() {
+            return Err(invalid(format!("memory {idx}: content is empty")));
+        }
+        let summary = item
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|s| !s.is_empty());
+        let mut supersede_ids = Vec::new();
+        if let Some(arr) = item.get("supersedes").and_then(|v| v.as_array()) {
+            for h in arr {
+                let handle = h
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("memory {idx}: supersedes must be string handles")))?;
+                let id = index.get(handle).copied().ok_or_else(|| {
+                    invalid(format!(
+                        "memory {idx}: supersedes handle `{handle}` is not in your Memory index"
+                    ))
+                })?;
+                // A handle may be superseded by at most one memory per batch.
+                if !seen_supersede.insert(id) {
+                    return Err(invalid(format!(
+                        "memory {idx}: handle `{handle}` is superseded more than once in this submission"
+                    )));
+                }
+                supersede_ids.push(id);
+                all_supersede.push((idx, handle.to_string(), id));
+            }
+        }
+        pending.push(PendingMemory {
+            kind,
+            title,
+            summary,
+            content: truncate(content),
+            supersede_ids,
+        });
+    }
+
+    // Confirm every supersede target is live/in-space/active in ONE query; abort if any gone.
+    if !all_supersede.is_empty() {
+        let ids: Vec<i32> = all_supersede.iter().map(|(_, _, id)| *id).collect();
+        let live: HashSet<i32> = loop_service::memory::get_for_read(conn, it.space_id, &ids)
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        if let Some((idx, handle, _)) = all_supersede.iter().find(|(_, _, id)| !live.contains(id)) {
+            return Err(invalid(format!(
+                "memory {idx}: supersedes handle `{handle}` no longer names an active memory"
+            )));
+        }
+    }
+
+    // derives_from: live result else issue root.
+    let issue_arts = loop_artifact::Entity::find()
+        .filter(loop_artifact::Column::IssueId.eq(it.issue_id))
+        .all(conn)
+        .await?;
+    let derive_target = issue_arts
+        .iter()
+        .find(|a| {
+            a.kind == ArtifactKind::Result
+                && !matches!(a.status, ArtifactStatus::Superseded | ArtifactStatus::Cancelled)
+        })
+        .or_else(|| issue_arts.iter().find(|a| a.kind == ArtifactKind::Issue))
+        .map(|a| a.id);
+
+    let txn = conn.begin().await?;
+    // The artifact insert is the idempotency gate (uniq_reflection_per_issue).
+    let art = match loop_service::artifact::create_artifact(
+        &txn,
+        it.space_id,
+        it.issue_id,
+        ArtifactKind::Reflection,
+        refl_title,
+        default_status_for_kind(ArtifactKind::Reflection),
+        ActorKind::Agent,
+        Some(it.id),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(crate::db::error::DbError::Database(e)) if transitions::is_unique_violation(&e) => {
+            // Lost the race — another submit already consolidated this issue.
+            let _ = txn.rollback().await;
+            return Ok(json!({ "ok": true, "idempotent": true }));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    loop_service::artifact::add_revision(
+        &txn,
+        art.id,
+        &truncate(refl_content),
+        ActorKind::Agent,
+        Some(it.id),
+    )
+    .await?;
+    if let Some(target) = derive_target {
+        loop_service::link::create_link(
+            &txn,
+            it.space_id,
+            art.id,
+            target,
+            LinkKind::DerivesFrom,
+            None,
+        )
+        .await?;
+    }
+    let mut recorded = 0usize;
+    let mut superseded_handles: Vec<String> = Vec::new();
+    for pm in &pending {
+        let m = loop_service::memory::create_memory(
+            &txn,
+            it.space_id,
+            pm.kind,
+            ActorKind::Agent,
+            &pm.title,
+            pm.summary.as_deref(),
+            &pm.content,
+            TrustTier::Distilled,
+            loop_service::memory::MemoryProvenance {
+                source_issue_id: Some(it.issue_id),
+                source_artifact_id: Some(art.id),
+                produced_by_iteration_id: Some(it.id),
+            },
+        )
+        .await?;
+        for old_id in &pm.supersede_ids {
+            if loop_service::memory::supersede_memory(&txn, *old_id, m.id).await? {
+                // echo the handle (not the id) the agent submitted for this target.
+                if let Some((_, h, _)) = all_supersede.iter().find(|(_, _, id)| id == old_id) {
+                    superseded_handles.push(h.clone());
+                }
+            }
+        }
+        recorded += 1;
+    }
+    txn.commit().await?;
+    Ok(json!({ "ok": true, "recorded": recorded, "superseded": superseded_handles }))
 }
 
 #[cfg(test)]
@@ -2000,5 +2221,237 @@ mod tests {
         assert_eq!(m.source_issue_id, Some(issue));
         assert_eq!(m.produced_by_iteration_id, Some(iter));
         assert_eq!(m.source_artifact_id, None);
+    }
+
+    // ---- loop_submit_reflection (P4.2) ----
+
+    async fn count_reflections(conn: &DatabaseConnection, issue_id: i32) -> usize {
+        loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(issue_id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Reflection))
+            .all(conn)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    async fn count_distilled(conn: &DatabaseConnection, space_id: i32) -> usize {
+        crate::db::entities::loop_memory::Entity::find()
+            .filter(crate::db::entities::loop_memory::Column::SpaceId.eq(space_id))
+            .filter(crate::db::entities::loop_memory::Column::TrustTier.eq(TrustTier::Distilled))
+            .all(conn)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn reflection_distills_memory_supersedes_and_links() {
+        let (db, space, issue, root) = seed().await;
+        let old = mk_memory(&db.conn, space, MemoryKind::Decision, "Old decision", Some("old")).await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        set_memory_index(&db.conn, iter, json!({ "M1": old })).await;
+
+        let out = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({
+                "reflection": { "title": "Retro", "content": "It went well." },
+                "memories": [{
+                    "kind": "procedural", "title": "Recipe",
+                    "summary": "do X then Y", "content": "steps",
+                    "supersedes": ["M1"]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recorded"], json!(1));
+        assert_eq!(out["superseded"], json!(["M1"]));
+
+        // A reflection artifact exists, Done, derives_from the issue root (no result).
+        let refl = loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(issue))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Reflection))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("reflection artifact");
+        assert_eq!(refl.status, ArtifactStatus::Done);
+        let link = crate::db::entities::loop_link::Entity::find()
+            .filter(crate::db::entities::loop_link::Column::FromArtifactId.eq(refl.id))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("derives_from link");
+        assert_eq!(link.to_artifact_id, root);
+        assert_eq!(link.kind, LinkKind::DerivesFrom);
+
+        // The distilled memory carries the reflection as its source artifact.
+        let distilled = crate::db::entities::loop_memory::Entity::find()
+            .filter(crate::db::entities::loop_memory::Column::SpaceId.eq(space))
+            .filter(crate::db::entities::loop_memory::Column::TrustTier.eq(TrustTier::Distilled))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("distilled memory");
+        assert_eq!(distilled.kind, MemoryKind::Procedural);
+        assert_eq!(distilled.source_artifact_id, Some(refl.id));
+        assert_eq!(distilled.source_issue_id, Some(issue));
+
+        // The old memory is superseded, pointing at the new one.
+        let old_row = fetch_memory(&db.conn, old).await;
+        assert_eq!(
+            old_row.status,
+            crate::db::entities::loop_memory::MemoryStatus::Superseded
+        );
+        assert_eq!(old_row.superseded_by, Some(distilled.id));
+    }
+
+    #[tokio::test]
+    async fn reflection_replay_is_idempotent() {
+        let (db, space, issue, _root) = seed().await;
+        let old = mk_memory(&db.conn, space, MemoryKind::Decision, "Old", None).await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        set_memory_index(&db.conn, iter, json!({ "M1": old })).await;
+        let payload = json!({
+            "reflection": { "title": "Retro", "content": "ok" },
+            "memories": [{ "kind": "episodic", "title": "E", "content": "c", "supersedes": ["M1"] }]
+        });
+        let first = ingest(&db.conn, "tok-refl", "loop_submit_reflection", &payload)
+            .await
+            .unwrap();
+        assert_eq!(first["recorded"], json!(1));
+        let old_after_first = fetch_memory(&db.conn, old).await.updated_at;
+
+        let second = ingest(&db.conn, "tok-refl", "loop_submit_reflection", &payload)
+            .await
+            .unwrap();
+        assert_eq!(second["idempotent"], json!(true));
+        // Exactly one reflection artifact; exactly one distilled memory.
+        assert_eq!(count_reflections(&db.conn, issue).await, 1);
+        assert_eq!(count_distilled(&db.conn, space).await, 1);
+        // The superseded memory was not double-touched on replay.
+        assert_eq!(fetch_memory(&db.conn, old).await.updated_at, old_after_first);
+    }
+
+    #[tokio::test]
+    async fn reflection_without_index_and_no_supersede_succeeds() {
+        let (db, space, issue, _root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        // No set_memory_index → injected_memory_index returns empty (not an error).
+        let out = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({
+                "reflection": { "title": "Retro", "content": "ok" },
+                "memories": [{ "kind": "episodic", "title": "E", "content": "c" }]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recorded"], json!(1));
+        assert_eq!(out["superseded"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn reflection_unknown_supersede_handle_aborts() {
+        let (db, space, issue, _root) = seed().await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        set_memory_index(&db.conn, iter, json!({})).await;
+        let err = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({
+                "reflection": { "title": "R", "content": "c" },
+                "memories": [{ "kind": "episodic", "title": "E", "content": "c", "supersedes": ["M9"] }]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        assert_eq!(count_reflections(&db.conn, issue).await, 0); // no partial write
+    }
+
+    #[tokio::test]
+    async fn reflection_duplicate_supersede_target_aborts() {
+        let (db, space, issue, _root) = seed().await;
+        let old = mk_memory(&db.conn, space, MemoryKind::Decision, "Old", None).await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        set_memory_index(&db.conn, iter, json!({ "M1": old })).await;
+        let err = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({
+                "reflection": { "title": "R", "content": "c" },
+                "memories": [
+                    { "kind": "episodic", "title": "A", "content": "c", "supersedes": ["M1"] },
+                    { "kind": "procedural", "title": "B", "content": "c", "supersedes": ["M1"] }
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        assert_eq!(count_reflections(&db.conn, issue).await, 0);
+        assert_eq!(
+            fetch_memory(&db.conn, old).await.status,
+            crate::db::entities::loop_memory::MemoryStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn reflection_constitution_kind_rejected() {
+        let (db, space, issue, _root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        let err = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({
+                "reflection": { "title": "R", "content": "c" },
+                "memories": [{ "kind": "constitution", "title": "X", "content": "c" }]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        assert_eq!(count_reflections(&db.conn, issue).await, 0);
+    }
+
+    #[tokio::test]
+    async fn reflection_wrong_stage_rejected() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-refine").await;
+        let err = ingest(
+            &db.conn,
+            "tok-refine",
+            "loop_submit_reflection",
+            &json!({ "reflection": { "title": "R", "content": "c" } }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn reflection_with_empty_memories_writes_artifact_only() {
+        let (db, space, issue, _root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Reflect, None, "tok-refl").await;
+        let out = ingest(
+            &db.conn,
+            "tok-refl",
+            "loop_submit_reflection",
+            &json!({ "reflection": { "title": "Retro", "content": "nothing to record" }, "memories": [] }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["recorded"], json!(0));
+        assert_eq!(count_reflections(&db.conn, issue).await, 1);
+        assert_eq!(count_distilled(&db.conn, space).await, 0);
     }
 }

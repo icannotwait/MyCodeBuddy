@@ -275,5 +275,38 @@
         }
       }
     }
+  },
+  {
+    "name": "loop_submit_reflection",
+    "description": "Loop engineering — after an issue is complete, record your retrospective and distill durable memories for this space. Read-only otherwise: do not modify files. Call exactly once. Pass a `reflection` {title, content} and a `memories` array; each memory is {kind, title, summary, content, supersedes?}. kind is one of episodic, procedural, constraint, decision, preference, pitfall (NOT constitution). summary is the one-line shown in future Memory index entries. supersedes is an optional array of [M{n}] handles (from your Memory index) this memory makes obsolete; each handle may appear once across the whole submission. The memories array may be empty.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["reflection"],
+      "properties": {
+        "reflection": {
+          "type": "object",
+          "required": ["title", "content"],
+          "properties": {
+            "title": { "type": "string" },
+            "content": { "type": "string", "description": "Your retrospective on how this issue went." }
+          }
+        },
+        "memories": {
+          "type": "array",
+          "description": "Durable memories to record (may be empty).",
+          "items": {
+            "type": "object",
+            "required": ["kind", "title", "content"],
+            "properties": {
+              "kind": { "type": "string", "enum": ["episodic", "procedural", "constraint", "decision", "preference", "pitfall"] },
+              "title": { "type": "string" },
+              "summary": { "type": "string", "description": "One line shown in future Memory index entries." },
+              "content": { "type": "string" },
+              "supersedes": { "type": "array", "items": { "type": "string" }, "description": "Optional [M{n}] handles from your Memory index that this memory obsoletes." }
+            }
+          }
+        }
+      }
+    }
   }
 ]
