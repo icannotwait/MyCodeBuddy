@@ -23,7 +23,6 @@ mod tests {
     use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
     use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
     use crate::db::entities::loop_criterion::CriterionKind;
-    use crate::db::entities::loop_iteration::Stage;
     use crate::db::entities::loop_link::LinkKind;
     use crate::db::entities::loop_memory::{MemoryKind, TrustTier};
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
@@ -281,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_crud_and_stage_matrix() {
+    async fn memory_crud() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/repo-e").await;
         let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
@@ -313,12 +312,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(memory::list_memory(&db.conn, space.id).await.unwrap().len(), 2);
-
-        // implement stage injects pitfalls, not decisions.
-        let injected = memory::list_active_for_stage(&db.conn, space.id, Stage::Implement)
-            .await
-            .unwrap();
-        assert!(injected.iter().any(|m| m.kind == MemoryKind::Pitfall));
-        assert!(!injected.iter().any(|m| m.kind == MemoryKind::Decision));
     }
 }

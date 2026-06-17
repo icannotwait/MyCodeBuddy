@@ -4,7 +4,6 @@ use sea_orm::{
 };
 
 use crate::db::entities::loop_artifact_revision::ActorKind;
-use crate::db::entities::loop_iteration::Stage;
 use crate::db::entities::loop_memory::{self, MemoryKind, MemoryStatus, TrustTier};
 use crate::db::error::DbError;
 use crate::models::loops::LoopMemoryRow;
@@ -34,21 +33,6 @@ pub struct MemoryProvenance {
     pub source_issue_id: Option<i32>,
     pub source_artifact_id: Option<i32>,
     pub produced_by_iteration_id: Option<i32>,
-}
-
-/// Memory kinds injected for a given stage (briefing §4.8 matrix). `constitution`
-/// is handled separately by the briefing assembler, so it is never returned here.
-fn kinds_for_stage(stage: Stage) -> Vec<MemoryKind> {
-    use MemoryKind::*;
-    match stage {
-        Stage::Triage => vec![Constraint, Preference],
-        Stage::Refine | Stage::Design => vec![Constraint, Decision, Preference],
-        Stage::Plan => vec![Decision, Constraint],
-        Stage::Implement => vec![Pitfall, Preference, Constraint],
-        Stage::Review => vec![Constraint, Decision, Preference, Pitfall],
-        // finalize summarizes; reuse the review-wide set.
-        Stage::Finalize => vec![Constraint, Decision, Preference, Pitfall],
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,21 +108,6 @@ pub async fn list_memory(
         .into_iter()
         .map(to_row)
         .collect())
-}
-
-/// Active memories to inject for `stage` (excludes constitution).
-pub async fn list_active_for_stage(
-    conn: &sea_orm::DatabaseConnection,
-    space_id: i32,
-    stage: Stage,
-) -> Result<Vec<loop_memory::Model>, DbError> {
-    Ok(loop_memory::Entity::find()
-        .filter(loop_memory::Column::SpaceId.eq(space_id))
-        .filter(loop_memory::Column::Status.eq(MemoryStatus::Active))
-        .filter(loop_memory::Column::Kind.is_in(kinds_for_stage(stage)))
-        .order_by_asc(loop_memory::Column::Id)
-        .all(conn)
-        .await?)
 }
 
 /// The space constitution memories (always injected first by the briefing).

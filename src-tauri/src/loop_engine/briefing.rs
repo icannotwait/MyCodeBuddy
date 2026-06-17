@@ -30,7 +30,7 @@ use crate::db::entities::loop_artifact_revision::ActorKind;
 use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_iteration::Stage;
 use crate::db::entities::loop_link::LinkKind;
-use crate::db::entities::loop_memory::{self, MemoryKind};
+use crate::db::entities::loop_memory::{self, MemoryKind, TrustTier};
 use crate::db::entities::loop_issue;
 use crate::db::service::loop_service;
 use crate::loop_engine::LoopError;
@@ -64,6 +64,14 @@ fn memory_kind_label(kind: MemoryKind) -> &'static str {
         MemoryKind::Decision => "decision",
         MemoryKind::Preference => "preference",
         MemoryKind::Pitfall => "pitfall",
+    }
+}
+
+fn trust_tier_label(t: TrustTier) -> &'static str {
+    match t {
+        TrustTier::Human => "human",
+        TrustTier::Distilled => "distilled",
+        TrustTier::Proposed => "proposed",
     }
 }
 
@@ -519,6 +527,10 @@ pub async fn assemble_briefing(
     // submitted checks against, persisted into the iteration's `context_manifest`
     // at dispatch (D10). `None` for non-review stages.
     let mut criteria_manifest: Option<Value> = None;
+    // The `{ "M{n}": memory_id }` map for the full memory index injected below —
+    // stashed into the iteration's `context_manifest` so `loop_read_memory`
+    // resolves read handles against exactly what this briefing showed.
+    let mut memory_index_manifest: Option<Value> = None;
 
     // ① Space constitution — human-authored, always first.
     let constitution = loop_service::memory::list_constitution(conn, issue.space_id).await?;
@@ -530,19 +542,53 @@ pub async fn assemble_briefing(
         components.push(json!({ "section": "constitution", "count": constitution.len() }));
     }
 
-    // ② Stage memory matrix — the memory kinds relevant to this stage.
-    let mems = loop_service::memory::list_active_for_stage(conn, issue.space_id, stage).await?;
-    if !mems.is_empty() {
+    // ② Memory index — EVERY active memory (except the constitution), one line
+    // each with a stable [M{n}] handle. No ranking/scoring/filter (§4.2): the
+    // agent reads what it judges relevant via loop_read_memory. The { "M{n}": id }
+    // map is stashed in the manifest so ingest resolves read handles against
+    // exactly what was shown here.
+    let index = loop_service::memory::build_index(conn, issue.space_id).await?;
+    if !index.is_empty() {
+        let mut body = String::new();
+        let mut map = serde_json::Map::new();
+        for (i, m) in index.iter().enumerate() {
+            let handle = format!("M{}", i + 1);
+            let mut tail = String::new();
+            // One compact line per memory: collapse any whitespace/newlines in the
+            // summary so a multiline summary can't break the index layout.
+            if let Some(s) = m.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                tail.push_str(" — ");
+                tail.push_str(&s.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            // Provenance shown for judgment (§4.5) — present-only, never used to
+            // rank/filter/score. (source_artifact_id is set by reflect in P4.)
+            if let Some(id) = m.source_issue_id {
+                tail.push_str(&format!(" · issue {id}"));
+            }
+            if let Some(id) = m.source_artifact_id {
+                tail.push_str(&format!(" · artifact {id}"));
+            }
+            if let Some(id) = m.produced_by_iteration_id {
+                tail.push_str(&format!(" · iter {id}"));
+            }
+            body.push_str(&format!(
+                "- [{}] ({} · {}) {}{}\n",
+                handle,
+                memory_kind_label(m.kind),
+                trust_tier_label(m.trust_tier),
+                m.title,
+                tail,
+            ));
+            map.insert(handle, json!(m.id));
+        }
         sections.push(format!(
-            "# Relevant memory ({} stage)\n{}",
-            stage_label(stage),
-            render_memories(&mems)
+            "# Memory index\nRead any of these in full with `loop_read_memory` — pass as many \
+             of the bracketed [M{{n}}] handles as you want in ONE call (batch read; you decide \
+             how many):\n{}",
+            body.trim_end()
         ));
-        components.push(json!({
-            "section": "memory_matrix",
-            "stage": stage_label(stage),
-            "count": mems.len(),
-        }));
+        components.push(json!({ "section": "memory_index", "count": index.len() }));
+        memory_index_manifest = Some(Value::Object(map));
     }
 
     // ③ Issue full text — the human-written objective.
@@ -851,6 +897,11 @@ pub async fn assemble_briefing(
     if let Some(criteria) = criteria_manifest {
         manifest["criteria"] = criteria;
     }
+    // The full memory index handles (when any active memory exists) — what
+    // loop_read_memory resolves submitted [M{n}] handles against.
+    if let Some(mem) = memory_index_manifest {
+        manifest["memory_index"] = mem;
+    }
 
     Ok(BriefingOutput {
         text: sections.join("\n\n"),
@@ -965,7 +1016,7 @@ mod tests {
         )
         .await
         .unwrap();
-        loop_service::memory::create_memory(
+        let decision_id = loop_service::memory::create_memory(
             &db.conn,
             space,
             MemoryKind::Decision,
@@ -977,8 +1028,9 @@ mod tests {
             loop_service::memory::MemoryProvenance::default(),
         )
         .await
-        .unwrap();
-        loop_service::memory::create_memory(
+        .unwrap()
+        .id;
+        let pitfall_id = loop_service::memory::create_memory(
             &db.conn,
             space,
             MemoryKind::Pitfall,
@@ -990,7 +1042,8 @@ mod tests {
             loop_service::memory::MemoryProvenance::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
 
         // issue root → requirement → (design target is the requirement).
         let req = add_node(
@@ -1010,14 +1063,20 @@ mod tests {
             .unwrap();
         let t = &out.text;
 
-        // ① constitution, ② design memory matrix (decision present, pitfall NOT).
+        // ① constitution shown in full text (title + body via render_memories).
         assert!(t.contains("Space constitution"));
         assert!(t.contains("No new dependencies"));
-        assert!(t.contains("Use the existing keyring abstraction."));
+        // ② full memory index — EVERY active non-constitution memory by title with a
+        // stable [M{n}] handle, id-ascending, no stage filter (the pitfall is present
+        // too now). Bodies are NOT shown — they're read on demand via loop_read_memory.
+        assert!(t.contains("# Memory index"));
+        assert!(t.contains("[M1] (decision · proposed) Token store"));
+        assert!(t.contains("[M2] (pitfall · proposed) Flaky test"));
         assert!(
-            !t.contains("auth_test is order-dependent"),
-            "pitfall is not in the design memory matrix"
+            !t.contains("Use the existing keyring abstraction."),
+            "memory bodies are read on demand, never shown in the index"
         );
+        assert!(!t.contains("auth_test is order-dependent"));
         // ③ issue full text.
         assert!(t.contains("Add login"));
         assert!(t.contains("Users must be able to authenticate."));
@@ -1041,7 +1100,7 @@ mod tests {
             .collect();
         for expected in [
             "constitution",
-            "memory_matrix",
+            "memory_index",
             "issue",
             "requirements",
             "stage_instruction",
@@ -1049,6 +1108,11 @@ mod tests {
         ] {
             assert!(sections.contains(&expected), "manifest missing {expected}");
         }
+        // The memory_index manifest maps each handle to its id, id-ascending — the
+        // single source loop_read_memory resolves submitted [M{n}] handles against.
+        assert_eq!(out.manifest["memory_index"]["M1"], decision_id);
+        assert_eq!(out.manifest["memory_index"]["M2"], pitfall_id);
+        assert!(decision_id < pitfall_id, "handles follow id-ascending order");
     }
 
     #[tokio::test]
