@@ -3266,6 +3266,10 @@
       "pass": "已通過",
       "fail": "未通過",
       "undecided": "未決"
+    },
+    "dag": {
+      "running": "執行中",
+      "queued": "排隊中"
     }
   }
 }

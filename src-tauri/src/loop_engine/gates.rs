@@ -1997,6 +1997,7 @@ mod tests {
             coverage: Vec::new(),
             criterion_checks: Vec::new(),
             gate_decisions: Vec::new(),
+            live_iterations: Vec::new(),
         }
     }
 

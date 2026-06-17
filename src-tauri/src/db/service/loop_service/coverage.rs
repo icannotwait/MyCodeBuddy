@@ -47,7 +47,7 @@ pub async fn create_coverage(
 /// All coverage edges whose task artifact belongs to `issue_id`. Joined through
 /// the artifact's `issue_id` (coverage carries only `space_id`, not `issue_id`).
 pub async fn list_for_issue(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     issue_id: i32,
 ) -> Result<Vec<LoopCoverageRow>, DbError> {
     let task_ids: Vec<i32> = loop_artifact::Entity::find()

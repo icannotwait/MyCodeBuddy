@@ -3266,6 +3266,10 @@
       "pass": "Réussi",
       "fail": "Échoué",
       "undecided": "Indécis"
+    },
+    "dag": {
+      "running": "En cours",
+      "queued": "En file"
     }
   }
 }

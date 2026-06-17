@@ -3266,6 +3266,10 @@
       "pass": "Passed",
       "fail": "Failed",
       "undecided": "Undecided"
+    },
+    "dag": {
+      "running": "Running",
+      "queued": "Queued"
     }
   }
 }

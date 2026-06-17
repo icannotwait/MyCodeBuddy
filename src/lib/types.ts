@@ -671,6 +671,8 @@ export interface LoopDagView {
   coverage: LoopCoverageRow[]
   criterion_checks: LoopCriterionCheckRow[]
   gate_decisions: LoopGateDecisionRow[]
+  /** In-flight (queued|running) iterations — drives ghost nodes + stage rail. */
+  live_iterations: LoopIterationRow[]
 }
 
 export interface LoopIterationRow {

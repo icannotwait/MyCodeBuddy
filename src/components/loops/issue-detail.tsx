@@ -9,7 +9,6 @@ import {
   cancelLoopIssue,
   getLoopDag,
   getLoopIssue,
-  listLoopIterations,
   pauseLoopIssue,
   resumeLoopIssue,
   triggerLoopIssue,
@@ -31,10 +30,12 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable"
+import type { PendingNode } from "@/lib/loop-dag"
 import { DagGraph } from "@/components/loops/dag-graph"
 import { IssueSettingsPanel } from "@/components/loops/issue-settings-dialog"
 import { BoardView } from "@/components/loops/board-view"
 import { IterationList } from "@/components/loops/iteration-list"
+import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
 import { ArtifactList } from "@/components/loops/artifact-list"
 import {
   AlertDialog,
@@ -56,16 +57,14 @@ interface IssueDetailData {
   detail: LoopIssueDetail | null
   artifacts: LoopArtifactRow[]
   links: LoopLinkRow[]
-  iterations: LoopIterationRow[]
-  iterationsError: boolean
+  liveIterations: LoopIterationRow[]
 }
 
 const EMPTY_ISSUE_DETAIL: IssueDetailData = {
   detail: null,
   artifacts: [],
   links: [],
-  iterations: [],
-  iterationsError: false,
+  liveIterations: [],
 }
 
 export function IssueDetail({
@@ -83,6 +82,7 @@ export function IssueDetail({
   const tToasts = useTranslations("Loops.toasts")
 
   const { nav, openArtifact, openSettings, closeSettings } = useLoopNav()
+  const { openIteration } = useLoopOverlays()
   const settingsOpen = nav.settings
   const [actionBusy, setActionBusy] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
@@ -100,24 +100,15 @@ export function IssueDetail({
         getLoopDag(issueId),
       ])
       if (!detail) return EMPTY_ISSUE_DETAIL
-      // Iterations drive the "executing now" highlight (read-stage artifacts
-      // land done/pending, so status alone can't show a live node). Non-fatal:
-      // the graph still renders without the highlight, but a load failure is now
-      // surfaced (rather than silently swallowed) so the operator knows the
-      // iterations panel may be incomplete.
-      let iterations: LoopIterationRow[] = []
-      let iterationsError = false
-      try {
-        iterations = await listLoopIterations(detail.space_id, issueId)
-      } catch {
-        iterationsError = true
-      }
+      // In-flight iterations ride on the DAG view (single authoritative fetch):
+      // they drive the "executing now" highlight + the real-time ghost nodes and
+      // stage rail. Read-stage artifacts land done/pending, so status alone can't
+      // show a live node.
       return {
         detail,
         artifacts: dag.artifacts,
         links: dag.links,
-        iterations,
-        iterationsError,
+        liveIterations: dag.live_iterations,
       }
     },
     {
@@ -127,20 +118,45 @@ export function IssueDetail({
     }
   )
   const issue = data.detail
-  const { artifacts, links, iterations, iterationsError } = data
+  const { artifacts, links, liveIterations } = data
 
-  // Artifact ids with a live iteration: a target node for non-triage stages, or
-  // the issue root while triage runs (triage targets the whole issue).
+  // Namespaced executing keys (`artifact:{id}`) for nodes with a live iteration:
+  // the issue root while triage runs, and the target task while implement/review
+  // runs. Read / finalize / reflect stages are shown as ghost nodes (not by
+  // highlighting an input node), so they're deliberately excluded here.
   const executingIds = useMemo(() => {
-    const ids = new Set<number>()
+    const ids = new Set<string>()
     const root = artifacts.find((a) => a.kind === "issue")
-    for (const it of iterations) {
+    for (const it of liveIterations) {
       if (it.status !== "queued" && it.status !== "running") continue
-      if (it.target_artifact_id != null) ids.add(it.target_artifact_id)
-      else if (it.stage === "triage" && root) ids.add(root.id)
+      if (it.stage === "triage") {
+        if (root) ids.add(`artifact:${root.id}`)
+      } else if (it.stage === "implement" || it.stage === "review") {
+        if (it.target_artifact_id != null)
+          ids.add(`artifact:${it.target_artifact_id}`)
+      }
     }
     return ids
-  }, [iterations, artifacts])
+  }, [liveIterations, artifacts])
+
+  // Open a ghost's live iteration session in the shared viewer (the engine binds
+  // a conversation when it sends the briefing; queued ghosts have none yet, so
+  // the card stays inert until then). Issue context labels the viewer.
+  const onOpenIteration = useCallback(
+    (pending: PendingNode) => {
+      if (issue == null || pending.conversationId == null) return
+      openIteration({
+        conversationId: pending.conversationId,
+        issueContext: {
+          spaceId: issue.space_id,
+          issueId: issue.id,
+          issueSeq: issue.seq_no,
+          stage: pending.stage,
+        },
+      })
+    },
+    [openIteration, issue]
+  )
 
   // Run an engine action; the resulting `loop://changed` event refreshes the
   // view. `onOk` carries any success-only side effect (e.g. a toast).
@@ -299,10 +315,12 @@ export function IssueDetail({
               <DagGraph
                 artifacts={artifacts}
                 links={links}
+                liveIterations={liveIterations}
                 executingIds={executingIds}
                 onSelect={openArtifact}
+                onOpenIteration={onOpenIteration}
               />
-              {artifacts.length <= 1 && (
+              {artifacts.length <= 1 && liveIterations.length === 0 && (
                 <p className="mt-4 text-center text-xs text-muted-foreground">
                   {t("graphPlaceholder")}
                 </p>
@@ -312,7 +330,11 @@ export function IssueDetail({
               value="board"
               className="min-h-0 flex-1 overflow-auto p-5 data-[state=inactive]:hidden"
             >
-              <BoardView artifacts={artifacts} onSelect={openArtifact} />
+              <BoardView
+                artifacts={artifacts}
+                liveIterations={liveIterations}
+                onSelect={openArtifact}
+              />
             </TabsContent>
           </Tabs>
         </ResizablePanel>
@@ -334,11 +356,6 @@ export function IssueDetail({
               value="iterations"
               className="min-h-0 flex-1 overflow-y-auto px-5 py-2 data-[state=inactive]:hidden"
             >
-              {iterationsError && (
-                <p className="mb-1 text-xs text-amber-600">
-                  {t("iterationsError")}
-                </p>
-              )}
               <IterationList spaceId={issue.space_id} issueId={issue.id} />
             </TabsContent>
             <TabsContent

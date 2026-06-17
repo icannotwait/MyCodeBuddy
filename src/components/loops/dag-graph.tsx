@@ -3,10 +3,17 @@
 import { useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 
-import { buildDag, foldReviews, type DagCluster } from "@/lib/loop-dag"
+import {
+  buildDag,
+  foldReviews,
+  placeGhosts,
+  type DagCluster,
+  type PendingNode,
+} from "@/lib/loop-dag"
 import type {
   LoopArtifactRow,
   LoopArtifactStatus,
+  LoopIterationRow,
   LoopLinkRow,
   LoopReviewVerdict,
 } from "@/lib/types"
@@ -19,6 +26,7 @@ const COL_W = 208
 const NODE_W = 176
 const HEADER_H = 58
 const ROW_PITCH = HEADER_H + 18
+const GHOST_GAP = ROW_PITCH - HEADER_H // gap between a column's last real node and its ghost
 const PAD = 8
 const LANE_GAP = 22
 const REVIEW_H = 22
@@ -59,25 +67,36 @@ const clusterHeight = (c: DagCluster) =>
 export function DagGraph({
   artifacts,
   links,
+  liveIterations,
   executingIds,
   onSelect,
+  onOpenIteration,
 }: {
   artifacts: LoopArtifactRow[]
   links: LoopLinkRow[]
-  executingIds: Set<number>
+  /** queued|running iterations — drives ghost nodes for in-flight stages. */
+  liveIterations: LoopIterationRow[]
+  /** Namespaced executing keys (`artifact:{id}`) for nodes with a live iteration. */
+  executingIds: Set<string>
   onSelect: (artifactId: number) => void
+  /** Open a ghost's live iteration session (when it has a conversation). */
+  onOpenIteration?: (pending: PendingNode) => void
 }) {
   const tKind = useTranslations("Loops.artifactKind")
   const tStatus = useTranslations("Loops.artifactStatus")
   const tVerdict = useTranslations("Loops.reviewVerdict")
   const tDetail = useTranslations("Loops.issueDetail")
+  const tDag = useTranslations("Loops.dag")
 
   // Dead nodes (superseded / cancelled) are hidden by default so the graph shows
   // the live plan; the toggle reveals them (dimmed) for audit.
   const [showSuperseded, setShowSuperseded] = useState(false)
   const layout = useMemo(
-    () => buildDag(artifacts, links, { includeSuperseded: showSuperseded }),
-    [artifacts, links, showSuperseded]
+    () =>
+      buildDag(artifacts, links, liveIterations, {
+        includeSuperseded: showSuperseded,
+      }),
+    [artifacts, links, liveIterations, showSuperseded]
   )
 
   const geom = useMemo(() => {
@@ -116,6 +135,7 @@ export function DagGraph({
     const resultLayout = layout.result
       ? {
           artifact: layout.result.artifact,
+          col: layout.result.col,
           x: PAD + layout.result.col * COL_W,
           y: resultY,
         }
@@ -126,6 +146,7 @@ export function DagGraph({
     const reflectionLayout = layout.reflection
       ? {
           artifact: layout.reflection.artifact,
+          col: layout.reflection.col,
           x: PAD + layout.reflection.col * COL_W,
           y: resultY,
         }
@@ -153,16 +174,48 @@ export function DagGraph({
       })
     }
 
+    // Ghost nodes for in-flight read/finalize/reflect stages (no output artifact
+    // yet). They carry no edges (their output node doesn't exist), so they're not
+    // registered in `boxOf`. Stack each strictly BELOW its column's real-node
+    // bottom: real nodes use three y-systems (stage rows, packed lane bands,
+    // centered result/reflection), so we measure each column's actual pixel
+    // bottom here — the only layer that can — and let `placeGhosts` position
+    // beneath it. A column with no real node leaves no entry → ghost sits at PAD.
+    const columnBottom = new Map<number, number>()
+    const noteBottom = (col: number, bottom: number) =>
+      columnBottom.set(col, Math.max(columnBottom.get(col) ?? 0, bottom))
+    for (const s of stageLayout) noteBottom(s.node.col, s.y + HEADER_H)
+    for (const c of clusterLayout) noteBottom(c.cluster.col, c.y + c.height)
+    if (resultLayout) noteBottom(resultLayout.col, resultLayout.y + HEADER_H)
+    if (reflectionLayout)
+      noteBottom(reflectionLayout.col, reflectionLayout.y + HEADER_H)
+    const ghostY = placeGhosts(layout.pending, columnBottom, {
+      pad: PAD,
+      rowPitch: ROW_PITCH,
+      gap: GHOST_GAP,
+    })
+    const pendingLayout = layout.pending.map((p) => ({
+      pending: p,
+      x: PAD + p.col * COL_W,
+      y: ghostY.get(p.iterationId) ?? PAD,
+    }))
+
+    const pendingBottom = pendingLayout.reduce(
+      (m, p) => Math.max(m, p.y - PAD + HEADER_H),
+      0
+    )
     const contentHeight = Math.max(
       stageBandHeight,
       clusterBandHeight,
-      resultLayout || reflectionLayout ? HEADER_H : 0
+      resultLayout || reflectionLayout ? HEADER_H : 0,
+      pendingBottom
     )
     return {
       stageLayout,
       clusterLayout,
       resultLayout,
       reflectionLayout,
+      pendingLayout,
       boxOf,
       width: PAD * 2 + Math.max(layout.colCount - 1, 0) * COL_W + NODE_W,
       height: PAD * 2 + contentHeight,
@@ -173,7 +226,8 @@ export function DagGraph({
     geom.stageLayout.length === 0 &&
     geom.clusterLayout.length === 0 &&
     !geom.resultLayout &&
-    !geom.reflectionLayout
+    !geom.reflectionLayout &&
+    geom.pendingLayout.length === 0
   if (canvasEmpty && layout.supersededCount === 0) {
     return null
   }
@@ -232,7 +286,7 @@ export function DagGraph({
             artifact={node.artifact}
             x={x}
             y={y}
-            executing={executingIds.has(node.artifact.id)}
+            executing={executingIds.has(`artifact:${node.artifact.id}`)}
             dimmed={isDead(node.artifact.status)}
             kindLabel={tKind(node.artifact.kind)}
             statusLabel={tStatus(node.artifact.status)}
@@ -246,7 +300,9 @@ export function DagGraph({
             artifact={geom.resultLayout.artifact}
             x={geom.resultLayout.x}
             y={geom.resultLayout.y}
-            executing={executingIds.has(geom.resultLayout.artifact.id)}
+            executing={executingIds.has(
+              `artifact:${geom.resultLayout.artifact.id}`
+            )}
             dimmed={isDead(geom.resultLayout.artifact.status)}
             kindLabel={tKind(geom.resultLayout.artifact.kind)}
             statusLabel={tStatus(geom.resultLayout.artifact.status)}
@@ -260,7 +316,9 @@ export function DagGraph({
             artifact={geom.reflectionLayout.artifact}
             x={geom.reflectionLayout.x}
             y={geom.reflectionLayout.y}
-            executing={executingIds.has(geom.reflectionLayout.artifact.id)}
+            executing={executingIds.has(
+              `artifact:${geom.reflectionLayout.artifact.id}`
+            )}
             dimmed={isDead(geom.reflectionLayout.artifact.status)}
             kindLabel={tKind(geom.reflectionLayout.artifact.kind)}
             statusLabel={tStatus(geom.reflectionLayout.artifact.status)}
@@ -288,8 +346,68 @@ export function DagGraph({
             onSelect={onSelect}
           />
         ))}
+
+        {geom.pendingLayout.map(({ pending, x, y }) => (
+          <PendingCard
+            key={`pending:${pending.iterationId}`}
+            pending={pending}
+            x={x}
+            y={y}
+            kindLabel={tKind(pending.kind)}
+            statusLabel={
+              pending.status === "running" ? tDag("running") : tDag("queued")
+            }
+            onOpen={onOpenIteration}
+          />
+        ))}
       </div>
     </div>
+  )
+}
+
+/**
+ * Ghost card for an in-flight read/finalize/reflect stage whose output artifact
+ * doesn't exist yet (spec D2). Dashed + pulsing; clickable to its live iteration
+ * session when one is attached.
+ */
+function PendingCard({
+  pending,
+  x,
+  y,
+  kindLabel,
+  statusLabel,
+  onOpen,
+}: {
+  pending: PendingNode
+  x: number
+  y: number
+  kindLabel: string
+  statusLabel: string
+  onOpen?: (pending: PendingNode) => void
+}) {
+  const clickable = pending.conversationId != null && onOpen != null
+  return (
+    <button
+      type="button"
+      disabled={!clickable}
+      onClick={() => onOpen?.(pending)}
+      style={{ left: x, top: y, width: NODE_W, height: HEADER_H }}
+      aria-label={`${kindLabel}: ${statusLabel}`}
+      className={cn(
+        "absolute flex flex-col justify-center gap-1 rounded-lg border border-dashed bg-card/60 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        clickable ? "hover:bg-accent" : "cursor-default"
+      )}
+    >
+      <div className="flex items-center gap-1.5">
+        <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-500" />
+        <span className="text-[0.625rem] uppercase tracking-wide text-muted-foreground">
+          {kindLabel}
+        </span>
+      </div>
+      <span className="truncate text-sm font-medium text-muted-foreground">
+        {statusLabel}
+      </span>
+    </button>
   )
 }
 
@@ -385,7 +503,7 @@ function ClusterCard({
   y: number
   height: number
   dimmed: boolean
-  executingIds: Set<number>
+  executingIds: Set<string>
   kindLabel: string
   reviewKindLabel: string
   statusLabelOf: (s: LoopArtifactStatus) => string
@@ -395,7 +513,7 @@ function ClusterCard({
   onSelect: (artifactId: number) => void
 }) {
   const { task } = cluster
-  const taskExecuting = executingIds.has(task.id)
+  const taskExecuting = executingIds.has(`artifact:${task.id}`)
   const hasReviews = fold.latest.length > 0 || fold.olderCount > 0
   return (
     <div
@@ -434,7 +552,7 @@ function ClusterCard({
           style={{ paddingTop: REVIEW_PAD, paddingBottom: REVIEW_PAD }}
         >
           {fold.latest.map((review) => {
-            const executing = executingIds.has(review.id)
+            const executing = executingIds.has(`artifact:${review.id}`)
             // Row text keeps the artifact title so sibling reviews stay distinct;
             // the pass/fail outcome shows as a shape glyph (✓/✗) — not color alone
             // — and is named in the accessible label + tooltip.

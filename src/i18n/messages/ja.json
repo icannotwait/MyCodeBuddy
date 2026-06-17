@@ -3266,6 +3266,10 @@
       "pass": "合格",
       "fail": "不合格",
       "undecided": "未確定"
+    },
+    "dag": {
+      "running": "実行中",
+      "queued": "待機中"
     }
   }
 }

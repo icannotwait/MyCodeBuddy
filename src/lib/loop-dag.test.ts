@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest"
 
-import { buildDag, foldReviews, STAGE_COLUMNS } from "@/lib/loop-dag"
+import {
+  buildDag,
+  foldReviews,
+  placeGhosts,
+  STAGE_COLUMNS,
+  type PendingNode,
+} from "@/lib/loop-dag"
 import type {
   LoopArtifactKind,
   LoopArtifactRow,
@@ -239,6 +245,7 @@ describe("buildDag", () => {
     const layout = buildDag(
       [issue, design, live, old],
       [link(live.id, design.id), link(old.id, design.id)],
+      [],
       { includeSuperseded: true }
     )
 
@@ -268,7 +275,7 @@ describe("buildDag", () => {
     expect(def.supersededCount).toBe(1)
 
     // …revealed: it folds in (so the row can be dimmed by its own status).
-    const shown = buildDag([issue, task, liveReview, deadReview], links, {
+    const shown = buildDag([issue, task, liveReview, deadReview], links, [], {
       includeSuperseded: true,
     })
     expect(
@@ -294,5 +301,160 @@ describe("foldReviews", () => {
 
   it("returns empty for a task with no reviews", () => {
     expect(foldReviews([])).toEqual({ latest: [], olderCount: 0 })
+  })
+})
+
+import type { LoopIterationRow, LoopStage } from "@/lib/types"
+
+function iter(
+  stage: LoopStage,
+  extra: Partial<LoopIterationRow> = {}
+): LoopIterationRow {
+  return {
+    id: nextId++,
+    issue_id: 1,
+    issue_seq: 1,
+    stage,
+    target_artifact_id: null,
+    target_title: null,
+    conversation_id: null,
+    status: "running",
+    launched_by: "engine",
+    attempt: 0,
+    tokens_used: 0,
+    created_at: "2026-06-17T00:00:00Z",
+    started_at: "2026-06-17T00:00:00Z",
+    ended_at: null,
+    ...extra,
+  }
+}
+
+describe("buildDag pending (ghost) nodes", () => {
+  it("synthesizes a requirement ghost for an in-flight refine iteration", () => {
+    const issue = artifact("issue")
+    const reqCol = STAGE_COLUMNS.indexOf("requirement")
+    const { pending } = buildDag([issue], [], [iter("refine", { id: 700 })])
+
+    expect(pending).toHaveLength(1)
+    expect(pending[0]).toMatchObject({
+      iterationId: 700,
+      stage: "refine",
+      kind: "requirement",
+      col: reqCol,
+      status: "running",
+    })
+  })
+
+  it("suppresses a ghost once that iteration's artifact has landed (dedup by producer)", () => {
+    const issue = artifact("issue")
+    // The design this very iteration produced already exists (stale live snapshot).
+    const design = artifact("design", { produced_by_iteration_id: 42 })
+    const { pending } = buildDag(
+      [issue, design],
+      [],
+      [iter("design", { id: 42 })]
+    )
+    expect(pending).toHaveLength(0)
+  })
+
+  it("still shows a ghost for a rerun when only an OLD (other-iteration) artifact exists", () => {
+    const issue = artifact("issue")
+    // A superseded design from a *different* iteration must not swallow the rerun.
+    const old = artifact("design", {
+      status: "superseded",
+      produced_by_iteration_id: 1,
+    })
+    const { pending } = buildDag([issue, old], [], [iter("design", { id: 99 })])
+    expect(pending.map((p) => p.iterationId)).toEqual([99])
+    expect(pending[0].kind).toBe("design")
+  })
+
+  it("emits no ghost for triage / implement / review iterations", () => {
+    const issue = artifact("issue")
+    const task = artifact("task", { status: "in_progress" })
+    const { pending } = buildDag(
+      [issue, task],
+      [],
+      [
+        iter("triage"),
+        iter("implement", { target_artifact_id: task.id }),
+        iter("review", { target_artifact_id: task.id }),
+      ]
+    )
+    expect(pending).toHaveLength(0)
+  })
+
+  it("ignores terminal iterations and grows colCount to fit a ghost", () => {
+    const issue = artifact("issue")
+    const layout = buildDag(
+      [issue],
+      [],
+      [
+        iter("design", { id: 5 }),
+        iter("refine", { id: 6, status: "succeeded" }),
+      ]
+    )
+    expect(layout.pending.map((p) => p.iterationId)).toEqual([5])
+    // design ghost lands in the design column (index 2) → colCount covers it.
+    expect(layout.colCount).toBeGreaterThanOrEqual(
+      STAGE_COLUMNS.indexOf("design") + 1
+    )
+  })
+
+  it("orders ghosts that share a column with an incrementing row", () => {
+    const issue = artifact("issue")
+    // Two plan iterations both target the base task column (col == STAGE_COLUMNS
+    // length). buildDag is pure and doesn't enforce active-iteration uniqueness,
+    // so it must still order co-located ghosts deterministically.
+    const { pending } = buildDag(
+      [issue],
+      [],
+      [iter("plan", { id: 10 }), iter("plan", { id: 11 })]
+    )
+    expect(pending.map((p) => p.col)).toEqual([
+      STAGE_COLUMNS.length,
+      STAGE_COLUMNS.length,
+    ])
+    expect(pending.map((p) => p.row)).toEqual([0, 1])
+  })
+})
+
+describe("placeGhosts", () => {
+  const geom = { pad: 8, rowPitch: 76, gap: 18 }
+  const ghost = (
+    iterationId: number,
+    col: number,
+    row: number
+  ): PendingNode => ({
+    iterationId,
+    conversationId: null,
+    stage: "plan",
+    kind: "task",
+    col,
+    row,
+    status: "running",
+    startedAt: null,
+  })
+
+  it("stacks a ghost strictly below its column's measured real-node bottom", () => {
+    const y = placeGhosts([ghost(1, 3, 0)], new Map([[3, 300]]), geom)
+    // Below the column's pixel bottom + gap — never overlapping it, however tall
+    // the real nodes (review-fold clusters) measured.
+    expect(y.get(1)).toBe(300 + geom.gap)
+  })
+
+  it("places a ghost at the top pad when its column has no real nodes", () => {
+    const y = placeGhosts([ghost(1, 3, 0)], new Map(), geom)
+    expect(y.get(1)).toBe(geom.pad)
+  })
+
+  it("stacks multiple ghosts in one column by rowPitch", () => {
+    const y = placeGhosts(
+      [ghost(1, 3, 0), ghost(2, 3, 1)],
+      new Map([[3, 300]]),
+      geom
+    )
+    expect(y.get(1)).toBe(318)
+    expect(y.get(2)).toBe(318 + geom.rowPitch)
   })
 })

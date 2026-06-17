@@ -166,7 +166,7 @@ pub async fn count_fail(
 }
 
 pub async fn list_for_issue(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     issue_id: i32,
 ) -> Result<Vec<LoopGateDecisionRow>, DbError> {
     Ok(loop_gate_decision::Entity::find()

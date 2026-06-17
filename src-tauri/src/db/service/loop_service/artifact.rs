@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus, ReviewVerdict};
@@ -223,8 +223,18 @@ pub async fn list_dag(
     conn: &sea_orm::DatabaseConnection,
     issue_id: i32,
 ) -> Result<LoopDagView, DbError> {
+    // Read the whole view inside one transaction so every slice — artifacts,
+    // links, coverage, checks, gate decisions, and in-flight iterations — is a
+    // single consistent snapshot. Without it, an iteration settling mid-read
+    // could be captured as NEITHER a ghost (already gone from the live set) nor
+    // its landed artifact (read before it appeared), making the node blink out of
+    // the DAG/board for one poll. The frontend dedups the "both present" overlap
+    // (ghost vs. landed artifact) by `produced_by_iteration_id`, so a snapshot
+    // that errs toward showing both is safe; one that shows neither is not.
+    let txn = conn.begin().await?;
+
     let issue_seq = loop_issue::Entity::find_by_id(issue_id)
-        .one(conn)
+        .one(&txn)
         .await?
         .map(|i| i.seq_no)
         .unwrap_or(0);
@@ -232,7 +242,7 @@ pub async fn list_dag(
     let artifact_models = loop_artifact::Entity::find()
         .filter(loop_artifact::Column::IssueId.eq(issue_id))
         .order_by_asc(loop_artifact::Column::Id)
-        .all(conn)
+        .all(&txn)
         .await?;
     let artifact_ids: Vec<i32> = artifact_models.iter().map(|m| m.id).collect();
     let artifacts = artifact_models
@@ -246,16 +256,19 @@ pub async fn list_dag(
     } else {
         loop_link::Entity::find()
             .filter(loop_link::Column::FromArtifactId.is_in(artifact_ids))
-            .all(conn)
+            .all(&txn)
             .await?
             .into_iter()
             .map(to_link_row)
             .collect()
     };
 
-    let coverage = super::coverage::list_for_issue(conn, issue_id).await?;
-    let criterion_checks = super::criterion_check::list_for_issue(conn, issue_id).await?;
-    let gate_decisions = super::gate_decision::list_for_issue(conn, issue_id).await?;
+    let coverage = super::coverage::list_for_issue(&txn, issue_id).await?;
+    let criterion_checks = super::criterion_check::list_for_issue(&txn, issue_id).await?;
+    let gate_decisions = super::gate_decision::list_for_issue(&txn, issue_id).await?;
+    let live_iterations = super::iteration::list_live_for_issue(&txn, issue_id).await?;
+
+    txn.commit().await?;
 
     Ok(LoopDagView {
         artifacts,
@@ -263,6 +276,7 @@ pub async fn list_dag(
         coverage,
         criterion_checks,
         gate_decisions,
+        live_iterations,
     })
 }
 

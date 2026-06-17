@@ -3266,6 +3266,10 @@
       "pass": "통과",
       "fail": "실패",
       "undecided": "미결정"
+    },
+    "dag": {
+      "running": "실행 중",
+      "queued": "대기 중"
     }
   }
 }

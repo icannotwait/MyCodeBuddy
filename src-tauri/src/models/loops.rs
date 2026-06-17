@@ -347,6 +347,10 @@ pub struct LoopDagView {
     pub criterion_checks: Vec<LoopCriterionCheckRow>,
     /// Immutable gate decisions across this issue (task review + integration).
     pub gate_decisions: Vec<LoopGateDecisionRow>,
+    /// In-flight (`queued`|`running`) iterations — drives real-time ghost nodes +
+    /// the stage rail (spec D1). Output artifacts don't exist yet for these, so
+    /// they're carried alongside the landed DAG, not as artifacts.
+    pub live_iterations: Vec<LoopIterationRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]

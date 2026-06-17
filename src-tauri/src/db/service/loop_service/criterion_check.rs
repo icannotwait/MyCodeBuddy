@@ -56,7 +56,7 @@ pub async fn create_check(
 /// matrix (checks carry only `space_id`, so the issue is resolved via the scope
 /// artifact).
 pub async fn list_for_issue(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     issue_id: i32,
 ) -> Result<Vec<LoopCriterionCheckRow>, DbError> {
     let art_ids: Vec<i32> = loop_artifact::Entity::find()
