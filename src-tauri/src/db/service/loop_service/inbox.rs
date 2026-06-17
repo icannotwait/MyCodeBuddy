@@ -92,6 +92,15 @@ pub async fn list_inbox(
         .collect())
 }
 
+/// Fetch a single inbox item by id — used by the command layer to guard a
+/// dismiss to informational cards before marking it handled.
+pub async fn get_inbox(
+    conn: &sea_orm::DatabaseConnection,
+    id: i32,
+) -> Result<Option<loop_inbox_item::Model>, DbError> {
+    Ok(loop_inbox_item::Entity::find_by_id(id).one(conn).await?)
+}
+
 pub async fn handle_inbox(
     conn: &sea_orm::DatabaseConnection,
     id: i32,

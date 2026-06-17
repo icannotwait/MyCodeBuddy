@@ -3028,7 +3028,8 @@
       "design": "Design",
       "task": "Task",
       "review": "Review",
-      "result": "Result"
+      "result": "Result",
+      "reflection": "Reflection"
     },
     "criterionKind": {
       "acceptance": "Acceptance",
@@ -3095,7 +3096,11 @@
       "addBudgetTitle": "Add budget",
       "addBudgetPlaceholder": "Additional tokens",
       "submitAddBudget": "Add",
-      "openConversation": "Open conversation"
+      "openConversation": "Open conversation",
+      "kindReflectFailed": "Memory reflection skipped",
+      "reflectFailedDesc": "Memory consolidation for this issue didn't complete after repeated attempts. The issue is merged and unaffected; this notice is informational.",
+      "dismiss": "Dismiss",
+      "sectionNotices": "Notices"
     },
     "iteration": {
       "title": "Iteration session",
@@ -3150,7 +3155,8 @@
       "plan": "Plan",
       "implement": "Implement",
       "review": "Review",
-      "finalize": "Finalize"
+      "finalize": "Finalize",
+      "reflect": "Reflect"
     },
     "iterationStatus": {
       "queued": "Queued",
@@ -3165,7 +3171,9 @@
       "constraint": "Constraint",
       "decision": "Decision",
       "preference": "Preference",
-      "pitfall": "Pitfall"
+      "pitfall": "Pitfall",
+      "episodic": "Episodic",
+      "procedural": "Procedural"
     },
     "trustTier": {
       "human": "Human",
@@ -3208,7 +3216,10 @@
       "summary": "Summary",
       "superseded": "Superseded",
       "supersededSection": "Superseded ({count})",
-      "empty": "No memory yet."
+      "empty": "No memory yet.",
+      "layerSemantic": "Semantic",
+      "layerEpisodic": "Episodic",
+      "layerProcedural": "Procedural"
     },
     "config": {
       "tabAgents": "Agents",

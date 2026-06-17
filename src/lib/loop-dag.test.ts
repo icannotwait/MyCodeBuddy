@@ -137,6 +137,34 @@ describe("buildDag", () => {
     expect(res?.col).toBe(4)
   })
 
+  it("places the reflection node one column past result and keeps its edge", () => {
+    const issue = artifact("issue")
+    const task = artifact("task")
+    const result = artifact("result")
+    const reflection = artifact("reflection")
+    // Canonical derives_from: tail = reflection (derived), head = result (source).
+    const layout = buildDag(
+      [issue, task, result, reflection],
+      [link(reflection.id, result.id)]
+    )
+
+    expect(layout.result?.col).toBe(4) // task col 3 → result col 4
+    expect(layout.reflection?.artifact.id).toBe(reflection.id)
+    expect(layout.reflection?.col).toBe(5) // one past result
+    expect(layout.colCount).toBe(6)
+    const edge = layout.edges.find(
+      (e) => e.from === reflection.id && e.to === result.id
+    )
+    expect(edge).toBeDefined() // both endpoints present → edge kept
+  })
+
+  it("yields a null reflection when the issue has no reflection artifact", () => {
+    const issue = artifact("issue")
+    const result = artifact("result")
+    const layout = buildDag([issue, result], [])
+    expect(layout.reflection).toBeNull()
+  })
+
   it("marks skips_to edges dashed and derivation edges solid", () => {
     const issue = artifact("issue")
     const task = artifact("task", { status: "pending" })

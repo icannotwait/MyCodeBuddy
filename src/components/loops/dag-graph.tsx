@@ -121,6 +121,16 @@ export function DagGraph({
         }
       : null
 
+    // The post-merge reflection node sits one column past `result`, vertically
+    // centered the same way (mirrors the result node render).
+    const reflectionLayout = layout.reflection
+      ? {
+          artifact: layout.reflection.artifact,
+          x: PAD + layout.reflection.col * COL_W,
+          y: resultY,
+        }
+      : null
+
     // Edge endpoints connect to each artifact's header rect (top of a cluster).
     const boxOf = new Map<number, { x: number; y: number }>()
     for (const s of stageLayout)
@@ -134,16 +144,25 @@ export function DagGraph({
         y: resultLayout.y,
       })
     }
+    // Register the reflection node so its derives_from→result edge resolves both
+    // endpoints (otherwise the edge would render detached or be dropped).
+    if (reflectionLayout) {
+      boxOf.set(reflectionLayout.artifact.id, {
+        x: reflectionLayout.x,
+        y: reflectionLayout.y,
+      })
+    }
 
     const contentHeight = Math.max(
       stageBandHeight,
       clusterBandHeight,
-      resultLayout ? HEADER_H : 0
+      resultLayout || reflectionLayout ? HEADER_H : 0
     )
     return {
       stageLayout,
       clusterLayout,
       resultLayout,
+      reflectionLayout,
       boxOf,
       width: PAD * 2 + Math.max(layout.colCount - 1, 0) * COL_W + NODE_W,
       height: PAD * 2 + contentHeight,
@@ -153,7 +172,8 @@ export function DagGraph({
   const canvasEmpty =
     geom.stageLayout.length === 0 &&
     geom.clusterLayout.length === 0 &&
-    !geom.resultLayout
+    !geom.resultLayout &&
+    !geom.reflectionLayout
   if (canvasEmpty && layout.supersededCount === 0) {
     return null
   }
@@ -230,6 +250,20 @@ export function DagGraph({
             dimmed={isDead(geom.resultLayout.artifact.status)}
             kindLabel={tKind(geom.resultLayout.artifact.kind)}
             statusLabel={tStatus(geom.resultLayout.artifact.status)}
+            executingLabel={tDetail("executingNow")}
+            onSelect={onSelect}
+          />
+        )}
+
+        {geom.reflectionLayout && (
+          <NodeCard
+            artifact={geom.reflectionLayout.artifact}
+            x={geom.reflectionLayout.x}
+            y={geom.reflectionLayout.y}
+            executing={executingIds.has(geom.reflectionLayout.artifact.id)}
+            dimmed={isDead(geom.reflectionLayout.artifact.status)}
+            kindLabel={tKind(geom.reflectionLayout.artifact.kind)}
+            statusLabel={tStatus(geom.reflectionLayout.artifact.status)}
             executingLabel={tDetail("executingNow")}
             onSelect={onSelect}
           />

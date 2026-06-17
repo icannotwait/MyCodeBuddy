@@ -31,6 +31,7 @@ export const SINGLE_STAGES: LoopStage[] = [
   "plan",
   "implement",
   "finalize",
+  "reflect",
 ]
 
 // Select can't carry an empty value, so these sentinels stand in for "no value".

@@ -3028,7 +3028,8 @@
       "design": "Conception",
       "task": "Tâche",
       "review": "Revue",
-      "result": "Résultat"
+      "result": "Résultat",
+      "reflection": "Réflexion"
     },
     "criterionKind": {
       "acceptance": "Acceptation",
@@ -3095,7 +3096,11 @@
       "addBudgetTitle": "Ajouter du budget",
       "addBudgetPlaceholder": "Jetons supplémentaires",
       "submitAddBudget": "Ajouter",
-      "openConversation": "Ouvrir la conversation"
+      "openConversation": "Ouvrir la conversation",
+      "kindReflectFailed": "Réflexion mémoire ignorée",
+      "reflectFailedDesc": "La consolidation de la mémoire pour ce ticket ne s'est pas terminée après plusieurs tentatives. Le ticket est fusionné et non affecté ; cet avis est purement informatif.",
+      "dismiss": "Ignorer",
+      "sectionNotices": "Avis"
     },
     "iteration": {
       "title": "Session d'itération",
@@ -3150,7 +3155,8 @@
       "plan": "Planification",
       "implement": "Implémenter",
       "review": "Relecture",
-      "finalize": "Finaliser"
+      "finalize": "Finaliser",
+      "reflect": "Réflexion"
     },
     "iterationStatus": {
       "queued": "En file",
@@ -3165,7 +3171,9 @@
       "constraint": "Contrainte",
       "decision": "Décision",
       "preference": "Préférence",
-      "pitfall": "Piège"
+      "pitfall": "Piège",
+      "episodic": "Épisodique",
+      "procedural": "Procédurale"
     },
     "trustTier": {
       "human": "Humain",
@@ -3208,7 +3216,10 @@
       "summary": "Résumé",
       "superseded": "Remplacé",
       "supersededSection": "Remplacées ({count})",
-      "empty": "Aucune mémoire pour le moment."
+      "empty": "Aucune mémoire pour le moment.",
+      "layerSemantic": "Sémantique",
+      "layerEpisodic": "Épisodique",
+      "layerProcedural": "Procédurale"
     },
     "config": {
       "tabAgents": "Agents",

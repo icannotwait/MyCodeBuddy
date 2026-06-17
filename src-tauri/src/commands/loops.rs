@@ -496,6 +496,36 @@ pub async fn list_loop_inbox_core(
     Ok(inbox::list_inbox(conn, space_id, status).await?)
 }
 
+/// Dismiss an informational inbox card (the reflect-exhausted notice, §4.4/D11):
+/// mark it handled so it leaves the pending pane. Blocking cards (approval /
+/// blocked / budget) are NOT dismissible here — they clear only via their gate
+/// action — so a non-informational kind is rejected (the UI only offers Dismiss
+/// on the informational card). Emits a `loop://changed` so other clients converge.
+pub async fn dismiss_loop_inbox_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    let item = inbox::get_inbox(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found(format!("inbox item {id}")))?;
+    if item.kind != InboxKind::ReflectionFailed {
+        return Err(AppCommandError::invalid_input(
+            "only informational inbox cards can be dismissed",
+        ));
+    }
+    inbox::handle_inbox(conn, id, serde_json::json!({ "action": "dismissed" })).await?;
+    emit_loop_changed(
+        emitter,
+        item.space_id,
+        Some(item.issue_id),
+        "issue",
+        item.issue_id,
+        "reflect_dismissed",
+    );
+    Ok(())
+}
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 
 pub async fn list_loop_memory_core(
@@ -856,6 +886,16 @@ pub async fn list_loop_inbox(
     status: Option<InboxStatus>,
 ) -> Result<Vec<LoopInboxItemRow>, AppCommandError> {
     list_loop_inbox_core(&db.conn, space_id, status).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn dismiss_loop_inbox(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    dismiss_loop_inbox_core(&db.conn, &EventEmitter::Tauri(app), id).await
 }
 
 #[cfg(feature = "tauri-runtime")]

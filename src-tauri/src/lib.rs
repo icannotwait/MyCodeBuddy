@@ -1063,6 +1063,7 @@ mod tauri_app {
                 loops_commands::list_loop_iterations,
                 loops_commands::list_loop_validations,
                 loops_commands::list_loop_inbox,
+                loops_commands::dismiss_loop_inbox,
                 loops_commands::list_loop_memory,
                 loops_commands::create_loop_memory,
                 loops_commands::update_loop_memory,

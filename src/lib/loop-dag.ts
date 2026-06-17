@@ -62,6 +62,9 @@ export interface DagLayout {
   clusters: DagCluster[]
   /** The single result node + its trailing column, or null before finalize. */
   result: { artifact: LoopArtifactRow; col: number } | null
+  /** The post-merge reflection node + its column (one right of `result`), or
+   *  null until memory consolidation produces it. */
+  reflection: { artifact: LoopArtifactRow; col: number } | null
   /** Edges with both endpoints present, excluding any that touch a folded review. */
   edges: DagEdge[]
   /** Highest occupied column index + 1 (width driver); 0 when empty. */
@@ -224,6 +227,18 @@ export function buildDag(
     ? { artifact: resultArtifact, col: maxTaskCol + 1 }
     : null
 
+  // --- Reflection closes the trace one column past `result` (post-merge). ---
+  // Its derives_from edge (from = reflection, to = result) is kept by the edge
+  // filter below since both endpoints are present.
+  const reflectionArtifact =
+    visible.find((a) => a.kind === "reflection") ?? null
+  const reflection = reflectionArtifact
+    ? {
+        artifact: reflectionArtifact,
+        col: (result ? result.col : maxTaskCol) + 1,
+      }
+    : null
+
   // --- Edges: drop dangling + any touching a folded review (containment says it). ---
   const present = new Set(visible.map((a) => a.id))
   const edges: DagEdge[] = links
@@ -246,11 +261,13 @@ export function buildDag(
   for (const n of stageNodes) maxCol = Math.max(maxCol, n.col)
   for (const c of clusters) maxCol = Math.max(maxCol, c.col)
   if (result) maxCol = Math.max(maxCol, result.col)
+  if (reflection) maxCol = Math.max(maxCol, reflection.col)
 
   return {
     stageNodes,
     clusters,
     result,
+    reflection,
     edges,
     colCount: maxCol + 1,
     laneCount: clusters.length

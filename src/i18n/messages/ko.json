@@ -3028,7 +3028,8 @@
       "design": "설계",
       "task": "작업",
       "review": "검토",
-      "result": "결과"
+      "result": "결과",
+      "reflection": "회고"
     },
     "criterionKind": {
       "acceptance": "인수",
@@ -3095,7 +3096,11 @@
       "addBudgetTitle": "예산 추가",
       "addBudgetPlaceholder": "추가 토큰 수",
       "submitAddBudget": "추가",
-      "openConversation": "대화 열기"
+      "openConversation": "대화 열기",
+      "kindReflectFailed": "메모리 회고 건너뜀",
+      "reflectFailedDesc": "이 이슈의 메모리 통합이 여러 번 시도했지만 완료되지 않았습니다. 이슈는 병합되었으며 영향을 받지 않습니다. 이 알림은 정보 제공용입니다.",
+      "dismiss": "닫기",
+      "sectionNotices": "알림"
     },
     "iteration": {
       "title": "이터레이션 세션",
@@ -3150,7 +3155,8 @@
       "plan": "계획",
       "implement": "구현",
       "review": "검토",
-      "finalize": "마무리"
+      "finalize": "마무리",
+      "reflect": "회고"
     },
     "iterationStatus": {
       "queued": "대기 중",
@@ -3165,7 +3171,9 @@
       "constraint": "제약",
       "decision": "결정",
       "preference": "선호",
-      "pitfall": "함정"
+      "pitfall": "함정",
+      "episodic": "에피소드",
+      "procedural": "절차"
     },
     "trustTier": {
       "human": "사람",
@@ -3208,7 +3216,10 @@
       "summary": "요약",
       "superseded": "대체됨",
       "supersededSection": "대체됨 ({count})",
-      "empty": "아직 메모리가 없습니다."
+      "empty": "아직 메모리가 없습니다.",
+      "layerSemantic": "의미",
+      "layerEpisodic": "에피소드",
+      "layerProcedural": "절차"
     },
     "config": {
       "tabAgents": "에이전트",

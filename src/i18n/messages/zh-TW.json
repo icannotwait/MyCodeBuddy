@@ -3028,7 +3028,8 @@
       "design": "設計",
       "task": "任務",
       "review": "評審",
-      "result": "結果"
+      "result": "結果",
+      "reflection": "反思"
     },
     "criterionKind": {
       "acceptance": "驗收",
@@ -3095,7 +3096,11 @@
       "addBudgetTitle": "追加預算",
       "addBudgetPlaceholder": "追加的 tokens 數",
       "submitAddBudget": "追加",
-      "openConversation": "開啟會話"
+      "openConversation": "開啟會話",
+      "kindReflectFailed": "記憶反思已略過",
+      "reflectFailedDesc": "此議題的記憶整合在多次嘗試後仍未完成。議題已合併且不受影響；此通知僅供參考。",
+      "dismiss": "忽略",
+      "sectionNotices": "通知"
     },
     "iteration": {
       "title": "疊代會話",
@@ -3150,7 +3155,8 @@
       "plan": "規劃",
       "implement": "實作",
       "review": "評審",
-      "finalize": "收尾"
+      "finalize": "收尾",
+      "reflect": "反思"
     },
     "iterationStatus": {
       "queued": "排隊中",
@@ -3165,7 +3171,9 @@
       "constraint": "約束",
       "decision": "決策",
       "preference": "偏好",
-      "pitfall": "陷阱"
+      "pitfall": "陷阱",
+      "episodic": "情景",
+      "procedural": "程序"
     },
     "trustTier": {
       "human": "人工",
@@ -3208,7 +3216,10 @@
       "summary": "摘要",
       "superseded": "已取代",
       "supersededSection": "已取代（{count}）",
-      "empty": "暫無記憶。"
+      "empty": "暫無記憶。",
+      "layerSemantic": "語意",
+      "layerEpisodic": "情景",
+      "layerProcedural": "程序"
     },
     "config": {
       "tabAgents": "智能體",

@@ -193,6 +193,12 @@ export function listLoopInbox(spaceId: number, status?: LoopInboxStatus) {
   })
 }
 
+/** Dismiss an informational inbox card (the reflect-exhausted notice) — marks it
+ *  handled so it leaves the pending pane. Blocking cards are not dismissible. */
+export function dismissLoopInbox(id: number) {
+  return getTransport().call<void>("dismiss_loop_inbox", { id })
+}
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 
 export function listLoopMemory(spaceId: number) {

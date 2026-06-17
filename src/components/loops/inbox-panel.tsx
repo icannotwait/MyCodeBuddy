@@ -10,6 +10,7 @@ import {
   approveLoopDesign,
   approveLoopMerge,
   cancelLoopIssue,
+  dismissLoopInbox,
   listLoopInbox,
   rejectLoopDesign,
   rejectLoopMerge,
@@ -33,6 +34,9 @@ type Gate = "design" | "merge"
 
 /** Kinds that block the loop and need a person to clear them — the first pane. */
 const BLOCKING_KINDS = new Set(["approval", "blocked", "budget_exhausted"])
+
+/** Informational, non-blocking notices a person can dismiss — the third pane. */
+const NOTICE_KINDS = new Set(["reflection_failed"])
 
 function payloadObj(p: unknown): Record<string, unknown> {
   return p && typeof p === "object" ? (p as Record<string, unknown>) : {}
@@ -128,18 +132,20 @@ export function InboxPanel({
 
   // Split into the two panes, deduping defensively (the backend's partial unique
   // index already forbids two pending cards with the same issue/kind/subject).
-  const { blocking, questions } = useMemo(() => {
+  const { blocking, questions, notices } = useMemo(() => {
     const seen = new Set<string>()
     const blocking: LoopInboxItemRow[] = []
     const questions: LoopInboxItemRow[] = []
+    const notices: LoopInboxItemRow[] = []
     for (const item of items) {
       const id = identity(item)
       if (seen.has(id)) continue
       seen.add(id)
       if (BLOCKING_KINDS.has(item.kind)) blocking.push(item)
+      else if (NOTICE_KINDS.has(item.kind)) notices.push(item)
       else questions.push(item)
     }
-    return { blocking, questions }
+    return { blocking, questions, notices }
   }, [items])
 
   const run = async (id: number, fn: () => Promise<void>) => {
@@ -216,6 +222,11 @@ export function InboxPanel({
         const q = questionText(item)
         return { label: t("kindQuestion"), desc: q || t("questionDesc") }
       }
+      case "reflection_failed":
+        return {
+          label: t("kindReflectFailed"),
+          desc: t("reflectFailedDesc"),
+        }
       default:
         return { label: item.kind, desc: "" }
     }
@@ -310,6 +321,19 @@ export function InboxPanel({
             {t("openConversation")}
           </Button>
         ) : null
+      case "reflection_failed":
+        return (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7"
+            disabled={busy}
+            onClick={() => void run(item.id, () => dismissLoopInbox(item.id))}
+          >
+            {spin}
+            {t("dismiss")}
+          </Button>
+        )
       default:
         return null
     }
@@ -367,6 +391,7 @@ export function InboxPanel({
           <div className="space-y-5">
             {renderSection(t("sectionBlocking"), blocking)}
             {renderSection(t("sectionQuestions"), questions)}
+            {notices.length > 0 && renderSection(t("sectionNotices"), notices)}
           </div>
         )}
       </div>

@@ -422,6 +422,7 @@ export type LoopStage =
   | "implement"
   | "review"
   | "finalize"
+  | "reflect"
 export type LoopIterationStatus =
   | "queued"
   | "running"
@@ -436,6 +437,7 @@ export type LoopArtifactKind =
   | "task"
   | "review"
   | "result"
+  | "reflection"
 export type LoopArtifactStatus =
   | "pending"
   | "in_progress"
@@ -456,6 +458,7 @@ export type LoopInboxKind =
   | "blocked"
   | "budget_exhausted"
   | "question"
+  | "reflection_failed"
 export type LoopInboxStatus = "pending" | "handled"
 export type LoopMemoryKind =
   | "constitution"
@@ -463,6 +466,8 @@ export type LoopMemoryKind =
   | "decision"
   | "preference"
   | "pitfall"
+  | "episodic"
+  | "procedural"
 export type LoopMemoryStatus = "active" | "archived" | "superseded"
 export type LoopTrustTier = "human" | "distilled" | "proposed"
 
@@ -502,6 +507,7 @@ export interface StageAgents {
   plan?: AgentSpec
   implement?: AgentSpec
   finalize?: AgentSpec
+  reflect?: AgentSpec
 }
 
 export interface IssueConfig {

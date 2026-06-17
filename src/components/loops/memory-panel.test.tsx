@@ -151,6 +151,23 @@ describe("MemoryPanel", () => {
     )
   })
 
+  it("groups live memories by CoALA layer", async () => {
+    listLoopMemory.mockResolvedValue([
+      mem({ id: 1, kind: "decision", title: "Sem note" }),
+      mem({ id: 2, kind: "episodic", title: "Epi note" }),
+      mem({ id: 3, kind: "procedural", title: "Proc note" }),
+    ])
+    render(<MemoryPanel spaceId={1} />)
+    await screen.findByText("Sem note")
+    // One subheading per non-empty layer (the mock t echoes its key).
+    expect(screen.getByText("layerSemantic")).toBeInTheDocument()
+    expect(screen.getByText("layerEpisodic")).toBeInTheDocument()
+    expect(screen.getByText("layerProcedural")).toBeInTheDocument()
+    // The reflect-authored kinds render in their layers.
+    expect(screen.getByText("Epi note")).toBeInTheDocument()
+    expect(screen.getByText("Proc note")).toBeInTheDocument()
+  })
+
   it("folds superseded entries read-only behind a toggle", async () => {
     listLoopMemory.mockResolvedValue([
       mem({ id: 1, title: "Live one" }),

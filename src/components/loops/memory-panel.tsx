@@ -43,12 +43,37 @@ import {
 } from "@/components/ui/dialog"
 import { MessageResponse } from "@/components/ai-elements/message"
 
+// The human-create dropdown stays the five semantic kinds; episodic/procedural
+// are reflect-authored only (D9).
 const MEMORY_KINDS: LoopMemoryKind[] = [
   "constitution",
   "constraint",
   "decision",
   "preference",
   "pitfall",
+]
+
+/** CoALA layer each memory kind belongs to — the live list groups by this. */
+const LAYER_OF: Record<LoopMemoryKind, "semantic" | "episodic" | "procedural"> =
+  {
+    constitution: "semantic",
+    constraint: "semantic",
+    decision: "semantic",
+    preference: "semantic",
+    pitfall: "semantic",
+    episodic: "episodic",
+    procedural: "procedural",
+  }
+
+const LAYERS: Array<
+  [
+    "semantic" | "episodic" | "procedural",
+    "layerSemantic" | "layerEpisodic" | "layerProcedural",
+  ]
+> = [
+  ["semantic", "layerSemantic"],
+  ["episodic", "layerEpisodic"],
+  ["procedural", "layerProcedural"],
 ]
 
 /**
@@ -246,10 +271,21 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
             {t("empty")}
           </p>
         ) : (
-          <div className="space-y-2">
-            <ul className="space-y-2">
-              {live.map((m) => renderMemory(m, true))}
-            </ul>
+          <div className="space-y-3">
+            {LAYERS.map(([layer, labelKey]) => {
+              const rows = live.filter((m) => LAYER_OF[m.kind] === layer)
+              if (rows.length === 0) return null
+              return (
+                <div key={layer} className="space-y-2">
+                  <h3 className="px-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {t(labelKey)}
+                  </h3>
+                  <ul className="space-y-2">
+                    {rows.map((m) => renderMemory(m, true))}
+                  </ul>
+                </div>
+              )
+            })}
             {superseded.length > 0 && (
               <div className="space-y-2">
                 <button

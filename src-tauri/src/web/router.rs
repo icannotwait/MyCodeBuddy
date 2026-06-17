@@ -105,6 +105,10 @@ pub fn build_router(
             post(handlers::loops::list_loop_validations),
         )
         .route("/list_loop_inbox", post(handlers::loops::list_loop_inbox))
+        .route(
+            "/dismiss_loop_inbox",
+            post(handlers::loops::dismiss_loop_inbox),
+        )
         .route("/list_loop_memory", post(handlers::loops::list_loop_memory))
         .route("/create_loop_memory", post(handlers::loops::create_loop_memory))
         .route("/update_loop_memory", post(handlers::loops::update_loop_memory))

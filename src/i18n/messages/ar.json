@@ -3028,7 +3028,8 @@
       "design": "تصميم",
       "task": "مهمة",
       "review": "مراجعة",
-      "result": "نتيجة"
+      "result": "نتيجة",
+      "reflection": "تأمل"
     },
     "criterionKind": {
       "acceptance": "قبول",
@@ -3095,7 +3096,11 @@
       "addBudgetTitle": "إضافة ميزانية",
       "addBudgetPlaceholder": "رموز إضافية",
       "submitAddBudget": "إضافة",
-      "openConversation": "فتح المحادثة"
+      "openConversation": "فتح المحادثة",
+      "kindReflectFailed": "تم تخطّي تأمل الذاكرة",
+      "reflectFailedDesc": "لم يكتمل توحيد الذاكرة لهذه المسألة بعد محاولات متكررة. المسألة مدمجة وغير متأثرة؛ هذا الإشعار للعلم فقط.",
+      "dismiss": "تجاهل",
+      "sectionNotices": "إشعارات"
     },
     "iteration": {
       "title": "جلسة التكرار",
@@ -3150,7 +3155,8 @@
       "plan": "التخطيط",
       "implement": "التنفيذ",
       "review": "المراجعة",
-      "finalize": "الإنهاء"
+      "finalize": "الإنهاء",
+      "reflect": "تأمل"
     },
     "iterationStatus": {
       "queued": "في الانتظار",
@@ -3165,7 +3171,9 @@
       "constraint": "قيد",
       "decision": "قرار",
       "preference": "تفضيل",
-      "pitfall": "مأزق"
+      "pitfall": "مأزق",
+      "episodic": "حدثية",
+      "procedural": "إجرائية"
     },
     "trustTier": {
       "human": "بشري",
@@ -3208,7 +3216,10 @@
       "summary": "ملخّص",
       "superseded": "مُستبدَل",
       "supersededSection": "مُستبدَلة ({count})",
-      "empty": "لا توجد ذاكرة بعد."
+      "empty": "لا توجد ذاكرة بعد.",
+      "layerSemantic": "دلالية",
+      "layerEpisodic": "حدثية",
+      "layerProcedural": "إجرائية"
     },
     "config": {
       "tabAgents": "الوكلاء",

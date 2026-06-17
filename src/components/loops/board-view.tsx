@@ -14,6 +14,7 @@ const COLUMNS: LoopArtifactKind[] = [
   "task",
   "review",
   "result",
+  "reflection",
 ]
 
 /**

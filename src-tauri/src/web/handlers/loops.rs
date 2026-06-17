@@ -376,6 +376,14 @@ pub async fn list_loop_inbox(
     ))
 }
 
+pub async fn dismiss_loop_inbox(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::dismiss_loop_inbox_core(&state.db.conn, &state.emitter, p.id).await?;
+    Ok(Json(()))
+}
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 
 pub async fn list_loop_memory(

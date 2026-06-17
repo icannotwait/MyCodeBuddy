@@ -48,6 +48,7 @@ const STAGE_SUBTABS: LoopStage[] = [
   "implement",
   "review",
   "finalize",
+  "reflect",
 ]
 
 /**
