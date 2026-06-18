@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "실행 중",
       "queued": "대기 중",
-      "attention": "{count, plural, other {# 건 처리 필요}}"
+      "attention": "{count, plural, other {# 건 처리 필요}}",
+      "connector": "{count, plural, other {링크 #개}}",
+      "connectorHidden": "{count, plural, other {# 개 숨김}}",
+      "unmappedNodes": "{count, plural, other {인식할 수 없는 노드 #개}}"
     },
     "stageRail": {
       "statusDone": "완료",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "건너뜀",
       "statusPending": "대기 중",
       "runningCount": "{n}개 실행 중"
+    },
+    "phase": {
+      "issue": "이슈",
+      "requirement": "요구사항",
+      "design": "설계",
+      "implement": "구현",
+      "result": "결과",
+      "reflect": "회고"
+    },
+    "phaseState": {
+      "blocked": "차단됨",
+      "awaiting_approval": "승인 대기",
+      "active": "진행 중",
+      "pending": "대기 중",
+      "done": "완료",
+      "empty": "비어 있음"
     }
   }
 }

@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "実行中",
       "queued": "待機中",
-      "attention": "{count, plural, other {# 件の要対応}}"
+      "attention": "{count, plural, other {# 件の要対応}}",
+      "connector": "{count, plural, other {# 件のリンク}}",
+      "connectorHidden": "{count, plural, other {# 件は非表示}}",
+      "unmappedNodes": "{count, plural, other {# 件の認識できないノード}}"
     },
     "stageRail": {
       "statusDone": "完了",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "スキップ",
       "statusPending": "保留中",
       "runningCount": "{n} 件実行中"
+    },
+    "phase": {
+      "issue": "課題",
+      "requirement": "要件",
+      "design": "設計",
+      "implement": "実装",
+      "result": "結果",
+      "reflect": "振り返り"
+    },
+    "phaseState": {
+      "blocked": "ブロック中",
+      "awaiting_approval": "承認待ち",
+      "active": "実行中",
+      "pending": "保留中",
+      "done": "完了",
+      "empty": "なし"
     }
   }
 }

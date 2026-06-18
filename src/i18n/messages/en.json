@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "Running",
       "queued": "Queued",
-      "attention": "{count, plural, one {# item needs you} other {# items need you}}"
+      "attention": "{count, plural, one {# item needs you} other {# items need you}}",
+      "connector": "{count, plural, one {# link} other {# links}}",
+      "connectorHidden": "{count, plural, one {# hidden} other {# hidden}}",
+      "unmappedNodes": "{count, plural, one {# unrecognized node} other {# unrecognized nodes}}"
     },
     "stageRail": {
       "statusDone": "Done",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "Skipped",
       "statusPending": "Pending",
       "runningCount": "{n} running"
+    },
+    "phase": {
+      "issue": "Issue",
+      "requirement": "Requirement",
+      "design": "Design",
+      "implement": "Implement",
+      "result": "Result",
+      "reflect": "Reflect"
+    },
+    "phaseState": {
+      "blocked": "Blocked",
+      "awaiting_approval": "Awaiting approval",
+      "active": "Active",
+      "pending": "Pending",
+      "done": "Done",
+      "empty": "Empty"
     }
   }
 }

@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "執行中",
       "queued": "排隊中",
-      "attention": "{count, plural, other {# 項待處理}}"
+      "attention": "{count, plural, other {# 項待處理}}",
+      "connector": "{count, plural, other {# 條連結}}",
+      "connectorHidden": "{count, plural, other {# 條已隱藏}}",
+      "unmappedNodes": "{count, plural, other {# 個無法識別的節點}}"
     },
     "stageRail": {
       "statusDone": "已完成",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "已略過",
       "statusPending": "待處理",
       "runningCount": "{n} 個執行中"
+    },
+    "phase": {
+      "issue": "議題",
+      "requirement": "需求",
+      "design": "設計",
+      "implement": "實作",
+      "result": "結果",
+      "reflect": "反思"
+    },
+    "phaseState": {
+      "blocked": "受阻",
+      "awaiting_approval": "待審批",
+      "active": "進行中",
+      "pending": "待處理",
+      "done": "完成",
+      "empty": "空"
     }
   }
 }

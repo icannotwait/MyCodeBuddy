@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "قيد التشغيل",
       "queued": "في قائمة الانتظار",
-      "attention": "{count, plural, other {# عنصرًا بحاجة إليك}}"
+      "attention": "{count, plural, other {# عنصرًا بحاجة إليك}}",
+      "connector": "{count, plural, other {# رابط}}",
+      "connectorHidden": "{count, plural, other {# مخفي}}",
+      "unmappedNodes": "{count, plural, other {# عقدة غير معروفة}}"
     },
     "stageRail": {
       "statusDone": "تم",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "تم التخطّي",
       "statusPending": "قيد الانتظار",
       "runningCount": "{n} قيد التشغيل"
+    },
+    "phase": {
+      "issue": "مسألة",
+      "requirement": "متطلب",
+      "design": "تصميم",
+      "implement": "التنفيذ",
+      "result": "نتيجة",
+      "reflect": "تأمل"
+    },
+    "phaseState": {
+      "blocked": "محظور",
+      "awaiting_approval": "بانتظار الموافقة",
+      "active": "نشط",
+      "pending": "قيد الانتظار",
+      "done": "مكتمل",
+      "empty": "فارغ"
     }
   }
 }

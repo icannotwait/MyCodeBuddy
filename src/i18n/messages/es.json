@@ -3312,7 +3312,10 @@
     "dag": {
       "running": "En curso",
       "queued": "En cola",
-      "attention": "{count, plural, one {# elemento te necesita} other {# elementos te necesitan}}"
+      "attention": "{count, plural, one {# elemento te necesita} other {# elementos te necesitan}}",
+      "connector": "{count, plural, one {# vínculo} other {# vínculos}}",
+      "connectorHidden": "{count, plural, one {# oculto} other {# ocultos}}",
+      "unmappedNodes": "{count, plural, one {# nodo no reconocido} other {# nodos no reconocidos}}"
     },
     "stageRail": {
       "statusDone": "Hecho",
@@ -3321,6 +3324,22 @@
       "statusSkipped": "Omitido",
       "statusPending": "Pendiente",
       "runningCount": "{n} en curso"
+    },
+    "phase": {
+      "issue": "Problema",
+      "requirement": "Requisito",
+      "design": "Diseño",
+      "implement": "Implementar",
+      "result": "Resultado",
+      "reflect": "Reflexión"
+    },
+    "phaseState": {
+      "blocked": "Bloqueado",
+      "awaiting_approval": "Esperando aprobación",
+      "active": "Activo",
+      "pending": "Pendiente",
+      "done": "Completado",
+      "empty": "Vacío"
     }
   }
 }
