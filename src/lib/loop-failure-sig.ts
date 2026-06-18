@@ -27,6 +27,7 @@ export type FailureSigKey =
   | "noIntegrationCriteria"
   | "integrationGap"
   | "designRejected"
+  | "oscillation"
 
 export interface HumanFailure {
   /** Cause family — a short grouping label (used for tests / future grouping). */
@@ -57,6 +58,13 @@ export function humanizeFailureSig(
   const p = payloadObj(item.payload)
   const sig = str(p.failure_sig)
   const reason = str(p.reason)
+
+  // D14: an oscillation card is a deterministic-failure escalation. Its message
+  // takes precedence over the underlying `failure_sig` it carries (the repeated
+  // cause), because the actionable point is "retry won't help — use an exit".
+  if (reason === "oscillation") {
+    return { family: "oscillation", key: "oscillation" }
+  }
 
   // The failure_sig (what actually failed) is more informative than the breaker
   // reason (why we stopped, e.g. max_attempts), so it wins when both are present.

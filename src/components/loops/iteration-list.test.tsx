@@ -63,6 +63,7 @@ function artifact(over: Partial<LoopArtifactRow>): LoopArtifactRow {
     origin: "agent",
     produced_by_iteration_id: 1,
     verdict: null,
+    contribution_kind: "delta",
     attempt: 0,
     sort: 0,
     updated_at: "2026-06-14T00:00:00Z",

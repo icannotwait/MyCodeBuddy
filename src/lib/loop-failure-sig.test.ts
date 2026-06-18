@@ -44,6 +44,20 @@ describe("humanizeFailureSig", () => {
     ).toEqual({ family: "emptyDiff", key: "emptyDiff" })
   })
 
+  it("oscillation reason wins over the underlying failure_sig it carries (D14)", () => {
+    // An oscillation card carries the repeated cause's sig, but its escalation
+    // message must take precedence.
+    expect(
+      humanizeFailureSig(
+        card({
+          reason: "oscillation",
+          failure_sig: "validation_failed:9f3a",
+          count: 2,
+        })
+      )
+    ).toEqual({ family: "oscillation", key: "oscillation" })
+  })
+
   it("falls back to reason when there is no failure_sig", () => {
     expect(
       humanizeFailureSig(card({ reason: "stalled", stage: "implement" }))

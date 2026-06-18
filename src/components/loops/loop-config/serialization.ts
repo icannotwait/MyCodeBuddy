@@ -76,6 +76,7 @@ export interface LoopConfigFormState {
    *  `ReviewPassRule` union in {@link formStateToConfig}. */
   reviewPassRule: string
   maxAttempts: string
+  oscillationLimit: string
   autoMerge: boolean
   forceRoute: string
   iterationTimeoutSecs: string
@@ -93,9 +94,13 @@ function parsePositiveOrNull(s: string): number | null {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null
 }
 
-/** A bounded integer field with a fallback when blank or unparseable. */
+/** A bounded integer field with a fallback when blank or unparseable. A blank
+ *  field means "unspecified" → the fallback, NOT 0 (note `Number("")` is 0, which
+ *  would otherwise let a cleared field silently mean zero). */
 function parseCount(s: string, min: number, fallback: number): number {
-  const n = Number(s.trim())
+  const trimmed = s.trim()
+  if (trimmed === "") return fallback
+  const n = Number(trimmed)
   return Number.isFinite(n) ? Math.max(min, Math.floor(n)) : fallback
 }
 
@@ -139,6 +144,7 @@ export function configToFormState(c: IssueConfig): LoopConfigFormState {
     ),
     reviewPassRule: c.review_pass_rule || "unanimous",
     maxAttempts: String(c.max_attempts ?? 0),
+    oscillationLimit: String(c.oscillation_limit ?? 2),
     autoMerge: !!c.auto_merge,
     forceRoute: route && route !== "undecided" ? route : ROUTE_AUTO,
     iterationTimeoutSecs: intField(c.iteration_timeout_secs),
@@ -178,6 +184,10 @@ export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
     review_pass_rule:
       form.reviewPassRule === "majority" ? "majority" : "unanimous",
     max_attempts: parseCount(form.maxAttempts, 0, 0),
+    // min 0 so "0 = off" survives (the backend breaker is disabled at 0); blank /
+    // unparseable falls back to the default of 2, never to 0 (which would silently
+    // disable the breaker the user never asked to turn off).
+    oscillation_limit: parseCount(form.oscillationLimit, 0, 2),
     auto_merge: form.autoMerge,
     force_route:
       form.forceRoute === ROUTE_AUTO

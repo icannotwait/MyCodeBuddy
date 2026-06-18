@@ -252,6 +252,21 @@ export function LoopConfigForm({
               </p>
             </div>
             <div className="space-y-1.5">
+              <Label htmlFor="oscillation-limit">{t("oscillationLimit")}</Label>
+              <Input
+                id="oscillation-limit"
+                type="number"
+                min={0}
+                value={value.oscillationLimit}
+                onChange={(e) => patch({ oscillationLimit: e.target.value })}
+                className="h-8"
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("oscillationLimitHint")}
+              </p>
+            </div>
+            <div className="space-y-1.5">
               <Label htmlFor="force-route">{t("forceRoute")}</Label>
               <div id="force-route">
                 <Select

@@ -17,6 +17,8 @@ const {
   retryLoopIssue,
   addLoopIssueBudget,
   cancelLoopIssue,
+  forceCompleteLoopTask,
+  overrideLoopOscillation,
   focusArtifact,
   gotoIssue,
   openIteration,
@@ -31,6 +33,8 @@ const {
   retryLoopIssue: vi.fn(),
   addLoopIssueBudget: vi.fn(),
   cancelLoopIssue: vi.fn(),
+  forceCompleteLoopTask: vi.fn(),
+  overrideLoopOscillation: vi.fn(),
   focusArtifact: vi.fn(),
   gotoIssue: vi.fn(),
   openIteration: vi.fn(),
@@ -57,6 +61,8 @@ vi.mock("@/lib/loops-api", () => ({
   retryLoopIssue,
   addLoopIssueBudget,
   cancelLoopIssue,
+  forceCompleteLoopTask,
+  overrideLoopOscillation,
 }))
 
 function item(over: Partial<LoopInboxItemRow> = {}): LoopInboxItemRow {
@@ -153,6 +159,41 @@ describe("InboxPanel", () => {
     render(<InboxPanel spaceId={1} />)
     fireEvent.click(await screen.findByRole("button", { name: "stop" }))
     await waitFor(() => expect(cancelLoopIssue).toHaveBeenCalledWith(7))
+  })
+
+  it("offers force-complete on an ordinary empty-diff block (D15 primary path)", async () => {
+    listLoopInbox.mockResolvedValue([
+      blocked({
+        subject_artifact_id: 9,
+        payload: {
+          failure_sig: "empty_diff:implement",
+          reason: "max_attempts",
+        },
+      }),
+    ])
+    forceCompleteLoopTask.mockResolvedValue(undefined)
+    render(<InboxPanel spaceId={1} />)
+    // Retry stays the primary exit; force-complete is offered alongside it because
+    // the cause is an empty diff — reachable WITHOUT waiting for oscillation escalation.
+    expect(
+      await screen.findByRole("button", { name: "retry" })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "forceComplete" }))
+    await waitFor(() => expect(forceCompleteLoopTask).toHaveBeenCalledWith(9))
+  })
+
+  it("does not offer force-complete on a non-empty-diff block", async () => {
+    listLoopInbox.mockResolvedValue([
+      blocked({
+        subject_artifact_id: 9,
+        payload: { failure_sig: "validation_failed:x", reason: "max_attempts" },
+      }),
+    ])
+    render(<InboxPanel spaceId={1} />)
+    expect(
+      await screen.findByRole("button", { name: "retry" })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "forceComplete" })).toBeNull()
   })
 
   it("adds budget to a budget-exhausted issue", async () => {

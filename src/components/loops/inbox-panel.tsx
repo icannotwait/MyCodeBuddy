@@ -11,8 +11,10 @@ import {
   approveLoopMerge,
   cancelLoopIssue,
   dismissLoopInbox,
+  forceCompleteLoopTask,
   listLoopInbox,
   listLoopIterations,
+  overrideLoopOscillation,
   rejectLoopDesign,
   rejectLoopMerge,
   retryLoopIssue,
@@ -116,7 +118,7 @@ export function InboxPanel({
   const tToasts = useTranslations("Loops.toasts")
   const tCommon = useTranslations("Loops.common")
 
-  const { focusArtifact, gotoIssue } = useLoopNav()
+  const { focusArtifact, gotoIssue, openSettings } = useLoopNav()
   const { openIteration } = useLoopOverlays()
 
   const [busyId, setBusyId] = useState<number | null>(null)
@@ -296,7 +298,70 @@ export function InboxPanel({
             </Button>
           </>
         )
-      case "blocked":
+      case "blocked": {
+        const taskId = item.subject_artifact_id
+        const p =
+          item.payload && typeof item.payload === "object"
+            ? (item.payload as Record<string, unknown>)
+            : {}
+        // D15: force-complete accepts ONLY an empty-diff cause (the backend rejects a
+        // validation/infra cause). Offer it on ANY blocked card with that cause — the
+        // FIRST empty-diff block is an ordinary `no_progress` card, not just the
+        // escalated `oscillation:` card, so gating on oscillation alone made D15
+        // unreachable from the inbox for its primary case (Codex r2).
+        const canForceComplete =
+          taskId != null &&
+          typeof p.failure_sig === "string" &&
+          p.failure_sig.startsWith("empty_diff:implement")
+        // D17: an oscillation card is a deterministic-failure escalation — a plain
+        // retry would re-exclude the task, so offer targeted exits (force-complete the
+        // breaker, override it, open settings), not bare Retry.
+        if (item.subject_key.startsWith("oscillation:")) {
+          return (
+            <>
+              {canForceComplete && (
+                <Button
+                  size="sm"
+                  className="h-7"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(item.id, () => forceCompleteLoopTask(taskId))
+                  }
+                >
+                  {spin}
+                  {t("forceComplete")}
+                </Button>
+              )}
+              {taskId != null && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(item.id, () => overrideLoopOscillation(taskId))
+                  }
+                >
+                  {t("overrideRetry")}
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7"
+                onClick={() => {
+                  gotoIssue(spaceId, item.issue_id)
+                  openSettings()
+                }}
+              >
+                {t("openSettings")}
+              </Button>
+              {stop}
+            </>
+          )
+        }
+        // Ordinary blocked card: Retry is the primary exit; force-complete is offered
+        // as a secondary action when the cause is an empty diff (D15's primary path).
         return (
           <>
             <Button
@@ -310,9 +375,23 @@ export function InboxPanel({
               {spin}
               {t("retry")}
             </Button>
+            {canForceComplete && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7"
+                disabled={busy}
+                onClick={() =>
+                  void run(item.id, () => forceCompleteLoopTask(taskId))
+                }
+              >
+                {t("forceComplete")}
+              </Button>
+            )}
             {stop}
           </>
         )
+      }
       case "budget_exhausted":
         return (
           <>

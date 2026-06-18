@@ -123,6 +123,18 @@ export function retryLoopIssue(id: number) {
   return getTransport().call<void>("retry_loop_issue", { id })
 }
 
+/** D15: force-complete a blocked, empty-diff task as a no-op so a wedged issue
+ * can finish. `taskId` is the task artifact id. */
+export function forceCompleteLoopTask(taskId: number) {
+  return getTransport().call<void>("force_complete_loop_task", { taskId })
+}
+
+/** D17: override an oscillation breaker — clear the epoch and re-arm the task for
+ * a fresh attempt budget. `taskId` is the task artifact id. */
+export function overrideLoopOscillation(taskId: number) {
+  return getTransport().call<void>("override_loop_oscillation", { taskId })
+}
+
 /** Add `additional` tokens to a budget-paused issue's budget and resume it. */
 export function addLoopIssueBudget(id: number, additional: number) {
   return getTransport().call<void>("add_loop_issue_budget", { id, additional })

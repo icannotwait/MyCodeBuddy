@@ -30,6 +30,7 @@ function artifact(
     origin: "agent",
     produced_by_iteration_id: null,
     verdict: null,
+    contribution_kind: "delta",
     attempt: 0,
     sort: 0,
     updated_at: "2026-06-13T00:00:00Z",

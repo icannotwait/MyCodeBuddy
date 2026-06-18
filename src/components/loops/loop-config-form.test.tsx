@@ -143,6 +143,7 @@ describe("loop-config-form helpers", () => {
       validation_commands: ["pnpm test"],
       review_pass_rule: "majority",
       max_attempts: 6,
+      oscillation_limit: 3,
       auto_merge: true,
       force_route: "full",
       iteration_timeout_secs: 120,
@@ -160,12 +161,40 @@ describe("loop-config-form helpers", () => {
     expect(formStateToConfig(configToFormState(cfg))).toEqual(cfg)
   })
 
+  it("preserves an oscillation limit of 0 (off) and defaults a blank one to 2", () => {
+    const base: IssueConfig = {
+      agents: { default: { agent: "claude_code", config_values: {} } },
+      validation_commands: [],
+      review_pass_rule: "unanimous",
+      max_attempts: 6,
+      oscillation_limit: 2,
+      auto_merge: false,
+      force_route: null,
+      iteration_timeout_secs: null,
+      token_budget_per_turn: null,
+      stall_alert_secs: null,
+      reviewers: [],
+    }
+    // 0 = off must survive the round-trip (the backend breaker is disabled at 0);
+    // it must NOT be clamped back up to the default of 2.
+    expect(
+      formStateToConfig(configToFormState({ ...base, oscillation_limit: 0 }))
+        .oscillation_limit
+    ).toBe(0)
+    // A blank field (user cleared it) falls back to the default of 2, not 0 —
+    // a blank value must never silently disable the breaker.
+    const form = configToFormState(base)
+    form.oscillationLimit = ""
+    expect(formStateToConfig(form).oscillation_limit).toBe(2)
+  })
+
   it("writes a concrete per-stage spec and omits inherited stages", () => {
     const form = configToFormState({
       agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
       review_pass_rule: "unanimous",
       max_attempts: 6,
+      oscillation_limit: 2,
       auto_merge: false,
       force_route: null,
       iteration_timeout_secs: null,
@@ -200,6 +229,7 @@ describe("LoopConfigForm", () => {
       validation_commands: [],
       review_pass_rule: "unanimous",
       max_attempts: 6,
+      oscillation_limit: 2,
       auto_merge: false,
       force_route: null,
       iteration_timeout_secs: null,
@@ -247,6 +277,7 @@ describe("LoopConfigForm", () => {
       validation_commands: [],
       review_pass_rule: "unanimous",
       max_attempts: 6,
+      oscillation_limit: 2,
       auto_merge: false,
       force_route: null,
       iteration_timeout_secs: null,
@@ -278,6 +309,7 @@ describe("LoopConfigForm", () => {
       validation_commands: [],
       review_pass_rule: "unanimous",
       max_attempts: 6,
+      oscillation_limit: 2,
       auto_merge: false,
       force_route: null,
       iteration_timeout_secs: null,

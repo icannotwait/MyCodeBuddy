@@ -520,6 +520,9 @@ export interface IssueConfig {
   reviewers: ReviewerEntry[]
   review_pass_rule: ReviewPassRule
   max_attempts: number
+  /** D14: consecutive same-signature blocked epochs before a task is promoted to
+   *  an oscillation card. 0 = off. */
+  oscillation_limit: number
   auto_merge: boolean
   force_route: LoopIssueRoute | null
   iteration_timeout_secs: number | null
@@ -578,6 +581,11 @@ export interface LoopIssueDetail extends LoopIssueRow {
   base_commit: string | null
 }
 
+/** D12: whether a Done task contributed a real diff or was an agent-declared
+ * no-op (already satisfied; no commit). Only meaningful for parallel fan-in
+ * participants; serial tasks always record `delta`. */
+export type ContributionKind = "delta" | "no_op"
+
 export interface LoopArtifactRow {
   id: number
   issue_id: number
@@ -589,6 +597,7 @@ export interface LoopArtifactRow {
   produced_by_iteration_id: number | null
   verdict: LoopReviewVerdict | null
   attempt: number
+  contribution_kind: ContributionKind
   sort: number
   updated_at: string
 }

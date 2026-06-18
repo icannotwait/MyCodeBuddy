@@ -45,6 +45,7 @@ function fullConfig(): IssueConfig {
     reviewers: [{ inherit: true }],
     review_pass_rule: "majority",
     max_attempts: 6,
+    oscillation_limit: 2,
     auto_merge: true,
     force_route: "full",
     iteration_timeout_secs: 120,

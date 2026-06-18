@@ -432,6 +432,12 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
               <>
                 <Badge variant="outline">{tKind(detail.kind)}</Badge>
                 <Badge variant="secondary">{tStatus(detail.status)}</Badge>
+                {detail.kind === "task" &&
+                  detail.contribution_kind === "no_op" && (
+                    <Badge variant="outline" className="text-muted-foreground">
+                      {t("noOpContribution")}
+                    </Badge>
+                  )}
                 {detail.kind === "review" && detail.verdict && (
                   <Badge
                     variant="outline"

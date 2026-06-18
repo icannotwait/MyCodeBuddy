@@ -15,6 +15,7 @@ export function defaultIssueConfig(): IssueConfig {
     reviewers: [{ inherit: true }],
     review_pass_rule: "unanimous",
     max_attempts: 6,
+    oscillation_limit: 2,
     auto_merge: false,
     force_route: null,
     iteration_timeout_secs: null,
