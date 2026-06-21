@@ -28,8 +28,8 @@ use crate::acp::InternalEventBus;
 use crate::commands::acp::{build_session_runtime_env, verify_agent_installed};
 use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
 use crate::commands::folders::{
-    emit_folder_upsert, get_folder_core, git_checkout, git_worktree_add, open_worktree_folder_core,
-    resolve_worktree_folder_core,
+    emit_folder_upsert, get_folder_core, git_checkout, git_list_branches, git_worktree_add,
+    open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::service::automation_service;
@@ -217,10 +217,16 @@ impl AutomationEngine {
         let run = automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
             .await
             .map_err(|e| e.to_string())?;
-        // RunStarted is emitted inside `launch` once the run is fully wired (its
-        // connection + conversation attached), so the broadcast carries the live
-        // "View conversation" link. A launch that fails before that point still
-        // surfaces via the RunSettled(failed) emit in the `Err` arm below.
+        // Broadcast the running row immediately so every client sees it the
+        // instant it exists — `launch` can take seconds (worktree add + agent
+        // spawn) before it re-emits RunStarted with the live "View conversation"
+        // link attached. The frontend refetches the whole run list on each event,
+        // so the double emit is idempotent. A launch that fails before the
+        // re-emit still surfaces via the RunSettled(failed) emit in the `Err` arm.
+        self.emit(AutomationChange::RunStarted {
+            automation_id,
+            run_id: run.id,
+        });
 
         match self.launch(&auto, run.id).await {
             Ok(()) => Ok(run.id),
@@ -329,9 +335,9 @@ impl AutomationEngine {
         )
         .await;
 
-        // The run row now carries its connection + conversation, so RunStarted
-        // here gives run history a running row whose "View conversation" link is
-        // live during the run (not only after settle).
+        // Re-emit now that the run carries its connection + conversation, so the
+        // running row's "View conversation" link goes live during the run (the
+        // early emit in `run_automation` already showed the row itself).
         self.emit(AutomationChange::RunStarted {
             automation_id: auto.id,
             run_id,
@@ -436,6 +442,25 @@ impl AutomationEngine {
                         worktree_folder_id: resolution.folder_id,
                     }),
                     None => {
+                        // A remote pick stores the stripped leaf name, and a bare
+                        // `git checkout <leaf>` silently prefers a same-named local
+                        // branch (possibly divergent) over the intended remote.
+                        // Refuse that ambiguity loudly rather than run the wrong
+                        // branch. With no local match the checkout below DWIMs a
+                        // unique remote into a tracking branch (and git raises its
+                        // own error when multiple remotes share the name).
+                        if auto.is_remote_branch {
+                            let locals = git_list_branches(root.path.clone())
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            if locals.iter().any(|b| b == &branch) {
+                                return Err(format!(
+                                    "automation targets remote branch '{branch}' but a local \
+                                     branch of that name exists — use a per-run worktree or \
+                                     remove the local branch"
+                                ));
+                            }
+                        }
                         git_checkout(root.path.clone(), branch)
                             .await
                             .map_err(|e| e.to_string())?;
@@ -671,8 +696,19 @@ impl AutomationEngine {
             let _ = self.manager.disconnect(&conn_id).await;
         }
 
-        if settled {
-            if let Ok(Some(run)) = run_by_id(&self.db.conn, run_id).await {
+        if let Ok(Some(run)) = run_by_id(&self.db.conn, run_id).await {
+            // Converge the produced conversation. The `manager.cancel` path above
+            // flips it when we owned a live connection; a run with no live worker
+            // (lost index / another process / the pre-reconcile window) would
+            // otherwise strand its conversation at InProgress in the sidebar.
+            if let Some(conv_id) = run.conversation_id {
+                if self.conversation_status(conv_id).await
+                    == Some(ConversationStatus::InProgress)
+                {
+                    self.cancel_conversation(conv_id).await;
+                }
+            }
+            if settled {
                 self.emit(AutomationChange::RunSettled {
                     automation_id: run.automation_id,
                     run_id,
