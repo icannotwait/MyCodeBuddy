@@ -103,6 +103,9 @@ import type {
   UpdateModelProviderResult,
   PluginCheckSummary,
   QuickMessage,
+  OfficecliInfo,
+  OfficecliSkill,
+  SkillSyncReport,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -662,6 +665,65 @@ export async function expertsReadContent(expertId: string): Promise<string> {
 
 export async function expertsOpenCentralDir(): Promise<string> {
   return getTransport().call("experts_open_central_dir")
+}
+
+// ─── Office tools ───
+
+export async function officecliDetect(): Promise<OfficecliInfo> {
+  return getTransport().call("officecli_detect")
+}
+
+export async function officecliInstall(): Promise<OfficecliInfo> {
+  return getTransport().call("officecli_install")
+}
+
+export async function officecliUninstall(): Promise<OfficecliInfo> {
+  return getTransport().call("officecli_uninstall")
+}
+
+export async function officecliListSkills(): Promise<OfficecliSkill[]> {
+  return getTransport().call("officecli_list_skills")
+}
+
+export async function officecliSyncSkills(): Promise<SkillSyncReport> {
+  return getTransport().call("officecli_sync_skills")
+}
+
+export async function officecliSkillLinkToAgent(params: {
+  skillId: string
+  agentType: AgentType
+}): Promise<ExpertInstallStatus> {
+  return getTransport().call("officecli_skill_link_to_agent", params)
+}
+
+export async function officecliSkillUnlinkFromAgent(params: {
+  skillId: string
+  agentType: AgentType
+}): Promise<void> {
+  return getTransport().call("officecli_skill_unlink_from_agent", params)
+}
+
+export async function officecliSkillGetInstallStatus(
+  skillId: string
+): Promise<ExpertInstallStatus[]> {
+  return getTransport().call("officecli_skill_get_install_status", { skillId })
+}
+
+export async function officecliSkillReadContent(
+  skillId: string
+): Promise<string> {
+  return getTransport().call("officecli_skill_read_content", { skillId })
+}
+
+/**
+ * Render an office file (.docx/.xlsx/.pptx) to self-contained HTML via the
+ * OfficeCLI backend, for the in-app preview. `path` is relative to `rootPath`.
+ */
+export async function officecliRenderHtml(
+  rootPath: string,
+  path: string
+): Promise<string> {
+  return getTransport().call("officecli_render_html", { rootPath, path })
 }
 
 export async function getSystemProxySettings(): Promise<SystemProxySettings> {

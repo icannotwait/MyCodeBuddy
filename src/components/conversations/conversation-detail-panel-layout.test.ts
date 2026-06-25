@@ -44,6 +44,9 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(welcomeBranch).toContain("<ChatInput")
     expect(welcomeBranch).toContain("overflow-x-hidden overflow-y-auto")
     expect(welcomeBranch).not.toContain("WelcomeBackdrop")
+    // The welcome input is flushed: the welcome column already supplies px-4, so
+    // the input must not double-pad (would make it narrower than the cards).
+    expect(welcomeBranch).toContain("flush")
   })
 
   it("does not render a decorative welcome backdrop", () => {
@@ -98,7 +101,10 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(conversationShellSource).toContain(
       'className="mx-auto w-full max-w-3xl"'
     )
-    expect(chatInputSource).toContain('className="px-4 pt-0 pb-1"')
+    // Ordinary (active) chat input keeps its own px-4 gutter to align with the
+    // sibling cards in conversation-shell; only the welcome input drops it via
+    // `flush` (the welcome column already provides the px-4).
+    expect(chatInputSource).toContain('cn("pt-0 pb-1", !flush && "px-4")')
     expect(chatInputSource).toContain('className="min-h-24 max-h-60"')
     expect(chatInputSource).not.toContain("containerClassName")
     expect(source).not.toContain("containerClassName")

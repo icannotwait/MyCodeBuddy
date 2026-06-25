@@ -1563,6 +1563,27 @@ export interface ExpertInstallStatus {
   copyMode: boolean
 }
 
+export interface OfficecliInfo {
+  installed: boolean
+  version: string | null
+  path: string | null
+}
+
+export interface OfficecliSkill {
+  id: string
+  category: string
+  icon: string
+  sortOrder: number
+  displayName: Record<string, string>
+  description: Record<string, string>
+  installedCentrally: boolean
+}
+
+export interface SkillSyncReport {
+  synced: number
+  errors: string[]
+}
+
 export interface SystemProxySettings {
   enabled: boolean
   proxy_url: string | null

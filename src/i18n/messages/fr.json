@@ -49,6 +49,7 @@
       "web_service": "Service Web",
       "model_providers": "Fournisseurs de Modèles",
       "experts": "Experts",
+      "office_tools": "Outils bureautiques",
       "quick_messages": "Messages rapides",
       "logs": "Journaux d'exécution"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "Réinitialiser le zoom",
       "htmlPreviewTitle": "Aperçu HTML",
       "htmlPreviewTrust": "Activer les scripts",
-      "htmlPreviewTrustHint": "Exécuter les scripts de ce fichier et autoriser l'accès réseau. À activer uniquement pour les fichiers de confiance."
+      "htmlPreviewTrustHint": "Exécuter les scripts de ce fichier et autoriser l'accès réseau. À activer uniquement pour les fichiers de confiance.",
+      "officePreviewTitle": "Aperçu du document Office",
+      "officeFullRender": "Rendu complet",
+      "officeFullRenderHint": "Affiche les animations Morph, la 3D et les formules (exécute les scripts de la diapositive)",
+      "officeNotInstalled": "OfficeCLI n'est pas installé",
+      "officeNotInstalledHint": "Installe OfficeCLI dans Paramètres → Outils Office pour prévisualiser les fichiers Word, Excel et PowerPoint.",
+      "officeOpenSettings": "Ouvrir les paramètres"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "Ouvrez un fichier ou un diff pour l'afficher automatiquement à côté de la conversation.",
           "quickMessages": "Ouvrez le bouton + à côté de la saisie et choisissez Messages rapides pour insérer un extrait enregistré (à gérer dans Paramètres → Messages rapides).",
           "experts": "Le bouton + propose un menu Compétences expertes — chargez en un clic des rôles comme Débogage ou Planification."
+        },
+        "quickActions": {
+          "excel": "Classeur Excel",
+          "excelDesc": "Tableaux, formules et graphiques",
+          "word": "Document Word",
+          "wordDesc": "Rapports, lettres et notes",
+          "ppt": "Présentation",
+          "pptDesc": "Diapositives au design professionnel",
+          "pitchDeck": "Pitch Deck",
+          "pitchDeckDesc": "Présentation de levée avec indicateurs",
+          "morph": "Animation Morph",
+          "morphDesc": "Transitions de diapositive cinématographiques",
+          "morph3d": "Morph 3D",
+          "morph3dDesc": "Modèles 3D avec mouvements de caméra",
+          "academic": "Article académique",
+          "academicDesc": "Recherche avec citations et structure",
+          "financial": "Modèle financier",
+          "financialDesc": "États, DCF et projections",
+          "dashboard": "Tableau de bord",
+          "dashboardDesc": "KPI et analyses à partir de vos données",
+          "prompts": {
+            "excel": "Crée un classeur Excel avec les exigences suivantes :\n\n[décris ici tes données, tableaux, formules et graphiques]",
+            "word": "Crée un document Word avec les exigences suivantes :\n\n[décris ici le contenu, la structure et la mise en forme du document]",
+            "ppt": "Crée une présentation PowerPoint avec les exigences suivantes :\n\n[décris ici tes diapositives, le contenu et le design]",
+            "pitchDeck": "Crée un pitch deck de levée de fonds avec les exigences suivantes :\n\n[décris ici ton entreprise, le tour de financement et les indicateurs clés]",
+            "morph": "Crée une présentation avec des animations de transition Morph :\n\n[décris ici le sujet de la présentation et les effets visuels souhaités]",
+            "morph3d": "Crée une présentation Morph 3D avec des modèles GLB et des mouvements de caméra :\n\n[décris ici ton sujet et le concept visuel en 3D]",
+            "academic": "Rédige un article académique dans Word avec les exigences suivantes :\n\n[décris ici ton sujet de recherche, la méthodologie et les principaux résultats]",
+            "financial": "Crée un modèle financier dans Excel avec les exigences suivantes :\n\n[décris ici tes états financiers, projections et analyses]",
+            "dashboard": "Crée un tableau de bord de données dans Excel avec les exigences suivantes :\n\n[décris ici ta source de données, les KPI et les graphiques]"
+          },
+          "tabs": {
+            "office": "Bureautique",
+            "coding": "Développement"
+          },
+          "coding": {
+            "brainstormingDesc": "Explorer intention et besoins avant de coder",
+            "debuggingDesc": "Trouver la cause racine avant de corriger",
+            "writingSkillsDesc": "Créer, modifier et vérifier des skills réutilisables"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "Échec de l'activation de l'expert",
       "disableFailed": "Échec de la désactivation de l'expert",
       "openFolderFailed": "Échec de l'ouverture du dossier"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Outils Office",
+    "description": "Gérez les compétences OfficeCLI pour créer des fichiers Excel, Word et PowerPoint. Installez OfficeCLI, synchronisez les compétences et activez-les par agent.",
+    "loadingContent": "Chargement du contenu…",
+    "emptySkills": "Aucune compétence disponible. Installez OfficeCLI et synchronisez les compétences.",
+    "emptySelection": "Sélectionnez une compétence pour voir son contenu et gérer l'activation.",
+    "emptySearch": "Aucune compétence correspondante.",
+    "searchPlaceholder": "Rechercher par nom, ID ou description",
+    "enableForAgents": "Activer pour les agents",
+    "noAgents": "Aucun agent ACP détecté.",
+    "installFirst": "Installez d'abord OfficeCLI pour activer les compétences.",
+    "syncFirst": "Synchronisez d'abord les compétences pour charger le contenu.",
+    "noContent": "Aucun contenu disponible.",
+    "copyModeWarning": "Copié (non lié). Resynchronisez pour obtenir la dernière version.",
+    "previewTitle": "Aperçu SKILL.md",
+    "detection": {
+      "installed": "Installé",
+      "notInstalled": "Non installé",
+      "installHint": "Installez OfficeCLI pour activer les compétences de génération de documents Office pour vos agents IA.",
+      "install": "Installer",
+      "uninstall": "Désinstaller",
+      "syncSkills": "Synchroniser les compétences"
+    },
+    "categories": {
+      "general": "Général",
+      "presentations": "Présentations",
+      "documents": "Documents",
+      "spreadsheets": "Tableurs"
+    },
+    "states": {
+      "not_linked": "Non activé",
+      "linked_to_codeg": "Activé",
+      "linked_elsewhere": "Bloqué — un autre lien existe",
+      "blocked_by_real_directory": "Bloqué — une compétence personnalisée occupe ce nom",
+      "broken": "Lien cassé"
+    },
+    "badges": {
+      "notSynced": "Non synchronisé"
+    },
+    "actions": {
+      "refresh": "Actualiser"
+    },
+    "toasts": {
+      "loadFailed": "Échec du chargement des détails de la compétence",
+      "enabled": "Compétence activée pour cet agent",
+      "disabled": "Compétence désactivée pour cet agent",
+      "enableFailed": "Échec de l'activation de la compétence",
+      "disableFailed": "Échec de la désactivation de la compétence",
+      "installSuccess": "OfficeCLI installé avec succès",
+      "installFailed": "Échec de l'installation d'OfficeCLI",
+      "uninstallSuccess": "OfficeCLI désinstallé",
+      "uninstallFailed": "Échec de la désinstallation d'OfficeCLI",
+      "syncSuccess": "{synced} compétences synchronisées",
+      "syncPartial": "{synced} synchronisées, {errors} échouées",
+      "syncFailed": "Échec de la synchronisation des compétences"
     }
   },
   "QuickMessagesSettings": {

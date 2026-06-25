@@ -49,6 +49,7 @@
       "web_service": "Web 服務",
       "model_providers": "模型供應商",
       "experts": "專家",
+      "office_tools": "辦公工具",
       "quick_messages": "快捷訊息",
       "logs": "執行日誌"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "重設縮放",
       "htmlPreviewTitle": "HTML 預覽",
       "htmlPreviewTrust": "執行指令碼",
-      "htmlPreviewTrustHint": "執行此檔案的指令碼並允許網路存取。僅對信任的檔案啟用。"
+      "htmlPreviewTrustHint": "執行此檔案的指令碼並允許網路存取。僅對信任的檔案啟用。",
+      "officePreviewTitle": "辦公文件預覽",
+      "officeFullRender": "完整渲染",
+      "officeFullRenderHint": "渲染 Morph 動畫、3D 與公式（會執行投影片自帶的指令碼）",
+      "officeNotInstalled": "未安裝 OfficeCLI",
+      "officeNotInstalledHint": "在 設定 → 辦公工具 中安裝 OfficeCLI，即可預覽 Word、Excel 與 PowerPoint 檔案。",
+      "officeOpenSettings": "開啟設定"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "開啟檔案或差異後，會自動與會話並排顯示",
           "quickMessages": "點輸入框旁的 + 按鈕選擇「快捷訊息」，可一鍵插入預存片段（在「設定 → 快捷訊息」中管理）",
           "experts": "透過 + 按鈕裡的「專家技能」可一鍵載入預設角色（除錯 / 規劃等）"
+        },
+        "quickActions": {
+          "excel": "Excel 活頁簿",
+          "excelDesc": "資料表、公式與圖表",
+          "word": "Word 文件",
+          "wordDesc": "報告、信函與備忘錄",
+          "ppt": "簡報",
+          "pptDesc": "專業設計的投影片",
+          "pitchDeck": "募資簡報",
+          "pitchDeckDesc": "含關鍵指標的募資簡報",
+          "morph": "Morph 動畫",
+          "morphDesc": "電影級投影片轉場",
+          "morph3d": "3D Morph",
+          "morph3dDesc": "3D 模型與鏡頭運動",
+          "academic": "學術論文",
+          "academicDesc": "含引用與結構的研究論文",
+          "financial": "財務模型",
+          "financialDesc": "報表、DCF 與預測",
+          "dashboard": "資料儀表板",
+          "dashboardDesc": "從資料產生 KPI 與分析",
+          "prompts": {
+            "excel": "建立一個 Excel 活頁簿，需求如下：\n\n[在此描述你的資料、表格、公式與圖表]",
+            "word": "建立一個 Word 文件，需求如下：\n\n[在此描述文件內容、結構與排版]",
+            "ppt": "建立一個 PowerPoint 簡報，需求如下：\n\n[在此描述投影片、內容與設計]",
+            "pitchDeck": "建立一個募資簡報，需求如下：\n\n[在此描述公司、募資輪次與關鍵指標]",
+            "morph": "建立一個帶 Morph 轉場動畫的簡報：\n\n[在此描述簡報主題與期望的視覺效果]",
+            "morph3d": "建立一個帶 GLB 模型與鏡頭運動的 3D Morph 簡報：\n\n[在此描述主題與 3D 視覺構想]",
+            "academic": "用 Word 撰寫一篇學術論文，需求如下：\n\n[在此描述研究主題、方法與主要發現]",
+            "financial": "用 Excel 建立一個財務模型，需求如下：\n\n[在此描述財務報表、預測與分析]",
+            "dashboard": "用 Excel 建立一個資料儀表板，需求如下：\n\n[在此描述資料來源、KPI 與圖表]"
+          },
+          "tabs": {
+            "office": "日常辦公",
+            "coding": "程式開發"
+          },
+          "coding": {
+            "brainstormingDesc": "動手前先梳理意圖與需求",
+            "debuggingDesc": "先定位根因再提出修復",
+            "writingSkillsDesc": "建立、編輯並驗證可重用技能"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "啟用專家失敗",
       "disableFailed": "停用專家失敗",
       "openFolderFailed": "開啟目錄失敗"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Office 工具",
+    "description": "管理 OfficeCLI 技能，用於建立 Excel、Word 和 PowerPoint 檔案。安裝 OfficeCLI，同步技能，並為每個智慧體啟用。",
+    "loadingContent": "載入內容中…",
+    "emptySkills": "暫無技能。請先安裝 OfficeCLI 並同步技能。",
+    "emptySelection": "選擇一個技能查看內容和管理啟用狀態。",
+    "emptySearch": "沒有匹配的技能。",
+    "searchPlaceholder": "按名稱、ID 或描述搜尋技能",
+    "enableForAgents": "為智慧體啟用",
+    "noAgents": "未偵測到 ACP 智慧體。",
+    "installFirst": "請先安裝 OfficeCLI 以啟用技能。",
+    "syncFirst": "請先同步技能以載入內容。",
+    "noContent": "暫無內容。",
+    "copyModeWarning": "已複製（非連結）。重新同步以取得最新版本。",
+    "previewTitle": "SKILL.md 預覽",
+    "detection": {
+      "installed": "已安裝",
+      "notInstalled": "未安裝",
+      "installHint": "安裝 OfficeCLI 以為 AI 智慧體啟用辦公文件生成技能。",
+      "install": "安裝",
+      "uninstall": "解除安裝",
+      "syncSkills": "同步技能"
+    },
+    "categories": {
+      "general": "通用",
+      "presentations": "簡報",
+      "documents": "文件",
+      "spreadsheets": "試算表"
+    },
+    "states": {
+      "not_linked": "未啟用",
+      "linked_to_codeg": "已啟用",
+      "linked_elsewhere": "已阻止——存在其他連結",
+      "blocked_by_real_directory": "已阻止——自訂技能佔用此名稱",
+      "broken": "連結已損壞"
+    },
+    "badges": {
+      "notSynced": "未同步"
+    },
+    "actions": {
+      "refresh": "重新整理"
+    },
+    "toasts": {
+      "loadFailed": "載入技能詳情失敗",
+      "enabled": "已為此智慧體啟用技能",
+      "disabled": "已為此智慧體停用技能",
+      "enableFailed": "啟用技能失敗",
+      "disableFailed": "停用技能失敗",
+      "installSuccess": "OfficeCLI 安裝成功",
+      "installFailed": "安裝 OfficeCLI 失敗",
+      "uninstallSuccess": "OfficeCLI 已解除安裝",
+      "uninstallFailed": "解除安裝 OfficeCLI 失敗",
+      "syncSuccess": "已成功同步 {synced} 個技能",
+      "syncPartial": "已同步 {synced} 個技能，{errors} 個失敗",
+      "syncFailed": "同步技能失敗"
     }
   },
   "QuickMessagesSettings": {

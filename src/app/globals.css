@@ -1132,6 +1132,44 @@
   }
 }
 
+/* Welcome-page quick actions: single-row seamless marquee. The motion is driven
+   by a JS requestAnimationFrame loop (see quick-actions.tsx) that sets the track
+   transform every frame — NOT a CSS animation. A CSS transform animation gets
+   composited, and on hover-pause WebKit reverts to the (slightly-behind)
+   main-thread clock, snapping the row backwards; setting the transform
+   explicitly each frame means pausing just stops updating, so it freezes in
+   place. CSS here only does the visuals + the reduced-motion fallback. */
+
+/* Both-edge fade so bars scroll in/out softly instead of clipping at a hard
+   border. Background-agnostic (masks the content itself, not an overlay). */
+.qa-marquee-viewport {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 1.5rem,
+    #000 calc(100% - 1.5rem),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 1.5rem,
+    #000 calc(100% - 1.5rem),
+    transparent
+  );
+}
+
+/* Reduced motion: the rAF loop bails, so drop the transform and turn the
+   viewport into a normal horizontal scroller with the duplicate copy hidden. */
+@media (prefers-reduced-motion: reduce) {
+  .qa-marquee-viewport {
+    overflow-x: auto;
+  }
+  .qa-marquee-track > [data-qa-clone] {
+    display: none;
+  }
+}
+
 .select-none {
   -webkit-user-select: none;
   -moz-user-select: none;

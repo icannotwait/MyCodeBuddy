@@ -49,6 +49,7 @@
       "web_service": "Web Service",
       "model_providers": "Model Providers",
       "experts": "Experts",
+      "office_tools": "Office Tools",
       "quick_messages": "Quick Messages",
       "logs": "Runtime Logs"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "Reset zoom",
       "htmlPreviewTitle": "HTML preview",
       "htmlPreviewTrust": "Enable scripts",
-      "htmlPreviewTrustHint": "Run this file's scripts and allow network access. Enable only for files you trust."
+      "htmlPreviewTrustHint": "Run this file's scripts and allow network access. Enable only for files you trust.",
+      "officePreviewTitle": "Office document preview",
+      "officeFullRender": "Full render",
+      "officeFullRenderHint": "Render Morph animations, 3D and math (runs the slide's own scripts)",
+      "officeNotInstalled": "OfficeCLI is not installed",
+      "officeNotInstalledHint": "Install OfficeCLI under Settings → Office Tools to preview Word, Excel, and PowerPoint files.",
+      "officeOpenSettings": "Open Settings"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "Open a file or diff to automatically show it alongside the conversation.",
           "quickMessages": "Open the + button next to the input and pick Quick Messages to insert a saved snippet (manage them under Settings → Quick Messages).",
           "experts": "The + button has an Expert Skills menu — preload roles like Debug or Planning with one click."
+        },
+        "quickActions": {
+          "excel": "Excel Workbook",
+          "excelDesc": "Data tables, formulas & charts",
+          "word": "Word Document",
+          "wordDesc": "Reports, letters & memos",
+          "ppt": "Presentation",
+          "pptDesc": "Slides with professional design",
+          "pitchDeck": "Pitch Deck",
+          "pitchDeckDesc": "Fundraising deck with key metrics",
+          "morph": "Morph Animation",
+          "morphDesc": "Cinematic slide transitions",
+          "morph3d": "3D Morph",
+          "morph3dDesc": "3D models with camera moves",
+          "academic": "Academic Paper",
+          "academicDesc": "Research with citations & structure",
+          "financial": "Financial Model",
+          "financialDesc": "Statements, DCF & projections",
+          "dashboard": "Data Dashboard",
+          "dashboardDesc": "KPIs & analytics from your data",
+          "prompts": {
+            "excel": "Create an Excel workbook with the following requirements:\n\n[describe your data, tables, formulas, and charts here]",
+            "word": "Create a Word document with the following requirements:\n\n[describe your document content, structure, and formatting here]",
+            "ppt": "Create a PowerPoint presentation with the following requirements:\n\n[describe your slides, content, and design here]",
+            "pitchDeck": "Create a fundraising pitch deck with the following requirements:\n\n[describe your company, funding round, and key metrics here]",
+            "morph": "Create a presentation with Morph transition animations:\n\n[describe your presentation topic and desired visual effects here]",
+            "morph3d": "Create a 3D Morph presentation with GLB models and camera moves:\n\n[describe your topic and 3D visual concept here]",
+            "academic": "Write an academic paper in Word with the following requirements:\n\n[describe your research topic, methodology, and key findings here]",
+            "financial": "Create a financial model in Excel with the following requirements:\n\n[describe your financial statements, projections, and analysis here]",
+            "dashboard": "Create a data dashboard in Excel with the following requirements:\n\n[describe your data source, KPIs, and charts here]"
+          },
+          "tabs": {
+            "office": "Office Work",
+            "coding": "Code Development"
+          },
+          "coding": {
+            "brainstormingDesc": "Explore intent & requirements before building",
+            "debuggingDesc": "Find the root cause before proposing fixes",
+            "writingSkillsDesc": "Create, edit & verify reusable skills"
+          }
         }
       },
       "agentSelector": {
@@ -2722,6 +2769,63 @@
       "enableFailed": "Failed to enable expert",
       "disableFailed": "Failed to disable expert",
       "openFolderFailed": "Failed to open folder"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Office Tools",
+    "description": "Manage OfficeCLI skills for creating Excel, Word, and PowerPoint files. Install OfficeCLI, sync skills, and enable them per agent.",
+    "loadingContent": "Loading content…",
+    "emptySkills": "No skills available. Install OfficeCLI and sync skills to get started.",
+    "emptySelection": "Select a skill to see its content and manage activation.",
+    "emptySearch": "No skills match the current search.",
+    "searchPlaceholder": "Search skills by name, id, or description",
+    "enableForAgents": "Enable for agents",
+    "noAgents": "No ACP agents detected.",
+    "installFirst": "Install OfficeCLI first to enable skills for agents.",
+    "syncFirst": "Sync skills first to load this skill's content.",
+    "noContent": "No content available.",
+    "copyModeWarning": "Copied (not linked). Re-sync to get the latest version.",
+    "previewTitle": "SKILL.md preview",
+    "detection": {
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "installHint": "Install OfficeCLI to enable office document generation skills for your AI agents.",
+      "install": "Install",
+      "uninstall": "Uninstall",
+      "syncSkills": "Sync Skills"
+    },
+    "categories": {
+      "general": "General",
+      "presentations": "Presentations",
+      "documents": "Documents",
+      "spreadsheets": "Spreadsheets"
+    },
+    "states": {
+      "not_linked": "Not enabled",
+      "linked_to_codeg": "Enabled",
+      "linked_elsewhere": "Blocked — another link exists",
+      "blocked_by_real_directory": "Blocked — a custom skill occupies this name",
+      "broken": "Broken link"
+    },
+    "badges": {
+      "notSynced": "Not synced"
+    },
+    "actions": {
+      "refresh": "Refresh"
+    },
+    "toasts": {
+      "loadFailed": "Failed to load skill details",
+      "enabled": "Skill enabled for this agent",
+      "disabled": "Skill disabled for this agent",
+      "enableFailed": "Failed to enable skill",
+      "disableFailed": "Failed to disable skill",
+      "installSuccess": "OfficeCLI installed successfully",
+      "installFailed": "Failed to install OfficeCLI",
+      "uninstallSuccess": "OfficeCLI uninstalled",
+      "uninstallFailed": "Failed to uninstall OfficeCLI",
+      "syncSuccess": "{synced} skills synced successfully",
+      "syncPartial": "{synced} skills synced, {errors} failed",
+      "syncFailed": "Failed to sync skills"
     }
   },
   "QuickMessagesSettings": {

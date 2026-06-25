@@ -11,6 +11,7 @@ import {
   Bot,
   BookOpenText,
   FileSpreadsheet,
+  FileStack,
   GitBranch,
   Globe,
   Keyboard,
@@ -46,6 +47,7 @@ interface SettingsNavItem {
     | "mcp"
     | "skills"
     | "experts"
+    | "office_tools"
     | "quick_messages"
     | "shortcuts"
     | "version_control"
@@ -81,6 +83,11 @@ const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
     href: "/settings/experts",
     labelKey: "experts",
     icon: Sparkles,
+  },
+  {
+    href: "/settings/office-tools",
+    labelKey: "office_tools",
+    icon: FileStack,
   },
   {
     href: "/settings/agents",

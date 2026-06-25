@@ -49,6 +49,7 @@
       "web_service": "Webサービス",
       "model_providers": "モデルプロバイダー",
       "experts": "エキスパート",
+      "office_tools": "Officeツール",
       "quick_messages": "クイックメッセージ",
       "logs": "実行ログ"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "ズームをリセット",
       "htmlPreviewTitle": "HTML プレビュー",
       "htmlPreviewTrust": "スクリプトを有効化",
-      "htmlPreviewTrustHint": "このファイルのスクリプトを実行し、ネットワークアクセスを許可します。信頼できるファイルでのみ有効にしてください。"
+      "htmlPreviewTrustHint": "このファイルのスクリプトを実行し、ネットワークアクセスを許可します。信頼できるファイルでのみ有効にしてください。",
+      "officePreviewTitle": "Office ドキュメントのプレビュー",
+      "officeFullRender": "フル描画",
+      "officeFullRenderHint": "Morph アニメーション・3D・数式を描画します（スライド自身のスクリプトを実行）",
+      "officeNotInstalled": "OfficeCLI がインストールされていません",
+      "officeNotInstalledHint": "設定 → Office ツール から OfficeCLI をインストールすると、Word・Excel・PowerPoint ファイルをプレビューできます。",
+      "officeOpenSettings": "設定を開く"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "ファイルや差分を開くと、会話の横に自動で表示されます。",
           "quickMessages": "入力欄横の + ボタンから「クイックメッセージ」を選ぶと、保存済みのスニペットを一発で挿入できます（「設定 → クイックメッセージ」で管理）",
           "experts": "+ ボタンの「エキスパートスキル」メニューから、デバッグや計画などのプリセットロールをワンクリックで読み込めます"
+        },
+        "quickActions": {
+          "excel": "Excel ブック",
+          "excelDesc": "データ表・数式・グラフ",
+          "word": "Word 文書",
+          "wordDesc": "報告書・手紙・メモ",
+          "ppt": "プレゼン資料",
+          "pptDesc": "プロ仕様のスライド",
+          "pitchDeck": "ピッチデック",
+          "pitchDeckDesc": "主要指標付きの資金調達資料",
+          "morph": "Morph アニメ",
+          "morphDesc": "映画的なスライド遷移",
+          "morph3d": "3D Morph",
+          "morph3dDesc": "3D モデルとカメラワーク",
+          "academic": "学術論文",
+          "academicDesc": "引用と構成のある研究論文",
+          "financial": "財務モデル",
+          "financialDesc": "財務諸表・DCF・予測",
+          "dashboard": "データダッシュボード",
+          "dashboardDesc": "データから KPI と分析を生成",
+          "prompts": {
+            "excel": "次の要件で Excel ブックを作成してください：\n\n[データ・表・数式・グラフをここに記述]",
+            "word": "次の要件で Word 文書を作成してください：\n\n[文書の内容・構成・書式をここに記述]",
+            "ppt": "次の要件で PowerPoint プレゼンを作成してください：\n\n[スライド・内容・デザインをここに記述]",
+            "pitchDeck": "次の要件で資金調達のピッチデックを作成してください：\n\n[会社・調達ラウンド・主要指標をここに記述]",
+            "morph": "Morph トランジションアニメーション付きのプレゼンを作成してください：\n\n[プレゼンのテーマと希望する視覚効果をここに記述]",
+            "morph3d": "GLB モデルとカメラワーク付きの 3D Morph プレゼンを作成してください：\n\n[テーマと 3D ビジュアルの構想をここに記述]",
+            "academic": "次の要件で Word の学術論文を執筆してください：\n\n[研究テーマ・手法・主要な発見をここに記述]",
+            "financial": "次の要件で Excel の財務モデルを作成してください：\n\n[財務諸表・予測・分析をここに記述]",
+            "dashboard": "次の要件で Excel のデータダッシュボードを作成してください：\n\n[データソース・KPI・グラフをここに記述]"
+          },
+          "tabs": {
+            "office": "日常業務",
+            "coding": "コード開発"
+          },
+          "coding": {
+            "brainstormingDesc": "着手前に意図と要件を整理",
+            "debuggingDesc": "修正の前に根本原因を特定",
+            "writingSkillsDesc": "再利用可能なスキルを作成・編集・検証"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "エキスパートの有効化に失敗しました",
       "disableFailed": "エキスパートの無効化に失敗しました",
       "openFolderFailed": "フォルダを開けませんでした"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Office ツール",
+    "description": "OfficeCLI スキルを管理し、Excel、Word、PowerPoint ファイルを作成します。OfficeCLI をインストールし、スキルを同期して、エージェントごとに有効化できます。",
+    "loadingContent": "コンテンツを読み込み中…",
+    "emptySkills": "スキルがありません。OfficeCLI をインストールしてスキルを同期してください。",
+    "emptySelection": "スキルを選択して内容を確認し、有効化を管理します。",
+    "emptySearch": "検索に一致するスキルがありません。",
+    "searchPlaceholder": "名前、ID、説明でスキルを検索",
+    "enableForAgents": "エージェントに対して有効化",
+    "noAgents": "ACP エージェントが検出されませんでした。",
+    "installFirst": "スキルを有効にするには、まず OfficeCLI をインストールしてください。",
+    "syncFirst": "コンテンツを読み込むには、まずスキルを同期してください。",
+    "noContent": "コンテンツがありません。",
+    "copyModeWarning": "コピー済み（リンクなし）。最新版を取得するには再同期してください。",
+    "previewTitle": "SKILL.md プレビュー",
+    "detection": {
+      "installed": "インストール済み",
+      "notInstalled": "未インストール",
+      "installHint": "OfficeCLI をインストールして、AI エージェントにオフィスドキュメント生成スキルを有効にします。",
+      "install": "インストール",
+      "uninstall": "アンインストール",
+      "syncSkills": "スキルを同期"
+    },
+    "categories": {
+      "general": "一般",
+      "presentations": "プレゼンテーション",
+      "documents": "ドキュメント",
+      "spreadsheets": "スプレッドシート"
+    },
+    "states": {
+      "not_linked": "無効",
+      "linked_to_codeg": "有効",
+      "linked_elsewhere": "ブロック — 他のリンクが存在します",
+      "blocked_by_real_directory": "ブロック — カスタムスキルがこの名前を使用しています",
+      "broken": "リンク切れ"
+    },
+    "badges": {
+      "notSynced": "未同期"
+    },
+    "actions": {
+      "refresh": "更新"
+    },
+    "toasts": {
+      "loadFailed": "スキル詳細の読み込みに失敗",
+      "enabled": "このエージェントでスキルを有効化しました",
+      "disabled": "このエージェントでスキルを無効化しました",
+      "enableFailed": "スキルの有効化に失敗",
+      "disableFailed": "スキルの無効化に失敗",
+      "installSuccess": "OfficeCLI のインストールに成功",
+      "installFailed": "OfficeCLI のインストールに失敗",
+      "uninstallSuccess": "OfficeCLI をアンインストールしました",
+      "uninstallFailed": "OfficeCLI のアンインストールに失敗",
+      "syncSuccess": "{synced} 個のスキルを同期しました",
+      "syncPartial": "{synced} 個同期、{errors} 個失敗",
+      "syncFailed": "スキルの同期に失敗"
     }
   },
   "QuickMessagesSettings": {

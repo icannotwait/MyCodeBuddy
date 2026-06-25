@@ -171,6 +171,17 @@ import type {
   ResourceInputAttachment,
 } from "./message-input-attachments"
 
+/**
+ * Payload pushed into the composer from outside (e.g. a welcome-page quick
+ * action). `text` replaces the document; `skill`, when present, is prepended as
+ * the leading invocation badge (serializes to `${prefix}${id}` as the first
+ * token), exactly like picking the skill from the expert menu.
+ */
+export interface ComposerInjectContent {
+  text: string
+  skill?: { id: string; label: string }
+}
+
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   placeholder?: string
@@ -218,6 +229,8 @@ interface MessageInputProps {
   /** Grey out the live-feedback "+" entry when a note can't be sent right now
    *  (no active turn / agent lacks the tool). */
   feedbackAddDisabled?: boolean
+  injectContent?: ComposerInjectContent | null
+  onInjectConsumed?: () => void
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -484,6 +497,8 @@ export function MessageInput({
   onForkSend,
   onAddFeedback,
   feedbackAddDisabled,
+  injectContent,
+  onInjectConsumed,
 }: MessageInputProps) {
   const t = useTranslations("Folder.chat.messageInput")
   const tQueue = useTranslations("Folder.chat.messageQueue")
@@ -784,30 +799,45 @@ export function MessageInput({
   useEffect(() => {
     if (!composerReady || hydratedRef.current) return
     hydratedRef.current = true
-    const ed = editorRef.current
-    if (!ed) return
+    if (!editorRef.current) return
+    // Bookkeeping stays synchronous so the sibling re-hydrate effect below sees
+    // the claimed item and doesn't double-hydrate; only the editor mutation is
+    // deferred to the next frame. Restoring a draft/queue payload that contains
+    // a reference badge inserts a React NodeView, which @tiptap/react renders
+    // with a synchronous flushSync() — running that here in the effect body
+    // trips React's "flushSync from inside a lifecycle method" warning.
     if (
       isEditingQueueItem &&
       (editingDraftBlocks != null || editingDraftText != null)
     ) {
-      const editor = ed.getEditor()
-      if (editingDraftBlocks && editingDraftBlocks.length > 0 && editor) {
-        // Full fidelity: restore inline badges + images from the blocks.
-        hydrateFromBlocks(editor, editingDraftBlocks)
-      } else if (editingDraftText != null) {
-        ed.setMarkdown(editingDraftText)
-      }
       prevEditingItemIdRef.current = editingItemId ?? null
-    } else if (effectiveDraftStorageKey) {
-      const loaded = loadMessageInputDraftV2(effectiveDraftStorageKey)
-      if (loaded?.kind === "doc") {
-        ed.setDoc(loaded.doc)
-      } else if (loaded?.kind === "legacyMarkdown") {
-        ed.setMarkdown(loaded.markdown)
-      }
     }
-    const editor = ed.getEditor()
-    setComposerEmpty(editor ? isComposerEmpty(editor) : true)
+    const raf = requestAnimationFrame(() => {
+      const ed = editorRef.current
+      if (!ed) return
+      if (
+        isEditingQueueItem &&
+        (editingDraftBlocks != null || editingDraftText != null)
+      ) {
+        const editor = ed.getEditor()
+        if (editingDraftBlocks && editingDraftBlocks.length > 0 && editor) {
+          // Full fidelity: restore inline badges + images from the blocks.
+          hydrateFromBlocks(editor, editingDraftBlocks)
+        } else if (editingDraftText != null) {
+          ed.setMarkdown(editingDraftText)
+        }
+      } else if (effectiveDraftStorageKey) {
+        const loaded = loadMessageInputDraftV2(effectiveDraftStorageKey)
+        if (loaded?.kind === "doc") {
+          ed.setDoc(loaded.doc)
+        } else if (loaded?.kind === "legacyMarkdown") {
+          ed.setMarkdown(loaded.markdown)
+        }
+      }
+      const editor = ed.getEditor()
+      setComposerEmpty(editor ? isComposerEmpty(editor) : true)
+    })
+    return () => cancelAnimationFrame(raf)
   }, [
     composerReady,
     isEditingQueueItem,
@@ -828,16 +858,20 @@ export function MessageInput({
       editingItemId !== prevEditingItemIdRef.current
     ) {
       prevEditingItemIdRef.current = editingItemId
-      const editor = editorRef.current?.getEditor()
-      if (editingDraftBlocks && editingDraftBlocks.length > 0 && editor) {
-        hydrateFromBlocks(editor, editingDraftBlocks)
-      } else if (editingDraftText != null) {
-        editorRef.current?.setMarkdown(editingDraftText)
-      }
-      setComposerEmpty(editor ? isComposerEmpty(editor) : true)
-      requestAnimationFrame(() => {
+      // Same flushSync deferral as the hydration effect above: hydrateFromBlocks
+      // can insert reference-badge NodeViews (synchronous @tiptap/react
+      // flushSync). Mutation + focus run next frame, off the commit phase.
+      const raf = requestAnimationFrame(() => {
+        const editor = editorRef.current?.getEditor()
+        if (editingDraftBlocks && editingDraftBlocks.length > 0 && editor) {
+          hydrateFromBlocks(editor, editingDraftBlocks)
+        } else if (editingDraftText != null) {
+          editorRef.current?.setMarkdown(editingDraftText)
+        }
+        setComposerEmpty(editor ? isComposerEmpty(editor) : true)
         editorRef.current?.focus()
       })
+      return () => cancelAnimationFrame(raf)
     } else if (!isEditingQueueItem) {
       prevEditingItemIdRef.current = null
     }
@@ -848,6 +882,43 @@ export function MessageInput({
     editingDraftBlocks,
     hydrateFromBlocks,
   ])
+
+  useEffect(() => {
+    if (!injectContent || !composerReady) return
+    const payload = injectContent
+    // Defer the editor mutation to the next frame. Inserting the skill badge
+    // creates a React NodeView, which @tiptap/react renders with a synchronous
+    // flushSync(); doing that here in the effect body runs flushSync during
+    // React's commit phase and trips the "flushSync was called from inside a
+    // lifecycle method" warning. Scheduling it out of the commit phase is the
+    // same rAF pattern the hydration effects above use. onInjectConsumed fires
+    // inside the frame so the synchronous body never flips injectContent → null
+    // and lets the cleanup cancel our own rAF before it runs.
+    const raf = requestAnimationFrame(() => {
+      const handle = editorRef.current
+      if (handle) {
+        handle.setMarkdown(payload.text)
+        // Prepend the skill as the leading invocation badge (same path the
+        // expert menu uses), so the sent message opens with `${prefix}${id}`.
+        if (payload.skill) {
+          const editor = handle.getEditor()
+          if (editor) {
+            applyExpertReference(editor, {
+              refType: "skill",
+              id: payload.skill.id,
+              label: payload.skill.label,
+              uri: null,
+              meta: { invocationPrefix: expertPrefix, scope: "expert" },
+            })
+          }
+        }
+        setComposerEmpty(false)
+        handle.focus()
+      }
+      onInjectConsumed?.()
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [injectContent, composerReady, expertPrefix, onInjectConsumed])
 
   const setDragActiveIfChanged = useCallback((next: boolean) => {
     if (dragActiveRef.current === next) return

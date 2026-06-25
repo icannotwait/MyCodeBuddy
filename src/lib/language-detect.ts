@@ -182,6 +182,18 @@ export function isHtmlPreviewable(path: string | null | undefined): boolean {
   return ext === "html" || ext === "htm"
 }
 
+// Office documents (.docx/.xlsx/.pptx) we can render in the in-app preview via
+// the OfficeCLI backend. These are binary OpenXML files — there is no text
+// editor view, so a matching tab is always preview-only.
+export function isOfficePreviewable(path: string | null | undefined): boolean {
+  if (!path) return false
+  const basename = path.toLowerCase().split(/[\\/]/).pop() ?? ""
+  const dot = basename.lastIndexOf(".")
+  if (dot === -1) return false
+  const ext = basename.slice(dot + 1)
+  return ext === "docx" || ext === "xlsx" || ext === "pptx"
+}
+
 export function languageFromPath(path: string): string {
   const lower = path.toLowerCase()
   const basename = lower.split(/[\\/]/).pop() ?? lower

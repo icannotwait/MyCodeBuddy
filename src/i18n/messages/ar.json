@@ -49,6 +49,7 @@
       "web_service": "خدمة الويب",
       "model_providers": "مزودو النماذج",
       "experts": "الخبراء",
+      "office_tools": "أدوات المكتب",
       "quick_messages": "رسائل سريعة",
       "logs": "سجلات التشغيل"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "إعادة تعيين التكبير",
       "htmlPreviewTitle": "معاينة HTML",
       "htmlPreviewTrust": "تفعيل البرامج النصية",
-      "htmlPreviewTrustHint": "تشغيل البرامج النصية لهذا الملف والسماح بالوصول إلى الشبكة. فعّلها فقط للملفات الموثوقة."
+      "htmlPreviewTrustHint": "تشغيل البرامج النصية لهذا الملف والسماح بالوصول إلى الشبكة. فعّلها فقط للملفات الموثوقة.",
+      "officePreviewTitle": "معاينة مستند Office",
+      "officeFullRender": "عرض كامل",
+      "officeFullRenderHint": "يعرض حركات Morph والأبعاد الثلاثية والمعادلات (يشغّل سكربتات الشريحة نفسها)",
+      "officeNotInstalled": "OfficeCLI غير مثبّت",
+      "officeNotInstalledHint": "ثبّت OfficeCLI من الإعدادات → أدوات Office لمعاينة ملفات Word و Excel و PowerPoint.",
+      "officeOpenSettings": "فتح الإعدادات"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "افتح ملفًا أو فرقًا لعرضه تلقائيًا بجوار المحادثة.",
           "quickMessages": "افتح زر + بجانب الإدخال واختر «الرسائل السريعة» لإدراج مقتطف محفوظ (تُدار من «الإعدادات → الرسائل السريعة»).",
           "experts": "يحتوي زر + على قائمة «مهارات الخبراء» — حمّل أدوارًا مثل التصحيح أو التخطيط بنقرة واحدة."
+        },
+        "quickActions": {
+          "excel": "مصنّف Excel",
+          "excelDesc": "جداول بيانات وصيغ ومخططات",
+          "word": "مستند Word",
+          "wordDesc": "تقارير ورسائل ومذكرات",
+          "ppt": "عرض تقديمي",
+          "pptDesc": "شرائح بتصميم احترافي",
+          "pitchDeck": "عرض استثماري",
+          "pitchDeckDesc": "عرض تمويل بمؤشرات رئيسية",
+          "morph": "حركة Morph",
+          "morphDesc": "انتقالات شرائح سينمائية",
+          "morph3d": "Morph ثلاثي الأبعاد",
+          "morph3dDesc": "نماذج ثلاثية الأبعاد وحركات كاميرا",
+          "academic": "ورقة أكاديمية",
+          "academicDesc": "بحث باستشهادات وبنية",
+          "financial": "نموذج مالي",
+          "financialDesc": "قوائم وDCF وتوقعات",
+          "dashboard": "لوحة بيانات",
+          "dashboardDesc": "مؤشرات وتحليلات من بياناتك",
+          "prompts": {
+            "excel": "أنشئ مصنّف Excel وفق المتطلبات التالية:\n\n[صف هنا بياناتك وجداولك وصيغك ومخططاتك]",
+            "word": "أنشئ مستند Word وفق المتطلبات التالية:\n\n[صف هنا محتوى المستند وبنيته وتنسيقه]",
+            "ppt": "أنشئ عرض PowerPoint تقديمي وفق المتطلبات التالية:\n\n[صف هنا شرائحك ومحتواك وتصميمك]",
+            "pitchDeck": "أنشئ عرضًا استثماريًا لجمع التمويل وفق المتطلبات التالية:\n\n[صف هنا شركتك وجولة التمويل والمؤشرات الرئيسية]",
+            "morph": "أنشئ عرضًا تقديميًا بحركات انتقال Morph:\n\n[صف هنا موضوع العرض والمؤثرات المرئية المطلوبة]",
+            "morph3d": "أنشئ عرض Morph ثلاثي الأبعاد بنماذج GLB وحركات كاميرا:\n\n[صف هنا موضوعك ومفهومك المرئي ثلاثي الأبعاد]",
+            "academic": "اكتب ورقة أكاديمية في Word وفق المتطلبات التالية:\n\n[صف هنا موضوع بحثك ومنهجيتك وأبرز نتائجك]",
+            "financial": "أنشئ نموذجًا ماليًا في Excel وفق المتطلبات التالية:\n\n[صف هنا قوائمك المالية وتوقعاتك وتحليلاتك]",
+            "dashboard": "أنشئ لوحة بيانات في Excel وفق المتطلبات التالية:\n\n[صف هنا مصدر بياناتك ومؤشراتك ومخططاتك]"
+          },
+          "tabs": {
+            "office": "الأعمال المكتبية",
+            "coding": "تطوير الكود"
+          },
+          "coding": {
+            "brainstormingDesc": "استكشف النية والمتطلبات قبل البناء",
+            "debuggingDesc": "حدد السبب الجذري قبل اقتراح الإصلاحات",
+            "writingSkillsDesc": "أنشئ وحرّر وتحقق من مهارات قابلة لإعادة الاستخدام"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "فشل تفعيل الخبير",
       "disableFailed": "فشل تعطيل الخبير",
       "openFolderFailed": "فشل فتح المجلد"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "أدوات Office",
+    "description": "إدارة مهارات OfficeCLI لإنشاء ملفات Excel وWord وPowerPoint. قم بتثبيت OfficeCLI ومزامنة المهارات وتفعيلها لكل وكيل.",
+    "loadingContent": "جارٍ تحميل المحتوى…",
+    "emptySkills": "لا توجد مهارات متاحة. قم بتثبيت OfficeCLI ومزامنة المهارات.",
+    "emptySelection": "اختر مهارة لعرض محتواها وإدارة التفعيل.",
+    "emptySearch": "لا توجد مهارات مطابقة.",
+    "searchPlaceholder": "البحث بالاسم أو المعرف أو الوصف",
+    "enableForAgents": "تفعيل للوكلاء",
+    "noAgents": "لم يتم اكتشاف وكلاء ACP.",
+    "installFirst": "قم بتثبيت OfficeCLI أولاً لتفعيل المهارات.",
+    "syncFirst": "قم بمزامنة المهارات أولاً لتحميل المحتوى.",
+    "noContent": "لا يوجد محتوى متاح.",
+    "copyModeWarning": "تم النسخ (بدون ربط). أعد المزامنة للحصول على أحدث إصدار.",
+    "previewTitle": "معاينة SKILL.md",
+    "detection": {
+      "installed": "مثبّت",
+      "notInstalled": "غير مثبّت",
+      "installHint": "قم بتثبيت OfficeCLI لتفعيل مهارات إنشاء مستندات Office لوكلاء الذكاء الاصطناعي.",
+      "install": "تثبيت",
+      "uninstall": "إلغاء التثبيت",
+      "syncSkills": "مزامنة المهارات"
+    },
+    "categories": {
+      "general": "عام",
+      "presentations": "عروض تقديمية",
+      "documents": "مستندات",
+      "spreadsheets": "جداول بيانات"
+    },
+    "states": {
+      "not_linked": "غير مفعّل",
+      "linked_to_codeg": "مفعّل",
+      "linked_elsewhere": "محظور — يوجد رابط آخر",
+      "blocked_by_real_directory": "محظور — مهارة مخصصة تشغل هذا الاسم",
+      "broken": "رابط معطل"
+    },
+    "badges": {
+      "notSynced": "غير متزامن"
+    },
+    "actions": {
+      "refresh": "تحديث"
+    },
+    "toasts": {
+      "loadFailed": "فشل تحميل تفاصيل المهارة",
+      "enabled": "تم تفعيل المهارة لهذا الوكيل",
+      "disabled": "تم تعطيل المهارة لهذا الوكيل",
+      "enableFailed": "فشل تفعيل المهارة",
+      "disableFailed": "فشل تعطيل المهارة",
+      "installSuccess": "تم تثبيت OfficeCLI بنجاح",
+      "installFailed": "فشل تثبيت OfficeCLI",
+      "uninstallSuccess": "تم إلغاء تثبيت OfficeCLI",
+      "uninstallFailed": "فشل إلغاء تثبيت OfficeCLI",
+      "syncSuccess": "تمت مزامنة {synced} مهارة",
+      "syncPartial": "تمت مزامنة {synced}، فشلت {errors}",
+      "syncFailed": "فشل مزامنة المهارات"
     }
   },
   "QuickMessagesSettings": {

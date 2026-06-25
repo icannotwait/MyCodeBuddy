@@ -49,6 +49,7 @@
       "web_service": "웹 서비스",
       "model_providers": "모델 제공업체",
       "experts": "전문가",
+      "office_tools": "오피스 도구",
       "quick_messages": "빠른 메시지",
       "logs": "실행 로그"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "확대/축소 초기화",
       "htmlPreviewTitle": "HTML 미리보기",
       "htmlPreviewTrust": "스크립트 사용",
-      "htmlPreviewTrustHint": "이 파일의 스크립트를 실행하고 네트워크 접근을 허용합니다. 신뢰할 수 있는 파일에서만 사용하세요."
+      "htmlPreviewTrustHint": "이 파일의 스크립트를 실행하고 네트워크 접근을 허용합니다. 신뢰할 수 있는 파일에서만 사용하세요.",
+      "officePreviewTitle": "Office 문서 미리보기",
+      "officeFullRender": "전체 렌더링",
+      "officeFullRenderHint": "Morph 애니메이션, 3D, 수식을 렌더링합니다(슬라이드 자체 스크립트 실행).",
+      "officeNotInstalled": "OfficeCLI가 설치되지 않았습니다",
+      "officeNotInstalledHint": "설정 → Office 도구에서 OfficeCLI를 설치하면 Word, Excel, PowerPoint 파일을 미리볼 수 있습니다.",
+      "officeOpenSettings": "설정 열기"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "파일이나 diff를 열면 대화 옆에 자동으로 표시됩니다.",
           "quickMessages": "입력창 옆 + 버튼에서 '빠른 메시지'를 선택하면 저장된 스니펫을 한 번에 삽입할 수 있습니다('설정 → 빠른 메시지'에서 관리)",
           "experts": "+ 버튼의 '전문가 스킬' 메뉴에서 디버그 / 기획 등 사전 정의된 역할을 한 번에 불러올 수 있습니다"
+        },
+        "quickActions": {
+          "excel": "Excel 통합 문서",
+          "excelDesc": "데이터 표, 수식, 차트",
+          "word": "Word 문서",
+          "wordDesc": "보고서, 편지, 메모",
+          "ppt": "프레젠테이션",
+          "pptDesc": "전문 디자인 슬라이드",
+          "pitchDeck": "피치덱",
+          "pitchDeckDesc": "핵심 지표가 담긴 투자 자료",
+          "morph": "Morph 애니메이션",
+          "morphDesc": "영화 같은 슬라이드 전환",
+          "morph3d": "3D Morph",
+          "morph3dDesc": "3D 모델과 카메라 무빙",
+          "academic": "학술 논문",
+          "academicDesc": "인용과 구조를 갖춘 연구 논문",
+          "financial": "재무 모델",
+          "financialDesc": "재무제표, DCF, 예측",
+          "dashboard": "데이터 대시보드",
+          "dashboardDesc": "데이터로 KPI와 분석 생성",
+          "prompts": {
+            "excel": "다음 요구 사항으로 Excel 통합 문서를 만들어 주세요:\n\n[데이터, 표, 수식, 차트를 여기에 설명]",
+            "word": "다음 요구 사항으로 Word 문서를 만들어 주세요:\n\n[문서 내용, 구조, 서식을 여기에 설명]",
+            "ppt": "다음 요구 사항으로 PowerPoint 프레젠테이션을 만들어 주세요:\n\n[슬라이드, 내용, 디자인을 여기에 설명]",
+            "pitchDeck": "다음 요구 사항으로 투자 피치덱을 만들어 주세요:\n\n[회사, 투자 라운드, 핵심 지표를 여기에 설명]",
+            "morph": "Morph 전환 애니메이션이 있는 프레젠테이션을 만들어 주세요:\n\n[발표 주제와 원하는 시각 효과를 여기에 설명]",
+            "morph3d": "GLB 모델과 카메라 무빙이 있는 3D Morph 프레젠테이션을 만들어 주세요:\n\n[주제와 3D 비주얼 콘셉트를 여기에 설명]",
+            "academic": "다음 요구 사항으로 Word 학술 논문을 작성해 주세요:\n\n[연구 주제, 방법론, 주요 결과를 여기에 설명]",
+            "financial": "다음 요구 사항으로 Excel 재무 모델을 만들어 주세요:\n\n[재무제표, 예측, 분석을 여기에 설명]",
+            "dashboard": "다음 요구 사항으로 Excel 데이터 대시보드를 만들어 주세요:\n\n[데이터 소스, KPI, 차트를 여기에 설명]"
+          },
+          "tabs": {
+            "office": "일상 업무",
+            "coding": "코드 개발"
+          },
+          "coding": {
+            "brainstormingDesc": "구현 전 의도와 요구사항 탐색",
+            "debuggingDesc": "수정 제안 전에 근본 원인 파악",
+            "writingSkillsDesc": "재사용 가능한 스킬 생성·편집·검증"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "전문가 활성화에 실패했습니다",
       "disableFailed": "전문가 비활성화에 실패했습니다",
       "openFolderFailed": "폴더를 열지 못했습니다"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Office 도구",
+    "description": "OfficeCLI 스킬을 관리하여 Excel, Word, PowerPoint 파일을 생성합니다. OfficeCLI를 설치하고 스킬을 동기화한 후 에이전트별로 활성화할 수 있습니다.",
+    "loadingContent": "콘텐츠 로드 중…",
+    "emptySkills": "스킬이 없습니다. OfficeCLI를 설치하고 스킬을 동기화하세요.",
+    "emptySelection": "스킬을 선택하여 내용을 확인하고 활성화를 관리합니다.",
+    "emptySearch": "검색과 일치하는 스킬이 없습니다.",
+    "searchPlaceholder": "이름, ID 또는 설명으로 스킬 검색",
+    "enableForAgents": "에이전트에 활성화",
+    "noAgents": "ACP 에이전트가 감지되지 않았습니다.",
+    "installFirst": "스킬을 활성화하려면 먼저 OfficeCLI를 설치하세요.",
+    "syncFirst": "콘텐츠를 로드하려면 먼저 스킬을 동기화하세요.",
+    "noContent": "콘텐츠가 없습니다.",
+    "copyModeWarning": "복사됨(링크 아님). 최신 버전을 가져오려면 다시 동기화하세요.",
+    "previewTitle": "SKILL.md 미리보기",
+    "detection": {
+      "installed": "설치됨",
+      "notInstalled": "미설치",
+      "installHint": "OfficeCLI를 설치하여 AI 에이전트에 오피스 문서 생성 스킬을 활성화합니다.",
+      "install": "설치",
+      "uninstall": "제거",
+      "syncSkills": "스킬 동기화"
+    },
+    "categories": {
+      "general": "일반",
+      "presentations": "프레젠테이션",
+      "documents": "문서",
+      "spreadsheets": "스프레드시트"
+    },
+    "states": {
+      "not_linked": "비활성",
+      "linked_to_codeg": "활성",
+      "linked_elsewhere": "차단됨 — 다른 링크가 존재합니다",
+      "blocked_by_real_directory": "차단됨 — 사용자 정의 스킬이 이 이름을 사용 중",
+      "broken": "링크 끊김"
+    },
+    "badges": {
+      "notSynced": "미동기화"
+    },
+    "actions": {
+      "refresh": "새로고침"
+    },
+    "toasts": {
+      "loadFailed": "스킬 상세 로드 실패",
+      "enabled": "이 에이전트에 스킬 활성화됨",
+      "disabled": "이 에이전트에서 스킬 비활성화됨",
+      "enableFailed": "스킬 활성화 실패",
+      "disableFailed": "스킬 비활성화 실패",
+      "installSuccess": "OfficeCLI 설치 성공",
+      "installFailed": "OfficeCLI 설치 실패",
+      "uninstallSuccess": "OfficeCLI 제거됨",
+      "uninstallFailed": "OfficeCLI 제거 실패",
+      "syncSuccess": "{synced}개 스킬 동기화 완료",
+      "syncPartial": "{synced}개 동기화, {errors}개 실패",
+      "syncFailed": "스킬 동기화 실패"
     }
   },
   "QuickMessagesSettings": {

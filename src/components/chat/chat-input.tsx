@@ -13,8 +13,12 @@ import type {
   AvailableCommandInfo,
 } from "@/lib/types"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
-import { MessageInput } from "@/components/chat/message-input"
+import {
+  MessageInput,
+  type ComposerInjectContent,
+} from "@/components/chat/message-input"
 import { MessageQueueDisplay } from "@/components/chat/message-queue-display"
+import { cn } from "@/lib/utils"
 
 interface ChatInputProps {
   status: ConnectionStatus | null
@@ -59,6 +63,11 @@ interface ChatInputProps {
    * disabled and the chat could never be started.
    */
   allowOfflineCompose?: boolean
+  injectContent?: ComposerInjectContent | null
+  onInjectConsumed?: () => void
+  /** Drop the input's own horizontal padding when an ancestor already supplies
+   *  the gutter (the welcome column wraps this in its own `px-4`). */
+  flush?: boolean
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -97,6 +106,9 @@ export const ChatInput = memo(function ChatInput({
   onAddFeedback,
   feedbackAddDisabled,
   allowOfflineCompose = false,
+  injectContent,
+  onInjectConsumed,
+  flush = false,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -105,7 +117,7 @@ export const ChatInput = memo(function ChatInput({
 
   return (
     <div
-      className="px-4 pt-0 pb-1"
+      className={cn("pt-0 pb-1", !flush && "px-4")}
       onContextMenu={(event) => event.stopPropagation()}
     >
       {queue &&
@@ -155,6 +167,8 @@ export const ChatInput = memo(function ChatInput({
         onForkSend={onForkSend}
         onAddFeedback={onAddFeedback}
         feedbackAddDisabled={feedbackAddDisabled}
+        injectContent={injectContent}
+        onInjectConsumed={onInjectConsumed}
         placeholder={
           isConnecting
             ? t("connecting")

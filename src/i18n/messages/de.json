@@ -49,6 +49,7 @@
       "web_service": "Webdienst",
       "model_providers": "Modellanbieter",
       "experts": "Experten",
+      "office_tools": "Office-Tools",
       "quick_messages": "Schnellnachrichten",
       "logs": "Laufzeitprotokolle"
     }
@@ -1305,7 +1306,13 @@
       "imageZoomReset": "Zoom zurücksetzen",
       "htmlPreviewTitle": "HTML-Vorschau",
       "htmlPreviewTrust": "Skripte aktivieren",
-      "htmlPreviewTrustHint": "Skripte dieser Datei ausführen und Netzwerkzugriff erlauben. Nur für vertrauenswürdige Dateien aktivieren."
+      "htmlPreviewTrustHint": "Skripte dieser Datei ausführen und Netzwerkzugriff erlauben. Nur für vertrauenswürdige Dateien aktivieren.",
+      "officePreviewTitle": "Office-Dokumentvorschau",
+      "officeFullRender": "Vollständige Darstellung",
+      "officeFullRenderHint": "Stellt Morph-Animationen, 3D und Formeln dar (führt die Skripte der Folie aus)",
+      "officeNotInstalled": "OfficeCLI ist nicht installiert",
+      "officeNotInstalledHint": "Installiere OfficeCLI unter Einstellungen → Office-Tools, um Word-, Excel- und PowerPoint-Dateien vorzuschauen.",
+      "officeOpenSettings": "Einstellungen öffnen"
     },
     "branchDropdown": {
       "toasts": {
@@ -1990,6 +1997,46 @@
           "fusionMode": "Öffne eine Datei oder ein Diff, um es automatisch neben der Konversation zu sehen.",
           "quickMessages": "Klicke auf die +-Schaltfläche neben der Eingabe und wähle Schnellnachrichten, um ein gespeichertes Snippet einzufügen (verwaltbar unter Einstellungen → Schnellnachrichten).",
           "experts": "Die +-Schaltfläche hat ein Menü Expertenfähigkeiten – lade Rollen wie Debugging oder Planung mit einem Klick."
+        },
+        "quickActions": {
+          "excel": "Excel-Arbeitsmappe",
+          "excelDesc": "Datentabellen, Formeln & Diagramme",
+          "word": "Word-Dokument",
+          "wordDesc": "Berichte, Briefe & Memos",
+          "ppt": "Präsentation",
+          "pptDesc": "Folien mit professionellem Design",
+          "pitchDeck": "Pitch Deck",
+          "pitchDeckDesc": "Investoren-Deck mit Kennzahlen",
+          "morph": "Morph-Animation",
+          "morphDesc": "Filmreife Folienübergänge",
+          "morph3d": "3D-Morph",
+          "morph3dDesc": "3D-Modelle mit Kamerafahrten",
+          "academic": "Wissenschaftliche Arbeit",
+          "academicDesc": "Forschung mit Zitaten & Struktur",
+          "financial": "Finanzmodell",
+          "financialDesc": "Abschlüsse, DCF & Prognosen",
+          "dashboard": "Daten-Dashboard",
+          "dashboardDesc": "KPIs & Analysen aus deinen Daten",
+          "prompts": {
+            "excel": "Erstelle eine Excel-Arbeitsmappe mit den folgenden Anforderungen:\n\n[beschreibe hier deine Daten, Tabellen, Formeln und Diagramme]",
+            "word": "Erstelle ein Word-Dokument mit den folgenden Anforderungen:\n\n[beschreibe hier Inhalt, Struktur und Formatierung des Dokuments]",
+            "ppt": "Erstelle eine PowerPoint-Präsentation mit den folgenden Anforderungen:\n\n[beschreibe hier deine Folien, Inhalte und das Design]",
+            "pitchDeck": "Erstelle ein Investoren-Pitch-Deck mit den folgenden Anforderungen:\n\n[beschreibe hier dein Unternehmen, die Finanzierungsrunde und die wichtigsten Kennzahlen]",
+            "morph": "Erstelle eine Präsentation mit Morph-Übergangsanimationen:\n\n[beschreibe hier das Thema der Präsentation und die gewünschten visuellen Effekte]",
+            "morph3d": "Erstelle eine 3D-Morph-Präsentation mit GLB-Modellen und Kamerafahrten:\n\n[beschreibe hier dein Thema und das visuelle 3D-Konzept]",
+            "academic": "Schreibe eine wissenschaftliche Arbeit in Word mit den folgenden Anforderungen:\n\n[beschreibe hier dein Forschungsthema, die Methodik und die wichtigsten Ergebnisse]",
+            "financial": "Erstelle ein Finanzmodell in Excel mit den folgenden Anforderungen:\n\n[beschreibe hier deine Finanzabschlüsse, Prognosen und Analysen]",
+            "dashboard": "Erstelle ein Daten-Dashboard in Excel mit den folgenden Anforderungen:\n\n[beschreibe hier deine Datenquelle, KPIs und Diagramme]"
+          },
+          "tabs": {
+            "office": "Büroarbeit",
+            "coding": "Code-Entwicklung"
+          },
+          "coding": {
+            "brainstormingDesc": "Absicht & Anforderungen vor dem Bauen klären",
+            "debuggingDesc": "Erst die Ursache finden, dann Fixes vorschlagen",
+            "writingSkillsDesc": "Wiederverwendbare Skills erstellen, bearbeiten & prüfen"
+          }
         }
       },
       "agentSelector": {
@@ -2710,6 +2757,63 @@
       "enableFailed": "Aktivieren des Experten fehlgeschlagen",
       "disableFailed": "Deaktivieren des Experten fehlgeschlagen",
       "openFolderFailed": "Ordner konnte nicht geöffnet werden"
+    }
+  },
+  "OfficeToolsSettings": {
+    "title": "Office-Tools",
+    "description": "Verwalten Sie OfficeCLI-Skills zum Erstellen von Excel-, Word- und PowerPoint-Dateien. Installieren Sie OfficeCLI, synchronisieren Sie Skills und aktivieren Sie sie pro Agent.",
+    "loadingContent": "Inhalt wird geladen…",
+    "emptySkills": "Keine Skills verfügbar. Installieren Sie OfficeCLI und synchronisieren Sie die Skills.",
+    "emptySelection": "Wählen Sie einen Skill aus, um den Inhalt anzuzeigen und die Aktivierung zu verwalten.",
+    "emptySearch": "Keine übereinstimmenden Skills gefunden.",
+    "searchPlaceholder": "Skills nach Name, ID oder Beschreibung suchen",
+    "enableForAgents": "Für Agenten aktivieren",
+    "noAgents": "Keine ACP-Agenten erkannt.",
+    "installFirst": "Installieren Sie zuerst OfficeCLI, um Skills zu aktivieren.",
+    "syncFirst": "Synchronisieren Sie zuerst die Skills, um den Inhalt zu laden.",
+    "noContent": "Kein Inhalt verfügbar.",
+    "copyModeWarning": "Kopiert (nicht verknüpft). Erneut synchronisieren, um die neueste Version zu erhalten.",
+    "previewTitle": "SKILL.md-Vorschau",
+    "detection": {
+      "installed": "Installiert",
+      "notInstalled": "Nicht installiert",
+      "installHint": "Installieren Sie OfficeCLI, um Office-Dokumentenerstellungs-Skills für Ihre KI-Agenten zu aktivieren.",
+      "install": "Installieren",
+      "uninstall": "Deinstallieren",
+      "syncSkills": "Skills synchronisieren"
+    },
+    "categories": {
+      "general": "Allgemein",
+      "presentations": "Präsentationen",
+      "documents": "Dokumente",
+      "spreadsheets": "Tabellenkalkulationen"
+    },
+    "states": {
+      "not_linked": "Nicht aktiviert",
+      "linked_to_codeg": "Aktiviert",
+      "linked_elsewhere": "Blockiert — ein anderer Link existiert",
+      "blocked_by_real_directory": "Blockiert — ein benutzerdefinierter Skill belegt diesen Namen",
+      "broken": "Defekter Link"
+    },
+    "badges": {
+      "notSynced": "Nicht synchronisiert"
+    },
+    "actions": {
+      "refresh": "Aktualisieren"
+    },
+    "toasts": {
+      "loadFailed": "Skill-Details konnten nicht geladen werden",
+      "enabled": "Skill für diesen Agenten aktiviert",
+      "disabled": "Skill für diesen Agenten deaktiviert",
+      "enableFailed": "Skill konnte nicht aktiviert werden",
+      "disableFailed": "Skill konnte nicht deaktiviert werden",
+      "installSuccess": "OfficeCLI erfolgreich installiert",
+      "installFailed": "OfficeCLI konnte nicht installiert werden",
+      "uninstallSuccess": "OfficeCLI deinstalliert",
+      "uninstallFailed": "OfficeCLI konnte nicht deinstalliert werden",
+      "syncSuccess": "{synced} Skills erfolgreich synchronisiert",
+      "syncPartial": "{synced} synchronisiert, {errors} fehlgeschlagen",
+      "syncFailed": "Skills konnten nicht synchronisiert werden"
     }
   },
   "QuickMessagesSettings": {
