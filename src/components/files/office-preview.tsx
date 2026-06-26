@@ -72,7 +72,6 @@ export function OfficePreview({
   const [retryKey, setRetryKey] = useState(0)
 
   const path = tab.path ?? ""
-  const heading = path.split("/").pop() || path
 
   // True only for a local desktop window: it loads the watch's loopback URL
   // directly. Web windows go through the proxy.
@@ -227,44 +226,35 @@ export function OfficePreview({
     )
   }
 
+  // No filename header here — the workspace tab already shows the file name.
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-b border-border bg-muted/20 px-3">
-        <span
-          className="min-w-0 truncate text-xs font-medium text-foreground/80"
-          title={heading || undefined}
-        >
-          {heading}
-        </span>
-      </div>
-      <div className="relative min-h-0 flex-1">
-        {watchUrl == null ? (
-          <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {t("loading")}
-          </div>
-        ) : (
-          <iframe
-            title={t("officePreviewTitle")}
-            src={watchUrl}
-            // Desktop loopback keeps its real (loopback) origin so officecli's
-            // own same-origin SSE works. Web/proxy mode runs opaque-origin (no
-            // allow-same-origin) so the page can't read the app's storage; its
-            // sub-requests are rewritten + CORS-allowed by the proxy.
-            sandbox={
-              loopbackDirect
-                ? "allow-scripts allow-same-origin allow-popups allow-forms"
-                : "allow-scripts allow-popups allow-forms"
-            }
-            // The proxy URL carries the watch capability; never let it ride a
-            // Referer to any external resource officecli's page might load. The
-            // injected shim routes officecli's own requests by absolute path, so
-            // it doesn't depend on Referer.
-            referrerPolicy="no-referrer"
-            className="absolute inset-0 h-full w-full border-0 bg-white"
-          />
-        )}
-      </div>
+    <div className="relative h-full min-h-0">
+      {watchUrl == null ? (
+        <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {t("loading")}
+        </div>
+      ) : (
+        <iframe
+          title={t("officePreviewTitle")}
+          src={watchUrl}
+          // Desktop loopback keeps its real (loopback) origin so officecli's
+          // own same-origin SSE works. Web/proxy mode runs opaque-origin (no
+          // allow-same-origin) so the page can't read the app's storage; its
+          // sub-requests are rewritten + CORS-allowed by the proxy.
+          sandbox={
+            loopbackDirect
+              ? "allow-scripts allow-same-origin allow-popups allow-forms"
+              : "allow-scripts allow-popups allow-forms"
+          }
+          // The proxy URL carries the watch capability; never let it ride a
+          // Referer to any external resource officecli's page might load. The
+          // injected shim routes officecli's own requests by absolute path, so
+          // it doesn't depend on Referer.
+          referrerPolicy="no-referrer"
+          className="absolute inset-0 h-full w-full border-0 bg-white"
+        />
+      )}
     </div>
   )
 }

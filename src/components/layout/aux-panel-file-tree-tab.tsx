@@ -2445,48 +2445,37 @@ export function FileTreeTab() {
 
   // Auto-surface office files (.docx/.xlsx/.pptx) the agent produces: the first
   // time one appears in changed_paths with no tab open for it, open its live
-  // preview. Once open, the OfficePreview tracks further edits itself (via the
-  // officecli watch SSE channel), so we never re-open — that avoids pane thrash.
+  // preview immediately. Once open, the OfficePreview tracks further edits over
+  // the officecli watch SSE channel, so we never re-open.
   //
-  // Gated on the user's auto-preview preference, and debounced: an agent
-  // building a doc fires a burst of officecli writes, so we coalesce them and
-  // only act once the dust settles (the backend already batches fs events; this
-  // adds a second coalescing window on the open decision itself).
+  // Leading-edge on purpose: an agent building a doc fires a continuous burst of
+  // officecli writes, and a trailing debounce would keep resetting through the
+  // whole burst — so a freshly-created doc wouldn't preview until the agent
+  // paused. We instead open on first sighting and dedup via `autoOpened` (which
+  // also keeps a tab the user has since closed from popping back open). The
+  // backend already coalesces raw fs events, so this won't thrash.
   const officeAutoPreview = useOfficeAutoPreview()
   useEffect(() => {
     if (!subscribeWorkspaceEnvelopes || !officeAutoPreview) return
-    let timer: ReturnType<typeof setTimeout> | null = null
-    // Normalized path → original path, dedup'd across the debounce window.
-    const pending = new Map<string, string>()
+    const autoOpened = new Set<string>()
 
-    const flush = () => {
-      timer = null
+    const unsubscribe = subscribeWorkspaceEnvelopes(({ changed_paths }) => {
+      if (!changed_paths || changed_paths.length === 0) return
       const openPaths = new Set(
         fileTabsRef.current
           .filter((t) => t.kind === "file" && t.path)
           .map((t) => normalizeComparePath(t.path as string))
       )
-      for (const [norm, changed] of pending) {
-        if (isOfficePreviewable(changed) && !openPaths.has(norm)) {
-          void openFilePreview(changed)
-        }
-      }
-      pending.clear()
-    }
-
-    const unsubscribe = subscribeWorkspaceEnvelopes(({ changed_paths }) => {
-      if (!changed_paths || changed_paths.length === 0) return
       for (const changed of changed_paths) {
-        pending.set(normalizeComparePath(changed), changed)
+        if (!isOfficePreviewable(changed)) continue
+        const norm = normalizeComparePath(changed)
+        if (autoOpened.has(norm) || openPaths.has(norm)) continue
+        autoOpened.add(norm)
+        void openFilePreview(changed)
       }
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(flush, 800)
     })
 
-    return () => {
-      if (timer) clearTimeout(timer)
-      unsubscribe()
-    }
+    return unsubscribe
   }, [subscribeWorkspaceEnvelopes, openFilePreview, officeAutoPreview])
 
   // Stale-on-activation: when the user switches to (or just opened) a tab
