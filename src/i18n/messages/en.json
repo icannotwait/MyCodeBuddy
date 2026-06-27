@@ -2913,6 +2913,7 @@
     "detection": {
       "installed": "Installed",
       "notInstalled": "Not installed",
+      "notRunnable": "Installed but not runnable",
       "installHint": "Install OfficeCLI to enable office document generation skills for your AI agents.",
       "install": "Install",
       "uninstall": "Uninstall",

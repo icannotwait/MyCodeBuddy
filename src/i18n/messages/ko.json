@@ -2901,6 +2901,7 @@
     "detection": {
       "installed": "설치됨",
       "notInstalled": "미설치",
+      "notRunnable": "설치됨, 실행 불가",
       "installHint": "OfficeCLI를 설치하여 AI 에이전트에 오피스 문서 생성 스킬을 활성화합니다.",
       "install": "설치",
       "uninstall": "제거",

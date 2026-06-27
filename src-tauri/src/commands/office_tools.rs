@@ -82,6 +82,12 @@ pub struct OfficecliInfo {
     pub installed: bool,
     pub version: Option<String>,
     pub path: Option<String>,
+    /// Set when the binary file is present (`installed = true`) but actually
+    /// running it failed — e.g. a self-contained-.NET startup failure from a
+    /// missing system library (libicu) on a slim Linux server image. Carries a
+    /// human-readable, actionable diagnostic; `None` when officecli runs fine or
+    /// isn't installed at all.
+    pub runtime_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,17 +336,93 @@ pub(crate) fn officecli_agent_path_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-async fn detect_version(binary: &Path) -> Option<String> {
-    let output = tokio_command(binary).arg("--version").output().await.ok()?;
-    if !output.status.success() {
-        return None;
+/// Recognize the self-contained-.NET "missing system dependency" startup
+/// failures in an officecli invocation's stderr and return an actionable hint.
+///
+/// OfficeCLI is a single self-contained binary with an embedded .NET runtime;
+/// on Linux that runtime still needs a few system libraries at startup — most
+/// commonly ICU (globalization). The slim server/Docker base image
+/// (`node:*-bookworm-slim`) doesn't ship `libicu`, so every officecli call
+/// aborts before doing any work and the raw .NET message ("Couldn't find a valid
+/// ICU package installed on the system") is opaque to most users. Map the known
+/// signatures to a fix; return `None` for unrecognized stderr (shown verbatim).
+fn officecli_runtime_dependency_hint(stderr: &str) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    let missing_icu = lower.contains("valid icu package")
+        || lower.contains("libicu")
+        || (lower.contains("icu") && lower.contains("globalization"));
+    if missing_icu {
+        return Some(
+            "officecli could not start: the server is missing the ICU library its \
+             embedded .NET runtime needs. Install it in the runtime image and restart \
+             (Debian/Ubuntu: `apt-get install -y libicu72`; Alpine: `apk add icu-libs`), \
+             or upgrade to a codeg image that already includes it."
+                .to_string(),
+        );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = stdout.trim().to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
+    if lower.contains("error while loading shared libraries") {
+        return Some(
+            "officecli could not start: a required system library is missing on the \
+             server. Install the library named in the error below and restart."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Build a diagnostic for an officecli invocation that ran but failed, pairing a
+/// recognized actionable hint (missing libicu, …) with a bounded tail of the raw
+/// stderr so the underlying error is never hidden.
+fn officecli_run_failure_message(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    match officecli_runtime_dependency_hint(stderr) {
+        Some(hint) if stderr.is_empty() => hint,
+        Some(hint) => format!("{hint}\n\nofficecli error: {}", bounded_tail(stderr, 600)),
+        None if stderr.is_empty() => {
+            "officecli exited with an error and produced no output".to_string()
+        }
+        None => format!("officecli error: {}", bounded_tail(stderr, 600)),
+    }
+}
+
+/// Outcome of probing an installed officecli binary by running `--version`.
+struct OfficecliProbe {
+    version: Option<String>,
+    runtime_error: Option<String>,
+}
+
+/// Run `officecli --version` to learn the version AND confirm the binary can
+/// actually execute. A present-but-unrunnable binary (e.g. missing libicu on a
+/// slim Linux server) yields `runtime_error` so the UI can show "installed but
+/// not runnable" instead of a misleading healthy "installed" badge.
+async fn probe_officecli(binary: &Path) -> OfficecliProbe {
+    match tokio_command(binary).arg("--version").output().await {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            OfficecliProbe {
+                version: (!version.is_empty()).then_some(version),
+                runtime_error: None,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                "[office] `officecli --version` exited unsuccessfully ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+            OfficecliProbe {
+                version: None,
+                runtime_error: Some(officecli_run_failure_message(&stderr)),
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[office] `officecli --version` could not be spawned: {e}");
+            OfficecliProbe {
+                version: None,
+                runtime_error: Some(format!("failed to run officecli: {e}")),
+            }
+        }
     }
 }
 
@@ -350,17 +432,19 @@ async fn detect_version(binary: &Path) -> Option<String> {
 pub async fn officecli_detect() -> OfficecliInfo {
     match resolve_officecli() {
         Some(path) => {
-            let version = detect_version(&path).await;
+            let probe = probe_officecli(&path).await;
             OfficecliInfo {
                 installed: true,
-                version,
+                version: probe.version,
                 path: Some(path.to_string_lossy().to_string()),
+                runtime_error: probe.runtime_error,
             }
         }
         None => OfficecliInfo {
             installed: false,
             version: None,
             path: None,
+            runtime_error: None,
         },
     }
 }
@@ -535,25 +619,35 @@ pub(crate) async fn officecli_install_core(
     }
 
     let info = officecli_detect().await;
-    if info.installed {
-        let done = match &info.version {
-            Some(version) => format!("OfficeCLI {version} installed successfully"),
-            None => "OfficeCLI installed successfully".to_string(),
-        };
-        emit_officecli_install_event(
-            emitter,
-            &task_id,
-            OfficecliInstallEventKind::Completed,
-            done,
-        );
-        Ok(info)
-    } else {
+    if !info.installed {
         let msg = format!(
             "installation completed but the officecli binary was not found — install manually from {OFFICECLI_MANUAL_URL}"
         );
         emit_officecli_install_event(emitter, &task_id, OfficecliInstallEventKind::Failed, &msg);
-        Err(OfficeToolsError::CommandFailed(msg))
+        return Err(OfficeToolsError::CommandFailed(msg));
     }
+
+    // The installer placed the binary, but it must also actually RUN. A present-
+    // but-unrunnable binary (e.g. missing libicu on a slim Linux server) is not a
+    // usable install: report it as a failure with the actionable diagnostic
+    // rather than a misleading "installed successfully" that the caller would then
+    // follow with a doomed auto-sync (every load_skill would fail the same way).
+    if let Some(runtime_error) = &info.runtime_error {
+        emit_officecli_install_event(
+            emitter,
+            &task_id,
+            OfficecliInstallEventKind::Failed,
+            runtime_error.clone(),
+        );
+        return Err(OfficeToolsError::CommandFailed(runtime_error.clone()));
+    }
+
+    let done = match &info.version {
+        Some(version) => format!("OfficeCLI {version} installed successfully"),
+        None => "OfficeCLI installed successfully".to_string(),
+    };
+    emit_officecli_install_event(emitter, &task_id, OfficecliInstallEventKind::Completed, done);
+    Ok(info)
 }
 
 // ─── Official installer (shell out, mirror-first) ──────────────────────
@@ -968,11 +1062,23 @@ pub async fn officecli_sync_skills() -> Result<SkillSyncReport, OfficeToolsError
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                report
-                    .errors
-                    .push(format!("{}: load_skill failed: {}", def.id, stderr.trim()));
+                let stderr = stderr.trim();
+                tracing::warn!(
+                    "[office] load_skill {} exited unsuccessfully ({}): {stderr}",
+                    def.load_id,
+                    out.status
+                );
+                // Map a known runtime-dependency failure (missing libicu, …) to a
+                // single actionable line; otherwise surface the raw stderr. The
+                // full detail is in the log line above regardless.
+                let msg = match officecli_runtime_dependency_hint(stderr) {
+                    Some(hint) => format!("{}: {hint}", def.id),
+                    None => format!("{}: load_skill failed: {stderr}", def.id),
+                };
+                report.errors.push(msg);
             }
             Err(e) => {
+                tracing::warn!("[office] load_skill {} could not be spawned: {e}", def.load_id);
                 report
                     .errors
                     .push(format!("{}: command error: {e}", def.id));
@@ -1442,6 +1548,54 @@ mod tests {
             assert_eq!(name, "officecli");
             assert!(p.ends_with(".local/bin/officecli"), "{p:?}");
         }
+    }
+
+    #[test]
+    fn runtime_dependency_hint_detects_missing_icu() {
+        // The exact .NET startup failure users hit on a slim Linux server image
+        // (node:*-bookworm-slim ships no system libicu).
+        for stderr in [
+            "Process terminated. Couldn't find a valid ICU package installed on the system. \
+             Please install libicu (or icu-libs) using your package manager and try again.",
+            "System.Globalization could not load ICU",
+            "error: libicu not found",
+        ] {
+            let hint = officecli_runtime_dependency_hint(stderr)
+                .unwrap_or_else(|| panic!("ICU failure should be recognized: {stderr}"));
+            assert!(hint.contains("libicu72"), "hint must name the fix: {hint}");
+        }
+    }
+
+    #[test]
+    fn runtime_dependency_hint_detects_missing_shared_library() {
+        let stderr =
+            "officecli: error while loading shared libraries: libfoo.so.1: cannot open shared \
+             object file: No such file or directory";
+        assert!(officecli_runtime_dependency_hint(stderr).is_some());
+    }
+
+    #[test]
+    fn runtime_dependency_hint_ignores_ordinary_errors() {
+        // A normal officecli error (e.g. unknown skill) must NOT be mislabeled as
+        // a missing-system-library problem.
+        assert!(officecli_runtime_dependency_hint("unknown skill id: pptx").is_none());
+        assert!(officecli_runtime_dependency_hint("").is_none());
+    }
+
+    #[test]
+    fn run_failure_message_pairs_hint_with_raw_stderr() {
+        let stderr = "Couldn't find a valid ICU package installed on the system.";
+        let msg = officecli_run_failure_message(stderr);
+        assert!(msg.contains("libicu72"), "actionable: {msg}");
+        assert!(msg.contains("officecli error:"), "keeps raw detail: {msg}");
+    }
+
+    #[test]
+    fn run_failure_message_handles_empty_stderr() {
+        let msg = officecli_run_failure_message("   ");
+        assert!(!msg.is_empty());
+        // No dangling "officecli error:" with nothing after it.
+        assert!(!msg.contains("officecli error:"), "no empty raw tail: {msg}");
     }
 
     #[test]

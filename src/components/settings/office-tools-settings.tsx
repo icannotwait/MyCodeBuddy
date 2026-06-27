@@ -103,14 +103,21 @@ function DetectionCard({
 }) {
   const t = useTranslations("OfficeToolsSettings")
   const installed = info?.installed === true
+  const runtimeError = info?.runtimeError ?? null
+  // "Installed" means the binary file exists; "healthy" additionally means it
+  // actually runs. On a slim Linux server it can be present yet unrunnable
+  // (missing libicu), which must NOT read as a green, working install.
+  const healthy = installed && !runtimeError
 
   return (
     <div
       className={cn(
         "rounded-lg border p-4",
-        installed
+        healthy
           ? "border-green-500/30 bg-green-500/5"
-          : "border-muted bg-muted/5"
+          : installed
+            ? "border-amber-500/40 bg-amber-500/5"
+            : "border-muted bg-muted/5"
       )}
     >
       <div className="flex items-center justify-between gap-4">
@@ -119,12 +126,19 @@ function DetectionCard({
             <h3 className="text-sm font-semibold">OfficeCLI</h3>
             {detecting ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-            ) : installed ? (
+            ) : healthy ? (
               <Badge
                 variant="outline"
                 className="h-5 px-1.5 text-[10px] border-green-500/40 bg-green-500/10 text-green-600 dark:text-green-400"
               >
                 {t("detection.installed")}
+              </Badge>
+            ) : installed ? (
+              <Badge
+                variant="outline"
+                className="h-5 px-1.5 text-[10px] border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+              >
+                {t("detection.notRunnable")}
               </Badge>
             ) : (
               <Badge
@@ -142,6 +156,11 @@ function DetectionCard({
                 <code className="font-mono text-[10px]">{info.path}</code>
               )}
             </div>
+          )}
+          {installed && runtimeError && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1.5 whitespace-pre-wrap break-words">
+              {runtimeError}
+            </p>
           )}
           {!installed && !detecting && (
             <p className="text-xs text-muted-foreground mt-1">
@@ -337,19 +356,34 @@ export function OfficeToolsSettings() {
       const result = await officecliInstall(taskId)
       setInfo(result)
       toast.success(t("toasts.installSuccess"))
-      await officecliSyncSkills()
+      // Auto-sync the newly available skills, surfacing failures like handleSync
+      // so a partial/failed sync isn't silently swallowed behind the success toast.
+      const report = await officecliSyncSkills()
+      if (report.errors.length > 0) {
+        toast.warning(
+          t("toasts.syncPartial", {
+            synced: report.synced,
+            errors: report.errors.length,
+          }),
+          { description: report.errors.slice(0, 2).join("\n") }
+        )
+      }
       await refreshSkills()
     } catch (err) {
       toast.error(t("toasts.installFailed"), {
         description: toErrorMessage(err),
       })
+      // The installer may have placed a present-but-unrunnable binary (e.g.
+      // missing libicu on a Linux server); re-detect so the card shows the real
+      // "installed but not runnable" state instead of staying stale.
+      await detect()
     } finally {
       setInstalling(false)
     }
     // `installStream` is a fresh object each render, but its state lives in this
     // component so a streamed line already re-renders us; handleInstall identity
     // is immaterial (its only consumer isn't memoized).
-  }, [t, refreshSkills, installStream])
+  }, [t, detect, refreshSkills, installStream])
 
   const handleUninstall = useCallback(async () => {
     try {
@@ -374,7 +408,10 @@ export function OfficeToolsSettings() {
           t("toasts.syncPartial", {
             synced: report.synced,
             errors: report.errors.length,
-          })
+          }),
+          // Surface the actual reason(s) — not just a count — so a server-side
+          // failure (e.g. missing libicu in Docker) is diagnosable from the UI.
+          { description: report.errors.slice(0, 2).join("\n") }
         )
       } else {
         toast.success(t("toasts.syncSuccess", { synced: report.synced }))

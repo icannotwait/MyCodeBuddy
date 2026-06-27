@@ -1585,6 +1585,10 @@ export interface OfficecliInfo {
   installed: boolean
   version: string | null
   path: string | null
+  // Set when the binary file is present (`installed = true`) but running it
+  // failed — e.g. a missing system library (libicu) on a slim Linux server.
+  // Carries an actionable diagnostic; null when officecli runs fine.
+  runtimeError: string | null
 }
 
 export interface OfficecliSkill {

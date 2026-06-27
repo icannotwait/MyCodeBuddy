@@ -2901,6 +2901,7 @@
     "detection": {
       "installed": "已安裝",
       "notInstalled": "未安裝",
+      "notRunnable": "已安裝但無法執行",
       "installHint": "安裝 OfficeCLI 以為 AI 智慧體啟用辦公文件生成技能。",
       "install": "安裝",
       "uninstall": "解除安裝",

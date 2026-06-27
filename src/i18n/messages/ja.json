@@ -2901,6 +2901,7 @@
     "detection": {
       "installed": "インストール済み",
       "notInstalled": "未インストール",
+      "notRunnable": "インストール済みですが実行できません",
       "installHint": "OfficeCLI をインストールして、AI エージェントにオフィスドキュメント生成スキルを有効にします。",
       "install": "インストール",
       "uninstall": "アンインストール",

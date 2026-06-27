@@ -2901,6 +2901,7 @@
     "detection": {
       "installed": "Instalado",
       "notInstalled": "Não instalado",
+      "notRunnable": "Instalado, mas não executável",
       "installHint": "Instale o OfficeCLI para habilitar as habilidades de geração de documentos Office para seus agentes de IA.",
       "install": "Instalar",
       "uninstall": "Desinstalar",

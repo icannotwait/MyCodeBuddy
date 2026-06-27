@@ -2901,6 +2901,7 @@
     "detection": {
       "installed": "مثبّت",
       "notInstalled": "غير مثبّت",
+      "notRunnable": "مثبّت لكن لا يعمل",
       "installHint": "قم بتثبيت OfficeCLI لتفعيل مهارات إنشاء مستندات Office لوكلاء الذكاء الاصطناعي.",
       "install": "تثبيت",
       "uninstall": "إلغاء التثبيت",

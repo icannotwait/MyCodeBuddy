@@ -30,7 +30,15 @@ RUN apt-get update && apt-get install -y \
     curl \
     python3 \
     python3-pip \
+    libicu72 \
     && rm -rf /var/lib/apt/lists/*
+# libicu72: OfficeCLI ships as a self-contained binary with an embedded .NET
+# runtime, which requires the system ICU library at startup. node:*-bookworm-slim
+# bundles Node's own ICU statically and so does NOT install system libicu — without
+# this, every `officecli` invocation aborts with "Couldn't find a valid ICU package
+# installed on the system", breaking both skill sync and office file preview in the
+# server/Docker mode. The version (72) is pinned to Debian bookworm; bump it to match
+# if the base image moves to a newer Debian release (e.g. trixie ships libicu76).
 
 COPY --from=backend /app/src-tauri/target/release/codeg-server /usr/local/bin/codeg-server
 COPY --from=backend /app/src-tauri/target/release/codeg-mcp /usr/local/bin/codeg-mcp

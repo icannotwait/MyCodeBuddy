@@ -2913,6 +2913,7 @@
     "detection": {
       "installed": "已安装",
       "notInstalled": "未安装",
+      "notRunnable": "已安装但无法运行",
       "installHint": "安装 OfficeCLI 以为 AI 智能体启用办公文档生成技能。",
       "install": "安装",
       "uninstall": "卸载",

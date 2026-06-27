@@ -1107,10 +1107,21 @@ mod tests {
             },
         );
 
-        let reaped = sweep_office_watches(Duration::from_secs(300));
-        assert!(reaped >= 2);
-        assert!(lock_watches().get("sweep-dead").is_none());
-        assert!(lock_watches().get("sweep-web").is_none());
+        // Don't assert on the returned count: it's racy under parallel tests. A
+        // concurrent sweep (e.g. `sweep_prunes_unreferenced_spawn_locks`) can
+        // reap these entries first, and this sweep can additionally reap another
+        // test's seeded dead child. The post-conditions below are deterministic
+        // — after this sweep returns, a dead/abandoned entry is gone no matter
+        // which sweep reaped it, and a live desktop preview is never reapable.
+        sweep_office_watches(Duration::from_secs(300));
+        assert!(
+            lock_watches().get("sweep-dead").is_none(),
+            "a dead child must be reaped"
+        );
+        assert!(
+            lock_watches().get("sweep-web").is_none(),
+            "an abandoned web preview must be reaped"
+        );
         assert!(
             lock_watches().get("sweep-desk").is_some(),
             "a live desktop preview must not be swept"
