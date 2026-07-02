@@ -32,6 +32,27 @@ describe("normalizeAbsPath", () => {
   it("upper-cases Windows drive letters for one identity", () => {
     expect(normalizeAbsPath("c:/Repo/x.ts")).toBe("C:/Repo/x.ts")
   })
+
+  it("resolves dot segments so aliases collapse to one identity", () => {
+    expect(normalizeAbsPath("/repo/src/../a.ts")).toBe("/repo/a.ts")
+    expect(normalizeAbsPath("/repo/./a.ts")).toBe("/repo/a.ts")
+    expect(normalizeAbsPath("/repo//src///a.ts")).toBe("/repo/src/a.ts")
+    expect(normalizeAbsPath("C:/repo/../x.ts")).toBe("C:/x.ts")
+  })
+
+  it("floors .. at the root — a lexical escape is classified by its target", () => {
+    // "/repo/../etc/passwd" is NOT inside /repo; it must normalize to the
+    // path it actually points at so folder matching cannot be fooled.
+    expect(normalizeAbsPath("/repo/../etc/passwd")).toBe("/etc/passwd")
+    expect(normalizeAbsPath("/a/../../x")).toBe("/x")
+  })
+
+  it("preserves the UNC double-slash prefix", () => {
+    expect(normalizeAbsPath("//server/share/x.ts")).toBe("//server/share/x.ts")
+    expect(normalizeAbsPath("\\\\server\\share\\x.ts")).toBe(
+      "//server/share/x.ts"
+    )
+  })
 })
 
 describe("splitAbsPath", () => {
@@ -78,6 +99,11 @@ describe("joinRootRel", () => {
     expect(joinRootRel("/repo", "./src/a.ts")).toBe("/repo/src/a.ts")
     expect(joinRootRel("/repo", "/src/a.ts")).toBe("/repo/src/a.ts")
     expect(joinRootRel("/repo", "src\\a.ts")).toBe("/repo/src/a.ts")
+  })
+
+  it("resolves dot segments inside the relative part", () => {
+    expect(joinRootRel("/repo", "src/../a.ts")).toBe("/repo/a.ts")
+    expect(joinRootRel("/repo", "src/./a.ts")).toBe("/repo/src/a.ts")
   })
 
   it("returns the root itself for an empty relative part", () => {
@@ -139,6 +165,15 @@ describe("findOwningFolder", () => {
   it("returns null for relative input or when nothing contains the path", () => {
     expect(findOwningFolder("src/a.ts", folders)).toBeNull()
     expect(findOwningFolder("/elsewhere/a.ts", folders)).toBeNull()
+  })
+
+  it("is not fooled by dot-segment escapes out of a root", () => {
+    expect(findOwningFolder("/repo/../outside/x.ts", folders)).toBeNull()
+    // …and an escape that lands back inside is fine.
+    expect(findOwningFolder("/repo/sub/../src/a.ts", folders)).toMatchObject({
+      folderId: 1,
+      relPath: "src/a.ts",
+    })
   })
 })
 

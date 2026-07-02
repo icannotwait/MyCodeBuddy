@@ -17,10 +17,15 @@ import { isAbsoluteFilePath, normalizeSlashPath } from "@/lib/file-path-display"
 const WINDOWS_DRIVE_PREFIX = /^[a-zA-Z]:/
 
 /**
- * Canonical form used as tab identity: forward slashes, no trailing slash
- * (except the bare `/` and `X:/` roots), Windows drive letter uppercased so
- * `c:/repo` and `C:/repo` are one identity. POSIX case is preserved
- * (case-sensitivity matches the backend's treatment of relative paths today).
+ * Canonical form used as tab identity: forward slashes; `.` and `..`
+ * segments resolved (floored at the root — `..` can never climb above it,
+ * so a lexical alias like `/repo/../etc/x` collapses to `/etc/x` and is
+ * classified by where it actually points); duplicate separators collapsed;
+ * no trailing slash (except the bare `/` and `X:/` roots); Windows drive
+ * letter uppercased so `c:/repo` and `C:/repo` are one identity. A UNC
+ * `//server/share` prefix is preserved. POSIX case is preserved
+ * (case-sensitivity matches the backend's treatment of relative paths
+ * today).
  */
 export function normalizeAbsPath(path: string): string {
   let normalized = normalizeSlashPath(path.trim())
@@ -32,12 +37,31 @@ export function normalizeAbsPath(path: string): string {
   if (WINDOWS_DRIVE_PREFIX.test(normalized)) {
     normalized = normalized[0].toUpperCase() + normalized.slice(1)
   }
-  // Strip trailing slashes but keep the root designators themselves.
-  while (
-    normalized.length > 1 &&
-    normalized.endsWith("/") &&
-    !/^[a-zA-Z]:\/$/.test(normalized)
-  ) {
+
+  const drive = WINDOWS_DRIVE_PREFIX.test(normalized)
+    ? normalized.slice(0, 2)
+    : null
+  const isUnc = !drive && normalized.startsWith("//")
+  const isPosix = !drive && !isUnc && normalized.startsWith("/")
+
+  if (drive || isUnc || isPosix) {
+    const body = drive ? normalized.slice(2) : normalized
+    const parts: string[] = []
+    for (const segment of body.split("/")) {
+      if (!segment || segment === ".") continue
+      if (segment === "..") {
+        if (parts.length > 0) parts.pop()
+        continue
+      }
+      parts.push(segment)
+    }
+    const prefix = drive ? `${drive}/` : isUnc ? "//" : "/"
+    return parts.length > 0 ? prefix + parts.join("/") : prefix
+  }
+
+  // Relative (or otherwise unrooted) input: leave segments alone, only
+  // strip trailing slashes.
+  while (normalized.length > 1 && normalized.endsWith("/")) {
     normalized = normalized.slice(0, -1)
   }
   return normalized
@@ -79,7 +103,12 @@ export function joinRootRel(rootPath: string, relPath: string): string {
   const root = normalizeAbsPath(rootPath)
   const rel = normalizeSlashPath(relPath).replace(/^\.?\/+/, "")
   if (!rel) return root
-  return root.endsWith("/") ? `${root}${rel}` : `${root}/${rel}`
+  // Funnel the join back through normalizeAbsPath so dot segments and
+  // duplicate separators inside `rel` cannot mint a second byte-form of
+  // the same file.
+  return normalizeAbsPath(
+    root.endsWith("/") ? `${root}${rel}` : `${root}/${rel}`
+  )
 }
 
 export interface OwningFolderMatch {

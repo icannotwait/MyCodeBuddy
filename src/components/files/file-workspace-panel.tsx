@@ -178,7 +178,11 @@ function useLocalImageSrc(
 ): string | undefined {
   const [dataUrl, setDataUrl] = useState<string | undefined>(undefined)
 
-  const isLocal = src && fileDir && !/^https?:\/\/|^data:|^blob:/.test(src)
+  // Protocol-relative "//host/…" srcs are REMOTE (the browser resolves them
+  // against the page protocol) — never route them into local file IO, where
+  // "//Users/…" would otherwise read an unintended local path.
+  const isLocal =
+    src && fileDir && !/^https?:\/\/|^data:|^blob:|^\/\//.test(src)
 
   useEffect(() => {
     if (!isLocal || !src || !fileDir) return

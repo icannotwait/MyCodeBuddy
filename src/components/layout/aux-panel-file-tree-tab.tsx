@@ -22,6 +22,7 @@ import {
   useWorkspaceFileTabs,
 } from "@/contexts/workspace-context"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import { findOwningFolder } from "@/lib/file-open-target"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
 import { WorkspaceUploadDialog } from "@/components/layout/workspace-upload-dialog"
@@ -882,6 +883,16 @@ export function FileTreeTab() {
   const { activeFilePath } = useWorkspaceFileTabs()
   const { openBranchDiff, openFilePreview, openWorkingTreeDiff } =
     useWorkspaceActions()
+  // File tab paths are absolute; the tree's node paths are relative to
+  // THIS panel's folder — derive the relative form (undefined when the
+  // active file lives outside this folder, which correctly unselects).
+  const selectedTreePath = useMemo(() => {
+    if (!activeFilePath || !folder) return undefined
+    return (
+      findOwningFolder(activeFilePath, [{ id: folder.id, path: folder.path }])
+        ?.relPath ?? undefined
+    )
+  }, [activeFilePath, folder])
   const workspaceState = useWorkspaceStateStore(folder?.path ?? null)
   const [nodes, setNodes] = useState<FileTreeNode[]>([])
   const [gitStatusByPath, setGitStatusByPath] = useState<Map<string, string>>(
@@ -2091,7 +2102,7 @@ export function FileTreeTab() {
               className="border-0 rounded-none bg-transparent w-max min-w-full"
               expanded={expandedPaths}
               onExpandedChange={setExpandedPaths}
-              selectedPath={activeFilePath ?? undefined}
+              selectedPath={selectedTreePath}
               onSelect={handleTreeSelect}
             >
               {folder?.path && (

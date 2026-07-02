@@ -472,7 +472,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const input = isHomeRelativePath(rawPath)
         ? await expandHomePath(rawPath)
         : rawPath
-      if (isAbsoluteFilePath(input)) return normalizeAbsPath(input)
+      if (isAbsoluteFilePath(input)) {
+        const abs = normalizeAbsPath(input)
+        // Re-root through the owning registered folder when there is one:
+        // on case-insensitive filesystems an agent may echo the root with
+        // different casing (c:/repo vs C:/Repo), and watch events join the
+        // FOLDER's stored casing — canonicalizing here collapses those
+        // aliases into the one identity the watcher reproduces.
+        const owning = findOwningFolder(abs, allFoldersRef.current)
+        return owning ? joinRootRel(owning.rootPath, owning.relPath) : abs
+      }
       const base = resolveTargetFolder(baseFolderId)
       if (!base) return null
       return joinRootRel(base.path, normalizePath(input))
@@ -2022,6 +2031,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
                   saveState: "idle",
                   saveError: null,
                   loading: false,
+                  // A successful reload IS the reconciliation a stale flag
+                  // asks for — clearing it here keeps the activation pass
+                  // from immediately re-reloading the same tab.
+                  stale: false,
                 }
               : candidate
           )

@@ -2860,6 +2860,12 @@ function AbsolutePathProbe({
         open-abs-f2
       </button>
       <button onClick={() => void openFilePreview("a.ts")}>open-a-f1</button>
+      <button onClick={() => void openFilePreview("/repo/src/../a.ts")}>
+        open-alias-a
+      </button>
+      <button onClick={() => void openFilePreview("c:/repo/src/a.ts")}>
+        open-win-alias
+      </button>
       <button onClick={() => void openFilePreview("src/i.ts", { folderId: 3 })}>
         open-nested-rel
       </button>
@@ -2967,6 +2973,39 @@ describe("unified absolute-path file tabs (outside-workspace opens)", () => {
     expect(mockedApi.gitIsTracked).toHaveBeenCalledWith("/repo2", "src/x.ts")
     expect(workspaceStoreMock.acquiredCount("/repo2")).toBe(1)
     expect(snap().tabs[0].id).toBe(fileTabId("/repo2/src/x.ts"))
+  })
+
+  it("collapses dot-segment aliases of one file into a single tab", async () => {
+    const snap = renderAbsolute()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("open-alias-a").click()
+    })
+
+    // "/repo/src/../a.ts" IS "/repo/a.ts" — one tab, one read.
+    expect(snap().tabs).toHaveLength(1)
+    expect(snap().tabs[0].id).toBe(fileTabId("/repo/a.ts"))
+    expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(1)
+  })
+
+  it("canonicalizes root casing through the owning folder (Windows aliases)", async () => {
+    foldersMock.setAllFolders([
+      { id: 9, path: "C:/Repo", name: "win", color: "inherit" },
+    ])
+    const snap = renderAbsolute()
+
+    await act(async () => {
+      screen.getByText("open-win-alias").click()
+    })
+
+    // The agent echoed "c:/repo/…" but the registered folder is "C:/Repo" —
+    // the tab identity takes the folder's casing, which is exactly what a
+    // watch event (folder root + relative path) joins back to.
+    expect(snap().tabs[0].id).toBe(fileTabId("C:/Repo/src/a.ts"))
+    expect(workspaceStoreMock.acquiredCount("C:/Repo")).toBe(1)
   })
 
   it("dedupes the same physical file opened through a nested folder and an absolute path", async () => {

@@ -129,6 +129,32 @@ describe("file-workspace-panel routes active-tab openers by tab folder", () => {
       /target\s*=\s*clean\s*\.replace\(\/\^\\\/\+\//
     )
   })
+
+  it("treats protocol-relative // image srcs as remote, never local file IO", () => {
+    // A "/"-prefixed src is an absolute local path under the new model,
+    // but "//host/…" is a protocol-relative URL — routing it into
+    // readFileBase64 would attempt local reads of "//Users/…"-style
+    // paths. The isLocal gate must exclude the double-slash form.
+    const isLocalIdx = panelSource.indexOf("const isLocal =")
+    expect(isLocalIdx).toBeGreaterThan(-1)
+    const gate = panelSource.slice(isLocalIdx, isLocalIdx + 300)
+    expect(gate).toMatch(/\^\\\/\\\//)
+  })
+})
+
+describe("aux file tree derives its selection from the absolute tab path", () => {
+  const auxTreeSource = readFileSync(
+    resolve(process.cwd(), "src/components/layout/aux-panel-file-tree-tab.tsx"),
+    "utf8"
+  )
+
+  it("maps the absolute active path to a folder-relative tree selection", () => {
+    // Tree node paths are relative to THIS panel's folder; the absolute
+    // activeFilePath must be re-based (and unselected when outside).
+    expect(auxTreeSource).toMatch(/findOwningFolder\(activeFilePath/)
+    expect(auxTreeSource).toMatch(/selectedPath=\{selectedTreePath\}/)
+    expect(auxTreeSource).not.toMatch(/selectedPath=\{activeFilePath/)
+  })
 })
 
 describe("workspace-context divergence-aware save guard", () => {
