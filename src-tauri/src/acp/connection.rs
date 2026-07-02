@@ -4440,6 +4440,21 @@ struct CodeBuddyLiveState {
     /// Sub-agent tool calls that already reached a final status — guards against a
     /// stray late non-final frame re-opening a finished sub-agent.
     closed_subagents: HashSet<String>,
+    /// Objective of the Codex `/goal` run currently open on this connection (set
+    /// by the latest `active` `session_info_update` goal, cleared on any terminal
+    /// status). Lets a later `goal:null` close the run by objective — and be a
+    /// no-op when no run is open. See `crate::acp::codex_goal::next_goal_marker`.
+    ///
+    /// This lives here (not in `SessionState`) because `CodeBuddyLiveState` and
+    /// `SessionState` share one lifetime: a browser refresh / reconnect re-attaches
+    /// to the *running* connection (`find_connection_for_reuse`), keeping both; a
+    /// brand-new connection resets both together (empty live blocks + fresh state).
+    /// So this state never resets while goal blocks it would close still exist.
+    codex_open_goal: Option<String>,
+    /// Monotonic per-connection counter for synthetic goal tool-call ids. Occurrence
+    /// (not content) addressing keeps two runs that share an objective from
+    /// colliding in the reducer's id-keyed live block list.
+    codex_goal_seq: u64,
 }
 
 /// Resolve a tool call's title, honoring an authoritative rewrite recorded for
@@ -4908,6 +4923,49 @@ async fn emit_conversation_update(
                 },
             )
             .await;
+        }
+        SessionUpdate::SessionInfoUpdate(info) => {
+            // codex-acp v1.1.0 (#263) reports `/goal` transitions as structured
+            // session metadata instead of live "Goal updated (…)" agent text:
+            // the goal object rides under `_meta.codex.goal`. Map it onto codeg's
+            // canonical create_goal/update_goal synthetic tool call so the
+            // existing goal-card pipeline (groupGoalRuns/GoalCard) renders it —
+            // byte-identical to the history path (parsers/codex.rs). Non-Codex
+            // agents don't populate the `codex` key, so this is a no-op for them.
+            // (`info.title` is Codex's native thread name; it is adopted via the
+            // parser auto-title path on the next conversation fetch, not here, to
+            // keep this DB-agnostic emit path unchanged — see parsers/codex.rs.)
+            if let Some(goal) = info
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("codex"))
+                .and_then(|codex| codex.get("goal"))
+            {
+                if let Some(marker) =
+                    crate::acp::codex_goal::next_goal_marker(&mut cb_state.codex_open_goal, goal)
+                {
+                    cb_state.codex_goal_seq += 1;
+                    let tool_call_id =
+                        crate::acp::codex_goal::goal_tool_call_id(cb_state.codex_goal_seq);
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::ToolCall {
+                            tool_call_id,
+                            title: marker.title,
+                            kind: "other".to_string(),
+                            status: "completed".to_string(),
+                            content: None,
+                            raw_input: Some(marker.input_json),
+                            raw_output: Some(marker.output_json),
+                            locations: None,
+                            meta: None,
+                            images: None,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         other => {
             // Log unhandled update types for debugging
