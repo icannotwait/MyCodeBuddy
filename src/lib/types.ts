@@ -3,7 +3,6 @@ export type AgentType =
   | "codex"
   | "open_code"
   | "gemini"
-  | "open_claw"
   | "cline"
   | "hermes"
   | "code_buddy"
@@ -451,7 +450,6 @@ export const AGENT_DISPLAY_ORDER: AgentType[] = [
   "claude_code",
   "open_code",
   "gemini",
-  "open_claw",
   "cline",
   "hermes",
   "code_buddy",
@@ -474,7 +472,6 @@ export const ALL_AGENT_TYPES: AgentType[] = [
   "codex",
   "open_code",
   "gemini",
-  "open_claw",
   "cline",
   "hermes",
   "code_buddy",
@@ -764,7 +761,6 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   codex: "Codex",
   open_code: "OpenCode",
   gemini: "Gemini CLI",
-  open_claw: "OpenClaw",
   cline: "Cline",
   hermes: "Hermes Agent",
   code_buddy: "CodeBuddy",
@@ -777,7 +773,6 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   codex: "bg-[#7A9DFF]",
   open_code: "bg-black",
   gemini: "bg-[#3186FF]",
-  open_claw: "bg-emerald-600",
   cline: "bg-purple-500",
   hermes: "bg-amber-500",
   code_buddy: "bg-[#0052D9]",
@@ -1767,7 +1762,6 @@ export type McpAppType =
   | "claude_code"
   | "codex"
   | "gemini"
-  | "open_claw"
   | "open_code"
   | "cline"
   | "hermes"

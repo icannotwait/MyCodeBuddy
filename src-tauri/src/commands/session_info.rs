@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn agent_type_str_is_snake_case() {
         assert_eq!(agent_type_str(AgentType::ClaudeCode), "claude_code");
-        assert_eq!(agent_type_str(AgentType::OpenClaw), "open_claw");
+        assert_eq!(agent_type_str(AgentType::OpenCode), "open_code");
     }
 
     #[tokio::test]

@@ -583,7 +583,7 @@ fn usage_from_object(usage: Option<&Value>) -> Option<TurnUsage> {
 }
 
 /// ISO-8601 `timestamp` string → `DateTime<Utc>` (chrono's RFC3339 `FromStr`),
-/// mirroring `parsers::openclaw::parse_iso_timestamp`.
+/// mirroring the other JSONL parser timestamp helpers.
 fn record_iso_ts(value: &Value) -> Option<DateTime<Utc>> {
     value
         .get("timestamp")

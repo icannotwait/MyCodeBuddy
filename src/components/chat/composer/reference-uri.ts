@@ -83,8 +83,7 @@ export function parseCodegReferenceUri(
     // LEGACY links `codeg://session/<agent_type>_<external_id>` (still present in
     // historical transcripts) keep their agent icon: the type is recovered by
     // prefix match against the known set — never by splitting on the first `_`,
-    // since agent types themselves contain underscores (claude_code, open_code,
-    // open_claw).
+    // since agent types themselves contain underscores (claude_code, open_code).
     const agentType = ALL_AGENT_TYPES.find((type) => id.startsWith(`${type}_`))
     return {
       refType: "session",

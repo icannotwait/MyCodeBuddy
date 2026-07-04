@@ -5,7 +5,7 @@ pub enum AgentDistribution {
     Npx {
         version: &'static str,
         package: &'static str,
-        /// The command name provided by this npx package (e.g. "gemini", "openclaw").
+        /// The command name provided by this npx package (e.g. "gemini").
         cmd: &'static str,
         args: &'static [&'static str],
         env: &'static [(&'static str, &'static str)],
@@ -55,9 +55,6 @@ pub struct AcpAgentMeta {
     pub agent_type: AgentType,
     /// 是否经 ACP 线缆（session/new 的 `mcpServers` 字段）向该 agent 转发 MCP
     /// 服务器——既包括用户配置的服务器，也包括内置 codeg-mcp 伴生进程。
-    /// OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
-    /// 故置 false。注意空列表 `[]` 仍会按 ACP schema 序列化、OpenClaw 可接受——
-    /// 闸门只是保证该列表对 OpenClaw 恒为空（不含任何条目）。
     pub supports_mcp: bool,
     pub name: &'static str,
     pub description: &'static str,
@@ -106,7 +103,6 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::ClaudeCode,
         AgentType::Codex,
         AgentType::Gemini,
-        AgentType::OpenClaw,
         AgentType::OpenCode,
         AgentType::Cline,
         AgentType::Hermes,
@@ -121,7 +117,6 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::ClaudeCode => "claude-acp",
         AgentType::Codex => "codex-acp",
         AgentType::Gemini => "gemini",
-        AgentType::OpenClaw => "openclaw-acp",
         AgentType::OpenCode => "opencode",
         AgentType::Cline => "cline",
         AgentType::Hermes => "hermes",
@@ -136,7 +131,6 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "claude-acp" => Some(AgentType::ClaudeCode),
         "codex-acp" => Some(AgentType::Codex),
         "gemini" => Some(AgentType::Gemini),
-        "openclaw-acp" => Some(AgentType::OpenClaw),
         "opencode" => Some(AgentType::OpenCode),
         "cline" => Some(AgentType::Cline),
         "hermes" => Some(AgentType::Hermes),
@@ -202,22 +196,6 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 args: &["--acp", "--skip-trust"],
                 env: &[],
                 node_required: Some("20.0.0"),
-            },
-        },
-        AgentType::OpenClaw => AcpAgentMeta {
-            agent_type,
-            // OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
-            // 故不向其转发任何 MCP 条目（含 codeg-mcp 伴生进程）。详见 supports_mcp 字段注释。
-            supports_mcp: false,
-            name: "OpenClaw",
-            description: "OpenClaw is a personal AI assistant you run on your own devices.",
-            distribution: AgentDistribution::Npx {
-                version: "2026.6.11",
-                package: "openclaw@2026.6.11",
-                cmd: "openclaw",
-                args: &["acp"],
-                env: &[],
-                node_required: Some("22.19.0"),
             },
         },
         AgentType::Cline => AcpAgentMeta {
@@ -326,10 +304,9 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             agent_type,
             // pi-acp accepts ACP-wire `mcpServers` but drops them (does not
             // forward to pi), and pi has no native MCP. supports_mcp stays
-            // `true` only to satisfy the `only_openclaw_opts_out_of_mcp`
-            // invariant — actual wire forwarding is short-circuited in
-            // `connection.rs` (see the skip-list), so neither user servers nor
-            // the codeg-mcp companion are futilely forwarded.
+            // Actual wire forwarding is short-circuited in `connection.rs` (see
+            // the skip-list), so neither user servers nor the codeg-mcp companion
+            // are futilely forwarded.
             supports_mcp: true,
             name: "Pi",
             description: "Self-extensible coding agent (ACP via pi-acp)",
@@ -450,12 +427,6 @@ mod tests {
             "@google/gemini-cli@0.47.0",
             Some("20.0.0"),
         );
-        assert_npx_version(
-            AgentType::OpenClaw,
-            "2026.6.11",
-            "openclaw@2026.6.11",
-            Some("22.19.0"),
-        );
         assert_npx_version(AgentType::Cline, "3.0.34", "cline@3.0.34", None);
         assert_npx_version(
             AgentType::CodeBuddy,
@@ -488,19 +459,25 @@ mod tests {
         );
     }
 
-    // OpenClaw rejects MCP server entries inside `mcpServers` (the empty `[]`
-    // field is still serialized and tolerated) and fails session/new on any
-    // entry, so it must be the only agent with `supports_mcp == false`. Every
-    // other agent (current and future) keeps it `true`. Iterating the full
-    // registry means a newly-added agent that wrongly opts out — or a
-    // regression flipping OpenClaw back on — trips this assert.
     #[test]
-    fn only_openclaw_opts_out_of_mcp() {
+    fn removed_agent_is_not_registered() {
+        let removed_registry_id = ["open", "claw-acp"].join("");
+        assert!(
+            !all_acp_agents()
+                .iter()
+                .any(|agent_type| registry_id_for(*agent_type) == removed_registry_id),
+            "removed agent must not be exposed as an ACP agent"
+        );
+        assert_eq!(from_registry_id(&removed_registry_id), None);
+    }
+
+    #[test]
+    fn all_registered_agents_support_mcp() {
         for agent_type in all_acp_agents() {
             let meta = get_agent_meta(agent_type);
             assert_eq!(
                 meta.supports_mcp,
-                agent_type != AgentType::OpenClaw,
+                true,
                 "unexpected supports_mcp for {agent_type:?}"
             );
         }

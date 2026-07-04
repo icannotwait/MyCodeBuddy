@@ -358,32 +358,6 @@ async fn build_agent(
             for a in args {
                 parts.push((*a).into());
             }
-            // Translate OpenClaw-specific env vars to CLI flags
-            if agent_type == AgentType::OpenClaw {
-                if let Some(url) = runtime_env
-                    .get("OPENCLAW_GATEWAY_URL")
-                    .filter(|v| !v.is_empty())
-                {
-                    parts.push("--url".into());
-                    parts.push(url.clone());
-                }
-                if let Some(key) = runtime_env
-                    .get("OPENCLAW_SESSION_KEY")
-                    .filter(|v| !v.is_empty())
-                {
-                    parts.push("--session".into());
-                    parts.push(key.clone());
-                }
-                // When creating a new conversation (no session_id to resume),
-                // pass --reset-session so OpenClaw mints a fresh transcript
-                // instead of appending to the previous one.
-                if runtime_env
-                    .get("OPENCLAW_RESET_SESSION")
-                    .is_some_and(|v| v == "1")
-                {
-                    parts.push("--reset-session".into());
-                }
-            }
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -1753,15 +1727,9 @@ async fn run_connection(
             );
 
             // Whether this agent accepts MCP server entries over the ACP wire
-            // (`session/new`'s `mcpServers`). Almost all do; OpenClaw rejects
-            // any server entry and fails session creation, so it must receive
-            // NONE — neither user-configured servers nor the built-in codeg-mcp
-            // companion. (The `mcpServers` key itself is always serialized as
-            // `[]` by the ACP schema and OpenClaw tolerates the empty list; the
-            // gate only guarantees the list stays empty for it.) This is the
-            // single chokepoint feeding session/new, session/load, and the
-            // load→new fallback, so gating here keeps server entries off the
-            // wire on every path. See `AcpAgentMeta::supports_mcp`.
+            // (`session/new`'s `mcpServers`). This is the single chokepoint
+            // feeding session/new, session/load, and the load→new fallback.
+            // See `AcpAgentMeta::supports_mcp`.
             let agent_supports_mcp = registry::get_agent_meta(agent_type).supports_mcp;
 
             // Load MCP servers configured for this agent and filter by the
@@ -3286,8 +3254,7 @@ fn is_agent_output_update(update: &SessionUpdate) -> bool {
 /// `end_turn` (success) and `cancelled` (already user-driven).
 ///
 /// `Refusal` is included because OpenCode (and similar agents) map backend /
-/// gateway errors to `Refusal` per the ACP spec gap — see
-/// <https://shashikantjagtap.net/openclaw-acp-what-coding-agent-users-need-to-know-about-protocol-gaps/>.
+/// gateway errors to `Refusal` per the ACP spec gap.
 /// `empty` is a synthesized reason emitted by `run_conversation_loop` when
 /// the agent reports `EndTurn` without producing any agent output.
 fn turn_failure_error_event(reason_str: &str, agent_type: AgentType) -> Option<AcpEvent> {
@@ -5309,49 +5276,6 @@ mod tests {
         assert!(req.meta.is_none());
     }
 
-    // OpenClaw rejects MCP server *entries* over the ACP wire, not the
-    // `mcpServers` field itself. The ACP schema does not `skip_serializing_if`
-    // that field on NewSessionRequest/LoadSessionRequest, so it always
-    // serializes as `[]`; every agent (OpenClaw included) already receives
-    // `mcpServers: []` on a fresh install with no servers configured and
-    // codeg-mcp off — the known-good payload. The connection-layer gate
-    // (`supports_mcp == false`) forces OpenClaw onto that empty payload
-    // unconditionally. This pins the wire contract: both builders emit an
-    // empty list, so no server entry can ever reach OpenClaw.
-    #[test]
-    fn openclaw_session_requests_carry_no_mcp_servers() {
-        let cwd = std::path::PathBuf::from("/tmp/codeg");
-
-        let new_req = build_new_session_request(AgentType::OpenClaw, &cwd, Vec::new());
-        assert!(
-            new_req.mcp_servers.is_empty(),
-            "OpenClaw session/new must carry no MCP servers"
-        );
-        let new_json = serde_json::to_value(&new_req).unwrap();
-        assert_eq!(
-            new_json.get("mcpServers"),
-            Some(&serde_json::json!([])),
-            "OpenClaw session/new mcpServers must serialize as an empty list"
-        );
-
-        let load_req = build_load_session_request(
-            AgentType::OpenClaw,
-            SessionId::new("openclaw-session".to_string()),
-            &cwd,
-            Vec::new(),
-        );
-        assert!(
-            load_req.mcp_servers.is_empty(),
-            "OpenClaw session/load must carry no MCP servers"
-        );
-        let load_json = serde_json::to_value(&load_req).unwrap();
-        assert_eq!(
-            load_json.get("mcpServers"),
-            Some(&serde_json::json!([])),
-            "OpenClaw session/load mcpServers must serialize as an empty list"
-        );
-    }
-
     #[test]
     fn build_resume_session_request_sets_claude_raw_meta() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
@@ -5383,42 +5307,6 @@ mod tests {
         );
 
         assert!(req.meta.is_none());
-    }
-
-    // Unlike NewSessionRequest/LoadSessionRequest (whose `mcp_servers` has no
-    // `skip_serializing_if`, so it always serializes as `[]`),
-    // ResumeSessionRequest marks `mcp_servers` `skip_serializing_if =
-    // Vec::is_empty` — an empty list is OMITTED from the wire entirely. OpenClaw
-    // (which supports session/resume) tolerates both an absent key and `[]`, and
-    // the connection-layer gate keeps the list empty regardless, so no server
-    // entry can ever reach it. Pin both the empty-list invariant and the
-    // documented wire-shape divergence here.
-    #[test]
-    fn openclaw_resume_request_carries_no_mcp_servers() {
-        let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = build_resume_session_request(
-            AgentType::OpenClaw,
-            SessionId::new("openclaw-session".to_string()),
-            &cwd,
-            Vec::new(),
-        );
-        assert!(
-            req.mcp_servers.is_empty(),
-            "OpenClaw session/resume must carry no MCP servers"
-        );
-
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(
-            json.get("mcpServers").is_none(),
-            "empty mcp_servers must be omitted from the resume wire payload"
-        );
-        // camelCase round-trip: sanity that the UntypedMessage send produces the
-        // ACP-correct shape.
-        assert!(
-            json.get("sessionId").is_some(),
-            "sessionId must serialize in camelCase"
-        );
-        assert!(json.get("cwd").is_some());
     }
 
     #[test]

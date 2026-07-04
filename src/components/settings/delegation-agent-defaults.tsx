@@ -59,7 +59,6 @@ const AGENT_TYPES: AgentType[] = [
   "codex",
   "open_code",
   "gemini",
-  "open_claw",
   "cline",
   "hermes",
   "code_buddy",

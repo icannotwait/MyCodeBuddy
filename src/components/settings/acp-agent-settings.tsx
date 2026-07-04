@@ -172,9 +172,6 @@ interface AgentDraft {
   codexAuthJsonText: string
   codexConfigTomlText: string
   openCodeAuthJsonText: string
-  openClawGatewayUrl: string
-  openClawGatewayToken: string
-  openClawSessionKey: string
   clineProvider: ClineProvider
   clineApiKey: string
   clineModel: string
@@ -359,12 +356,6 @@ const GEMINI_ENV_KEYS = {
   cloudLocation: "GOOGLE_CLOUD_LOCATION",
   applicationCredentials: "GOOGLE_APPLICATION_CREDENTIALS",
   model: "GEMINI_MODEL",
-} as const
-
-const OPENCLAW_ENV_KEYS = {
-  gatewayUrl: "OPENCLAW_GATEWAY_URL",
-  gatewayToken: "OPENCLAW_GATEWAY_TOKEN",
-  sessionKey: "OPENCLAW_SESSION_KEY",
 } as const
 
 const CLINE_PROVIDERS = [
@@ -714,12 +705,6 @@ function extractGeminiImportantValues(
   }
 }
 
-interface OpenClawImportantValues {
-  gatewayUrl: string
-  gatewayToken: string
-  sessionKey: string
-}
-
 interface ClineImportantValues {
   provider: ClineProvider
   apiKey: string
@@ -737,22 +722,6 @@ function extractClineImportantValues(configText: string): ClineImportantValues {
     apiKey: typeof config.apiKey === "string" ? config.apiKey : "",
     model: typeof config.model === "string" ? config.model : "",
     baseUrl: typeof config.apiBaseUrl === "string" ? config.apiBaseUrl : "",
-  }
-}
-
-function extractOpenClawImportantValues(
-  env: Record<string, string>,
-  configText: string
-): OpenClawImportantValues {
-  const parseResult = parseConfigJsonText(configText)
-  const config = parseResult.config
-  const configEnv = envFromConfig(config)
-  const mergedEnv = { ...env, ...configEnv }
-
-  return {
-    gatewayUrl: findEnvValue(mergedEnv, [OPENCLAW_ENV_KEYS.gatewayUrl]),
-    gatewayToken: findEnvValue(mergedEnv, [OPENCLAW_ENV_KEYS.gatewayToken]),
-    sessionKey: findEnvValue(mergedEnv, [OPENCLAW_ENV_KEYS.sessionKey]),
   }
 }
 
@@ -2551,10 +2520,6 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     configText
   )
   const geminiImportant = extractGeminiImportantValues(agent.env, configText)
-  const openClawImportant = extractOpenClawImportantValues(
-    agent.env,
-    configText
-  )
   const codexImportant = extractCodexImportantValues(
     codexAuthJsonText,
     codexConfigTomlText
@@ -2646,9 +2611,6 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexAuthJsonText,
     codexConfigTomlText,
     openCodeAuthJsonText,
-    openClawGatewayUrl: openClawImportant.gatewayUrl,
-    openClawGatewayToken: openClawImportant.gatewayToken,
-    openClawSessionKey: openClawImportant.sessionKey,
     clineProvider: clineImportant.provider,
     clineApiKey: clineImportant.apiKey,
     clineModel: clineImportant.model,
@@ -4102,10 +4064,7 @@ export function AcpAgentSettings() {
       // so the backend merge_json_values can delete them from disk.
       let configForPersist =
         agentType === "open_code" && !normalizedConfig ? "{}" : normalizedConfig
-      const usesMerge =
-        agentType === "claude_code" ||
-        agentType === "gemini" ||
-        agentType === "open_claw"
+      const usesMerge = agentType === "claude_code" || agentType === "gemini"
       if (usesMerge && configForPersist) {
         const originalAgent = agents.find((a) => a.agent_type === agentType)
         const originalConfig = originalAgent?.config_json
@@ -5480,35 +5439,6 @@ export function AcpAgentSettings() {
       }))
     },
     [selectedAgent, selectedDraft, t, updateSelectedDraft]
-  )
-
-  const handleOpenClawFieldChange = useCallback(
-    (
-      key: "openClawGatewayUrl" | "openClawGatewayToken" | "openClawSessionKey",
-      value: string
-    ) => {
-      if (
-        !selectedAgent ||
-        !selectedDraft ||
-        selectedAgent.agent_type !== "open_claw"
-      )
-        return
-
-      const envKeyMap: Record<string, string> = {
-        openClawGatewayUrl: OPENCLAW_ENV_KEYS.gatewayUrl,
-        openClawGatewayToken: OPENCLAW_ENV_KEYS.gatewayToken,
-        openClawSessionKey: OPENCLAW_ENV_KEYS.sessionKey,
-      }
-
-      updateSelectedDraft((current) => ({
-        ...current,
-        [key]: value,
-        envText: patchEnvText(current.envText, {
-          [envKeyMap[key]]: value,
-        }),
-      }))
-    },
-    [selectedAgent, selectedDraft, updateSelectedDraft]
   )
 
   const handleHermesFieldChange = useCallback(
@@ -8860,152 +8790,6 @@ supports_websockets = true`}
                           <>
                             <Save className="h-3.5 w-3.5" />
                             {t("actions.saveClineConfig")}
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                  </div>
-                ) : selectedAgent.agent_type === "open_claw" ? (
-                  <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-                    <div>
-                      <label className="text-xs font-medium">
-                        {t("openClaw.gatewayConfig")}
-                      </label>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
-                        {t("openClaw.gatewayDescription")}
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        Gateway URL
-                      </label>
-                      <Input
-                        value={selectedDraft.openClawGatewayUrl}
-                        onChange={(event) => {
-                          handleOpenClawFieldChange(
-                            "openClawGatewayUrl",
-                            event.target.value
-                          )
-                        }}
-                        placeholder="wss://gateway-host:18789"
-                      />
-                      <p className="text-[11px] text-muted-foreground">
-                        {t("openClaw.gatewayUrlHint")}
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        Gateway Token
-                      </label>
-                      <div className="flex items-center gap-2">
-                        <Input
-                          type={
-                            showApiKeys[selectedAgent.agent_type]
-                              ? "text"
-                              : "password"
-                          }
-                          value={selectedDraft.openClawGatewayToken}
-                          onChange={(event) => {
-                            handleOpenClawFieldChange(
-                              "openClawGatewayToken",
-                              event.target.value
-                            )
-                          }}
-                          placeholder={t("openClaw.gatewayTokenPlaceholder")}
-                        />
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setShowApiKeys((prev) => ({
-                              ...prev,
-                              [selectedAgent.agent_type]:
-                                !prev[selectedAgent.agent_type],
-                            }))
-                          }}
-                          title={
-                            showApiKeys[selectedAgent.agent_type]
-                              ? t("actions.hideToken")
-                              : t("actions.showToken")
-                          }
-                        >
-                          {showApiKeys[selectedAgent.agent_type] ? (
-                            <EyeOff className="h-3.5 w-3.5" />
-                          ) : (
-                            <Eye className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
-                      </div>
-                      <p className="text-[11px] text-muted-foreground">
-                        {t("openClaw.gatewayTokenHint")}
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[11px] text-muted-foreground">
-                        Session Key
-                      </label>
-                      <Input
-                        value={selectedDraft.openClawSessionKey}
-                        onChange={(event) => {
-                          handleOpenClawFieldChange(
-                            "openClawSessionKey",
-                            event.target.value
-                          )
-                        }}
-                        placeholder="agent:main:main"
-                      />
-                      <p className="text-[11px] text-muted-foreground">
-                        {t("openClaw.sessionKeyHint")}
-                      </p>
-                    </div>
-
-                    <div className="flex items-center justify-end gap-2">
-                      <Button
-                        size="sm"
-                        onClick={() => {
-                          Promise.all([
-                            persistEnv(
-                              selectedAgent.agent_type,
-                              selectedDraft.enabled,
-                              selectedDraft.envText,
-                              selectedDraft.modelProviderId
-                            ),
-                            persistConfig(
-                              selectedAgent.agent_type,
-                              selectedDraft.configText
-                            ),
-                          ])
-                            .then(() => {
-                              toast.success(t("toasts.openClawSaved"), {
-                                description: t("toasts.configSavedHint"),
-                              })
-                            })
-                            .catch((err) => {
-                              console.error(
-                                "[Settings] save openclaw config failed:",
-                                err
-                              )
-                              const message = toErrorMessage(err)
-                              toast.error(t("toasts.saveOpenClawFailed"), {
-                                description: message,
-                              })
-                            })
-                        }}
-                        disabled={selectedIsSavingEnv || selectedIsSavingConfig}
-                      >
-                        {selectedIsSavingEnv || selectedIsSavingConfig ? (
-                          <>
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            {t("actions.saving")}
-                          </>
-                        ) : (
-                          <>
-                            <Save className="h-3.5 w-3.5" />
-                            {t("actions.saveOpenClawConfig")}
                           </>
                         )}
                       </Button>

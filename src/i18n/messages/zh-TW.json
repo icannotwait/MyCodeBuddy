@@ -389,7 +389,6 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
       "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
@@ -560,7 +559,6 @@
       "saveCodexConfig": "儲存 Codex 配置",
       "saveGeminiConfig": "儲存 Gemini 配置",
       "saveOpenCodeConfig": "儲存 OpenCode 配置",
-      "saveOpenClawConfig": "儲存 OpenClaw 配置",
       "saveConfigManagement": "儲存配置管理",
       "saveCurrentProvider": "儲存目前 Provider",
       "showApiKey": "顯示 API Key",
@@ -708,14 +706,6 @@
       "refreshCatalog": "重新整理目錄",
       "reasoningBadge": "推理",
       "contextWindow": "上下文視窗"
-    },
-    "openClaw": {
-      "gatewayConfig": "Gateway 配置",
-      "gatewayDescription": "配置 OpenClaw Gateway 連線資訊。支援本地或遠端 Gateway。",
-      "gatewayUrlHint": "留空則使用 openclaw 本地配置的 gateway.remote.url。",
-      "gatewayTokenPlaceholder": "Gateway 認證 Token",
-      "gatewayTokenHint": "建議使用 token-file 取代明文 Token，可透過 openclaw 命令列配置。",
-      "sessionKeyHint": "可選。指定 Gateway Session Key，留空則自動分配隔離會話。"
     },
     "hermes": {
       "configManagement": "Hermes 配置",
@@ -881,8 +871,6 @@
       "openCodeConfigSynced": "OpenCode 配置與認證 JSON 已同步儲存。",
       "openCodeSaved": "OpenCode 配置已儲存",
       "saveOpenCodeFailed": "儲存 OpenCode 配置失敗",
-      "openClawSaved": "OpenClaw 配置已儲存",
-      "saveOpenClawFailed": "儲存 OpenClaw 配置失敗",
       "configSaved": "配置已儲存",
       "configSavedHint": "已有會話需要重新打開才能生效",
       "saveConfigManagementFailed": "儲存配置管理失敗",

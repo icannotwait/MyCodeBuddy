@@ -4301,11 +4301,6 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".gemini/skills", ".agents/skills"],
         }),
-        AgentType::OpenClaw => Some(SkillStorageSpec {
-            kind: SkillStorageKind::SkillDirectoryOnly,
-            global_dirs: vec![home_dir_or_default().join(".openclaw").join("skills")],
-            project_rel_dirs: vec!["skills"],
-        }),
         AgentType::Cline => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![
@@ -4965,9 +4960,6 @@ fn cascade_update_agent_config(
                 serde_json::to_string(&patch).map_err(|e| AcpError::protocol(e.to_string()))?;
             persist_agent_local_config_json(agent_type, Some(&patch_str))?;
         }
-        AgentType::OpenClaw => {
-            // agent_local_config_path returns None for OpenClaw — no-op
-        }
         AgentType::Hermes => {
             // Hermes self-manages credentials in ~/.hermes/.env via
             // `hermes model` / `hermes setup`; codeg writes no provider creds.
@@ -5200,8 +5192,8 @@ pub async fn acp_preflight(
 }
 
 /// Resolve the full runtime env every ACP spawn should receive — settings
-/// override, model provider credentials, git credential helper, OpenClaw
-/// reset flag. Returns `AcpError::protocol("...disabled in settings")` when
+/// override, model provider credentials and git credential helper. Returns
+/// `AcpError::protocol("...disabled in settings")` when
 /// the user has disabled the agent.
 ///
 /// This is the **single source of truth** for "what env does an agent
@@ -5222,7 +5214,7 @@ pub async fn acp_preflight(
 pub(crate) async fn build_session_runtime_env(
     db: &AppDatabase,
     agent_type: AgentType,
-    session_id: Option<&str>,
+    _session_id: Option<&str>,
     data_dir: &Path,
 ) -> Result<BTreeMap<String, String>, AcpError> {
     let setting = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
@@ -5256,20 +5248,7 @@ pub(crate) async fn build_session_runtime_env(
         }
     }
 
-    if agent_type == AgentType::OpenClaw && session_id.is_none() {
-        runtime_env.insert("OPENCLAW_RESET_SESSION".into(), "1".into());
-    }
-
     Ok(runtime_env)
-}
-
-/// Per-launch env keys that vary by session/run but don't represent user
-/// config, so they're excluded from the config fingerprint. Without this, a
-/// session-id-derived value would flip the fingerprint the moment a real
-/// session id is assigned and make every session look "stale". Currently only
-/// OpenClaw's reset flag (set iff `session_id` is None at spawn).
-fn is_volatile_fingerprint_key(key: &str) -> bool {
-    key == "OPENCLAW_RESET_SESSION"
 }
 
 /// Fingerprint the effective config a spawned agent process is locked to: the
@@ -5288,9 +5267,6 @@ pub(crate) fn fingerprint_config(
     let mut hasher = Sha256::new();
     // BTreeMap iterates in sorted key order → deterministic across calls.
     for (k, v) in runtime_env {
-        if is_volatile_fingerprint_key(k) {
-            continue;
-        }
         hasher.update(k.as_bytes());
         hasher.update([0u8]);
         hasher.update(v.as_bytes());
@@ -6355,7 +6331,7 @@ pub(crate) async fn acp_update_agent_config_core(
         return Ok(());
     }
 
-    // Claude Code, Gemini, OpenClaw — write config JSON to local file without merging env
+    // Claude Code and Gemini — write config JSON to local file without merging env
     let local_patch_value = config_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -8201,12 +8177,6 @@ wire_api = "chat"
         env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
         assert_ne!(fp1, fingerprint_config(agent, &env_changed));
 
-        // The per-launch volatile key is excluded — adding it must NOT change
-        // the fingerprint (otherwise OpenClaw would look stale once a real
-        // session id is assigned and the reset flag drops).
-        let mut env_volatile = env.clone();
-        env_volatile.insert("OPENCLAW_RESET_SESSION".to_string(), "1".to_string());
-        assert_eq!(fp1, fingerprint_config(agent, &env_volatile));
     }
 
     #[tokio::test]

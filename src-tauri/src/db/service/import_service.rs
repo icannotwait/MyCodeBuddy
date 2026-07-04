@@ -15,7 +15,6 @@ use crate::parsers::gemini::GeminiParser;
 use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
 use crate::parsers::pi::PiParser;
-use crate::parsers::openclaw::OpenClawParser;
 use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::{path_eq_for_matching, AgentParser};
 
@@ -37,7 +36,6 @@ pub async fn import_local_conversations(
             (AgentType::Codex, Box::new(CodexParser::new())),
             (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
             (AgentType::Gemini, Box::new(GeminiParser::new())),
-            (AgentType::OpenClaw, Box::new(OpenClawParser::new())),
             (AgentType::Cline, Box::new(ClineParser::new())),
             (AgentType::Hermes, Box::new(HermesParser::new())),
             (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),

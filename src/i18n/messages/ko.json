@@ -389,7 +389,6 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
       "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
@@ -560,7 +559,6 @@
       "saveCodexConfig": "Codex 설정 저장",
       "saveGeminiConfig": "Gemini 설정 저장",
       "saveOpenCodeConfig": "OpenCode 설정 저장",
-      "saveOpenClawConfig": "OpenClaw 설정 저장",
       "saveConfigManagement": "구성 관리 저장",
       "saveCurrentProvider": "현재 Provider 저장",
       "showApiKey": "API 키 보기",
@@ -708,14 +706,6 @@
       "refreshCatalog": "카탈로그 새로고침",
       "reasoningBadge": "추론",
       "contextWindow": "컨텍스트 윈도우"
-    },
-    "openClaw": {
-      "gatewayConfig": "Gateway 구성",
-      "gatewayDescription": "OpenClaw Gateway 연결을 구성합니다. 로컬 또는 원격 gateway를 지원합니다.",
-      "gatewayUrlHint": "비워두면 로컬 openclaw 설정의 gateway.remote.url을 사용합니다.",
-      "gatewayTokenPlaceholder": "Gateway 인증 토큰",
-      "gatewayTokenHint": "가능하면 평문 토큰 대신 token-file을 사용하세요. openclaw CLI로 설정하세요.",
-      "sessionKeyHint": "선택 사항입니다. gateway 세션 키를 지정합니다. 비워두면 격리된 세션이 자동 할당됩니다."
     },
     "hermes": {
       "configManagement": "Hermes 구성",
@@ -881,8 +871,6 @@
       "openCodeConfigSynced": "OpenCode config와 auth JSON이 동기화되었습니다.",
       "openCodeSaved": "OpenCode 설정 저장됨",
       "saveOpenCodeFailed": "OpenCode 설정 저장 실패",
-      "openClawSaved": "OpenClaw 설정 저장됨",
-      "saveOpenClawFailed": "OpenClaw 설정 저장 실패",
       "configSaved": "구성이 저장되었습니다",
       "configSavedHint": "기존 세션은 다시 열어야 적용됩니다",
       "saveConfigManagementFailed": "구성 관리 저장 실패",

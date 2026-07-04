@@ -389,7 +389,6 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
       "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
@@ -560,7 +559,6 @@
       "saveCodexConfig": "Enregistrer la config Codex",
       "saveGeminiConfig": "Enregistrer la config Gemini",
       "saveOpenCodeConfig": "Enregistrer la config OpenCode",
-      "saveOpenClawConfig": "Enregistrer la config OpenClaw",
       "saveConfigManagement": "Enregistrer la gestion de config",
       "saveCurrentProvider": "Enregistrer le provider actuel",
       "showApiKey": "Afficher la clé API",
@@ -708,14 +706,6 @@
       "refreshCatalog": "Actualiser le catalogue",
       "reasoningBadge": "raisonnement",
       "contextWindow": "Fenêtre de contexte"
-    },
-    "openClaw": {
-      "gatewayConfig": "Configuration Gateway",
-      "gatewayDescription": "Configure la connexion OpenClaw Gateway. Prend en charge une gateway locale ou distante.",
-      "gatewayUrlHint": "Laisser vide pour utiliser gateway.remote.url depuis la configuration locale openclaw.",
-      "gatewayTokenPlaceholder": "Token d’authentification Gateway",
-      "gatewayTokenHint": "Utilisez token-file plutôt qu’un token en clair si possible ; configurez-le via le CLI openclaw.",
-      "sessionKeyHint": "Optionnel. Spécifie la session key de la gateway ; laisser vide pour auto-attribuer une session isolée."
     },
     "hermes": {
       "configManagement": "Configuration de Hermes",
@@ -881,8 +871,6 @@
       "openCodeConfigSynced": "La configuration OpenCode et auth JSON ont été synchronisés.",
       "openCodeSaved": "Configuration OpenCode enregistrée",
       "saveOpenCodeFailed": "Échec de l’enregistrement de la configuration OpenCode",
-      "openClawSaved": "Configuration OpenClaw enregistrée",
-      "saveOpenClawFailed": "Échec de l’enregistrement de la configuration OpenClaw",
       "configSaved": "Configuration enregistrée",
       "configSavedHint": "Les sessions existantes doivent être rouvertes pour prendre effet",
       "saveConfigManagementFailed": "Échec de l’enregistrement de la gestion de configuration",

@@ -61,9 +61,9 @@ describe("parseCodegReferenceUri", () => {
   })
 
   it("never splits an agent type on its first underscore", () => {
-    // claude_code / open_code / open_claw contain underscores; a naive first-`_`
-    // split would yield "claude" / "open". The whole `<type>_<external_id>` is
-    // the id and the full type is recovered by prefix match.
+    // claude_code / open_code contain underscores; a naive first-`_` split would
+    // yield "claude" / "open". The whole `<type>_<external_id>` is the id and
+    // the full type is recovered by prefix match.
     expect(
       parseCodegReferenceUri("codeg://session/claude_code_sess-9", "")
     ).toMatchObject({
@@ -73,9 +73,6 @@ describe("parseCodegReferenceUri", () => {
     expect(
       parseCodegReferenceUri("codeg://session/open_code_x", "")?.meta
     ).toEqual({ agentType: "open_code" })
-    expect(
-      parseCodegReferenceUri("codeg://session/open_claw_y", "")?.meta
-    ).toEqual({ agentType: "open_claw" })
   })
 
   it("treats a legacy numeric session id as opaque (no agent icon)", () => {

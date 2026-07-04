@@ -5,7 +5,6 @@ pub mod codex;
 pub mod gemini;
 pub mod hermes;
 pub mod kimi_code;
-pub mod openclaw;
 pub mod opencode;
 pub mod pi;
 
@@ -50,7 +49,7 @@ impl ExternalSource {
 /// environment (honoring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, etc.). Sources
 /// whose root does not exist are still listed; callers skip missing roots.
 pub fn external_transcript_sources() -> Vec<ExternalSource> {
-    let mut sources = vec![
+    let sources = vec![
         ExternalSource {
             agent: "claude",
             root: claude::resolve_claude_config_dir().join("projects"),
@@ -127,14 +126,6 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             include_top: None,
         },
     ];
-    if let Some(home) = dirs::home_dir() {
-        sources.push(ExternalSource {
-            agent: "openclaw",
-            root: home.join(".openclaw").join("agents"),
-            is_file: false,
-            include_top: None,
-        });
-    }
     sources
 }
 

@@ -43,7 +43,6 @@ const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<AgentType>([
   "open_code",
   "gemini",
   "cline",
-  "open_claw",
   "hermes",
   "code_buddy",
   "kimi_code",

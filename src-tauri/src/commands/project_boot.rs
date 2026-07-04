@@ -263,16 +263,15 @@ pub async fn create_shadcn_project(
 // HyperFrames (HTML-to-video) launcher
 // ---------------------------------------------------------------------------
 
-/// codeg's six supported agents, mapped to the `skills` CLI's `--agent` ids.
+/// codeg's supported agents, mapped to the `skills` CLI's `--agent` ids.
 /// The launcher only ever targets these agents (never the CLI's full 55+ agent
 /// universe via `--all`/`--agent '*'`), so installs stay scoped to tools codeg
 /// can actually orchestrate. Also the allowlist that validates incoming ids.
-const HYPERFRAMES_SKILL_AGENTS: [&str; 6] = [
+const HYPERFRAMES_SKILL_AGENTS: [&str; 5] = [
     "claude-code",
     "codex",
     "opencode",
     "gemini-cli",
-    "openclaw",
     "cline",
 ];
 
@@ -302,7 +301,6 @@ fn agent_type_for_skill_id(skill_agent: &str) -> Option<AgentType> {
         "codex" => AgentType::Codex,
         "opencode" => AgentType::OpenCode,
         "gemini-cli" => AgentType::Gemini,
-        "openclaw" => AgentType::OpenClaw,
         "cline" => AgentType::Cline,
         "hermes" => AgentType::Hermes,
         _ => return None,

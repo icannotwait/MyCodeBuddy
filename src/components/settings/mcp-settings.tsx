@@ -86,10 +86,6 @@ const APP_OPTIONS: { value: McpAppType; label: string }[] = [
   { value: "claude_code", label: "Claude Code" },
   { value: "codex", label: "Codex CLI" },
   { value: "gemini", label: "Gemini CLI" },
-  // OpenClaw 不接受 ACP 线缆上的 MCP 服务器条目（后端 registry.rs supports_mcp=false
-  // 会让其 mcpServers 恒为空 []，否则带条目时 OpenClaw 会在建会话阶段报错），按产品
-  // 决策不作为可分配目标。McpAppType 仍保留 "open_claw" 以兼容回读存量配置，
-  // saveLocalServer 也会保留既有 open_claw 分配（不静默清除）。
   { value: "open_code", label: "OpenCode" },
   { value: "cline", label: "Cline" },
   { value: "hermes", label: "Hermes Agent" },
@@ -253,7 +249,6 @@ function appsToDraft(apps: McpAppType[]): Record<McpAppType, boolean> {
     claude_code: appSet.has("claude_code"),
     codex: appSet.has("codex"),
     gemini: appSet.has("gemini"),
-    open_claw: appSet.has("open_claw"),
     open_code: appSet.has("open_code"),
     cline: appSet.has("cline"),
     hermes: appSet.has("hermes"),
@@ -594,17 +589,7 @@ export function McpSettings() {
       return
     }
 
-    // Apps the user can see and toggle in the UI.
-    const visibleApps = selectedAppsFromDraft(localAppsDraft)
-    // Carry forward assignments for agents no longer offered in the UI (e.g.
-    // OpenClaw, which no longer accepts MCP over the ACP wire). We never add
-    // these, but must not silently strip a legacy assignment from a server the
-    // user is editing — that would destroy existing on-disk config and could
-    // wedge an OpenClaw-only server into an unsavable "no apps" state.
-    const hiddenLegacyApps = selectedLocal.apps.filter(
-      (app) => !APP_OPTIONS.some((option) => option.value === app)
-    )
-    const apps = normalizeApps([...visibleApps, ...hiddenLegacyApps])
+    const apps = normalizeApps(selectedAppsFromDraft(localAppsDraft))
     if (apps.length === 0) {
       toast.error(t("toasts.selectAtLeastOneApp"))
       return

@@ -1097,7 +1097,6 @@ fn supported_agents() -> Vec<AgentType> {
         AgentType::Codex,
         AgentType::OpenCode,
         AgentType::Gemini,
-        AgentType::OpenClaw,
         AgentType::Cline,
         AgentType::Hermes,
         AgentType::CodeBuddy,
