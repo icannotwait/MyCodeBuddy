@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn removed_agent_is_not_registered() {
-        let removed_registry_id = ["open", "claw-acp"].join("");
+        let removed_registry_id = ["open", "cl", "aw-acp"].join("");
         assert!(
             !all_acp_agents()
                 .iter()

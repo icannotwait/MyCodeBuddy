@@ -159,7 +159,7 @@ mod tauri_app {
         // Skipped in debug builds so a locally-built `cargo run` instance
         // can run alongside an installed release build of codeg during
         // development. Debug desktop builds use an isolated SQLite file, but
-        // they still share other `app.codeg` data-dir artifacts with release.
+        // they still share other `app.mycodebuddy` data-dir artifacts with release.
         #[cfg(not(debug_assertions))]
         let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             windows::show_main_window(app);

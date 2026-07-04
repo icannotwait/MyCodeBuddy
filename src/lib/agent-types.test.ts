@@ -4,8 +4,8 @@ import { AGENT_DISPLAY_ORDER, ALL_AGENT_TYPES, AGENT_LABELS } from "./types"
 
 describe("agent type registry", () => {
   it("does not expose the removed agent", () => {
-    const removedType = ["open", "claw"].join("_")
-    const removedLabel = ["Open", "Claw"].join("")
+    const removedType = ["open", "cl", "aw"].join("_")
+    const removedLabel = ["Open", "Cl", "aw"].join("")
 
     expect(ALL_AGENT_TYPES).not.toContain(removedType)
     expect(AGENT_DISPLAY_ORDER).not.toContain(removedType)

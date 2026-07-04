@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "codeg",
+  "productName": "MyCodeBuddy",
+  "mainBinaryName": "MyCodeBuddy",
   "version": "0.18.8",
-  "identifier": "app.codeg",
+  "identifier": "app.mycodebuddy",
   "build": {
     "beforeDevCommand": "pnpm tauri:before-dev",
     "devUrl": "http://localhost:3000",

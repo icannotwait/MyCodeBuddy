@@ -16,7 +16,7 @@ static TRASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn cache_dir() -> Result<PathBuf, AcpError> {
     let base = dirs::cache_dir()
         .ok_or_else(|| AcpError::DownloadFailed("cannot determine cache directory".into()))?;
-    Ok(base.join("app.codeg").join("acp-binaries"))
+    Ok(base.join("app.mycodebuddy").join("acp-binaries"))
 }
 
 /// Directory where codeg caches a managed `uv` toolchain (`uv` + `uvx`),

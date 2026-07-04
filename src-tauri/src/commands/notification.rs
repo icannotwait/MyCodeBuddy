@@ -15,7 +15,7 @@ pub async fn send_notification(
         let app_id = if tauri::is_dev() {
             "com.apple.Terminal"
         } else {
-            "app.codeg"
+            "app.mycodebuddy"
         };
         let _ = mac_notification_sys::set_application(app_id);
 

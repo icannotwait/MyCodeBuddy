@@ -9783,7 +9783,7 @@ wire_api = "chat"
         // leading double-quoted string makes PowerShell parse the line as a
         // string expression and fail with "Unexpected token" instead of running
         // uvx; an unquoted bare path runs in both cmd and PowerShell.
-        let path = r"C:\Users\Administrator\AppData\Local\app.codeg\acp-binaries\uv-tool\windows-x86_64\uvx.exe";
+        let path = r"C:\Users\Administrator\AppData\Local\app.mycodebuddy\acp-binaries\uv-tool\windows-x86_64\uvx.exe";
         assert_eq!(shell_quote_arg_for(path, true), path);
         // On POSIX the backslash is the escape char, so it still forces quoting.
         assert_eq!(shell_quote_arg_for(path, false), format!("'{path}'"));

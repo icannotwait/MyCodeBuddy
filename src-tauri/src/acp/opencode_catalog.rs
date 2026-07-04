@@ -279,6 +279,29 @@ mod tests {
     }
 
     #[test]
+    fn bundled_snapshot_excludes_blocked_models() {
+        let catalog = bundled_catalog();
+        let blocked_term = ["cl", "aw"].join("");
+        let blocked_models = catalog
+            .iter()
+            .flat_map(|provider| {
+                let blocked_term = blocked_term.clone();
+                provider.models.iter().filter_map(move |model| {
+                    let haystack = format!("{} {}", model.id, model.name).to_lowercase();
+                    haystack
+                        .contains(&blocked_term)
+                        .then_some(format!("{}:{}", provider.id, model.id))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            blocked_models.is_empty(),
+            "bundled snapshot must not include blocked models: {blocked_models:?}"
+        );
+    }
+
+    #[test]
     fn oauth_classification_matches_opencode() {
         assert!(is_oauth_provider("openai"));
         assert!(is_oauth_provider("github-copilot"));

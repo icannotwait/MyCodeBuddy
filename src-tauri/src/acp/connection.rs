@@ -258,13 +258,13 @@ impl AgentConnection {
 /// Directory handed to codex-acp via `APP_SERVER_LOGS` so its adapter-side
 /// (ACP ↔ Codex app-server translation) logs land on disk for support.
 ///
-/// Roots under the same `<cache>/app.codeg` tree as
+/// Roots under the same `<cache>/app.mycodebuddy` tree as
 /// [`binary_cache::cache_dir`] for consistency. Returns `None` — and the
 /// caller injects nothing — when the system cache dir is unknown or the
 /// directory can't be created: diagnostics must never block a connection.
 fn codex_app_server_log_dir() -> Option<String> {
     let dir = dirs::cache_dir()?
-        .join("app.codeg")
+        .join("app.mycodebuddy")
         .join("acp-logs")
         .join("codex-acp");
     std::fs::create_dir_all(&dir).ok()?;
@@ -1220,7 +1220,7 @@ pub struct DelegationInjection {
 ///    binary without touching the install layout.
 /// 2. Sibling of the running executable — the production layout for every
 ///    shipping target. Tauri sidecar (`Contents/MacOS/codeg-mcp` on macOS,
-///    next to `codeg.exe` on Windows, next to the unix binary on Linux
+///    next to the desktop executable on Windows and the unix binary on Linux
 ///    deb/rpm), `install.sh`/`install.ps1` (drops `codeg-mcp` next to
 ///    `codeg-server`), Docker image (`/usr/local/bin/codeg-mcp` next to
 ///    `codeg-server`), and `cargo build` dev output
