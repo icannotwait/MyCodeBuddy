@@ -34,7 +34,7 @@ export function useUiFont() {
   }
 }
 
-/** 编辑器字体（Monaco）：含字号与连字。stack 已解析。 */
+/** 编辑器字体（Monaco）：含字号、连字与自动换行。stack 已解析。 */
 export function useEditorFont() {
   const {
     editorFont,
@@ -43,6 +43,8 @@ export function useEditorFont() {
     setEditorFontSize,
     editorLigatures,
     setEditorLigatures,
+    editorWordWrap,
+    setEditorWordWrap,
   } = useAppearance()
   return {
     editorFont,
@@ -52,6 +54,8 @@ export function useEditorFont() {
     setEditorFontSize,
     editorLigatures,
     setEditorLigatures,
+    editorWordWrap,
+    setEditorWordWrap,
   }
 }
 

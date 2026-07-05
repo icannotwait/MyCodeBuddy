@@ -107,6 +107,7 @@
       "fontSize": "Schriftgröße",
       "ligatures": "Ligaturen aktivieren",
       "ligaturesUnavailable": "Diese Schriftart hat keine Ligaturen",
+      "wordWrap": "Zeilenumbruch aktivieren",
       "terminalLigaturesHint": "Terminal-Ligaturen gelten nur für mitgelieferte Programmierschriftarten.",
       "preview": "Vorschau"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "Zum Chat hinzufügen",
       "addSelectionToChatDone": "{label} zur Unterhaltung hinzugefügt",
       "addFileToChat": "Datei zum Chat hinzufügen",
+      "toggleWordWrap": "Zeilenumbruch umschalten",
       "addFileToChatDone": "{label} zur Unterhaltung hinzugefügt",
       "viewDiff": "Diff anzeigen",
       "openFile": "Datei öffnen",

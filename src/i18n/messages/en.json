@@ -107,6 +107,7 @@
       "fontSize": "Font size",
       "ligatures": "Enable font ligatures",
       "ligaturesUnavailable": "This font has no ligatures",
+      "wordWrap": "Enable word wrap",
       "terminalLigaturesHint": "Terminal ligatures apply only to bundled coding fonts.",
       "preview": "Preview"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "Add to Chat",
       "addSelectionToChatDone": "Added {label} to the conversation",
       "addFileToChat": "Add File to Chat",
+      "toggleWordWrap": "Toggle Word Wrap",
       "addFileToChatDone": "Added {label} to the conversation",
       "viewDiff": "View Diff",
       "openFile": "Open File",

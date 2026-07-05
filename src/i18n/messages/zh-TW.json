@@ -107,6 +107,7 @@
       "fontSize": "字級",
       "ligatures": "啟用連字",
       "ligaturesUnavailable": "此字型不含連字",
+      "wordWrap": "啟用自動換行",
       "terminalLigaturesHint": "終端機連字僅對內建程式字型生效。",
       "preview": "預覽"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "加入對話",
       "addSelectionToChatDone": "已將 {label} 加入對話",
       "addFileToChat": "新增檔案到對話",
+      "toggleWordWrap": "切換自動換行",
       "addFileToChatDone": "已將 {label} 加入對話",
       "viewDiff": "查看差異",
       "openFile": "打開檔案",

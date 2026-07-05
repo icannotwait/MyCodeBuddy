@@ -107,6 +107,7 @@
       "fontSize": "حجم الخط",
       "ligatures": "تفعيل الحروف المتصلة",
       "ligaturesUnavailable": "هذا الخط لا يحتوي على حروف متصلة",
+      "wordWrap": "تفعيل التفاف النص",
       "terminalLigaturesHint": "تنطبق الحروف المتصلة في الطرفية على خطوط البرمجة المضمّنة فقط.",
       "preview": "معاينة"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "إضافة إلى المحادثة",
       "addSelectionToChatDone": "تمت إضافة {label} إلى المحادثة",
       "addFileToChat": "إضافة الملف إلى المحادثة",
+      "toggleWordWrap": "تبديل التفاف النص",
       "addFileToChatDone": "تمت إضافة {label} إلى المحادثة",
       "viewDiff": "عرض Diff",
       "openFile": "فتح الملف",

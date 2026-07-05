@@ -30,6 +30,7 @@ import {
   STORAGE_KEY_EDITOR_FONT_CUSTOM,
   STORAGE_KEY_EDITOR_FONT_SIZE,
   STORAGE_KEY_EDITOR_LIGATURES,
+  STORAGE_KEY_EDITOR_WORD_WRAP,
   STORAGE_KEY_TERMINAL_FONT,
   STORAGE_KEY_TERMINAL_FONT_CUSTOM,
   STORAGE_KEY_TERMINAL_FONT_SIZE,
@@ -74,6 +75,9 @@ type AppearanceContextValue = {
   setTerminalFontSize: (size: FontSize) => void
   editorLigatures: boolean
   setEditorLigatures: (on: boolean) => void
+  /** 编辑器自动换行（作用于代码编辑器 Monaco 的 wordWrap 选项） */
+  editorWordWrap: boolean
+  setEditorWordWrap: (on: boolean) => void
   terminalLigatures: boolean
   setTerminalLigatures: (on: boolean) => void
 }
@@ -201,6 +205,9 @@ export function AppearanceProvider({
   const [editorLigatures, setEditorLigaturesState] = useState<boolean>(() =>
     readBool(STORAGE_KEY_EDITOR_LIGATURES, false)
   )
+  const [editorWordWrap, setEditorWordWrapState] = useState<boolean>(() =>
+    readBool(STORAGE_KEY_EDITOR_WORD_WRAP, false)
+  )
   const [terminalLigatures, setTerminalLigaturesState] = useState<boolean>(() =>
     readBool(STORAGE_KEY_TERMINAL_LIGATURES, false)
   )
@@ -256,6 +263,11 @@ export function AppearanceProvider({
     persist(STORAGE_KEY_EDITOR_LIGATURES, on ? "1" : "0")
   }, [])
 
+  const setEditorWordWrap = useCallback((on: boolean) => {
+    setEditorWordWrapState(on)
+    persist(STORAGE_KEY_EDITOR_WORD_WRAP, on ? "1" : "0")
+  }, [])
+
   const setTerminalLigatures = useCallback((on: boolean) => {
     setTerminalLigaturesState(on)
     persist(STORAGE_KEY_TERMINAL_LIGATURES, on ? "1" : "0")
@@ -295,6 +307,7 @@ export function AppearanceProvider({
       STORAGE_KEY_EDITOR_FONT_CUSTOM,
       STORAGE_KEY_EDITOR_FONT_SIZE,
       STORAGE_KEY_EDITOR_LIGATURES,
+      STORAGE_KEY_EDITOR_WORD_WRAP,
       STORAGE_KEY_TERMINAL_FONT,
       STORAGE_KEY_TERMINAL_FONT_CUSTOM,
       STORAGE_KEY_TERMINAL_FONT_SIZE,
@@ -326,6 +339,7 @@ export function AppearanceProvider({
         readFontSize(STORAGE_KEY_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FONT_SIZE)
       )
       setEditorLigaturesState(readBool(STORAGE_KEY_EDITOR_LIGATURES, false))
+      setEditorWordWrapState(readBool(STORAGE_KEY_EDITOR_WORD_WRAP, false))
       setTerminalLigaturesState(readBool(STORAGE_KEY_TERMINAL_LIGATURES, false))
       // 仅界面字体落到 --font-sans；编辑器/终端字体由各自组件读取 provider 状态后应用。
       document.documentElement.style.setProperty(
@@ -381,6 +395,8 @@ export function AppearanceProvider({
         setTerminalFontSize,
         editorLigatures,
         setEditorLigatures,
+        editorWordWrap,
+        setEditorWordWrap,
         terminalLigatures,
         setTerminalLigatures,
       }}

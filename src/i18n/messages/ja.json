@@ -107,6 +107,7 @@
       "fontSize": "フォントサイズ",
       "ligatures": "合字を有効にする",
       "ligaturesUnavailable": "このフォントには合字がありません",
+      "wordWrap": "折り返しを有効にする",
       "terminalLigaturesHint": "ターミナルの合字は内蔵のコーディングフォントにのみ適用されます。",
       "preview": "プレビュー"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "チャットに追加",
       "addSelectionToChatDone": "{label} を会話に追加しました",
       "addFileToChat": "ファイルをチャットに追加",
+      "toggleWordWrap": "折り返しの切り替え",
       "addFileToChatDone": "{label} を会話に追加しました",
       "viewDiff": "差分を見る",
       "openFile": "ファイルを開く",

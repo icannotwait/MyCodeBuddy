@@ -107,6 +107,7 @@
       "fontSize": "Taille de police",
       "ligatures": "Activer les ligatures",
       "ligaturesUnavailable": "Cette police n’a pas de ligatures",
+      "wordWrap": "Activer le retour à la ligne",
       "terminalLigaturesHint": "Les ligatures du terminal ne s’appliquent qu’aux polices de programmation intégrées.",
       "preview": "Aperçu"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "Ajouter au chat",
       "addSelectionToChatDone": "{label} ajouté à la conversation",
       "addFileToChat": "Ajouter le fichier au chat",
+      "toggleWordWrap": "Basculer le retour à la ligne",
       "addFileToChatDone": "{label} ajouté à la conversation",
       "viewDiff": "Voir le Diff",
       "openFile": "Ouvrir le fichier",

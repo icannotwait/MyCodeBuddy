@@ -1018,7 +1018,18 @@ export function FileWorkspacePanel() {
   const monacoRef = useRef<Monaco | null>(null)
   const editorTheme = useMonacoThemeSync()
   const { zoomLevel } = useZoomLevel()
-  const { editorFontStack, editorFontSize, editorLigatures } = useEditorFont()
+  const {
+    editorFontStack,
+    editorFontSize,
+    editorLigatures,
+    editorWordWrap,
+    setEditorWordWrap,
+  } = useEditorFont()
+  // The Alt+Z toggle action is registered once at mount, so it reads the live
+  // word-wrap preference through a ref to dodge a stale closure (same tactic as
+  // tRef / attachContextRef). `setEditorWordWrap` from context is stable.
+  const editorWordWrapRef = useRef(editorWordWrap)
+  const wordWrapActionRef = useRef<IDisposable | null>(null)
   const [editorMountVersion, setEditorMountVersion] = useState(0)
   const [cursorLine, setCursorLine] = useState(1)
   const [collapsedFiles, setCollapsedFiles] = useState<Record<string, boolean>>(
@@ -1153,6 +1164,8 @@ export function FileWorkspacePanel() {
       addToChatActionRef.current = null
       addFileToChatActionRef.current?.dispose()
       addFileToChatActionRef.current = null
+      wordWrapActionRef.current?.dispose()
+      wordWrapActionRef.current = null
       selectionListenerRef.current?.dispose()
       selectionListenerRef.current = null
       focusListenerRef.current?.dispose()
@@ -1166,6 +1179,36 @@ export function FileWorkspacePanel() {
       attachableKeyRef.current = null
     },
     []
+  )
+
+  // Register (or re-register) the word-wrap toggle. Re-registerable so the
+  // label can follow an in-app locale change — Monaco caches an action's label
+  // at registration time, and the editor outlives a tab switch. The handler
+  // reads the live preference through a ref, so re-registration only refreshes
+  // the label.
+  //
+  // Exposed BOTH as a right-click context-menu entry AND an Alt+Z keybinding
+  // (mirrors how the add-to-chat action pairs a menu item with its shortcut).
+  // The menu entry is the dependable path on macOS, where Alt is Option (⌥):
+  // ⌥Z only fires while the editor itself is focused and Option-letter combos
+  // are delivered unreliably through the webview (⌥Z otherwise inserts "Ω").
+  const registerWordWrapAction = useCallback(
+    (
+      editor: MonacoEditorNs.IStandaloneCodeEditor,
+      monaco: Monaco,
+      label: string
+    ) => {
+      wordWrapActionRef.current?.dispose()
+      wordWrapActionRef.current = editor.addAction({
+        id: "codeg.toggleWordWrap",
+        label,
+        keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.KeyZ],
+        contextMenuGroupId: "z_view",
+        contextMenuOrder: 1,
+        run: () => setEditorWordWrap(!editorWordWrapRef.current),
+      })
+    },
+    [setEditorWordWrap]
   )
 
   // Keep the activation refs + Monaco context key in sync with React state, and
@@ -1185,11 +1228,17 @@ export function FileWorkspacePanel() {
     }
   }, [t, activeAbsPath, activeFileTab?.title, activeSessionTabId, isAttachable])
 
+  // Keep the once-registered Alt+Z toggle action reading the live preference.
+  useEffect(() => {
+    editorWordWrapRef.current = editorWordWrap
+  }, [editorWordWrap])
+
   // Refresh the cached action label when the locale changes. The initial
   // registration happens in handleEditorMount (the editor isn't mounted yet on
   // first render); this only re-fires once the label string actually changes.
   const addSelectionLabel = t("addSelectionToChat")
   const addFileLabel = t("addFileToChat")
+  const toggleWordWrapLabel = t("toggleWordWrap")
   useEffect(() => {
     // The sync effect above runs first, so tRef.current is the fresh locale here
     // — refresh the (registration-cached) action labels and the live pill label.
@@ -1200,9 +1249,20 @@ export function FileWorkspacePanel() {
         addSelectionLabel,
         addFileLabel
       )
+      registerWordWrapAction(
+        editorRef.current,
+        monacoRef.current,
+        toggleWordWrapLabel
+      )
     }
     addToChatPillRef.current?.refreshLabel()
-  }, [addSelectionLabel, addFileLabel, registerAddToChatActions])
+  }, [
+    addSelectionLabel,
+    addFileLabel,
+    toggleWordWrapLabel,
+    registerAddToChatActions,
+    registerWordWrapAction,
+  ])
 
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const autoSaveGuardRef = useRef({
@@ -1446,6 +1506,16 @@ export function FileWorkspacePanel() {
         tRef.current("addSelectionToChat"),
         tRef.current("addFileToChat")
       )
+
+      // Alt+Z toggles the (global, persisted) word-wrap preference — mirrors VS
+      // Code's "View: Toggle Word Wrap". `wordWrap` is a controlled option, so
+      // flipping the preference re-renders and applies the change.
+      registerWordWrapAction(
+        editorInstance,
+        monaco,
+        tRef.current("toggleWordWrap")
+      )
+
       const pill = createAddToChatPill(
         monaco,
         () => addSelectionToChat(),
@@ -1499,6 +1569,7 @@ export function FileWorkspacePanel() {
     [
       addSelectionToChat,
       registerAddToChatActions,
+      registerWordWrapAction,
       teardownAddToChat,
       applyGitChangeDecorations,
       applyHiddenAreas,
@@ -2125,7 +2196,7 @@ export function FileWorkspacePanel() {
                 fontLigatures: editorLigatures,
                 lineNumbersMinChars,
                 lineDecorationsWidth: 10,
-                wordWrap: "off",
+                wordWrap: editorWordWrap ? "on" : "off",
                 scrollBeyondLastLine: false,
                 scrollBeyondLastColumn: 8,
                 renderLineHighlight: "line",

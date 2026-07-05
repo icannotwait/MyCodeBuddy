@@ -107,6 +107,7 @@
       "fontSize": "Tamaño de fuente",
       "ligatures": "Activar ligaduras",
       "ligaturesUnavailable": "Esta fuente no tiene ligaduras",
+      "wordWrap": "Activar ajuste de línea",
       "terminalLigaturesHint": "Las ligaduras del terminal solo se aplican a las fuentes de programación incluidas.",
       "preview": "Vista previa"
     }
@@ -1405,6 +1406,7 @@
       "addToChat": "Añadir al chat",
       "addSelectionToChatDone": "Se añadió {label} a la conversación",
       "addFileToChat": "Añadir archivo al chat",
+      "toggleWordWrap": "Alternar ajuste de línea",
       "addFileToChatDone": "Se añadió {label} a la conversación",
       "viewDiff": "Ver Diff",
       "openFile": "Abrir archivo",
