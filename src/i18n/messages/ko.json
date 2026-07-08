@@ -2273,7 +2273,7 @@
         "elapsedHours": "{value}시간",
         "elapsedMinutes": "{value}분",
         "elapsedSeconds": "{value}초",
-        "toolUseCount": "{count}개 도구 {count, plural, one {use} other {uses}}"
+        "toolUseCount": "도구 {count}회 사용"
       },
       "tool": {
         "parameters": "매개변수",

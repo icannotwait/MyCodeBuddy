@@ -2273,7 +2273,7 @@
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
-        "toolUseCount": "{count} 个工具 {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} 次工具呼叫"
       },
       "tool": {
         "parameters": "參數",

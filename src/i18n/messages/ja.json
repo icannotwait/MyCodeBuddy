@@ -2273,7 +2273,7 @@
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
-        "toolUseCount": "{count} 個のツール {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} 回のツール使用"
       },
       "tool": {
         "parameters": "パラメーター",

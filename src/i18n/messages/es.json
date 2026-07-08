@@ -2273,7 +2273,7 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "toolUseCount": "{count} herramienta {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count, plural, one {# uso de herramienta} other {# usos de herramienta}}"
       },
       "tool": {
         "parameters": "Parámetros",
