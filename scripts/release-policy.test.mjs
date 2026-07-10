@@ -9,6 +9,41 @@ import {
   readCargoVersion,
 } from "./release-policy.mjs"
 
+const validWindowsWorkflow = `
+name: Release MyCodeBuddy
+
+env:
+  RELEASE_REPOSITORY: icannotwait/MyCodeBuddy
+
+jobs:
+  verify:
+    steps:
+      - name: Verify fork repository
+        shell: bash
+        run: |
+          test "$GITHUB_REPOSITORY" = "icannotwait/MyCodeBuddy"
+
+  build-desktop:
+    strategy:
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - name: Windows ARM64
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: \${{ matrix.runner }}
+    steps:
+      - uses: tauri-apps/tauri-action@v0.6.1
+        with:
+          prerelease: false
+          args: --target \${{ matrix.target }} --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+`
+
 test("reads the package version from Cargo.toml", () => {
   assert.equal(
     readCargoVersion(
@@ -21,6 +56,10 @@ test("reads the package version from Cargo.toml", () => {
 test("requires the MyCodeBuddy version suffix", () => {
   assert.doesNotThrow(() => assertForkVersion("0.18.8-mycodebuddy.1"))
   assert.throws(() => assertForkVersion("0.18.8"), /mycodebuddy/)
+})
+
+test("requires a positive MyCodeBuddy version counter", () => {
+  assert.throws(() => assertForkVersion("0.18.8-mycodebuddy.0"), /positive/)
 })
 
 test("requires package Cargo Tauri and tag versions to match", () => {
@@ -55,16 +94,118 @@ test("finds upstream URLs in runtime-owned files", () => {
   )
 })
 
-test("requires Windows desktop targets and rejects non-Windows release jobs", () => {
-  const good = `
-    target: x86_64-pc-windows-msvc
-    target: aarch64-pc-windows-msvc
-    runner: windows-2022
-  `
-  assert.doesNotThrow(() => assertWindowsReleaseWorkflow(good))
+test("accepts the complete Windows release policy", () => {
+  assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
+})
+
+test("rejects every release target except the two Windows MSVC targets", () => {
+  for (const target of [
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "i686-pc-windows-msvc",
+  ]) {
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          `${validWindowsWorkflow}\n  target: ${target}\n`
+        ),
+      /unsupported release target/
+    )
+  }
   assert.throws(
-    () => assertWindowsReleaseWorkflow(`${good}\ntarget: x86_64-apple-darwin`),
-    /non-Windows/
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow}
+run: rustup target add wasm32-unknown-unknown
+`
+      ),
+    /unsupported release target/
+  )
+})
+
+test("requires both Tauri updater signing secret references", () => {
+  for (const secret of [
+    "TAURI_SIGNING_PRIVATE_KEY",
+    "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+  ]) {
+    const withoutSecret = validWindowsWorkflow.replace(
+      `\${{ secrets.${secret} }}`,
+      "missing"
+    )
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          `${withoutSecret}\n# \${{ secrets.${secret} }}\n`
+        ),
+      new RegExp(secret)
+    )
+  }
+})
+
+test("rejects Authenticode certificate and signing configuration", () => {
+  for (const configuration of [
+    "certificateThumbprint: ABCDEF",
+    "run: signtool sign MyCodeBuddy.exe",
+    "TAURI_BUNDLER_WINDOWS_DIGEST_ALGORITHM: sha256",
+  ]) {
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          `${validWindowsWorkflow}\n${configuration}\n`
+        ),
+      /Authenticode/
+    )
+  }
+  assert.doesNotThrow(() =>
+    assertWindowsReleaseWorkflow(
+      `${validWindowsWorkflow}
+- name: Build without Authenticode
+# Authenticode certificate signing is intentionally disabled.
+# target: x86_64-apple-darwin
+`
+    )
+  )
+})
+
+test("rejects output commands that expose updater signing values", () => {
+  for (const outputCommand of [
+    'echo "$TAURI_SIGNING_PRIVATE_KEY"',
+    'echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"',
+    "Write-Host $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+    "core.info(process.env.TAURI_SIGNING_PRIVATE_KEY)",
+  ]) {
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          `${validWindowsWorkflow}\nrun: ${outputCommand}\n`
+        ),
+      /must not print/
+    )
+  }
+})
+
+test("requires GitHub releases to set prerelease false", () => {
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        validWindowsWorkflow.replace("prerelease: false", "prerelease: true")
+      ),
+    /prerelease: false/
+  )
+})
+
+test("requires the MyCodeBuddy fork repository identity", () => {
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow.replaceAll(
+          "icannotwait/MyCodeBuddy",
+          "someone/other-repository"
+        )}
+# GITHUB_REPOSITORY must be icannotwait/MyCodeBuddy
+`
+      ),
+    /icannotwait\/MyCodeBuddy/
   )
 })
 
