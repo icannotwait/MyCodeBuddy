@@ -1,7 +1,7 @@
 #
 # Codeg Server installer for Windows
 # Usage:
-#   irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 #   .\install.ps1 -Version v0.5.0
 #
 
@@ -12,7 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "xintaofei/codeg"
+$Repo = "icannotwait/MyCodeBuddy"
 $Artifact = "codeg-server-windows-x64"
 
 # Names of binaries this installer manages. codeg-server is the user-facing
@@ -80,12 +80,11 @@ $TargetVer = $Version -replace '^v', ''
 #
 # A binary "shadows" the install if it appears in PATH BEFORE the destination
 # directory: that's the binary `Get-Command codeg-server` returns after install.
-# Unlike install.sh (which doesn't modify PATH), this script appends
-# `$InstallDir` to user PATH below when it's missing, so any pre-existing
-# codeg-server in PATH ends up before the destination after install and must be
-# cleaned. We therefore collect conflicts even when the destination isn't on
-# PATH yet: stop the walk at the destination if present, otherwise scan to the
-# end (post-install, the destination will be at the tail).
+# This script appends `$InstallDir` to user PATH below when it is missing, so
+# any pre-existing codeg-server in PATH ends up before the destination after
+# install and must be cleaned. We therefore collect conflicts even when the
+# destination is not on PATH yet: stop the walk at the destination if present,
+# otherwise scan to the end (post-install, the destination will be at the tail).
 
 $DestBin = Join-Path $InstallDir "codeg-server.exe"
 $DestBinReal = Get-CanonicalPath $DestBin

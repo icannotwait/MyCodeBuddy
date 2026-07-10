@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import test from "node:test"
 import {
   assertComplianceResources,
@@ -9,6 +10,9 @@ import {
   findForbiddenRuntimeUrls,
   readCargoVersion,
 } from "./release-policy.mjs"
+
+const readRepositoryFile = (path) =>
+  readFileSync(new URL(`../${path}`, import.meta.url), "utf8")
 
 const validWindowsWorkflow = `
 name: Release MyCodeBuddy
@@ -94,6 +98,31 @@ test("finds upstream URLs in runtime-owned files", () => {
     }),
     ["tauri.conf.json"]
   )
+})
+
+test("repository identity matches the MyCodeBuddy release policy", () => {
+  const version = "0.18.8-mycodebuddy.1"
+  const packageJson = JSON.parse(readRepositoryFile("package.json"))
+  const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
+  const tauriConfig = JSON.parse(
+    readRepositoryFile("src-tauri/tauri.conf.json")
+  )
+  const runtimeFiles = Object.fromEntries(
+    [
+      "src-tauri/tauri.conf.json",
+      "src-tauri/src/update/version.rs",
+      "src/components/settings/system-network-settings.tsx",
+      "install.ps1",
+    ].map((path) => [path, readRepositoryFile(path)])
+  )
+
+  assertMatchingVersions({
+    packageVersion: packageJson.version,
+    cargoVersion: readCargoVersion(cargoToml),
+    tauriVersion: tauriConfig.version,
+  })
+  assert.equal(packageJson.version, version)
+  assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
 })
 
 test("accepts the complete Windows release policy", () => {

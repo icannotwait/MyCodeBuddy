@@ -1,10 +1,13 @@
 [package]
 name = "codeg"
-version = "0.18.8"
+version = "0.18.8-mycodebuddy.1"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
 default-run = "codeg"
+license = "Apache-2.0"
+repository = "https://github.com/icannotwait/MyCodeBuddy"
+homepage = "https://github.com/icannotwait/MyCodeBuddy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

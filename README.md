@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy)](https://github.com/icannotwait/MyCodeBuddy/releases)
+[![License](https://img.shields.io/github/license/icannotwait/MyCodeBuddy)](./LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](./Dockerfile)
@@ -73,7 +73,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 - Git remote account management (GitHub and other Git servers)
 - Web service mode — access Codeg from any browser for remote work
 - **Standalone server deployment** — run `codeg-server` on any Linux/macOS server, access via browser
-- **Docker support** — `docker compose up` or `docker run`, with custom token, port, and volume mounts for data persistence and project directories
+- **Docker support** — local builds with `docker compose up -d`, with custom token, port, and volume mounts for data persistence and project directories
 - Runtime Logs — a live in-app log viewer with filtering and per-module log levels
 - Integrated engineering loop (file tree, diff, git changes, commit, terminal)
 
@@ -244,28 +244,10 @@ cargo insta review                                              # accept parser 
 
 Codeg can run as a standalone web server without a desktop environment.
 
-#### Option 1: One-line install (Linux / macOS)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
-```
-
-Install a specific version or to a custom directory:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
-```
-
-Then run:
-
-```bash
-codeg-server
-```
-
-#### Option 2: One-line install (Windows PowerShell)
+#### Option 1: One-line install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 ```
 
 Or install a specific version:
@@ -274,47 +256,25 @@ Or install a specific version:
 .\install.ps1 -Version v0.5.2
 ```
 
-#### Option 3: Download from GitHub Releases
+#### Option 2: Download from GitHub Releases
 
-Pre-built binaries (with bundled web assets) are available on the [Releases](https://github.com/xintaofei/codeg/releases) page:
+Pre-built Windows binaries (with bundled web assets) are available on the [Releases](https://github.com/icannotwait/MyCodeBuddy/releases) page:
 
-| Platform    | File                               |
-| ----------- | ---------------------------------- |
-| Linux x64   | `codeg-server-linux-x64.tar.gz`    |
-| Linux arm64 | `codeg-server-linux-arm64.tar.gz`  |
-| macOS x64   | `codeg-server-darwin-x64.tar.gz`   |
-| macOS arm64 | `codeg-server-darwin-arm64.tar.gz` |
-| Windows x64 | `codeg-server-windows-x64.zip`     |
-
-```bash
-# Example: download, extract, and run
-tar xzf codeg-server-linux-x64.tar.gz
-cd codeg-server-linux-x64
-CODEG_STATIC_DIR=./web ./codeg-server
-```
+| Platform    | File                           |
+| ----------- | ------------------------------ |
+| Windows x64 | `codeg-server-windows-x64.zip` |
 
 > For unattended deployments, start it with `--supervise` so a failed in-place upgrade is automatically rolled back — see [In-place updates](#in-place-updates).
 
-#### Option 4: Docker
+#### Option 3: Docker
 
 ```bash
-# Using Docker Compose (recommended)
 docker compose up -d
-
-# Or run directly with Docker
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
-
-# With custom token and project directory mounted
-docker run -d -p 3080:3080 \
-  -v codeg-data:/data \
-  -v /path/to/projects:/projects \
-  -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
 ```
 
-The Docker image uses a multi-stage build (Node.js + Rust → slim Debian runtime) and includes `git` and `ssh` for repository operations. Data is persisted in the `/data` volume. You can optionally mount project directories to access local repos from within the container.
+Docker Compose builds the image locally from this repository. The multi-stage build (Node.js + Rust → slim Debian runtime) includes `git` and `ssh` for repository operations. Data is persisted in the `/data` volume. You can optionally configure token, port, and project-directory mounts in `docker-compose.yml`.
 
-#### Option 5: Build from source
+#### Option 4: Build from source
 
 ```bash
 pnpm install && pnpm build          # build frontend
@@ -338,7 +298,7 @@ CODEG_STATIC_DIR=./web ./codeg-server --supervise
 
 Without `--supervise` the server still updates in place (it re-execs itself), but the upgrade is best-effort: there is no supervisor to auto-roll-back a version that can't start. The Docker image already runs under the supervisor.
 
-**Docker upgrades change the container, not the image.** An in-place upgrade rewrites the binaries and web assets inside the running container's writable layer, so they live only in that container. The `/data` volume persists, but the upgraded files do **not**: recreating the container — `docker compose up --force-recreate`, a fresh `docker run`, or recreating after a `docker pull` — starts from the image again and drops the in-place upgrade. (A `docker pull` on its own only refreshes the local image; nothing reverts until the container is recreated.) To make an upgrade permanent, build or pull an image at the new version and recreate the container from it.
+**Docker upgrades change the container, not the locally built image.** An in-place upgrade rewrites the binaries and web assets inside the running container's writable layer, so they live only in that container. The `/data` volume persists, but the upgraded files do **not**: recreating the container with `docker compose up --build --force-recreate` starts from the local source build again and drops the in-place upgrade. To make an upgrade permanent, update the source checkout and rebuild the container.
 
 #### Configuration
 
@@ -421,10 +381,11 @@ Next.js 16 (Static Export) + React 19
 
 ## Acknowledgments
 
+- MyCodeBuddy is a fork of the original [Codeg](https://github.com/xintaofei/codeg) project.
 - [ACP](https://agentclientprotocol.com) — the Agent Client Protocol (ACP) is the foundation that enables Codeg to connect with multiple agents
 - [Superpowers](https://github.com/obra/superpowers) — powers Codeg's expert skills module
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — powers Codeg's Office documents workflow
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](./LICENSE).

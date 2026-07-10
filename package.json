@@ -1,7 +1,13 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.18.8",
+  "version": "0.18.8-mycodebuddy.1",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icannotwait/MyCodeBuddy.git"
+  },
+  "homepage": "https://github.com/icannotwait/MyCodeBuddy",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "dev": "next dev --turbopack",

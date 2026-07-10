@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](../../LICENSE)
+[![Release](https://img.shields.io/github/v/release/icannotwait/MyCodeBuddy)](https://github.com/icannotwait/MyCodeBuddy/releases)
+[![License](https://img.shields.io/github/license/icannotwait/MyCodeBuddy)](../../LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
@@ -73,7 +73,7 @@ Codeg (Code Generation) é um workspace de codificação multiagente. Ele reúne
 - Gerenciamento de contas remotas Git (GitHub e outros servidores Git)
 - Modo de serviço web — acesse o Codeg de qualquer navegador para trabalho remoto
 - **Implantação de servidor standalone** — execute `codeg-server` em qualquer servidor Linux/macOS, acesse via navegador
-- **Suporte a Docker** — `docker compose up` ou `docker run`, com token/porta personalizáveis, persistência de dados e montagem de diretórios de projetos
+- **Suporte a Docker** — build local com `docker compose up -d`, com token/porta personalizáveis, persistência de dados e montagem de diretórios de projetos
 - Registros de execução — visualizador de registros em tempo real integrado com filtragem e níveis de log por módulo
 - Ciclo de engenharia integrado (árvore de arquivos, diff, alterações git, commit, terminal)
 
@@ -244,28 +244,10 @@ cargo insta review                                              # aceitar atuali
 
 O Codeg pode ser executado como um servidor web standalone sem ambiente desktop.
 
-#### Opção 1: Instalação em uma linha (Linux / macOS)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
-```
-
-Instalar uma versão específica ou em um diretório personalizado:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
-```
-
-Em seguida, executar:
-
-```bash
-codeg-server
-```
-
-#### Opção 2: Instalação em uma linha (Windows PowerShell)
+#### Opção 1: Instalação em uma linha (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 ```
 
 Ou instalar uma versão específica:
@@ -274,45 +256,23 @@ Ou instalar uma versão específica:
 .\install.ps1 -Version v0.5.2
 ```
 
-#### Opção 3: Baixar do GitHub Releases
+#### Opção 2: Baixar do GitHub Releases
 
-Binários pré-compilados (com recursos web incluídos) estão disponíveis na página de [Releases](https://github.com/xintaofei/codeg/releases):
+Binários pré-compilados para Windows (com recursos web incluídos) estão disponíveis na página de [Releases](https://github.com/icannotwait/MyCodeBuddy/releases):
 
-| Plataforma  | Arquivo                            |
-| ----------- | ---------------------------------- |
-| Linux x64   | `codeg-server-linux-x64.tar.gz`    |
-| Linux arm64 | `codeg-server-linux-arm64.tar.gz`  |
-| macOS x64   | `codeg-server-darwin-x64.tar.gz`   |
-| macOS arm64 | `codeg-server-darwin-arm64.tar.gz` |
-| Windows x64 | `codeg-server-windows-x64.zip`     |
+| Plataforma  | Arquivo                         |
+| ----------- | ------------------------------- |
+| Windows x64 | `codeg-server-windows-x64.zip` |
+
+#### Opção 3: Docker
 
 ```bash
-# Exemplo: baixar, extrair e executar
-tar xzf codeg-server-linux-x64.tar.gz
-cd codeg-server-linux-x64
-CODEG_STATIC_DIR=./web ./codeg-server
-```
-
-#### Opção 4: Docker
-
-```bash
-# Usando Docker Compose (recomendado)
 docker compose up -d
-
-# Ou executar diretamente com Docker
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
-
-# Com token personalizado e diretório de projeto montado
-docker run -d -p 3080:3080 \
-  -v codeg-data:/data \
-  -v /path/to/projects:/projects \
-  -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
 ```
 
-A imagem Docker usa um build multi-stage (Node.js + Rust → runtime Debian slim) e inclui `git` e `ssh` para operações com repositórios. Os dados são persistidos no volume `/data`. Opcionalmente, você pode montar diretórios de projetos para acessar repositórios locais de dentro do contêiner.
+O Docker Compose cria a imagem localmente a partir deste repositório. O build multi-stage (Node.js + Rust → runtime Debian slim) inclui `git` e `ssh`. Os dados ficam no volume `/data`; token, porta e montagens de projetos podem ser configurados em `docker-compose.yml`.
 
-#### Opção 5: Compilar a partir do código-fonte
+#### Opção 4: Compilar a partir do código-fonte
 
 ```bash
 pnpm install && pnpm build          # compilar frontend
@@ -405,10 +365,11 @@ Next.js 16 (Static Export) + React 19
 
 ## Agradecimentos
 
+- MyCodeBuddy é um fork do projeto [Codeg](https://github.com/xintaofei/codeg) original.
 - [ACP](https://agentclientprotocol.com) — o Agent Client Protocol (ACP) é a base que permite ao Codeg conectar-se a múltiplos agentes
 - [Superpowers](https://github.com/obra/superpowers) — alimenta o módulo de habilidades de especialistas do Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — alimenta o fluxo de trabalho de documentos Office do Codeg
 
 ## Licença
 
-Apache-2.0. Veja `LICENSE`.
+Apache-2.0. Veja [LICENSE](../../LICENSE).
