@@ -40,6 +40,66 @@ or rewritten so they do not advertise artifacts that the fork's Windows-only
 workflow does not publish. Windows desktop and Windows server installation
 instructions will point to the fork.
 
+## Upstream Synchronization
+
+The local repository will use two remotes:
+
+```text
+origin    -> icannotwait/MyCodeBuddy
+upstream  -> xintaofei/codeg
+```
+
+MyCodeBuddy's `main` branch will track `origin/main`. Published history will
+not be rewritten. New Codeg versions will be integrated through a temporary
+branch named `sync/codeg-<version>`:
+
+```bash
+git fetch upstream
+git switch main
+git pull --ff-only origin main
+git switch -c sync/codeg-<version>
+git merge --no-ff upstream/main
+```
+
+After resolving conflicts and passing the full verification suite, the sync
+branch will be pushed to the fork and merged through a pull request. Direct
+rebases of published MyCodeBuddy history are out of scope.
+
+Repository-local documentation will record this workflow in
+`docs/UPSTREAM_SYNC.md`, including conflict-resolution guidance for branding,
+release configuration, removed upstream features, and local functional
+changes. Git `rerere` will be recommended so repeated conflicts can reuse
+previous resolutions.
+
+Branding, updater, licensing, and release-only changes will remain concentrated
+in a small set of files. Functional modifications will remain in separate
+commits where practical so future upstream conflicts are attributable and
+reviewable.
+
+## Versioning
+
+MyCodeBuddy releases will preserve the upstream base version and add a SemVer
+prerelease suffix:
+
+```text
+0.18.8-mycodebuddy.1
+0.18.8-mycodebuddy.2
+0.18.9-mycodebuddy.1
+```
+
+The corresponding Git tags are:
+
+```text
+v0.18.8-mycodebuddy.1
+v0.18.8-mycodebuddy.2
+v0.18.9-mycodebuddy.1
+```
+
+The counter resets to `1` whenever the upstream base version changes. The
+package, Cargo, and Tauri versions must remain identical. The release workflow
+will treat every `-mycodebuddy.` version as a prerelease and will reject tags
+that do not exactly match the configured application version.
+
 ## Licensing And Attribution
 
 The upstream Apache License 2.0 text remains unchanged in the root `LICENSE`
@@ -88,7 +148,7 @@ adding a second competing workflow.
 The workflow will:
 
 1. verify that the tag commit belongs to the default branch;
-2. verify that the tag exactly matches the Tauri application version;
+2. verify that the tag exactly matches the package, Cargo, and Tauri versions;
 3. create or reuse a draft GitHub Release;
 4. build and upload Windows x64 and ARM64 NSIS/updater artifacts;
 5. build, smoke-test, sign, and upload the Windows x64 server ZIP;
@@ -121,7 +181,9 @@ Automated verification will cover:
 - deterministic third-party license report generation;
 - required compliance files appearing in Tauri resource configuration;
 - no runtime updater URL pointing to `xintaofei/codeg`;
+- package, Cargo, Tauri, and tag version consistency;
 - release workflow containing only Windows build targets;
+- upstream sync documentation containing the required remote and merge flow;
 - frontend production build;
 - frontend tests and lint;
 - Rust tests and clippy for the affected release tooling;
