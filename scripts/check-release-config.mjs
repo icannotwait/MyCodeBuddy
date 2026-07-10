@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url"
 import {
   assertComplianceResources,
   assertMatchingVersions,
+  assertNoAuthenticodeConfig,
   assertWindowsReleaseWorkflow,
   findForbiddenRuntimeUrls,
   readCargoVersion,
@@ -50,6 +51,7 @@ assertMatchingVersions({
 })
 assertWindowsReleaseWorkflow(workflowText)
 assertComplianceResources(tauriConfig)
+assertNoAuthenticodeConfig(tauriConfig)
 
 const forbiddenFiles = findForbiddenRuntimeUrls({
   "src-tauri/tauri.conf.json": tauriConfigText,

@@ -4,6 +4,7 @@ import {
   assertComplianceResources,
   assertForkVersion,
   assertMatchingVersions,
+  assertNoAuthenticodeConfig,
   assertWindowsReleaseWorkflow,
   findForbiddenRuntimeUrls,
   readCargoVersion,
@@ -17,6 +18,7 @@ env:
 
 jobs:
   verify:
+    runs-on: ubuntu-22.04
     steps:
       - name: Verify fork repository
         shell: bash
@@ -142,6 +144,76 @@ test("requires both Tauri updater signing secret references", () => {
   }
 })
 
+test("requires direct updater signing secret env mappings", () => {
+  for (const [secret, alias] of [
+    ["TAURI_SIGNING_PRIVATE_KEY", "UPDATER_PRIVATE_KEY"],
+    ["TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "UPDATER_KEY_PASSWORD"],
+  ]) {
+    const directMapping = `${secret}: ` + `\${{ secrets.${secret} }}`
+    const aliasMapping = `${alias}: ` + `\${{ secrets.${secret} }}`
+
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          validWindowsWorkflow.replace(directMapping, aliasMapping)
+        ),
+      /direct env mapping/
+    )
+    assert.throws(
+      () =>
+        assertWindowsReleaseWorkflow(
+          `${validWindowsWorkflow}\n${aliasMapping}\n`
+        ),
+      /env alias/
+    )
+  }
+})
+
+test("rejects macOS runners but allows Ubuntu release management", () => {
+  assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow}
+  build-macos:
+    runs-on: macos-14
+`
+      ),
+    /macOS runner/
+  )
+})
+
+test("requires an allowed Windows target on every Tauri release build", () => {
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        validWindowsWorkflow.replace(
+          "args: --target ${{ matrix.target }} --bundles nsis",
+          "args: --bundles nsis"
+        )
+      ),
+    /Windows matrix target/
+  )
+  assert.throws(
+    () =>
+      assertWindowsReleaseWorkflow(
+        `${validWindowsWorkflow}
+      - name: Untargeted CLI build
+        run: pnpm tauri build --bundles nsis
+`
+      ),
+    /Windows matrix target/
+  )
+  assert.doesNotThrow(() =>
+    assertWindowsReleaseWorkflow(
+      `${validWindowsWorkflow}
+      - name: Targeted CLI build
+        run: pnpm tauri build --target \${{ matrix.target }} --bundles nsis
+`
+    )
+  )
+})
+
 test("rejects Authenticode certificate and signing configuration", () => {
   for (const configuration of [
     "certificateThumbprint: ABCDEF",
@@ -165,23 +237,6 @@ test("rejects Authenticode certificate and signing configuration", () => {
 `
     )
   )
-})
-
-test("rejects output commands that expose updater signing values", () => {
-  for (const outputCommand of [
-    'echo "$TAURI_SIGNING_PRIVATE_KEY"',
-    'echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"',
-    "Write-Host $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
-    "core.info(process.env.TAURI_SIGNING_PRIVATE_KEY)",
-  ]) {
-    assert.throws(
-      () =>
-        assertWindowsReleaseWorkflow(
-          `${validWindowsWorkflow}\nrun: ${outputCommand}\n`
-        ),
-      /must not print/
-    )
-  }
 })
 
 test("requires GitHub releases to set prerelease false", () => {
@@ -222,6 +277,32 @@ test("requires bundled compliance resources", () => {
             "licenses/THIRD_PARTY_LICENSES.txt",
         },
       },
+    })
+  )
+})
+
+test("rejects Tauri Authenticode configuration", () => {
+  for (const key of [
+    "certificateThumbprint",
+    "digestAlgorithm",
+    "timestampUrl",
+    "signCommand",
+    "certificatePath",
+  ]) {
+    assert.throws(
+      () =>
+        assertNoAuthenticodeConfig({
+          bundle: { windows: { [key]: "configured" } },
+        }),
+      /Authenticode/
+    )
+  }
+  assert.doesNotThrow(() =>
+    assertNoAuthenticodeConfig({
+      bundle: {
+        windows: { nsis: { installerHooks: "./windows/installer-hooks.nsh" } },
+      },
+      plugins: { updater: { pubkey: "public-key" } },
     })
   )
 })

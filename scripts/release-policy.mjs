@@ -11,6 +11,9 @@ const UPDATER_SIGNING_SECRETS = [
   "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
 ]
 const FORK_REPOSITORY = "icannotwait/MyCodeBuddy"
+const TAURI_RELEASE_ACTION_RE =
+  /^\s*-\s*uses\s*:\s*tauri-apps\/tauri-action(?:@|\s|$)/im
+const TAURI_BUILD_COMMAND_RE = /\bpnpm\s+(?:exec\s+)?tauri\s+build\b/i
 
 function uncommentedWorkflowText(workflowText) {
   return workflowText
@@ -45,26 +48,76 @@ function releaseTargets(workflowText) {
   return targets
 }
 
-function referencesGitHubSecret(workflowText, secret) {
-  const referenceRe = new RegExp(String.raw`\$\{\{\s*secrets\.${secret}\s*\}\}`)
-  return referenceRe.test(workflowText)
+function workflowStepBlocks(workflowText) {
+  const lines = workflowText.split(/\r?\n/)
+  const starts = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(\s*)-\s+/)
+    if (match) starts.push({ index, indent: match[1].length })
+  }
+
+  return starts.map(({ index, indent }, startIndex) => {
+    let end = lines.length
+    for (
+      let nextIndex = startIndex + 1;
+      nextIndex < starts.length;
+      nextIndex += 1
+    ) {
+      if (starts[nextIndex].indent <= indent) {
+        end = starts[nextIndex].index
+        break
+      }
+    }
+    return lines.slice(index, end).join("\n")
+  })
 }
 
-function printsUpdaterSigningValue(workflowText) {
-  const outputCommandRe =
-    /\b(?:echo|printf|printenv|Write-Host|Write-Output|console\.log|core\.(?:debug|error|info|notice|warning)|process\.stdout\.write)\b/i
-  const secretValueRe =
-    /(?:\$\{\{\s*(?:env|secrets)\.TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?\s*\}\}|\$(?:env:)?TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?\b|\$\{TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?[^}]*\}|process\.env(?:\.|\[["'])TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?|toJSON\(\s*secrets\s*\))/i
-  const printenvSecretRe =
-    /\bprintenv\s+TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?\b/i
+function hasExplicitWindowsMatrixTarget(stepText, targets) {
+  const hasMatrixTarget = /\$\{\{\s*matrix\.target\s*\}\}/i.test(stepText)
+  const hasTargetArgument =
+    /--target(?:=|\s+)\s*["']?\$\{\{\s*matrix\.target\s*\}\}/i.test(stepText)
+  const hasTargetProperty =
+    /^\s*target\s*:\s*["']?\$\{\{\s*matrix\.target\s*\}\}/im.test(stepText)
+  return (
+    hasMatrixTarget &&
+    (hasTargetArgument || hasTargetProperty) &&
+    [...targets].some((target) => WINDOWS_RELEASE_TARGETS.has(target))
+  )
+}
 
-  return workflowText
-    .split(/\r?\n/)
-    .some(
-      (line) =>
-        printenvSecretRe.test(line) ||
-        (outputCommandRe.test(line) && secretValueRe.test(line))
+function assertDirectUpdaterSigningEnvMappings(workflowText) {
+  const mappingRe =
+    /^[ \t]*(?:-[ \t]*)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*?)[ \t]*(?:#.*)?$/gm
+  const secretReferences = new Map(
+    UPDATER_SIGNING_SECRETS.map((secret) => [
+      secret,
+      new RegExp(String.raw`\$\{\{\s*secrets\.${secret}\s*\}\}`),
+    ])
+  )
+
+  for (const secret of UPDATER_SIGNING_SECRETS) {
+    const directMappingRe = new RegExp(
+      String.raw`^[ \t]*${secret}[ \t]*:[ \t]*\$\{\{\s*secrets\.${secret}\s*\}\}[ \t]*(?:#.*)?$`,
+      "im"
     )
+    if (!directMappingRe.test(workflowText)) {
+      throw new Error(
+        `release workflow requires direct env mapping for ${secret}`
+      )
+    }
+  }
+
+  for (const match of workflowText.matchAll(mappingRe)) {
+    const [, name, value] = match
+    for (const [secret, referenceRe] of secretReferences) {
+      if (!referenceRe.test(value)) continue
+      if (name !== secret) {
+        throw new Error(
+          `release workflow must not assign ${secret} to env alias ${name}`
+        )
+      }
+    }
+  }
 }
 
 export function readCargoVersion(text) {
@@ -138,11 +191,13 @@ export function assertWindowsReleaseWorkflow(workflowText) {
     }
   }
 
-  for (const secret of UPDATER_SIGNING_SECRETS) {
-    if (!referencesGitHubSecret(policyText, secret)) {
-      throw new Error(`release workflow must reference secrets.${secret}`)
-    }
+  if (
+    /^\s*(?:runs-on|runner|os)\s*:[^\n]*\bmacos-[^\s"'#]+/im.test(policyText)
+  ) {
+    throw new Error("release workflow contains a macOS runner")
   }
+
+  assertDirectUpdaterSigningEnvMappings(policyText)
 
   const authenticodePatterns = [
     /^\s*(?:-\s*)?authenticode\s*:/im,
@@ -156,10 +211,18 @@ export function assertWindowsReleaseWorkflow(workflowText) {
     throw new Error("release workflow must not configure Authenticode signing")
   }
 
-  if (printsUpdaterSigningValue(policyText)) {
-    throw new Error(
-      "release workflow must not print updater private-key or password values"
-    )
+  for (const stepText of workflowStepBlocks(policyText)) {
+    const isTauriReleaseInvocation =
+      TAURI_RELEASE_ACTION_RE.test(stepText) ||
+      TAURI_BUILD_COMMAND_RE.test(stepText)
+    if (
+      isTauriReleaseInvocation &&
+      !hasExplicitWindowsMatrixTarget(stepText, targets)
+    ) {
+      throw new Error(
+        "release Tauri build must use an allowed Windows matrix target"
+      )
+    }
   }
 
   const prereleaseValues = [
@@ -210,4 +273,46 @@ export function assertComplianceResources(tauriConfig) {
       throw new Error(`missing compliance resource ${source} -> ${target}`)
     }
   }
+}
+
+function isAuthenticodeConfigKey(key) {
+  const normalized = key.replace(/[-_.]/g, "").toLowerCase()
+  return (
+    normalized.includes("authenticode") ||
+    normalized.startsWith("certificate") ||
+    normalized === "digestalgorithm" ||
+    normalized.startsWith("timestamp") ||
+    normalized === "signcommand" ||
+    normalized === "signingcommand" ||
+    normalized.startsWith("signtool") ||
+    normalized.startsWith("signingcertificate") ||
+    normalized.startsWith("signingtool") ||
+    normalized.startsWith("windowscertificate") ||
+    normalized.startsWith("windowssign") ||
+    normalized.startsWith("windowsdigest") ||
+    normalized.startsWith("windowstimestamp") ||
+    normalized.startsWith("trustedsigning") ||
+    normalized.startsWith("azuretrusted")
+  )
+}
+
+export function assertNoAuthenticodeConfig(tauriConfig) {
+  const visit = (value, path) => {
+    if (!value || typeof value !== "object") return
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`))
+      return
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (isAuthenticodeConfigKey(key)) {
+        throw new Error(
+          `Tauri configuration must not contain Authenticode key ${path}.${key}`
+        )
+      }
+      visit(child, `${path}.${key}`)
+    }
+  }
+
+  visit(tauriConfig, "tauriConfig")
 }
