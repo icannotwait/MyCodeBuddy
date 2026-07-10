@@ -97,8 +97,14 @@ v0.18.9-mycodebuddy.1
 
 The counter resets to `1` whenever the upstream base version changes. The
 package, Cargo, and Tauri versions must remain identical. The release workflow
-will treat every `-mycodebuddy.` version as a prerelease and will reject tags
-that do not exactly match the configured application version.
+will accept only `-mycodebuddy.` versions and will reject tags that do not
+exactly match the configured application version.
+
+Although the suffix is represented by SemVer's prerelease component, completed
+MyCodeBuddy builds will be published as non-prerelease GitHub Releases. This is
+required because GitHub's `/releases/latest` and
+`/releases/latest/download/...` routes exclude releases marked as prereleases;
+the updater and Windows server installer depend on those routes.
 
 ## Licensing And Attribution
 
