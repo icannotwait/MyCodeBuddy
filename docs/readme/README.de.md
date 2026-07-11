@@ -19,19 +19,13 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere Agenten (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi usw.) in einem Arbeitsbereich, unterstützt Konversationsaggregation und Multi-Agent-Zusammenarbeit sowie Desktop-Installation und Server-/Docker-Bereitstellung.
+Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere Agenten (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build usw.) in einem Arbeitsbereich, unterstützt Konversationsaggregation und Multi-Agent-Zusammenarbeit sowie Desktop-Installation und Server-/Docker-Bereitstellung.
 
 ![gallery](../images/gallery.svg)
 
 ## Sponsoren
 
 <table>
-  <tr>
-    <td colspan="2" align="center">
-      <a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg" target="_blank"><img src="https://raw.githubusercontent.com/LeoYeAI/myclaw-sponsor-preview/main/banner.svg" alt="MyClaw.ai — Your OpenClaw Agent, Always On." /></a><br/>
-      <strong><a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg">MyClaw.ai</a></strong> — Vollständig verwaltete OpenClaw-Cloud-Plattform: Ein-Klick-Bereitstellung, 24/7-Verfügbarkeit und vollständiger Datenbesitz – ganz ohne eigene Serververwaltung.
-    </td>
-  </tr>
   <tr>
     <td align="center" width="220">
       <a href="https://www.compshare.cn/?ytag=GPU_YY_git_codeg" target="_blank"><img src="../images/compshare.png" alt="Compshare" width="160" /></a><br/>
@@ -72,6 +66,7 @@ Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere
 - Parallele Entwicklung mit integrierten `git worktree`-Abläufen
 - **Projekt-Starter** — neue Projekte visuell erstellen mit Live-Vorschau
 - **Office-Dokumente** — erstelle, analysiere, überprüfe und bearbeite .docx / .xlsx / .pptx-Dateien mit dem integrierten officecli-Toolset; Live-Vorschau in einer Datei-Registerkarte, die bei Agent-Bearbeitungen sofort aktualisiert wird
+- **Wissenschaftliche Forschung** — gebündelte Wissenschafts-Skills (Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung, Literaturrecherche), die jeder Agent aufrufen kann, pro Agent verwaltet
 - **Automatisierungen** — speichere eine beliebige Composer-Konfiguration als wiederverwendbare Automatisierung, die headless per Cron-Zeitplan oder auf Abruf ausgeführt wird
 - **Chat-Kanäle** — Telegram, Lark (Feishu), iLink (Weixin) und mehr mit Ihren Coding-Agenten verbinden für Echtzeit-Benachrichtigungen, vollständige Sitzungsinteraktion und Remote-Aufgabensteuerung
 - MCP-Verwaltung (lokaler Scan + Registry-Suche/Installation)
@@ -97,6 +92,7 @@ Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > Hinweis: Umgebungsvariablen haben Vorrang vor Fallback-Pfaden.
 
@@ -147,8 +143,21 @@ Arbeiten Sie mit Word-, Excel- und PowerPoint-Dateien als erstklassigen Workflow
 - **Erstellen und Bearbeiten** — neue Dokumente generieren oder vorhandene .docx / .xlsx / .pptx-Dateien bearbeiten, einschließlich Diagramme, Tabellen und Formatierung
 - **Analysieren und Korrigieren** — Dokumentstruktur prüfen, Formatierungsprobleme aufdecken und Inhalte korrigieren
 - **Live-Vorschau** — öffnen Sie eine .docx / .xlsx / .pptx-Datei in einem Datei-Tab; sie wird inline gerendert und aktualisiert sich automatisch, wenn der Agent Änderungen vornimmt — unterstützt durch einen dauerhaft laufenden `officecli watch`-Server (mit Reverse-Proxy und Fähigkeits-Authentifizierung für Web- und Serverumgebungen)
-- **Schnellaktionen** — die Willkommensseite bietet Tabs für Codierung und Office, die mit einem Klick den passenden Skill-Aufruf und eine Prompt-Vorlage in den Composer einfügen; nicht aktivierte Skills zeigen ein Schloss-Badge und verlinken zur Aktivierung
+- **Schnellaktionen** — die Willkommensseite bietet Tabs für Codierung, Office und Wissenschaftliche Forschung, die mit einem Klick den passenden Skill-Aufruf und eine Prompt-Vorlage in den Composer einfügen; nicht aktivierte Skills zeigen ein Schloss-Badge und verlinken zur Aktivierung
 - **Office-Tools-Einstellungen** — eine dedizierte Einstellungsseite installiert `officecli` und verwaltet dessen Dokument-Skills über eine Skill×Agent-Matrix: beliebige (Skill, Agent)-Paare umschalten und Massenänderungen anwenden
+
+</details>
+
+<details>
+<summary><h2>Wissenschaftliche Forschung</h2></summary>
+
+Verwandeln Sie jeden Agenten in einen rigorosen Forschungsassistenten. Codeg bündelt eine kuratierte Sammlung MIT-lizenzierter **wissenschaftlicher Forschungs-Skills** — von der Ideenfindung über die Analyse bis zur Ausarbeitung —, die sich in den gemeinsamen zentralen Skill-Speicher installieren und in beliebige von Ihnen ausgewählte Agenten einbinden lassen, genau wie die Experten- und Office-Toolsets.
+
+### Funktionen
+
+- **Kuratierte Skills** — Hypothesengenerierung, Versuchsplanung, statistische Power, statistische Analyse, explorative Datenanalyse, wissenschaftliche Visualisierung, kritische Bewertung, Peer-Review, Zitationsverwaltung, Scholar-Bewertung, Paper-Suche und KI-Schaubilder
+- **Schnellaktionen** — der Tab „Wissenschaftliche Forschung" der Willkommensseite fügt mit einem Klick den passenden Skill-Aufruf und eine lokalisierte Prompt-Vorlage in den Composer ein
+- **Wissenschafts-Einstellungen** — eine dedizierte Einstellungsseite verwaltet die Skills über eine Skill×Agent-Matrix, mit Badges, die Skills kennzeichnen, die einen API-Schlüssel oder eine Python-Umgebung benötigen
 
 </details>
 
@@ -300,6 +309,8 @@ cd codeg-server-linux-x64
 CODEG_STATIC_DIR=./web ./codeg-server
 ```
 
+> Für unbeaufsichtigte Deployments starten Sie ihn mit `--supervise`, damit ein fehlgeschlagenes In-Place-Upgrade automatisch zurückgesetzt wird — siehe [In-Place-Updates](#in-place-updates).
+
 #### Option 4: Docker
 
 ```bash
@@ -330,6 +341,20 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp wird 
 ```
 
 Wenn Sie die beiden Binärdateien in getrennten Verzeichnissen halten, setzen Sie `CODEG_MCP_BIN=/abs/pfad/zu/codeg-mcp`, damit die Laufzeit den Begleiter dennoch findet; ohne diese Variable wird die Multi-Agent-Delegation stillschweigend deaktiviert.
+
+#### In-Place-Updates
+
+Der Server kann sich selbst über **Einstellungen → Softwareupdate** aktualisieren: Er lädt das signierte Release für seine Plattform herunter, tauscht die Binärdateien und Web-Assets auf der Festplatte aus und startet neu — keine manuelle erneute Bereitstellung. Dies ist nur unter Linux/macOS verfügbar (unter Windows deaktiviert). Die vorherige Version wird als Sicherung aufbewahrt, sodass dieselbe Seite eine **Zurücksetzen**-Aktion anbietet, um zu ihr zurückzukehren.
+
+**Für automatisches Zurücksetzen unter dem Supervisor ausführen.** Starten Sie den Standalone-Server mit `--supervise`, sodass ein frisch aktualisierter Prozess, der innerhalb des Testfensters nicht startet, automatisch auf die vorherige Version zurückgesetzt wird:
+
+```bash
+CODEG_STATIC_DIR=./web ./codeg-server --supervise
+```
+
+Ohne `--supervise` aktualisiert sich der Server dennoch an Ort und Stelle (er führt sich selbst per re-exec neu aus), doch das Upgrade erfolgt nach dem Best-Effort-Prinzip: Es gibt keinen Supervisor, der eine Version, die nicht startet, automatisch zurücksetzt. Das Docker-Image läuft bereits unter dem Supervisor.
+
+**Docker-Upgrades verändern den Container, nicht das Image.** Ein In-Place-Upgrade überschreibt die Binärdateien und Web-Assets in der beschreibbaren Schicht des laufenden Containers, sodass sie nur in diesem Container existieren. Das `/data`-Volume bleibt erhalten, die aktualisierten Dateien jedoch **nicht**: Beim Neuerstellen des Containers — `docker compose up --force-recreate`, ein frisches `docker run` oder ein Neuerstellen nach einem `docker pull` — wird erneut vom Image ausgegangen und das In-Place-Upgrade verworfen. (Ein `docker pull` allein aktualisiert nur das lokale Image; nichts wird zurückgesetzt, bevor der Container neu erstellt wird.) Um ein Upgrade dauerhaft zu machen, bauen oder ziehen Sie ein Image mit der neuen Version und erstellen den Container daraus neu.
 
 #### Konfiguration
 
@@ -403,18 +428,12 @@ Next.js 16 (Static Export) + React 19
 
 - Danke an die [LinuxDO](https://linux.do)-Community für ihre Unterstützung
 
-## Coffee
-
-- Wenn Codeg Ihnen geholfen hat, spendieren Sie mir gerne einen Kaffee
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Codeg unterstützen" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Codeg unterstützen" width="240" />
-
 ## Danksagungen
 
 - [ACP](https://agentclientprotocol.com) — das Agent Client Protocol (ACP) ist die Grundlage, die es Codeg ermöglicht, sich mit mehreren Agenten zu verbinden
 - [Superpowers](https://github.com/obra/superpowers) — unterstützt das Experten-Skills-Modul von Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — unterstützt den Office-Dokument-Workflow von Codeg
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — unterstützt die wissenschaftlichen Forschungs-Skills von Codeg (MIT-lizenzierte Teilmenge)
 
 ## Lizenz
 

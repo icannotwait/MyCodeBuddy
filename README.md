@@ -19,19 +19,13 @@
   <a href="./docs/readme/README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, etc.) into one workspace, supporting conversation aggregation and multi-agent collaboration, with desktop installation plus server/Docker deployment.
+Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, etc.) into one workspace, supporting conversation aggregation and multi-agent collaboration, with desktop installation plus server/Docker deployment.
 
 ![gallery](./docs/images/gallery.svg)
 
 ## Sponsors
 
 <table>
-  <tr>
-    <td colspan="2" align="center">
-      <a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg" target="_blank"><img src="https://raw.githubusercontent.com/LeoYeAI/myclaw-sponsor-preview/main/banner.svg" alt="MyClaw.ai — Your OpenClaw Agent, Always On." /></a><br/>
-      <strong><a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg">MyClaw.ai</a></strong> — A fully managed OpenClaw cloud platform with one-click setup, 24/7 uptime, and full data ownership — no server management required.
-    </td>
-  </tr>
   <tr>
     <td align="center" width="220">
       <a href="https://www.compshare.cn/?ytag=GPU_YY_git_codeg" target="_blank"><img src="./docs/images/compshare.png" alt="Compshare" width="160" /></a><br/>
@@ -72,7 +66,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 - Parallel development with built-in `git worktree` flows
 - **Project Boot** — visually scaffold new projects with live preview
 - **Office Documents** — create, analyze, proofread, and edit `.docx` / `.xlsx` / `.pptx` through the bundled `officecli` toolset, with live in-tab preview that refreshes as the agent edits
-- **Scientific Research** — bundled science skills (hypothesis generation, experimental design, statistics, visualization, critical appraisal, literature search) any agent can invoke, managed per-agent like the office and expert toolsets
+- **Scientific Research** — bundled science skills (hypothesis generation, experimental design, statistics, visualization, critical appraisal, literature search) any agent can invoke, managed per-agent
 - **Automations** — save a composer setup as a reusable automation that runs headlessly, on a cron schedule or on demand
 - **Chat Channels** — connect Telegram, Lark (Feishu), iLink (Weixin) and more to your coding agents for real-time notifications, full session interaction, and remote task control
 - MCP management (local scan + registry search/install)
@@ -98,6 +92,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > Note: environment variables take precedence over fallback paths.
 
@@ -163,9 +158,6 @@ Turn any agent into a rigorous research assistant. Codeg bundles a curated set o
 - **Curated skills** — hypothesis generation, experimental design, statistical power, statistical analysis, exploratory data analysis, scientific visualization, critical appraisal, peer review, citation management, scholar evaluation, paper lookup, and AI schematics
 - **Quick Actions** — the welcome page's Scientific Research tab drops the matching skill invocation plus a localized prompt template into the composer with one click
 - **Science settings** — a dedicated settings page manages the skills through a skill-by-agent matrix, with badges flagging skills that need an API key or a Python environment
-- **Offline-first** — skill text is bundled and works without network; scripts that call external services (OpenRouter, scholarly APIs) are opt-in and clearly marked
-
-Skills are vendored from [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills); re-sync with `scripts/sync-science-skills.sh` (pins an upstream commit, enforces an MIT-only license gate, and asserts byte-identity).
 
 </details>
 
@@ -435,13 +427,6 @@ Next.js 16 (Static Export) + React 19
 <img src="./docs/images/weixin-dark.jpg#gh-dark-mode-only" alt="WeChat" width="240" />
 
 - Thanks to the [LinuxDO](https://linux.do) community for their support
-
-## Coffee
-
-- If Codeg has helped you, consider buying me a coffee
-
-<img src="./docs/images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Sponsor Codeg" width="240" />
-<img src="./docs/images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Sponsor Codeg" width="240" />
 
 ## Acknowledgments
 

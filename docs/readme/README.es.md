@@ -19,19 +19,13 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. Unifica varios agentes (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, etc.) en un único espacio de trabajo, admite agregación de conversaciones y colaboración multiagente, y permite instalación de escritorio y despliegue en servidor/Docker.
+Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. Unifica varios agentes (Claude Code, Codex CLI, OpenCode, Gemini CLI, OpenClaw, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, etc.) en un único espacio de trabajo, admite agregación de conversaciones y colaboración multiagente, y permite instalación de escritorio y despliegue en servidor/Docker.
 
 ![gallery](../images/gallery.svg)
 
 ## Patrocinadores
 
 <table>
-  <tr>
-    <td colspan="2" align="center">
-      <a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg" target="_blank"><img src="https://raw.githubusercontent.com/LeoYeAI/myclaw-sponsor-preview/main/banner.svg" alt="MyClaw.ai — Your OpenClaw Agent, Always On." /></a><br/>
-      <strong><a href="https://myclaw.ai/?utm_source=github&utm_campaign=codeg">MyClaw.ai</a></strong> — Plataforma OpenClaw en la nube totalmente gestionada: despliegue en un clic, disponibilidad 24/7 y propiedad total de los datos, sin tener que administrar servidores.
-    </td>
-  </tr>
   <tr>
     <td align="center" width="220">
       <a href="https://www.compshare.cn/?ytag=GPU_YY_git_codeg" target="_blank"><img src="../images/compshare.png" alt="Compshare" width="160" /></a><br/>
@@ -72,6 +66,7 @@ Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. U
 - Desarrollo paralelo con flujos integrados de `git worktree`
 - **Inicio de Proyecto** — crea nuevos proyectos visualmente con vista previa en tiempo real
 - **Documentos Office** — crea, analiza, revisa y edita archivos .docx / .xlsx / .pptx con el toolset officecli integrado; vista previa en tiempo real en pestaña de archivo que se actualiza mientras el agente edita
+- **Investigación científica** — habilidades científicas integradas (generación de hipótesis, diseño experimental, estadística, visualización, evaluación crítica, búsqueda bibliográfica) que cualquier agente puede invocar, gestionadas por agente
 - **Automatizaciones** — guarda cualquier configuración del compositor como automatización reutilizable que se ejecuta de forma desatendida según cron o bajo demanda
 - **Canales de Chat** — conecta Telegram, Lark (Feishu), iLink (Weixin) y más a tus agentes de codificación para notificaciones en tiempo real, interacción completa con sesiones y control remoto de tareas
 - Gestión de MCP (escaneo local + búsqueda/instalación desde registro)
@@ -97,6 +92,7 @@ Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. U
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > Nota: las variables de entorno tienen prioridad sobre las rutas de respaldo.
 
@@ -147,8 +143,21 @@ Trabaja con archivos Word, Excel y PowerPoint como un flujo de trabajo de primer
 - **Crear y editar** — genera nuevos documentos o modifica .docx / .xlsx / .pptx existentes, incluyendo gráficos, tablas y formato
 - **Analizar y revisar** — inspecciona la estructura del documento, detecta problemas de formato y revisa el contenido
 - **Vista previa en vivo** — abre un .docx / .xlsx / .pptx en una pestaña de archivo y se renderiza en línea, actualizándose automáticamente mientras el agente edita — respaldado por un servidor `officecli watch` permanente (con proxy inverso y autenticación por capacidad para entornos web y servidor)
-- **Acciones rápidas** — la página de bienvenida ofrece pestañas de Codificación y Office que insertan la invocación de habilidad correspondiente y una plantilla de prompt con un solo clic; las habilidades no habilitadas muestran un badge de bloqueo y enlazan a donde puedes activarlas
+- **Acciones rápidas** — la página de bienvenida ofrece pestañas de Codificación, Office e Investigación científica que insertan la invocación de habilidad correspondiente y una plantilla de prompt con un solo clic; las habilidades no habilitadas muestran un badge de bloqueo y enlazan a donde puedes activarlas
 - **Configuración de Office Tools** — una página de ajustes dedicada instala `officecli` y gestiona sus habilidades mediante una matriz de habilidad×agente: alterna cualquier par (habilidad, agente) y aplica cambios masivos
+
+</details>
+
+<details>
+<summary><h2>Investigación científica</h2></summary>
+
+Convierte cualquier agente en un asistente de investigación riguroso. Codeg incluye un conjunto curado de **habilidades de investigación científica** con licencia MIT — desde la ideación hasta el análisis y la redacción — que se instalan en el almacén central de habilidades compartido y se vinculan a los agentes que elijas, exactamente igual que los toolsets de expertos y de office.
+
+### Qué ofrece
+
+- **Habilidades curadas** — generación de hipótesis, diseño experimental, potencia estadística, análisis estadístico, análisis exploratorio de datos, visualización científica, evaluación crítica, revisión por pares, gestión de citas, evaluación de académicos, búsqueda de artículos y esquemas de IA
+- **Acciones rápidas** — la pestaña de Investigación científica de la página de bienvenida inserta la invocación de habilidad correspondiente junto con una plantilla de prompt localizada en el compositor con un solo clic
+- **Configuración de Ciencia** — una página de ajustes dedicada gestiona las habilidades mediante una matriz de habilidad×agente, con badges que señalan las habilidades que necesitan una clave de API o un entorno de Python
 
 </details>
 
@@ -300,6 +309,8 @@ cd codeg-server-linux-x64
 CODEG_STATIC_DIR=./web ./codeg-server
 ```
 
+> Para despliegues desatendidos, inícialo con `--supervise` para que una actualización in situ fallida se revierta automáticamente — consulta [Actualizaciones in situ](#actualizaciones-in-situ).
+
 #### Opción 4: Docker
 
 ```bash
@@ -330,6 +341,20 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp se de
 ```
 
 Si mantienes los dos binarios en directorios separados, define `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` para que el runtime pueda seguir encontrando el compañero; sin esto, la delegación multi-agente se desactiva silenciosamente.
+
+#### Actualizaciones in situ
+
+El servidor puede actualizarse a sí mismo desde **Ajustes → Actualización de software**: descarga la versión firmada para su plataforma, reemplaza los binarios y los recursos web en disco, y se reinicia — sin necesidad de volver a desplegar manualmente. Esto es solo para Linux/macOS (desactivado en Windows). La versión anterior se conserva como copia de seguridad, por lo que la misma pantalla ofrece una acción **Revertir** para volver a ella.
+
+**Ejecuta bajo el supervisor para la reversión automática.** Inicia el servidor independiente con `--supervise` para que un proceso recién actualizado que no arranque dentro de la ventana de prueba se revierta automáticamente a la versión anterior:
+
+```bash
+CODEG_STATIC_DIR=./web ./codeg-server --supervise
+```
+
+Sin `--supervise` el servidor sigue actualizándose in situ (se vuelve a ejecutar a sí mismo), pero la actualización es de mejor esfuerzo: no hay ningún supervisor que revierta automáticamente una versión que no puede arrancar. La imagen Docker ya se ejecuta bajo el supervisor.
+
+**Las actualizaciones en Docker cambian el contenedor, no la imagen.** Una actualización in situ reescribe los binarios y los recursos web dentro de la capa de escritura del contenedor en ejecución, por lo que solo existen en ese contenedor. El volumen `/data` persiste, pero los archivos actualizados **no**: recrear el contenedor — `docker compose up --force-recreate`, un nuevo `docker run`, o recrearlo tras un `docker pull` — vuelve a partir de la imagen y descarta la actualización in situ. (Un `docker pull` por sí solo únicamente actualiza la imagen local; nada se revierte hasta que se recrea el contenedor.) Para que una actualización sea permanente, compila o descarga una imagen con la nueva versión y recrea el contenedor a partir de ella.
 
 #### Configuración
 
@@ -403,18 +428,12 @@ Next.js 16 (Static Export) + React 19
 
 - Gracias a la comunidad de [LinuxDO](https://linux.do) por su apoyo
 
-## Coffee
-
-- Si Codeg te ha resultado útil, considera invitarme a un café
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Patrocinar Codeg" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Patrocinar Codeg" width="240" />
-
 ## Agradecimientos
 
 - [ACP](https://agentclientprotocol.com) — el Agent Client Protocol (ACP) es la base que permite a Codeg conectarse con múltiples agentes
 - [Superpowers](https://github.com/obra/superpowers) — impulsa el módulo de habilidades de expertos de Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — impulsa el flujo de trabajo de documentos Office de Codeg
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — impulsa las habilidades de Investigación científica de Codeg (subconjunto con licencia MIT)
 
 ## Licencia
 
