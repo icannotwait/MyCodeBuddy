@@ -42,6 +42,11 @@ coverage/
 *.csr
 *.p12
 certificate-base64.txt
+updater-signing.key
+updater-signing.key.pub
+updater-signing.password
+local-build.env
+GITHUB_SECRETS.md
 
 # Agent
 .claude
