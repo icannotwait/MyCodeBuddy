@@ -133,6 +133,16 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
   assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
 })
 
+test("release workflow publishes only Windows MyCodeBuddy artifacts", () => {
+  const workflowText = readRepositoryFile(".github/workflows/release.yml")
+
+  assertWindowsReleaseWorkflow(workflowText)
+  assert.match(workflowText, /MyCodeBuddy \$\{tag\}/)
+  assert.match(workflowText, /prerelease:\s*false/)
+  assert.match(workflowText, /codeg-server-windows-x64/)
+  assert.doesNotMatch(workflowText, /includeUpdaterJson:\s*false/)
+})
+
 test("accepts the complete Windows release policy", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
 })
