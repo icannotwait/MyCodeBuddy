@@ -57,6 +57,7 @@ git tag v0.18.8-mycodebuddy.1
 git push origin v0.18.8-mycodebuddy.1
 ```
 
-The tag starts the Windows release workflow. Verify the draft release contains
-the Windows x64 and ARM64 desktop updater artifacts and the signed Windows x64
-server ZIP before the workflow publishes it.
+The tag starts the Windows release workflow. After all builds and uploads
+succeed, the workflow publishes the release automatically. Inspect the
+published release afterward to confirm it contains the Windows x64 and ARM64
+desktop updater artifacts and the signed Windows x64 server ZIP.

@@ -5,15 +5,24 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 const scriptPath = fileURLToPath(import.meta.url)
 const repoRoot = resolve(dirname(scriptPath), "..")
 const tauriConfigPath = join(repoRoot, "src-tauri", "tauri.conf.json")
+const GENERATION_FAILURE_MESSAGE = "updater signing key generation failed"
+const LOCK_MESSAGE = "updater signing generation is already in progress"
+const OVERWRITE_MESSAGE =
+  "updater signing files already exist; refusing to overwrite"
+
+class SafeGenerationError extends Error {}
 
 export function buildSigningPaths(homeDirectory) {
   const signingDir = join(homeDirectory, ".config", "mycodebuddy", "signing")
@@ -86,32 +95,113 @@ export function replacePublicKeyInConfigText(configText, publicKey) {
   return updatedText
 }
 
+function isCanonicalBase64(value) {
+  return (
+    typeof value === "string" &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value
+    ) &&
+    Buffer.from(value, "base64").toString("base64") === value
+  )
+}
+
+export function validateGeneratedPublicKey(publicKey) {
+  if (!isCanonicalBase64(publicKey)) {
+    throw new Error("generated updater public key is invalid")
+  }
+
+  const document = Buffer.from(publicKey, "base64").toString("utf8")
+  const lines = document.split("\n")
+  if (
+    lines.length !== 3 ||
+    !/^untrusted comment: minisign public key: [0-9A-F]{16}$/.test(lines[0]) ||
+    lines[2] !== "" ||
+    !lines[1].startsWith("RW")
+  ) {
+    throw new Error("generated updater public key is invalid")
+  }
+
+  const keyPayload = lines[1]
+  if (
+    !isCanonicalBase64(keyPayload) ||
+    Buffer.from(keyPayload, "base64").length !== 42
+  ) {
+    throw new Error("generated updater public key is invalid")
+  }
+
+  return publicKey
+}
+
 function shellQuote(value) {
   return `'${value.replaceAll("'", "'\"'\"'")}'`
 }
 
+function writeSupportFile(filePath, contents) {
+  writeFileSync(filePath, contents, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  })
+  chmodSync(filePath, 0o600)
+}
+
+function writeConfigAtomically(configPath, contents) {
+  const configDirectory = dirname(configPath)
+  const configMode = statSync(configPath).mode & 0o777
+  const temporaryPath = join(
+    configDirectory,
+    `.${basename(configPath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+  )
+  let temporaryFileExists = false
+
+  try {
+    writeFileSync(temporaryPath, contents, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: configMode,
+    })
+    temporaryFileExists = true
+    renameSync(temporaryPath, configPath)
+    temporaryFileExists = false
+  } finally {
+    if (temporaryFileExists) {
+      rmSync(temporaryPath, { force: true })
+    }
+  }
+}
+
 function prepareUpdaterSigningKey() {
   const paths = buildSigningPaths(homedir())
-  mkdirSync(paths.signingDir, { recursive: true, mode: 0o700 })
-  chmodSync(paths.signingDir, 0o700)
+  const lockPath = join(paths.signingDir, ".updater-signing-generation.lock")
+  let lockAcquired = false
+  let failure
 
-  const generatedPaths = [
-    paths.privateKey,
-    paths.publicKey,
-    paths.passwordFile,
-    paths.localEnv,
-    paths.githubSecrets,
-  ]
-  if (generatedPaths.some((generatedPath) => existsSync(generatedPath))) {
-    throw new Error(
-      `refusing to overwrite existing updater signing files in ${paths.signingDir}`
-    )
-  }
-
-  const password = randomBytes(32).toString("base64url")
-
-  process.env.PNPM_CONFIG_REPORTER = "silent"
   try {
+    mkdirSync(paths.signingDir, { recursive: true, mode: 0o700 })
+    chmodSync(paths.signingDir, 0o700)
+    try {
+      writeFileSync(lockPath, "", { flag: "wx", mode: 0o600 })
+      lockAcquired = true
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "EEXIST") {
+        throw new SafeGenerationError(LOCK_MESSAGE)
+      }
+      throw error
+    }
+
+    const generatedPaths = [
+      paths.privateKey,
+      paths.publicKey,
+      paths.passwordFile,
+      paths.localEnv,
+      paths.githubSecrets,
+    ]
+    if (generatedPaths.some((generatedPath) => existsSync(generatedPath))) {
+      throw new SafeGenerationError(OVERWRITE_MESSAGE)
+    }
+
+    const password = randomBytes(32).toString("base64url")
+    process.env.PNPM_CONFIG_REPORTER = "silent"
     execFileSync(
       process.platform === "win32" ? "pnpm.cmd" : "pnpm",
       [
@@ -126,48 +216,63 @@ function prepareUpdaterSigningKey() {
       ],
       { cwd: repoRoot, stdio: ["ignore", "ignore", "inherit"] }
     )
-  } catch {
-    throw new Error("updater signer generation failed")
+
+    const publicKey = validateGeneratedPublicKey(
+      readFileSync(paths.publicKey, "utf8").trim()
+    )
+    const resolvedPrivateKeyPath = resolve(paths.privateKey)
+
+    writeSupportFile(paths.passwordFile, password)
+    writeSupportFile(
+      paths.localEnv,
+      [
+        `TAURI_SIGNING_PRIVATE_KEY=${shellQuote(resolvedPrivateKeyPath)}`,
+        `TAURI_SIGNING_PRIVATE_KEY_PATH=${shellQuote(resolvedPrivateKeyPath)}`,
+        `TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${shellQuote(password)}`,
+      ].join("\n")
+    )
+    writeSupportFile(
+      paths.githubSecrets,
+      [
+        "# GitHub updater signing secrets",
+        "",
+        `- TAURI_SIGNING_PRIVATE_KEY: use the contents of ${paths.privateKey}`,
+        `- TAURI_SIGNING_PRIVATE_KEY_PASSWORD: use the contents of ${paths.passwordFile}`,
+        "",
+      ].join("\n")
+    )
+
+    const configText = readFileSync(tauriConfigPath, "utf8")
+    writeConfigAtomically(
+      tauriConfigPath,
+      replacePublicKeyInConfigText(configText, publicKey)
+    )
+  } catch (error) {
+    failure = error
+  } finally {
+    if (existsSync(paths.privateKey)) {
+      try {
+        chmodSync(paths.privateKey, 0o600)
+      } catch (error) {
+        failure ??= error
+      }
+    }
+
+    if (lockAcquired) {
+      try {
+        rmSync(lockPath, { force: true })
+      } catch (error) {
+        failure ??= error
+      }
+    }
   }
 
-  chmodSync(paths.privateKey, 0o600)
-  writeFileSync(paths.passwordFile, `${password}\n`, { mode: 0o600 })
-  chmodSync(paths.passwordFile, 0o600)
-
-  const publicKey = readFileSync(paths.publicKey, "utf8").trim()
-  if (!publicKey) {
-    throw new Error(`generated public key is empty: ${paths.publicKey}`)
+  if (failure) {
+    if (failure instanceof SafeGenerationError) {
+      throw failure
+    }
+    throw new Error(GENERATION_FAILURE_MESSAGE)
   }
-
-  const configText = readFileSync(tauriConfigPath, "utf8")
-  writeFileSync(
-    tauriConfigPath,
-    replacePublicKeyInConfigText(configText, publicKey)
-  )
-
-  writeFileSync(
-    paths.localEnv,
-    [
-      `TAURI_SIGNING_PRIVATE_KEY_PATH=${shellQuote(resolve(paths.privateKey))}`,
-      `TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${shellQuote(password)}`,
-      "",
-    ].join("\n"),
-    { mode: 0o600 }
-  )
-  chmodSync(paths.localEnv, 0o600)
-
-  writeFileSync(
-    paths.githubSecrets,
-    [
-      "# GitHub updater signing secrets",
-      "",
-      `- TAURI_SIGNING_PRIVATE_KEY: use the contents of ${paths.privateKey}`,
-      `- TAURI_SIGNING_PRIVATE_KEY_PASSWORD: use the contents of ${paths.passwordFile}`,
-      "",
-    ].join("\n"),
-    { mode: 0o600 }
-  )
-  chmodSync(paths.githubSecrets, 0o600)
 
   for (const generatedPath of [
     paths.privateKey,
