@@ -2709,6 +2709,11 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
 License text SHA-256: none
 
+cargo:toml_edit@0.19.15
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/toml-rs/toml
+License text SHA-256: none
+
 cargo:toml_edit@0.20.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/toml-rs/toml
@@ -7735,6 +7740,11 @@ Declared license: ISC
 Homepage: https://github.com/StefanTerdell/zod-to-json-schema#readme
 License text SHA-256: 80d3168ad2f70f6f5bb2ab22b23414707abf6f0a392034891481ae36a1a429d4
 
+npm:zustand@5.0.14
+Declared license: MIT
+Homepage: https://github.com/pmndrs/zustand
+License text SHA-256: 384a8fa756d4ca7e5df8639719e5ee7e279b2b27d2ccecbbe4222733050d4423
+
 npm:zwitch@2.0.4
 Declared license: MIT
 Homepage: https://github.com/wooorm/zwitch#readme
@@ -10883,6 +10893,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+SHA-256: 384a8fa756d4ca7e5df8639719e5ee7e279b2b27d2ccecbbe4222733050d4423
+Packages:
+- npm:zustand@5.0.14
+
+MIT License
+
+Copyright (c) 2019 Paul Henschel
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 SHA-256: 386091cda07036e7f6d8e2d30137b358b355484c29a305ececb63d0386025daa
 Packages:
