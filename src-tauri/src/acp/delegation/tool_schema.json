@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
+    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id, reason). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task"],
@@ -55,14 +55,19 @@
   },
   {
     "name": "cancel_delegation",
-    "description": "Stop a running delegated task by its task_id and tear down its sub-agent — use this only when you no longer want the result. Don't cancel just because a task is taking a while: substantial work can legitimately run for a long time, so prefer waiting on it (get_delegation_status with wait_ms) over canceling. If the task has already finished, nothing is canceled and its final result is returned instead.",
+    "description": "Stop a running delegated task by its task_id and tear down its sub-agent — use this only when you no longer want the result. You must provide a reason. Use timeout only when you are tempted to cancel because the child is still running too long; timeout will not cancel and will tell you to keep waiting. Don't cancel just because a task is taking a while: substantial work can legitimately run for a long time, so prefer waiting on it (get_delegation_status with wait_ms) over canceling. If the task has already finished, nothing is canceled and its final result is returned instead.",
     "inputSchema": {
       "type": "object",
-      "required": ["task_id"],
+      "required": ["task_id", "reason"],
       "properties": {
         "task_id": {
           "type": "string",
           "description": "The task_id returned by delegate_to_agent."
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["timeout", "taskfail", "usercancel", "others"],
+          "description": "Why this task should be canceled. timeout is non-canceling and returns guidance to keep waiting; taskfail, usercancel, and others cancel the task."
         }
       }
     }

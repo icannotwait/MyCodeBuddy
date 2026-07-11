@@ -19,7 +19,7 @@ use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest,
+    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
 };
 use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
@@ -358,9 +358,13 @@ impl DelegationListener {
             .await
     }
 
-    /// Validate the token, resolve the caller's parent, and cancel the task.
-    /// Backs the `cancel_delegation` tool.
+    /// Backs the `cancel_delegation` tool. A `timeout` reason is explicitly
+    /// non-canceling; every other reason validates the token, resolves the
+    /// caller's parent, and cancels the task.
     async fn process_cancel_task(&self, req: BrokerCancelTaskRequest) -> DelegationTaskReport {
+        if req.reason == CancelDelegationReason::Timeout {
+            return timeout_cancel_guidance_report(&req.task_id);
+        }
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             return unknown_report(&req.task_id);
         };
@@ -373,6 +377,7 @@ impl DelegationListener {
                 &entry.parent_connection_id,
                 parent_conversation_id,
                 &req.task_id,
+                req.reason.as_str(),
             )
             .await
     }
@@ -624,6 +629,19 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         text: None,
         error_code: None,
         message: Some("unknown task id".into()),
+        duration_ms: None,
+    }
+}
+
+fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
+    DelegationTaskReport {
+        task_id: Some(task_id.to_string()),
+        status: TaskStatus::Running,
+        child_conversation_id: None,
+        agent_type: None,
+        text: None,
+        error_code: None,
+        message: Some("不要取消仍在 running 的子代理".into()),
         duration_ms: None,
     }
 }
@@ -1354,12 +1372,61 @@ mod tests {
         let cancel = BrokerMessage::CancelTask(BrokerCancelTaskRequest {
             token: "tok".into(),
             task_id: task_id.clone(),
+            reason: CancelDelegationReason::UserCancel,
         });
         write_frame(&mut client, &cancel).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
         server_task.await.unwrap();
         assert_eq!(resp.outcome["status"], "canceled");
         assert_eq!(broker.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_timeout_reason_returns_guidance_without_canceling() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn".into())).await;
+        mock.queue_send(Ok(7)).await;
+        let broker = make_broker(mock.clone()).await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let ack = broker
+            .start_delegation(DelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: "pt-1".into(),
+                agent_type: AgentType::Codex,
+                task: "do x".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await;
+        let task_id = ack.task_id.clone().unwrap();
+
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        let cancel = BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+            token: "tok".into(),
+            task_id,
+            reason: CancelDelegationReason::Timeout,
+        });
+        write_frame(&mut client, &cancel).await.unwrap();
+        let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(resp.outcome["status"], "running");
+        assert_eq!(resp.outcome["message"], "不要取消仍在 running 的子代理");
+        assert_eq!(broker.pending_count().await, 1);
     }
 
     #[tokio::test]

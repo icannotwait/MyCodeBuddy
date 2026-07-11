@@ -3039,6 +3039,7 @@ impl DelegationBroker {
         parent_connection_id: &str,
         parent_conversation_id: Option<i32>,
         task_id: &str,
+        reason: &str,
     ) -> DelegationTaskReport {
         let drained = {
             let mut inner = self.pending.inner.lock().await;
@@ -3050,12 +3051,7 @@ impl DelegationBroker {
             }
             match inner.running.get(task_id) {
                 Some(r) if r.parent_connection_id == parent_connection_id => {
-                    drain_and_record_canceled(
-                        &mut inner,
-                        vec![task_id.to_string()],
-                        "canceled by request",
-                    )
-                    .pop()
+                    drain_and_record_canceled(&mut inner, vec![task_id.to_string()], reason).pop()
                 }
                 Some(_) => return unknown_report(task_id),
                 None => None,
@@ -3071,7 +3067,7 @@ impl DelegationBroker {
                 report_from_outcome(
                     Some(task_id.to_string()),
                     Some(task.agent_type),
-                    &canceled_outcome(task.child_conversation_id, "canceled by request"),
+                    &canceled_outcome(task.child_conversation_id, reason),
                     Some(duration_ms),
                 )
             }

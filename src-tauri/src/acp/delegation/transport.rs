@@ -129,6 +129,33 @@ pub struct BrokerStatusRequest {
 pub struct BrokerCancelTaskRequest {
     pub token: String,
     pub task_id: String,
+    pub reason: CancelDelegationReason,
+}
+
+/// Required reason supplied by the LLM when it calls `cancel_delegation`.
+/// `timeout` is intentionally non-canceling: a slow still-running child should
+/// be polled again instead of torn down just because it is taking time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelDelegationReason {
+    #[serde(rename = "timeout")]
+    Timeout,
+    #[serde(rename = "taskfail")]
+    TaskFail,
+    #[serde(rename = "usercancel")]
+    UserCancel,
+    #[serde(rename = "others")]
+    Others,
+}
+
+impl CancelDelegationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::TaskFail => "taskfail",
+            Self::UserCancel => "usercancel",
+            Self::Others => "others",
+        }
+    }
 }
 
 /// Pull the pending live-feedback notes for the parent session. Backs the

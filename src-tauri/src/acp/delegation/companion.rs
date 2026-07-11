@@ -46,7 +46,7 @@ use crate::acp::delegation::transport::{
     client_feedback_round_trip, client_round_trip, client_session_round_trip,
     client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerStatusRequest,
+    BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
@@ -471,9 +471,20 @@ async fn build_tools_call_spawn(
                     ));
                 }
             };
+            let reason = match parse_cancel_reason(&arguments) {
+                Ok(reason) => reason,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            if reason == CancelDelegationReason::Timeout {
+                return LineAction::Respond(ok(
+                    id,
+                    render_task_report(&timeout_cancel_guidance_report(&task_id)),
+                ));
+            }
             let req = BrokerCancelTaskRequest {
                 token: ctx.token.clone(),
                 task_id,
+                reason,
             };
             let round_trip =
                 Box::pin(async move { client_cancel_task_round_trip(&socket, &req).await });
@@ -830,6 +841,32 @@ fn normalize_status_task_ids(arguments: &Value) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+fn parse_cancel_reason(arguments: &Value) -> Result<CancelDelegationReason, String> {
+    let Some(reason) = arguments.get("reason").and_then(|v| v.as_str()) else {
+        return Err(cancel_reason_error());
+    };
+    match reason {
+        "timeout" => Ok(CancelDelegationReason::Timeout),
+        "taskfail" => Ok(CancelDelegationReason::TaskFail),
+        "usercancel" => Ok(CancelDelegationReason::UserCancel),
+        "others" => Ok(CancelDelegationReason::Others),
+        _ => Err(cancel_reason_error()),
+    }
+}
+
+fn cancel_reason_error() -> String {
+    "cancel_delegation requires reason to be one of: timeout, taskfail, usercancel, others"
+        .to_string()
+}
+
+fn timeout_cancel_guidance_report(task_id: &str) -> Value {
+    json!({
+        "task_id": task_id,
+        "status": "running",
+        "message": "不要取消仍在 running 的子代理"
+    })
 }
 
 /// Render the `get_delegation_status` round-trip outcome (always a
@@ -1236,6 +1273,17 @@ mod tests {
         assert!(status["inputSchema"]["properties"]["wait_ms"].is_object());
         let required = status["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task_ids"));
+        let cancel = tools
+            .iter()
+            .find(|t| t["name"] == "cancel_delegation")
+            .unwrap();
+        let cancel_required = cancel["inputSchema"]["required"].as_array().unwrap();
+        assert!(cancel_required.iter().any(|v| v == "task_id"));
+        assert!(cancel_required.iter().any(|v| v == "reason"));
+        assert_eq!(
+            cancel["inputSchema"]["properties"]["reason"]["enum"],
+            json!(["timeout", "taskfail", "usercancel", "others"])
+        );
     }
 
     #[tokio::test]
@@ -1250,6 +1298,62 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("task_ids"));
+    }
+
+    #[tokio::test]
+    async fn cancel_delegation_without_reason_rejected() {
+        let line = r#"{
+            "jsonrpc":"2.0",
+            "id":12,
+            "method":"tools/call",
+            "params": { "name": "cancel_delegation", "arguments": { "task_id": "abc" } }
+        }"#;
+        let resp = unwrap_respond(dispatch_for_test(line).await);
+        let e = resp.error.unwrap();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("reason"));
+    }
+
+    #[tokio::test]
+    async fn cancel_delegation_rejects_invalid_reason() {
+        let line = r#"{
+            "jsonrpc":"2.0",
+            "id":13,
+            "method":"tools/call",
+            "params": {
+                "name": "cancel_delegation",
+                "arguments": { "task_id": "abc", "reason": "slow" }
+            }
+        }"#;
+        let resp = unwrap_respond(dispatch_for_test(line).await);
+        let e = resp.error.unwrap();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("reason"));
+        assert!(e.message.contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn cancel_delegation_timeout_reason_returns_guidance_without_spawning() {
+        let inflight = Arc::new(InflightCalls::new());
+        let line = r#"{
+            "jsonrpc":"2.0",
+            "id":14,
+            "method":"tools/call",
+            "params": {
+                "name": "cancel_delegation",
+                "arguments": { "task_id": "abc", "reason": "timeout" }
+            }
+        }"#;
+        let resp = unwrap_respond(dispatch_line(&ctx(), inflight.clone(), line).await);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "不要取消仍在 running 的子代理"
+        );
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["status"], "running");
+        assert_eq!(inflight.inner.lock().await.len(), 0);
     }
 
     #[tokio::test]
