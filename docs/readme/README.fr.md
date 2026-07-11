@@ -267,9 +267,9 @@ Les binaires Windows pré-compilés (avec les ressources web incluses) sont disp
 Les mises à niveau du serveur Windows précompilé sont manuelles. Relancez
 `install.ps1` ou remplacez l'installation existante avec les fichiers du
 prochain `codeg-server-windows-x64.zip`. Ce fork ne publie aucun artefact de
-serveur Linux/macOS précompilé dans GitHub Releases ; les mises à jour sur
-place sous Linux/macOS concernent uniquement les builds locaux depuis les
-sources.
+serveur Linux/macOS précompilé dans GitHub Releases. La mise à jour de version
+sur place du serveur autonome n'est disponible sur aucune plateforme de ce
+fork.
 
 #### Option 3 : Docker
 
@@ -290,6 +290,23 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp est d
 ```
 
 Si vous conservez les deux binaires dans des répertoires séparés, définissez `CODEG_MCP_BIN=/chemin/abs/vers/codeg-mcp` pour que le runtime puisse toujours trouver le compagnon ; sans cela, la délégation multi-agents est désactivée silencieusement.
+
+#### Mise à niveau des builds source Linux/macOS
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-mcp --no-default-features
+# Arrêtez le service, redéployez les deux binaires et les ressources web, puis redémarrez.
+```
+
+Les déploiements Linux/macOS compilés depuis les sources se mettent à niveau en
+récupérant la révision voulue, en recompilant et en redéployant. Les endpoints
+du serveur autonome ne téléchargent ni n'appliquent les versions GitHub
+Releases sur place. Les déploiements Docker reconstruisent aussi l'image et le
+conteneur.
 
 #### Configuration
 

@@ -268,8 +268,8 @@ Upgrades des vorkompilierten Windows-Servers erfolgen manuell. Führen Sie
 `install.ps1` erneut aus oder ersetzen Sie die bestehende Installation durch
 die Dateien aus der nächsten `codeg-server-windows-x64.zip`. Dieser Fork
 veröffentlicht keine vorkompilierten Linux/macOS-Serverartefakte in GitHub
-Releases; direkte Updates unter Linux/macOS gelten nur für lokale
-Quellcode-Builds.
+Releases. Ein direktes Release-Update des Standalone-Servers ist in diesem Fork
+auf keiner Plattform verfügbar.
 
 #### Option 3: Docker
 
@@ -290,6 +290,22 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp wird 
 ```
 
 Wenn Sie die beiden Binärdateien in getrennten Verzeichnissen halten, setzen Sie `CODEG_MCP_BIN=/abs/pfad/zu/codeg-mcp`, damit die Laufzeit den Begleiter dennoch findet; ohne diese Variable wird die Multi-Agent-Delegation stillschweigend deaktiviert.
+
+#### Upgrades quellcodebasierter Linux/macOS-Installationen
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-mcp --no-default-features
+# Dienst stoppen, beide Binärdateien und Web-Assets neu bereitstellen, dann neu starten.
+```
+
+Quellcodebasierte Linux/macOS-Installationen werden durch Abrufen des Zielstands,
+Neukompilieren und erneutes Bereitstellen aktualisiert. Die Standalone-Server-
+Endpunkte laden keine GitHub-Releases direkt herunter und wenden sie nicht an.
+Docker-Installationen werden nach dem Abrufen des Quellcodes neu gebaut.
 
 #### Konfiguration
 

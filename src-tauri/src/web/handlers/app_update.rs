@@ -1,10 +1,10 @@
-//! In-place self-update endpoints for the standalone server / Docker
-//! runtime: download+verify+swap (`perform_app_update`), relaunch
-//! (`restart_app`), and revert (`rollback_app`).
+//! Standalone server update endpoints. This fork gates the public
+//! download/swap, restart, and rollback actions on every platform because it
+//! publishes no compatible standalone release channel.
 //!
-//! All three are gated behind the process-wide `system_op_lock` so a second
-//! click can't race a download already in flight. On desktop (Tauri) builds
-//! they hard-error — desktop updates through `tauri-plugin-updater`.
+//! The low-level implementation remains compiled for its existing tests and
+//! internal contracts. Desktop Tauri updates use separate IPC commands backed
+//! by `tauri-plugin-updater` and are unaffected by this HTTP gate.
 
 use std::sync::Arc;
 
@@ -15,6 +15,14 @@ use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::update::runtime::UpdateCapability;
 use crate::update::AppUpdateState;
+
+const SERVER_UPDATE_UNSUPPORTED_MESSAGE: &str = "In-place standalone server updates are unavailable under this fork release policy; rerun install.ps1 or replace the Windows ZIP install, or pull source and rebuild/redeploy on Linux/macOS";
+
+fn ensure_public_server_update_supported() -> Result<(), AppCommandError> {
+    Err(AppCommandError::invalid_input(
+        SERVER_UPDATE_UNSUPPORTED_MESSAGE,
+    ))
+}
 
 /// Current update snapshot (in-flight download progress, ready-to-restart, or
 /// error). Mode-agnostic: reads the shared in-memory handle both runtimes
@@ -41,27 +49,25 @@ pub struct UpdateActionResult {
     pub capability: UpdateCapability,
 }
 
-/// Kick off the download/verify/swap and return **immediately** with the
-/// current snapshot (`Downloading`). The actual work runs in a detached task so
-/// it survives the client navigating away, reloading, or dropping the
-/// connection — progress is observed via the `app_update_state` event/snapshot,
-/// not by holding this request open. Idempotent: a second call while one is in
-/// flight just returns the live snapshot.
+/// Reject standalone in-place updates under the fork release policy.
 pub async fn perform_app_update(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<AppUpdateState>, AppCommandError> {
+    ensure_public_server_update_supported()?;
     perform_impl(state).await.map(Json)
 }
 
 pub async fn restart_app(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<UpdateActionResult>, AppCommandError> {
+    ensure_public_server_update_supported()?;
     restart_impl(state).map(Json)
 }
 
 pub async fn rollback_app(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<UpdateActionResult>, AppCommandError> {
+    ensure_public_server_update_supported()?;
     rollback_impl(state).await.map(Json)
 }
 
@@ -90,7 +96,7 @@ fn not_supported() -> AppCommandError {
     AppCommandError::invalid_input("In-place update is only available in server mode")
 }
 
-// ─── server build: the real thing ────────────────────────────────────────
+// ─── retained server implementation ─────────────────────────────────────
 
 #[cfg(not(feature = "tauri-runtime"))]
 fn busy() -> AppCommandError {
@@ -301,9 +307,42 @@ async fn rollback_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCo
     })
 }
 
+#[cfg(test)]
+mod release_policy_tests {
+    use super::*;
+
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new_for_test(db, dir.path().to_path_buf()));
+        (state, dir)
+    }
+
+    fn assert_release_policy_error(error: AppCommandError) {
+        assert!(matches!(
+            error.code,
+            crate::app_error::AppErrorCode::InvalidInput
+        ));
+        assert_eq!(error.message, SERVER_UPDATE_UNSUPPORTED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn public_server_update_endpoints_reject_fork_in_place_updates() {
+        let (state, _dir) = test_state().await;
+
+        assert_release_policy_error(
+            perform_app_update(Extension(state.clone()))
+                .await
+                .unwrap_err(),
+        );
+        assert_release_policy_error(restart_app(Extension(state.clone())).await.unwrap_err());
+        assert_release_policy_error(rollback_app(Extension(state)).await.unwrap_err());
+    }
+}
+
 // `ensure_supported` rejects Windows, and the desktop build's `perform_impl` is
-// the not-supported stub — so this concurrency test only applies to a server
-// build on a supported platform.
+// the not-supported stub, so these low-level implementation tests only apply to
+// a server build on a supported platform.
 #[cfg(all(test, not(feature = "tauri-runtime"), not(target_os = "windows")))]
 mod tests {
     use super::*;

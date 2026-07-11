@@ -266,8 +266,8 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 
 ترقيات خادم Windows الجاهز تتم يدويًا. أعد تشغيل `install.ps1`، أو استبدل
 التثبيت الحالي بملفات `codeg-server-windows-x64.zip` التالية. لا ينشر هذا
-التفرع حزم خادم Linux/macOS جاهزة ضمن GitHub Releases؛ والتحديث الموضعي على
-Linux/macOS متاح فقط للبناء المحلي من المصدر.
+التفرع حزم خادم Linux/macOS جاهزة ضمن GitHub Releases. لا يتوفر محدّث إصدارات
+موضعي للخادم المستقل على أي منصة في هذا التفرع.
 
 #### الخيار 3: Docker
 
@@ -288,6 +288,22 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # يتم التق
 ```
 
 إذا احتفظت بالملفين التنفيذيين في دليلين منفصلين، فاضبط `CODEG_MCP_BIN=/مسار/مطلق/إلى/codeg-mcp` حتى يستطيع التشغيل العثور على الرفيق؛ بدون ذلك، يُعطَّل التفويض متعدد الوكلاء بصمت.
+
+#### ترقية بناء Linux/macOS من المصدر
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-mcp --no-default-features
+# أوقف الخدمة، وأعد نشر الملفين التنفيذيين وموارد الويب، ثم أعد التشغيل.
+```
+
+تُرقّى عمليات نشر Linux/macOS المبنية من المصدر عبر سحب المراجعة المطلوبة
+وإعادة البناء والنشر. لا تقوم نقاط نهاية الخادم المستقل بتنزيل تحديثات
+GitHub Releases أو تطبيقها موضعيًا. ويجب كذلك إعادة بناء صورة Docker والحاوية
+بعد سحب المصدر.
 
 #### التكوين
 

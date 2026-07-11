@@ -386,9 +386,9 @@ https://github.com/icannotwait/MyCodeBuddy/releases/latest
 https://github.com/icannotwait/MyCodeBuddy
 ```
 
-in Tauri updater config, Rust server updater constants, settings links, and
-`install.ps1`. Set `$Repo = "icannotwait/MyCodeBuddy"` in the PowerShell
-installer. Before creating or writing `InstallDir`, validate
+in Tauri updater config, retained low-level Rust server updater constants,
+settings links, and `install.ps1`. Set `$Repo = "icannotwait/MyCodeBuddy"` in
+the PowerShell installer. Before creating or writing `InstallDir`, validate
 `codeg-server.exe`, `codeg-mcp.exe`, `LICENSE`, `NOTICE`, and
 `THIRD_PARTY_LICENSES.txt`; then copy all five files while preserving the web
 asset copy behavior.
@@ -406,8 +406,10 @@ Update the root README and every localized README so:
 - the Windows PowerShell example points to the fork;
 - Windows prebuilt upgrades require rerunning `install.ps1` or replacing files
   from the next Windows ZIP;
-- Linux/macOS in-place updates are described only as local source-built
-  behavior because this fork publishes no prebuilt Linux/macOS server assets;
+- Linux/macOS source-built upgrades require pulling source, rebuilding, and
+  redeploying because this fork publishes no prebuilt Linux/macOS server assets;
+- standalone server in-place release update capability and action endpoints
+  are disabled on every platform while the Tauri desktop updater is unchanged;
 - Docker instructions describe local `docker compose up -d` builds only and
   contain no `ghcr.io/xintaofei/codeg` image;
 - the license section links to `LICENSE`;
@@ -532,6 +534,8 @@ Implementation requirements:
 - run Cargo metadata from `src-tauri` for exactly
   `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
   `x86_64-apple-darwin`, and `aarch64-apple-darwin`;
+- from each metadata `resolve.root`, traverse only dependency edges with a
+  normal/null or build `dep_kind`, excluding exclusively dev edges;
 - collect npm production metadata once and form a deterministic Cargo union;
 - merge equivalent duplicate metadata and reject conflicting metadata;
 - exclude the workspace root `codeg` package from third-party Cargo records;

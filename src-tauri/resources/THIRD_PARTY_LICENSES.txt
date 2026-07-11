@@ -1,7 +1,7 @@
 THIRD-PARTY SOFTWARE LICENSES
 
 This report covers locked npm production dependencies and Cargo
-dependencies resolved for the deterministic union of these targets:
+normal/build dependency graphs for the deterministic union of these targets:
 - x86_64-pc-windows-msvc
 - aarch64-pc-windows-msvc
 - x86_64-apple-darwin
@@ -105,11 +105,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/bluss/arrayvec
 License text SHA-256: none
 
-cargo:assert-json-diff@2.0.2
-Declared license: MIT
-Homepage: https://github.com/davidpdrsn/assert-json-diff
-License text SHA-256: bd93a76e524df7158f9db404a74051162ef3fd2c165ff01bbf97214ab88bb80e
-
 cargo:async-compression@0.4.42
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/Nullus157/async-compression
@@ -145,11 +140,6 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/smol-rs/atomic-waker
 License text SHA-256: none
 
-cargo:auto-future@1.0.0
-Declared license: MIT
-Homepage: https://github.com/JosephLenton/auto-future
-License text SHA-256: bc968e711df2655be9052effdec49b99b48c08bc1f8aa6a0163618d6962c3c09
-
 cargo:autocfg@1.5.0
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/cuviper/autocfg
@@ -164,11 +154,6 @@ cargo:axum-core@0.5.6
 Declared license: MIT
 Homepage: https://github.com/tokio-rs/axum
 License text SHA-256: 008c87afcd2e626eaf564093250bed06dd7efb5732113264bba3dda8f1c556a1
-
-cargo:axum-test@17.3.0
-Declared license: MIT
-Homepage: https://github.com/JosephLenton/axum-test
-License text SHA-256: bc968e711df2655be9052effdec49b99b48c08bc1f8aa6a0163618d6962c3c09
 
 cargo:base64@0.21.7
 Declared license: MIT OR Apache-2.0
@@ -285,11 +270,6 @@ Declared license: MIT
 Homepage: https://github.com/tokio-rs/bytes
 License text SHA-256: 51f778ffff2c0705f0392f4202c932c7c93124850ced31abb7eef1e937da42c4
 
-cargo:bytesize@2.3.1
-Declared license: Apache-2.0
-Homepage: https://github.com/bytesize-rs/bytesize
-License text SHA-256: c5accbbd8546e94c34aed24afe689a617627d18eed5a6c48277e48db57c23851
-
 cargo:bzip2@0.5.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/trifectatechfoundation/bzip2-rs
@@ -404,11 +384,6 @@ cargo:concurrent-queue@2.5.0
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/smol-rs/concurrent-queue
 License text SHA-256: none
-
-cargo:console@0.16.3
-Declared license: MIT
-Homepage: https://github.com/console-rs/console
-License text SHA-256: 1c5ed1a530e6251c4a1afebb18f1b8b76eda11d08ba31b65c03d2cb52408351b
 
 cargo:const-oid@0.9.6
 Declared license: Apache-2.0 OR MIT
@@ -605,11 +580,6 @@ Declared license: MIT
 Homepage: https://github.com/JelteF/derive_more
 License text SHA-256: 4a4d43f3f90d1d8b5f55a3598015779f5aa94baa203a0e5a7b7c853f7d2426ea
 
-cargo:diff@0.1.13
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/utkarshkukreti/diff.rs
-License text SHA-256: none
-
 cargo:digest@0.10.7
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/traits
@@ -688,11 +658,6 @@ License text SHA-256: c4be15bd543af19231ce7866442f74e8e4f226f1f409f40829279ed8f4
 cargo:embed_plist@1.2.2
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/nvzqz/embed-plist-rs
-License text SHA-256: none
-
-cargo:encode_unicode@1.0.0
-Declared license: Apache-2.0 OR MIT
-Homepage: https://github.com/tormol/encode_unicode
 License text SHA-256: none
 
 cargo:encoding_rs@0.8.35
@@ -1133,11 +1098,6 @@ cargo:inout@0.1.4
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/utils
 License text SHA-256: none
-
-cargo:insta@1.47.2
-Declared license: Apache-2.0
-Homepage: https://insta.rs/
-License text SHA-256: 769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb
 
 cargo:ioctl-rs@0.1.6
 Declared license: MIT
@@ -1619,26 +1579,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/servo/rust-url/
 License text SHA-256: none
 
-cargo:pest@2.8.6
-Declared license: MIT OR Apache-2.0
-Homepage: https://pest.rs/
-License text SHA-256: none
-
-cargo:pest_derive@2.8.6
-Declared license: MIT OR Apache-2.0
-Homepage: https://pest.rs/
-License text SHA-256: none
-
-cargo:pest_generator@2.8.6
-Declared license: MIT OR Apache-2.0
-Homepage: https://pest.rs/
-License text SHA-256: none
-
-cargo:pest_meta@2.8.6
-Declared license: MIT OR Apache-2.0
-Homepage: https://pest.rs/
-License text SHA-256: none
-
 cargo:pgvector@0.4.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/pgvector/pgvector-rust
@@ -1798,11 +1738,6 @@ cargo:precomputed-hash@0.1.1
 Declared license: MIT
 Homepage: https://github.com/emilio/precomputed-hash
 License text SHA-256: 695de7436b470fd94bf51ecb275c1352ec9be3560873e65b03fd736b286536cb
-
-cargo:pretty_assertions@1.4.1
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/rust-pretty-assertions/rust-pretty-assertions
-License text SHA-256: none
 
 cargo:prettyplease@0.2.37
 Declared license: MIT OR Apache-2.0
@@ -1989,11 +1924,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/seanmonstar/reqwest
 License text SHA-256: none
 
-cargo:reserve-port@2.4.0
-Declared license: MIT
-Homepage: https://github.com/JosephLenton/reserve-port
-License text SHA-256: bc968e711df2655be9052effdec49b99b48c08bc1f8aa6a0163618d6962c3c09
-
 cargo:rfd@0.16.0
 Declared license: MIT
 Homepage: https://github.com/PolyMeilex/rfd
@@ -2027,11 +1957,6 @@ License text SHA-256: none
 cargo:rsa@0.9.10
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/RSA
-License text SHA-256: none
-
-cargo:rust-multipart-rfc7578_2@0.8.0
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/JosephLenton/rust-multipart-rfc7578_2
 License text SHA-256: none
 
 cargo:rust_decimal@1.40.0
@@ -2379,11 +2304,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rusticstuff/simdutf8
 License text SHA-256: none
 
-cargo:similar@2.7.0
-Declared license: Apache-2.0
-Homepage: https://github.com/mitsuhiko/similar
-License text SHA-256: 769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb
-
 cargo:siphasher@0.3.11
 Declared license: MIT/Apache-2.0
 Homepage: https://docs.rs/siphasher
@@ -2659,11 +2579,6 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/tauri-apps/winrt-notification
 License text SHA-256: c801c521ff39a5d63c02fdfdcf8e8eff20af237da14847545748cc6d1b2664fa
 
-cargo:temp-env@0.3.6
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/vmx/temp-env
-License text SHA-256: none
-
 cargo:tempfile@3.24.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://stebalien.com/projects/tempfile-rs/
@@ -2898,11 +2813,6 @@ cargo:typenum@1.19.0
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/paholg/typenum
 License text SHA-256: db11fec9946737df39ca3898d9cd8c10ec6f6c3a884a6802b0ad0b81b4e8f23a
-
-cargo:ucd-trie@0.1.7
-Declared license: MIT OR Apache-2.0
-Homepage: https://github.com/BurntSushi/ucd-generate
-License text SHA-256: none
 
 cargo:unic-char-property@0.9.0
 Declared license: MIT/Apache-2.0
@@ -9505,32 +9415,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-SHA-256: 1c5ed1a530e6251c4a1afebb18f1b8b76eda11d08ba31b65c03d2cb52408351b
-Packages:
-- cargo:console@0.16.3
-
-The MIT License (MIT)
-
-Copyright (c) 2017 Armin Ronacher <armin.ronacher@active-4.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 SHA-256: 1ce6eee93b3831cf67a52a4c24fa44e5b356b65243857b08adb1a33c07a0d20c
 Packages:
 - npm:confbox@0.1.8
@@ -15833,10 +15717,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 SHA-256: 769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb
 Packages:
-- cargo:insta@1.47.2
 - cargo:prost-derive@0.13.5
 - cargo:prost@0.13.5
-- cargo:similar@2.7.0
 
                               Apache License
                         Version 2.0, January 2004
@@ -20846,34 +20728,6 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF 
 NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 
-SHA-256: bc968e711df2655be9052effdec49b99b48c08bc1f8aa6a0163618d6962c3c09
-Packages:
-- cargo:auto-future@1.0.0
-- cargo:axum-test@17.3.0
-- cargo:reserve-port@2.4.0
-
-MIT License
-
-Copyright (c) 2023 Joseph Lenton
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 SHA-256: bd470a9114ffb0c125553667203e65dce3ed50a339a3f5c43de24e225c040b7a
 Packages:
 - npm:js-yaml@4.1.1
@@ -20899,18 +20753,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-SHA-256: bd93a76e524df7158f9db404a74051162ef3fd2c165ff01bbf97214ab88bb80e
-Packages:
-- cargo:assert-json-diff@2.0.2
-
-Copyright (c) 2019 David Pedersen
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 SHA-256: bd9ddf4af1ab8c1792a672598b7b34b925c0442b36e2a11c7cc207170993149b
 Packages:
@@ -21573,7 +21415,6 @@ Packages:
 
 SHA-256: c5accbbd8546e94c34aed24afe689a617627d18eed5a6c48277e48db57c23851
 Packages:
-- cargo:bytesize@2.3.1
 - npm:detect-libc@2.1.2
 
                                  Apache License

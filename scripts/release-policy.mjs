@@ -314,6 +314,46 @@ export function assertUpdaterArtifactPolicy({
 }
 
 export function assertServerInstallerCompliance(installScriptText) {
+  if (
+    !/\$RequiredInstalledFiles\s*=\s*@\("codeg-server\.exe",\s*"codeg-mcp\.exe",\s*"LICENSE",\s*"NOTICE",\s*"THIRD_PARTY_LICENSES\.txt"\)/.test(
+      installScriptText
+    )
+  ) {
+    throw new Error(
+      "server installer required installed files must include both executables and all compliance files"
+    )
+  }
+  if (
+    !/\$RequiredInstalledDirectories\s*=\s*@\("web"\)/.test(installScriptText)
+  ) {
+    throw new Error(
+      "server installer required installed directories must include web"
+    )
+  }
+  if (
+    !/function Test-InstalledFilesComplete\(\[string\]\$Directory\)\s*\{[\s\S]*?foreach \(\$filename in \$RequiredInstalledFiles\)[\s\S]*?Test-Path -LiteralPath \$path -PathType Leaf[\s\S]*?foreach \(\$directoryName in \$RequiredInstalledDirectories\)[\s\S]*?Test-Path -LiteralPath \$path -PathType Container[\s\S]*?return \$true\s*\}/.test(
+      installScriptText
+    )
+  ) {
+    throw new Error(
+      "server installer must check every required installed file and directory"
+    )
+  }
+
+  const versionShortcut = installScriptText.match(
+    /if \(\$CurrentVersion[\s\S]*?Write-Host "codeg-server is already at version \$TargetVer, nothing to do\."[\s\S]*?exit 0\s*\}/
+  )?.[0]
+  if (
+    !versionShortcut ||
+    !/-and \(Test-InstalledFilesComplete -Directory \$InstallDir\)/.test(
+      versionShortcut
+    )
+  ) {
+    throw new Error(
+      "server installer version shortcut must require complete installed files"
+    )
+  }
+
   const installMarker = installScriptText.indexOf("# ── Install ──")
   if (installMarker < 0) {
     throw new Error("server installer is missing the install section")

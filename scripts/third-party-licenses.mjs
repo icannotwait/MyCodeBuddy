@@ -110,15 +110,75 @@ export const collectNpmPackages = (pnpmReport) => {
 }
 
 export const collectCargoPackages = (cargoMetadata) => {
-  const workspaceMembers = new Set(cargoMetadata.workspace_members ?? [])
+  if (!cargoMetadata.resolve || !Array.isArray(cargoMetadata.resolve.nodes)) {
+    throw new Error("Cargo metadata resolve graph is missing")
+  }
+  const rootId = cargoMetadata.resolve.root
+  if (typeof rootId !== "string" || rootId.length === 0) {
+    throw new Error("Cargo metadata resolve root is missing")
+  }
+  if (!Array.isArray(cargoMetadata.packages)) {
+    throw new Error("Cargo metadata packages list is missing")
+  }
 
-  return cargoMetadata.packages
-    .filter(
-      (cargoPackage) =>
-        !(
-          cargoPackage.name === "codeg" && workspaceMembers.has(cargoPackage.id)
-        )
+  const packagesById = new Map(
+    cargoMetadata.packages.map((cargoPackage) => [
+      cargoPackage.id,
+      cargoPackage,
+    ])
+  )
+  if (!packagesById.has(rootId)) {
+    throw new Error(
+      `Cargo metadata resolve root references unknown package ID: ${rootId}`
     )
+  }
+
+  const nodesById = new Map()
+  for (const node of cargoMetadata.resolve.nodes) {
+    if (!packagesById.has(node.id)) {
+      throw new Error(
+        `Cargo metadata resolve node references unknown package ID: ${node.id}`
+      )
+    }
+    nodesById.set(node.id, node)
+    for (const dependency of node.deps ?? []) {
+      if (!packagesById.has(dependency.pkg)) {
+        throw new Error(
+          `Cargo metadata resolve graph references unknown package ID: ${dependency.pkg}`
+        )
+      }
+    }
+  }
+  if (!nodesById.has(rootId)) {
+    throw new Error(
+      `Cargo metadata resolve graph is missing the root node: ${rootId}`
+    )
+  }
+
+  const reachablePackageIds = new Set([rootId])
+  const pendingPackageIds = [rootId]
+  while (pendingPackageIds.length > 0) {
+    const packageId = pendingPackageIds.pop()
+    const node = nodesById.get(packageId)
+    if (!node) {
+      throw new Error(
+        `Cargo metadata resolve graph is missing node for package ID: ${packageId}`
+      )
+    }
+    for (const dependency of node.deps ?? []) {
+      const isProductionEdge = (dependency.dep_kinds ?? []).some(
+        ({ kind }) => kind == null || kind === "normal" || kind === "build"
+      )
+      if (isProductionEdge && !reachablePackageIds.has(dependency.pkg)) {
+        reachablePackageIds.add(dependency.pkg)
+        pendingPackageIds.push(dependency.pkg)
+      }
+    }
+  }
+
+  return [...reachablePackageIds]
+    .filter((packageId) => packageId !== rootId)
+    .map((packageId) => packagesById.get(packageId))
     .map((cargoPackage) =>
       assertLicensed({
         ecosystem: "cargo",
@@ -260,7 +320,7 @@ export const renderLicenseReport = (records) => {
     "THIRD-PARTY SOFTWARE LICENSES",
     "",
     "This report covers locked npm production dependencies and Cargo",
-    "dependencies resolved for the deterministic union of these targets:",
+    "normal/build dependency graphs for the deterministic union of these targets:",
     ...CARGO_TARGETS.map((target) => `- ${target}`),
     "",
     "PACKAGE INVENTORY",

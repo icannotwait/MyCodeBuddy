@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 import {
+  collectCargoPackageUnion,
   collectCargoPackages,
   collectNpmPackages,
   findLicenseFiles,
@@ -131,6 +132,34 @@ test("collects Cargo Windows metadata and excludes the workspace root", () => {
         homepage: "https://example.test/alpha",
       },
     ],
+    resolve: {
+      root: "path+file:///checkout/src-tauri#codeg@1.0.0",
+      nodes: [
+        {
+          id: "path+file:///checkout/src-tauri#codeg@1.0.0",
+          deps: [
+            {
+              name: "alpha",
+              pkg: "registry+https://example.test#alpha@1.0.0",
+              dep_kinds: [{ kind: null, target: null }],
+            },
+            {
+              name: "beta",
+              pkg: "registry+https://example.test#beta@2.0.0",
+              dep_kinds: [{ kind: null, target: null }],
+            },
+          ],
+        },
+        {
+          id: "registry+https://example.test#alpha@1.0.0",
+          deps: [],
+        },
+        {
+          id: "registry+https://example.test#beta@2.0.0",
+          deps: [],
+        },
+      ],
+    },
   }
 
   const records = collectCargoPackages(cargoMetadata)
@@ -159,9 +188,187 @@ test("collects Cargo Windows metadata and excludes the workspace root", () => {
   )
 })
 
+test("collects only production-reachable Cargo packages from the resolve graph", () => {
+  const packageRecord = (name) => {
+    const directory = makePackageDirectory(name, {
+      LICENSE: `${name} terms`,
+    })
+    return {
+      id: `registry+https://example.test#${name}@1.0.0`,
+      name,
+      version: "1.0.0",
+      license: "MIT",
+      manifest_path: join(directory, "Cargo.toml"),
+      homepage: `https://example.test/${name}`,
+    }
+  }
+  const root = {
+    id: "path+file:///checkout/src-tauri#codeg@1.0.0",
+    name: "codeg",
+    version: "1.0.0",
+    license: "Apache-2.0",
+    manifest_path: join(makePackageDirectory("codeg"), "Cargo.toml"),
+  }
+  const packages = [
+    root,
+    ...[
+      "normal-direct",
+      "normal-transitive",
+      "build-direct",
+      "build-transitive",
+      "mixed-normal-dev",
+      "axum-test",
+      "insta",
+      "temp-env",
+    ].map(packageRecord),
+  ]
+  const id = (name) =>
+    packages.find((cargoPackage) => cargoPackage.name === name).id
+  const dependency = (name, kinds) => ({
+    name,
+    pkg: id(name),
+    dep_kinds: kinds.map((kind) => ({ kind, target: null })),
+  })
+  const metadata = {
+    packages,
+    workspace_members: [root.id],
+    resolve: {
+      root: root.id,
+      nodes: [
+        {
+          id: root.id,
+          deps: [
+            dependency("normal-direct", [null]),
+            dependency("build-direct", ["build"]),
+            dependency("mixed-normal-dev", [null, "dev"]),
+            dependency("axum-test", ["dev"]),
+            dependency("insta", ["dev"]),
+            dependency("temp-env", ["dev"]),
+          ],
+        },
+        {
+          id: id("normal-direct"),
+          deps: [dependency("normal-transitive", [null])],
+        },
+        {
+          id: id("normal-transitive"),
+          deps: [],
+        },
+        {
+          id: id("build-direct"),
+          deps: [dependency("build-transitive", ["build"])],
+        },
+        {
+          id: id("build-transitive"),
+          deps: [],
+        },
+        {
+          id: id("mixed-normal-dev"),
+          deps: [],
+        },
+        {
+          id: id("axum-test"),
+          deps: [],
+        },
+        {
+          id: id("insta"),
+          deps: [],
+        },
+        {
+          id: id("temp-env"),
+          deps: [],
+        },
+      ],
+    },
+  }
+
+  const records = collectCargoPackages(metadata)
+
+  assert.deepEqual(
+    records.map(({ name }) => name),
+    [
+      "build-direct",
+      "build-transitive",
+      "mixed-normal-dev",
+      "normal-direct",
+      "normal-transitive",
+    ]
+  )
+})
+
+test("rejects missing or invalid Cargo resolve graphs", () => {
+  const root = {
+    id: "path+file:///checkout/src-tauri#codeg@1.0.0",
+    name: "codeg",
+    version: "1.0.0",
+    license: "Apache-2.0",
+    manifest_path: join(makePackageDirectory("codeg"), "Cargo.toml"),
+  }
+  const dependency = {
+    id: "registry+https://example.test#dependency@1.0.0",
+    name: "dependency",
+    version: "1.0.0",
+    license: "MIT",
+    manifest_path: join(
+      makePackageDirectory("dependency", { LICENSE: "Dependency terms" }),
+      "Cargo.toml"
+    ),
+  }
+
+  assert.throws(
+    () => collectCargoPackages({ packages: [root, dependency] }),
+    /Cargo metadata resolve graph is missing/
+  )
+  assert.throws(
+    () =>
+      collectCargoPackages({
+        packages: [root, dependency],
+        resolve: { root: null, nodes: [] },
+      }),
+    /Cargo metadata resolve root is missing/
+  )
+  assert.throws(
+    () =>
+      collectCargoPackages({
+        packages: [root, dependency],
+        resolve: {
+          root: root.id,
+          nodes: [
+            {
+              id: root.id,
+              deps: [
+                {
+                  name: "missing",
+                  pkg: "registry+https://example.test#missing@1.0.0",
+                  dep_kinds: [{ kind: null, target: null }],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    /unknown package ID.*missing@1\.0\.0/
+  )
+  assert.throws(
+    () =>
+      collectCargoPackageUnion([
+        {
+          packages: [root, dependency],
+          resolve: {
+            root: root.id,
+            nodes: [
+              { id: root.id, deps: [] },
+              { id: "unknown", deps: [] },
+            ],
+          },
+        },
+      ]),
+    /resolve node references unknown package ID.*unknown/
+  )
+})
+
 test("unions the four bundled Cargo targets and deduplicates shared packages", async () => {
-  const { CARGO_TARGETS, collectCargoPackageUnion } =
-    await import("./third-party-licenses.mjs")
+  const { CARGO_TARGETS } = await import("./third-party-licenses.mjs")
   const shared = makePackageDirectory("shared", { LICENSE: "Shared terms" })
   const windowsArmOnly = makePackageDirectory("windows-arm-only", {
     LICENSE: "Windows ARM terms",
@@ -177,10 +384,36 @@ test("unions the four bundled Cargo targets and deduplicates shared packages", a
     manifest_path: join(directory, "Cargo.toml"),
     homepage: `https://example.test/${name}`,
   })
-  const metadata = (packages) => ({
-    workspace_members: [],
-    packages,
-  })
+  const metadata = (packages) => {
+    const root = {
+      id: "path+file:///checkout/src-tauri#codeg@1.0.0",
+      name: "codeg",
+      version: "1.0.0",
+      license: "Apache-2.0",
+      manifest_path: join(makePackageDirectory("codeg"), "Cargo.toml"),
+    }
+    return {
+      workspace_members: [root.id],
+      packages: [root, ...packages],
+      resolve: {
+        root: root.id,
+        nodes: [
+          {
+            id: root.id,
+            deps: packages.map((cargoPackage) => ({
+              name: cargoPackage.name,
+              pkg: cargoPackage.id,
+              dep_kinds: [{ kind: null, target: null }],
+            })),
+          },
+          ...packages.map((cargoPackage) => ({
+            id: cargoPackage.id,
+            deps: [],
+          })),
+        ],
+      },
+    }
+  }
 
   assert.deepEqual(CARGO_TARGETS, [
     "x86_64-pc-windows-msvc",
@@ -216,8 +449,6 @@ test("unions the four bundled Cargo targets and deduplicates shared packages", a
 })
 
 test("rejects conflicting Cargo metadata while merging equivalent records", async () => {
-  const { collectCargoPackageUnion } =
-    await import("./third-party-licenses.mjs")
   const first = makePackageDirectory("conflict-first", {
     LICENSE: "First terms",
   })
@@ -233,10 +464,35 @@ test("rejects conflicting Cargo metadata while merging equivalent records", asyn
     homepage: "https://example.test/conflict",
     ...overrides,
   })
-  const metadata = (cargoPackageRecord) => ({
-    workspace_members: [],
-    packages: [cargoPackageRecord],
-  })
+  const metadata = (cargoPackageRecord) => {
+    const root = {
+      id: "path+file:///checkout/src-tauri#codeg@1.0.0",
+      name: "codeg",
+      version: "1.0.0",
+      license: "Apache-2.0",
+      manifest_path: join(makePackageDirectory("codeg"), "Cargo.toml"),
+    }
+    return {
+      workspace_members: [root.id],
+      packages: [root, cargoPackageRecord],
+      resolve: {
+        root: root.id,
+        nodes: [
+          {
+            id: root.id,
+            deps: [
+              {
+                name: cargoPackageRecord.name,
+                pkg: cargoPackageRecord.id,
+                dep_kinds: [{ kind: null, target: null }],
+              },
+            ],
+          },
+          { id: cargoPackageRecord.id, deps: [] },
+        ],
+      },
+    }
+  }
 
   assert.throws(
     () =>

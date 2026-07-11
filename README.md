@@ -267,7 +267,8 @@ Pre-built Windows binaries (with bundled web assets) are available on the [Relea
 Windows prebuilt server upgrades are manual. Rerun `install.ps1`, or replace
 the existing installation with files from the next
 `codeg-server-windows-x64.zip`. This fork publishes no prebuilt Linux/macOS
-server artifacts in GitHub Releases.
+server artifacts in GitHub Releases. No in-place standalone server release
+updater is available on any platform in this fork.
 
 #### Option 3: Docker
 
@@ -289,23 +290,25 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp is pi
 
 If you keep the two binaries in separate directories, set `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` so the runtime can still find the companion; without it, multi-agent delegation is silently disabled.
 
-#### Source-built Linux/macOS updates
-
-In-place updates from **Settings → Software Update** are local, source-built
-Linux/macOS behavior only. This fork does not publish prebuilt Linux/macOS
-server artifacts in GitHub Releases. The updater swaps locally installed
-binaries and web assets, restarts the server, and retains the previous version
-for the **Roll back** action.
-
-**Run under the supervisor for auto-rollback.** Start the standalone server with `--supervise` so a freshly-upgraded process that fails to boot within the trial window is automatically reverted to the previous version:
+#### Source-built Linux/macOS upgrades
 
 ```bash
-CODEG_STATIC_DIR=./web ./codeg-server --supervise
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-mcp --no-default-features
+# Stop the service, redeploy both binaries and the web assets, then restart it.
 ```
 
-Without `--supervise` the server still updates in place (it re-execs itself), but the upgrade is best-effort: there is no supervisor to auto-roll-back a version that can't start. The Docker image already runs under the supervisor.
+Source-built Linux/macOS deployments upgrade by pulling the desired source,
+rebuilding, and redeploying the server, companion, and static web output. The
+standalone server endpoints do not download or apply GitHub Release assets in
+place.
 
-**Docker upgrades change the container, not the locally built image.** An in-place upgrade rewrites the binaries and web assets inside the running container's writable layer, so they live only in that container. The `/data` volume persists, but the upgraded files do **not**: recreating the container with `docker compose up --build --force-recreate` starts from the local source build again and drops the in-place upgrade. To make an upgrade permanent, update the source checkout and rebuild the container.
+Docker deployments upgrade by pulling source and rebuilding/recreating the
+container, for example
+`git pull && docker compose up --build -d --force-recreate`.
 
 #### Configuration
 

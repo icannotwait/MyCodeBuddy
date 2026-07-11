@@ -184,6 +184,49 @@ test("server installer validates and copies compliance files before install writ
   const installScript = readRepositoryFile("install.ps1")
 
   assert.doesNotThrow(() => assertServerInstallerCompliance(installScript))
+  assert.match(
+    installScript,
+    /\$RequiredInstalledFiles\s*=\s*@\("codeg-server\.exe",\s*"codeg-mcp\.exe",\s*"LICENSE",\s*"NOTICE",\s*"THIRD_PARTY_LICENSES\.txt"\)/
+  )
+  assert.match(installScript, /\$RequiredInstalledDirectories\s*=\s*@\("web"\)/)
+  assert.match(
+    installScript,
+    /-and \(Test-InstalledFilesComplete -Directory \$InstallDir\)/
+  )
+  for (const requiredEntry of [
+    "codeg-server.exe",
+    "codeg-mcp.exe",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.txt",
+    "web",
+  ]) {
+    const requiredListName =
+      requiredEntry === "web"
+        ? "$RequiredInstalledDirectories"
+        : "$RequiredInstalledFiles"
+    const requiredListLine = installScript
+      .split("\n")
+      .find((line) => line.startsWith(requiredListName))
+    assert.ok(requiredListLine, `${requiredListName} is missing`)
+    const withoutRequiredEntry = installScript.replace(
+      requiredListLine,
+      requiredListLine
+        .replace(`"${requiredEntry}", `, "")
+        .replace(`, "${requiredEntry}"`, "")
+        .replace(`"${requiredEntry}"`, "")
+    )
+    assert.notEqual(
+      withoutRequiredEntry,
+      installScript,
+      `fixture failed to remove ${requiredEntry}`
+    )
+    assert.throws(
+      () => assertServerInstallerCompliance(withoutRequiredEntry),
+      /required installed/i,
+      `policy accepted a shortcut without ${requiredEntry}`
+    )
+  }
   assert.throws(
     () =>
       assertServerInstallerCompliance(
@@ -226,10 +269,6 @@ test("server READMEs require manual Windows upgrades and current examples", () =
   for (const path of paths) {
     const text = readRepositoryFile(path)
     const releaseSectionStart = text.indexOf("codeg-server-windows-x64.zip")
-    const releaseSection = text.slice(
-      releaseSectionStart,
-      releaseSectionStart + 1000
-    )
 
     assert.notEqual(
       releaseSectionStart,
@@ -251,11 +290,26 @@ test("server READMEs require manual Windows upgrades and current examples", () =
       `${path} must describe replacement from the next Windows ZIP`
     )
     assert.match(
-      releaseSection,
-      /Linux\/macOS/,
-      `${path} must qualify Linux/macOS updates as source-built/local only`
+      text,
+      /git pull/,
+      `${path} must tell source-built deployments to pull source`
     )
-    assert.match(releaseSection, /GitHub\s+Releases/)
+    assert.match(
+      text,
+      /cargo build --release --bin codeg-server --no-default-features/,
+      `${path} must tell source-built deployments to rebuild`
+    )
+    assert.match(
+      text,
+      /Linux\/macOS/,
+      `${path} must describe Linux/macOS source-built upgrades`
+    )
+    assert.match(text, /GitHub\s+Releases/)
+    assert.doesNotMatch(
+      text,
+      /--supervise/,
+      `${path} must not advertise supervisor-driven auto-update`
+    )
   }
 })
 

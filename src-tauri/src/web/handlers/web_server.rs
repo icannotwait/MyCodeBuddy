@@ -109,20 +109,18 @@ pub struct AppUpdateInfo {
 pub struct AppUpdateCheckResult {
     pub current_version: String,
     pub update: Option<AppUpdateInfo>,
-    /// Whether *this* process can apply the update in place. True for the
-    /// standalone server build on a supported platform; false on desktop
-    /// (which updates via Tauri's own updater) and on unknown platforms.
-    /// When false the frontend falls back to a "view release" link.
+    /// Whether *this* process can apply the update in place. Always false for
+    /// this fork's standalone server endpoint; desktop updates use Tauri IPC.
     pub self_update_supported: bool,
-    /// How a self-update would restart: `"supervised"` (our `--supervise`
-    /// parent relaunches) or `"reexec"` (the process re-execs itself).
+    /// Retained wire metadata for client compatibility. Ignored while
+    /// `self_update_supported` is false.
     pub capability: crate::update::runtime::UpdateCapability,
     /// `"docker"` | `"standalone"` — drives the post-upgrade hint.
     pub runtime: String,
     /// Relaunch delay (ms) the frontend countdown should use after a
     /// supervised restart.
     pub restart_delay_ms: u64,
-    /// A previous version is staged in `.bak` and can be rolled back to.
+    /// Always false because the public standalone rollback endpoint is gated.
     pub rollback_available: bool,
     /// This server speaks the detached `app_update_state` protocol (background
     /// download + progress events + ready-to-restart snapshot). Always true on
@@ -132,30 +130,15 @@ pub struct AppUpdateCheckResult {
     pub live_progress: bool,
 }
 
-#[cfg(feature = "tauri-runtime")]
 fn server_self_update_supported() -> bool {
-    // Desktop builds self-update through `tauri-plugin-updater`; the embedded
-    // web server must never swap the desktop binary with a server tarball.
+    // This fork publishes no standalone Linux/macOS server assets, and Windows
+    // server self-update is unsupported. Desktop builds use the separate Tauri
+    // updater command path.
     false
 }
 
-#[cfg(not(feature = "tauri-runtime"))]
-fn server_self_update_supported() -> bool {
-    // Windows server self-update is intentionally disabled: swapping a running
-    // .exe and the standalone re-exec port rebind have not been validated on a
-    // real Windows host. Only Linux/macOS are supported for now. (The desktop
-    // Windows app is unaffected — it updates via tauri-plugin-updater.)
-    !cfg!(target_os = "windows") && crate::update::install::asset_basename().is_some()
-}
-
-#[cfg(feature = "tauri-runtime")]
 fn server_rollback_available() -> bool {
     false
-}
-
-#[cfg(not(feature = "tauri-runtime"))]
-fn server_rollback_available() -> bool {
-    crate::update::install::rollback_available()
 }
 
 pub async fn check_app_update() -> Result<Json<AppUpdateCheckResult>, AppCommandError> {
@@ -193,16 +176,16 @@ pub struct ServerUpdateStatus {
     /// settings page can show the current version even when the release source
     /// is unreachable.
     pub current_version: String,
-    /// Whether this process can apply an in-place update (server build on a
-    /// supported platform). Local — no network.
+    /// Whether this process can apply an in-place update. Always false for the
+    /// standalone server in this fork.
     pub self_update_supported: bool,
-    /// How a self-update would restart: `"supervised"` or `"reexec"`.
+    /// Retained wire metadata for client compatibility.
     pub capability: crate::update::runtime::UpdateCapability,
     /// `"docker"` | `"standalone"` — drives the post-upgrade hint.
     pub runtime: String,
     /// Relaunch delay (ms) the frontend countdown should use.
     pub restart_delay_ms: u64,
-    /// A previous version is staged in `.bak` and can be rolled back to.
+    /// Always false because the public standalone rollback endpoint is gated.
     pub rollback_available: bool,
     /// This server speaks the detached `app_update_state` protocol. See
     /// [`AppUpdateCheckResult::live_progress`].
@@ -210,12 +193,9 @@ pub struct ServerUpdateStatus {
 }
 
 /// Local-only counterpart to [`check_app_update`]: reports what this process
-/// can do (self-update capability, rollback availability) WITHOUT contacting
-/// the release source. The manual rollback affordance must stay reachable even
-/// when the update manifest is unreachable (proxy, outage, air-gap), since
-/// `rollback_app` is an entirely local operation — gating it behind the
-/// network-dependent update check would hide it exactly when recovery is most
-/// needed.
+/// can do WITHOUT contacting the release source. The standalone update and
+/// rollback capabilities are intentionally false under this fork's release
+/// policy.
 pub async fn app_update_status() -> Json<ServerUpdateStatus> {
     use crate::update::runtime;
     Json(ServerUpdateStatus {
@@ -227,4 +207,16 @@ pub async fn app_update_status() -> Json<ServerUpdateStatus> {
         rollback_available: server_rollback_available(),
         live_progress: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn standalone_server_status_never_advertises_in_place_update_support() {
+        let Json(status) = app_update_status().await;
+        assert!(!status.self_update_supported);
+        assert!(!status.rollback_available);
+    }
 }

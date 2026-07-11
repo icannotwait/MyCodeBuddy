@@ -267,8 +267,9 @@ Binários pré-compilados para Windows (com recursos web incluídos) estão disp
 As atualizações do servidor Windows pré-compilado são manuais. Execute
 `install.ps1` novamente ou substitua a instalação existente pelos arquivos do
 próximo `codeg-server-windows-x64.zip`. Este fork não publica artefatos de
-servidor Linux/macOS pré-compilados no GitHub Releases; as atualizações no
-local em Linux/macOS destinam-se apenas a builds locais a partir do código.
+servidor Linux/macOS pré-compilados no GitHub Releases. O atualizador de
+versões no local do servidor standalone não está disponível em nenhuma
+plataforma deste fork.
 
 #### Opção 3: Docker
 
@@ -289,6 +290,22 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp é de
 ```
 
 Se você mantiver os dois binários em diretórios separados, defina `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` para que o runtime ainda possa encontrar o companion; sem isso, a delegação multi-agente é desativada silenciosamente.
+
+#### Atualizações de builds de origem no Linux/macOS
+
+```bash
+git pull
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release --bin codeg-server --no-default-features
+cargo build --release --bin codeg-mcp --no-default-features
+# Pare o serviço, reimplante os dois binários e os recursos web e reinicie.
+```
+
+Implantações Linux/macOS compiladas a partir do código são atualizadas puxando
+a revisão desejada, recompilando e reimplantando. Os endpoints do servidor
+standalone não baixam nem aplicam atualizações do GitHub Releases no local.
+Implantações Docker também devem reconstruir a imagem e recriar o contêiner.
 
 #### Configuração
 

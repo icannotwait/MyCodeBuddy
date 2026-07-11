@@ -120,8 +120,9 @@ A root `NOTICE` file will:
 
 A generated third-party license report will list bundled production npm and
 Cargo packages, their versions, declared licenses, and available license text.
-The generator will collect npm production dependencies once and use the
-deterministic union of Cargo packages resolved for exactly:
+The generator will collect npm production dependencies once and traverse each
+Cargo resolve graph from its workspace root through normal and build edges,
+excluding exclusively dev edges, before taking the deterministic union for:
 
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
@@ -148,8 +149,11 @@ The fork will use a newly generated Tauri updater signing key pair:
   `TAURI_SIGNING_PRIVATE_KEY` and
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
-Desktop and server update URLs will use the fork's GitHub Releases. A static
-test will reject upstream update URLs in runtime update configuration.
+Desktop update URLs will use the fork's GitHub Releases. Retained low-level
+standalone update code may also reference the fork for testability, but the
+public standalone server capability is false and all in-place update action
+endpoints reject the operation on every platform. A static test will reject
+upstream update URLs in runtime update configuration.
 
 The Windows installer will not use Authenticode because no code-signing
 certificate is available. Documentation will state that Windows SmartScreen
@@ -180,6 +184,9 @@ The server installer will validate both executables plus `LICENSE`, `NOTICE`,
 and `THIRD_PARTY_LICENSES.txt` before writing to its destination, then install
 all five files. Windows prebuilt server upgrades are manual: users rerun
 `install.ps1` or replace the installation from the next Windows ZIP.
+Linux/macOS source-built servers upgrade by pulling source, rebuilding, and
+redeploying. This fork exposes no in-place standalone server release updater
+on Windows, Linux, or macOS; the Tauri desktop updater remains available.
 
 Apple certificates, Linux cross-compilers, Docker buildx, Docker Hub secrets,
 and unrelated release jobs will be removed from this workflow.
@@ -217,6 +224,7 @@ Automated verification will cover:
 - required compliance files appearing in Tauri resource configuration;
 - release-only updater artifact configuration and workflow usage;
 - installer validation and copying of all compliance files;
+- standalone server update capability and action endpoint rejection;
 - no runtime updater URL pointing to `xintaofei/codeg`;
 - package, Cargo, Tauri, and tag version consistency;
 - release workflow containing only Windows build targets;

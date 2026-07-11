@@ -22,6 +22,8 @@ $Artifact = "codeg-server-windows-x64"
 # resolves the companion as a sibling of the running server executable.
 $ManagedBins = @("codeg-server", "codeg-mcp")
 $ComplianceFiles = @("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
+$RequiredInstalledFiles = @("codeg-server.exe", "codeg-mcp.exe", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
+$RequiredInstalledDirectories = @("web")
 
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly
@@ -61,6 +63,22 @@ function Read-BinVersion([string]$BinPath) {
         Remove-Item $stdout -Force -ErrorAction SilentlyContinue
         Remove-Item $stderr -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-InstalledFilesComplete([string]$Directory) {
+    foreach ($filename in $RequiredInstalledFiles) {
+        $path = Join-Path $Directory $filename
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $false
+        }
+    }
+    foreach ($directoryName in $RequiredInstalledDirectories) {
+        $path = Join-Path $Directory $directoryName
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 # ── Resolve version ──
@@ -140,11 +158,11 @@ if ($VersionCheckBin) {
     $CurrentVersion = Read-BinVersion $VersionCheckBin
 }
 
-# Only short-circuit when the active binary is up to date AND the destination
-# itself has it AND no other PATH entries shadow it.
+# Only short-circuit when the active binary is up to date, no other PATH entry
+# shadows it, and the destination still contains the complete installed bundle.
 if ($CurrentVersion -and ($CurrentVersion -eq $TargetVer) `
         -and ($PathConflicts.Count -eq 0) `
-        -and (Test-Path -LiteralPath $DestBin)) {
+        -and (Test-InstalledFilesComplete -Directory $InstallDir)) {
     Write-Host "codeg-server is already at version $TargetVer, nothing to do."
     exit 0
 }
