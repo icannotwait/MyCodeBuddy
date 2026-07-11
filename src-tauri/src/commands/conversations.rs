@@ -438,6 +438,78 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
     serde_json::Value::Object(obj)
 }
 
+fn delegation_task_id_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("structuredContent")
+                .and_then(delegation_task_id_from_value)
+        })
+        .or_else(|| {
+            value
+                .get("tasks")
+                .and_then(|v| v.as_array())
+                .and_then(|tasks| tasks.iter().find_map(delegation_task_id_from_value))
+        })
+}
+
+fn delegation_task_id_from_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(task_id) = delegation_task_id_from_value(&value) {
+            return Some(task_id);
+        }
+    }
+    if let Some((_, after_output)) = trimmed.split_once("Output:") {
+        if let Some(task_id) = delegation_task_id_from_text(after_output.trim()) {
+            return Some(task_id);
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                if let Some(task_id) = delegation_task_id_from_value(&value) {
+                    return Some(task_id);
+                }
+            }
+        }
+    }
+    trimmed.find("task_id=").and_then(|idx| {
+        let rest = &trimmed[idx + "task_id=".len()..];
+        let task_id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        (!task_id.is_empty()).then_some(task_id)
+    })
+}
+
+fn delegation_task_ids_by_tool_use_id(turns: &[MessageTurn]) -> HashMap<String, String> {
+    let mut ids = HashMap::new();
+    for turn in turns {
+        for block in &turn.blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id: Some(tool_use_id),
+                output_preview: Some(output),
+                ..
+            } = block
+            {
+                if let Some(task_id) = delegation_task_id_from_text(output) {
+                    ids.insert(tool_use_id.clone(), task_id);
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// Walk every `delegate_to_agent` ToolUse block in `turns` and, when its
 /// `tool_use_id` matches a child conversation in `children`, set
 /// `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
@@ -453,6 +525,11 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
         .iter()
         .filter_map(|c| c.parent_tool_use_id.as_deref().map(|tu| (tu, c)))
         .collect();
+    let by_delegation_call_id: HashMap<&str, &DbConversationSummary> = children
+        .iter()
+        .filter_map(|c| c.delegation_call_id.as_deref().map(|call_id| (call_id, c)))
+        .collect();
+    let task_ids_by_tool_use_id = delegation_task_ids_by_tool_use_id(turns);
     for turn in turns.iter_mut() {
         for block in turn.blocks.iter_mut() {
             if let ContentBlock::ToolUse {
@@ -468,7 +545,12 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
                 if !tool_name.contains("delegate_to_agent") {
                     continue;
                 }
-                if let Some(child) = by_parent_tool_use_id.get(tu.as_str()) {
+                let child = by_parent_tool_use_id.get(tu.as_str()).copied().or_else(|| {
+                    task_ids_by_tool_use_id
+                        .get(tu.as_str())
+                        .and_then(|task_id| by_delegation_call_id.get(task_id.as_str()).copied())
+                });
+                if let Some(child) = child {
                     *meta = Some(serde_json::json!({
                         "codeg.delegation": build_historical_delegation_meta(child),
                     }));
@@ -1848,6 +1930,57 @@ mod tests {
             .unwrap();
         assert_eq!(inner["status"], "completed");
         assert_eq!(inner["child_conversation_id"], 11);
+    }
+
+    #[test]
+    fn inject_delegation_meta_matches_by_task_id_when_tool_use_id_changed() {
+        let mut turns = vec![MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::ToolUse {
+                    tool_use_id: Some("call-live".into()),
+                    tool_name: "delegate_to_agent".into(),
+                    input_preview: None,
+                    meta: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: Some("call-live".into()),
+                    output_preview: Some(
+                        concat!(
+                            "Wall time: 0.0210 seconds\nOutput:\n",
+                            "{\"agent_type\":\"claude_code\",",
+                            "\"child_conversation_id\":5,",
+                            "\"message\":\"Delegation successful. ",
+                            "task_id=c5168930-df71-49d5-b52d-79a642e357ac. ",
+                            "Call get_delegation_status with this id.\",",
+                            "\"status\":\"running\",",
+                            "\"task_id\":\"c5168930-df71-49d5-b52d-79a642e357ac\"}",
+                        )
+                        .into(),
+                    ),
+                    is_error: false,
+                    agent_stats: None,
+                    images: Vec::new(),
+                },
+            ],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+        let mut child = summary_child(5, "item_0", "pending_review");
+        child.delegation_call_id = Some("c5168930-df71-49d5-b52d-79a642e357ac".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        let inner = first_block_meta(&turns[0])
+            .unwrap()
+            .get("codeg.delegation")
+            .unwrap();
+        assert_eq!(inner["status"], "completed");
+        assert_eq!(inner["child_conversation_id"], 5);
     }
 
     #[test]

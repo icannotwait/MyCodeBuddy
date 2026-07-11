@@ -235,6 +235,10 @@ type Action =
         duration_ms?: number | null
         model?: string | null
         completed_at?: string | null
+        tool_meta?: Array<{
+          tool_use_id: string
+          meta: Record<string, unknown> | null
+        }>
       }>
       sessionStats?: SessionStats | null
     }
@@ -898,6 +902,59 @@ function userTurnContentKey(turn: MessageTurn): string {
   )
 }
 
+function sameJsonValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
+}
+
+function collectToolMetaPatches(
+  localTurn: MessageTurn,
+  parsedTurns: MessageTurn[]
+): Array<{ tool_use_id: string; meta: Record<string, unknown> | null }> {
+  const localToolUseIds = new Set<string>()
+  for (const block of localTurn.blocks) {
+    if (block.type === "tool_use" && block.tool_use_id) {
+      localToolUseIds.add(block.tool_use_id)
+    }
+  }
+  if (localToolUseIds.size === 0) return []
+
+  const byId = new Map<string, Record<string, unknown> | null>()
+  for (const turn of parsedTurns) {
+    for (const block of turn.blocks) {
+      if (
+        block.type === "tool_use" &&
+        block.tool_use_id &&
+        localToolUseIds.has(block.tool_use_id) &&
+        block.meta !== undefined
+      ) {
+        byId.set(block.tool_use_id, block.meta ?? null)
+      }
+    }
+  }
+
+  const patches: Array<{
+    tool_use_id: string
+    meta: Record<string, unknown> | null
+  }> = []
+  for (const block of localTurn.blocks) {
+    if (
+      block.type === "tool_use" &&
+      block.tool_use_id &&
+      byId.has(block.tool_use_id)
+    ) {
+      const parsedMeta = byId.get(block.tool_use_id) ?? null
+      if (!sameJsonValue(block.meta ?? null, parsedMeta)) {
+        patches.push({
+          tool_use_id: block.tool_use_id,
+          meta: parsedMeta,
+        })
+      }
+    }
+  }
+  return patches
+}
+
 function reducer(
   state: ConversationRuntimeState,
   action: Action
@@ -1289,18 +1346,53 @@ function reducer(
       for (const patch of action.turnPatches) {
         const turn = patchedTurns[patch.index]
         if (!turn) continue
-        const newUsage = turn.usage ?? patch.usage
-        const newDuration = turn.duration_ms ?? patch.duration_ms
-        const newModel = turn.model ?? patch.model
-        const newCompletedAt = turn.completed_at ?? patch.completed_at
+        const newUsage =
+          patch.usage === undefined ? turn.usage : (turn.usage ?? patch.usage)
+        const newDuration =
+          patch.duration_ms === undefined
+            ? turn.duration_ms
+            : (turn.duration_ms ?? patch.duration_ms)
+        const newModel =
+          patch.model === undefined ? turn.model : (turn.model ?? patch.model)
+        const newCompletedAt =
+          patch.completed_at === undefined
+            ? turn.completed_at
+            : (turn.completed_at ?? patch.completed_at)
+        const toolMetaById =
+          patch.tool_meta && patch.tool_meta.length > 0
+            ? new Map(patch.tool_meta.map((m) => [m.tool_use_id, m.meta]))
+            : null
+        let nextBlocks = turn.blocks
+        if (toolMetaById) {
+          let blocksChanged = false
+          nextBlocks = turn.blocks.map((block) => {
+            if (
+              block.type === "tool_use" &&
+              block.tool_use_id &&
+              toolMetaById.has(block.tool_use_id)
+            ) {
+              const nextMeta = toolMetaById.get(block.tool_use_id) ?? null
+              if (!sameJsonValue(block.meta ?? null, nextMeta)) {
+                blocksChanged = true
+                return { ...block, meta: nextMeta }
+              }
+            }
+            return block
+          })
+          if (!blocksChanged) {
+            nextBlocks = turn.blocks
+          }
+        }
         if (
           newUsage !== turn.usage ||
           newDuration !== turn.duration_ms ||
           newModel !== turn.model ||
-          newCompletedAt !== turn.completed_at
+          newCompletedAt !== turn.completed_at ||
+          nextBlocks !== turn.blocks
         ) {
           patchedTurns[patch.index] = {
             ...turn,
+            blocks: nextBlocks,
             usage: newUsage,
             duration_ms: newDuration,
             model: newModel,
@@ -1843,6 +1935,10 @@ export function ConversationRuntimeProvider({
                 duration_ms?: number | null
                 model?: string | null
                 completed_at?: string | null
+                tool_meta?: Array<{
+                  tool_use_id: string
+                  meta: Record<string, unknown> | null
+                }>
               }> = []
 
               for (let i = 0; i < localAssistantIndices.length; i++) {
@@ -1855,9 +1951,11 @@ export function ConversationRuntimeProvider({
                 // earlier rolled-in parsed turns precede it in time, so we
                 // don't aggregate completion timestamps.
                 let completedAtToApply: string | null | undefined
+                const parsedTurnsForLocal: MessageTurn[] = []
 
                 if (parsedIdx >= 0 && parsedIdx < parsedAssistantTurns.length) {
                   const pt = parsedAssistantTurns[parsedIdx]
+                  parsedTurnsForLocal.push(pt)
                   usageToApply = pt.usage
                   durationToApply = pt.duration_ms
                   modelToApply = pt.model
@@ -1904,11 +2002,23 @@ export function ConversationRuntimeProvider({
                   }
                 }
 
+                const toolMetaParsedTurns =
+                  i === 0 && offset > 0
+                    ? [
+                        ...parsedAssistantTurns.slice(0, offset),
+                        ...parsedTurnsForLocal,
+                      ]
+                    : parsedTurnsForLocal
+                const toolMetaToApply = collectToolMetaPatches(
+                  cur.localTurns[localAssistantIndices[i]],
+                  toolMetaParsedTurns
+                )
                 if (
                   !usageToApply &&
                   !durationToApply &&
                   !modelToApply &&
-                  !completedAtToApply
+                  !completedAtToApply &&
+                  toolMetaToApply.length === 0
                 )
                   continue
                 patches.push({
@@ -1917,6 +2027,8 @@ export function ConversationRuntimeProvider({
                   duration_ms: durationToApply,
                   model: modelToApply,
                   completed_at: completedAtToApply,
+                  tool_meta:
+                    toolMetaToApply.length > 0 ? toolMetaToApply : undefined,
                 })
               }
 

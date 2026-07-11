@@ -798,6 +798,112 @@ describe("ConversationRuntimeProvider delegation kickoff projection", () => {
     expect(timeline.some((t) => t.key === "kickoff-99")).toBe(false)
   })
 
+  it("patches parser-recovered delegation meta into promoted local turns", async () => {
+    vi.useFakeTimers()
+    try {
+      const runningMeta = {
+        "codeg.delegation": {
+          status: "running",
+          child_conversation_id: 12,
+        },
+      }
+      const completedMeta = {
+        "codeg.delegation": {
+          status: "completed",
+          child_conversation_id: 12,
+        },
+      }
+      const liveReply: LiveMessage = {
+        id: "delegation-live",
+        role: "assistant",
+        startedAt: 0,
+        content: [
+          {
+            type: "tool_call",
+            info: {
+              tool_call_id: "call_delegate",
+              title: "delegate_to_agent",
+              kind: "other",
+              status: "completed",
+              content:
+                '{"agent_type":"codex","child_conversation_id":12,"status":"running","task_id":"task-1"}',
+              raw_input: JSON.stringify({
+                agent_type: "codex",
+                task: "review the design",
+              }),
+              raw_output_chunks: [],
+              raw_output_total_bytes: 0,
+              locations: null,
+              meta: runningMeta,
+              images: [],
+            },
+          },
+        ],
+      }
+      const parsedTurn: MessageTurn = {
+        id: "parsed-assistant",
+        role: "assistant",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "call_delegate",
+            tool_name: "delegate_to_agent",
+            input_preview: JSON.stringify({
+              agent_type: "codex",
+              task: "review the design",
+            }),
+            meta: completedMeta,
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "call_delegate",
+            output_preview:
+              '{"agent_type":"codex","child_conversation_id":12,"status":"running","task_id":"task-1"}',
+            is_error: false,
+          },
+        ],
+        timestamp: "2026-05-28T00:00:00.000Z",
+        completed_at: "2026-05-28T00:00:01.000Z",
+      }
+      mockGetFolderConversation.mockResolvedValueOnce(
+        detailWithTurns([parsedTurn])
+      )
+      renderProvider(<RuntimeCapture />)
+      const api = () => runtimeHolder.current!
+
+      act(() => {
+        api().setLiveMessage(99, liveReply, true)
+      })
+      act(() => {
+        api().completeTurn(99, liveReply)
+      })
+
+      const before = api().getSession(99)?.localTurns[0]?.blocks[0]
+      expect(before).toMatchObject({
+        type: "tool_use",
+        meta: runningMeta,
+      })
+
+      let cancelSync: (() => void) | undefined
+      act(() => {
+        cancelSync = api().syncTurnMetadata(99)
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+        await Promise.resolve()
+      })
+
+      const after = api().getSession(99)?.localTurns[0]?.blocks[0]
+      expect(after).toMatchObject({
+        type: "tool_use",
+        meta: completedMeta,
+      })
+      cancelSync?.()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("does not synthesize a kickoff for a normal (non-live-owned) session", async () => {
     mockGetFolderConversation.mockResolvedValueOnce(
       detailWithTurns([assistantTurn("a1")])

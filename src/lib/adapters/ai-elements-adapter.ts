@@ -1840,13 +1840,15 @@ export interface MessageTurnAdapter {
  * blocksLen, timestamp, role, usage, duration_ms, model)` all match. The
  * blocks reference catches whole-turn rewrites (e.g. detail refetch
  * replacing `detail.turns`) where blocksLen/timestamp may stay equal but
- * a tool's output_preview was updated; PATCH_TURN_METADATA preserves the
- * blocks reference, so it still hits. The usage trio is patched in by
- * `syncTurnMetadata` after a stream finishes (initial blocks land first,
- * token totals arrive on a later DB roundtrip), so excluding them would
- * freeze the turn at its pre-patch state and the post-stream stats row
- * would never appear. Turns no longer present are GC'd at the end of
- * every adapt() call so the cache size tracks the conversation.
+ * a tool's output_preview was updated. `PATCH_TURN_METADATA` preserves the
+ * blocks reference for stats-only patches and replaces it only when a
+ * parser-recovered tool meta snapshot changes, so delegation cards re-adapt
+ * after a stream settles. The usage trio is patched in by `syncTurnMetadata`
+ * after a stream finishes (initial blocks land first, token totals arrive on
+ * a later DB roundtrip), so excluding them would freeze the turn at its
+ * pre-patch state and the post-stream stats row would never appear. Turns no
+ * longer present are GC'd at the end of every adapt() call so the cache size
+ * tracks the conversation.
  */
 export function createMessageTurnAdapter(): MessageTurnAdapter {
   const cache = new Map<string, TurnCacheEntry>()
