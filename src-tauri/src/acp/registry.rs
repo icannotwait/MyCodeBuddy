@@ -475,9 +475,8 @@ mod tests {
     fn all_registered_agents_support_mcp() {
         for agent_type in all_acp_agents() {
             let meta = get_agent_meta(agent_type);
-            assert_eq!(
+            assert!(
                 meta.supports_mcp,
-                true,
                 "unexpected supports_mcp for {agent_type:?}"
             );
         }
