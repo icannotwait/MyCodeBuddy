@@ -1257,11 +1257,12 @@ mod tests {
         let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(agents.len(), 9);
+        assert_eq!(agents.len(), 10);
         assert!(agents.iter().any(|a| a == "hermes"));
         assert!(agents.iter().any(|a| a == "code_buddy"));
         assert!(agents.iter().any(|a| a == "kimi_code"));
         assert!(agents.iter().any(|a| a == "pi"));
+        assert!(agents.iter().any(|a| a == "grok"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools

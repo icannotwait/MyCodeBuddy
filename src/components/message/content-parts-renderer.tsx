@@ -52,6 +52,7 @@ import { GeneratedImagesBlock } from "./generated-images-block"
 import { GoalRunPart, GoalToolCallPart } from "./goal-tool-call"
 import { PlanCard, PlanEntriesList } from "./plan-card"
 import { PlanModeCard } from "./plan-mode-card"
+import { PlainTextWithBadges } from "./plain-text-with-badges"
 import {
   FileTextIcon,
   FilePenLineIcon,
@@ -2075,16 +2076,23 @@ function parseCliExecutionEnvelope(text: string): {
 
 const TextPart = memo(function TextPart({
   text,
-  softBreaks = false,
+  isUser = false,
 }: {
   text: string
-  // User-authored text opts in so single newlines survive as line breaks
-  // (chat input commonly relies on them) while Markdown still renders.
-  softBreaks?: boolean
+  // User messages render as plain text + inline reference badges (no Markdown),
+  // matching the plain-text composer. Assistant / system text keeps full Markdown.
+  isUser?: boolean
 }) {
+  if (isUser) {
+    return (
+      <div className="break-words text-sm">
+        <PlainTextWithBadges text={text} />
+      </div>
+    )
+  }
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-      <MessageResponse softBreaks={softBreaks}>{text}</MessageResponse>
+      <MessageResponse>{text}</MessageResponse>
     </div>
   )
 })
@@ -2664,7 +2672,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
         <TextPart
           key={`text-${keyId}`}
           text={part.text}
-          softBreaks={role === "user"}
+          isUser={role === "user"}
         />
       )
     }

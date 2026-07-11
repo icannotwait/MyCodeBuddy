@@ -17,12 +17,18 @@ import { openSettingsWindow, type SettingsSection } from "@/lib/api"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
 import { useEnabledSkillIds } from "@/hooks/use-enabled-skill-ids"
+import { useWelcomeQuickActions } from "@/hooks/use-appearance"
 import { getExpertIcon, pickLocalized } from "@/lib/expert-presentation"
 import {
   OFFICE_ACTIONS,
   OFFICE_FEATURED_ACCENTS,
   type OfficeAction,
 } from "@/lib/office-actions"
+import {
+  RESEARCH_ACTIONS,
+  RESEARCH_FEATURED_ACCENTS,
+  type ResearchAction,
+} from "@/lib/research-actions"
 import {
   loadQuickActionsTab,
   saveQuickActionsTab,
@@ -40,6 +46,20 @@ const OFFICE_FIXED: (OfficeAction & { accent: string })[] =
 // Remaining office skills — de-colored bars in the scrolling row (icons kept).
 const OFFICE_SCROLL: OfficeAction[] = OFFICE_ACTIONS.filter(
   (action) => !(action.id in OFFICE_FEATURED_ACCENTS)
+)
+
+// Three primary research skills — prominent fixed cards (keep their color).
+const RESEARCH_FIXED: (ResearchAction & { accent: string })[] =
+  RESEARCH_ACTIONS.filter(
+    (action) => action.id in RESEARCH_FEATURED_ACCENTS
+  ).map((action) => ({
+    ...action,
+    accent: RESEARCH_FEATURED_ACCENTS[action.id],
+  }))
+
+// Remaining research skills — de-colored bars in the scrolling row.
+const RESEARCH_SCROLL: ResearchAction[] = RESEARCH_ACTIONS.filter(
+  (action) => !(action.id in RESEARCH_FEATURED_ACCENTS)
 )
 
 // Three featured coding experts get prominent fixed cards (color + curated
@@ -91,6 +111,11 @@ const ACCENTS: Record<string, { icon: string; surface: string }> = {
     icon: "text-purple-600 dark:text-purple-400",
     surface:
       "border-purple-500/20 hover:border-purple-500/40 hover:bg-purple-500/5",
+  },
+  violet: {
+    icon: "text-violet-600 dark:text-violet-400",
+    surface:
+      "border-violet-500/20 hover:border-violet-500/40 hover:bg-violet-500/5",
   },
 }
 
@@ -285,6 +310,7 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
   const locale = useLocale()
   const experts = useBuiltInExperts()
   const { enabledIds, ready, supported } = useEnabledSkillIds(agentType)
+  const { showWelcomeQuickActions } = useWelcomeQuickActions()
   const lockHint = t("notEnabled.hint")
 
   // A skill card is locked when we know which agent will run (welcome mode
@@ -327,7 +353,12 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
   // conversation shows the previous choice.
   const [tab, setTab] = useState<QuickActionsTab>(() => loadQuickActionsTab())
   const handleTabChange = useCallback((value: string) => {
-    const next: QuickActionsTab = value === "office" ? "office" : "coding"
+    const next: QuickActionsTab =
+      value === "office"
+        ? "office"
+        : value === "research"
+          ? "research"
+          : "coding"
     setTab(next)
     saveQuickActionsTab(next)
   }, [])
@@ -337,6 +368,21 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
       const label = t(action.id as Parameters<typeof t>[0])
       if (isLocked(action.skillId)) {
         notifyNotEnabled(label, "office-tools")
+        return
+      }
+      onSelect({
+        text: t(action.promptKey as Parameters<typeof t>[0]),
+        skill: { id: action.skillId, label },
+      })
+    },
+    [onSelect, t, isLocked, notifyNotEnabled]
+  )
+
+  const handleResearch = useCallback(
+    (action: ResearchAction) => {
+      const label = t(action.id as Parameters<typeof t>[0])
+      if (isLocked(action.skillId)) {
+        notifyNotEnabled(label, "science")
         return
       }
       onSelect({
@@ -385,10 +431,12 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
     return { codingFeatured: featured, codingRest: rest }
   }, [experts])
 
-  // A custom-dir pi can't have skills managed by codeg's default-dir store, so
-  // hide the shortcut cards rather than show ones that lock with a Settings
-  // path the Experts/Office matrices also hide for this agent.
-  if (!supported) return null
+  // Hidden when the user has turned off the welcome-page mode selection area
+  // (Settings › Appearance), or when a custom-dir pi can't have skills managed
+  // by codeg's default-dir store — in the latter case we hide the shortcut
+  // cards rather than show ones that lock with a Settings path the
+  // Experts/Office matrices also hide for this agent.
+  if (!supported || !showWelcomeQuickActions) return null
 
   return (
     <Tabs value={tab} onValueChange={handleTabChange}>
@@ -404,6 +452,12 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
           className="data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm"
         >
           {t("tabs.office")}
+        </TabsTrigger>
+        <TabsTrigger
+          value="research"
+          className="data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm"
+        >
+          {t("tabs.research")}
         </TabsTrigger>
       </TabsList>
 
@@ -474,6 +528,39 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
                 label={t(action.id as Parameters<typeof t>[0])}
                 title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
                 onClick={() => handleOffice(action)}
+                locked={isLocked(action.skillId)}
+                lockHint={lockHint}
+              />
+            ))
+          }
+        </Marquee>
+      </TabsContent>
+
+      <TabsContent value="research" className="flex flex-col gap-2">
+        <div className="grid grid-cols-3 gap-2">
+          {RESEARCH_FIXED.map((action) => (
+            <BigCard
+              key={action.id}
+              icon={action.icon}
+              accent={action.accent}
+              title={t(action.id as Parameters<typeof t>[0])}
+              description={t(`${action.id}Desc` as Parameters<typeof t>[0])}
+              onClick={() => handleResearch(action)}
+              locked={isLocked(action.skillId)}
+              lockHint={lockHint}
+            />
+          ))}
+        </div>
+        <Marquee itemCount={RESEARCH_SCROLL.length}>
+          {(clone) =>
+            RESEARCH_SCROLL.map((action) => (
+              <SkillBar
+                key={`${action.id}-${clone ? "c" : "r"}`}
+                clone={clone}
+                icon={action.icon}
+                label={t(action.id as Parameters<typeof t>[0])}
+                title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
+                onClick={() => handleResearch(action)}
                 locked={isLocked(action.skillId)}
                 lockHint={lockHint}
               />

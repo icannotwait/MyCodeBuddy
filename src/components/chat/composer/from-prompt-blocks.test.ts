@@ -27,12 +27,12 @@ function refSegments(segments: RestoreSegment[]): ReferenceAttrs[] {
 }
 
 describe("blocksToRestoredDraft", () => {
-  it("restores a text block as a markdown segment", () => {
+  it("restores a text block as a text segment", () => {
     const { segments, attachments } = blocksToRestoredDraft(
       [{ type: "text", text: "hello **world**" }],
       counter()
     )
-    expect(segments).toEqual([{ kind: "markdown", text: "hello **world**" }])
+    expect(segments).toEqual([{ kind: "text", text: "hello **world**" }])
     expect(attachments).toEqual([])
   })
 
@@ -72,10 +72,10 @@ describe("blocksToRestoredDraft", () => {
     ])
   })
 
-  it("restores an inline file link in a text block as markdown, not a badge", () => {
+  it("restores an inline file link in a text block as text, not a badge", () => {
     // docToPromptBlocks keeps files inline now, so a text block can carry a
-    // `[name](file://…)` link; it must replay as prose (a markdown segment), not
-    // a re-hydrated reference badge. The resource_link branch above stays for
+    // `[name](file://…)` link; it must replay as prose (a text segment), not a
+    // re-hydrated reference badge. The resource_link branch above stays for
     // host-appended payloads (embedded bytes / data uris).
     const { segments, attachments } = blocksToRestoredDraft(
       [{ type: "text", text: "see [app.ts](file:///repo/src/app.ts) please" }],
@@ -84,7 +84,7 @@ describe("blocksToRestoredDraft", () => {
     expect(attachments).toEqual([])
     expect(segments).toEqual([
       {
-        kind: "markdown",
+        kind: "text",
         text: "see [app.ts](file:///repo/src/app.ts) please",
       },
     ])
@@ -241,11 +241,7 @@ describe("blocksToRestoredDraft", () => {
       { type: "text", text: "and" },
     ]
     const { segments } = blocksToRestoredDraft(blocks, counter())
-    expect(segments.map((s) => s.kind)).toEqual([
-      "markdown",
-      "reference",
-      "markdown",
-    ])
+    expect(segments.map((s) => s.kind)).toEqual(["text", "reference", "text"])
   })
 })
 
@@ -292,8 +288,8 @@ describe("round-trip with docToPromptBlocks", () => {
     // inline markdown link inside the prose — never lifted out to a badge segment
     // (consistent with how session/commit/agent/skill refs round-trip).
     expect(refSegments(segments)).toEqual([])
-    const md = segments.find((s) => s.kind === "markdown")
-    expect(md && md.kind === "markdown" && md.text).toContain(
+    const seg = segments.find((s) => s.kind === "text")
+    expect(seg && seg.kind === "text" && seg.text).toContain(
       "[app.ts](file:///repo/src/app.ts)"
     )
   })

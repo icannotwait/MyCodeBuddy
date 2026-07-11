@@ -24,7 +24,7 @@ pub enum AgentDistribution {
     /// Used for ACP agents distributed as Python packages (e.g. Hermes).
     Uvx {
         version: &'static str,
-        /// The `uvx --from` package spec, e.g. "hermes-agent[acp,mcp]==0.18.0".
+        /// The `uvx --from` package spec, e.g. "hermes-agent[acp,mcp]==0.18.2".
         package: &'static str,
         /// The console-script entry point to run, e.g. "hermes-acp".
         cmd: &'static str,
@@ -109,6 +109,7 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::CodeBuddy,
         AgentType::KimiCode,
         AgentType::Pi,
+        AgentType::Grok,
     ]
 }
 
@@ -123,6 +124,7 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::CodeBuddy => "codebuddy-code",
         AgentType::KimiCode => "kimi-code",
         AgentType::Pi => "pi-acp",
+        AgentType::Grok => "grok-build",
     }
 }
 
@@ -137,6 +139,7 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "codebuddy-code" => Some(AgentType::CodeBuddy),
         "kimi-code" => Some(AgentType::KimiCode),
         "pi-acp" => Some(AgentType::Pi),
+        "grok-build" => Some(AgentType::Grok),
         _ => None,
     }
 }
@@ -153,12 +156,12 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Claude Code",
             description: "ACP wrapper for Anthropic's Claude",
             distribution: AgentDistribution::Npx {
-                version: "0.55.0",
-                package: "@agentclientprotocol/claude-agent-acp@0.55.0",
+                version: "0.58.1",
+                package: "@agentclientprotocol/claude-agent-acp@0.58.1",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
-                node_required: None,
+                node_required: Some("22.0.0"),
             },
         },
         AgentType::Codex => AcpAgentMeta {
@@ -168,7 +171,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.0 bundles `@openai/codex` 0.142.5 and drives `codex
+            // 1.1.2 depends on `@openai/codex` ^0.144.0 and drives `codex
             // app-server`; since 1.0.1 it also resolves the resumed
             // `model_provider` from `~/.codex/config.toml` (#224), so codeg no
             // longer injects `MODEL_PROVIDER` to keep resumed sessions on the
@@ -176,12 +179,12 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // structured `session_info_update` (`_meta.codex.goal`) rather than
             // live agent text — see `crate::acp::codex_goal`.
             distribution: AgentDistribution::Npx {
-                version: "1.1.0",
-                package: "@agentclientprotocol/codex-acp@1.1.0",
+                version: "1.1.2",
+                package: "@agentclientprotocol/codex-acp@1.1.2",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
-                node_required: None,
+                node_required: Some("20.0.0"),
             },
         },
         AgentType::Gemini => AcpAgentMeta {
@@ -190,8 +193,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Gemini CLI",
             description: "Google's official CLI for Gemini",
             distribution: AgentDistribution::Npx {
-                version: "0.47.0",
-                package: "@google/gemini-cli@0.47.0",
+                version: "0.50.0",
+                package: "@google/gemini-cli@0.50.0",
                 cmd: "gemini",
                 args: &["--acp", "--skip-trust"],
                 env: &[],
@@ -204,12 +207,12 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Cline",
             description: "Autonomous coding agent CLI",
             distribution: AgentDistribution::Npx {
-                version: "3.0.34",
-                package: "cline@3.0.34",
+                version: "3.0.39",
+                package: "cline@3.0.39",
                 cmd: "cline",
                 args: &["--acp"],
                 env: &[],
-                node_required: None,
+                node_required: Some("22.0.0"),
             },
         },
         AgentType::OpenCode => AcpAgentMeta {
@@ -218,34 +221,34 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenCode",
             description: "The open source coding agent",
             distribution: AgentDistribution::Binary {
-                version: "1.17.13",
+                version: "1.17.18",
                 cmd: "opencode",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-darwin-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-darwin-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-x64.zip",
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-linux-arm64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-arm64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-linux-x64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-x64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-windows-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.13/opencode-windows-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-x64.zip",
                     },
                 ],
             },
@@ -256,13 +259,13 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Hermes Agent",
             description: "Nous Research's self-improving agent (ACP via uvx)",
             distribution: AgentDistribution::Uvx {
-                version: "0.18.0",
-                package: "hermes-agent[acp,mcp]==0.18.0",
+                version: "0.18.2",
+                package: "hermes-agent[acp,mcp]==0.18.2",
                 cmd: "hermes-acp",
                 args: &[],
                 env: &[],
                 uv_required: Some("0.5.0"),
-                // hermes-agent 0.18.0 is `requires-python = ">=3.11,<3.14"`, and
+                // hermes-agent 0.18.2 is `requires-python = ">=3.11,<3.14"`, and
                 // its win32 dep `pywinpty` (>=2.0.0,<3) has no Python 3.14 wheel
                 // (the 2.0.15 source build fails against PyO3's 3.13 ceiling).
                 // Without this pin uvx grabs the machine's default interpreter
@@ -278,8 +281,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.114.2",
-                package: "@tencent-ai/codebuddy-code@2.114.2",
+                version: "2.117.2",
+                package: "@tencent-ai/codebuddy-code@2.117.2",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -292,8 +295,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "0.22.1",
-                package: "@moonshot-ai/kimi-code@0.22.1",
+                version: "0.23.3",
+                package: "@moonshot-ai/kimi-code@0.23.3",
                 cmd: "kimi",
                 args: &["acp"],
                 env: &[],
@@ -324,6 +327,38 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
                 node_required: Some("22.0.0"),
+            },
+        },
+        AgentType::Grok => AcpAgentMeta {
+            agent_type,
+            supports_mcp: true,
+            name: "Grok",
+            description: "xAI's official coding agent and CLI (ACP via grok agent stdio)",
+            // `@xai-official/grok` ships each platform's native binary as a
+            // brotli-compressed **optional dependency** (`@xai-official/grok-<os>-<arch>`);
+            // the npm `bin/grok` trampoline decompresses it into `~/.grok/bin` on
+            // first run. Public mirrors (e.g. registry.npmmirror.com, a common CN
+            // default) lag far behind this package — at time of writing only 0.1.4,
+            // which predates the `grok agent stdio` ACP subcommand — so the pinned
+            // version isn't resolvable there.
+            //
+            // Both concerns are handled by codeg's shared `npm install -g` path
+            // (`install_npm_global_package_streaming` in commands/acp.rs), which
+            // always passes `--include=optional` (pulls the platform binary) and
+            // `--registry=https://registry.npmjs.org` (bypasses lagging mirrors)
+            // for every npx agent — so no per-agent launch env is needed here.
+            // (It couldn't live here anyway: the launch env is serialized as
+            // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
+            // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
+            distribution: AgentDistribution::Npx {
+                version: "0.2.94",
+                package: "@xai-official/grok@0.2.94",
+                cmd: "grok",
+                args: &["agent", "stdio"],
+                env: &[],
+                // `@xai-official/grok@0.2.94` declares `engines.node: ">=20"`;
+                // surface that in preflight so Node 18 isn't silently accepted.
+                node_required: Some("20.0.0"),
             },
         },
     }
@@ -417,43 +452,54 @@ mod tests {
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.55.0",
-            "@agentclientprotocol/claude-agent-acp@0.55.0",
-            None,
+            "0.58.1",
+            "@agentclientprotocol/claude-agent-acp@0.58.1",
+            Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::Gemini,
-            "0.47.0",
-            "@google/gemini-cli@0.47.0",
+            "0.50.0",
+            "@google/gemini-cli@0.50.0",
             Some("20.0.0"),
         );
-        assert_npx_version(AgentType::Cline, "3.0.34", "cline@3.0.34", None);
+        assert_npx_version(
+            AgentType::Cline,
+            "3.0.39",
+            "cline@3.0.39",
+            Some("22.0.0"),
+        );
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.114.2",
-            "@tencent-ai/codebuddy-code@2.114.2",
+            "2.117.2",
+            "@tencent-ai/codebuddy-code@2.117.2",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::KimiCode,
-            "0.22.1",
-            "@moonshot-ai/kimi-code@0.22.1",
+            "0.23.3",
+            "@moonshot-ai/kimi-code@0.23.3",
             Some("22.19.0"),
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.1.0",
-            "@agentclientprotocol/codex-acp@1.1.0",
-            None,
+            "1.1.2",
+            "@agentclientprotocol/codex-acp@1.1.2",
+            Some("20.0.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
-        assert_binary_version(AgentType::OpenCode, "1.17.13", "/releases/download/v1.17.13/");
+        assert_npx_version(
+            AgentType::Grok,
+            "0.2.94",
+            "@xai-official/grok@0.2.94",
+            Some("20.0.0"),
+        );
+        assert_binary_version(AgentType::OpenCode, "1.17.18", "/releases/download/v1.17.18/");
         assert_uvx_version(
             AgentType::Hermes,
-            "0.18.0",
-            "hermes-agent[acp,mcp]==0.18.0",
+            "0.18.2",
+            "hermes-agent[acp,mcp]==0.18.2",
             Some("0.5.0"),
-            // hermes-agent 0.18.0 is requires-python `<3.14`; uvx must pin an
+            // hermes-agent 0.18.2 is requires-python `<3.14`; uvx must pin an
             // interpreter it (and its win32 `pywinpty` dep) supports.
             Some("3.13"),
         );

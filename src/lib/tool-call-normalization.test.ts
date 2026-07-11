@@ -145,6 +145,38 @@ describe("inferLiveToolName meta.claudeCode.toolName override", () => {
     ).toBe("task")
   })
 
+  it("resolves Grok companion tools from the unwrapped title over the input shape", () => {
+    // Grok sets no claudeCode meta; its backend unwraps the `use_tool` envelope
+    // so the title is the raw `<server>__<tool>` name. cancel_delegation's
+    // {task_id} input would otherwise be misread as the generic "task" tool —
+    // the title-companion priority must win.
+    expect(
+      inferLiveToolName({
+        title: "codeg-mcp__cancel_delegation",
+        kind: "other",
+        rawInput: JSON.stringify({ task_id: "t1" }),
+        meta: { "x.ai/tool": { name: "use_tool" } },
+      })
+    ).toBe("cancel_delegation")
+    // Siblings stay correct too.
+    expect(
+      inferLiveToolName({
+        title: "codeg-mcp__get_delegation_status",
+        kind: "other",
+        rawInput: JSON.stringify({ task_ids: ["t1"] }),
+        meta: { "x.ai/tool": { name: "use_tool" } },
+      })
+    ).toBe("get_delegation_status")
+    expect(
+      inferLiveToolName({
+        title: "codeg-mcp__delegate_to_agent",
+        kind: "other",
+        rawInput: JSON.stringify({ agent_type: "codex", task: "go" }),
+        meta: { "x.ai/tool": { name: "use_tool" } },
+      })
+    ).toBe("delegate_to_agent")
+  })
+
   it("ignores meta when claudeCode is missing or malformed", () => {
     expect(
       inferLiveToolName({
@@ -340,5 +372,17 @@ describe("inferLiveToolName codex collab detection", () => {
         rawInput: JSON.stringify({ agent_type: "worker", message: "go" }),
       })
     ).toBe("agent")
+  })
+})
+
+describe("normalizeToolName Grok terminal tool", () => {
+  it("aliases Grok's run_terminal_command to bash", () => {
+    // Grok Build (xAI) reports its terminal tool as `run_terminal_command`
+    // (`_meta["x.ai/tool"].name`), which the history parser stores verbatim.
+    // Without the alias the reload path would miss the "bash" classification
+    // the live path infers from `rawInput.command`, rendering the command card
+    // via the generic tool shell (raw ANSI, no terminal title) instead of the
+    // Terminal card.
+    expect(normalizeToolName("run_terminal_command")).toBe("bash")
   })
 })

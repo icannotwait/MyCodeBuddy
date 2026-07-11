@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.18.8-mycodebuddy.1"
+version = "0.20.0-mycodebuddy.1"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -89,6 +89,10 @@ fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", version 
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 toml = "0.8"
+# Format-preserving TOML editing for surgical scalar merges into user config
+# files (e.g. the Grok settings panel writing [ui]/[models] keys without
+# clobbering comments/layout). Already in the lock tree via `toml` 0.8.
+toml_edit = "0.19"
 serde_yaml = "0.9"
 notify = "6"
 base64 = "0.22"

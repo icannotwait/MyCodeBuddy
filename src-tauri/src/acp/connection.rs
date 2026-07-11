@@ -28,6 +28,7 @@ use sacp::{
 use sacp_tokio::AcpAgent;
 use tokio::sync::{mpsc, RwLock};
 
+use crate::acp::background_watch;
 use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
 use crate::acp::registry::{self, AgentDistribution};
@@ -994,6 +995,285 @@ async fn emit_selectors_ready(state: &Arc<RwLock<SessionState>>, emitter: &Event
     emit_with_state(state, emitter, AcpEvent::SelectorsReady).await;
 }
 
+/// Synthesized config-option id for Grok's model picker (drives the composer's
+/// grouped model selector via the frontend's `isModelConfigOption`).
+const GROK_MODEL_OPTION_ID: &str = "model";
+
+/// Stable `AcpEvent::Error` code the frontend localizes when a Grok model switch
+/// is rejected because the conversation is already bound to a different agent
+/// type (see `is_grok_incompatible_agent_switch`). Recoverable, not terminal.
+const GROK_INCOMPATIBLE_AGENT_ERROR_CODE: &str = "grok_model_switch_incompatible_agent";
+
+/// Grok partitions its models by `agentType` (e.g. `grok-4.5` → `grok-build-plan`,
+/// `grok-composer-2.5-fast` → `cursor`). A session may switch models freely until
+/// its first turn, after which it is locked to the agent type it started with;
+/// a later cross-agent-type `session/set_model` is then rejected with a stable
+/// `data.code` of `MODEL_SWITCH_INCOMPATIBLE_AGENT` (`suggestion: start_new_session`).
+/// Grok's own `x.ai/sessionConfig` still lists every model regardless of type, so
+/// the composer offers them all and we detect this specific rejection to handle
+/// it gracefully rather than leaking a raw JSON-RPC error.
+fn is_grok_incompatible_agent_switch(e: &sacp::Error) -> bool {
+    e.data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(|c| c.as_str())
+        == Some("MODEL_SWITCH_INCOMPATIBLE_AGENT")
+}
+
+/// Grok does not emit the standard ACP `config_options` / `modes` channels that
+/// codeg's generic composer-selector pipeline reads (which is why the composer
+/// showed no selectors for Grok). Instead it ships its selectors in a
+/// non-standard `_meta["x.ai/sessionConfig"].options` list — a flat array of
+/// `{id, category, label, description?, selected}` covering both model choices
+/// (`category:"model"`) and reasoning-effort choices (`category:"mode"`). Fold
+/// that list into the same `SessionConfigOptionInfo` shape every other agent's
+/// selectors flow through, so Grok reaches selector parity with zero new
+/// frontend code. Returns `None` when there is no usable sessionConfig.
+fn synthesize_grok_config_options(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Vec<SessionConfigOptionInfo>> {
+    let options = meta?
+        .get("x.ai/sessionConfig")?
+        .get("options")?
+        .as_array()?;
+
+    let mut model_opts: Vec<SessionConfigSelectOptionInfo> = Vec::new();
+    let mut model_current: Option<String> = None;
+
+    for opt in options {
+        let Some(id) = opt.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Only the MODEL selector is surfaced in the composer. Grok exposes a
+        // live `session/set_model`, but has NO live reasoning-effort setter, and
+        // effort is a GLOBAL `~/.grok/config.toml` setting shared by every Grok
+        // session — so it belongs in the Grok settings panel (which routes
+        // through the manager's fingerprint staleness), not a per-session
+        // composer control. Grok's effort choices arrive here as category
+        // "mode"; we deliberately skip them.
+        if opt.get("category").and_then(|v| v.as_str()) != Some("model") {
+            continue;
+        }
+        let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or(id);
+        if opt
+            .get("selected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            model_current = Some(id.to_string());
+        }
+        model_opts.push(SessionConfigSelectOptionInfo {
+            value: id.to_string(),
+            name: label.to_string(),
+            description: opt
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
+    }
+
+    if model_opts.is_empty() {
+        return None;
+    }
+    let current = model_current.unwrap_or_else(|| model_opts[0].value.clone());
+    Some(vec![SessionConfigOptionInfo {
+        id: GROK_MODEL_OPTION_ID.to_string(),
+        name: "Model".to_string(),
+        description: None,
+        category: Some("model".to_string()),
+        kind: SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+            current_value: current,
+            options: model_opts,
+            groups: Vec::new(),
+        }),
+    }])
+}
+
+/// Emit an already-mapped `SessionConfigOptionInfo` list (used by the Grok path,
+/// which synthesizes `Info` directly rather than mapping sacp `SessionConfigOption`s).
+async fn emit_session_config_options_info(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    config_options: Vec<SessionConfigOptionInfo>,
+) {
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::SessionConfigOptions { config_options },
+    )
+    .await;
+}
+
+/// Switch Grok's active model via the standard ACP `session/set_model`. Sent as
+/// an `UntypedMessage` for the same reason as `session/resume` /
+/// `session/set_config_option`: sacp 11.0.0's typed request is gated behind the
+/// `unstable_session_model` feature (not enabled), and the orphan rule blocks a
+/// local `JsonRpcRequest` impl. Grok has no ACP setter for reasoning effort
+/// (verified: `set_model` ignores it and `set_mode` is a no-op) — that is
+/// handled out-of-band by writing `~/.grok/config.toml`.
+async fn set_grok_model(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    model_id: String,
+) -> Result<(), sacp::Error> {
+    let params = serde_json::json!({
+        "sessionId": session_id.0.to_string(),
+        "modelId": model_id,
+    });
+    let untyped_req = UntypedMessage::new("session/set_model", params).map_err(|e| {
+        sacp::util::internal_error(format!("Failed to build set_model request: {e}"))
+    })?;
+    cx.send_request_to(Agent, untyped_req).block_task().await?;
+    Ok(())
+}
+
+/// On reconnect, re-apply the user's last-picked Grok model (saved per agent by
+/// the frontend and shipped back as a preferred config value) via `set_model`,
+/// reflecting it in `current_value`. Effort preferences are omitted: Grok has no
+/// live effort setter, so effort follows `~/.grok/config.toml` at session birth.
+async fn apply_grok_preferred_model(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    opts: &mut [SessionConfigOptionInfo],
+    preferred_config_values: &BTreeMap<String, String>,
+) {
+    let Some(pref) = preferred_config_values.get(GROK_MODEL_OPTION_ID) else {
+        return;
+    };
+    let Some(model_opt) = opts.iter_mut().find(|o| o.id == GROK_MODEL_OPTION_ID) else {
+        return;
+    };
+    let SessionConfigKindInfo::Select(sel) = &mut model_opt.kind;
+    // Skip if already current, or the saved model is no longer offered (stale).
+    if &sel.current_value == pref || !sel.options.iter().any(|o| &o.value == pref) {
+        return;
+    }
+    match set_grok_model(cx, session_id, pref.clone()).await {
+        Ok(()) => sel.current_value = pref.clone(),
+        Err(e) => {
+            tracing::error!("[ACP] failed to apply preferred grok model '{pref}' on connect: {e}")
+        }
+    }
+}
+
+/// Route a composer config-option change for Grok. Only the model selector is
+/// live: model → `session/set_model`. (Reasoning effort is not a composer
+/// control — it's a global `~/.grok/config.toml` setting owned by the Grok
+/// settings panel.) Re-emits the options with the new `current_value` so the
+/// backend snapshot stays authoritative.
+///
+/// A cross-agent-type switch rejected on an established conversation
+/// (`is_grok_incompatible_agent_switch`) is handled in-band: re-emit the
+/// authoritative options to revert the composer's optimistic pick and surface a
+/// friendly, recoverable `AcpEvent::Error` (localized by the frontend via
+/// `GROK_INCOMPATIBLE_AGENT_ERROR_CODE`), returning `Ok` so the caller does not
+/// also emit the raw JSON-RPC error. The saved model preference is left intact,
+/// so the suggested "start a new session" actually lands on the picked model
+/// (a fresh session applies the preference pre-turn, where the switch succeeds).
+async fn set_grok_config_option(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    config_id: String,
+    value_id: String,
+) -> Result<(), sacp::Error> {
+    if config_id != GROK_MODEL_OPTION_ID {
+        return Ok(());
+    }
+    // Model switching is live over ACP.
+    match set_grok_model(cx, session_id, value_id.clone()).await {
+        Ok(()) => {
+            let current = state.read().await.config_options.clone();
+            if let Some(mut opts) = current {
+                if let Some(o) = opts.iter_mut().find(|o| o.id == config_id) {
+                    let SessionConfigKindInfo::Select(sel) = &mut o.kind;
+                    sel.current_value = value_id;
+                }
+                emit_session_config_options_info(state, emitter, opts).await;
+            }
+            Ok(())
+        }
+        Err(e) if is_grok_incompatible_agent_switch(&e) => {
+            emit_grok_incompatible_agent_switch(state, emitter).await;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Recover from a Grok cross-agent-type model-switch rejection: revert the
+/// composer's optimistic selection by re-emitting the authoritative (unchanged)
+/// options, then surface a friendly, recoverable error the frontend localizes
+/// via `GROK_INCOMPATIBLE_AGENT_ERROR_CODE`. Split out of `set_grok_config_option`
+/// so it can be unit-tested without a live ACP connection.
+async fn emit_grok_incompatible_agent_switch(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    // Clone the options out of the read guard into a local BEFORE emitting: the
+    // `emit_*` helpers re-acquire this same state's WRITE lock, and an `if let`
+    // scrutinee keeps its temporary (the read guard) alive across the whole body
+    // in Rust 2021 — so reading inline would deadlock. `current_value` is
+    // unchanged because the switch never took effect.
+    let current = state.read().await.config_options.clone();
+    if let Some(opts) = current {
+        emit_session_config_options_info(state, emitter, opts).await;
+    }
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::Error {
+            message: "Cannot switch to that model in an existing conversation. \
+                      Start a new session to use it."
+                .to_string(),
+            agent_type: AgentType::Grok.to_string(),
+            code: Some(GROK_INCOMPATIBLE_AGENT_ERROR_CODE.to_string()),
+            // Recoverable: the conversation continues on its current model.
+            terminal: false,
+        },
+    )
+    .await;
+}
+
+/// Emit the composer's session config-option selectors. For Grok this reads the
+/// synthesized `x.ai/sessionConfig` (parity path); for every other agent it runs
+/// the standard preference-application + sacp-mapping pipeline unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn apply_and_emit_session_config_options(
+    cx: &ConnectionTo<Agent>,
+    session: &mut sacp::ActiveSession<'_, Agent>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    grok_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    preferred_mode_id: Option<&str>,
+    preferred_config_values: &BTreeMap<String, String>,
+    initial_config_options: Vec<SessionConfigOption>,
+) {
+    if agent_type == AgentType::Grok {
+        if let Some(mut opts) = synthesize_grok_config_options(grok_meta) {
+            let session_id = session.session_id().clone();
+            apply_grok_preferred_model(cx, &session_id, &mut opts, preferred_config_values).await;
+            emit_session_config_options_info(state, emitter, opts).await;
+            return;
+        }
+        // No x.ai/sessionConfig (unexpected): fall through to the standard path,
+        // which for Grok emits an empty list (no selectors) — same as before.
+    }
+    let updated = apply_preferred_session_options(
+        cx,
+        session,
+        state,
+        emitter,
+        preferred_mode_id,
+        preferred_config_values,
+        initial_config_options,
+    )
+    .await;
+    emit_session_config_options_values(state, emitter, agent_type, updated).await;
+}
+
 async fn emit_prompt_capabilities(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -1142,14 +1422,18 @@ fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
 /// ACP wire format. Errors and unsupported entries are logged and skipped so
 /// a single malformed entry never blocks a session from starting.
 fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
-    // Hermes and Kimi Code each read their own native MCP config at launch —
-    // Hermes from `~/.hermes/config.yaml` (`mcp_servers`, registered as
+    // Hermes, Kimi Code, and Grok each read their own native MCP config at
+    // launch — Hermes from `~/.hermes/config.yaml` (`mcp_servers`, registered as
     // `mcp-<name>` toolsets), Kimi Code from `~/.kimi-code/mcp.json`
-    // (`mcpServers`). codeg manages those files directly via the MCP settings
-    // UI, so forwarding the same servers over the ACP wire here would
-    // double-register them — skip it. (The built-in `codeg-mcp` companion is
-    // injected separately by `inject_codeg_mcp`, so it still reaches them.)
-    if matches!(agent_type, AgentType::Hermes | AgentType::KimiCode) {
+    // (`mcpServers`), Grok from `~/.grok/config.toml` (`[mcp_servers.<name>]`).
+    // codeg manages those files directly via the MCP settings UI, so forwarding
+    // the same servers over the ACP wire here would double-register them — skip
+    // it. (The built-in `codeg-mcp` companion is injected separately by
+    // `inject_codeg_mcp`, so it still reaches them.)
+    if matches!(
+        agent_type,
+        AgentType::Hermes | AgentType::KimiCode | AgentType::Grok
+    ) {
         return Vec::new();
     }
     let entries = match crate::commands::mcp::read_servers_for_agent_type(agent_type) {
@@ -1536,6 +1820,30 @@ async fn run_connection(
     let perms = pending_perms.clone();
     let state_outer = Arc::clone(&state);
 
+    // Claude-only: tail this connection's session transcript for OUT-OF-TURN
+    // activity (async sub-agent / background-shell completions, the agent's
+    // continued work after them, cron//loop autonomous turns — none of which
+    // the wire reliably represents) and surface it as `BackgroundActivity`
+    // events; also feeds the keep-alive accounting that exempts the
+    // connection from the idle sweeps while such work is pending. Created
+    // HERE — per CONNECTION, not per conversation loop — so ONE watcher (and
+    // one prompt ledger) spans fork restarts: `run_watch` observes the
+    // session-id change and re-arms in place, carrying still-outstanding
+    // tasks and settled ids across the fork (a post-fork `SendMessage`
+    // resume must re-arm the keep-alive). The guard aborts the watcher when
+    // this connection ends. Its spawn epoch (captured before the session
+    // exists) is what lets the first arm process records written before the
+    // transcript file is discovered.
+    let prompt_ledger = background_watch::PromptLedger::shared();
+    let _bg_watch = background_watch::spawn_if_claude(
+        &connection_id,
+        agent_type,
+        Arc::clone(&state),
+        emitter.clone(),
+        cwd_string.clone(),
+        Arc::clone(&prompt_ledger),
+    );
+
     Client
         .builder()
         .name("codeg")
@@ -1841,6 +2149,11 @@ async fn run_connection(
                                 .modes(resume_resp.modes)
                                 .config_options(resume_resp.config_options)
                                 .meta(resume_resp.meta);
+                            let grok_meta = if agent_type == AgentType::Grok {
+                                new_resp.meta.clone()
+                            } else {
+                                None
+                            };
                             let mut session = cx.attach_session(new_resp, Default::default())?;
 
                             // No drain: session/resume does not replay history,
@@ -1857,21 +2170,16 @@ async fn run_connection(
                             )
                             .await;
                             emit_session_modes(&state, &emitter_clone, session.modes()).await;
-                            let updated_config_options = apply_preferred_session_options(
+                            apply_and_emit_session_config_options(
                                 &cx,
                                 &mut session,
                                 &state,
                                 &emitter_clone,
+                                agent_type,
+                                grok_meta.as_ref(),
                                 preferred_mode_id.as_deref(),
                                 &preferred_config_values,
                                 initial_config_options.unwrap_or_default(),
-                            )
-                            .await;
-                            emit_session_config_options_values(
-                                &state,
-                                &emitter_clone,
-                                agent_type,
-                                updated_config_options,
                             )
                             .await;
                             emit_selectors_ready(&state, &emitter_clone).await;
@@ -1887,6 +2195,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
+                                &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -1907,6 +2216,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
+                                &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -1949,6 +2259,11 @@ async fn run_connection(
                             .modes(load_resp.modes)
                             .config_options(load_resp.config_options)
                             .meta(load_resp.meta);
+                        let grok_meta = if agent_type == AgentType::Grok {
+                            new_resp.meta.clone()
+                        } else {
+                            None
+                        };
                         let mut session = cx.attach_session(new_resp, Default::default())?;
 
                         // Drain historical replay notifications from session/load,
@@ -2014,21 +2329,16 @@ async fn run_connection(
                         )
                         .await;
                         emit_session_modes(&state, &emitter_clone, session.modes()).await;
-                        let updated_config_options = apply_preferred_session_options(
+                        apply_and_emit_session_config_options(
                             &cx,
                             &mut session,
                             &state,
                             &emitter_clone,
+                            agent_type,
+                            grok_meta.as_ref(),
                             preferred_mode_id.as_deref(),
                             &preferred_config_values,
                             initial_config_options.unwrap_or_default(),
-                        )
-                        .await;
-                        emit_session_config_options_values(
-                            &state,
-                            &emitter_clone,
-                            agent_type,
-                            updated_config_options,
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
@@ -2044,6 +2354,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2060,6 +2371,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2146,6 +2458,11 @@ async fn run_connection(
                             .await?;
                         let fallback_sid = new_resp.session_id.0.to_string();
                         let initial_config_options = new_resp.config_options.clone();
+                        let grok_meta = if agent_type == AgentType::Grok {
+                            new_resp.meta.clone()
+                        } else {
+                            None
+                        };
                         let mut session = cx.attach_session(new_resp, Default::default())?;
                         emit_with_state(
                             &state,
@@ -2156,21 +2473,16 @@ async fn run_connection(
                         )
                         .await;
                         emit_session_modes(&state, &emitter_clone, session.modes()).await;
-                        let updated_config_options = apply_preferred_session_options(
+                        apply_and_emit_session_config_options(
                             &cx,
                             &mut session,
                             &state,
                             &emitter_clone,
+                            agent_type,
+                            grok_meta.as_ref(),
                             preferred_mode_id.as_deref(),
                             &preferred_config_values,
                             initial_config_options.unwrap_or_default(),
-                        )
-                        .await;
-                        emit_session_config_options_values(
-                            &state,
-                            &emitter_clone,
-                            agent_type,
-                            updated_config_options,
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
@@ -2186,6 +2498,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2204,6 +2517,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2220,6 +2534,11 @@ async fn run_connection(
                     .await?;
                 let sid = new_resp.session_id.0.to_string();
                 let initial_config_options = new_resp.config_options.clone();
+                let grok_meta = if agent_type == AgentType::Grok {
+                    new_resp.meta.clone()
+                } else {
+                    None
+                };
                 let mut session = cx.attach_session(new_resp, Default::default())?;
                 emit_with_state(
                     &state,
@@ -2230,21 +2549,16 @@ async fn run_connection(
                 )
                 .await;
                 emit_session_modes(&state, &emitter_clone, session.modes()).await;
-                let updated_config_options = apply_preferred_session_options(
+                apply_and_emit_session_config_options(
                     &cx,
                     &mut session,
                     &state,
                     &emitter_clone,
+                    agent_type,
+                    grok_meta.as_ref(),
                     preferred_mode_id.as_deref(),
                     &preferred_config_values,
                     initial_config_options.unwrap_or_default(),
-                )
-                .await;
-                emit_session_config_options_values(
-                    &state,
-                    &emitter_clone,
-                    agent_type,
-                    updated_config_options,
                 )
                 .await;
                 emit_selectors_ready(&state, &emitter_clone).await;
@@ -2260,6 +2574,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
                 .await;
@@ -2276,6 +2591,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
                 .await
@@ -3121,6 +3437,10 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    // Threaded through from run_connection: the connection-scoped prompt
+    // ledger (the forked session's loop keeps fingerprinting into the SAME
+    // ledger the still-running watcher consumes from).
+    prompt_ledger: &background_watch::PromptLedger,
     // Threaded through from run_connection so the forked session's
     // run_conversation_loop call has the same delegation cascade
     // capability as the original.
@@ -3157,6 +3477,11 @@ async fn handle_fork_or_exit(
         .modes(fork_resp.modes)
         .config_options(fork_resp.config_options)
         .meta(fork_resp.meta);
+    let grok_meta = if agent_type == AgentType::Grok {
+        new_resp.meta.clone()
+    } else {
+        None
+    };
     let mut session = cx.attach_session(new_resp, Default::default())?;
 
     emit_with_state(
@@ -3168,10 +3493,15 @@ async fn handle_fork_or_exit(
     )
     .await;
     emit_session_modes(state, emitter, session.modes()).await;
-    emit_session_config_options_values(
+    apply_and_emit_session_config_options(
+        &cx,
+        &mut session,
         state,
         emitter,
         agent_type,
+        grok_meta.as_ref(),
+        None,
+        &BTreeMap::new(),
         initial_config_options.unwrap_or_default(),
     )
     .await;
@@ -3188,6 +3518,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        prompt_ledger,
         delegation_injection,
     )
     .await;
@@ -3206,6 +3537,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        prompt_ledger,
         delegation_injection,
     ))
     .await
@@ -3312,6 +3644,10 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    // Connection-scoped (created once in `run_connection`, shared across fork
+    // restarts of this loop): outgoing prompts are fingerprinted here so the
+    // transcript watcher can classify their turns as wire-rendered foreground.
+    prompt_ledger: &background_watch::PromptLedger,
     // Source of the broker reference used to cascade-cancel pending
     // delegations on parent prompt cancel / non-success TurnComplete.
     // `None` for test paths that don't wire delegation.
@@ -3368,6 +3704,11 @@ async fn run_conversation_loop<'a>(
                 blocks,
                 user_message,
             }) => {
+                // Fingerprint the outgoing prompt for the background watcher's
+                // foreground/out-of-turn classifier BEFORE the blocks are
+                // consumed: the transcript record this prompt becomes must
+                // classify as wire-rendered foreground, not overlay.
+                prompt_ledger.record_prompt_blocks(&blocks);
                 let prompt_blocks = map_prompt_blocks(blocks);
                 if prompt_blocks.is_empty() {
                     // Defensive: the manager rejects empty prompts before the
@@ -3689,17 +4030,19 @@ async fn run_conversation_loop<'a>(
                                     config_id,
                                     value_id,
                                 }) => {
-                                    if let Err(e) = set_session_config_option(
-                                        &cx,
-                                        &sid,
-                                        state,
-                                        emitter,
-                                        agent_type,
-                                        config_id,
-                                        value_id,
-                                    )
-                                    .await
-                                    {
+                                    let set_result = if agent_type == AgentType::Grok {
+                                        set_grok_config_option(
+                                            &cx, &sid, state, emitter, config_id, value_id,
+                                        )
+                                        .await
+                                    } else {
+                                        set_session_config_option(
+                                            &cx, &sid, state, emitter, agent_type, config_id,
+                                            value_id,
+                                        )
+                                        .await
+                                    };
+                                    if let Err(e) = set_result {
                                         emit_with_state(
                                             state,
                                             emitter,
@@ -3868,11 +4211,15 @@ async fn run_conversation_loop<'a>(
             }) => {
                 let cx = session.connection();
                 let sid = session.session_id().clone();
-                if let Err(e) = set_session_config_option(
-                    &cx, &sid, state, emitter, agent_type, config_id, value_id,
-                )
-                .await
-                {
+                let set_result = if agent_type == AgentType::Grok {
+                    set_grok_config_option(&cx, &sid, state, emitter, config_id, value_id).await
+                } else {
+                    set_session_config_option(
+                        &cx, &sid, state, emitter, agent_type, config_id, value_id,
+                    )
+                    .await
+                };
+                if let Err(e) = set_result {
                     emit_with_state(
                         state,
                         emitter,
@@ -4207,6 +4554,104 @@ fn json_value_to_text(val: &Option<serde_json::Value>) -> Option<String> {
         Some(v) if !v.is_null() => Some(v.to_string()),
         _ => None,
     }
+}
+
+/// Resolve the live `raw_output` string for a Grok tool call.
+///
+/// Grok reports terminal output in the standard `content[]` channel (clean,
+/// human-readable text) AND in a structured `rawOutput` object whose readable
+/// text lives only in the string `output_for_prompt` (its `output` field is a
+/// raw byte array, and the remaining keys — `command`, `exit_code`, … — are
+/// metadata). Feeding that object through `json_value_to_text` stringifies the
+/// whole thing into a JSON blob that (a) shadows the clean `content` — the live
+/// renderer's `raw_output_chunks` win over `content`
+/// (`conversation-runtime-store.ts`) — and (b) is then dropped by the terminal
+/// renderer as a metadata-only "command envelope"
+/// (`commandOutputFromJsonString` returns `""`), so a finished command shows no
+/// result during live streaming even though the history parser renders it fine.
+///
+/// Mirror the history parser (`parsers/grok.rs::update_tool_output`): prefer the
+/// already-serialized `content`, and only fall back — when `content` is empty —
+/// to the object's string `output_for_prompt` (Bash/terminal) or, for an MCP
+/// `rawOutput`, the text under `output` (see grok_mcp_output_text). Returning
+/// `None` lets the frontend render `content`. Never emit the object blob.
+/// Non-object / absent / unrecognized `rawOutput` → `None`.
+///
+/// Note: `content` here is `serialize_tool_call_content`, which for a Grok
+/// terminal call is the plain text block (verified against real `~/.grok`
+/// data). It could in principle also serialize `Diff`/`Terminal` blocks, in
+/// which case a Grok tool carrying ONLY such a block plus `output_for_prompt`
+/// would render the serialized block instead of the prompt text — but Grok's
+/// `run_terminal_command` emits `content:text`, so this stays parity with
+/// history for the shapes Grok actually produces.
+fn grok_live_tool_output(
+    content: &Option<String>,
+    raw_output: &Option<serde_json::Value>,
+) -> Option<String> {
+    if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+        return None;
+    }
+    let raw = raw_output.as_ref()?;
+    // Bash / terminal calls: the readable text lives only in `output_for_prompt`.
+    if let Some(text) = raw
+        .get("output_for_prompt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    // MCP calls (Grok's `use_tool` envelope): the result text lives under
+    // `output.<*Output>` instead (see grok_mcp_output_text). Without this a
+    // finished MCP call — e.g. the `delegate_to_agent` ack carrying
+    // `task_id=…` — would surface no output at all.
+    grok_mcp_output_text(raw)
+}
+
+/// Grok wraps every MCP tool invocation in a generic `use_tool` envelope whose
+/// `raw_input` is `{"tool_name": "<server>__<tool>", "tool_input": {..real args..}}`.
+/// Peel it so the call is correlated (delegation `lifecycle.rs`), classified, and
+/// parsed as a direct MCP call — identical to how hosts like Claude Code surface
+/// MCP tools. Without this, Grok's `delegate_to_agent` (and the other codeg-mcp
+/// companion tools) never resolve to their dedicated cards, and the delegation
+/// broker can't correlate the parent tool call to bind the sub-session.
+///
+/// Returns `(inner_tool_name, inner_tool_input)` only for the envelope shape —
+/// a non-empty string `tool_name` plus a `tool_input` value — so Grok's native
+/// tools (`run_terminal_command`, `search_tool`, `spawn_subagent`, …), which
+/// carry their args directly, pass through untouched.
+fn unwrap_grok_use_tool(
+    raw_input: Option<&serde_json::Value>,
+) -> Option<(String, serde_json::Value)> {
+    let obj = raw_input?.as_object()?;
+    let tool_name = obj
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let tool_input = obj.get("tool_input")?;
+    Some((tool_name.to_string(), tool_input.clone()))
+}
+
+/// Extract the human-readable text from a Grok MCP `rawOutput`
+/// (`{"type":"MCP","output":{"OkayOutput":"…"}}`, or an `*Output` error variant).
+/// The MCP result is the first string value under `output` (`output` may itself
+/// be a bare string on some tools). Returns `None` for a non-MCP `rawOutput` so
+/// the caller can fall through to the Bash/`output_for_prompt` path.
+fn grok_mcp_output_text(raw_output: &serde_json::Value) -> Option<String> {
+    if raw_output.get("type").and_then(serde_json::Value::as_str) != Some("MCP") {
+        return None;
+    }
+    let output = raw_output.get("output")?;
+    if let Some(text) = output.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    // First NON-EMPTY string value (the singleton `*Output` variant). Filtering
+    // inside `find_map` — not after — so an earlier empty-string sibling can't
+    // shadow a later populated one.
+    output
+        .as_object()?
+        .values()
+        .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
+        .map(str::to_string)
 }
 
 /// Mirrors `parsers/opencode.rs:425-429` (and `parsers/codebuddy.rs`'s
@@ -4693,8 +5138,21 @@ async fn emit_conversation_update(
             // `Diff` from `content` — it's the same edit re-serialized hunklessly,
             // which would otherwise double the event and skew the header +/- stats.
             // Blank raw_input is treated as absent (matches the frontend guard).
-            let own_raw_input =
-                json_value_to_text(&tc.raw_input).filter(|t| !t.trim().is_empty());
+            // Grok wraps every MCP call in a `use_tool` envelope; peel it so the
+            // call is correlated/classified/parsed as a direct MCP call — its
+            // real `tool_input` becomes `raw_input`, its `tool_name` the title
+            // below (see unwrap_grok_use_tool).
+            let grok_use_tool = if matches!(agent_type, AgentType::Grok) {
+                unwrap_grok_use_tool(tc.raw_input.as_ref())
+            } else {
+                None
+            };
+            let own_raw_input = match &grok_use_tool {
+                Some((_, inner)) => {
+                    json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
+                }
+                None => json_value_to_text(&tc.raw_input).filter(|t| !t.trim().is_empty()),
+            };
             let synthesized_edit = if own_raw_input.is_none() {
                 synthesize_edit_input_from_diffs(&tc.content)
             } else {
@@ -4710,10 +5168,17 @@ async fn emit_conversation_update(
             // Initial tool_call notification — the frontend reducer
             // treats `raw_output` as a full replacement, so we bypass
             // the diff path and seed the cache with the current snapshot.
-            let raw_output = json_value_to_text(&tc.raw_output)
-                .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
-                .map(|text| structurize_live_output(&text))
-                .and_then(|text| raw_output_cache.seed(&tool_call_id, &text));
+            let raw_output_text = if matches!(agent_type, AgentType::Grok) {
+                // Grok's structured rawOutput would shadow `content` and render
+                // empty; take the parity path (see grok_live_tool_output).
+                grok_live_tool_output(&content, &tc.raw_output)
+            } else {
+                json_value_to_text(&tc.raw_output)
+                    .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
+                    .map(|text| structurize_live_output(&text))
+            };
+            let raw_output =
+                raw_output_text.and_then(|text| raw_output_cache.seed(&tool_call_id, &text));
             let locations = if tc.locations.is_empty() {
                 None
             } else {
@@ -4733,6 +5198,16 @@ async fn emit_conversation_update(
             // user task descriptions (PII-adjacent) and would create noise in
             // server-mode log sinks. The opaque tool_call_id is enough to
             // correlate these events with downstream traces.
+            // Record the peeled Grok MCP name as an authoritative title override
+            // so later sparse `use_tool` updates (which carry the generic wrapper
+            // title and no raw_input) re-assert it via resolve_rewritten_title
+            // instead of reverting the delegation card to a generic tool. Mirrors
+            // the CodeBuddy DeferExecuteTool / sub-agent title persistence.
+            if let Some((name, _)) = &grok_use_tool {
+                cb_state
+                    .title_overrides
+                    .insert(tool_call_id.clone(), name.clone());
+            }
             // Resolve (and record) any authoritative title rewrite so a later
             // status-only update can't downgrade this card (see fn doc).
             let title = resolve_rewritten_title(
@@ -4782,8 +5257,23 @@ async fn emit_conversation_update(
             // edit may first arrive on an update. Drop the redundant Diff from
             // `content` when hoisted. The reducer preserves a prior raw_input on
             // status-only updates (`action.raw_input ?? block.info.raw_input`).
-            let own_raw_input =
-                json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty());
+            // Grok `use_tool` unwrap, symmetric with the ToolCall arm — a rare
+            // update that re-sends the envelope is peeled the same way (most
+            // updates carry no raw_input, so this resolves to None and the
+            // reducer keeps the prior unwrapped input).
+            let grok_use_tool = if matches!(agent_type, AgentType::Grok) {
+                unwrap_grok_use_tool(tcu.fields.raw_input.as_ref())
+            } else {
+                None
+            };
+            let own_raw_input = match &grok_use_tool {
+                Some((_, inner)) => {
+                    json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
+                }
+                None => {
+                    json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty())
+                }
+            };
             let synthesized_edit = if own_raw_input.is_none() {
                 tcu.fields
                     .content
@@ -4812,9 +5302,15 @@ async fn emit_conversation_update(
             // with `raw_output_append=true`, collapsing the O(N²) transfer
             // problem to O(N) while capping any single emitted chunk to
             // MAX_SINGLE_EMIT_BYTES.
-            let raw_output_text = json_value_to_text(&tcu.fields.raw_output)
-                .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
-                .map(|text| structurize_live_output(&text));
+            let raw_output_text = if matches!(agent_type, AgentType::Grok) {
+                // Grok's structured rawOutput would shadow `content` and render
+                // empty; take the parity path (see grok_live_tool_output).
+                grok_live_tool_output(&content, &tcu.fields.raw_output)
+            } else {
+                json_value_to_text(&tcu.fields.raw_output)
+                    .map(|text| unwrap_codebuddy_deferred_output(agent_type, &text).unwrap_or(text))
+                    .map(|text| structurize_live_output(&text))
+            };
             let (raw_output, raw_output_append) = match raw_output_text {
                 Some(text) => match raw_output_cache.consume(&tool_call_id, &text) {
                     Some((payload, append)) => (Some(payload), Some(append)),
@@ -4841,6 +5337,13 @@ async fn emit_conversation_update(
             // its child nesting (`getToolName === "agent"`) don't revert to a
             // generic tool call mid-stream. Falls back to the event's own title
             // for never-classified tool calls.
+            // Symmetric with the ToolCall arm: a (rare) update that re-sends the
+            // envelope records the peeled name so it survives later sparse updates.
+            if let Some((name, _)) = &grok_use_tool {
+                cb_state
+                    .title_overrides
+                    .insert(tool_call_id.clone(), name.clone());
+            }
             let title = resolve_rewritten_title(
                 agent_type,
                 &raw_input,
@@ -5350,6 +5853,618 @@ mod tests {
             ),
             other => panic!("expected Stdio variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grok_incompatible_agent_switch_detects_stable_code() {
+        // Exact shape Grok returns when switching to a model whose agentType
+        // differs from the established conversation's (captured from a live
+        // `session/set_model` probe against grok 0.2.94).
+        let err = sacp::Error::new(-32600, "Cannot switch to model ...").data(serde_json::json!({
+            "code": "MODEL_SWITCH_INCOMPATIBLE_AGENT",
+            "activeAgentType": "grok-build-plan",
+            "requiredAgentType": "cursor",
+            "modelId": "grok-composer-2.5-fast",
+            "suggestion": "start_new_session"
+        }));
+        assert!(is_grok_incompatible_agent_switch(&err));
+
+        // A different data.code, or no data at all, must NOT be swallowed —
+        // those fall through to the generic error path.
+        let other = sacp::Error::new(-32603, "boom")
+            .data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
+        assert!(!is_grok_incompatible_agent_switch(&other));
+        assert!(!is_grok_incompatible_agent_switch(&sacp::Error::internal_error()));
+    }
+
+    #[test]
+    fn synthesize_grok_config_options_yields_model_only_selector() {
+        // `_meta["x.ai/sessionConfig"].options` as delivered by `session/new`
+        // (captured live): both model choices and the "mode" effort choices.
+        let meta: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({
+                "x.ai/sessionConfig": {
+                    "options": [
+                        {"id": "grok-4.5", "category": "model", "label": "Grok 4.5", "selected": true},
+                        {"id": "grok-composer-2.5-fast", "category": "model", "label": "Composer 2.5", "selected": false},
+                        {"id": "high", "category": "mode", "label": "High Effort", "selected": true},
+                        {"id": "low", "category": "mode", "label": "Low Effort", "selected": false}
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+
+        let opts = synthesize_grok_config_options(Some(&meta)).expect("should synthesize");
+        assert_eq!(opts.len(), 1, "only the model selector is surfaced");
+        let opt = &opts[0];
+        assert_eq!(opt.id, GROK_MODEL_OPTION_ID);
+        assert_eq!(opt.category.as_deref(), Some("model"));
+        let SessionConfigKindInfo::Select(sel) = &opt.kind;
+        // Both models appear (agent-type filtering is deliberately NOT applied —
+        // cross-type switches are handled gracefully at set time instead).
+        assert_eq!(sel.options.len(), 2);
+        assert_eq!(sel.current_value, "grok-4.5", "the `selected` model is current");
+        assert!(sel.options.iter().any(|o| o.value == "grok-composer-2.5-fast"));
+        // The "mode" (effort) entries are excluded from the composer.
+        assert!(sel.options.iter().all(|o| o.value != "high" && o.value != "low"));
+    }
+
+    #[test]
+    fn synthesize_grok_config_options_none_without_sessionconfig() {
+        let empty: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        assert!(synthesize_grok_config_options(Some(&empty)).is_none());
+        assert!(synthesize_grok_config_options(None).is_none());
+    }
+
+    fn grok_model_options(current: &str) -> Vec<SessionConfigOptionInfo> {
+        vec![SessionConfigOptionInfo {
+            id: GROK_MODEL_OPTION_ID.to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: Some("model".to_string()),
+            kind: SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+                current_value: current.to_string(),
+                options: vec![
+                    SessionConfigSelectOptionInfo {
+                        value: "grok-4.5".to_string(),
+                        name: "Grok 4.5".to_string(),
+                        description: None,
+                    },
+                    SessionConfigSelectOptionInfo {
+                        value: "grok-composer-2.5-fast".to_string(),
+                        name: "Composer 2.5".to_string(),
+                        description: None,
+                    },
+                ],
+                groups: Vec::new(),
+            }),
+        }]
+    }
+
+    #[tokio::test]
+    async fn grok_incompatible_agent_switch_reverts_and_reports_without_deadlock() {
+        use std::time::Duration;
+
+        let mut st = SessionState::new(
+            "conn-test".to_string(),
+            AgentType::Grok,
+            None,
+            "win".to_string(),
+            None,
+        );
+        // The conversation is on grok-4.5; the user optimistically picked the
+        // cross-agent-type Composer model, which Grok rejected mid-conversation.
+        st.config_options = Some(grok_model_options("grok-4.5"));
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+
+        // Regression guard: the recovery previously read `config_options` inline
+        // in an `if let`, holding the read guard across `emit_*` (which take the
+        // write lock) → deadlock. A timeout turns that hang into a failure.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            emit_grok_incompatible_agent_switch(&state, &emitter),
+        )
+        .await
+        .expect("recovery must complete, not deadlock on the state lock");
+
+        let guard = state.read().await;
+
+        // The optimistic pick is reverted: the authoritative model is unchanged.
+        let opts = guard.config_options.as_ref().expect("options preserved");
+        let SessionConfigKindInfo::Select(sel) = &opts[0].kind;
+        assert_eq!(sel.current_value, "grok-4.5");
+
+        // Event ordering: the authoritative options (revert) precede the coded
+        // error so the composer snaps back before the toast appears.
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let cfg_idx = events
+            .iter()
+            .position(|e| matches!(&e.payload, AcpEvent::SessionConfigOptions { .. }))
+            .expect("a session_config_options revert is emitted");
+        let err_idx = events
+            .iter()
+            .position(|e| matches!(&e.payload, AcpEvent::Error { .. }))
+            .expect("a coded error is emitted");
+        assert!(cfg_idx < err_idx, "revert must precede the error");
+
+        // The reverted options carry the original model.
+        if let AcpEvent::SessionConfigOptions { config_options } = &events[cfg_idx].payload {
+            let SessionConfigKindInfo::Select(sel) = &config_options[0].kind;
+            assert_eq!(sel.current_value, "grok-4.5");
+        }
+
+        // Exactly one error, carrying the localizable code (not a raw message)
+        // and recoverable — no generic double-emit.
+        let errors: Vec<(Option<String>, bool)> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                AcpEvent::Error {
+                    code, terminal, ..
+                } => Some((code.clone(), *terminal)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "no double error emit");
+        assert_eq!(
+            errors[0].0.as_deref(),
+            Some(GROK_INCOMPATIBLE_AGENT_ERROR_CODE)
+        );
+        assert!(!errors[0].1, "recoverable, not terminal");
+    }
+
+    #[test]
+    fn grok_live_tool_output_prefers_content() {
+        // The clean content channel carries the output → don't ship raw_output
+        // at all (frontend renders `content`, matching the parser's precedence).
+        let content = Some("build ok\n".to_string());
+        let raw = Some(serde_json::json!({
+            "output_for_prompt": "exit: 0\n\nbuild ok",
+            "exit_code": 0,
+            "command": "pnpm build",
+        }));
+        assert_eq!(grok_live_tool_output(&content, &raw), None);
+    }
+
+    #[test]
+    fn grok_live_tool_output_falls_back_to_output_for_prompt_when_content_empty() {
+        // With no content, recover the readable text from the string
+        // `output_for_prompt` (NOT the byte-array `output`, NOT the whole blob).
+        let raw = Some(serde_json::json!({
+            "output": [10, 62, 32],
+            "output_for_prompt": "exit: 0\n\nok",
+            "exit_code": 0,
+            "command": "pnpm build",
+        }));
+        assert_eq!(
+            grok_live_tool_output(&None, &raw).as_deref(),
+            Some("exit: 0\n\nok")
+        );
+        // Whitespace-only content is treated as empty.
+        let ws = Some("  \n".to_string());
+        assert_eq!(
+            grok_live_tool_output(&ws, &raw).as_deref(),
+            Some("exit: 0\n\nok")
+        );
+    }
+
+    #[test]
+    fn grok_live_tool_output_none_without_usable_string() {
+        // Object without `output_for_prompt` (only the byte-array `output`).
+        let no_prompt = Some(serde_json::json!({
+            "output": [10, 62],
+            "exit_code": 0,
+            "command": "x",
+        }));
+        assert_eq!(grok_live_tool_output(&None, &no_prompt), None);
+        // Non-object rawOutput.
+        assert_eq!(
+            grok_live_tool_output(&None, &Some(serde_json::json!("a string"))),
+            None
+        );
+        // Absent rawOutput.
+        assert_eq!(grok_live_tool_output(&None, &None), None);
+    }
+
+    /// A finished Grok terminal `tool_call_update` carries the readable output in
+    /// BOTH the `content[]` channel and a structured `rawOutput` object (its
+    /// `output` field a byte array, text only under `output_for_prompt`).
+    /// Regression: the live path must NOT ship the stringified object as
+    /// `raw_output` (which shadows `content` and renders empty) — it emits `None`
+    /// so the frontend renders the clean `content`.
+    #[tokio::test]
+    async fn grok_terminal_update_emits_content_not_raw_output_blob() {
+        let st = SessionState::new(
+            "conn-grok".to_string(),
+            AgentType::Grok,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "\n> build\nbuild ok\n"}}],
+            "rawOutput": {
+                "output": [10, 62, 32],
+                "output_for_prompt": "exit: 0\n\nbuild ok",
+                "exit_code": 0,
+                "command": "pnpm build",
+            },
+        }))
+        .expect("valid tool_call_update wire shape");
+
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Grok,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let (raw_output, content) = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCallUpdate {
+                    raw_output,
+                    content,
+                    ..
+                } => Some((raw_output.clone(), content.clone())),
+                _ => None,
+            })
+            .expect("a tool_call_update event is emitted");
+
+        assert!(
+            raw_output.is_none(),
+            "Grok must not ship the rawOutput object blob (it shadows content \
+             and the terminal renderer drops it): {raw_output:?}"
+        );
+        assert!(
+            content.as_deref().is_some_and(|c| c.contains("build ok")),
+            "the clean content channel carries the executed command's output: {content:?}"
+        );
+    }
+
+    /// Contrast guard: the Grok-only extraction must not change other agents.
+    /// A non-Grok agent that sends the same object-shaped `rawOutput` still gets
+    /// it stringified into `raw_output` (existing `json_value_to_text` behavior).
+    #[tokio::test]
+    async fn non_grok_object_raw_output_is_stringified_unchanged() {
+        let st = SessionState::new(
+            "conn-claude".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "completed",
+            "rawOutput": {"output_for_prompt": "exit: 0\n\nok", "command": "x"},
+        }))
+        .expect("valid tool_call_update wire shape");
+
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::ClaudeCode,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let raw_output = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCallUpdate { raw_output, .. } => Some(raw_output.clone()),
+                _ => None,
+            })
+            .expect("a tool_call_update event is emitted");
+        assert!(
+            raw_output.is_some(),
+            "non-Grok agents keep the existing json_value_to_text behavior"
+        );
+    }
+
+    #[test]
+    fn unwrap_grok_use_tool_peels_mcp_envelope() {
+        // Grok's `use_tool` envelope nests the real MCP tool name + args.
+        let raw = serde_json::json!({
+            "tool_name": "codeg-mcp__delegate_to_agent",
+            "tool_input": {"agent_type": "codex", "task": "build", "working_dir": "/w"},
+        });
+        let (name, input) = unwrap_grok_use_tool(Some(&raw)).expect("envelope peels");
+        assert_eq!(name, "codeg-mcp__delegate_to_agent");
+        assert_eq!(input.get("task").and_then(|v| v.as_str()), Some("build"));
+        assert_eq!(
+            input.get("agent_type").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn unwrap_grok_use_tool_ignores_native_tools() {
+        // Native Grok tools carry args directly (no tool_name/tool_input shape) —
+        // they must pass through untouched.
+        let terminal = serde_json::json!({"command": "pnpm build"});
+        assert!(unwrap_grok_use_tool(Some(&terminal)).is_none());
+        // Missing tool_input.
+        assert!(unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "x"}))).is_none());
+        // Empty tool_name.
+        assert!(
+            unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "", "tool_input": {}})))
+                .is_none()
+        );
+        // Absent / non-object.
+        assert!(unwrap_grok_use_tool(None).is_none());
+        assert!(unwrap_grok_use_tool(Some(&serde_json::json!("s"))).is_none());
+    }
+
+    #[test]
+    fn grok_mcp_output_text_extracts_result() {
+        // `{type:MCP, output:{OkayOutput:"…"}}` — text is the first string value.
+        let ok = serde_json::json!({
+            "type": "MCP",
+            "tool_name": "delegate_to_agent",
+            "output": {"OkayOutput": "Delegation successful. task_id=abc-123."},
+        });
+        assert_eq!(
+            grok_mcp_output_text(&ok).as_deref(),
+            Some("Delegation successful. task_id=abc-123.")
+        );
+        // `output` may be a bare string.
+        let bare = serde_json::json!({"type": "MCP", "output": "done"});
+        assert_eq!(grok_mcp_output_text(&bare).as_deref(), Some("done"));
+        // An empty-string sibling (sorted before the real key) must not shadow
+        // the populated result.
+        let empty_first = serde_json::json!({
+            "type": "MCP",
+            "output": {"AErr": "", "OkayOutput": "real result"},
+        });
+        assert_eq!(
+            grok_mcp_output_text(&empty_first).as_deref(),
+            Some("real result")
+        );
+        // A pure error variant (any `*Output` key) is surfaced too.
+        let err = serde_json::json!({"type": "MCP", "output": {"ErrOutput": "boom"}});
+        assert_eq!(grok_mcp_output_text(&err).as_deref(), Some("boom"));
+        // Non-MCP rawOutput → None (caller falls through to output_for_prompt).
+        let bash = serde_json::json!({"type": "Bash", "output_for_prompt": "ok"});
+        assert_eq!(grok_mcp_output_text(&bash), None);
+    }
+
+    #[test]
+    fn grok_live_tool_output_recovers_mcp_result() {
+        // An MCP call (delegate ack) has empty content and no output_for_prompt;
+        // the readable text lives under `output.OkayOutput`.
+        let raw = Some(serde_json::json!({
+            "type": "MCP",
+            "tool_name": "delegate_to_agent",
+            "server_name": "codeg-mcp",
+            "output": {"OkayOutput": "Delegation successful. task_id=2dc85849-5426."},
+        }));
+        assert_eq!(
+            grok_live_tool_output(&None, &raw).as_deref(),
+            Some("Delegation successful. task_id=2dc85849-5426.")
+        );
+    }
+
+    /// Grok wraps `delegate_to_agent` in a `use_tool` envelope. The live path must
+    /// peel it so the emitted event carries the MCP tool name as its title and the
+    /// real `{agent_type, task}` as raw_input — the exact shape the delegation
+    /// broker (`lifecycle.rs`) correlates on and the frontend classifies into the
+    /// delegation card — and must surface the MCP ack (carrying `task_id`) as
+    /// output instead of dropping it.
+    #[tokio::test]
+    async fn grok_use_tool_delegate_unwraps_to_direct_mcp_call() {
+        let st = SessionState::new(
+            "conn-grok".to_string(),
+            AgentType::Grok,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        // Initial tool_call carries the use_tool envelope (real Grok wire shape —
+        // no kind/status on the update object; they default).
+        let call: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-d",
+            "title": "use_tool",
+            "rawInput": {
+                "tool_name": "codeg-mcp__delegate_to_agent",
+                "tool_input": {"agent_type": "codex", "working_dir": "/w", "task": "run build"},
+            },
+        }))
+        .expect("valid tool_call wire shape");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Grok,
+            call,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        // The ack arrives on the completed update as an MCP rawOutput. Real Grok
+        // updates re-send the generic `use_tool` wrapper title and carry NO
+        // raw_input — the recorded override must re-assert the peeled name so the
+        // frontend reducer doesn't revert the delegation card to a generic tool.
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-d",
+            "title": "use_tool",
+            "status": "completed",
+            "rawOutput": {
+                "type": "MCP",
+                "tool_name": "delegate_to_agent",
+                "server_name": "codeg-mcp",
+                "output": {"OkayOutput": "Delegation successful. task_id=2dc85849-5426-44f7."},
+            },
+        }))
+        .expect("valid tool_call_update wire shape");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Grok,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+
+        // Initial ToolCall: title unwrapped to the MCP tool name; raw_input the
+        // real delegation args (the `use_tool` wrapper gone).
+        let (title, raw_input) = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCall {
+                    title, raw_input, ..
+                } => Some((title.clone(), raw_input.clone())),
+                _ => None,
+            })
+            .expect("a tool_call event is emitted");
+        assert_eq!(title, "codeg-mcp__delegate_to_agent");
+        let raw_input = raw_input.expect("raw_input present after unwrap");
+        assert!(
+            raw_input.contains("\"agent_type\":\"codex\""),
+            "raw_input carries agent_type: {raw_input}"
+        );
+        assert!(
+            raw_input.contains("\"task\":\"run build\""),
+            "raw_input carries task: {raw_input}"
+        );
+        assert!(
+            !raw_input.contains("tool_input"),
+            "the use_tool wrapper is peeled: {raw_input}"
+        );
+
+        // Update: the MCP ack (with task_id) surfaces as output, AND the emitted
+        // title re-asserts the peeled name — the sparse `use_tool` wrapper title
+        // must not win.
+        let (upd_title, raw_output) = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCallUpdate {
+                    title, raw_output, ..
+                } => raw_output.clone().map(|o| (title.clone(), o)),
+                _ => None,
+            })
+            .expect("a tool_call_update with output is emitted");
+        assert!(
+            raw_output.contains("task_id=2dc85849"),
+            "the delegate ack (with task_id) surfaces as output: {raw_output}"
+        );
+        assert_eq!(
+            upd_title.as_deref(),
+            Some("codeg-mcp__delegate_to_agent"),
+            "the sparse-update wrapper title is overridden by the recorded name"
+        );
+        // No emitted event ever ships the generic `use_tool` wrapper title.
+        assert!(
+            events.iter().all(|e| !matches!(
+                &e.payload,
+                AcpEvent::ToolCall { title, .. } if title == "use_tool"
+            ) && !matches!(
+                &e.payload,
+                AcpEvent::ToolCallUpdate { title: Some(t), .. } if t == "use_tool"
+            )),
+            "no event ships the generic use_tool wrapper title"
+        );
+    }
+
+    /// The unwrap is symmetric on the ToolCallUpdate arm: an update that itself
+    /// carries the `use_tool` envelope (rawInput) is peeled the same way — title →
+    /// MCP name, raw_input → the inner args.
+    #[tokio::test]
+    async fn grok_use_tool_envelope_on_update_is_unwrapped() {
+        let st = SessionState::new(
+            "conn-grok".to_string(),
+            AgentType::Grok,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-u",
+            "title": "use_tool",
+            "status": "in_progress",
+            "rawInput": {
+                "tool_name": "codeg-mcp__cancel_delegation",
+                "tool_input": {"task_id": "abc-123"},
+            },
+        }))
+        .expect("valid tool_call_update wire shape");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Grok,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+        )
+        .await;
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        let (title, raw_input) = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCallUpdate {
+                    title, raw_input, ..
+                } => Some((title.clone(), raw_input.clone())),
+                _ => None,
+            })
+            .expect("a tool_call_update event is emitted");
+        assert_eq!(title.as_deref(), Some("codeg-mcp__cancel_delegation"));
+        let raw_input = raw_input.expect("raw_input present after unwrap");
+        assert!(
+            raw_input.contains("\"task_id\":\"abc-123\""),
+            "inner args surface as raw_input: {raw_input}"
+        );
+        assert!(
+            !raw_input.contains("tool_input"),
+            "the use_tool wrapper is peeled: {raw_input}"
+        );
     }
 
     #[test]

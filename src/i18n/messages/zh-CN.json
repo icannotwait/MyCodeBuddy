@@ -49,6 +49,7 @@
       "web_service": "Web 服务",
       "model_providers": "模型供应商",
       "experts": "专家",
+      "science": "科学研究",
       "office_tools": "办公工具",
       "quick_messages": "快捷消息",
       "logs": "运行日志"
@@ -107,8 +108,14 @@
       "fontSize": "字号",
       "ligatures": "启用连字",
       "ligaturesUnavailable": "该字体不含连字",
+      "wordWrap": "启用自动换行",
       "terminalLigaturesHint": "终端连字仅对内置编程字体生效。",
       "preview": "预览"
+    },
+    "welcomePanel": {
+      "sectionTitle": "模式选择区域",
+      "sectionDescription": "新会话页面输入框上方显示的「代码开发 / 日常办公」快捷卡片区域。",
+      "showQuickActions": "在新会话页面显示"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "卸载中...",
       "saveEnvVars": "保存环境变量",
       "saving": "保存中...",
+      "saveGrokConfig": "保存 Grok 配置",
       "saveCodexConfig": "保存 Codex 配置",
       "saveGeminiConfig": "保存 Gemini 配置",
       "saveOpenCodeConfig": "保存 OpenCode 配置",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "预检项：{count}",
       "notRun": "尚未执行检测。"
+    },
+    "grok": {
+      "configDescription": "在此配置 Grok。下面的控件（权限模式、推理级别）会合并写入 ~/.grok/config.toml，保留你的其它键与注释。登录使用 XAI_API_KEY 或 `grok login`。其它键可在「高级」中编辑。",
+      "permissionModeLabel": "权限模式",
+      "permissionAsk": "每次询问",
+      "permissionAlwaysApprove": "始终允许",
+      "reasoningEffortLabel": "推理级别",
+      "effortLow": "低（更快）",
+      "effortMedium": "中（均衡）",
+      "effortHigh": "高",
+      "effortXhigh": "最高",
+      "optionDefault": "使用默认",
+      "authTitle": "认证",
+      "authKeyConfigured": "已配置 XAI_API_KEY。",
+      "authKeyMissing": "未设置 XAI_API_KEY。",
+      "authLoginHint": "在此设置 XAI_API_KEY，或运行 `grok login` 进行订阅登录（SuperGrok / X Premium+）。",
+      "advancedToggle": "高级（原始 config.toml）",
+      "configTomlNative": "config.toml（原生）",
+      "configTomlHint": "按原样整体写入 ~/.grok/config.toml。非法 TOML 会被拒绝，绝不因笔误截断文件。",
+      "configTomlPlaceholder": "# 上面控件之外的键，例如\n# [mcp_servers.*]、[cli]、[permission] 规则。"
     },
     "codex": {
       "configDescription": "支持 API URL、API Key、模型名称、Reasoning Effort 快捷配置，并与 `auth.json` / `config.toml` 双向联动。",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "保存 Agent 排序失败",
       "saveAgentSwitchFailed": "保存 Agent 开关失败",
       "saveEnvFailed": "保存环境变量失败",
+      "grokSaved": "Grok 配置已保存",
+      "saveGrokNativeFailed": "保存 Grok 原生配置失败",
+      "saveGrokApiKeyFailed": "设置已保存，但 API Key 未能保存",
       "codexSaved": "Codex 配置已保存",
       "saveCodexNativeFailed": "保存 Codex 原生配置失败",
       "geminiSaved": "Gemini 配置已保存",
@@ -1393,6 +1424,7 @@
       "addToChat": "加入会话",
       "addSelectionToChatDone": "已将 {label} 加入会话",
       "addFileToChat": "添加文件到会话",
+      "toggleWordWrap": "切换自动换行",
       "addFileToChatDone": "已将 {label} 加入会话",
       "viewDiff": "查看差异",
       "openFile": "打开文件",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "折叠已跟踪改动",
       "expandUntracked": "展开未跟踪文件",
       "collapseUntracked": "折叠未跟踪文件",
+      "showRemainingItems": "显示其余 {count} 项",
       "actions": {
         "commitCode": "提交代码",
         "rollback": "回滚",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "{agent} 已达到本轮回复的最大 Token 限制。",
           "turnFailedMaxTurnRequests": "{agent} 已达到本轮回复允许的最大请求次数。",
           "turnFailedUnknown": "{agent} 以未知的停止原因结束了本轮回复。",
+          "grokModelSwitchIncompatibleAgent": "{agent} 无法在已有对话中切换到该模型，请新建会话以使用它。",
           "turnFailedEmpty": "{agent} 本轮没有产生任何回复就结束了，请检查代理配置。"
         },
         "unableReadAgentConfig": "无法读取 Agent 配置：{message}",
@@ -2033,7 +2067,7 @@
         "quickMessages": "快捷消息",
         "quickMessagesEmpty": "暂无快捷消息",
         "quickMessagesLoading": "加载中...",
-        "paste": "粘贴",
+        "pasteAsPlainText": "粘贴为纯文本",
         "cut": "剪切",
         "copy": "复制",
         "selectAll": "全选",
@@ -2139,11 +2173,39 @@
             "morph3d": "创建一个带 GLB 模型和镜头运动的 3D Morph 演示文稿：\n\n[在此描述主题和 3D 视觉构想]",
             "academic": "用 Word 写一篇学术论文，要求如下：\n\n[在此描述研究主题、方法和主要发现]",
             "financial": "用 Excel 创建一个财务模型，要求如下：\n\n[在此描述财务报表、预测和分析]",
-            "dashboard": "用 Excel 创建一个数据仪表盘，要求如下：\n\n[在此描述数据来源、KPI 和图表]"
+            "dashboard": "用 Excel 创建一个数据仪表盘，要求如下：\n\n[在此描述数据来源、KPI 和图表]",
+            "scientific-brainstorming": "帮我进行科研头脑风暴：探索跨学科联系、挑战假设、发现有潜力的研究空白。我正在探索的方向：",
+            "hypothesis-generation": "帮我把这些观察转化为可检验的假设：给出明确预测、合理机制，并设计验证实验。我的观察：",
+            "experimental-design": "在采集数据前帮我设计严谨的实验：设计方案、随机化、对照，以及如何避免混杂。我想研究的问题：",
+            "statistical-power": "帮我确定所需样本量：为我的设计做功效分析（效应量、显著性水平、功效）。具体信息：",
+            "statistical-analysis": "帮我正确分析这份数据：选择合适的检验、检查假设、报告效应量并撰写结论。我的数据与问题：",
+            "exploratory-data-analysis": "对我的数据文件做探索性分析：概述其结构、质量与值得注意的模式，并建议后续步骤。文件是：",
+            "scientific-visualization": "帮我制作出版级图表：清晰布局、真实误差棒、色盲友好配色，以及期刊格式。我想展示的内容：",
+            "scientific-critical-thinking": "帮我批判性评估这项研究或主张：评估证据质量、识别偏倚与混杂，并权衡结论。内容如下：",
+            "paper-lookup": "帮我在学术数据库中查找相关论文与开放获取全文，并提供可复用的引用。我要找的是："
           },
+          "paper-lookup": "论文检索",
+          "paper-lookupDesc": "检索 10 个学术 API（PubMed、arXiv、OpenAlex、Crossref…）查找论文、引用与开放获取全文。",
+          "scientific-critical-thinking": "批判性思维",
+          "scientific-critical-thinkingDesc": "评估科学主张与证据质量：识别偏倚与混杂，运用 GRADE 与偏倚风险框架。",
+          "scientific-visualization": "科学可视化",
+          "scientific-visualizationDesc": "出版级图表：多面板布局、显著性标注与期刊专属格式。",
+          "exploratory-data-analysis": "探索性数据分析",
+          "exploratory-data-analysisDesc": "对 200+ 种格式的科学数据文件做自动化探索，输出质量指标与报告。",
+          "statistical-analysis": "统计分析",
+          "statistical-analysisDesc": "引导式统计分析：检验选择、假设检查、效应量与 APA 格式报告。",
+          "statistical-power": "统计功效",
+          "statistical-powerDesc": "样本量与统计功效分析：所需样本数、最小可检测效应与功效曲线。",
+          "experimental-design": "实验设计",
+          "experimental-designDesc": "在采集数据前设计严谨研究：随机化、区组、对照与析因/DOE 布局。",
+          "hypothesis-generation": "假设生成",
+          "hypothesis-generationDesc": "将观察转化为可检验的假设，给出预测、机制并设计验证实验。",
+          "scientific-brainstorming": "科学头脑风暴",
+          "scientific-brainstormingDesc": "开放式科研构思：探索跨学科联系、挑战假设、发现研究空白。",
           "tabs": {
             "office": "日常办公",
-            "coding": "代码开发"
+            "coding": "代码开发",
+            "research": "科学研究"
           },
           "coding": {
             "brainstormingDesc": "动手前先梳理意图与需求",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value} 小时",
         "elapsedMinutes": "{value} 分钟",
         "elapsedSeconds": "{value} 秒",
-        "toolUseCount": "{count} 个工具 {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} 次工具调用"
       },
       "tool": {
         "parameters": "参数",
@@ -2525,6 +2587,16 @@
         "opWait": "获取子智能体结果",
         "opClose": "结束子智能体",
         "opResume": "恢复子智能体"
+      },
+      "backgroundTasks": {
+        "running": "{count} 个后台任务运行中",
+        "settling": "正在同步后台结果…",
+        "settledFallback": "后台任务已结束（{status}）",
+        "cardRunning": "后台运行中",
+        "cardLaunchedPending": "已启动后台任务",
+        "cardCompleted": "后台任务已完成",
+        "cardFinishedWithStatus": "后台任务已结束（{status}）",
+        "cardResultPending": "结果尚未返回"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "代码块 {index}",
       "loadingHunk": "正在加载代码块...",
-      "noDiffData": "无差异数据"
+      "noDiffData": "无差异数据",
+      "showRemainingLines": "显示剩余 {count} 行"
     },
     "conversationContextBar": {
       "folderTitle": "工作文件夹",
@@ -2860,7 +2933,7 @@
     "agentTypeRequired": "请选择智能体类型。",
     "agentTypeImmutableHint": "智能体类型创建后不可修改。",
     "model": "模型",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "主模型",
     "claudeReasoningModel": "推理模型（思考）",
@@ -2981,6 +3054,40 @@
       "disabled": "已为该代理禁用专家",
       "enableFailed": "启用专家失败",
       "disableFailed": "禁用专家失败",
+      "openFolderFailed": "打开目录失败"
+    }
+  },
+  "ScienceSettings": {
+    "title": "科学研究技能",
+    "description": "为你的 AI 编码智能体启用精选的科学研究技能：假设生成、实验设计、统计、可视化、批判性评估与文献检索。codeg 管理中央副本，并将每个技能链接到你选择的智能体。",
+    "loading": "正在加载科学研究技能…",
+    "emptySkills": "没有可用的科学研究技能。请检查应用日志。",
+    "searchPlaceholder": "按名称、ID 或描述搜索科学研究技能",
+    "categories": {
+      "ideation": "构思",
+      "design": "研究设计",
+      "analysis": "分析",
+      "visualization": "可视化",
+      "evaluation": "评估",
+      "literature": "文献"
+    },
+    "states": {
+      "not_linked": "未启用",
+      "linked_to_codeg": "已启用",
+      "linked_elsewhere": "冲突 — 已有其他链接",
+      "blocked_by_real_directory": "冲突 — 已有同名的自定义 skill 占用",
+      "broken": "链接损坏"
+    },
+    "badges": {
+      "userModified": "用户修改过",
+      "needsKey": "需要密钥",
+      "needsSetup": "可能需环境"
+    },
+    "actions": {
+      "openCentralDir": "打开中央目录",
+      "refresh": "刷新"
+    },
+    "toasts": {
       "openFolderFailed": "打开目录失败"
     }
   },

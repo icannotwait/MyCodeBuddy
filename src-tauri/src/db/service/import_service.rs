@@ -12,6 +12,7 @@ use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
 use crate::parsers::gemini::GeminiParser;
+use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
 use crate::parsers::pi::PiParser;
@@ -41,6 +42,7 @@ pub async fn import_local_conversations(
             (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),
             (AgentType::KimiCode, Box::new(KimiCodeParser::new())),
             (AgentType::Pi, Box::new(PiParser::new())),
+            (AgentType::Grok, Box::new(GrokParser::new())),
         ];
 
         let mut matched = Vec::new();

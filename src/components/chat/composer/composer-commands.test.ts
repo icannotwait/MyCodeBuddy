@@ -10,7 +10,13 @@ import {
   restoreBlocksIntoEditor,
 } from "./composer-commands"
 import { buildComposerExtensions } from "./editor-config"
+import { serializeDocToText } from "./to-prompt-blocks"
 import type { ReferenceAttrs } from "./types"
+
+/** The composer's plain-text send serialization (references → inline tokens). */
+function serialized(editor: Editor): string {
+  return serializeDocToText(editor.state.doc)
+}
 
 /** An expert reference (refType `skill`, `meta.scope === "expert"`). */
 function expertAttrs(id: string, prefix: "/" | "$" = "/"): ReferenceAttrs {
@@ -36,7 +42,7 @@ describe("isComposerEmpty", () => {
   })
 
   it("is false once there is real text", () => {
-    editor.commands.setContent("hello", { contentType: "markdown" })
+    editor.commands.setContent("hello")
     expect(isComposerEmpty(editor)).toBe(false)
   })
 
@@ -106,19 +112,19 @@ describe("applyExpertReference", () => {
     // The badge is a real reference node (not plain text)…
     expect(JSON.stringify(editor.getJSON())).toContain('"refType":"skill"')
     // …that serializes to its `/reviewer` invocation token at the front.
-    expect(editor.getMarkdown().trimStart()).toMatch(/^\/reviewer\b/)
+    expect(serialized(editor).trimStart()).toMatch(/^\/reviewer\b/)
   })
 
   it("prepends the badge in front of existing prose", () => {
-    editor.commands.setContent("look at this", { contentType: "markdown" })
+    editor.commands.setContent("look at this")
     applyExpertReference(editor, expertAttrs("reviewer"))
-    expect(editor.getMarkdown().trimStart()).toMatch(/^\/reviewer look at this/)
+    expect(serialized(editor).trimStart()).toMatch(/^\/reviewer look at this/)
   })
 
   it("replaces an existing leading expert badge instead of stacking", () => {
     applyExpertReference(editor, expertAttrs("old"))
     applyExpertReference(editor, expertAttrs("reviewer"))
-    const md = editor.getMarkdown()
+    const md = serialized(editor)
     expect(md.trimStart()).toMatch(/^\/reviewer\b/)
     expect(md).not.toContain("/old")
     // Exactly one expert badge remains.
@@ -128,36 +134,17 @@ describe("applyExpertReference", () => {
   })
 
   it("does NOT replace a leading plain-text token (only a real expert badge)", () => {
-    editor.commands.setContent("/unknown keep", { contentType: "markdown" })
+    editor.commands.setContent("/unknown keep")
     applyExpertReference(editor, expertAttrs("reviewer"))
-    const md = editor.getMarkdown()
+    const md = serialized(editor)
     expect(md.trimStart()).toMatch(/^\/reviewer /)
     expect(md).toContain("/unknown")
   })
 
-  it("keeps the badge ahead of a heading's Markdown marker (regression)", () => {
-    // First block is a heading: inserting inline at pos 1 would serialize as
-    // `# /reviewer Title` (marker first). The badge must lead the message.
-    editor.commands.setContent("# Title", { contentType: "markdown" })
-    applyExpertReference(editor, expertAttrs("reviewer"))
-    const md = editor.getMarkdown()
-    expect(md.trimStart()).toMatch(/^\/reviewer/)
-    expect(md).toContain("# Title")
-    expect(md.indexOf("/reviewer")).toBeLessThan(md.indexOf("# Title"))
-  })
-
-  it("keeps the badge ahead of a list's Markdown marker", () => {
-    editor.commands.setContent("- one\n- two", { contentType: "markdown" })
-    applyExpertReference(editor, expertAttrs("reviewer"))
-    const md = editor.getMarkdown()
-    expect(md.trimStart()).toMatch(/^\/reviewer/)
-    expect(md.indexOf("/reviewer")).toBeLessThan(md.indexOf("one"))
-  })
-
   it("supports the Codex `$` prefix", () => {
-    editor.commands.setContent("ship it", { contentType: "markdown" })
+    editor.commands.setContent("ship it")
     applyExpertReference(editor, expertAttrs("deploy", "$"))
-    expect(editor.getMarkdown().trimStart()).toMatch(/^\$deploy ship it/)
+    expect(serialized(editor).trimStart()).toMatch(/^\$deploy ship it/)
   })
 })
 
@@ -174,7 +161,7 @@ describe("restoreBlocksIntoEditor", () => {
       { type: "text", text: "hello **world**" },
     ]
     const attachments = restoreBlocksIntoEditor(editor, blocks)
-    expect(editor.getMarkdown()).toContain("**world**")
+    expect(serialized(editor)).toContain("**world**")
     expect(attachments).toEqual([])
   })
 
@@ -191,7 +178,7 @@ describe("restoreBlocksIntoEditor", () => {
     ]
     const attachments = restoreBlocksIntoEditor(editor, blocks)
     expect(JSON.stringify(editor.getJSON())).toContain('"type":"reference"')
-    expect(editor.getMarkdown()).toContain("see")
+    expect(serialized(editor)).toContain("see")
     expect(attachments).toEqual([])
   })
 
@@ -225,9 +212,9 @@ describe("restoreBlocksIntoEditor", () => {
   })
 
   it("clears any prior content before restoring", () => {
-    editor.commands.setContent("stale draft", { contentType: "markdown" })
+    editor.commands.setContent("stale draft")
     restoreBlocksIntoEditor(editor, [{ type: "text", text: "fresh" }])
-    const md = editor.getMarkdown()
+    const md = serialized(editor)
     expect(md).toContain("fresh")
     expect(md).not.toContain("stale")
   })

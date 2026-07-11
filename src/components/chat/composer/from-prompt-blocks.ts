@@ -13,11 +13,12 @@ import type { ReferenceAttrs } from "./types"
  * intact.
  *
  * The split mirrors the send rule:
- * - `text` blocks → markdown segments replayed into the editor. Every inline
- *   reference that was serialized *as text* comes back in that text form: file
- *   links `[name](file://…)` (which `docToPromptBlocks` now keeps inline) and
- *   session/commit/agent/skill references alike replay as inline links/text, not
- *   re-hydrated badges — consistent across every reference kind on a queue-edit.
+ * - `text` blocks → plain-text segments replayed into the editor verbatim. Every
+ *   inline reference that was serialized *as text* comes back in that text form:
+ *   file links `[name](file://…)` (which `docToPromptBlocks` keeps inline) and
+ *   session/commit/agent/skill references alike replay as their inline link/token
+ *   text, not re-hydrated badges — consistent across every reference kind on a
+ *   queue-edit.
  * - `resource_link` blocks whose uri is a composer scheme (`file:` / `codeg:`)
  *   → reference badge segments. `docToPromptBlocks` no longer emits file
  *   resource_links (files stay inline above), but this branch still restores any
@@ -26,12 +27,12 @@ import type { ReferenceAttrs } from "./types"
  * - everything else (`image`, embedded `resource`, non-composer `resource_link`)
  *   → out-of-band attachments.
  *
- * The host replays `segments` in order against a live editor (markdown via
- * `insertMarkdownAtCursor`, references via `insertReference`) and sets
+ * The host replays `segments` in order against a live editor (text via
+ * `insertTextAtCursor`, references via `insertReference`) and sets
  * `attachments`. Pure and deterministic given an injected `makeId`.
  */
 export type RestoreSegment =
-  | { kind: "markdown"; text: string }
+  | { kind: "text"; text: string }
   | { kind: "reference"; attrs: ReferenceAttrs }
 
 export interface RestoredDraft {
@@ -50,7 +51,7 @@ export function blocksToRestoredDraft(
     switch (block.type) {
       case "text": {
         if (block.text.trim().length > 0) {
-          segments.push({ kind: "markdown", text: block.text })
+          segments.push({ kind: "text", text: block.text })
         }
         break
       }

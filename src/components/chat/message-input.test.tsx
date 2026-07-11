@@ -14,6 +14,7 @@ import type { Editor } from "@tiptap/core"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { RichComposerHandle } from "./composer/rich-composer"
+import { serializeDocToText } from "./composer/to-prompt-blocks"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
@@ -188,19 +189,19 @@ describe("MessageInput attach-to-chat insertion position", () => {
   // land after "world".
   function seedWithMidCaret(editor: Editor) {
     act(() => {
-      editor.commands.setContent("hello world", { contentType: "markdown" })
+      editor.commands.setContent("hello world")
       editor.commands.setTextSelection(6)
     })
   }
 
-  function assertBetweenHelloAndWorld(markdown: string, link: string) {
-    const at = markdown.indexOf(link)
+  function assertBetweenHelloAndWorld(text: string, link: string) {
+    const at = text.indexOf(link)
     expect(at).toBeGreaterThanOrEqual(0)
     // Caret insertion: "hello" precedes the badge and "world" follows it.
     // (An end-of-doc append would put "world" before the link, failing the
     // second assertion.)
-    expect(markdown.slice(0, at)).toContain("hello")
-    expect(markdown.slice(at + link.length)).toContain("world")
+    expect(text.slice(0, at)).toContain("hello")
+    expect(text.slice(at + link.length)).toContain("world")
   }
 
   it("drops an attached whole-file badge at the caret, not the end", async () => {
@@ -210,8 +211,10 @@ describe("MessageInput attach-to-chat insertion position", () => {
       emitAttachFileToSession({ tabId: "tab-1", path: "/repo/app.ts" })
     })
     const link = "[app.ts](file:///repo/app.ts)"
-    await waitFor(() => expect(editor.getMarkdown()).toContain(link))
-    assertBetweenHelloAndWorld(editor.getMarkdown(), link)
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(link)
+    )
+    assertBetweenHelloAndWorld(serializeDocToText(editor.state.doc), link)
   })
 
   it("drops a ranged selection badge at the caret, not the end", async () => {
@@ -225,8 +228,10 @@ describe("MessageInput attach-to-chat insertion position", () => {
       })
     })
     const link = "[app.ts:10-25](file:///repo/app.ts#L10-25)"
-    await waitFor(() => expect(editor.getMarkdown()).toContain(link))
-    assertBetweenHelloAndWorld(editor.getMarkdown(), link)
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(link)
+    )
+    assertBetweenHelloAndWorld(serializeDocToText(editor.state.doc), link)
   })
 })
 

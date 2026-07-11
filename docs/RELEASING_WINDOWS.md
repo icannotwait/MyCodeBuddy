@@ -70,8 +70,8 @@ secrets are configured, run:
 
 ```bash
 pnpm release:check
-git tag v0.18.8-mycodebuddy.1
-git push origin v0.18.8-mycodebuddy.1
+git tag v0.20.0-mycodebuddy.1
+git push origin v0.20.0-mycodebuddy.1
 ```
 
 The tag starts the Windows release workflow. After all builds and uploads

@@ -171,6 +171,7 @@ impl PiParser {
             summary,
             turns,
             session_stats,
+            transcript_watermark: None,
         })
     }
 }
@@ -196,7 +197,11 @@ impl AgentParser for PiParser {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(summary) = self.parse_summary(path) {
+            if let Ok(Some(summary)) =
+                super::summary_cache::get_or_parse(AgentType::Pi, path, || {
+                    Ok(self.parse_summary(path))
+                })
+            {
                 conversations.push(summary);
             }
         }

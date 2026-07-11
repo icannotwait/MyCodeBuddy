@@ -377,6 +377,26 @@ async fn async_main() -> ExitCode {
         }
     });
 
+    // Install bundled scientific-research skills into the same central store.
+    // Runs in the background; failures are logged but non-fatal.
+    tokio::spawn(async move {
+        let report = codeg_lib::commands::science::ensure_central_science_installed().await;
+        if !report.errors.is_empty() {
+            tracing::error!(
+                "[Science] install finished with {} error(s): {:?}",
+                report.errors.len(),
+                report.errors
+            );
+        } else {
+            tracing::info!(
+                "[Science] install ok: installed={} updated={} pending_review={}",
+                report.installed_count,
+                report.updated_count,
+                report.pending_user_review.len()
+            );
+        }
+    });
+
     // Start chat channel background tasks (event subscriber, command dispatcher, scheduler, auto-connect)
     state
         .chat_channel_manager

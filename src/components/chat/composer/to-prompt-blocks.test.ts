@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import type { PromptInputBlock } from "@/lib/types"
 
 import { buildComposerExtensions } from "./editor-config"
-import { docToPromptBlocks } from "./to-prompt-blocks"
+import {
+  docToPromptBlocks,
+  serializeDocToDisplayText,
+  serializeDocToText,
+} from "./to-prompt-blocks"
 import type { ReferenceAttrs } from "./types"
 
 function ref(
@@ -40,11 +44,15 @@ describe("docToPromptBlocks", () => {
     editor?.destroy()
   })
 
-  it("serializes plain prose to a single text block", () => {
-    editor.commands.setContent("hello **world**", { contentType: "markdown" })
+  it("serializes plain prose to a single text block, markdown kept literal", () => {
+    editor.commands.insertContent({
+      type: "text",
+      text: "hello **world** # not a heading",
+    })
     const blocks = docToPromptBlocks(editor)
     expect(blocks).toHaveLength(1)
-    expect(textBlock(blocks)).toContain("**world**")
+    // No Markdown parsing: the syntax is preserved verbatim on the wire.
+    expect(textBlock(blocks)).toBe("hello **world** # not a heading")
   })
 
   it("returns no blocks for an empty document", () => {
@@ -254,20 +262,84 @@ describe("docToPromptBlocks", () => {
     expect(textBlock(blocks)).toContain("(file:///repo/deep/name.ts)")
   })
 
-  it("preserves marks in prose alongside an inline file reference", () => {
+  it("keeps prose alongside an inline file reference", () => {
     editor
       .chain()
-      .insertContent("look at ")
-      .insertContent({ type: "text", marks: [{ type: "bold" }], text: "this" })
-      .insertContent(" ")
+      .insertContent("look at this ")
       .insertReference(
         ref({ refType: "file", id: "x", label: "x.ts", uri: "file:///x.ts" })
       )
       .run()
     const blocks = docToPromptBlocks(editor)
     const text = textBlock(blocks)
-    expect(text).toContain("**this**")
+    expect(text).toContain("look at this")
     expect(text).toContain("[x.ts](file:///x.ts)")
     expect(links(blocks)).toHaveLength(0)
+  })
+})
+
+describe("serializeDocToDisplayText vs serializeDocToText (embedded)", () => {
+  let editor: Editor
+
+  beforeEach(() => {
+    editor = new Editor({ extensions: buildComposerExtensions() })
+  })
+  afterEach(() => editor?.destroy())
+
+  it("display KEEPS an embedded badge inline; send DROPS it", () => {
+    editor
+      .chain()
+      .insertContent("see ")
+      .insertReference(
+        ref({
+          refType: "file",
+          id: "report.pdf",
+          label: "report.pdf",
+          uri: "codeg://embedded/abc-123",
+        })
+      )
+      .insertContent(" please")
+      .run()
+    // Send text: the synthetic embedded uri never surfaces (bytes go separately).
+    const sent = serializeDocToText(editor.state.doc)
+    expect(sent).not.toContain("codeg://embedded")
+    expect(sent).not.toContain("report.pdf")
+    // Display text: the sender still sees the file they attached, as the same
+    // `[label](codeg://embedded/…)` link the transcript renders back to a badge —
+    // so the queue chip / optimistic bubble isn't blank ("Attached 0 attachment").
+    const shown = serializeDocToDisplayText(editor.state.doc)
+    expect(shown).toContain("[report.pdf](codeg://embedded/abc-123)")
+    expect(shown).toContain("see")
+    expect(shown).toContain("please")
+  })
+
+  it("an embedded-only document is empty on send but non-empty for display", () => {
+    editor.commands.insertReference(
+      ref({
+        refType: "file",
+        id: "report.pdf",
+        label: "report.pdf",
+        uri: "codeg://embedded/only-1",
+      })
+    )
+    expect(serializeDocToText(editor.state.doc).trim()).toBe("")
+    expect(serializeDocToDisplayText(editor.state.doc).trim()).toBe(
+      "[report.pdf](codeg://embedded/only-1)"
+    )
+  })
+
+  it("is byte-identical to the send form for content with no embedded refs", () => {
+    editor
+      .chain()
+      .insertContent("look at ")
+      .insertReference(
+        ref({ refType: "file", id: "x", label: "x.ts", uri: "file:///x.ts" })
+      )
+      .insertContent(" and ")
+      .insertReference(ref({ refType: "skill", id: "review", label: "Review" }))
+      .run()
+    expect(serializeDocToDisplayText(editor.state.doc)).toBe(
+      serializeDocToText(editor.state.doc)
+    )
   })
 })

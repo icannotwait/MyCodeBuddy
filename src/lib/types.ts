@@ -8,6 +8,7 @@ export type AgentType =
   | "code_buddy"
   | "kimi_code"
   | "pi"
+  | "grok"
 
 export type AppErrorCode =
   | "invalid_input"
@@ -215,6 +216,13 @@ export interface ConversationDetail {
   summary: ConversationSummary
   turns: MessageTurn[]
   session_stats?: SessionStats | null
+  /**
+   * Byte length of the source transcript this parse consumed (Claude only;
+   * absent elsewhere). Retires background-overlay turns whose
+   * `background_activity` watermark it has caught up to — see
+   * `BackgroundOverlayEntry` in the conversation runtime store.
+   */
+  transcript_watermark?: number | null
 }
 
 export interface FolderInfo {
@@ -399,6 +407,9 @@ export interface DbConversationDetail {
   summary: DbConversationSummary
   turns: MessageTurn[]
   session_stats?: SessionStats | null
+  /** See `ConversationDetail.transcript_watermark` (threaded through the DB
+   *  fetch path from the same parser detail). */
+  transcript_watermark?: number | null
   /**
    * Id of the persisted user turn the backend identified as the in-flight prompt
    * (present only while a turn is running on this conversation's connection). The
@@ -455,6 +466,7 @@ export const AGENT_DISPLAY_ORDER: AgentType[] = [
   "code_buddy",
   "kimi_code",
   "pi",
+  "grok",
 ]
 
 const AGENT_DISPLAY_ORDER_INDEX = new Map(
@@ -477,6 +489,7 @@ export const ALL_AGENT_TYPES: AgentType[] = [
   "code_buddy",
   "kimi_code",
   "pi",
+  "grok",
 ]
 
 export const MODEL_PROVIDER_AGENT_TYPES: AgentType[] = [
@@ -766,6 +779,7 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   code_buddy: "CodeBuddy",
   kimi_code: "Kimi Code",
   pi: "Pi",
+  grok: "Grok",
 }
 
 export const AGENT_COLORS: Record<AgentType, string> = {
@@ -778,6 +792,7 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   code_buddy: "bg-[#0052D9]",
   kimi_code: "bg-[#1783FF]",
   pi: "bg-[#0D9488]",
+  grok: "bg-neutral-900",
 }
 
 // ACP connection status (matches Rust ConnectionStatus)
@@ -1038,6 +1053,20 @@ export interface ToolCallImageWire {
 }
 
 // ACP events pushed from Rust backend (discriminated by "type" field)
+/**
+ * One background task settled by a `<task-notification>` transcript record
+ * (mirror of Rust `BackgroundSettledInfo`). `task_id` is the launch ack's
+ * `agentId` (async sub-agent) or `backgroundTaskId` (background shell);
+ * `status` is the notification's `<status>` verbatim (`"completed"` on
+ * success). The same id may settle more than once (a resumed sub-agent
+ * notifies again).
+ */
+export interface BackgroundSettledInfo {
+  task_id: string
+  status: string
+  summary?: string | null
+}
+
 export type AcpEvent =
   | { type: "content_delta"; text: string }
   | { type: "thinking"; text: string }
@@ -1166,6 +1195,24 @@ export type AcpEvent =
       type: "usage_update"
       used: number
       size: number
+    }
+  /**
+   * Out-of-turn activity surfaced from the agent's own session transcript by
+   * the backend watcher (Claude only): async sub-agent / background-shell
+   * `<task-notification>` completions, the agent's continued work after them,
+   * and cron//loop autonomous turns (which produce no wire events at all).
+   * `turns` are UPSERTs keyed by `MessageTurn.id` into the conversation
+   * runtime store's background overlay; `settled` entries each raise one OS
+   * notification; `outstanding` mirrors into the connection for the idle-sweep
+   * exemption and the "background tasks running" chip.
+   */
+  | {
+      type: "background_activity"
+      session_id: string
+      turns?: MessageTurn[]
+      outstanding: number
+      settled?: BackgroundSettledInfo[]
+      watermark: number
     }
   /**
    * A `delegate_to_agent` MCP tool call from the parent agent has spawned a
@@ -1428,6 +1475,11 @@ export interface LiveSessionSnapshot {
   /** Live-feedback notes for the current turn. Absent on older payloads /
    *  when empty (then treated as `[]`). */
   feedback?: FeedbackItem[]
+  /** Launched-but-unresolved background tasks (async sub-agents / background
+   *  shells) accounted from the transcript. Lets a client attaching
+   *  mid-episode recover the pending count the one-shot `background_activity`
+   *  events won't replay. Absent / omitted when zero. */
+  background_outstanding?: number
   /** Whether this agent has the `check_user_feedback` tool (fixed at launch).
    *  The frontend gates the feedback bar on this — the agent's real capability —
    *  not the (possibly later-toggled) global setting. Absent → `false`. */
@@ -1486,7 +1538,30 @@ export interface AcpAgentInfo {
   cline_secrets_json: string | null
   /** Raw ~/.hermes/config.yaml text, for the Hermes panel's advanced editor. */
   hermes_config_yaml: string | null
+  /** Raw ~/.grok/config.toml text, for the Grok panel's config-file editor. */
+  grok_config_toml: string | null
+  /** Parsed scalar settings backing the Grok panel's structured controls. Only
+   * populated for the Grok agent; derived from grok_config_toml. */
+  grok_settings: GrokSettings | null
   model_provider_id: number | null
+}
+
+/** Parsed scalar keys from ~/.grok/config.toml (mode / reasoning effort).
+ * `null` means the key is absent. Serialized snake_case to match AcpAgentInfo.
+ * The default model is intentionally NOT here — it's chosen per session from the
+ * composer, and a persistent [models].default is overridden at launch by the
+ * GROK_DEFAULT_MODEL env var. */
+export interface GrokSettings {
+  default_reasoning_effort: string | null
+  permission_mode: string | null
+}
+
+/** Structured-control values the Grok settings panel sends on save. Each
+ * non-null value sets its config.toml key; each null removes it. camelCase on
+ * the wire to match the request body. */
+export interface GrokStructuredConfig {
+  defaultReasoningEffort: string | null
+  permissionMode: string | null
 }
 
 // Lightweight agent status returned by acp_get_agent_status
@@ -1583,6 +1658,38 @@ export interface LinkOpResult {
   /** Present on a successful enable; null for disables and failures. */
   status: ExpertInstallStatus | null
   error: string | null
+}
+
+/**
+ * Built-in scientific-research skills, curated from
+ * K-Dense-AI/scientific-agent-skills and bundled into the codeg binary. They
+ * share the central store (`~/.codeg/skills/`) and link primitives with
+ * experts; link statuses reuse `ExpertInstallStatus`/`LinkOp`/`LinkOpResult`
+ * (the `expertId` field carries the science skill id).
+ */
+export interface ScienceMetadata {
+  id: string
+  category: string
+  icon: string | null
+  sort_order: number
+  /** Surface as a card in the new-session "Scientific Research" tab. */
+  featured: boolean
+  /** Color key indexing the ACCENTS map in quick-actions.tsx (featured only). */
+  accent: string | null
+  /** Primary workflow requires an external API key. */
+  needs_key: boolean
+  /** Ships scripts that may need a Python/uv environment. */
+  needs_env: boolean
+  display_name: Record<string, string>
+  description: Record<string, string>
+  bundled_hash: string
+}
+
+export interface ScienceListItem {
+  metadata: ScienceMetadata
+  installed_centrally: boolean
+  user_modified: boolean
+  central_path: string
 }
 
 export interface OfficecliInfo {
@@ -1767,6 +1874,7 @@ export type McpAppType =
   | "hermes"
   | "code_buddy"
   | "kimi_code"
+  | "grok"
 
 export interface LocalMcpServer {
   id: string

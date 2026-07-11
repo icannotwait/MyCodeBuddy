@@ -49,6 +49,7 @@
       "web_service": "Webdienst",
       "model_providers": "Modellanbieter",
       "experts": "Experten",
+      "science": "Wissenschaft",
       "office_tools": "Office-Tools",
       "quick_messages": "Schnellnachrichten",
       "logs": "Laufzeitprotokolle"
@@ -107,8 +108,14 @@
       "fontSize": "Schriftgröße",
       "ligatures": "Ligaturen aktivieren",
       "ligaturesUnavailable": "Diese Schriftart hat keine Ligaturen",
+      "wordWrap": "Zeilenumbruch aktivieren",
       "terminalLigaturesHint": "Terminal-Ligaturen gelten nur für mitgelieferte Programmierschriftarten.",
       "preview": "Vorschau"
+    },
+    "welcomePanel": {
+      "sectionTitle": "Modusauswahlbereich",
+      "sectionDescription": "Die Shortcut-Karten „Code-Entwicklung / Büroarbeit“ über dem Eingabefeld auf der Seite für eine neue Konversation.",
+      "showQuickActions": "Auf der Seite für neue Konversationen anzeigen"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "Wird deinstalliert...",
       "saveEnvVars": "Umgebungsvariablen speichern",
       "saving": "Speichern...",
+      "saveGrokConfig": "Grok-Konfiguration speichern",
       "saveCodexConfig": "Codex-Konfiguration speichern",
       "saveGeminiConfig": "Gemini-Konfiguration speichern",
       "saveOpenCodeConfig": "OpenCode-Konfiguration speichern",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "Preflight-Elemente: {count}",
       "notRun": "Prüfungen wurden noch nicht ausgeführt."
+    },
+    "grok": {
+      "configDescription": "Konfiguriere Grok hier. Die Steuerelemente unten (Berechtigungsmodus, Denkaufwand) werden in ~/.grok/config.toml zusammengeführt und behalten deine anderen Schlüssel und Kommentare. Die Anmeldung nutzt deinen XAI_API_KEY oder `grok login`. Andere Schlüssel bleiben unter Erweitert bearbeitbar.",
+      "permissionModeLabel": "Berechtigungsmodus",
+      "permissionAsk": "Jedes Mal fragen",
+      "permissionAlwaysApprove": "Immer zulassen",
+      "reasoningEffortLabel": "Denkaufwand",
+      "effortLow": "Niedrig (schneller)",
+      "effortMedium": "Mittel (ausgewogen)",
+      "effortHigh": "Hoch",
+      "effortXhigh": "Maximal",
+      "optionDefault": "Standard verwenden",
+      "authTitle": "Authentifizierung",
+      "authKeyConfigured": "XAI_API_KEY ist konfiguriert.",
+      "authKeyMissing": "Kein XAI_API_KEY festgelegt.",
+      "authLoginHint": "Lege hier XAI_API_KEY fest oder führe `grok login` für die Abo-Anmeldung aus (SuperGrok / X Premium+).",
+      "advancedToggle": "Erweitert (rohe config.toml)",
+      "configTomlNative": "config.toml (nativ)",
+      "configTomlHint": "Wird wortwörtlich als gesamte ~/.grok/config.toml gespeichert. Ungültiges TOML wird abgelehnt, sodass ein Tippfehler deine Datei nie abschneidet.",
+      "configTomlPlaceholder": "# Andere Schlüssel als die Steuerelemente oben, z. B.\n# [mcp_servers.*], [cli], [permission]-Regeln."
     },
     "codex": {
       "configDescription": "Unterstützt schnelle Konfiguration von API-URL, API-Key, Modellname und reasoning effort und synchronisiert mit `auth.json` / `config.toml`.",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "Speichern der Agent-Reihenfolge fehlgeschlagen",
       "saveAgentSwitchFailed": "Speichern des Agent-Schalters fehlgeschlagen",
       "saveEnvFailed": "Speichern der Umgebungsvariablen fehlgeschlagen",
+      "grokSaved": "Grok-Konfiguration gespeichert",
+      "saveGrokNativeFailed": "Grok-Nativkonfiguration konnte nicht gespeichert werden",
+      "saveGrokApiKeyFailed": "Einstellungen gespeichert, aber der API-Schlüssel konnte nicht gespeichert werden",
       "codexSaved": "Codex-Konfiguration gespeichert",
       "saveCodexNativeFailed": "Speichern der nativen Codex-Konfiguration fehlgeschlagen",
       "geminiSaved": "Gemini-Konfiguration gespeichert",
@@ -1393,6 +1424,7 @@
       "addToChat": "Zum Chat hinzufügen",
       "addSelectionToChatDone": "{label} zur Unterhaltung hinzugefügt",
       "addFileToChat": "Datei zum Chat hinzufügen",
+      "toggleWordWrap": "Zeilenumbruch umschalten",
       "addFileToChatDone": "{label} zur Unterhaltung hinzugefügt",
       "viewDiff": "Diff anzeigen",
       "openFile": "Datei öffnen",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "Verfolgte Änderungen einklappen",
       "expandUntracked": "Nicht verfolgte Dateien ausklappen",
       "collapseUntracked": "Nicht verfolgte Dateien einklappen",
+      "showRemainingItems": "{count} weitere Einträge anzeigen",
       "actions": {
         "commitCode": "Code committen",
         "rollback": "Zurücksetzen",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "{agent} hat das Token-Limit für diese Runde erreicht.",
           "turnFailedMaxTurnRequests": "{agent} hat die maximale Anzahl zulässiger Anfragen für diese Runde erreicht.",
           "turnFailedUnknown": "{agent} hat die Runde mit einem unbekannten Stoppgrund beendet.",
+          "grokModelSwitchIncompatibleAgent": "{agent} kann in einer bestehenden Unterhaltung nicht zu diesem Modell wechseln. Starte eine neue Sitzung, um es zu verwenden.",
           "turnFailedEmpty": "{agent} hat die Runde ohne jegliche Antwort beendet. Bitte prüfen Sie die Agent-Konfiguration."
         },
         "unableReadAgentConfig": "Agenten-Konfiguration kann nicht gelesen werden: {message}",
@@ -2031,7 +2065,7 @@
         "quickMessages": "Schnellnachrichten",
         "quickMessagesEmpty": "Noch keine Schnellnachrichten",
         "quickMessagesLoading": "Wird geladen...",
-        "paste": "Einfügen",
+        "pasteAsPlainText": "Als reinen Text einfügen",
         "cut": "Ausschneiden",
         "copy": "Kopieren",
         "selectAll": "Alles auswählen",
@@ -2139,11 +2173,39 @@
             "morph3d": "Erstelle eine 3D-Morph-Präsentation mit GLB-Modellen und Kamerafahrten:\n\n[beschreibe hier dein Thema und das visuelle 3D-Konzept]",
             "academic": "Schreibe eine wissenschaftliche Arbeit in Word mit den folgenden Anforderungen:\n\n[beschreibe hier dein Forschungsthema, die Methodik und die wichtigsten Ergebnisse]",
             "financial": "Erstelle ein Finanzmodell in Excel mit den folgenden Anforderungen:\n\n[beschreibe hier deine Finanzabschlüsse, Prognosen und Analysen]",
-            "dashboard": "Erstelle ein Daten-Dashboard in Excel mit den folgenden Anforderungen:\n\n[beschreibe hier deine Datenquelle, KPIs und Diagramme]"
+            "dashboard": "Erstelle ein Daten-Dashboard in Excel mit den folgenden Anforderungen:\n\n[beschreibe hier deine Datenquelle, KPIs und Diagramme]",
+            "scientific-brainstorming": "Hilf mir beim Brainstorming von Forschungsrichtungen — erkunde interdisziplinäre Verbindungen, hinterfrage Annahmen und finde vielversprechende Lücken. Mein Themenbereich: ",
+            "hypothesis-generation": "Hilf mir, diese Beobachtungen in prüfbare Hypothesen zu überführen — mit klaren Vorhersagen, plausiblen Mechanismen und Experimenten. Meine Beobachtungen: ",
+            "experimental-design": "Hilf mir, vor der Datenerhebung ein rigoroses Experiment zu planen — Design, Randomisierung, Kontrollen und wie man Confounding vermeidet. Was ich untersuchen möchte: ",
+            "statistical-power": "Hilf mir, die benötigte Stichprobengröße zu bestimmen — führe mich durch eine Poweranalyse (Effektstärke, Alpha, Power) für mein Design. Details: ",
+            "statistical-analysis": "Hilf mir, diese Daten korrekt zu analysieren — den richtigen Test wählen, Annahmen prüfen, Effektstärken berichten und alles aufschreiben. Meine Daten und Frage: ",
+            "exploratory-data-analysis": "Führe eine explorative Analyse meiner Datendatei durch — fasse Struktur, Qualität und auffällige Muster zusammen und schlage nächste Schritte vor. Die Datei ist: ",
+            "scientific-visualization": "Hilf mir, eine publikationsreife Abbildung zu erstellen — klares Layout, ehrliche Fehlerbalken, eine farbenblindensichere Palette und Journal-Formatierung. Was ich zeigen möchte: ",
+            "scientific-critical-thinking": "Hilf mir, diese Studie oder Behauptung kritisch zu bewerten — beurteile die Evidenzqualität, erkenne Verzerrungen und Confounder und wäge die Schlussfolgerungen ab. Hier ist sie: ",
+            "paper-lookup": "Hilf mir, relevante Artikel und Open-Access-Volltexte in wissenschaftlichen Datenbanken zu finden, mit wiederverwendbaren Zitaten. Ich suche: "
           },
+          "paper-lookup": "Publikationssuche",
+          "paper-lookupDesc": "10 wissenschaftliche APIs (PubMed, arXiv, OpenAlex, Crossref…) nach Artikeln, Zitationen und Open-Access-Volltext durchsuchen.",
+          "scientific-critical-thinking": "Kritisches Denken",
+          "scientific-critical-thinkingDesc": "Wissenschaftliche Aussagen und Evidenzqualität beurteilen — Verzerrungen und Confounder erkennen, GRADE anwenden.",
+          "scientific-visualization": "Wissenschaftliche Visualisierung",
+          "scientific-visualizationDesc": "Publikationsreife Abbildungen — Mehrfeld-Layouts, Signifikanz-Annotationen und journalspezifische Formate.",
+          "exploratory-data-analysis": "Explorative Datenanalyse",
+          "exploratory-data-analysisDesc": "Automatisierte Exploration wissenschaftlicher Datendateien in über 200 Formaten mit Qualitätsmetriken und Berichten.",
+          "statistical-analysis": "Statistische Analyse",
+          "statistical-analysisDesc": "Geführte statistische Analyse — Testauswahl, Annahmenprüfung, Effektstärken und Bericht im APA-Stil.",
+          "statistical-power": "Teststärke",
+          "statistical-powerDesc": "Stichprobengröße und Teststärke — benötigte Fallzahl, minimal nachweisbare Effekte und Powerkurven.",
+          "experimental-design": "Versuchsplanung",
+          "experimental-designDesc": "Rigorose Studien vor der Datenerhebung planen — Randomisierung, Blockbildung, Kontrollen und faktorielle/DOE-Designs.",
+          "hypothesis-generation": "Hypothesengenerierung",
+          "hypothesis-generationDesc": "Beobachtungen in prüfbare Hypothesen mit Vorhersagen, Mechanismen und Experimenten überführen.",
+          "scientific-brainstorming": "Wissenschaftliches Brainstorming",
+          "scientific-brainstormingDesc": "Offene Forschungsideen — interdisziplinäre Verbindungen erkunden, Annahmen hinterfragen, Forschungslücken finden.",
           "tabs": {
             "office": "Büroarbeit",
-            "coding": "Code-Entwicklung"
+            "coding": "Code-Entwicklung",
+            "research": "Forschung"
           },
           "coding": {
             "brainstormingDesc": "Absicht & Anforderungen vor dem Bauen klären",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value} Std",
         "elapsedMinutes": "{value} Min",
         "elapsedSeconds": "{value} Sek",
-        "toolUseCount": "{count} Tool {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count, plural, one {# Tool-Aufruf} other {# Tool-Aufrufe}}"
       },
       "tool": {
         "parameters": "Parameter",
@@ -2525,6 +2587,16 @@
         "opWait": "Sub-Agent-Ergebnis wird abgerufen",
         "opClose": "Sub-Agent wird geschlossen",
         "opResume": "Sub-Agent wird fortgesetzt"
+      },
+      "backgroundTasks": {
+        "running": "{count, plural, one {# Hintergrundaufgabe läuft} other {# Hintergrundaufgaben laufen}}",
+        "settling": "Hintergrundergebnisse werden synchronisiert…",
+        "settledFallback": "Hintergrundaufgabe beendet ({status})",
+        "cardRunning": "Läuft im Hintergrund",
+        "cardLaunchedPending": "Hintergrundaufgabe gestartet",
+        "cardCompleted": "Hintergrundaufgabe abgeschlossen",
+        "cardFinishedWithStatus": "Hintergrundaufgabe beendet ({status})",
+        "cardResultPending": "Ergebnis steht noch aus"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "Block {index}",
       "loadingHunk": "Hunk wird geladen...",
-      "noDiffData": "Keine Diff-Daten"
+      "noDiffData": "Keine Diff-Daten",
+      "showRemainingLines": "{count} weitere Zeilen anzeigen"
     },
     "conversationContextBar": {
       "folderTitle": "Arbeitsordner",
@@ -2848,7 +2921,7 @@
     "agentTypeRequired": "Agententyp ist erforderlich.",
     "agentTypeImmutableHint": "Der Agententyp kann nach der Erstellung nicht mehr geändert werden.",
     "model": "Modell",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "Hauptmodell",
     "claudeReasoningModel": "Reasoning-Modell (Thinking)",
@@ -2969,6 +3042,40 @@
       "disabled": "Experte für diesen Agent deaktiviert",
       "enableFailed": "Aktivieren des Experten fehlgeschlagen",
       "disableFailed": "Deaktivieren des Experten fehlgeschlagen",
+      "openFolderFailed": "Ordner konnte nicht geöffnet werden"
+    }
+  },
+  "ScienceSettings": {
+    "title": "Wissenschaftliche Skills",
+    "description": "Aktiviere kuratierte wissenschaftliche Skills für deine KI-Coding-Agents — Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung und Literatursuche. codeg verwaltet eine zentrale Kopie und verlinkt jeden Skill in die von dir gewählten Agents.",
+    "loading": "Wissenschaftliche Skills werden geladen…",
+    "emptySkills": "Keine wissenschaftlichen Skills verfügbar. Prüfe die Anwendungsprotokolle.",
+    "searchPlaceholder": "Wissenschaftliche Skills nach Name, ID oder Beschreibung suchen",
+    "categories": {
+      "ideation": "Ideenfindung",
+      "design": "Studiendesign",
+      "analysis": "Analyse",
+      "visualization": "Visualisierung",
+      "evaluation": "Bewertung",
+      "literature": "Literatur"
+    },
+    "states": {
+      "not_linked": "Nicht aktiviert",
+      "linked_to_codeg": "Aktiviert",
+      "linked_elsewhere": "Blockiert — ein anderer Link existiert",
+      "blocked_by_real_directory": "Blockiert — ein benutzerdefinierter Skill belegt diesen Namen",
+      "broken": "Defekter Link"
+    },
+    "badges": {
+      "userModified": "Vom Benutzer geändert",
+      "needsKey": "API-Schlüssel nötig",
+      "needsSetup": "Ggf. Einrichtung nötig"
+    },
+    "actions": {
+      "openCentralDir": "Zentralen Ordner öffnen",
+      "refresh": "Aktualisieren"
+    },
+    "toasts": {
       "openFolderFailed": "Ordner konnte nicht geöffnet werden"
     }
   },

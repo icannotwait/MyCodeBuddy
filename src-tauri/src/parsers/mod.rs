@@ -3,10 +3,12 @@ pub mod cline;
 pub mod codebuddy;
 pub mod codex;
 pub mod gemini;
+pub mod grok;
 pub mod hermes;
 pub mod kimi_code;
 pub mod opencode;
 pub mod pi;
+mod summary_cache;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -113,6 +115,17 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             root: kimi_code::resolve_kimi_code_home_dir(),
             is_file: false,
             include_top: Some(&["sessions", "session_index.jsonl"]),
+        },
+        ExternalSource {
+            // Grok keeps a directory-per-session transcript store under
+            // `~/.grok/sessions/<encoded-cwd>/<uuid>/` (relocatable via
+            // `GROK_HOME`). `resolve_grok_home_dir()` points at `~/.grok`, so
+            // scope the archive to the `sessions/` subtree — never the sibling
+            // `auth.json` / `config.toml` / `bin/` under the same home.
+            agent: "grok",
+            root: grok::resolve_grok_home_dir().join("sessions"),
+            is_file: false,
+            include_top: None,
         },
         ExternalSource {
             // pi writes one JSONL per session under `~/.pi/agent/sessions/`

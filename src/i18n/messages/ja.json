@@ -49,6 +49,7 @@
       "web_service": "Webサービス",
       "model_providers": "モデルプロバイダー",
       "experts": "エキスパート",
+      "science": "科学研究",
       "office_tools": "Officeツール",
       "quick_messages": "クイックメッセージ",
       "logs": "実行ログ"
@@ -107,8 +108,14 @@
       "fontSize": "フォントサイズ",
       "ligatures": "合字を有効にする",
       "ligaturesUnavailable": "このフォントには合字がありません",
+      "wordWrap": "折り返しを有効にする",
       "terminalLigaturesHint": "ターミナルの合字は内蔵のコーディングフォントにのみ適用されます。",
       "preview": "プレビュー"
+    },
+    "welcomePanel": {
+      "sectionTitle": "モード選択エリア",
+      "sectionDescription": "新しい会話ページで入力欄の上に表示される「コード開発 / 日常業務」のショートカットカードです。",
+      "showQuickActions": "新しい会話ページに表示する"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "アンインストール中...",
       "saveEnvVars": "環境変数を保存",
       "saving": "保存中...",
+      "saveGrokConfig": "Grok 設定を保存",
       "saveCodexConfig": "Codex設定を保存",
       "saveGeminiConfig": "Gemini設定を保存",
       "saveOpenCodeConfig": "OpenCode設定を保存",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "事前チェック項目: {count}",
       "notRun": "チェックはまだ実行されていません。"
+    },
+    "grok": {
+      "configDescription": "ここで Grok を設定します。下のコントロール（権限モード・推論レベル）は ~/.grok/config.toml にマージされ、他のキーとコメントは保持されます。サインインは XAI_API_KEY または `grok login` を使用します。その他のキーは「詳細」で編集できます。",
+      "permissionModeLabel": "権限モード",
+      "permissionAsk": "毎回確認",
+      "permissionAlwaysApprove": "常に許可",
+      "reasoningEffortLabel": "推論レベル",
+      "effortLow": "低（高速）",
+      "effortMedium": "中（バランス）",
+      "effortHigh": "高",
+      "effortXhigh": "最大",
+      "optionDefault": "デフォルトを使用",
+      "authTitle": "認証",
+      "authKeyConfigured": "XAI_API_KEY が設定されています。",
+      "authKeyMissing": "XAI_API_KEY が未設定です。",
+      "authLoginHint": "ここで XAI_API_KEY を設定するか、`grok login` でサブスクリプションサインイン（SuperGrok / X Premium+）を行います。",
+      "advancedToggle": "詳細（生の config.toml）",
+      "configTomlNative": "config.toml（ネイティブ）",
+      "configTomlHint": "~/.grok/config.toml 全体としてそのまま書き込まれます。無効な TOML は拒否され、タイプミスでファイルが切り詰められることはありません。",
+      "configTomlPlaceholder": "# 上のコントロール以外のキー。例:\n# [mcp_servers.*]、[cli]、[permission] ルール。"
     },
     "codex": {
       "configDescription": "API URL、API Key、モデル名、reasoning effort を素早く設定でき、`auth.json` / `config.toml` と同期します。",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "Agent の並び順の保存に失敗しました",
       "saveAgentSwitchFailed": "Agent の有効スイッチ保存に失敗しました",
       "saveEnvFailed": "環境変数の保存に失敗しました",
+      "grokSaved": "Grok 設定を保存しました",
+      "saveGrokNativeFailed": "Grok のネイティブ設定の保存に失敗しました",
+      "saveGrokApiKeyFailed": "設定は保存されましたが、API キーを保存できませんでした",
       "codexSaved": "Codex設定を保存しました",
       "saveCodexNativeFailed": "Codexネイティブ設定の保存に失敗しました",
       "geminiSaved": "Gemini設定を保存しました",
@@ -1393,6 +1424,7 @@
       "addToChat": "チャットに追加",
       "addSelectionToChatDone": "{label} を会話に追加しました",
       "addFileToChat": "ファイルをチャットに追加",
+      "toggleWordWrap": "折り返しの切り替え",
       "addFileToChatDone": "{label} を会話に追加しました",
       "viewDiff": "差分を見る",
       "openFile": "ファイルを開く",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "追跡中の変更を折りたたむ",
       "expandUntracked": "未追跡ファイルを展開",
       "collapseUntracked": "未追跡ファイルを折りたたむ",
+      "showRemainingItems": "残り {count} 件を表示",
       "actions": {
         "commitCode": "コードをコミット",
         "rollback": "ロールバック",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "{agent} がこのターンの最大トークン数に達しました。",
           "turnFailedMaxTurnRequests": "{agent} がこのターンで許可された最大リクエスト数に達しました。",
           "turnFailedUnknown": "{agent} が不明な停止理由でターンを終了しました。",
+          "grokModelSwitchIncompatibleAgent": "{agent} は既存の会話ではこのモデルに切り替えられません。新しいセッションを開始して使用してください。",
           "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。"
         },
         "unableReadAgentConfig": "エージェント設定を読み取れません: {message}",
@@ -2031,7 +2065,7 @@
         "quickMessages": "クイックメッセージ",
         "quickMessagesEmpty": "クイックメッセージはありません",
         "quickMessagesLoading": "読み込み中...",
-        "paste": "貼り付け",
+        "pasteAsPlainText": "プレーンテキストとして貼り付け",
         "cut": "切り取り",
         "copy": "コピー",
         "selectAll": "すべて選択",
@@ -2139,11 +2173,39 @@
             "morph3d": "GLB モデルとカメラワーク付きの 3D Morph プレゼンを作成してください：\n\n[テーマと 3D ビジュアルの構想をここに記述]",
             "academic": "次の要件で Word の学術論文を執筆してください：\n\n[研究テーマ・手法・主要な発見をここに記述]",
             "financial": "次の要件で Excel の財務モデルを作成してください：\n\n[財務諸表・予測・分析をここに記述]",
-            "dashboard": "次の要件で Excel のデータダッシュボードを作成してください：\n\n[データソース・KPI・グラフをここに記述]"
+            "dashboard": "次の要件で Excel のデータダッシュボードを作成してください：\n\n[データソース・KPI・グラフをここに記述]",
+            "scientific-brainstorming": "研究の方向性をブレインストーミングしてください。分野横断のつながりを探り、前提を問い直し、有望な空白を見つけます。検討している領域：",
+            "hypothesis-generation": "これらの観察を検証可能な仮説に変換してください。明確な予測、妥当なメカニズム、検証実験を示します。私の観察：",
+            "experimental-design": "データ収集前に厳密な実験を設計してください。デザイン、無作為化、対照、交絡の回避方法を含めます。研究したいこと：",
+            "statistical-power": "必要なサンプルサイズを求めてください。私のデザインについて検出力分析（効果量・有意水準・検出力）を進めます。詳細：",
+            "statistical-analysis": "このデータを適切に分析してください。適切な検定の選択、前提の確認、効果量の報告、結果の記述を行います。データと問い：",
+            "exploratory-data-analysis": "私のデータファイルを探索的に分析してください。構造・品質・注目すべきパターンを要約し、次のステップを提案します。ファイル：",
+            "scientific-visualization": "出版品質の図を作成してください。明確なレイアウト、誠実なエラーバー、色覚に配慮した配色、ジャーナル書式を用います。示したい内容：",
+            "scientific-critical-thinking": "この研究や主張を批判的に評価してください。エビデンスの質を評価し、バイアスや交絡を見抜き、結論を吟味します。対象：",
+            "paper-lookup": "学術データベースから関連論文とオープンアクセス全文を探し、再利用できる引用も示してください。探しているもの："
           },
+          "paper-lookup": "論文検索",
+          "paper-lookupDesc": "10 の学術 API（PubMed、arXiv、OpenAlex、Crossref…）で論文・引用・オープンアクセス全文を検索。",
+          "scientific-critical-thinking": "批判的思考",
+          "scientific-critical-thinkingDesc": "科学的主張とエビデンスの質を評価。バイアスや交絡を見抜き、GRADE やバイアスリスク枠組みを適用。",
+          "scientific-visualization": "科学的可視化",
+          "scientific-visualizationDesc": "出版品質の図。マルチパネル配置、有意差注釈、ジャーナル固有の書式に対応。",
+          "exploratory-data-analysis": "探索的データ解析",
+          "exploratory-data-analysisDesc": "200 以上の形式の科学データファイルを自動探索し、品質指標とレポートを生成。",
+          "statistical-analysis": "統計解析",
+          "statistical-analysisDesc": "ガイド付き統計解析。検定の選択、前提確認、効果量、APA 形式の報告に対応。",
+          "statistical-power": "統計的検出力",
+          "statistical-powerDesc": "サンプルサイズと検出力の分析。必要な被験者数、最小検出可能効果、検出力曲線を算出。",
+          "experimental-design": "実験計画",
+          "experimental-designDesc": "データ収集前に厳密な研究を設計。無作為化・ブロック化・対照・要因/DOE 配置に対応。",
+          "hypothesis-generation": "仮説生成",
+          "hypothesis-generationDesc": "観察を検証可能な仮説に変換し、予測・メカニズム・検証実験を提示します。",
+          "scientific-brainstorming": "科学的ブレインストーミング",
+          "scientific-brainstormingDesc": "自由な研究アイデア出し。分野横断のつながりを探り、前提を問い直し、研究の空白を見つけます。",
           "tabs": {
             "office": "日常業務",
-            "coding": "コード開発"
+            "coding": "コード開発",
+            "research": "科学研究"
           },
           "coding": {
             "brainstormingDesc": "着手前に意図と要件を整理",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
-        "toolUseCount": "{count} 個のツール {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} 回のツール使用"
       },
       "tool": {
         "parameters": "パラメーター",
@@ -2525,6 +2587,16 @@
         "opWait": "サブエージェントの結果を取得中",
         "opClose": "サブエージェントを終了中",
         "opResume": "サブエージェントを再開中"
+      },
+      "backgroundTasks": {
+        "running": "{count} 件のバックグラウンドタスクを実行中",
+        "settling": "バックグラウンド結果を同期中…",
+        "settledFallback": "バックグラウンドタスクが終了しました（{status}）",
+        "cardRunning": "バックグラウンドで実行中",
+        "cardLaunchedPending": "バックグラウンドタスクを開始しました",
+        "cardCompleted": "バックグラウンドタスクが完了しました",
+        "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
+        "cardResultPending": "結果はまだ返っていません"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "ハンク {index}",
       "loadingHunk": "Hunk を読み込み中...",
-      "noDiffData": "Diff データがありません"
+      "noDiffData": "Diff データがありません",
+      "showRemainingLines": "残り {count} 行を表示"
     },
     "conversationContextBar": {
       "folderTitle": "作業フォルダ",
@@ -2848,7 +2921,7 @@
     "agentTypeRequired": "エージェントタイプを選択してください。",
     "agentTypeImmutableHint": "エージェントタイプは作成後に変更できません。",
     "model": "モデル",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "メインモデル",
     "claudeReasoningModel": "推論モデル（思考）",
@@ -2969,6 +3042,40 @@
       "disabled": "このエージェントでエキスパートを無効化しました",
       "enableFailed": "エキスパートの有効化に失敗しました",
       "disableFailed": "エキスパートの無効化に失敗しました",
+      "openFolderFailed": "フォルダを開けませんでした"
+    }
+  },
+  "ScienceSettings": {
+    "title": "科学研究スキル",
+    "description": "AI コーディングエージェント向けに厳選した科学研究スキル（仮説生成・実験計画・統計・可視化・批判的評価・文献検索）を有効化します。codeg が中央コピーを管理し、選んだエージェントに各スキルをリンクします。",
+    "loading": "科学研究スキルを読み込み中…",
+    "emptySkills": "利用可能な科学研究スキルがありません。アプリのログを確認してください。",
+    "searchPlaceholder": "名前・ID・説明で科学研究スキルを検索",
+    "categories": {
+      "ideation": "アイデア出し",
+      "design": "研究デザイン",
+      "analysis": "分析",
+      "visualization": "可視化",
+      "evaluation": "評価",
+      "literature": "文献"
+    },
+    "states": {
+      "not_linked": "未有効",
+      "linked_to_codeg": "有効",
+      "linked_elsewhere": "ブロック — 別のリンクが存在",
+      "blocked_by_real_directory": "ブロック — カスタムスキルがこの名前を占有",
+      "broken": "壊れたリンク"
+    },
+    "badges": {
+      "userModified": "ユーザーにより変更",
+      "needsKey": "APIキーが必要",
+      "needsSetup": "環境構築が必要な場合あり"
+    },
+    "actions": {
+      "openCentralDir": "中央フォルダを開く",
+      "refresh": "更新"
+    },
+    "toasts": {
       "openFolderFailed": "フォルダを開けませんでした"
     }
   },

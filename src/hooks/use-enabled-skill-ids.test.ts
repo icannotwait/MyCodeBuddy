@@ -3,13 +3,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { AcpAgentInfo, ExpertInstallStatus } from "@/lib/types"
 
-// Both status scans are mocked so we can count how many times a window focus
-// triggers them across multiple mounted consumers. `acpListAgents` is pulled in
-// transitively via `useAcpAgents` (the hook reads each agent's env_json to spot
-// a custom-dir pi); it returns no agents here, so detection stays inert.
+// All three status scans are mocked so we can count how many times a window
+// focus triggers them across multiple mounted consumers. `acpListAgents` is
+// pulled in transitively via `useAcpAgents` (the hook reads each agent's
+// env_json to spot a custom-dir pi); it returns no agents here, so detection
+// stays inert.
 vi.mock("@/lib/api", () => ({
   expertsListAllInstallStatuses: vi.fn(),
   officecliSkillListAllInstallStatuses: vi.fn(),
+  scienceListAllInstallStatuses: vi.fn(),
   acpListAgents: vi.fn().mockResolvedValue([]),
 }))
 
@@ -30,12 +32,13 @@ async function setup() {
   const api = await import("@/lib/api")
   vi.mocked(api.expertsListAllInstallStatuses).mockResolvedValue([])
   vi.mocked(api.officecliSkillListAllInstallStatuses).mockResolvedValue([])
+  vi.mocked(api.scienceListAllInstallStatuses).mockResolvedValue([])
   const hook = await import("./use-enabled-skill-ids")
   return { api, hook }
 }
 
 describe("useEnabledSkillIds — focus refresh coalescing", () => {
-  it("runs a single (experts + office) refresh per focus regardless of how many consumers are mounted", async () => {
+  it("runs a single (experts + office + science) refresh per focus regardless of how many consumers are mounted", async () => {
     const { api, hook } = await setup()
     // Two mounted consumers — e.g. two tiled conversation composers.
     const a = renderHook(() => hook.useEnabledSkillIds("claude_code"))
@@ -47,6 +50,7 @@ describe("useEnabledSkillIds — focus refresh coalescing", () => {
 
     vi.mocked(api.expertsListAllInstallStatuses).mockClear()
     vi.mocked(api.officecliSkillListAllInstallStatuses).mockClear()
+    vi.mocked(api.scienceListAllInstallStatuses).mockClear()
 
     // A window focus must coalesce to ONE refresh — not one scan per instance
     // (the pre-fix behavior cleared `inflight` per listener, defeating dedup).
@@ -58,6 +62,7 @@ describe("useEnabledSkillIds — focus refresh coalescing", () => {
     await waitFor(() => {
       expect(api.expertsListAllInstallStatuses).toHaveBeenCalledTimes(1)
       expect(api.officecliSkillListAllInstallStatuses).toHaveBeenCalledTimes(1)
+      expect(api.scienceListAllInstallStatuses).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -71,6 +76,7 @@ describe("useEnabledSkillIds — focus refresh coalescing", () => {
     b.unmount()
     vi.mocked(api.expertsListAllInstallStatuses).mockClear()
     vi.mocked(api.officecliSkillListAllInstallStatuses).mockClear()
+    vi.mocked(api.scienceListAllInstallStatuses).mockClear()
 
     await act(async () => {
       window.dispatchEvent(new Event("focus"))
@@ -79,6 +85,7 @@ describe("useEnabledSkillIds — focus refresh coalescing", () => {
 
     expect(api.expertsListAllInstallStatuses).not.toHaveBeenCalled()
     expect(api.officecliSkillListAllInstallStatuses).not.toHaveBeenCalled()
+    expect(api.scienceListAllInstallStatuses).not.toHaveBeenCalled()
   })
 })
 

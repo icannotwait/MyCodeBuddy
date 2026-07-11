@@ -130,6 +130,7 @@ import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-
 import { useAgentSkills } from "@/hooks/use-agent-skills"
 import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
 import { useEnabledSkillIds } from "@/hooks/use-enabled-skill-ids"
+import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import { getExpertIcon, pickLocalized } from "@/lib/expert-presentation"
 import { OFFICE_ACTIONS, type OfficeAction } from "@/lib/office-actions"
 import {
@@ -141,7 +142,11 @@ import {
   RichComposer,
   type RichComposerHandle,
 } from "@/components/chat/composer/rich-composer"
-import { docToPromptBlocks } from "@/components/chat/composer/to-prompt-blocks"
+import {
+  composerLeafText,
+  docToPromptBlocks,
+  serializeDocToDisplayText,
+} from "@/components/chat/composer/to-prompt-blocks"
 import {
   buildEmbeddedReferenceUri,
   isEmbeddedReferenceUri,
@@ -157,7 +162,6 @@ import {
   skillToReference,
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
-import { referenceToMarkdown } from "@/components/chat/composer/reference-text"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
@@ -567,6 +571,9 @@ export function MessageInput({
   // pick closes it explicitly — matching the prior cog menu, which also closed
   // on every selection.
   const [collapsedSelectorsOpen, setCollapsedSelectorsOpen] = useState(false)
+  // Keep the collapsed settings popover open while dragging the (virtualized)
+  // model list's native scrollbar — see `useScrollbarSafeDismiss`.
+  const collapsedSelectorsGuard = useScrollbarSafeDismiss()
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -769,14 +776,14 @@ export function MessageInput({
           // Full fidelity: restore inline badges + images from the blocks.
           hydrateFromBlocks(editor, editingDraftBlocks)
         } else if (editingDraftText != null) {
-          ed.setMarkdown(editingDraftText)
+          ed.setText(editingDraftText)
         }
       } else if (effectiveDraftStorageKey) {
         const loaded = loadMessageInputDraftV2(effectiveDraftStorageKey)
         if (loaded?.kind === "doc") {
           ed.setDoc(loaded.doc)
         } else if (loaded?.kind === "legacyMarkdown") {
-          ed.setMarkdown(loaded.markdown)
+          ed.setText(loaded.markdown)
         }
       }
       const editor = ed.getEditor()
@@ -811,7 +818,7 @@ export function MessageInput({
         if (editingDraftBlocks && editingDraftBlocks.length > 0 && editor) {
           hydrateFromBlocks(editor, editingDraftBlocks)
         } else if (editingDraftText != null) {
-          editorRef.current?.setMarkdown(editingDraftText)
+          editorRef.current?.setText(editingDraftText)
         }
         setComposerEmpty(editor ? isComposerEmpty(editor) : true)
         editorRef.current?.focus()
@@ -842,7 +849,7 @@ export function MessageInput({
     const raf = requestAnimationFrame(() => {
       const handle = editorRef.current
       if (handle) {
-        handle.setMarkdown(payload.text)
+        handle.setText(payload.text)
         // Prepend the skill as the leading invocation badge, so the sent
         // message opens with `${prefix}${id}`.
         if (payload.skill) {
@@ -1861,7 +1868,7 @@ export function MessageInput({
         const editor = handle?.getEditor()
         if (!handle || !editor) return
         if (template && isComposerEmpty(editor)) {
-          handle.setMarkdown(template)
+          handle.setText(template)
         }
         applyExpertReference(editor, {
           refType: "skill",
@@ -1977,23 +1984,18 @@ export function MessageInput({
 
   const handleQuickMessageSelect = useCallback((message: QuickMessage) => {
     if (!message.content) return
-    editorRef.current?.insertMarkdownAtCursor(message.content)
+    editorRef.current?.insertTextAtCursor(message.content)
   }, [])
 
   // Plain-text rendering of the editor's current selection, for the right-click
   // Cut/Copy. Read straight from ProseMirror state (stable while the radix menu
-  // holds DOM focus); inline reference badges serialize to their Markdown form
-  // and hard breaks to newlines so a copied selection reads back as text.
+  // holds DOM focus). Uses the same leaf mapping as send serialization
+  // (`composerLeafText`: reference badges → their inline token, hard breaks →
+  // newlines) so a copied selection reads back exactly like what is sent.
   const selectionPlainText = useCallback((editor: Editor): string => {
     const { from, to } = editor.state.selection
     if (from >= to) return ""
-    return editor.state.doc.textBetween(from, to, "\n", (leaf) => {
-      if (leaf.type.name === "reference") {
-        return referenceToMarkdown(leaf.attrs as ReferenceAttrs)
-      }
-      if (leaf.type.name === "hardBreak") return "\n"
-      return ""
-    })
+    return editor.state.doc.textBetween(from, to, "\n", composerLeafText)
   }, [])
 
   // The radix menu traps focus until it closes, so the clipboard write is
@@ -2051,11 +2053,15 @@ export function MessageInput({
     [loadQuickMessages]
   )
 
-  // The composer's custom right-click "Paste". The native context menu only
-  // appears over the contenteditable text, so the blank chrome had no paste
-  // affordance — this reproduces Ctrl+V everywhere in the box. Reading the
-  // clipboard happens inside the menu-click user gesture, so the async
-  // Clipboard API has the activation it needs.
+  // Plain-text ("paste without formatting") paste, shared by the custom
+  // right-click menu item and the Ctrl/⌘+Shift+V shortcut. Reads only the
+  // clipboard's `text/plain` and inserts it verbatim via `pasteText` (no
+  // Markdown/HTML re-parsing), so it strips any formatting a keyboard Ctrl+V
+  // would preserve. The native context menu only appears over the
+  // contenteditable text, so the blank chrome had no paste affordance — this
+  // reproduces the shortcut everywhere in the box. Reading the clipboard happens
+  // inside the menu-click / keydown user gesture, so the async Clipboard API has
+  // the activation it needs.
   const handleContextPaste = useCallback(async () => {
     if (disabled) return
     const editor = editorRef.current?.getEditor()
@@ -2099,6 +2105,20 @@ export function MessageInput({
       toast.error(t("pasteUnavailable"))
     }
   }, [disabled, appendFilesFromInput, t])
+
+  // Bridges the composer's Ctrl/⌘+Shift+V key to the plain-text paste above.
+  // Returns whether the shortcut was consumed: when disabled or when the async
+  // clipboard read is available we take over (return true) so the composer
+  // suppresses the browser's native rich paste; in a non-secure context (no
+  // `readText`) we return false so the browser's own "paste and match style"
+  // still works. The read runs inside this keydown gesture, so its activation
+  // is preserved.
+  const handlePlainPasteShortcut = useCallback((): boolean => {
+    if (disabled) return true
+    if (!clipboardReadSupported) return false
+    void handleContextPaste()
+    return true
+  }, [disabled, clipboardReadSupported, handleContextPaste])
 
   useEffect(() => {
     if (!attachmentTabId) return
@@ -2282,6 +2302,15 @@ export function MessageInput({
     // first-class ResourceLinks; agent/session/commit/skill stay inline text;
     // embedded badges are dropped here and re-added below from the payload map).
     const blocks: PromptInputBlock[] = editor ? docToPromptBlocks(editor) : []
+    // Display/queue text is the SAME serialization as the sent prose, differing
+    // only in that it KEEPS embedded-attachment badges inline (their real bytes
+    // are appended below as a separate block; the send text drops the synthetic
+    // uri, but the sender must still see the file they attached). For every other
+    // kind of content it is byte-identical to what is sent, so the queue chip /
+    // optimistic bubble can't diverge from the actual prose.
+    const displayProse = editor
+      ? serializeDocToDisplayText(editor.state.doc).trim()
+      : ""
     // Append the real bytes-bearing block for every embedded-attachment badge
     // still present in the document, looked up by its `codeg://embedded/…` uri.
     // Walking the live doc (rather than a swap pass over a stored draft) means a
@@ -2300,8 +2329,6 @@ export function MessageInput({
         return true
       })
     }
-    const displayMarkdown = editorRef.current?.getMarkdown().trim() ?? ""
-
     if (blocks.length === 0 && attachments.length === 0) return null
 
     // `attachments` holds only images now — files live inline as badges above.
@@ -2317,7 +2344,7 @@ export function MessageInput({
     }
 
     const displayText =
-      displayMarkdown ||
+      displayProse ||
       `Attached ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
     return { blocks, displayText }
   }, [attachments])
@@ -2917,6 +2944,7 @@ export function MessageInput({
                 onSubmit={handleSend}
                 onFocus={onFocus}
                 onPasteFiles={handlePasteFiles}
+                onPlainPaste={handlePlainPasteShortcut}
                 submitShortcut={shortcuts.send_message}
                 newlineShortcut={shortcuts.newline_in_message}
                 isExternalMenuOpen={slashMenuOpen && slashAutocompleteCount > 0}
@@ -3249,9 +3277,13 @@ export function MessageInput({
                           </Button>
                         </PopoverTrigger>
                         <PopoverContent
+                          ref={collapsedSelectorsGuard.contentRef}
                           side="top"
                           align="start"
                           aria-label={t("agentSettings")}
+                          onPointerDownOutside={
+                            collapsedSelectorsGuard.onPointerDownOutside
+                          }
                           className="w-[22rem] max-w-[calc(100vw-1rem)] p-1"
                         >
                           {showConfigLoading && (
@@ -3305,7 +3337,7 @@ export function MessageInput({
               }}
             >
               <ClipboardPaste className="size-4" />
-              {t("paste")}
+              {t("pasteAsPlainText")}
             </ContextMenuItem>
             <ContextMenuItem
               disabled={disabled}

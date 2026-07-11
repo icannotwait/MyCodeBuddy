@@ -46,8 +46,8 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { AgentIcon } from "@/components/agent-icon"
-import { useAppWorkspace } from "@/contexts/app-workspace-context"
-import { useTabContext } from "@/contexts/tab-context"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useTabActions } from "@/contexts/tab-context"
 import {
   deleteConversation,
   listAllConversations,
@@ -103,8 +103,28 @@ export function ConversationManageDialog({
   const tCommon = useTranslations("Folder.common")
   const tStatus = useTranslations("Folder.statusLabels")
 
-  const { refreshConversations } = useAppWorkspace()
-  const { closeConversationTab } = useTabContext()
+  const refreshConversations = useAppWorkspaceStore(
+    (s) => s.refreshConversations
+  )
+  const allFolders = useAppWorkspaceStore((s) => s.allFolders)
+  const { closeConversationTab } = useTabActions()
+
+  // The dialog is always opened on a top-level repo folder (worktree children
+  // get no header/menu entry of their own). Worktree conversations, however,
+  // keep `folder_id = the worktree child folder` — the sidebar merges them into
+  // the parent group as a display-only redirect and never rewrites `folder_id`.
+  // So query the parent id PLUS every worktree child folder id, mirroring that
+  // merge; otherwise `list_all`'s exact `folder_id IN (...)` filter drops them.
+  // `allFolders` includes open and closed (non-deleted) folders, and a
+  // worktree's `parent_id` is flattened to the root, so one level of filtering
+  // is complete.
+  const queryFolderIds = useMemo(() => {
+    const ids = [folderId]
+    for (const f of allFolders) {
+      if (f.parent_id === folderId) ids.push(f.id)
+    }
+    return ids
+  }, [allFolders, folderId])
 
   const [search, setSearch] = useState("")
   const [agentFilter, setAgentFilter] = useState<AgentType | "all">("all")
@@ -138,7 +158,7 @@ export function ConversationManageDialog({
       setLoading(true)
       try {
         const data = await listAllConversations({
-          folder_ids: [folderId],
+          folder_ids: queryFolderIds,
           search: search.trim() || null,
           agent_type: agentFilter === "all" ? null : agentFilter,
           status: statusFilter === "all" ? null : statusFilter,
@@ -155,7 +175,7 @@ export function ConversationManageDialog({
       }
     }, 300)
     return () => clearTimeout(timer)
-  }, [open, folderId, search, agentFilter, statusFilter, refreshKey])
+  }, [open, queryFolderIds, search, agentFilter, statusFilter, refreshKey])
 
   const toggleOne = useCallback((id: number) => {
     setSelected((prev) => {

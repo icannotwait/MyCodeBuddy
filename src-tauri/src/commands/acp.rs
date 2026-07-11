@@ -15,7 +15,8 @@ use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
 use crate::acp::types::{
     AcpAgentInfo, AgentSkillContent, AgentSkillItem, AgentSkillLayout, AgentSkillLocation,
-    AgentSkillScope, AgentSkillsListResult, ConfigStaleKind, ConnectionStatus,
+    AgentSkillScope, AgentSkillsListResult, ConfigStaleKind, ConnectionStatus, GrokSettings,
+    GrokStructuredConfig,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
@@ -1664,6 +1665,135 @@ fn persist_codex_native_config_files(
             .map_err(|e| AcpError::protocol(format!("write codex auth.json failed: {e}")))?;
     }
 
+    Ok(())
+}
+
+/// Read the raw `~/.grok/config.toml` for the Grok settings panel's config-file
+/// editor. `GROK_HOME` is honored via `resolve_grok_home_dir`. Returns `None`
+/// when the file is absent (Grok writes it lazily on first `grok login`/run).
+fn load_grok_config_toml_raw() -> Option<String> {
+    fs::read_to_string(crate::parsers::grok::resolve_grok_home_dir().join("config.toml")).ok()
+}
+
+/// Read `~/.grok/config.toml` for use as the base of a structured merge. A
+/// missing file yields an empty base (the merge then creates it), but any OTHER
+/// read error is propagated rather than collapsed to `""` — collapsing would let
+/// a transient failure clobber the user's real config with a 2-key file.
+fn read_grok_config_or_empty() -> Result<String, AcpError> {
+    let path = crate::parsers::grok::resolve_grok_home_dir().join("config.toml");
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(AcpError::protocol(format!(
+            "read grok config.toml failed: {e}"
+        ))),
+    }
+}
+
+/// Persist the Grok settings panel's edited `~/.grok/config.toml` back to disk.
+/// Validates it parses as TOML first so a malformed edit never truncates the
+/// user's real config. Unlike Codex there is no companion auth.json — Grok auth
+/// lives in `~/.grok/auth.json` written by `grok login`, untouched here.
+fn persist_grok_native_config_files(grok_config_toml: Option<&str>) -> Result<(), AcpError> {
+    if let Some(raw_toml) = grok_config_toml {
+        toml::from_str::<toml::Table>(raw_toml)
+            .map_err(|e| AcpError::protocol(format!("invalid grok config.toml: {e}")))?;
+        let path = crate::parsers::grok::resolve_grok_home_dir().join("config.toml");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| AcpError::protocol(format!("create grok directory failed: {e}")))?;
+        }
+        fs::write(&path, raw_toml)
+            .map_err(|e| AcpError::protocol(format!("write grok config.toml failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Parse the scalar keys that back the Grok settings panel's structured controls
+/// from a raw `~/.grok/config.toml`. Read-only; uses the `toml` crate. Absent
+/// keys (or a malformed file) yield `None` fields — the panel then shows the
+/// "unset / default" option. Keys mirror docs.x.ai/build/settings/reference.
+fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
+    let table = raw_toml.parse::<toml::Table>().ok();
+    let get = |section: &str, key: &str| -> Option<String> {
+        // `as_table` here also matches TOML inline tables, so
+        // `models = { default_reasoning_effort = "high" }` reads correctly too.
+        table
+            .as_ref()?
+            .get(section)?
+            .as_table()?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    };
+    GrokSettings {
+        default_reasoning_effort: get("models", "default_reasoning_effort"),
+        permission_mode: get("ui", "permission_mode"),
+    }
+}
+
+/// Merge the Grok panel's structured control values into the raw config.toml
+/// text, format-preservingly (comments/layout of unmanaged keys are kept). Each
+/// `Some(value)` sets its documented key; each `None` removes it. Returns the
+/// new TOML text (still validated on the way to disk by
+/// `persist_grok_native_config_files`).
+fn apply_grok_structured_config(
+    base_toml: &str,
+    settings: &GrokStructuredConfig,
+) -> Result<String, AcpError> {
+    let mut doc = base_toml
+        .parse::<toml_edit::Document>()
+        .map_err(|e| AcpError::protocol(format!("invalid grok config.toml: {e}")))?;
+    set_or_remove_grok_key(
+        &mut doc,
+        "ui",
+        "permission_mode",
+        settings.permission_mode.as_deref(),
+    )?;
+    set_or_remove_grok_key(
+        &mut doc,
+        "models",
+        "default_reasoning_effort",
+        settings.default_reasoning_effort.as_deref(),
+    )?;
+    Ok(doc.to_string())
+}
+
+/// Set (`Some`) or remove (`None`) a scalar `[section].key` in a `toml_edit`
+/// document. Uses the table-LIKE accessor so a standard `[section]` table AND an
+/// inline `section = { … }` table are both edited in place (preserving their
+/// other keys) rather than clobbered. A missing section is auto-created as a
+/// table; a section that exists but is a scalar/array (incompatible) is an error
+/// rather than a silent overwrite that would drop the user's value. The section
+/// table itself is never removed — an empty `[ui]`/`[models]` is harmless.
+fn set_or_remove_grok_key(
+    doc: &mut toml_edit::Document,
+    section: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), AcpError> {
+    match value {
+        Some(v) => {
+            let item = &mut doc[section];
+            if item.is_none() {
+                *item = toml_edit::Item::Table(toml_edit::Table::new());
+            } else if item.as_table_like_mut().is_none() {
+                return Err(AcpError::protocol(format!(
+                    "cannot set [{section}].{key}: [{section}] exists but is not a table"
+                )));
+            }
+            if let Some(table) = item.as_table_like_mut() {
+                table.insert(key, toml_edit::value(v));
+            }
+        }
+        None => {
+            if let Some(table) = doc.get_mut(section).and_then(|item| item.as_table_like_mut())
+            {
+                table.remove(key);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4350,6 +4480,14 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".pi/skills", ".agents/skills"],
         }),
+        // Grok reads skills from `<GROK_HOME>/skills/` (default
+        // `~/.grok/skills/`, one `SKILL.md`-bearing directory per skill) and
+        // project-local `<root>/.grok/skills/`.
+        AgentType::Grok => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![crate::parsers::grok::resolve_grok_home_dir().join("skills")],
+            project_rel_dirs: vec![".grok/skills"],
+        }),
     }
 }
 
@@ -4741,6 +4879,12 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // non-interactive credential path is the `KIMI_MODEL_*` family, which
         // also takes priority over `~/.kimi-code/config.toml`.
         AgentType::KimiCode => ("KIMI_MODEL_BASE_URL", "KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME"),
+        // Grok's non-interactive credential is `XAI_API_KEY`. Model + endpoint
+        // also have working env overrides (verified against the 0.2.94 binary):
+        // `GROK_DEFAULT_MODEL` selects the default model and `GROK_XAI_API_BASE_URL`
+        // overrides the API base URL (both win over ~/.grok/config.toml). Note:
+        // `XAI_MODEL` is NOT read by Grok — the earlier placeholder was inert.
+        AgentType::Grok => ("GROK_XAI_API_BASE_URL", "XAI_API_KEY", "GROK_DEFAULT_MODEL"),
         _ => ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"),
     }
 }
@@ -5101,6 +5245,13 @@ fn cascade_update_agent_config(
             // Pi settings panel (`acp_update_pi_config`); it does not participate
             // in the model-provider credential cascade.
         }
+        AgentType::Grok => {
+            // Grok authenticates via `XAI_API_KEY` (or an interactive
+            // `grok login` session stored in ~/.grok/auth.json), injected as a
+            // runtime env var through the generic agent settings panel
+            // (`acpUpdateAgentEnv`); it does not write provider creds into
+            // ~/.grok/config.toml and does not participate in the cascade.
+        }
     }
     Ok(())
 }
@@ -5275,6 +5426,18 @@ pub(crate) fn fingerprint_config(
     hasher.update(b"\x01native\x01");
     if let Some(native) = load_agent_local_config_json(agent_type) {
         hasher.update(native.as_bytes());
+    }
+    // Grok's native config (~/.grok/config.toml) is not exposed via
+    // `agent_local_config_path` — it's edited through the Grok settings panel
+    // (model default, reasoning effort, mcp servers, …). Fold it into the
+    // fingerprint explicitly so those edits mark running Grok sessions
+    // restart-required; otherwise `refresh_config_staleness` would never see the
+    // change.
+    if agent_type == AgentType::Grok {
+        hasher.update(b"\x01grok_toml\x01");
+        if let Some(toml) = load_grok_config_toml_raw() {
+            hasher.update(toml.as_bytes());
+        }
     }
     format!("{:x}", hasher.finalize())
 }
@@ -5527,10 +5690,14 @@ pub async fn acp_cancel(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_fork(
     connection_id: String,
+    conversation_id: Option<i32>,
+    folder_id: Option<i32>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<ForkResultInfo, AcpError> {
-    manager.fork_session(&db, &connection_id).await
+    manager
+        .fork_session(&db, &connection_id, conversation_id, folder_id)
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -5885,6 +6052,15 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         } else {
             (local_config_json, None)
         };
+        let grok_config_toml = if agent_type == AgentType::Grok {
+            load_grok_config_toml_raw()
+        } else {
+            None
+        };
+        // Parsed scalar settings backing the Grok panel's structured controls
+        // (mode / reasoning effort). Derived from the same raw text so the
+        // dropdowns and the advanced editor stay in sync.
+        let grok_settings = grok_config_toml.as_deref().map(parse_grok_settings);
 
         agents.push(AcpAgentInfo {
             agent_type,
@@ -5906,6 +6082,8 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             codex_config_toml,
             cline_secrets_json,
             hermes_config_yaml,
+            grok_config_toml,
+            grok_settings,
             model_provider_id: setting.and_then(|m| m.model_provider_id),
         });
     }
@@ -6283,6 +6461,8 @@ pub(crate) async fn acp_update_agent_config_core(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    grok_config_toml: Option<String>,
+    grok_structured: Option<GrokStructuredConfig>,
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
     let config_json = config_json.and_then(|raw| {
@@ -6309,6 +6489,30 @@ pub(crate) async fn acp_update_agent_config_core(
                 codex_auth_json.as_deref(),
                 codex_config_toml.as_deref(),
             )?;
+        }
+        emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
+        return Ok(());
+    }
+
+    if agent_type == AgentType::Grok {
+        // Two independent save paths share this command:
+        //  - Advanced raw editor  → `grok_config_toml = Some(text)`: the user
+        //    authored the whole file, so it is the verbatim base.
+        //  - Structured controls  → `grok_config_toml = None`: merge the mode /
+        //    reasoning-effort selections onto the CURRENT on-disk config (read
+        //    fresh, failing loudly on a real read error) so a stale in-memory
+        //    snapshot can't silently drop config written by another window / the
+        //    MCP settings path since the panel opened.
+        if grok_config_toml.is_some() || grok_structured.is_some() {
+            let base = match grok_config_toml {
+                Some(text) => text,
+                None => read_grok_config_or_empty()?,
+            };
+            let merged = match &grok_structured {
+                Some(settings) => apply_grok_structured_config(&base, settings)?,
+                None => base,
+            };
+            persist_grok_native_config_files(Some(&merged))?;
         }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
@@ -6354,6 +6558,8 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    grok_config_toml: Option<String>,
+    grok_structured: Option<GrokStructuredConfig>,
     db: &AppDatabase,
     manager: &ConnectionManager,
     data_dir: &Path,
@@ -6365,6 +6571,8 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
         opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
+        grok_config_toml,
+        grok_structured,
         emitter,
     )
     .await?;
@@ -6380,6 +6588,8 @@ pub async fn acp_update_agent_config(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    grok_config_toml: Option<String>,
+    grok_structured: Option<GrokStructuredConfig>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
@@ -6396,6 +6606,8 @@ pub async fn acp_update_agent_config(
         opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
+        grok_config_toml,
+        grok_structured,
         &db,
         &manager,
         &app_data_dir,
@@ -7742,6 +7954,118 @@ pub(crate) async fn codex_poll_device_code_core(
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_grok_settings_reads_documented_keys() {
+        let toml = "[ui]\npermission_mode = \"always-approve\"\n\n\
+                    [models]\ndefault_reasoning_effort = \"high\"\n";
+        let s = parse_grok_settings(toml);
+        assert_eq!(s.permission_mode.as_deref(), Some("always-approve"));
+        assert_eq!(s.default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_grok_settings_absent_or_malformed_is_none() {
+        let s = parse_grok_settings("[cli]\nauto_update = true\n");
+        assert!(s.permission_mode.is_none());
+        assert!(s.default_reasoning_effort.is_none());
+        // Malformed TOML → all None, never panics.
+        let bad = parse_grok_settings("this is not = = = toml");
+        assert!(bad.default_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn apply_grok_structured_config_sets_and_creates_tables() {
+        // Starting from an empty file, both keys land in their tables.
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                default_reasoning_effort: Some("high".into()),
+                permission_mode: Some("ask".into()),
+            },
+        )
+        .unwrap();
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(back.permission_mode.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn apply_grok_structured_config_preserves_other_sections_and_comments() {
+        let base = "# my grok config\n[cli]\nauto_update = true  # keep me\n\n\
+                    [mcp_servers.context7]\ncommand = \"npx\"\n\n[models]\ndefault = \"grok-4.5\"\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                default_reasoning_effort: Some("low".into()),
+                permission_mode: Some("always-approve".into()),
+            },
+        )
+        .unwrap();
+        // Comments + unmanaged sections/keys survive (toml_edit is format-
+        // preserving); the unmanaged `[models].default` is NOT touched.
+        assert!(merged.contains("# my grok config"));
+        assert!(merged.contains("# keep me"));
+        assert!(merged.contains("[mcp_servers.context7]"));
+        assert!(merged.contains("default = \"grok-4.5\""));
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.default_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(back.permission_mode.as_deref(), Some("always-approve"));
+    }
+
+    #[test]
+    fn apply_grok_structured_config_preserves_inline_table_siblings() {
+        // A `[models]` written as an inline table must keep its other keys when a
+        // managed key is set (regression: `is_table()` misses inline tables and
+        // would clobber the whole value).
+        let base = "models = { default = \"grok-4.5\", session_summary = \"grok-4.5\" }\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                default_reasoning_effort: Some("high".into()),
+                permission_mode: None,
+            },
+        )
+        .unwrap();
+        assert!(merged.contains("session_summary"), "inline sibling preserved");
+        assert!(merged.contains("grok-4.5"), "inline default preserved");
+        assert_eq!(
+            parse_grok_settings(&merged).default_reasoning_effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn apply_grok_structured_config_removes_on_none() {
+        let base = "[ui]\npermission_mode = \"ask\"\n\n\
+                    [models]\ndefault_reasoning_effort = \"high\"\n";
+        let merged =
+            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        let back = parse_grok_settings(&merged);
+        assert!(back.permission_mode.is_none(), "unset removes the key");
+        assert!(back.default_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn apply_grok_structured_config_rejects_malformed_or_incompatible_base() {
+        assert!(
+            apply_grok_structured_config("== not toml ==", &GrokStructuredConfig::default())
+                .is_err(),
+            "a malformed base must error, never silently overwrite the user's config"
+        );
+        // A section that exists as a scalar must error rather than be replaced.
+        let incompatible = apply_grok_structured_config(
+            "ui = 1\n",
+            &GrokStructuredConfig {
+                default_reasoning_effort: None,
+                permission_mode: Some("ask".into()),
+            },
+        );
+        assert!(
+            incompatible.is_err(),
+            "an incompatible non-table section must error, not clobber"
+        );
+    }
+
     /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,
     /// so trust seeding writes a tempdir's `trust.json` instead of `~/.pi/agent`.
     fn pi_env_for(agent_dir: &Path) -> BTreeMap<String, String> {
@@ -8177,6 +8501,36 @@ wire_api = "chat"
         env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
         assert_ne!(fp1, fingerprint_config(agent, &env_changed));
 
+    }
+
+    #[test]
+    fn grok_fingerprint_tracks_config_toml_changes() {
+        // Grok's ~/.grok/config.toml is edited via the Grok settings panel but
+        // is NOT in `agent_local_config_path`, so `fingerprint_config` must fold
+        // it in explicitly — otherwise `refresh_config_staleness` never marks a
+        // running Grok session restart-required after a config.toml change.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        temp_env::with_var("GROK_HOME", Some(dir.path()), || {
+            let env: BTreeMap<String, String> = BTreeMap::new();
+            let empty_fp = fingerprint_config(AgentType::Grok, &env);
+
+            std::fs::write(&path, "[models]\ndefault_reasoning_effort = \"low\"\n")
+                .expect("write low");
+            let low_fp = fingerprint_config(AgentType::Grok, &env);
+            assert_ne!(
+                empty_fp, low_fp,
+                "adding ~/.grok/config.toml must change the fingerprint"
+            );
+
+            std::fs::write(&path, "[models]\ndefault_reasoning_effort = \"high\"\n")
+                .expect("write high");
+            let high_fp = fingerprint_config(AgentType::Grok, &env);
+            assert_ne!(
+                low_fp, high_fp,
+                "changing default_reasoning_effort must change the fingerprint"
+            );
+        });
     }
 
     #[tokio::test]

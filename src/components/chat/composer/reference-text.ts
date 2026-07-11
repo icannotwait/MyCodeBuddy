@@ -85,9 +85,10 @@ function escapeLinkDestination(uri: string): string {
 }
 
 /**
- * Canonical human-readable Markdown text for a reference. Used by the node's
- * `renderMarkdown` (so `editor.getMarkdown()` and Markdown drafts read well) and
- * reused by Phase 3 send serialization.
+ * Canonical inline token for a reference — the wire format on send. Used by the
+ * composer's plain-text send serialization (`to-prompt-blocks.composerLeafText`)
+ * and the node's `renderText`/`renderHTML`, and inverted by the transcript
+ * renderer (`message/user-message-segments.ts`) back into a badge.
  *
  * References with a URI render as a Markdown link `[label](uri)` — matching how
  * the backend's `user_blocks_from_prompt` already folds ResourceLinks into

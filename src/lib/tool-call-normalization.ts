@@ -3,6 +3,12 @@ import { COLLAB_AGENT_TOOL_NAME, isCodexCollabInput } from "@/lib/collab-tool"
 const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   shell_command: "bash",
   "functions.shell_command": "bash",
+  // Grok Build (xAI) names its terminal tool `run_terminal_command`. History
+  // parses the raw name (`parsers/grok.rs`), so without this alias the reload
+  // path misses the "bash" classification the live path infers from
+  // `rawInput.command` — the command card would fall through to the generic
+  // tool renderer (raw ANSI, no terminal title) instead of the Terminal card.
+  run_terminal_command: "bash",
   exec_command: "exec_command",
   "functions.exec_command": "exec_command",
   "functions.read": "read",
@@ -414,6 +420,17 @@ export function inferLiveToolName(params: {
     const normalizedMeta = normalizeToolName(metaToolName)
     if (DELEGATION_COMPANION_TOOLS.has(normalizedMeta)) return normalizedMeta
   }
+
+  // Delegation companion tools also carry their identity in the TITLE on hosts
+  // that don't set `claudeCode` meta — notably Grok, whose backend unwraps the
+  // `use_tool` envelope so the title becomes the raw `<server>__<tool>` name.
+  // Resolve them here, ahead of `inferFromInput`, so `cancel_delegation` (input
+  // `{task_id}`) isn't misclassified as the generic "task" tool (and
+  // get_delegation_status / delegate_to_agent stay consistent). Scoped to the
+  // companion set, so the input-shape-first ordering below is preserved for
+  // everything else.
+  const titleCompanion = normalizeToolName(params.title ?? "")
+  if (DELEGATION_COMPANION_TOOLS.has(titleCompanion)) return titleCompanion
 
   // Input-shape detection runs FIRST so cross-agent heuristics (Claude Code
   // `Task` tool routed via `subagent_type`, OpenCode sub-agent calls, etc.)

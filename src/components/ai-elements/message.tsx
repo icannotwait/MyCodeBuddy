@@ -13,10 +13,6 @@ import {
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { useTranslations } from "next-intl"
-import { cjk } from "@streamdown/cjk"
-import { code } from "@streamdown/code"
-import { createMathPlugin } from "@streamdown/math"
-import { mermaid } from "@streamdown/mermaid"
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
 import {
   createContext,
@@ -32,11 +28,10 @@ import {
   defaultRehypePlugins,
   defaultRemarkPlugins,
 } from "streamdown"
-import remarkBreaks from "remark-breaks"
 import { markdownLinkComponents } from "./markdown-link"
-import { rehypeCommandBadges } from "./rehype-command-badges"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
+import { useStreamdownPlugins } from "./streamdown-plugins"
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
   from: UIMessage["role"]
@@ -332,33 +327,11 @@ export const MessageBranchPage = ({
   )
 }
 
-export type MessageResponseProps = ComponentProps<typeof Streamdown> & {
-  /**
-   * Render single newlines as hard line breaks (GitHub-comment flavor). Used
-   * for user-authored messages so their literal line breaks survive Markdown
-   * rendering. Assistant output leaves this off so it follows standard
-   * Markdown, where soft breaks collapse to spaces.
-   */
-  softBreaks?: boolean
-}
-
-const math = createMathPlugin({ singleDollarTextMath: true })
-
-// Wrap the code plugin to guard against unsupported language identifiers
-// (e.g. "##", "function") that appear in fenced code blocks from tool output.
-// Without this, Shiki's createHighlighter tries to load unknown grammars and
-// produces noisy console errors.
-const safeCode: typeof code = {
-  ...code,
-  highlight(options, callback) {
-    const lang = code.supportsLanguage(options.language)
-      ? options.language
-      : ("text" as typeof options.language)
-    return code.highlight({ ...options, language: lang }, callback)
-  },
-}
-
-const streamdownPlugins = { cjk, code: safeCode, math, mermaid }
+// MessageResponse renders ASSISTANT / agent Markdown. User messages no longer
+// use it — they render as plain text + reference badges via PlainTextWithBadges
+// (see message/plain-text-with-badges.tsx) — so the former user-only `softBreaks`
+// / `/slash`-badging hooks were removed.
+export type MessageResponseProps = ComponentProps<typeof Streamdown>
 
 // remark-math only supports `$` delimiters. Convert LaTeX-style
 // `\[...\]` / `\(...\)` to `$$...$$` / `$...$` so they are recognized.
@@ -387,24 +360,14 @@ const remarkPlugins = [
   remarkRewriteFileUriLinks,
 ]
 
-// User messages opt in to this set so single newlines render as <br>.
-const remarkPluginsWithBreaks = [...remarkPlugins, remarkBreaks]
-
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
 const rehypePlugins = rehypePluginsAllowingCodeg(defaultRehypePlugins)
 
-// User messages additionally badge bare `/slash` / `$skill` invocation tokens.
-// Appended AFTER harden so the injected `codeg://skill/…` links aren't stripped,
-// and it runs before Streamdown's math (katex) rehype plugin so `$x$` math (by
-// then a `.math` element) is skipped, not mistaken for a `$skill` token.
-const rehypePluginsForUser = [...rehypePlugins, rehypeCommandBadges]
-
 function MessageResponseImpl({
   className,
   children,
-  softBreaks = false,
   ...props
 }: MessageResponseProps) {
   const normalized = useMemo(
@@ -414,6 +377,9 @@ function MessageResponseImpl({
         : children,
     [children]
   )
+  const plugins = useStreamdownPlugins(
+    typeof normalized === "string" ? normalized : undefined
+  )
 
   return (
     <Streamdown
@@ -421,9 +387,9 @@ function MessageResponseImpl({
         "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
         className
       )}
-      plugins={streamdownPlugins}
-      remarkPlugins={softBreaks ? remarkPluginsWithBreaks : remarkPlugins}
-      rehypePlugins={softBreaks ? rehypePluginsForUser : rehypePlugins}
+      plugins={plugins}
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
       {...props}
       // Merge after spreading props so a caller can still override other
       // elements, but the link icon + safety routing on `a` always wins.
@@ -436,9 +402,7 @@ function MessageResponseImpl({
 
 export const MessageResponse = memo(
   MessageResponseImpl,
-  (prevProps, nextProps) =>
-    prevProps.children === nextProps.children &&
-    prevProps.softBreaks === nextProps.softBreaks
+  (prevProps, nextProps) => prevProps.children === nextProps.children
 )
 
 MessageResponse.displayName = "MessageResponse"

@@ -4,6 +4,7 @@ import type { PromptInputBlock } from "@/lib/types"
 
 import type { InputAttachment } from "../message-input-attachments"
 import { blocksToRestoredDraft } from "./from-prompt-blocks"
+import { textToInlineContent } from "./plain-text-content"
 import type { ReferenceAttrs } from "./types"
 
 /**
@@ -50,12 +51,11 @@ export function isComposerChromeClick(target: EventTarget | null): boolean {
  * front (and serializes to `${prefix}${id}` as the first token), never at the
  * caret. `attrs` is an expert reference (refType `skill`, `meta.scope === "expert"`).
  *
- * The badge must be the FIRST inline node of the FIRST block. Inserting at
- * position 1 only achieves that when the first block is a paragraph; for a
- * heading/list/quote/code block the Markdown marker (`# `, `- `, `> `, …) would
- * serialize before it, so a fresh paragraph is prepended instead. When the first
- * block already opens with an expert badge (from a prior pick), it is replaced
- * rather than stacked — the agent only honors the first directive.
+ * The badge must be the FIRST inline node of the FIRST block. The plain-text
+ * schema has only paragraphs as blocks, so the first block is always a paragraph
+ * and position 1 (the start of its content) is always the right spot. When it
+ * already opens with an expert badge (from a prior pick), it is replaced rather
+ * than stacked — the agent only honors the first directive.
  */
 export function applyExpertReference(
   editor: Editor,
@@ -65,26 +65,14 @@ export function applyExpertReference(
     { type: "reference", attrs },
     { type: "text", text: " " },
   ]
-  const first = editor.state.doc.firstChild
 
-  // First block isn't a paragraph: prepend a fresh one so the badge is the very
-  // first inline content (cursor lands just after the badge + its space, pos 3).
-  if (!first || first.type.name !== "paragraph") {
-    editor
-      .chain()
-      .focus()
-      .insertContentAt(0, { type: "paragraph", content: badge })
-      .setTextSelection(3)
-      .run()
-    return
-  }
-
-  // Paragraph: replace an existing leading expert badge (atom at pos 1) if any,
-  // taking one following space with it so the replacement doesn't stack spaces.
+  // Replace an existing leading expert badge (atom at pos 1) if any, taking one
+  // following space with it so the replacement doesn't stack spaces.
   // `meta.scope === "expert"` is the unambiguous marker — only expert references
   // carry it (commands/skills don't), so no extra id allow-list is needed (and
   // an allow-list would false-negative on agent-linked experts → stacking).
-  const firstChild = first.firstChild
+  const first = editor.state.doc.firstChild
+  const firstChild = first?.firstChild
   const isExpertBadge =
     firstChild?.type.name === "reference" &&
     firstChild.attrs.refType === "skill" &&
@@ -92,7 +80,7 @@ export function applyExpertReference(
 
   let chain = editor.chain().focus()
   if (isExpertBadge) {
-    const afterBadge = first.maybeChild(1)
+    const afterBadge = first?.maybeChild(1)
     const trailingSpace =
       afterBadge?.isText && afterBadge.text?.startsWith(" ") ? 1 : 0
     chain = chain.deleteRange({ from: 1, to: 2 + trailingSpace })
@@ -115,8 +103,8 @@ export function restoreBlocksIntoEditor(
   let chain = editor.chain().clearContent()
   for (const segment of segments) {
     chain =
-      segment.kind === "markdown"
-        ? chain.insertContent(segment.text, { contentType: "markdown" })
+      segment.kind === "text"
+        ? chain.insertContent(textToInlineContent(segment.text))
         : chain.insertReference(segment.attrs)
   }
   chain.focus("end").run()

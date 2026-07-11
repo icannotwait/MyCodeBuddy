@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest"
 
 import { buildComposerExtensions } from "../editor-config"
 import { RichComposer, type RichComposerHandle } from "../rich-composer"
+import { serializeDocToText } from "../to-prompt-blocks"
 import type { ReferenceAttrs } from "../types"
 
 async function mountEditor() {
@@ -93,14 +94,14 @@ describe("Reference node", () => {
     ["commit", commitRef, "[abc1234](codeg://commit/repo@abc1234def)"],
     ["skill", skillRef, "/code-review"],
   ])(
-    "serializes a %s reference to its markdown token",
+    "serializes a %s reference to its inline token",
     async (_n, attrs, expected) => {
       const { ref, unmount } = await mountEditor()
       const editor = editorOf(ref)
       act(() => {
         editor.commands.insertReference(attrs as ReferenceAttrs)
       })
-      expect(editor.getMarkdown()).toContain(expected as string)
+      expect(serializeDocToText(editor.state.doc)).toContain(expected as string)
       unmount()
     }
   )

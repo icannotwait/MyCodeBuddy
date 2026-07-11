@@ -14,10 +14,12 @@ import { type Editor, type JSONContent } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
 import { exitSuggestion } from "@tiptap/suggestion"
 
+import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { cn } from "@/lib/utils"
 
 import { buildComposerExtensions } from "./editor-config"
-import { buildResilientMarkdownNodes } from "./markdown-insert"
+import { textToDoc, textToInlineContent } from "./plain-text-content"
+import { serializeDocToText } from "./to-prompt-blocks"
 import { decideComposerKey } from "./submit-key"
 import type {
   MentionController,
@@ -36,18 +38,19 @@ import type { ReferenceAttrs, ReferenceKind } from "./types"
 
 /**
  * Imperative handle exposed to the parent (e.g. the message input that owns
- * attachments, queue and send orchestration). The parent reads/writes Markdown
+ * attachments, queue and send orchestration). The parent reads/writes plain text
  * and controls focus without re-rendering the editor.
  */
 export interface RichComposerHandle {
-  /** Serialize the current document to Markdown. */
-  getMarkdown: () => string
-  /** Replace the whole document from a Markdown string. */
-  setMarkdown: (markdown: string) => void
+  /** Serialize the current document to plain text (references → their inline
+   *  token, hard breaks → newlines). */
+  getText: () => string
+  /** Replace the whole document from a plain-text string. */
+  setText: (text: string) => void
   /**
    * Replace the whole document from a Tiptap JSON doc — used to hydrate a v2
-   * draft or a queue-edit payload, preserving reference badges that a Markdown
-   * round-trip would downgrade to plain links.
+   * draft or a queue-edit payload, preserving reference badges that a plain-text
+   * round-trip would downgrade to their token.
    */
   setDoc: (doc: JSONContent) => void
   /** Clear the document. */
@@ -66,8 +69,8 @@ export interface RichComposerHandle {
   isEmpty: () => boolean
   /** Serialize the current document to Tiptap JSON (for draft persistence). */
   getJSON: () => JSONContent
-  /** Insert Markdown at the current selection (quick messages, appended text). */
-  insertMarkdownAtCursor: (markdown: string) => void
+  /** Insert plain text at the current selection (quick messages, appended text). */
+  insertTextAtCursor: (text: string) => void
   /** Insert an inline reference badge at the current selection. */
   insertReference: (attrs: ReferenceAttrs) => void
   /** Escape hatch to the underlying editor (null until initialized). */
@@ -75,8 +78,8 @@ export interface RichComposerHandle {
 }
 
 export interface RichComposerProps {
-  /** Initial content, parsed as Markdown. Applied once on creation. */
-  defaultMarkdown?: string
+  /** Initial content, inserted as plain text. Applied once on creation. */
+  defaultText?: string
   placeholder?: string
   autoFocus?: boolean
   disabled?: boolean
@@ -87,12 +90,12 @@ export interface RichComposerProps {
   /** Inline style for the outer wrapper (e.g. max-height). */
   style?: CSSProperties
   /**
-   * Fires on every document change with the serialized Markdown. Serialization
+   * Fires on every document change with the serialized plain text. Serialization
    * runs once per keystroke *only when a handler is attached* (the call is
    * skipped entirely otherwise). Callers that persist drafts must debounce —
-   * the Phase 3 draft layer owns that.
+   * the draft layer owns that.
    */
-  onChange?: (markdown: string) => void
+  onChange?: (text: string) => void
   /**
    * Submit intent: fired when the `submitShortcut` binding is pressed while not
    * composing (IME-safe) and not on a structural bare Enter (code block / list).
@@ -103,7 +106,7 @@ export interface RichComposerProps {
   onBlur?: () => void
   /**
    * Fired once the (async, `immediatelyRender:false`) editor has mounted and any
-   * `defaultMarkdown` has been applied. The host uses this to hydrate a draft /
+   * `defaultText` has been applied. The host uses this to hydrate a draft /
    * queue-edit document via the imperative handle, which isn't usable earlier.
    */
   onReady?: () => void
@@ -152,18 +155,27 @@ export interface RichComposerProps {
    * does not also insert it as text.
    */
   onPasteFiles?: (event: ClipboardEvent) => boolean
+  /**
+   * Paste-without-formatting intent: fired when `Ctrl/⌘+Shift+V` is pressed. The
+   * host owns the clipboard read (and its non-secure fallback). Return true when
+   * the host took over so the editor consumes the key and the browser's native
+   * rich paste is suppressed; return false (or omit the prop) to let the native
+   * "paste and match style" proceed (e.g. in a non-secure context where the async
+   * clipboard read is unavailable).
+   */
+  onPlainPaste?: () => boolean
 }
 
 /**
- * Rich-text composer: a Tiptap editor with live WYSIWYG Markdown, IME-safe
- * Enter-to-submit, inline reference badges, and an optional unified `@` mention
- * panel (enabled by `referenceSearch`). Not yet wired into message-input — that
- * integration (drafts, attachments, real data sources) is Phase 3.
+ * Plain-text message composer: a Tiptap editor with IME-safe Enter-to-submit,
+ * inline reference badges (the five built-in reference kinds), and an optional
+ * unified `@` mention panel (enabled by `referenceSearch`). No Markdown — typed
+ * formatting stays literal; see {@link buildComposerExtensions}.
  */
 export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
   function RichComposer(
     {
-      defaultMarkdown,
+      defaultText,
       placeholder,
       autoFocus,
       disabled,
@@ -183,6 +195,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       isExternalMenuOpen,
       onExternalMenuKeyDown,
       onPasteFiles,
+      onPlainPaste,
     },
     ref
   ) {
@@ -202,6 +215,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const isExternalMenuOpenRef = useRef(isExternalMenuOpen)
     const onExternalMenuKeyDownRef = useRef(onExternalMenuKeyDown)
     const onPasteFilesRef = useRef(onPasteFiles)
+    const onPlainPasteRef = useRef(onPlainPaste)
     // The live editor, captured for command access inside editorProps handlers
     // (which are created before `editor` is assigned in this closure).
     const editorInstanceRef = useRef<Editor | null>(null)
@@ -217,6 +231,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       isExternalMenuOpenRef.current = isExternalMenuOpen
       onExternalMenuKeyDownRef.current = onExternalMenuKeyDown
       onPasteFilesRef.current = onPasteFiles
+      onPlainPasteRef.current = onPlainPaste
     })
 
     // ── Unified `@` mention panel state bridge ──
@@ -285,13 +300,17 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           if (isExternalMenuOpenRef.current) {
             return onExternalMenuKeyDownRef.current?.(event) ?? false
           }
-          // Bindings are free-form (Enter, Shift+Enter, Mod+Enter, Tab, …), so
-          // we can't pre-filter by key. Instead, run a cheap first pass with no
-          // structural context: if neither binding matches it's plain typing —
-          // bail before resolving the (slightly costlier) editor structure.
-          // (A bare Enter still matches the default submit binding here, so we
-          // never wrongly skip it; the code-block/list carve-out is applied in
-          // the second pass below, which only narrows the result.)
+          // Paste without formatting: Ctrl/⌘+Shift+V routes to the host, which
+          // owns the clipboard read. Consume the key (suppressing the browser's
+          // native rich paste) only when the host takes over; otherwise return
+          // false so the native "paste and match style" proceeds — the correct
+          // fallback in a non-secure context where the async read is unavailable.
+          if (matchShortcutEvent(event, "mod+shift+v")) {
+            return onPlainPasteRef.current?.() === true
+          }
+          // Bindings are free-form (Enter, Shift+Enter, Mod+Enter, Tab, …). The
+          // composer is plain text, so there is no code block or list to carve
+          // out — inCodeBlock/inList are always false and one decision suffices.
           const keyEvent = {
             key: event.key,
             shiftKey: event.shiftKey,
@@ -305,33 +324,14 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             submit: submitShortcutRef.current ?? "enter",
             newline: newlineShortcutRef.current ?? "shift+enter",
           }
-          if (
-            decideComposerKey(
-              keyEvent,
-              { composing: view.composing, inCodeBlock: false, inList: false },
-              bindings
-            ) === null
-          ) {
-            return false
-          }
-          // A binding matched (or a bare Enter needing the structural carve-out):
-          // resolve code-block / list context and decide for real.
-          const { $from } = view.state.selection
-          let inCodeBlock = $from.parent.type.spec.code === true
-          let inList = false
-          for (let depth = $from.depth; depth > 0; depth--) {
-            const name = $from.node(depth).type.name
-            if (name === "codeBlock") inCodeBlock = true
-            if (name === "listItem" || name === "taskItem") inList = true
-          }
           const action = decideComposerKey(
             keyEvent,
-            { composing: view.composing, inCodeBlock, inList },
+            { composing: view.composing, inCodeBlock: false, inList: false },
             bindings
           )
           if (action === "submit") {
             // Only consume the key once a handler actually runs; otherwise let
-            // the editor apply its default (e.g. Enter splits the paragraph).
+            // the editor apply its default (Enter splits the paragraph).
             if (!onSubmitRef.current) return false
             onSubmitRef.current()
             return true
@@ -339,9 +339,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           if (action === "newline") {
             const ed = editorInstanceRef.current
             if (!ed) return false
-            // Code blocks take a literal newline; everywhere else a hard break.
-            if (inCodeBlock) ed.commands.insertContent("\n")
-            else ed.commands.setHardBreak()
+            ed.commands.setHardBreak()
             return true
           }
           return false
@@ -351,21 +349,20 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       },
       onCreate: ({ editor }) => {
         editorInstanceRef.current = editor
-        if (defaultMarkdown) {
-          editor.commands.setContent(defaultMarkdown, {
-            contentType: "markdown",
+        if (defaultText) {
+          editor.commands.setContent(textToDoc(defaultText), {
             emitUpdate: false,
           })
         }
         // The imperative handle is now usable; let the host hydrate a draft /
-        // queue-edit document that a Markdown `defaultMarkdown` can't represent.
+        // queue-edit document that a plain `defaultText` can't represent.
         onReadyRef.current?.()
       },
       onDestroy: () => {
         editorInstanceRef.current = null
       },
       onUpdate: ({ editor }) => {
-        onChangeRef.current?.(editor.getMarkdown())
+        onChangeRef.current?.(serializeDocToText(editor.state.doc))
       },
       onFocus: () => onFocusRef.current?.(),
       onBlur: () => onBlurRef.current?.(),
@@ -380,9 +377,8 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     useImperativeHandle(
       ref,
       (): RichComposerHandle => ({
-        getMarkdown: () => editor?.getMarkdown() ?? "",
-        setMarkdown: (markdown) =>
-          editor?.commands.setContent(markdown, { contentType: "markdown" }),
+        getText: () => (editor ? serializeDocToText(editor.state.doc) : ""),
+        setText: (text) => editor?.commands.setContent(textToDoc(text)),
         setDoc: (doc) => editor?.commands.setContent(doc),
         clear: () => editor?.commands.clearContent(true),
         focus: () => editor?.commands.focus("end"),
@@ -419,50 +415,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         },
         isEmpty: () => editor?.isEmpty ?? true,
         getJSON: () => editor?.getJSON() ?? { type: "doc", content: [] },
-        insertMarkdownAtCursor: (markdown) => {
-          if (!editor) return
-          // Fast path: parse the whole message as Markdown. Almost every quick
-          // message parses cleanly, and a throw here leaves the document
-          // untouched (the transaction is built, then dispatched — an exception
-          // during the build never reaches dispatch), so the recovery below
-          // cannot duplicate content.
-          try {
-            editor
-              .chain()
-              .focus()
-              .insertContent(markdown, { contentType: "markdown" })
-              .run()
-          } catch (error) {
-            // The composer's StarterKit schema can't represent every Markdown
-            // construct — GFM tables and task-list checkboxes (`- [ ]`) parse
-            // into nodes ProseMirror rejects, so `insertContent` throws a
-            // RangeError (it runs an unconditional `node.check()`; `setContent`
-            // silently drops such nodes instead). With no fallback the throw is
-            // swallowed by the click handler and the composer shows no reaction
-            // at all — the reported bug. Recover block-by-block so every
-            // *supported* block still renders as rich Markdown and only the
-            // unsupported ones degrade to their literal source text.
-            console.warn(
-              "[RichComposer] Markdown insert failed; degrading unsupported blocks to text.",
-              error
-            )
-            try {
-              const nodes = buildResilientMarkdownNodes(editor, markdown)
-              editor.chain().focus().insertContent(nodes).run()
-            } catch (recoveryError) {
-              // Belt-and-suspenders: the recovery nodes are pre-validated, but
-              // never leave the click looking dead — insert raw text verbatim.
-              console.warn(
-                "[RichComposer] Block recovery failed; inserting raw text.",
-                recoveryError
-              )
-              editor
-                .chain()
-                .focus()
-                .insertContent({ type: "text", text: markdown })
-                .run()
-            }
-          }
+        insertTextAtCursor: (text) => {
+          // Insert literal text with `\n` → hardBreak so line breaks survive in
+          // the plain-text schema. No Markdown parsing (and thus no schema-
+          // rejection throw) is possible, so no recovery path is needed.
+          editor?.chain().focus().insertContent(textToInlineContent(text)).run()
         },
         insertReference: (attrs) => {
           editor?.chain().focus().insertReference(attrs).run()

@@ -12,6 +12,7 @@ import {
   BookOpenText,
   FileSpreadsheet,
   FileStack,
+  FlaskConical,
   GitBranch,
   Globe,
   Keyboard,
@@ -47,6 +48,7 @@ interface SettingsNavItem {
     | "mcp"
     | "skills"
     | "experts"
+    | "science"
     | "office_tools"
     | "quick_messages"
     | "shortcuts"
@@ -83,6 +85,11 @@ const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
     href: "/settings/experts",
     labelKey: "experts",
     icon: Sparkles,
+  },
+  {
+    href: "/settings/science",
+    labelKey: "science",
+    icon: FlaskConical,
   },
   {
     href: "/settings/office-tools",

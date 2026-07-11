@@ -752,6 +752,36 @@ pub fn build_router(
             "/experts_open_central_dir",
             post(handlers::experts::experts_open_central_dir),
         )
+        // ─── Science ───
+        .route("/science_list", post(handlers::science::science_list))
+        .route(
+            "/science_get_install_status",
+            post(handlers::science::science_get_install_status),
+        )
+        .route(
+            "/science_list_all_install_statuses",
+            post(handlers::science::science_list_all_install_statuses),
+        )
+        .route(
+            "/science_link_to_agent",
+            post(handlers::science::science_link_to_agent),
+        )
+        .route(
+            "/science_apply_links",
+            post(handlers::science::science_apply_links),
+        )
+        .route(
+            "/science_unlink_from_agent",
+            post(handlers::science::science_unlink_from_agent),
+        )
+        .route(
+            "/science_read_content",
+            post(handlers::science::science_read_content),
+        )
+        .route(
+            "/science_open_central_dir",
+            post(handlers::science::science_open_central_dir),
+        )
         // ─── Office tools ───
         .route(
             "/officecli_detect",

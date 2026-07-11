@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest"
 
 import {
   applyClaudeProviderToConfigText,
+  buildGrokSaveOptions,
+  buildGrokStructuredConfig,
   buildVersionCheck,
   configTextForClaudeSave,
   getAgentChecks,
@@ -28,6 +30,8 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     codex_auth_json: null,
     cline_secrets_json: null,
     codex_config_toml: null,
+    grok_config_toml: null,
+    grok_settings: null,
     hermes_config_yaml: null,
     model_provider_id: null,
     ...overrides,
@@ -44,6 +48,79 @@ function fixDisabled(fix: unknown): boolean {
     (fix as Record<string, unknown>).disabled === true
   )
 }
+
+describe("buildGrokStructuredConfig — Grok panel save payload", () => {
+  // A chosen dropdown value passes through. These become [ui].permission_mode /
+  // [models].default_reasoning_effort on save.
+  it("passes chosen values through", () => {
+    expect(
+      buildGrokStructuredConfig({
+        grokPermissionMode: "always-approve",
+        grokReasoningEffort: "high",
+      })
+    ).toEqual({
+      permissionMode: "always-approve",
+      defaultReasoningEffort: "high",
+    })
+  })
+
+  // The empty "unset / use default" choice maps to null, which the backend
+  // treats as "remove this key" — so unsetting a control clears it from
+  // config.toml rather than writing an empty string.
+  it("maps unset (empty) fields to null", () => {
+    expect(
+      buildGrokStructuredConfig({
+        grokPermissionMode: "",
+        grokReasoningEffort: "",
+      })
+    ).toEqual({
+      permissionMode: null,
+      defaultReasoningEffort: null,
+    })
+  })
+})
+
+describe("buildGrokSaveOptions — one save persists both surfaces", () => {
+  const base = { grokPermissionMode: "ask", grokReasoningEffort: "high" }
+
+  // Advanced editor unchanged → send ONLY the structured controls; the backend
+  // merges them onto the fresh on-disk config (no stale snapshot to clobber
+  // concurrent edits).
+  it("omits raw TOML when the advanced editor matches disk", () => {
+    const opts = buildGrokSaveOptions(
+      { ...base, grokConfigTomlText: "[ui]\n" },
+      "[ui]\n"
+    )
+    expect(opts.grokConfigTomlText).toBeUndefined()
+    expect(opts.grokStructured).toEqual({
+      permissionMode: "ask",
+      defaultReasoningEffort: "high",
+    })
+  })
+
+  // Advanced editor edited → send it as the merge base so the user's other-key
+  // edits are saved TOGETHER with the structured controls in one action (no
+  // separate save that could discard either surface).
+  it("includes raw TOML when the advanced editor was edited", () => {
+    const opts = buildGrokSaveOptions(
+      { ...base, grokConfigTomlText: "[ui]\nvim_mode = true\n" },
+      "[ui]\n"
+    )
+    expect(opts.grokConfigTomlText).toBe("[ui]\nvim_mode = true\n")
+  })
+
+  // A null on-disk value (no file yet) is treated as empty for the dirty check.
+  it("treats null on-disk config as empty", () => {
+    expect(
+      buildGrokSaveOptions({ ...base, grokConfigTomlText: "" }, null)
+        .grokConfigTomlText
+    ).toBeUndefined()
+    expect(
+      buildGrokSaveOptions({ ...base, grokConfigTomlText: "x" }, null)
+        .grokConfigTomlText
+    ).toBe("x")
+  })
+})
 
 describe("buildVersionCheck", () => {
   // uv runtime not ready: a uvx agent (Hermes) must surface a blocked

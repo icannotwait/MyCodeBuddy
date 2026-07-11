@@ -49,6 +49,7 @@
       "web_service": "Service Web",
       "model_providers": "Fournisseurs de Modèles",
       "experts": "Experts",
+      "science": "Science",
       "office_tools": "Outils bureautiques",
       "quick_messages": "Messages rapides",
       "logs": "Journaux d'exécution"
@@ -107,8 +108,14 @@
       "fontSize": "Taille de police",
       "ligatures": "Activer les ligatures",
       "ligaturesUnavailable": "Cette police n’a pas de ligatures",
+      "wordWrap": "Activer le retour à la ligne",
       "terminalLigaturesHint": "Les ligatures du terminal ne s’appliquent qu’aux polices de programmation intégrées.",
       "preview": "Aperçu"
+    },
+    "welcomePanel": {
+      "sectionTitle": "Zone de sélection du mode",
+      "sectionDescription": "Les cartes de raccourci « Développement / Bureautique » affichées au-dessus du champ de saisie sur la page de nouvelle conversation.",
+      "showQuickActions": "Afficher sur la page de nouvelle conversation"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "Désinstallation...",
       "saveEnvVars": "Enregistrer les variables d’environnement",
       "saving": "Enregistrement...",
+      "saveGrokConfig": "Enregistrer la configuration Grok",
       "saveCodexConfig": "Enregistrer la config Codex",
       "saveGeminiConfig": "Enregistrer la config Gemini",
       "saveOpenCodeConfig": "Enregistrer la config OpenCode",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "Éléments de pré-vérification : {count}",
       "notRun": "Les vérifications n’ont pas encore été exécutées."
+    },
+    "grok": {
+      "configDescription": "Configurez Grok ici. Les contrôles ci-dessous (mode d'autorisation, effort de raisonnement) sont fusionnés dans ~/.grok/config.toml en conservant vos autres clés et commentaires. La connexion utilise votre XAI_API_KEY ou `grok login`. Les autres clés restent modifiables dans Avancé.",
+      "permissionModeLabel": "Mode d'autorisation",
+      "permissionAsk": "Demander à chaque fois",
+      "permissionAlwaysApprove": "Toujours approuver",
+      "reasoningEffortLabel": "Effort de raisonnement",
+      "effortLow": "Faible (plus rapide)",
+      "effortMedium": "Moyen (équilibré)",
+      "effortHigh": "Élevé",
+      "effortXhigh": "Maximum",
+      "optionDefault": "Utiliser la valeur par défaut",
+      "authTitle": "Authentification",
+      "authKeyConfigured": "XAI_API_KEY est configurée.",
+      "authKeyMissing": "Aucune XAI_API_KEY définie.",
+      "authLoginHint": "Définissez XAI_API_KEY ici, ou exécutez `grok login` pour la connexion par abonnement (SuperGrok / X Premium+).",
+      "advancedToggle": "Avancé (config.toml brut)",
+      "configTomlNative": "config.toml (natif)",
+      "configTomlHint": "Enregistré tel quel comme l'intégralité de ~/.grok/config.toml. Le TOML invalide est rejeté afin qu'une faute de frappe ne tronque jamais votre fichier.",
+      "configTomlPlaceholder": "# Clés autres que les contrôles ci-dessus, p. ex.\n# [mcp_servers.*], [cli], règles [permission]."
     },
     "codex": {
       "configDescription": "Prend en charge la configuration rapide de l’URL API, de la clé API, du nom du modèle et du reasoning effort, avec synchronisation vers `auth.json` / `config.toml`.",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "Échec de l’enregistrement de l’ordre des agents",
       "saveAgentSwitchFailed": "Échec de l’enregistrement du switch agent",
       "saveEnvFailed": "Échec de l’enregistrement des variables d’environnement",
+      "grokSaved": "Configuration Grok enregistrée",
+      "saveGrokNativeFailed": "Échec de l'enregistrement de la configuration native Grok",
+      "saveGrokApiKeyFailed": "Paramètres enregistrés, mais la clé API n'a pas pu être enregistrée",
       "codexSaved": "Configuration Codex enregistrée",
       "saveCodexNativeFailed": "Échec de l’enregistrement de la configuration native Codex",
       "geminiSaved": "Configuration Gemini enregistrée",
@@ -1393,6 +1424,7 @@
       "addToChat": "Ajouter au chat",
       "addSelectionToChatDone": "{label} ajouté à la conversation",
       "addFileToChat": "Ajouter le fichier au chat",
+      "toggleWordWrap": "Basculer le retour à la ligne",
       "addFileToChatDone": "{label} ajouté à la conversation",
       "viewDiff": "Voir le Diff",
       "openFile": "Ouvrir le fichier",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "Réduire les changements suivis",
       "expandUntracked": "Développer les fichiers non suivis",
       "collapseUntracked": "Réduire les fichiers non suivis",
+      "showRemainingItems": "Afficher {count} éléments de plus",
       "actions": {
         "commitCode": "Commit du code",
         "rollback": "Annuler",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "{agent} a atteint la limite maximale de jetons pour ce tour.",
           "turnFailedMaxTurnRequests": "{agent} a atteint le nombre maximal de requêtes autorisées pour ce tour.",
           "turnFailedUnknown": "{agent} a terminé le tour avec une raison d'arrêt inconnue.",
+          "grokModelSwitchIncompatibleAgent": "{agent} ne peut pas basculer vers ce modèle dans une conversation existante. Démarrez une nouvelle session pour l'utiliser.",
           "turnFailedEmpty": "{agent} a terminé le tour sans produire de réponse. Vérifiez la configuration de l'agent."
         },
         "unableReadAgentConfig": "Impossible de lire la configuration de l'agent : {message}",
@@ -2031,7 +2065,7 @@
         "quickMessages": "Messages rapides",
         "quickMessagesEmpty": "Aucun message rapide pour l'instant",
         "quickMessagesLoading": "Chargement...",
-        "paste": "Coller",
+        "pasteAsPlainText": "Coller en texte brut",
         "cut": "Couper",
         "copy": "Copier",
         "selectAll": "Tout sélectionner",
@@ -2139,11 +2173,39 @@
             "morph3d": "Crée une présentation Morph 3D avec des modèles GLB et des mouvements de caméra :\n\n[décris ici ton sujet et le concept visuel en 3D]",
             "academic": "Rédige un article académique dans Word avec les exigences suivantes :\n\n[décris ici ton sujet de recherche, la méthodologie et les principaux résultats]",
             "financial": "Crée un modèle financier dans Excel avec les exigences suivantes :\n\n[décris ici tes états financiers, projections et analyses]",
-            "dashboard": "Crée un tableau de bord de données dans Excel avec les exigences suivantes :\n\n[décris ici ta source de données, les KPI et les graphiques]"
+            "dashboard": "Crée un tableau de bord de données dans Excel avec les exigences suivantes :\n\n[décris ici ta source de données, les KPI et les graphiques]",
+            "scientific-brainstorming": "Aide-moi à imaginer des pistes de recherche : explore les liens interdisciplinaires, questionne les hypothèses et repère les lacunes prometteuses. Le domaine que j'explore : ",
+            "hypothesis-generation": "Aide-moi à transformer ces observations en hypothèses testables, avec des prédictions claires, des mécanismes plausibles et des expériences. Mes observations : ",
+            "experimental-design": "Aide-moi à concevoir une expérience rigoureuse avant de collecter des données : le plan, la randomisation, les contrôles et comment éviter les facteurs de confusion. Ce que je veux étudier : ",
+            "statistical-power": "Aide-moi à déterminer la taille d'échantillon nécessaire : guide-moi dans une analyse de puissance (taille d'effet, alpha, puissance) pour mon plan. Détails : ",
+            "statistical-analysis": "Aide-moi à analyser ces données correctement : choisir le bon test, vérifier les hypothèses, rapporter les tailles d'effet et rédiger. Mes données et ma question : ",
+            "exploratory-data-analysis": "Fais une analyse exploratoire de mon fichier de données : résume sa structure, sa qualité et les motifs notables, puis propose les prochaines étapes. Le fichier est : ",
+            "scientific-visualization": "Aide-moi à créer une figure de qualité publication : mise en page claire, barres d'erreur honnêtes, palette adaptée au daltonisme et mise en forme de revue. Ce que je veux montrer : ",
+            "scientific-critical-thinking": "Aide-moi à évaluer de façon critique cette étude ou affirmation : apprécie la qualité des preuves, repère les biais et facteurs de confusion, et pèse les conclusions. La voici : ",
+            "paper-lookup": "Aide-moi à trouver des articles pertinents et du texte intégral en libre accès dans les bases de données savantes, avec des citations réutilisables. Je cherche : "
           },
+          "paper-lookup": "Recherche d'articles",
+          "paper-lookupDesc": "Rechercher dans 10 API savantes (PubMed, arXiv, OpenAlex, Crossref…) articles, citations et texte intégral en libre accès.",
+          "scientific-critical-thinking": "Pensée critique",
+          "scientific-critical-thinkingDesc": "Évaluer les affirmations scientifiques et la qualité des preuves : repérer biais et facteurs de confusion, appliquer GRADE.",
+          "scientific-visualization": "Visualisation scientifique",
+          "scientific-visualizationDesc": "Figures prêtes à publier : dispositions multipanneaux, annotations de significativité et mise en forme par revue.",
+          "exploratory-data-analysis": "Analyse exploratoire des données",
+          "exploratory-data-analysisDesc": "Exploration automatisée de fichiers de données scientifiques (200+ formats) avec métriques de qualité et rapports.",
+          "statistical-analysis": "Analyse statistique",
+          "statistical-analysisDesc": "Analyse statistique guidée : choix du test, vérification des hypothèses, tailles d'effet et rapport au format APA.",
+          "statistical-power": "Puissance statistique",
+          "statistical-powerDesc": "Analyse de la taille d'échantillon et de la puissance : effectifs nécessaires, effets minimaux détectables, courbes de puissance.",
+          "experimental-design": "Plan d'expérience",
+          "experimental-designDesc": "Concevoir des études rigoureuses avant la collecte : randomisation, blocs, contrôles et plans factoriels/DOE.",
+          "hypothesis-generation": "Génération d'hypothèses",
+          "hypothesis-generationDesc": "Transformer des observations en hypothèses testables avec prédictions, mécanismes et expériences de test.",
+          "scientific-brainstorming": "Brainstorming scientifique",
+          "scientific-brainstormingDesc": "Idéation de recherche ouverte : explorer les liens interdisciplinaires, questionner les hypothèses, repérer les lacunes.",
           "tabs": {
             "office": "Bureautique",
-            "coding": "Développement"
+            "coding": "Développement",
+            "research": "Recherche"
           },
           "coding": {
             "brainstormingDesc": "Explorer intention et besoins avant de coder",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "toolUseCount": "{count} outil {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count, plural, one {# appel d'outil} other {# appels d'outil}}"
       },
       "tool": {
         "parameters": "Paramètres",
@@ -2525,6 +2587,16 @@
         "opWait": "Récupération du résultat du sous-agent",
         "opClose": "Fermeture du sous-agent",
         "opResume": "Reprise du sous-agent"
+      },
+      "backgroundTasks": {
+        "running": "{count, plural, one {# tâche en arrière-plan en cours} other {# tâches en arrière-plan en cours}}",
+        "settling": "Synchronisation des résultats d'arrière-plan…",
+        "settledFallback": "Tâche en arrière-plan terminée ({status})",
+        "cardRunning": "En cours d'exécution en arrière-plan",
+        "cardLaunchedPending": "Tâche lancée en arrière-plan",
+        "cardCompleted": "Tâche en arrière-plan terminée",
+        "cardFinishedWithStatus": "Tâche en arrière-plan terminée ({status})",
+        "cardResultPending": "Résultat pas encore reçu"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "Bloc {index}",
       "loadingHunk": "Chargement du hunk...",
-      "noDiffData": "Aucune donnée diff"
+      "noDiffData": "Aucune donnée diff",
+      "showRemainingLines": "Afficher {count} lignes de plus"
     },
     "conversationContextBar": {
       "folderTitle": "Dossier de travail",
@@ -2848,7 +2921,7 @@
     "agentTypeRequired": "Le type d'agent est requis.",
     "agentTypeImmutableHint": "Le type d'agent ne peut pas être modifié après la création.",
     "model": "Modèle",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "Modèle Principal",
     "claudeReasoningModel": "Modèle de Raisonnement (réflexion)",
@@ -2969,6 +3042,40 @@
       "disabled": "Expert désactivé pour cet agent",
       "enableFailed": "Échec de l'activation de l'expert",
       "disableFailed": "Échec de la désactivation de l'expert",
+      "openFolderFailed": "Échec de l'ouverture du dossier"
+    }
+  },
+  "ScienceSettings": {
+    "title": "Compétences de recherche scientifique",
+    "description": "Activez des compétences de recherche scientifique sélectionnées pour vos agents de codage IA : génération d'hypothèses, plan d'expérience, statistiques, visualisation, évaluation critique et recherche bibliographique. codeg gère une copie centrale et relie chaque compétence aux agents que vous choisissez.",
+    "loading": "Chargement des compétences scientifiques…",
+    "emptySkills": "Aucune compétence scientifique disponible. Consultez les journaux de l'application.",
+    "searchPlaceholder": "Rechercher des compétences scientifiques par nom, id ou description",
+    "categories": {
+      "ideation": "Idéation",
+      "design": "Plan d'étude",
+      "analysis": "Analyse",
+      "visualization": "Visualisation",
+      "evaluation": "Évaluation",
+      "literature": "Littérature"
+    },
+    "states": {
+      "not_linked": "Non activé",
+      "linked_to_codeg": "Activé",
+      "linked_elsewhere": "Bloqué — un autre lien existe",
+      "blocked_by_real_directory": "Bloqué — une compétence personnalisée occupe ce nom",
+      "broken": "Lien cassé"
+    },
+    "badges": {
+      "userModified": "Modifié par l'utilisateur",
+      "needsKey": "Clé API requise",
+      "needsSetup": "Configuration possible"
+    },
+    "actions": {
+      "openCentralDir": "Ouvrir le dossier central",
+      "refresh": "Actualiser"
+    },
+    "toasts": {
       "openFolderFailed": "Échec de l'ouverture du dossier"
     }
   },

@@ -49,6 +49,7 @@
       "web_service": "خدمة الويب",
       "model_providers": "مزودو النماذج",
       "experts": "الخبراء",
+      "science": "البحث العلمي",
       "office_tools": "أدوات المكتب",
       "quick_messages": "رسائل سريعة",
       "logs": "سجلات التشغيل"
@@ -107,8 +108,14 @@
       "fontSize": "حجم الخط",
       "ligatures": "تفعيل الحروف المتصلة",
       "ligaturesUnavailable": "هذا الخط لا يحتوي على حروف متصلة",
+      "wordWrap": "تفعيل التفاف النص",
       "terminalLigaturesHint": "تنطبق الحروف المتصلة في الطرفية على خطوط البرمجة المضمّنة فقط.",
       "preview": "معاينة"
+    },
+    "welcomePanel": {
+      "sectionTitle": "منطقة اختيار الوضع",
+      "sectionDescription": "بطاقات الاختصار «تطوير الكود / الأعمال المكتبية» التي تظهر أعلى مربع الإدخال في صفحة المحادثة الجديدة.",
+      "showQuickActions": "العرض في صفحة المحادثة الجديدة"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "جارٍ إزالة التثبيت...",
       "saveEnvVars": "حفظ متغيرات البيئة",
       "saving": "جارٍ الحفظ...",
+      "saveGrokConfig": "حفظ إعدادات Grok",
       "saveCodexConfig": "حفظ إعداد Codex",
       "saveGeminiConfig": "حفظ إعداد Gemini",
       "saveOpenCodeConfig": "حفظ إعداد OpenCode",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "عناصر الفحص المسبق: {count}",
       "notRun": "لم يتم تشغيل الفحوصات بعد."
+    },
+    "grok": {
+      "configDescription": "اضبط Grok هنا. تُدمج عناصر التحكم أدناه (وضع الأذونات وجهد الاستدلال) في ~/.grok/config.toml مع الحفاظ على مفاتيحك وتعليقاتك الأخرى. يستخدم تسجيل الدخول XAI_API_KEY أو `grok login`. تبقى المفاتيح الأخرى قابلة للتحرير ضمن «متقدم».",
+      "permissionModeLabel": "وضع الأذونات",
+      "permissionAsk": "السؤال في كل مرة",
+      "permissionAlwaysApprove": "الموافقة دائمًا",
+      "reasoningEffortLabel": "جهد الاستدلال",
+      "effortLow": "منخفض (أسرع)",
+      "effortMedium": "متوسط (متوازن)",
+      "effortHigh": "مرتفع",
+      "effortXhigh": "الأقصى",
+      "optionDefault": "استخدام الافتراضي",
+      "authTitle": "المصادقة",
+      "authKeyConfigured": "XAI_API_KEY مُهيَّأ.",
+      "authKeyMissing": "لم يتم تعيين XAI_API_KEY.",
+      "authLoginHint": "عيّن XAI_API_KEY هنا، أو نفّذ `grok login` لتسجيل الدخول بالاشتراك (SuperGrok / X Premium+).",
+      "advancedToggle": "متقدم (config.toml الخام)",
+      "configTomlNative": "config.toml (أصلي)",
+      "configTomlHint": "يُحفظ حرفيًا كملف ~/.grok/config.toml بالكامل. يُرفض TOML غير الصالح حتى لا يقتطع خطأ مطبعي ملفك أبدًا.",
+      "configTomlPlaceholder": "# مفاتيح غير عناصر التحكم أعلاه، مثل\n# [mcp_servers.*] و[cli] وقواعد [permission]."
     },
     "codex": {
       "configDescription": "يدعم الإعداد السريع لعنوان API ومفتاح API واسم النموذج وجهد الاستدلال، مع المزامنة مع `auth.json` / `config.toml`.",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "فشل حفظ ترتيب Agent",
       "saveAgentSwitchFailed": "فشل حفظ مفتاح Agent",
       "saveEnvFailed": "فشل حفظ متغيرات البيئة",
+      "grokSaved": "تم حفظ إعدادات Grok",
+      "saveGrokNativeFailed": "فشل حفظ إعدادات Grok الأصلية",
+      "saveGrokApiKeyFailed": "تم حفظ الإعدادات، لكن تعذّر حفظ مفتاح API",
       "codexSaved": "تم حفظ إعداد Codex",
       "saveCodexNativeFailed": "فشل حفظ إعداد Codex الأصلي",
       "geminiSaved": "تم حفظ إعداد Gemini",
@@ -1393,6 +1424,7 @@
       "addToChat": "إضافة إلى المحادثة",
       "addSelectionToChatDone": "تمت إضافة {label} إلى المحادثة",
       "addFileToChat": "إضافة الملف إلى المحادثة",
+      "toggleWordWrap": "تبديل التفاف النص",
       "addFileToChatDone": "تمت إضافة {label} إلى المحادثة",
       "viewDiff": "عرض Diff",
       "openFile": "فتح الملف",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "طي التغييرات المتعقبة",
       "expandUntracked": "توسيع الملفات غير المتعقبة",
       "collapseUntracked": "طي الملفات غير المتعقبة",
+      "showRemainingItems": "عرض {count} عنصر إضافي",
       "actions": {
         "commitCode": "التزام الكود",
         "rollback": "تراجع",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "بلغ {agent} الحد الأقصى للرموز المسموح بها في هذه الجولة.",
           "turnFailedMaxTurnRequests": "بلغ {agent} الحد الأقصى لعدد الطلبات المسموح بها في هذه الجولة.",
           "turnFailedUnknown": "أنهى {agent} الجولة بسبب توقف غير معروف.",
+          "grokModelSwitchIncompatibleAgent": "لا يمكن لـ {agent} التبديل إلى هذا النموذج في محادثة قائمة. ابدأ جلسة جديدة لاستخدامه.",
           "turnFailedEmpty": "أنهى {agent} الجولة دون إنتاج أي رد. يرجى التحقق من إعدادات الوكيل."
         },
         "unableReadAgentConfig": "تعذر قراءة إعدادات الوكيل: {message}",
@@ -2031,7 +2065,7 @@
         "quickMessages": "الرسائل السريعة",
         "quickMessagesEmpty": "لا توجد رسائل سريعة بعد",
         "quickMessagesLoading": "جارٍ التحميل...",
-        "paste": "لصق",
+        "pasteAsPlainText": "لصق كنص عادي",
         "cut": "قص",
         "copy": "نسخ",
         "selectAll": "تحديد الكل",
@@ -2139,11 +2173,39 @@
             "morph3d": "أنشئ عرض Morph ثلاثي الأبعاد بنماذج GLB وحركات كاميرا:\n\n[صف هنا موضوعك ومفهومك المرئي ثلاثي الأبعاد]",
             "academic": "اكتب ورقة أكاديمية في Word وفق المتطلبات التالية:\n\n[صف هنا موضوع بحثك ومنهجيتك وأبرز نتائجك]",
             "financial": "أنشئ نموذجًا ماليًا في Excel وفق المتطلبات التالية:\n\n[صف هنا قوائمك المالية وتوقعاتك وتحليلاتك]",
-            "dashboard": "أنشئ لوحة بيانات في Excel وفق المتطلبات التالية:\n\n[صف هنا مصدر بياناتك ومؤشراتك ومخططاتك]"
+            "dashboard": "أنشئ لوحة بيانات في Excel وفق المتطلبات التالية:\n\n[صف هنا مصدر بياناتك ومؤشراتك ومخططاتك]",
+            "scientific-brainstorming": "ساعدني في توليد أفكار بحثية: استكشف الروابط متعددة التخصصات، وتحدَّ الافتراضات، واكشف الفجوات الواعدة. المجال الذي أستكشفه: ",
+            "hypothesis-generation": "ساعدني في تحويل هذه الملاحظات إلى فرضيات قابلة للاختبار، مع تنبؤات واضحة وآليات معقولة وتجارب لاختبارها. ملاحظاتي: ",
+            "experimental-design": "ساعدني في تصميم تجربة دقيقة قبل جمع البيانات: التصميم والعشوائية والضوابط وكيفية تجنّب الالتباس. ما أريد دراسته: ",
+            "statistical-power": "ساعدني في تحديد حجم العينة المطلوب: أرشدني خلال تحليل القوة الإحصائية (حجم الأثر، ألفا، القوة) لتصميمي. التفاصيل: ",
+            "statistical-analysis": "ساعدني في تحليل هذه البيانات بشكل صحيح: اختر الاختبار المناسب، وتحقق من الافتراضات، وأبلغ عن أحجام الأثر، واكتب النتائج. بياناتي وسؤالي: ",
+            "exploratory-data-analysis": "قم بتحليل استكشافي لملف بياناتي: لخّص بنيته وجودته والأنماط اللافتة، ثم اقترح الخطوات التالية. الملف هو: ",
+            "scientific-visualization": "ساعدني في إنشاء شكل بجودة النشر: تخطيط واضح، وأشرطة خطأ صادقة، ولوحة ألوان مناسبة لعمى الألوان، وتنسيق المجلة. ما أريد عرضه: ",
+            "scientific-critical-thinking": "ساعدني في التقييم النقدي لهذه الدراسة أو الادعاء: قيّم جودة الأدلة، وارصد التحيّزات والعوامل المربكة، وزِن الاستنتاجات. إليك المحتوى: ",
+            "paper-lookup": "ساعدني في العثور على أوراق ذات صلة ونص كامل مفتوح الوصول عبر قواعد البيانات الأكاديمية، مع استشهادات يمكنني إعادة استخدامها. أبحث عن: "
           },
+          "paper-lookup": "البحث عن الأوراق البحثية",
+          "paper-lookupDesc": "البحث في 10 واجهات برمجية أكاديمية (PubMed وarXiv وOpenAlex وCrossref…) عن الأوراق والاستشهادات والنص الكامل المفتوح.",
+          "scientific-critical-thinking": "التفكير النقدي",
+          "scientific-critical-thinkingDesc": "تقييم الادعاءات العلمية وجودة الأدلة: رصد التحيّزات والعوامل المربكة وتطبيق أطر GRADE ومخاطر التحيّز.",
+          "scientific-visualization": "التصور العلمي",
+          "scientific-visualizationDesc": "أشكال جاهزة للنشر: تخطيطات متعددة اللوحات، وتعليقات الدلالة الإحصائية، وتنسيق خاص بكل مجلة.",
+          "exploratory-data-analysis": "تحليل البيانات الاستكشافي",
+          "exploratory-data-analysisDesc": "استكشاف آلي لملفات البيانات العلمية بأكثر من 200 صيغة مع مقاييس الجودة والتقارير.",
+          "statistical-analysis": "التحليل الإحصائي",
+          "statistical-analysisDesc": "تحليل إحصائي موجَّه: اختيار الاختبار، والتحقق من الافتراضات، وأحجام الأثر، والتقارير بأسلوب APA.",
+          "statistical-power": "القوة الإحصائية",
+          "statistical-powerDesc": "تحليل حجم العينة والقوة الإحصائية: عدد المشاركين اللازم، وأصغر تأثير قابل للكشف، ومنحنيات القوة.",
+          "experimental-design": "تصميم التجارب",
+          "experimental-designDesc": "تصميم دراسات دقيقة قبل جمع البيانات: العشوائية والتجميع والضوابط وتصاميم العوامل/DOE.",
+          "hypothesis-generation": "توليد الفرضيات",
+          "hypothesis-generationDesc": "تحويل الملاحظات إلى فرضيات قابلة للاختبار مع تنبؤات وآليات وتجارب لاختبارها.",
+          "scientific-brainstorming": "العصف الذهني العلمي",
+          "scientific-brainstormingDesc": "توليد أفكار بحثية مفتوحة: استكشاف الروابط متعددة التخصصات وتحدّي الافتراضات وكشف الفجوات البحثية.",
           "tabs": {
             "office": "الأعمال المكتبية",
-            "coding": "تطوير الكود"
+            "coding": "تطوير الكود",
+            "research": "البحث العلمي"
           },
           "coding": {
             "brainstormingDesc": "استكشف النية والمتطلبات قبل البناء",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
-        "toolUseCount": "{count} أداة {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} استخدام للأداة"
       },
       "tool": {
         "parameters": "المعلمات",
@@ -2525,6 +2587,16 @@
         "opWait": "جلب نتيجة الوكيل الفرعي",
         "opClose": "إغلاق الوكيل الفرعي",
         "opResume": "استئناف الوكيل الفرعي"
+      },
+      "backgroundTasks": {
+        "running": "{count, plural, one {مهمة خلفية واحدة قيد التشغيل} two {مهمتا خلفية قيد التشغيل} few {# مهام خلفية قيد التشغيل} other {# مهمة خلفية قيد التشغيل}}",
+        "settling": "جارٍ مزامنة نتائج الخلفية…",
+        "settledFallback": "انتهت مهمة الخلفية ({status})",
+        "cardRunning": "قيد التشغيل في الخلفية",
+        "cardLaunchedPending": "بدأت مهمة الخلفية",
+        "cardCompleted": "اكتملت مهمة الخلفية",
+        "cardFinishedWithStatus": "انتهت مهمة الخلفية ({status})",
+        "cardResultPending": "لم تصل النتيجة بعد"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "مقطع {index}",
       "loadingHunk": "جارٍ تحميل hunk...",
-      "noDiffData": "لا توجد بيانات diff"
+      "noDiffData": "لا توجد بيانات diff",
+      "showRemainingLines": "عرض {count} سطر إضافي"
     },
     "conversationContextBar": {
       "folderTitle": "مجلد العمل",
@@ -2848,7 +2921,7 @@
     "agentTypeRequired": "نوع الوكيل مطلوب.",
     "agentTypeImmutableHint": "لا يمكن تغيير نوع الوكيل بعد الإنشاء.",
     "model": "النموذج",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "النموذج الرئيسي",
     "claudeReasoningModel": "نموذج الاستدلال (التفكير)",
@@ -2969,6 +3042,40 @@
       "disabled": "تم تعطيل الخبير لهذا الوكيل",
       "enableFailed": "فشل تفعيل الخبير",
       "disableFailed": "فشل تعطيل الخبير",
+      "openFolderFailed": "فشل فتح المجلد"
+    }
+  },
+  "ScienceSettings": {
+    "title": "مهارات البحث العلمي",
+    "description": "فعّل مهارات البحث العلمي المنسّقة لوكلاء البرمجة بالذكاء الاصطناعي: توليد الفرضيات، وتصميم التجارب، والإحصاء، والتصور، والتقييم النقدي، والبحث في الأدبيات. يدير codeg نسخة مركزية ويربط كل مهارة بالوكلاء الذين تختارهم.",
+    "loading": "جارٍ تحميل مهارات البحث العلمي…",
+    "emptySkills": "لا توجد مهارات بحث علمي متاحة. تحقّق من سجلات التطبيق.",
+    "searchPlaceholder": "ابحث في مهارات البحث العلمي بالاسم أو المعرّف أو الوصف",
+    "categories": {
+      "ideation": "توليد الأفكار",
+      "design": "تصميم الدراسة",
+      "analysis": "التحليل",
+      "visualization": "التصور",
+      "evaluation": "التقييم",
+      "literature": "الأدبيات"
+    },
+    "states": {
+      "not_linked": "غير مُفعَّل",
+      "linked_to_codeg": "مُفعَّل",
+      "linked_elsewhere": "محظور — يوجد رابط آخر",
+      "blocked_by_real_directory": "محظور — مهارة مخصصة تشغل هذا الاسم",
+      "broken": "رابط معطوب"
+    },
+    "badges": {
+      "userModified": "عُدِّل من قبل المستخدم",
+      "needsKey": "يتطلب مفتاحًا",
+      "needsSetup": "قد يتطلب إعدادًا"
+    },
+    "actions": {
+      "openCentralDir": "فتح المجلد المركزي",
+      "refresh": "تحديث"
+    },
+    "toasts": {
       "openFolderFailed": "فشل فتح المجلد"
     }
   },

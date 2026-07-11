@@ -49,6 +49,7 @@
       "web_service": "Web 服務",
       "model_providers": "模型供應商",
       "experts": "專家",
+      "science": "科學研究",
       "office_tools": "辦公工具",
       "quick_messages": "快捷訊息",
       "logs": "執行日誌"
@@ -107,8 +108,14 @@
       "fontSize": "字級",
       "ligatures": "啟用連字",
       "ligaturesUnavailable": "此字型不含連字",
+      "wordWrap": "啟用自動換行",
       "terminalLigaturesHint": "終端機連字僅對內建程式字型生效。",
       "preview": "預覽"
+    },
+    "welcomePanel": {
+      "sectionTitle": "模式選擇區域",
+      "sectionDescription": "新會話頁面輸入框上方顯示的「程式開發 / 日常辦公」快捷卡片區域。",
+      "showQuickActions": "在新會話頁面顯示"
     }
   },
   "SystemSettings": {
@@ -556,6 +563,7 @@
       "uninstalling": "卸載中...",
       "saveEnvVars": "儲存環境變數",
       "saving": "儲存中...",
+      "saveGrokConfig": "儲存 Grok 設定",
       "saveCodexConfig": "儲存 Codex 配置",
       "saveGeminiConfig": "儲存 Gemini 配置",
       "saveOpenCodeConfig": "儲存 OpenCode 配置",
@@ -589,6 +597,26 @@
     "preflight": {
       "count": "預檢項：{count}",
       "notRun": "尚未執行檢測。"
+    },
+    "grok": {
+      "configDescription": "在此設定 Grok。下方的控制項（權限模式、推理級別）會合併寫入 ~/.grok/config.toml，保留你的其他鍵與註解。登入使用 XAI_API_KEY 或 `grok login`。其他鍵可在「進階」中編輯。",
+      "permissionModeLabel": "權限模式",
+      "permissionAsk": "每次詢問",
+      "permissionAlwaysApprove": "永遠允許",
+      "reasoningEffortLabel": "推理級別",
+      "effortLow": "低（較快）",
+      "effortMedium": "中（均衡）",
+      "effortHigh": "高",
+      "effortXhigh": "最高",
+      "optionDefault": "使用預設",
+      "authTitle": "驗證",
+      "authKeyConfigured": "已設定 XAI_API_KEY。",
+      "authKeyMissing": "未設定 XAI_API_KEY。",
+      "authLoginHint": "在此設定 XAI_API_KEY，或執行 `grok login` 進行訂閱登入（SuperGrok / X Premium+）。",
+      "advancedToggle": "進階（原始 config.toml）",
+      "configTomlNative": "config.toml（原生）",
+      "configTomlHint": "按原樣整體寫入 ~/.grok/config.toml。非法 TOML 會被拒絕，絕不因筆誤截斷檔案。",
+      "configTomlPlaceholder": "# 上面控制項之外的鍵，例如\n# [mcp_servers.*]、[cli]、[permission] 規則。"
     },
     "codex": {
       "configDescription": "支援 API URL、API Key、模型名稱、Reasoning Effort 快捷配置，並與 `auth.json` / `config.toml` 雙向聯動。",
@@ -860,6 +888,9 @@
       "saveAgentOrderFailed": "儲存 Agent 排序失敗",
       "saveAgentSwitchFailed": "儲存 Agent 開關失敗",
       "saveEnvFailed": "儲存環境變數失敗",
+      "grokSaved": "Grok 設定已儲存",
+      "saveGrokNativeFailed": "儲存 Grok 原生設定失敗",
+      "saveGrokApiKeyFailed": "設定已儲存，但 API Key 未能儲存",
       "codexSaved": "Codex 配置已儲存",
       "saveCodexNativeFailed": "儲存 Codex 原生配置失敗",
       "geminiSaved": "Gemini 配置已儲存",
@@ -1393,6 +1424,7 @@
       "addToChat": "加入對話",
       "addSelectionToChatDone": "已將 {label} 加入對話",
       "addFileToChat": "新增檔案到對話",
+      "toggleWordWrap": "切換自動換行",
       "addFileToChatDone": "已將 {label} 加入對話",
       "viewDiff": "查看差異",
       "openFile": "打開檔案",
@@ -1709,6 +1741,7 @@
       "collapseTracked": "折疊已追蹤變更",
       "expandUntracked": "展開未追蹤檔案",
       "collapseUntracked": "折疊未追蹤檔案",
+      "showRemainingItems": "顯示其餘 {count} 項",
       "actions": {
         "commitCode": "提交程式碼",
         "rollback": "回滾",
@@ -1978,6 +2011,7 @@
           "turnFailedMaxTokens": "{agent} 已達到此輪回覆的最大 Token 限制。",
           "turnFailedMaxTurnRequests": "{agent} 已達到此輪回覆允許的最大請求次數。",
           "turnFailedUnknown": "{agent} 以未知的停止原因結束了此輪回覆。",
+          "grokModelSwitchIncompatibleAgent": "{agent} 無法在既有對話中切換到該模型，請新建工作階段以使用它。",
           "turnFailedEmpty": "{agent} 此輪沒有產生任何回覆就結束了，請檢查代理設定。"
         },
         "unableReadAgentConfig": "無法讀取 Agent 設定：{message}",
@@ -2031,7 +2065,7 @@
         "quickMessages": "快捷訊息",
         "quickMessagesEmpty": "尚無快捷訊息",
         "quickMessagesLoading": "載入中...",
-        "paste": "貼上",
+        "pasteAsPlainText": "貼上純文字",
         "cut": "剪下",
         "copy": "複製",
         "selectAll": "全選",
@@ -2139,11 +2173,39 @@
             "morph3d": "建立一個帶 GLB 模型與鏡頭運動的 3D Morph 簡報：\n\n[在此描述主題與 3D 視覺構想]",
             "academic": "用 Word 撰寫一篇學術論文，需求如下：\n\n[在此描述研究主題、方法與主要發現]",
             "financial": "用 Excel 建立一個財務模型，需求如下：\n\n[在此描述財務報表、預測與分析]",
-            "dashboard": "用 Excel 建立一個資料儀表板，需求如下：\n\n[在此描述資料來源、KPI 與圖表]"
+            "dashboard": "用 Excel 建立一個資料儀表板，需求如下：\n\n[在此描述資料來源、KPI 與圖表]",
+            "scientific-brainstorming": "幫我進行科研腦力激盪：探索跨學科連結、挑戰假設、發掘有潛力的研究缺口。我正在探索的方向：",
+            "hypothesis-generation": "幫我把這些觀察轉化為可檢驗的假設：提出明確預測、合理機制，並設計驗證實驗。我的觀察：",
+            "experimental-design": "在蒐集資料前幫我設計嚴謹的實驗：設計方案、隨機化、對照，以及如何避免干擾。我想研究的問題：",
+            "statistical-power": "幫我確定所需樣本數：為我的設計做檢定力分析（效應量、顯著水準、檢定力）。具體資訊：",
+            "statistical-analysis": "幫我正確分析這份資料：選擇合適的檢定、檢查假設、報告效應量並撰寫結論。我的資料與問題：",
+            "exploratory-data-analysis": "對我的資料檔案做探索性分析：概述其結構、品質與值得注意的模式，並建議後續步驟。檔案是：",
+            "scientific-visualization": "幫我製作出版級圖表：清晰佈局、真實誤差棒、色盲友善配色，以及期刊格式。我想展示的內容：",
+            "scientific-critical-thinking": "幫我批判性評估這項研究或主張：評估證據品質、辨識偏誤與干擾，並權衡結論。內容如下：",
+            "paper-lookup": "幫我在學術資料庫中查找相關論文與開放取用全文，並提供可重用的引用。我要找的是："
           },
+          "paper-lookup": "論文檢索",
+          "paper-lookupDesc": "檢索 10 個學術 API（PubMed、arXiv、OpenAlex、Crossref…）查找論文、引用與開放取用全文。",
+          "scientific-critical-thinking": "批判性思維",
+          "scientific-critical-thinkingDesc": "評估科學主張與證據品質：辨識偏誤與干擾，運用 GRADE 與偏誤風險框架。",
+          "scientific-visualization": "科學視覺化",
+          "scientific-visualizationDesc": "出版級圖表：多面板佈局、顯著性標註與期刊專屬格式。",
+          "exploratory-data-analysis": "探索性資料分析",
+          "exploratory-data-analysisDesc": "對 200+ 種格式的科學資料檔案做自動化探索，輸出品質指標與報告。",
+          "statistical-analysis": "統計分析",
+          "statistical-analysisDesc": "引導式統計分析：檢定選擇、假設檢查、效應量與 APA 格式報告。",
+          "statistical-power": "統計檢定力",
+          "statistical-powerDesc": "樣本數與統計檢定力分析：所需樣本數、最小可檢測效應與檢定力曲線。",
+          "experimental-design": "實驗設計",
+          "experimental-designDesc": "在蒐集資料前設計嚴謹研究：隨機化、區集、對照與析因/DOE 佈局。",
+          "hypothesis-generation": "假設生成",
+          "hypothesis-generationDesc": "將觀察轉化為可檢驗的假設，提出預測、機制並設計驗證實驗。",
+          "scientific-brainstorming": "科學腦力激盪",
+          "scientific-brainstormingDesc": "開放式科研構思：探索跨學科連結、挑戰假設、發掘研究缺口。",
           "tabs": {
             "office": "日常辦公",
-            "coding": "程式開發"
+            "coding": "程式開發",
+            "research": "科學研究"
           },
           "coding": {
             "brainstormingDesc": "動手前先梳理意圖與需求",
@@ -2253,7 +2315,7 @@
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
-        "toolUseCount": "{count} 个工具 {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} 次工具呼叫"
       },
       "tool": {
         "parameters": "參數",
@@ -2525,6 +2587,16 @@
         "opWait": "取得子智能體結果",
         "opClose": "結束子智能體",
         "opResume": "恢復子智能體"
+      },
+      "backgroundTasks": {
+        "running": "{count} 個背景任務執行中",
+        "settling": "正在同步背景結果…",
+        "settledFallback": "背景任務已結束（{status}）",
+        "cardRunning": "背景執行中",
+        "cardLaunchedPending": "已啟動背景任務",
+        "cardCompleted": "背景任務已完成",
+        "cardFinishedWithStatus": "背景任務已結束（{status}）",
+        "cardResultPending": "結果尚未返回"
       }
     },
     "diffPreview": {
@@ -2536,7 +2608,8 @@
       },
       "hunkLabel": "區塊 {index}",
       "loadingHunk": "正在載入區塊...",
-      "noDiffData": "無差異資料"
+      "noDiffData": "無差異資料",
+      "showRemainingLines": "顯示剩餘 {count} 行"
     },
     "conversationContextBar": {
       "folderTitle": "工作資料夾",
@@ -2848,7 +2921,7 @@
     "agentTypeRequired": "請選擇智能體類型。",
     "agentTypeImmutableHint": "智能體類型建立後不可修改。",
     "model": "模型",
-    "modelPlaceholderCodex": "gpt-5 / gpt-5-mini",
+    "modelPlaceholderCodex": "gpt-5.6-sol / gpt-5.5",
     "modelPlaceholderGemini": "gemini-3-pro-preview",
     "claudeMainModel": "主要模型",
     "claudeReasoningModel": "推理模型（思考）",
@@ -2969,6 +3042,40 @@
       "disabled": "已為該代理停用專家",
       "enableFailed": "啟用專家失敗",
       "disableFailed": "停用專家失敗",
+      "openFolderFailed": "開啟目錄失敗"
+    }
+  },
+  "ScienceSettings": {
+    "title": "科學研究技能",
+    "description": "為你的 AI 編碼智能體啟用精選的科學研究技能：假設生成、實驗設計、統計、視覺化、批判性評估與文獻檢索。codeg 管理中央副本，並將每個技能連結到你選擇的智能體。",
+    "loading": "正在載入科學研究技能…",
+    "emptySkills": "沒有可用的科學研究技能。請檢查應用程式日誌。",
+    "searchPlaceholder": "依名稱、ID 或描述搜尋科學研究技能",
+    "categories": {
+      "ideation": "構思",
+      "design": "研究設計",
+      "analysis": "分析",
+      "visualization": "視覺化",
+      "evaluation": "評估",
+      "literature": "文獻"
+    },
+    "states": {
+      "not_linked": "未啟用",
+      "linked_to_codeg": "已啟用",
+      "linked_elsewhere": "衝突 — 已有其他連結",
+      "blocked_by_real_directory": "衝突 — 已有同名的自訂 skill 佔用",
+      "broken": "連結損壞"
+    },
+    "badges": {
+      "userModified": "使用者修改過",
+      "needsKey": "需要金鑰",
+      "needsSetup": "可能需環境"
+    },
+    "actions": {
+      "openCentralDir": "開啟中央目錄",
+      "refresh": "重新整理"
+    },
+    "toasts": {
       "openFolderFailed": "開啟目錄失敗"
     }
   },

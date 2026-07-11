@@ -56,6 +56,7 @@ pub enum McpAppType {
     Hermes,
     CodeBuddy,
     KimiCode,
+    Grok,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,8 +338,28 @@ pub async fn mcp_install_from_marketplace(
         }
     };
 
-    for app in &normalized_apps {
-        upsert_server_for_app(*app, &server_id, &canonical_spec)?;
+    let (hostable, excluded): (Vec<McpAppType>, Vec<McpAppType>) = normalized_apps
+        .iter()
+        .copied()
+        .partition(|app| app_can_host_spec(*app, &canonical_spec));
+    if hostable.is_empty() {
+        // Every selected agent was excluded (e.g. only Codex for an SSE server);
+        // fail instead of reporting success while writing nothing (and possibly
+        // returning a pre-existing server with the same id). See issue #325.
+        return Err(mcp_invalid_input(
+            "none of the selected agents can host this MCP server's transport (e.g. Codex does not support SSE)",
+        ));
+    }
+    // A selected-but-excluded app can't host this transport; remove any stale entry
+    // for this id there so it can't win scan precedence and reclassify the spec.
+    for app in excluded {
+        tracing::warn!(
+            "[MCP] {app:?} cannot host server '{server_id}' (transport unsupported); removing any stale entry"
+        );
+        let _ = remove_server_for_app(app, &server_id)?;
+    }
+    for app in hostable {
+        upsert_server_for_app(app, &server_id, &canonical_spec)?;
     }
 
     find_local_server(&server_id)?.ok_or_else(|| {
@@ -361,7 +382,22 @@ pub async fn mcp_upsert_local_server(
             .with_i18n("errors.appsRequired", BTreeMap::new()));
     }
 
-    let target_set = target_apps.iter().copied().collect::<BTreeSet<_>>();
+    // Preflight-exclude apps whose config can't host this transport (e.g. Codex +
+    // SSE) so a multi-agent save neither writes a misrepresented entry nor aborts
+    // the whole operation on the fail-fast `?` below. See issue #325.
+    let target_set = target_apps
+        .iter()
+        .copied()
+        .filter(|app| app_can_host_spec(*app, &canonical_spec))
+        .collect::<BTreeSet<_>>();
+    if target_set.is_empty() {
+        // Every selected agent was excluded (e.g. only Codex chosen for an SSE
+        // server). Surface a clear error rather than silently write nothing and then
+        // fail the reload below.
+        return Err(mcp_invalid_input(
+            "none of the selected agents can host this MCP server's transport (e.g. Codex does not support SSE)",
+        ));
+    }
     let all_apps = [
         McpAppType::ClaudeCode,
         McpAppType::Codex,
@@ -371,6 +407,7 @@ pub async fn mcp_upsert_local_server(
         McpAppType::Hermes,
         McpAppType::CodeBuddy,
         McpAppType::KimiCode,
+        McpAppType::Grok,
     ];
 
     for app in all_apps {
@@ -397,7 +434,23 @@ pub async fn mcp_set_server_apps(
     let current = find_local_server(&server_id)?
         .ok_or_else(|| mcp_not_found(format!("local MCP server not found: {server_id}")))?;
 
-    let target_set = target_apps.iter().copied().collect::<BTreeSet<_>>();
+    // Preflight-exclude apps whose config can't host this transport (e.g. Codex +
+    // SSE); such an app is treated as "not targeted" so any stale entry is removed
+    // rather than rewritten as a misrepresented one. See issue #325.
+    let target_set = target_apps
+        .iter()
+        .copied()
+        .filter(|app| app_can_host_spec(*app, &current.spec))
+        .collect::<BTreeSet<_>>();
+    if !target_apps.is_empty() && target_set.is_empty() {
+        // Every explicitly selected agent was excluded (e.g. only Codex chosen for
+        // an SSE server). Fail before mutating rather than silently delete the
+        // server; an explicit empty `apps` still means "remove from all" and is
+        // allowed to fall through.
+        return Err(mcp_invalid_input(
+            "none of the selected agents can host this MCP server's transport (e.g. Codex does not support SSE)",
+        ));
+    }
     let current_set = current.apps.iter().copied().collect::<BTreeSet<_>>();
 
     for app in current_set.difference(&target_set) {
@@ -427,6 +480,7 @@ pub async fn mcp_remove_server(
             McpAppType::Hermes,
             McpAppType::CodeBuddy,
             McpAppType::KimiCode,
+            McpAppType::Grok,
         ],
     };
 
@@ -447,6 +501,17 @@ fn normalize_apps(apps: Vec<McpAppType>) -> Vec<McpAppType> {
         seen.insert(app);
     }
     seen.into_iter().collect()
+}
+
+/// Whether `app`'s on-disk config can faithfully host `canonical_spec`. Codex's
+/// config.toml has only stdio and streamable-HTTP transports, so it cannot host an
+/// SSE server — writing one would persist a url-only entry that Codex loads as HTTP
+/// and codeg then reads back as `http`, silently reclassifying the shared canonical
+/// spec. Write paths preflight-exclude such (app, spec) pairs instead of writing a
+/// misrepresented entry or aborting the whole multi-agent operation. See issue #325.
+fn app_can_host_spec(app: McpAppType, canonical_spec: &Value) -> bool {
+    let is_sse = canonical_spec.get("type").and_then(Value::as_str) == Some("sse");
+    !(app == McpAppType::Codex && is_sse)
 }
 
 #[derive(Debug, Clone)]
@@ -1161,22 +1226,50 @@ fn codex_entry_to_canonical(id: &str, value: &toml::Value) -> Result<Value, AppC
         .as_table()
         .ok_or_else(|| mcp_invalid_input(format!("Codex MCP entry '{id}' must be a table")))?;
 
+    // Codex's native `[mcp_servers.*]` tables carry no `type` key — the transport
+    // is implied by the keys present (`command` = stdio, `url` = streamable HTTP).
+    // Honor an explicit `type` when present (older codeg output or hand-written
+    // configs), but when it is absent infer the transport from the keys rather
+    // than blindly assuming stdio, which would drop every url-only HTTP server
+    // (including the ones codeg now writes). See issue #325.
     let raw_type = table
         .get("type")
         .and_then(toml::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("stdio")
-        .to_string();
-    let canonical_type = normalize_mcp_type(&raw_type).ok_or_else(|| {
-        mcp_invalid_input(format!(
-            "Codex MCP entry '{id}' has unsupported type '{raw_type}'"
-        ))
-        .with_i18n(
-            "errors.codexEntryUnsupportedType",
-            mcp_i18n_params([("id", id), ("type", raw_type.as_str())]),
-        )
-    })?;
+        .map(str::to_string);
+    let has_key = |key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
+    // Codex hard-errors on an entry that carries BOTH `command` and `url` (mixed
+    // transports). Reject it here rather than silently classifying it as stdio and
+    // dropping `url` — which would both misrepresent the entry and let a later save
+    // erase the conflicting field. Presence (not just non-empty) mirrors Codex's
+    // own `throw_if_set` check. See issue #325.
+    if table.contains_key("command") && table.contains_key("url") {
+        return Err(mcp_invalid_input(format!(
+            "Codex MCP entry '{id}' sets both 'command' and 'url'; Codex accepts exactly one transport"
+        )));
+    }
+    let canonical_type = match raw_type.as_deref() {
+        Some(raw) => normalize_mcp_type(raw).ok_or_else(|| {
+            mcp_invalid_input(format!(
+                "Codex MCP entry '{id}' has unsupported type '{raw}'"
+            ))
+            .with_i18n(
+                "errors.codexEntryUnsupportedType",
+                mcp_i18n_params([("id", id), ("type", raw)]),
+            )
+        })?,
+        // No `command` and no `url` falls back to stdio so the downstream
+        // canonicalize surfaces a clear "missing command" error.
+        None if has_key("url") && !has_key("command") => "http",
+        None => "stdio",
+    };
 
     let mut spec = Map::new();
     spec.insert(
@@ -1267,12 +1360,15 @@ fn codex_entry_to_canonical(id: &str, value: &toml::Value) -> Result<Value, AppC
             }
         }
         _ => {
+            // Reachable only when an explicit `type` normalized to an OpenCode-only
+            // alias (`local`/`remote`), which Codex TOML does not accept.
+            let raw = raw_type.as_deref().unwrap_or(canonical_type);
             return Err(mcp_invalid_input(format!(
-                "Codex MCP entry '{id}' has unsupported type '{raw_type}'"
+                "Codex MCP entry '{id}' has unsupported type '{raw}'"
             ))
             .with_i18n(
                 "errors.codexEntryUnsupportedType",
-                mcp_i18n_params([("id", id), ("type", raw_type.as_str())]),
+                mcp_i18n_params([("id", id), ("type", raw)]),
             ));
         }
     }
@@ -1303,8 +1399,14 @@ fn canonical_to_codex_entry(spec: &Value) -> Result<toml::Value, AppCommandError
 
     let typ = obj.get("type").and_then(Value::as_str).unwrap_or("stdio");
 
+    // Codex's config.toml has NO `type` field under `[mcp_servers.*]`: it infers
+    // the transport from the keys present — `command` = stdio, `url` = streamable
+    // HTTP. An emitted `type` is silently ignored on Codex's default read path but
+    // is schema-invalid (Codex's generated JSON-Schema rejects it) and FATAL under
+    // `codex --strict-config`, so the `type` discriminator is used only to branch
+    // here and is never written out. Same hazard for any other foreign key (see the
+    // allowlist below). See issue #325.
     let mut table = toml::map::Map::new();
-    table.insert("type".to_string(), toml::Value::String(typ.to_string()));
 
     match typ {
         "stdio" => {
@@ -1355,8 +1457,8 @@ fn canonical_to_codex_entry(spec: &Value) -> Result<toml::Value, AppCommandError
                 }
             }
         }
-        "http" | "sse" => {
-            // env intentionally not written for http/sse: per ACP/MCP spec, env is
+        "http" => {
+            // env intentionally not written for http: per ACP/MCP spec, env is
             // stdio-only; remote transports use headers. canonicalize_spec strips
             // env upstream too.
             let url = obj.get("url").and_then(Value::as_str).ok_or_else(|| {
@@ -1384,6 +1486,18 @@ fn canonical_to_codex_entry(spec: &Value) -> Result<toml::Value, AppCommandError
                 }
             }
         }
+        "sse" => {
+            // Codex's config.toml has only stdio and streamable-HTTP transports — it
+            // cannot represent SSE. Reject rather than degrade to a bare `url`, which
+            // Codex would load as HTTP and codeg would then read back as `http`,
+            // silently reclassifying the shared canonical spec (and defeating the ACP
+            // wire-path SSE capability gate). Batch callers preflight-exclude Codex
+            // from an SSE server's targets (see `app_can_host_spec`); this is the
+            // backstop for any direct caller. See issue #325.
+            return Err(mcp_invalid_input(
+                "Codex conversion: SSE MCP servers are not supported by Codex; use streamable HTTP",
+            ));
+        }
         _ => {
             return Err(mcp_invalid_input(format!(
                 "Codex conversion: unsupported MCP type '{typ}'"
@@ -1391,15 +1505,22 @@ fn canonical_to_codex_entry(spec: &Value) -> Result<toml::Value, AppCommandError
         }
     }
 
+    // Pass through only Codex `RawMcpServerConfig` fields that are transport-agnostic
+    // AND validated to have Codex's exact value type here. A field-name allowlist
+    // alone is not enough: canonicalization preserves arbitrary values, so a
+    // same-named foreign field of the wrong shape (e.g. `"enabled": "false"`, or a
+    // number where Codex wants a bool) would be written to Codex TOML and fail strict
+    // deserialization — the same class of bug as the `type` field. Transport-specific
+    // or complex/uncertain fields (env_vars, auth, oauth, tools, bearer_token_env_var,
+    // startup_timeout_*, name, …) are emitted by the transport arms where they belong
+    // or intentionally NOT round-tripped — a rare, non-fatal loss versus a
+    // `--strict-config` failure. See issue #325.
     for (key, value) in obj {
-        if key == "type"
-            || key == "command"
-            || key == "args"
-            || key == "env"
-            || key == "cwd"
-            || key == "url"
-            || key == "headers"
-        {
+        let allowed = match key.as_str() {
+            "enabled" | "required" => value.is_boolean(),
+            _ => false,
+        };
+        if !allowed {
             continue;
         }
         if let Some(converted) = json_to_toml_value(value) {
@@ -2031,6 +2152,28 @@ fn read_cline_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
     Ok(out)
 }
 
+/// Convert codeg's canonical spec into a Cline `mcpServers` entry.
+///
+/// Cline validates each entry with a zod union whose `type` is a literal enum of
+/// exactly `stdio | sse | streamableHttp` — it does NOT accept the canonical
+/// `http`. Worse, `mcpServers` is validated as one `z.record`, so a single
+/// rejected entry makes Cline load *zero* servers. Remap `http` → `streamableHttp`
+/// (which codeg's reader collapses straight back to canonical `http` via
+/// `normalize_mcp_type`); stdio/sse already match Cline's literals and pass
+/// through untouched. See issue #325.
+fn canonical_to_cline_entry(spec: &Value) -> Result<Value, AppCommandError> {
+    let mut canonical = canonicalize_spec(spec, "Cline write")?;
+    if let Some(obj) = canonical.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("http") {
+            obj.insert(
+                "type".to_string(),
+                Value::String("streamableHttp".to_string()),
+            );
+        }
+    }
+    Ok(canonical)
+}
+
 fn upsert_cline_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
     let path = cline_config_path();
     let mut root = read_json_file(&path)?;
@@ -2038,7 +2181,7 @@ fn upsert_cline_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
         root = json!({});
     }
 
-    let canonical = canonicalize_spec(spec, "Cline write")?;
+    let canonical = canonical_to_cline_entry(spec)?;
 
     let obj = root.as_object_mut().ok_or_else(|| {
         mcp_configuration_invalid(format!("invalid JSON root in {}", path.display()))
@@ -2138,6 +2281,13 @@ fn scan_local_servers() -> Result<Vec<LocalMcpServer>, AppCommandError> {
         entry.1.insert(McpAppType::KimiCode);
     }
 
+    for (id, spec) in read_grok_servers()? {
+        let entry = merged
+            .entry(id)
+            .or_insert_with(|| (spec.clone(), BTreeSet::new()));
+        entry.1.insert(McpAppType::Grok);
+    }
+
     Ok(merged
         .into_iter()
         .map(|(id, (spec, apps))| LocalMcpServer {
@@ -2163,6 +2313,7 @@ fn upsert_server_for_app(app: McpAppType, id: &str, spec: &Value) -> Result<(), 
         McpAppType::Hermes => upsert_hermes_server(id, spec),
         McpAppType::CodeBuddy => upsert_codebuddy_server(id, spec),
         McpAppType::KimiCode => upsert_kimi_code_server(id, spec),
+        McpAppType::Grok => upsert_grok_server(id, spec),
     }
 }
 
@@ -2179,6 +2330,7 @@ pub fn read_servers_for_agent_type(
         AgentType::Hermes => read_hermes_servers(),
         AgentType::CodeBuddy => read_codebuddy_servers(),
         AgentType::KimiCode => read_kimi_code_servers(),
+        AgentType::Grok => read_grok_servers(),
         // pi-acp drops ACP-wire MCP and pi has no native MCP (it needs a
         // third-party extension), so codeg manages no MCP servers for pi (v1).
         AgentType::Pi => Ok(BTreeMap::new()),
@@ -2208,6 +2360,54 @@ fn read_kimi_code_servers() -> Result<BTreeMap<String, Value>, AppCommandError> 
     read_kimi_code_servers_at(&kimi_code_mcp_json_path())
 }
 
+/// Convert one Kimi `mcpServers` entry into codeg's canonical spec.
+///
+/// Kimi Code 0.23.3 validates `mcp.json` with a Zod discriminated union keyed on
+/// `transport` (`stdio`/`http`/`sse`): `command` ⇒ stdio, and a url-only remote
+/// entry DEFAULTS to streamable HTTP — it never infers SSE from the URL path, and
+/// `type` is not a recognized field (silently stripped). Mirror that so codeg
+/// classifies an entry the way Kimi actually will: stdio from `command`; otherwise
+/// a `url` is remote with transport taken from an explicit `transport` key (only
+/// `sse` yields SSE), else HTTP. `type` is intentionally NOT consulted for remote
+/// (Kimi ignores it). `transport` is then dropped from the canonical spec so it
+/// can't leak into another agent's config on a cross-agent sync. See issue #325.
+fn kimi_code_entry_to_canonical(spec: &Value, id: &str) -> Result<Value, AppCommandError> {
+    let Some(obj) = spec.as_object() else {
+        return canonicalize_spec(spec, "Kimi Code config");
+    };
+    let mut obj = obj.clone();
+    // Kimi 0.23.3 keys the transport off the `transport` DISCRIMINANT whenever it is
+    // present (exact literals `stdio`/`http`/`sse`, and it overrides `command`/`url`
+    // shape); only when `transport` is ABSENT does it infer (`command` ⇒ stdio,
+    // `url` ⇒ http). Crucially, Kimi never consults `type` — it strips it — so drop
+    // any on-disk `type` up front: an explicit `transport` sets the canonical type
+    // below, and an absent one leaves classification to canonicalize's own
+    // command⇒stdio / url⇒http inference (matching Kimi) rather than a stale `type`.
+    // `transport` is likewise dropped after mapping so it can't leak into another
+    // agent's config on a cross-agent sync. See issue #325.
+    obj.remove("type");
+    // Read the discriminant into an owned value first so the map isn't borrowed when
+    // we mutate it below. `transport` absent ⇒ infer; present-but-non-string or an
+    // unknown literal ⇒ reject (as Kimi would).
+    let explicit_transport = obj.get("transport").and_then(Value::as_str).map(str::to_string);
+    if obj.contains_key("transport") {
+        let canonical_type = match explicit_transport.as_deref() {
+            Some("stdio") => "stdio",
+            Some("http") => "http",
+            Some("sse") => "sse",
+            other => {
+                let shown = other.unwrap_or("<non-string>");
+                return Err(mcp_invalid_input(format!(
+                    "Kimi Code config '{id}': unsupported transport '{shown}' (Kimi accepts only \"stdio\", \"http\", or \"sse\")"
+                )));
+            }
+        };
+        obj.insert("type".to_string(), Value::String(canonical_type.to_string()));
+    }
+    obj.remove("transport");
+    canonicalize_spec(&Value::Object(obj), &format!("Kimi Code config '{id}'"))
+}
+
 fn read_kimi_code_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, AppCommandError> {
     let root = read_json_file(path)?;
     let mut out = BTreeMap::new();
@@ -2217,7 +2417,7 @@ fn read_kimi_code_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, App
     };
 
     for (id, spec) in servers {
-        match canonicalize_spec(spec, "Kimi Code config") {
+        match kimi_code_entry_to_canonical(spec, id) {
             Ok(normalized) => {
                 out.insert(id.to_string(), normalized);
             }
@@ -2228,6 +2428,50 @@ fn read_kimi_code_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, App
     }
 
     Ok(out)
+}
+
+/// Convert codeg's canonical spec into a Kimi `mcpServers` entry.
+///
+/// Kimi Code 0.23.3 keys the transport off a `transport` field (Zod
+/// discriminated union), defaulting a url-only remote entry to streamable HTTP — an
+/// SSE server MUST carry an explicit `transport: "sse"` or it silently downgrades to
+/// HTTP. So emit `transport` for remote entries. The streamable-HTTP literal is
+/// `"http"` (NOT `"streamable-http"`, which Kimi rejects — and one bad entry fails
+/// the whole `mcpServers` record). stdio needs no `transport` (Kimi injects it from
+/// `command`). The canonical `type` is left in place but Kimi ignores/strips it.
+/// See issue #325.
+fn canonical_to_kimi_code_entry(spec: &Value) -> Result<Value, AppCommandError> {
+    let canonical = canonicalize_spec(spec, "Kimi Code write")?;
+    let Some(obj) = canonical.as_object() else {
+        return Ok(canonical);
+    };
+    let transport = match obj.get("type").and_then(Value::as_str) {
+        Some("http") => Some("http"),
+        Some("sse") => Some("sse"),
+        _ => None, // stdio: Kimi infers the transport from `command`
+    };
+    // Emit only the fields Kimi models, each validated to its expected type — the
+    // same guard the Codex writer uses. Kimi validates its known fields and rejects
+    // the ENTIRE `mcpServers` record on a wrong-typed one (e.g. `"enabled": "false"`),
+    // so a stray same-named foreign value must not ride canonicalize's passthrough
+    // onto disk. The canonical `command`/`args`/`env`/`cwd`/`url`/`headers` already
+    // carry Kimi-compatible types; `type` is kept but Kimi ignores/strips it.
+    // See issue #325.
+    let mut out = Map::new();
+    for (key, value) in obj {
+        let keep = match key.as_str() {
+            "type" | "command" | "args" | "env" | "cwd" | "url" | "headers" => true,
+            "enabled" => value.is_boolean(),
+            _ => false,
+        };
+        if keep {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(transport) = transport {
+        out.insert("transport".to_string(), Value::String(transport.to_string()));
+    }
+    Ok(Value::Object(out))
 }
 
 fn upsert_kimi_code_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
@@ -2244,7 +2488,7 @@ fn upsert_kimi_code_server_at(
         root = json!({});
     }
 
-    let canonical = canonicalize_spec(spec, "Kimi Code write")?;
+    let canonical = canonical_to_kimi_code_entry(spec)?;
 
     let obj = root.as_object_mut().ok_or_else(|| {
         mcp_configuration_invalid(format!("invalid JSON root in {}", path.display()))
@@ -2284,6 +2528,333 @@ fn remove_kimi_code_server_at(path: &Path, id: &str) -> Result<bool, AppCommandE
     let removed = servers.remove(id).is_some();
     if removed {
         write_json_file(path, &root)?;
+    }
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Grok  (~/.grok/config.toml  →  [mcp_servers.<name>])
+//
+// Grok reads its user-global MCP config from `<GROK_HOME>/config.toml` (default
+// `~/.grok/config.toml`) under `[mcp_servers.<name>]` sections — the same TOML
+// table Codex uses, but WITHOUT a `type` discriminator: Grok infers the
+// transport from the presence of `command` (stdio) vs `url` (http/sse). The
+// file also holds unrelated sections (`[cli]`, `[ui]`, `[model.*]`), so we
+// read/modify/write the whole document and only touch `[mcp_servers]`.
+//
+// Because Grok loads this file natively at session start, `Grok` is on the ACP
+// forward skip list in `connection.rs` (like Hermes/Kimi) so the same user
+// servers aren't double-registered over `session/new`. The built-in `codeg-mcp`
+// companion is injected separately by `inject_codeg_mcp`, so it still reaches
+// Grok over the wire regardless.
+// ---------------------------------------------------------------------------
+
+fn grok_config_toml_path() -> PathBuf {
+    crate::parsers::grok::resolve_grok_home_dir().join("config.toml")
+}
+
+fn read_grok_root_toml_at(path: &Path) -> Result<toml::Value, AppCommandError> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let raw = fs::read_to_string(path).map_err(AppCommandError::io)?;
+    let parsed = raw.parse::<toml::Value>().map_err(|e| {
+        mcp_configuration_invalid(format!("invalid TOML at {}: {e}", path.display()))
+    })?;
+    if !parsed.is_table() {
+        return Err(mcp_configuration_invalid(format!(
+            "invalid TOML root at {}: expected table",
+            path.display()
+        )));
+    }
+    Ok(parsed)
+}
+
+fn write_grok_root_toml_at(path: &Path, root: &toml::Value) -> Result<(), AppCommandError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(AppCommandError::io)?;
+    }
+    let serialized = toml::to_string_pretty(root).map_err(|e| {
+        mcp_configuration_invalid(format!("failed to serialize TOML for {}: {e}", path.display()))
+    })?;
+    fs::write(path, format!("{serialized}\n")).map_err(AppCommandError::io)
+}
+
+/// Canonical spec → a Grok `[mcp_servers.<name>]` TOML entry. Grok has no
+/// `type` key (it infers transport from `command`/`url`), so we never write one;
+/// unknown canonical keys (e.g. `enabled`, `startup_timeout_sec`) pass through.
+fn canonical_to_grok_entry(spec: &Value) -> Result<toml::Value, AppCommandError> {
+    let canonical = canonicalize_spec(spec, "Grok conversion")?;
+    let obj = canonical
+        .as_object()
+        .ok_or_else(|| mcp_invalid_input("Grok conversion: canonical spec must be an object"))?;
+    let typ = obj.get("type").and_then(Value::as_str).unwrap_or("stdio");
+
+    let mut table = toml::map::Map::new();
+    match typ {
+        "stdio" => {
+            let command = obj.get("command").and_then(Value::as_str).ok_or_else(|| {
+                mcp_invalid_input("Grok conversion: stdio MCP spec missing command")
+            })?;
+            table.insert("command".to_string(), toml::Value::String(command.to_string()));
+            if let Some(args) = obj.get("args").and_then(Value::as_array) {
+                let values = args
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| toml::Value::String(value.to_string()))
+                    .collect::<Vec<_>>();
+                if !values.is_empty() {
+                    table.insert("args".to_string(), toml::Value::Array(values));
+                }
+            }
+            if let Some(env) = obj.get("env").and_then(Value::as_object) {
+                let mut env_table = toml::map::Map::new();
+                for (key, value) in env {
+                    if let Some(text) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        env_table.insert(key.to_string(), toml::Value::String(text.to_string()));
+                    }
+                }
+                if !env_table.is_empty() {
+                    table.insert("env".to_string(), toml::Value::Table(env_table));
+                }
+            }
+            if let Some(cwd) = obj
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                table.insert("cwd".to_string(), toml::Value::String(cwd.to_string()));
+            }
+        }
+        "http" | "sse" => {
+            // Grok infers `http` from a bare `url` and omits `type` for it, but
+            // SSE must carry an explicit `type = "sse"` (verified against Grok's
+            // CLI) — otherwise it round-trips back to `http` and loses the SSE
+            // transport.
+            if typ == "sse" {
+                table.insert("type".to_string(), toml::Value::String("sse".to_string()));
+            }
+            let url = obj
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| mcp_invalid_input("Grok conversion: remote MCP spec missing url"))?;
+            table.insert("url".to_string(), toml::Value::String(url.to_string()));
+            if let Some(headers) = obj.get("headers").and_then(Value::as_object) {
+                let mut headers_table = toml::map::Map::new();
+                for (key, value) in headers {
+                    if let Some(text) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        headers_table
+                            .insert(key.to_string(), toml::Value::String(text.to_string()));
+                    }
+                }
+                if !headers_table.is_empty() {
+                    table.insert("headers".to_string(), toml::Value::Table(headers_table));
+                }
+            }
+        }
+        other => {
+            return Err(mcp_invalid_input(format!(
+                "Grok conversion: unsupported MCP type '{other}'"
+            )));
+        }
+    }
+
+    // Preserve any extra canonical keys (e.g. `enabled`, timeouts) except the
+    // transport fields we already emitted and `type` (Grok has none).
+    for (key, value) in obj {
+        if matches!(
+            key.as_str(),
+            "type" | "command" | "args" | "env" | "cwd" | "url" | "headers"
+        ) {
+            continue;
+        }
+        if let Some(converted) = json_to_toml_value(value) {
+            table.insert(key.to_string(), converted);
+        }
+    }
+
+    Ok(toml::Value::Table(table))
+}
+
+/// A Grok `[mcp_servers.<name>]` TOML entry → canonical spec. Transport is
+/// inferred: a `url` is http (unless SSE is explicit elsewhere), else stdio.
+fn grok_entry_to_canonical(id: &str, value: &toml::Value) -> Result<Value, AppCommandError> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| mcp_invalid_input(format!("Grok MCP entry '{id}' must be a table")))?;
+
+    let mut spec = Map::new();
+    // Grok omits `type` for stdio and http (a bare `url` implies http), but
+    // writes `type = "sse"` explicitly for SSE (verified against Grok's CLI).
+    // Honor an explicit type; otherwise infer the transport from `url` presence.
+    let explicit_type = table
+        .get("type")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let has_url = table
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let is_remote = matches!(explicit_type, Some("http") | Some("sse"))
+        || (has_url && explicit_type != Some("stdio"));
+
+    if is_remote {
+        let canonical_type = if explicit_type == Some("sse") { "sse" } else { "http" };
+        spec.insert("type".to_string(), Value::String(canonical_type.to_string()));
+        if let Some(url) = table.get("url").and_then(toml::Value::as_str) {
+            spec.insert("url".to_string(), Value::String(url.trim().to_string()));
+        }
+        if let Some(headers) = table.get("headers").and_then(toml::Value::as_table) {
+            let mut mapped = Map::new();
+            for (key, value) in headers {
+                if let Some(text) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    mapped.insert(key.to_string(), Value::String(text.to_string()));
+                }
+            }
+            if !mapped.is_empty() {
+                spec.insert("headers".to_string(), Value::Object(mapped));
+            }
+        }
+    } else {
+        spec.insert("type".to_string(), Value::String("stdio".to_string()));
+        if let Some(command) = table
+            .get("command")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            spec.insert("command".to_string(), Value::String(command.to_string()));
+        }
+        if let Some(args) = table.get("args").and_then(toml::Value::as_array) {
+            let values = args
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| Value::String(value.to_string()))
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                spec.insert("args".to_string(), Value::Array(values));
+            }
+        }
+        if let Some(env) = table.get("env").and_then(toml::Value::as_table) {
+            let mut env_map = Map::new();
+            for (key, value) in env {
+                if let Some(text) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    env_map.insert(key.to_string(), Value::String(text.to_string()));
+                }
+            }
+            if !env_map.is_empty() {
+                spec.insert("env".to_string(), Value::Object(env_map));
+            }
+        }
+        if let Some(cwd) = table
+            .get("cwd")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            spec.insert("cwd".to_string(), Value::String(cwd.to_string()));
+        }
+    }
+
+    // Passthrough for any Grok-specific keys we don't model (enabled, timeouts).
+    // `type` is handled explicitly above (transport inference), so skip it here.
+    for (key, value) in table {
+        if matches!(
+            key.as_str(),
+            "type" | "command" | "args" | "env" | "cwd" | "url" | "headers"
+        ) {
+            continue;
+        }
+        spec.insert(key.to_string(), toml_to_json_value(value));
+    }
+
+    canonicalize_spec(&Value::Object(spec), "Grok config")
+}
+
+fn read_grok_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
+    read_grok_servers_at(&grok_config_toml_path())
+}
+
+fn read_grok_servers_at(path: &Path) -> Result<BTreeMap<String, Value>, AppCommandError> {
+    let root = read_grok_root_toml_at(path)?;
+    let mut out = BTreeMap::new();
+    let Some(table) = root.as_table() else {
+        return Ok(out);
+    };
+    if let Some(servers) = table.get("mcp_servers").and_then(toml::Value::as_table) {
+        for (id, spec) in servers {
+            match grok_entry_to_canonical(id, spec) {
+                Ok(normalized) => {
+                    out.insert(id.to_string(), normalized);
+                }
+                Err(err) => {
+                    tracing::warn!("[MCP] skip invalid Grok mcp_servers entry id={id}: {err}");
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn upsert_grok_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
+    upsert_grok_server_at(&grok_config_toml_path(), id, spec)
+}
+
+fn upsert_grok_server_at(path: &Path, id: &str, spec: &Value) -> Result<(), AppCommandError> {
+    let mut root = read_grok_root_toml_at(path)?;
+    let table = root
+        .as_table_mut()
+        .ok_or_else(|| mcp_configuration_invalid("Grok root TOML must be a table"))?;
+
+    let entry = canonical_to_grok_entry(spec)?;
+    if !table
+        .get("mcp_servers")
+        .map(toml::Value::is_table)
+        .unwrap_or(false)
+    {
+        table.insert(
+            "mcp_servers".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let mcp_servers = table
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| mcp_configuration_invalid("Grok mcp_servers must be a TOML table"))?;
+    mcp_servers.insert(id.to_string(), entry);
+
+    write_grok_root_toml_at(path, &root)
+}
+
+fn remove_grok_server(id: &str) -> Result<bool, AppCommandError> {
+    remove_grok_server_at(&grok_config_toml_path(), id)
+}
+
+fn remove_grok_server_at(path: &Path, id: &str) -> Result<bool, AppCommandError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut root = read_grok_root_toml_at(path)?;
+    let Some(table) = root.as_table_mut() else {
+        return Ok(false);
+    };
+    let mut removed = false;
+    if let Some(mcp_servers) = table.get_mut("mcp_servers").and_then(toml::Value::as_table_mut) {
+        removed |= mcp_servers.remove(id).is_some();
+        if mcp_servers.is_empty() {
+            table.remove("mcp_servers");
+        }
+    }
+    if removed {
+        write_grok_root_toml_at(path, &root)?;
     }
     Ok(removed)
 }
@@ -2541,6 +3112,7 @@ fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandEr
         McpAppType::Hermes => remove_hermes_server(id),
         McpAppType::CodeBuddy => remove_codebuddy_server(id),
         McpAppType::KimiCode => remove_kimi_code_server(id),
+        McpAppType::Grok => remove_grok_server(id),
     }
 }
 
@@ -4374,6 +4946,111 @@ mod tests {
         assert!(!remove_kimi_code_server_at(&path, "ctx7").expect("remove again"));
     }
 
+    #[test]
+    fn grok_config_toml_round_trips_and_preserves_sections() {
+        // Grok reads `<GROK_HOME>/config.toml` `[mcp_servers.<name>]` natively —
+        // same table as Codex but with NO `type` key (transport inferred). The
+        // file also holds unrelated `[cli]`/`[ui]` sections that must survive.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[cli]\nauto_update = true\n\n[ui]\nyolo = false\n",
+        )
+        .expect("seed config");
+
+        // Missing entry → no servers; removing is a no-op.
+        assert!(read_grok_servers_at(&path).expect("read seed").is_empty());
+        assert!(!remove_grok_server_at(&path, "fs").expect("remove missing"));
+
+        // Upsert a stdio server carrying command/args/env/cwd.
+        let stdio = json!({
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            "env": { "TOKEN": "sk-abc" },
+            "cwd": "/work/dir",
+        });
+        upsert_grok_server_at(&path, "fs", &stdio).expect("upsert stdio");
+
+        // Upsert a remote server with headers (Grok uses `headers`, not
+        // Codex's `http_headers`).
+        let http = json!({
+            "type": "http",
+            "url": "https://mcp.example.com/mcp",
+            "headers": { "Authorization": "Bearer xyz" },
+        });
+        upsert_grok_server_at(&path, "remote", &http).expect("upsert http");
+
+        // Upsert an SSE server — Grok marks these with an explicit `type = "sse"`;
+        // without it the entry would round-trip back to `http`.
+        let sse = json!({ "type": "sse", "url": "https://mcp.linear.app/sse" });
+        upsert_grok_server_at(&path, "linear", &sse).expect("upsert sse");
+
+        // All round-trip, canonicalized, with cwd + headers + sse transport kept.
+        let servers = read_grok_servers_at(&path).expect("read back");
+        assert_eq!(servers.len(), 3);
+        let fs = servers.get("fs").expect("fs present");
+        assert_eq!(fs.get("type").and_then(Value::as_str), Some("stdio"));
+        assert_eq!(fs.get("command").and_then(Value::as_str), Some("npx"));
+        assert_eq!(fs.get("cwd").and_then(Value::as_str), Some("/work/dir"));
+        assert_eq!(
+            fs.pointer("/env/TOKEN").and_then(Value::as_str),
+            Some("sk-abc")
+        );
+        let remote = servers.get("remote").expect("remote present");
+        assert_eq!(remote.get("type").and_then(Value::as_str), Some("http"));
+        assert_eq!(
+            remote.pointer("/headers/Authorization").and_then(Value::as_str),
+            Some("Bearer xyz")
+        );
+        let linear = servers.get("linear").expect("linear present");
+        assert_eq!(linear.get("type").and_then(Value::as_str), Some("sse"));
+        assert_eq!(
+            linear.get("url").and_then(Value::as_str),
+            Some("https://mcp.linear.app/sse")
+        );
+
+        // On-disk: `[mcp_servers.fs]` has NO `type` key, `[cli]`/`[ui]` survive.
+        let raw = std::fs::read_to_string(&path).expect("read file");
+        let root: toml::Value = raw.parse().expect("parse toml");
+        let table = root.as_table().expect("root table");
+        assert!(table.contains_key("cli"), "[cli] preserved");
+        assert!(table.contains_key("ui"), "[ui] preserved");
+        let fs_entry = table
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .and_then(|m| m.get("fs"))
+            .and_then(toml::Value::as_table)
+            .expect("mcp_servers.fs");
+        assert!(!fs_entry.contains_key("type"), "stdio entries omit `type`");
+        assert_eq!(
+            fs_entry.get("cwd").and_then(toml::Value::as_str),
+            Some("/work/dir")
+        );
+        // SSE entries, by contrast, must keep the explicit `type = "sse"`.
+        let linear_entry = table
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .and_then(|m| m.get("linear"))
+            .and_then(toml::Value::as_table)
+            .expect("mcp_servers.linear");
+        assert_eq!(
+            linear_entry.get("type").and_then(toml::Value::as_str),
+            Some("sse")
+        );
+
+        // Remove one; the others and the unrelated sections remain.
+        assert!(remove_grok_server_at(&path, "fs").expect("remove fs"));
+        let after = read_grok_servers_at(&path).expect("read after remove");
+        assert_eq!(after.len(), 2);
+        assert!(after.contains_key("remote"));
+        assert!(after.contains_key("linear"));
+        let raw2 = std::fs::read_to_string(&path).expect("read file 2");
+        let root2: toml::Value = raw2.parse().expect("parse toml 2");
+        assert!(root2.as_table().expect("t").contains_key("cli"));
+    }
+
     fn codex_entry(toml_src: &str) -> toml::Value {
         toml::from_str::<toml::Value>(toml_src).expect("parse test toml")
     }
@@ -4444,6 +5121,338 @@ mod tests {
             assert!(
                 codex_entry_to_canonical("ex", &value).is_err(),
                 "raw {raw:?} should not be accepted by Codex pipeline",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_to_codex_entry_never_emits_type_field() {
+        // Codex infers the transport from the keys present; an emitted `type` is
+        // schema-invalid and fatal under `codex --strict-config` (#325). No
+        // transport may emit it.
+        let stdio = canonical_to_codex_entry(&json!({
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "tavily-mcp@0.2.15"],
+        }))
+        .expect("stdio entry")
+        .as_table()
+        .cloned()
+        .expect("stdio table");
+        assert!(!stdio.contains_key("type"), "stdio must not carry type");
+        assert_eq!(
+            stdio.get("command").and_then(toml::Value::as_str),
+            Some("npx")
+        );
+
+        let http = canonical_to_codex_entry(&json!({
+            "type": "http",
+            "url": "https://mcp.exa.ai/mcp",
+        }))
+        .expect("http entry")
+        .as_table()
+        .cloned()
+        .expect("http table");
+        assert!(!http.contains_key("type"), "http must not carry type");
+        assert_eq!(
+            http.get("url").and_then(toml::Value::as_str),
+            Some("https://mcp.exa.ai/mcp")
+        );
+
+        // Codex can't represent SSE (its config.toml has only stdio + streamable
+        // HTTP); the writer rejects it rather than degrade to a bare `url` that
+        // would read back as `http` and reclassify the shared spec.
+        assert!(
+            canonical_to_codex_entry(&json!({
+                "type": "sse",
+                "url": "https://mcp.example.com/sse",
+            }))
+            .is_err(),
+            "sse must be rejected for Codex"
+        );
+    }
+
+    #[test]
+    fn app_can_host_spec_excludes_codex_from_sse_only() {
+        let sse = json!({"type": "sse", "url": "https://x/sse"});
+        let http = json!({"type": "http", "url": "https://x/mcp"});
+        let stdio = json!({"type": "stdio", "command": "npx"});
+        // Codex can host stdio/http but not sse.
+        assert!(!app_can_host_spec(McpAppType::Codex, &sse));
+        assert!(app_can_host_spec(McpAppType::Codex, &http));
+        assert!(app_can_host_spec(McpAppType::Codex, &stdio));
+        // Every other agent can host sse.
+        assert!(app_can_host_spec(McpAppType::Gemini, &sse));
+        assert!(app_can_host_spec(McpAppType::Cline, &sse));
+        assert!(app_can_host_spec(McpAppType::KimiCode, &sse));
+    }
+
+    #[test]
+    fn codex_entry_infers_transport_when_type_absent() {
+        // Native Codex tables (and codeg's own post-#325 output) carry no `type`;
+        // the reader must infer it from the transport keys, not assume stdio (which
+        // silently dropped every url-only server). Mirrors the issue's config.
+        let http = codex_entry("url = \"https://mcp.exa.ai/mcp\"\n");
+        let canonical = codex_entry_to_canonical("exa", &http).expect("url-only entry");
+        assert_eq!(canonical.get("type").and_then(Value::as_str), Some("http"));
+        assert_eq!(
+            canonical.get("url").and_then(Value::as_str),
+            Some("https://mcp.exa.ai/mcp")
+        );
+
+        let stdio = codex_entry("command = \"npx\"\nargs = [\"-y\", \"tavily-mcp@0.2.15\"]\n");
+        let canonical = codex_entry_to_canonical("tavily", &stdio).expect("command-only entry");
+        assert_eq!(canonical.get("type").and_then(Value::as_str), Some("stdio"));
+        assert_eq!(
+            canonical.get("command").and_then(Value::as_str),
+            Some("npx")
+        );
+    }
+
+    #[test]
+    fn codex_write_read_round_trips_without_type_key() {
+        // The writer's output must read back to the same canonical spec with no
+        // `type` ever hitting disk. (sse is excluded: Codex rejects it — covered by
+        // `canonical_to_codex_entry_never_emits_type_field`.)
+        for spec in [
+            json!({"type": "stdio", "command": "npx", "args": ["-y", "srv"], "env": {"A": "b"}}),
+            json!({"type": "http", "url": "https://mcp.exa.ai/mcp"}),
+        ] {
+            let entry = canonical_to_codex_entry(&spec).expect("to codex entry");
+            assert!(
+                !entry.as_table().expect("table").contains_key("type"),
+                "no type on disk for {spec}"
+            );
+            let back = codex_entry_to_canonical("id", &entry).expect("read back");
+            assert_eq!(
+                back.get("type").and_then(Value::as_str),
+                spec.get("type").and_then(Value::as_str),
+                "round-trip type for {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_to_cline_entry_remaps_http_to_streamable_http() {
+        // Cline's zod `type` literal accepts only stdio|sse|streamableHttp; the
+        // canonical `http` must become `streamableHttp` or Cline drops every
+        // server (#325). stdio/sse pass through unchanged.
+        let http = canonical_to_cline_entry(&json!({
+            "type": "http",
+            "url": "https://mcp.exa.ai/mcp",
+        }))
+        .expect("http entry");
+        assert_eq!(
+            http.get("type").and_then(Value::as_str),
+            Some("streamableHttp"),
+            "http must be remapped for Cline"
+        );
+        assert_eq!(
+            http.get("url").and_then(Value::as_str),
+            Some("https://mcp.exa.ai/mcp")
+        );
+
+        let stdio = canonical_to_cline_entry(&json!({"type": "stdio", "command": "npx"}))
+            .expect("stdio entry");
+        assert_eq!(stdio.get("type").and_then(Value::as_str), Some("stdio"));
+
+        let sse = canonical_to_cline_entry(&json!({"type": "sse", "url": "https://x/sse"}))
+            .expect("sse entry");
+        assert_eq!(sse.get("type").and_then(Value::as_str), Some("sse"));
+
+        // And codeg reads `streamableHttp` straight back to canonical `http`.
+        let round_trip = canonicalize_spec(
+            &json!({"type": "streamableHttp", "url": "https://mcp.exa.ai/mcp"}),
+            "test",
+        )
+        .expect("canonicalize streamableHttp");
+        assert_eq!(round_trip.get("type").and_then(Value::as_str), Some("http"));
+    }
+
+    #[test]
+    fn canonical_to_kimi_code_entry_pins_remote_transport() {
+        // Kimi 0.23.3 keys the transport off `transport` (defaulting url-only to
+        // HTTP), so codeg must emit an explicit `transport` or an SSE server silently
+        // downgrades to HTTP (#325). stdio is left as-is (Kimi infers it from
+        // `command`).
+        let sse = canonical_to_kimi_code_entry(&json!({"type": "sse", "url": "https://x/stream"}))
+            .expect("sse entry");
+        assert_eq!(sse.get("transport").and_then(Value::as_str), Some("sse"));
+        assert_eq!(sse.get("type").and_then(Value::as_str), Some("sse"));
+
+        let http = canonical_to_kimi_code_entry(&json!({"type": "http", "url": "https://x/mcp"}))
+            .expect("http entry");
+        assert_eq!(http.get("transport").and_then(Value::as_str), Some("http"));
+
+        let stdio = canonical_to_kimi_code_entry(&json!({"type": "stdio", "command": "npx"}))
+            .expect("stdio entry");
+        assert!(
+            stdio.get("transport").is_none(),
+            "stdio must not carry a transport key"
+        );
+    }
+
+    #[test]
+    fn kimi_code_entry_reads_native_transport_and_never_leaks_it() {
+        // A native Kimi SSE entry uses `transport: "sse"`, not `type`; the reader
+        // must classify it as sse from that explicit `transport` and must NOT surface
+        // `transport` in the canonical spec — otherwise it would leak into e.g. Codex
+        // TOML when the same server is later synced to another agent (#325).
+        let native_sse = json!({"url": "https://x/stream", "transport": "sse"});
+        let canonical = kimi_code_entry_to_canonical(&native_sse, "srv").expect("native sse");
+        assert_eq!(canonical.get("type").and_then(Value::as_str), Some("sse"));
+        assert!(
+            canonical.get("transport").is_none(),
+            "transport must be consumed, never leaked into the canonical spec"
+        );
+
+        // Full writer→reader round-trip stays canonical and transport-free.
+        let written = canonical_to_kimi_code_entry(&json!({"type": "sse", "url": "https://x/stream"}))
+            .expect("write sse");
+        let back = kimi_code_entry_to_canonical(&written, "srv").expect("read back");
+        assert_eq!(back.get("type").and_then(Value::as_str), Some("sse"));
+        assert!(back.get("transport").is_none());
+    }
+
+    #[test]
+    fn kimi_code_entry_mirrors_kimi_0_23_transport_selection() {
+        // Kimi Code 0.23.3 defaults a url-only remote entry to HTTP and does NOT
+        // infer SSE from a `/sse` URL path — only an explicit `transport: "sse"`
+        // yields SSE. (Corrects the earlier FastMCP-based reader; verified against
+        // the published 0.23.3 Zod schema.)
+        let sse_url = kimi_code_entry_to_canonical(&json!({"url": "https://host/sse"}), "s")
+            .expect("url-only /sse");
+        assert_eq!(
+            sse_url.get("type").and_then(Value::as_str),
+            Some("http"),
+            "url-only must be http, not sse-from-url"
+        );
+
+        let http_url = kimi_code_entry_to_canonical(&json!({"url": "https://host/mcp"}), "s")
+            .expect("url-only");
+        assert_eq!(http_url.get("type").and_then(Value::as_str), Some("http"));
+
+        // An on-disk `type` with NO `transport` does not classify: Kimi strips `type`
+        // and infers HTTP from the url, so codeg must too (not report it as SSE).
+        let stale_type = kimi_code_entry_to_canonical(
+            &json!({"type": "sse", "url": "https://host/mcp"}),
+            "s",
+        )
+        .expect("type-without-transport");
+        assert_eq!(stale_type.get("type").and_then(Value::as_str), Some("http"));
+
+        // Explicit `transport: "sse"` yields SSE (and `type` is ignored, matching
+        // Kimi); `transport` is stripped from the canonical spec.
+        let sse = kimi_code_entry_to_canonical(
+            &json!({"type": "http", "url": "https://host/mcp", "transport": "sse"}),
+            "s",
+        )
+        .expect("explicit sse");
+        assert_eq!(sse.get("type").and_then(Value::as_str), Some("sse"));
+        assert!(sse.get("transport").is_none());
+
+        // An explicit unknown transport Kimi would hard-reject is surfaced as an
+        // invalid entry, not reported as an active server. (`stdio` on a url-only
+        // entry is likewise invalid — Kimi's stdio variant requires `command`.)
+        for bad in ["streamable-http", "ws", "stdio"] {
+            assert!(
+                kimi_code_entry_to_canonical(
+                    &json!({"url": "https://host/mcp", "transport": bad}),
+                    "s"
+                )
+                .is_err(),
+                "transport {bad:?} must be rejected"
+            );
+        }
+        // A non-string transport is rejected too (Kimi's literals are exact).
+        assert!(
+            kimi_code_entry_to_canonical(&json!({"url": "https://host/mcp", "transport": 3}), "s")
+                .is_err()
+        );
+
+        // The `transport` discriminant wins over the entry's key shape: an explicit
+        // `sse` on an entry that ALSO carries `command` is SSE (Kimi ignores the
+        // extra `command`), not stdio.
+        let sse_over_cmd = kimi_code_entry_to_canonical(
+            &json!({"transport": "sse", "command": "npx", "url": "https://host/mcp"}),
+            "s",
+        )
+        .expect("transport wins over command");
+        assert_eq!(sse_over_cmd.get("type").and_then(Value::as_str), Some("sse"));
+    }
+
+    #[test]
+    fn canonical_to_kimi_code_entry_drops_wrong_typed_and_foreign_fields() {
+        // Kimi validates its known fields and rejects the whole `mcpServers` record on
+        // a wrong-typed one, so the writer must not let a stray same-named foreign
+        // value ride canonicalize's passthrough onto disk. See #325.
+        let entry = canonical_to_kimi_code_entry(&json!({
+            "type": "http",
+            "url": "https://host/mcp",
+            "enabled": "false",   // wrong shape (string, not bool) → dropped
+            "autoApprove": ["a"], // foreign key → dropped
+        }))
+        .expect("http entry");
+        let obj = entry.as_object().expect("object");
+        assert_eq!(obj.get("transport").and_then(Value::as_str), Some("http"));
+        assert!(!obj.contains_key("enabled"), "wrong-typed enabled must be dropped");
+        assert!(!obj.contains_key("autoApprove"), "foreign key must be dropped");
+
+        // A correctly-typed `enabled` bool is preserved.
+        let ok = canonical_to_kimi_code_entry(&json!({
+            "type": "http", "url": "https://host/mcp", "enabled": true,
+        }))
+        .expect("http entry");
+        assert_eq!(
+            ok.as_object().and_then(|o| o.get("enabled")).and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_entry_rejects_both_command_and_url() {
+        // Codex hard-errors on a mixed-transport entry; codeg must reject it rather
+        // than silently classify as stdio and drop the `url` (#325).
+        let both = codex_entry("command = \"npx\"\nurl = \"https://x/mcp\"\n");
+        assert!(codex_entry_to_canonical("mixed", &both).is_err());
+        // Rejected even when an explicit (legacy) type is present.
+        let both_typed =
+            codex_entry("type = \"stdio\"\ncommand = \"npx\"\nurl = \"https://x/mcp\"\n");
+        assert!(codex_entry_to_canonical("mixed", &both_typed).is_err());
+    }
+
+    #[test]
+    fn canonical_to_codex_entry_passthrough_is_type_validated() {
+        // Foreign keys, transport-specific fields, and — crucially — same-named
+        // fields of the WRONG shape must NOT reach Codex TOML; each is fatal under
+        // --strict-config. Only transport-agnostic fields validated to Codex's exact
+        // type pass through. See #325.
+        let entry = canonical_to_codex_entry(&json!({
+            "type": "http",
+            "url": "https://mcp.exa.ai/mcp",
+            "enabled": true,             // valid Codex bool → kept
+            "required": "yes",           // wrong shape (string, not bool) → dropped
+            "autoApprove": ["a"],        // foreign key → dropped
+            "transport": "sse",          // canonical-only discriminator → dropped
+            "env_vars": [{"name": "X"}], // stdio-only, wrong arm here → dropped
+            "startup_timeout_sec": 10.0, // not in the minimal allowlist → dropped
+        }))
+        .expect("http entry")
+        .as_table()
+        .cloned()
+        .expect("table");
+        assert_eq!(entry.get("enabled").and_then(toml::Value::as_bool), Some(true));
+        for dropped in [
+            "type",
+            "required",
+            "autoApprove",
+            "transport",
+            "env_vars",
+            "startup_timeout_sec",
+        ] {
+            assert!(
+                !entry.contains_key(dropped),
+                "'{dropped}' must be dropped from Codex TOML"
             );
         }
     }

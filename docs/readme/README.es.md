@@ -35,10 +35,10 @@ Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. U
   </tr>
   <tr>
     <td align="center" width="220">
-      <a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE" target="_blank"><img src="../images/sui-xiang.jpg" alt="Sui-Xiang AI Gateway" width="200" /></a><br/>
-      <strong><a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">Sui-Xiang AI Gateway</a></strong>
+      <a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE" target="_blank"><img src="../images/sui-xiang.jpg" alt="随想AI中转站" width="200" /></a><br/>
+      <strong><a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">随想AI中转站</a></strong>
     </td>
-    <td>¡Gracias a Sui-Xiang AI Gateway por patrocinar este proyecto! Sui-Xiang AI Gateway es un proveedor de retransmisión de API fiable y eficiente, que ofrece servicios de retransmisión para Claude, Codex, Gemini y más. Las cuentas nuevas reciben 0,5 ¥ de crédito de prueba con cada registro de asistencia diario tras <a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">registrarse</a>; las recargas se acreditan 1:1, sin suscripción y con pago por uso. La redundancia multilínea, la recuperación ante desastres entre regiones y la conmutación por error automática mantienen sin interrupciones las conexiones SSE de larga duración.</td>
+    <td>¡Gracias a 随想AI中转站 por patrocinar este proyecto! 随想AI中转站 es un proveedor de retransmisión de API fiable y eficiente, que ofrece servicios de retransmisión para Claude, Codex, Gemini y más. Las cuentas nuevas reciben 0,5 ¥ de crédito de prueba con cada registro de asistencia diario tras <a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">registrarse</a>; las recargas se acreditan 1:1, sin suscripción y con pago por uso. La redundancia multilínea, la recuperación ante desastres entre regiones y la conmutación por error automática mantienen sin interrupciones las conexiones SSE de larga duración.</td>
   </tr>
 </table>
 
@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 O instalar una versión específica:
 
 ```powershell
-.\install.ps1 -Version v0.18.8-mycodebuddy.1
+.\install.ps1 -Version v0.20.0-mycodebuddy.1
 ```
 
 #### Opción 2: Descargar desde GitHub Releases

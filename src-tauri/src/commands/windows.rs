@@ -19,7 +19,7 @@ use crate::models::FolderDetail;
 #[cfg(target_os = "macos")]
 const TRAFFIC_LIGHT_X: f64 = 12.0;
 #[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_Y: f64 = 14.0;
+const TRAFFIC_LIGHT_Y: f64 = 17.0;
 
 #[cfg(target_os = "macos")]
 static CURRENT_ZOOM: AtomicU32 = AtomicU32::new(100);
@@ -313,6 +313,7 @@ fn resolve_settings_route(section: Option<&str>) -> &'static str {
         Some("mcp") => "settings/mcp",
         Some("skills") => "settings/skills",
         Some("experts") => "settings/experts",
+        Some("science") => "settings/science",
         Some("office-tools") => "settings/office-tools",
         Some("shortcuts") => "settings/shortcuts",
         Some("system") => "settings/system",
