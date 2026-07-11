@@ -124,6 +124,10 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
     tauriVersion: tauriConfig.version,
   })
   assert.equal(packageJson.version, version)
+  assert.match(readRepositoryFile("install.ps1"), new RegExp(`v${version}`))
+  const syncGuide = readRepositoryFile("docs/UPSTREAM_SYNC.md")
+  assert.match(syncGuide, /sync\/codeg-0\.20\.0/)
+  assert.match(syncGuide, new RegExp(version.replaceAll(".", String.raw`\.`)))
   assertComplianceResources(tauriConfig)
   for (const path of [
     "LICENSE",

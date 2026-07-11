@@ -853,6 +853,7 @@ describe("out-of-turn wire guard + background activity", () => {
 
     // 3. one OS notification per settled task, carrying its summary.
     expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0][0]).toBe("x - MyCodeBuddy")
     expect(notify.mock.calls[0][1]).toContain('Agent "Run pnpm build" finished')
 
     // 4. a settlement folds into persisted turns via a detail refetch (the

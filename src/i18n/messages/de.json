@@ -3047,7 +3047,7 @@
   },
   "ScienceSettings": {
     "title": "Wissenschaftliche Skills",
-    "description": "Aktiviere kuratierte wissenschaftliche Skills für deine KI-Coding-Agents — Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung und Literatursuche. codeg verwaltet eine zentrale Kopie und verlinkt jeden Skill in die von dir gewählten Agents.",
+    "description": "Aktiviere kuratierte wissenschaftliche Skills für deine KI-Coding-Agents — Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung und Literatursuche. MyCodeBuddy verwaltet eine zentrale Kopie und verlinkt jeden Skill in die von dir gewählten Agents.",
     "loading": "Wissenschaftliche Skills werden geladen…",
     "emptySkills": "Keine wissenschaftlichen Skills verfügbar. Prüfe die Anwendungsprotokolle.",
     "searchPlaceholder": "Wissenschaftliche Skills nach Name, ID oder Beschreibung suchen",

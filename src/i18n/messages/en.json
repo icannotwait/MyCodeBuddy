@@ -3059,7 +3059,7 @@
   },
   "ScienceSettings": {
     "title": "Scientific Research Skills",
-    "description": "Enable curated scientific-research skills for your AI coding agents — hypothesis generation, experimental design, statistics, visualization, critical appraisal, and literature search. codeg manages a central copy and links each skill into the agents you choose.",
+    "description": "Enable curated scientific-research skills for your AI coding agents — hypothesis generation, experimental design, statistics, visualization, critical appraisal, and literature search. MyCodeBuddy manages a central copy and links each skill into the agents you choose.",
     "loading": "Loading science skills…",
     "emptySkills": "No science skills available. Check the application logs.",
     "searchPlaceholder": "Search science skills by name, id, or description",

@@ -2993,7 +2993,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const nc = storeRef.current.connections.get(contextKey)
             const agentLabel = nc ? AGENT_LABELS[nc.agentType] : "Agent"
             const fn = folderNameRef.current
-            const title = fn ? `${fn} - Codeg` : "Codeg"
+            const title = fn ? `${fn} - MyCodeBuddy` : "MyCodeBuddy"
             for (const settled of e.settled) {
               const body =
                 settled.summary ??

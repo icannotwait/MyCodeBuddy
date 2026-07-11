@@ -3047,7 +3047,7 @@
   },
   "ScienceSettings": {
     "title": "Compétences de recherche scientifique",
-    "description": "Activez des compétences de recherche scientifique sélectionnées pour vos agents de codage IA : génération d'hypothèses, plan d'expérience, statistiques, visualisation, évaluation critique et recherche bibliographique. codeg gère une copie centrale et relie chaque compétence aux agents que vous choisissez.",
+    "description": "Activez des compétences de recherche scientifique sélectionnées pour vos agents de codage IA : génération d'hypothèses, plan d'expérience, statistiques, visualisation, évaluation critique et recherche bibliographique. MyCodeBuddy gère une copie centrale et relie chaque compétence aux agents que vous choisissez.",
     "loading": "Chargement des compétences scientifiques…",
     "emptySkills": "Aucune compétence scientifique disponible. Consultez les journaux de l'application.",
     "searchPlaceholder": "Rechercher des compétences scientifiques par nom, id ou description",

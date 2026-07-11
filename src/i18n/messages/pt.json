@@ -3047,7 +3047,7 @@
   },
   "ScienceSettings": {
     "title": "Habilidades de pesquisa científica",
-    "description": "Ative habilidades de pesquisa científica selecionadas para seus agentes de código com IA: geração de hipóteses, delineamento experimental, estatística, visualização, avaliação crítica e busca de literatura. O codeg gerencia uma cópia central e vincula cada habilidade aos agentes que você escolher.",
+    "description": "Ative habilidades de pesquisa científica selecionadas para seus agentes de código com IA: geração de hipóteses, delineamento experimental, estatística, visualização, avaliação crítica e busca de literatura. O MyCodeBuddy gerencia uma cópia central e vincula cada habilidade aos agentes que você escolher.",
     "loading": "Carregando habilidades científicas…",
     "emptySkills": "Nenhuma habilidade científica disponível. Verifique os registros do aplicativo.",
     "searchPlaceholder": "Pesquisar habilidades científicas por nome, id ou descrição",

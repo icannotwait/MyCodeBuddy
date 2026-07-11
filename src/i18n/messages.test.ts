@@ -26,6 +26,7 @@ function collectKeys(node: MessageNode, prefix = ""): string[] {
 }
 
 const reference = new Set(collectKeys(en as MessageNode))
+const locales = [ar, de, en, es, fr, ja, ko, pt, zhCN, zhTW] as const
 
 // `en.json` is the source of truth. Any missing key in another locale fails
 // the test with the exact dotted path, making translation gaps grep-able.
@@ -45,5 +46,14 @@ describe("i18n locale key parity vs en.json", () => {
     const missing = [...reference].filter((k) => !localeKeys.has(k))
     const extra = [...localeKeys].filter((k) => !reference.has(k))
     expect({ missing, extra }).toEqual({ missing: [], extra: [] })
+  })
+})
+
+describe("MyCodeBuddy branding", () => {
+  it("uses the fork name in every science settings description", () => {
+    for (const messages of locales) {
+      expect(messages.ScienceSettings.description).toContain("MyCodeBuddy")
+      expect(messages.ScienceSettings.description).not.toMatch(/\bcodeg\b/i)
+    }
   })
 })
