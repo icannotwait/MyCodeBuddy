@@ -9,6 +9,19 @@ import type {
   SuggestionPopupHandle,
 } from "./types"
 
+const BASELINE_REFERENCE_TEXT =
+  "2026-07-06-simple-packaging-storage-ballistic-throw-design.md"
+const LONG_REFERENCE_TEXT = `${BASELINE_REFERENCE_TEXT}-with-additional-differentiating-suffix.md`
+
+function expectedMiddleTruncate(text: string): string {
+  const edgeChars = Math.floor(
+    (BASELINE_REFERENCE_TEXT.length - "...".length) / 2
+  )
+  return text.length <= BASELINE_REFERENCE_TEXT.length
+    ? text
+    : `${text.slice(0, edgeChars)}...${text.slice(-edgeChars)}`
+}
+
 // Distinct, non-colliding text: a row's label must differ from its detail and
 // from the agent icon's <title> ("Codex") so findByText is unambiguous.
 const fileRef = {
@@ -98,6 +111,39 @@ describe("SuggestionPopup", () => {
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Agents/
     )
+  })
+
+  it("widens file suggestions and middle-shortens over-limit labels and paths", async () => {
+    const longPath = `Client/Docs/AllWorkDocs/${LONG_REFERENCE_TEXT}`
+    const fileSearch: ReferenceSearch = () => [
+      {
+        kind: "file",
+        label: "Files",
+        items: [
+          {
+            reference: {
+              ...fileRef,
+              id: LONG_REFERENCE_TEXT,
+              label: LONG_REFERENCE_TEXT,
+              uri: `file:///repo/${LONG_REFERENCE_TEXT}`,
+            },
+            detail: longPath,
+          },
+        ],
+      },
+    ]
+
+    mountPopup({ search: fileSearch })
+    const panel = screen.getByTestId("mention-popup")
+    expect(panel).toHaveClass("w-[52rem]")
+    expect(
+      await screen.findByText(expectedMiddleTruncate(LONG_REFERENCE_TEXT))
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(expectedMiddleTruncate(longPath))
+    ).toBeInTheDocument()
+    expect(screen.queryByText(LONG_REFERENCE_TEXT)).toBeNull()
+    expect(screen.queryByText(longPath)).toBeNull()
   })
 
   it("shows an empty state (but keeps the tabs) when there are no matches", async () => {

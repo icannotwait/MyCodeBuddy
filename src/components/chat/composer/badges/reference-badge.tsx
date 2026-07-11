@@ -13,6 +13,7 @@ import { AgentIcon } from "@/components/agent-icon"
 import { type AgentType } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
+import { middleTruncateReferenceText } from "../reference-display"
 import type { ReferenceAttrs } from "../types"
 
 const ICON_CLASS = "size-3.5 shrink-0"
@@ -124,25 +125,28 @@ export interface ReferenceBadgeProps {
  * editor coupling.
  */
 export function ReferenceBadge({ data, className }: ReferenceBadgeProps) {
+  const label = data.label || data.id
+  const displayLabel = middleTruncateReferenceText(label)
+
   return (
     <span
       data-reference-badge=""
       data-ref-type={data.refType}
-      title={data.uri ?? data.label}
+      title={data.uri ?? label}
       // The badge is an inline contentEditable=false atom. `role="img"` makes it
       // a single named unit so `aria-label` is a reliable accessible name (a
       // bare span's aria-label is not), and collapses the decorative icon —
       // including AgentIcon's titled <svg> — into that one name.
       role="img"
-      aria-label={`${data.refType}: ${data.label || data.id}`}
+      aria-label={`${data.refType}: ${label}`}
       className={cn(
-        "inline-flex max-w-[18rem] items-center gap-0.5 align-middle text-[0.85em] font-medium leading-snug",
+        "inline-flex max-w-[36rem] items-center gap-0.5 align-middle text-[0.85em] font-medium leading-snug",
         badgeColorClass(data),
         className
       )}
     >
       <ReferenceIcon data={data} />
-      <span className="truncate">{data.label || data.id}</span>
+      <span className="truncate">{displayLabel}</span>
     </span>
   )
 }

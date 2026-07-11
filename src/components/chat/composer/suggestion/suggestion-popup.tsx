@@ -14,6 +14,7 @@ import { createPortal } from "react-dom"
 import { cn } from "@/lib/utils"
 
 import { ReferenceIcon } from "../badges/reference-badge"
+import { middleTruncateReferenceText } from "../reference-display"
 import type { ReferenceAttrs, ReferenceKind } from "../types"
 import type { MentionRenderState } from "./mention-suggestion"
 import { placeMentionPopup } from "./popup-position"
@@ -321,7 +322,7 @@ export const SuggestionPopup = forwardRef<
         // Cap to the viewport (minus the 8px×2 edge margin = 1rem) so the panel
         // always fits on small windows; the tab strip stays pinned and only the
         // option list scrolls. The positioner clamps placement, this bounds size.
-        className="flex max-h-[min(18rem,calc(100dvh_-_1rem))] w-80 max-w-[calc(100vw_-_1rem)] flex-col overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-lg"
+        className="flex max-h-[min(18rem,calc(100dvh_-_1rem))] w-[52rem] max-w-[calc(100vw_-_1rem)] flex-col overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-lg"
       >
         {/* Tab strip: pointer-/key-driven only (tabIndex=-1 keeps editor focus).
             Each tab controls the single listbox below (no role=tabpanel, which
@@ -391,6 +392,11 @@ export const SuggestionPopup = forwardRef<
             {!stale &&
               activeGroup?.items.map((item, index) => {
                 const active = index === selectedIndex
+                const label = item.reference.label || item.reference.id
+                const displayLabel = middleTruncateReferenceText(label)
+                const displayDetail = item.detail
+                  ? middleTruncateReferenceText(item.detail)
+                  : null
                 return (
                   <button
                     key={`${activeGroup.kind}:${item.reference.id}`}
@@ -413,18 +419,15 @@ export const SuggestionPopup = forwardRef<
                     onMouseEnter={() => setSelectedIndex(index)}
                   >
                     <ReferenceIcon data={item.reference} variant="option" />
-                    <span
-                      className="flex-1 truncate"
-                      title={item.reference.label || item.reference.id}
-                    >
-                      {item.reference.label || item.reference.id}
+                    <span className="min-w-0 flex-1 truncate" title={label}>
+                      {displayLabel}
                     </span>
-                    {item.detail && (
+                    {displayDetail && (
                       <span
-                        className="max-w-[10rem] truncate text-xs text-muted-foreground"
-                        title={item.detail}
+                        className="max-w-[18rem] truncate text-xs text-muted-foreground"
+                        title={item.detail ?? undefined}
                       >
-                        {item.detail}
+                        {displayDetail}
                       </span>
                     )}
                   </button>

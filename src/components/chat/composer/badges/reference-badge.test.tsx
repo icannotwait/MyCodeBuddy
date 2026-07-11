@@ -4,6 +4,19 @@ import { describe, expect, it } from "vitest"
 import { ReferenceBadge } from "./reference-badge"
 import type { ReferenceAttrs } from "../types"
 
+const BASELINE_REFERENCE_TEXT =
+  "2026-07-06-simple-packaging-storage-ballistic-throw-design.md"
+const LONG_REFERENCE_TEXT = `${BASELINE_REFERENCE_TEXT}-with-additional-differentiating-suffix.md`
+
+function expectedMiddleTruncate(text: string): string {
+  const edgeChars = Math.floor(
+    (BASELINE_REFERENCE_TEXT.length - "...".length) / 2
+  )
+  return text.length <= BASELINE_REFERENCE_TEXT.length
+    ? text
+    : `${text.slice(0, edgeChars)}...${text.slice(-edgeChars)}`
+}
+
 function ref(partial: Partial<ReferenceAttrs>): ReferenceAttrs {
   return {
     refType: "file",
@@ -32,6 +45,28 @@ describe("ReferenceBadge", () => {
     // Task 3: badges sit on the text's middle, not its baseline.
     expect(badge).toHaveClass("align-middle")
     expect(badge).not.toHaveClass("align-baseline")
+  })
+
+  it("keeps baseline-length file labels complete and expands the badge width", () => {
+    const { container } = render(
+      <ReferenceBadge
+        data={ref({ refType: "file", label: BASELINE_REFERENCE_TEXT })}
+      />
+    )
+    const badge = badgeOf(container)
+    expect(badge).toHaveTextContent(BASELINE_REFERENCE_TEXT)
+    expect(badge).toHaveClass("max-w-[36rem]")
+  })
+
+  it("middle-shortens longer file labels instead of clipping the suffix", () => {
+    const { container } = render(
+      <ReferenceBadge
+        data={ref({ refType: "file", label: LONG_REFERENCE_TEXT })}
+      />
+    )
+    const badge = badgeOf(container)
+    expect(badge).toHaveTextContent(expectedMiddleTruncate(LONG_REFERENCE_TEXT))
+    expect(badge).not.toHaveTextContent(LONG_REFERENCE_TEXT)
   })
 
   it("colors a file reference blue with no background or border", () => {
