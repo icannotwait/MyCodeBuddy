@@ -13,11 +13,10 @@ import {
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 const args = process.argv.slice(2)
 
-if (
-  args.length > 2 ||
-  (args.length > 0 && (args[0] !== "--tag" || !args[1]))
-) {
-  throw new Error("usage: node scripts/check-release-config.mjs [--tag vVERSION]")
+if (args.length > 2 || (args.length > 0 && (args[0] !== "--tag" || !args[1]))) {
+  throw new Error(
+    "usage: node scripts/check-release-config.mjs [--tag vVERSION]"
+  )
 }
 
 const tag = args[1]

@@ -24,7 +24,10 @@ const compareRecords = (left, right) =>
   compareStrings(left.version, right.version)
 
 const normalizeText = (text) =>
-  text.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trimEnd()
+  text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trimEnd()
 
 const normalizeHomepage = (homepage) => {
   const value = typeof homepage === "string" ? homepage.trim() : ""
