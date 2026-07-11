@@ -37,6 +37,33 @@ export function buildSigningPaths(homeDirectory) {
   }
 }
 
+export function buildSignerProcessInvocation({
+  platform,
+  comSpec,
+  password,
+  privateKey,
+}) {
+  const signerArgs = [
+    "tauri",
+    "signer",
+    "generate",
+    "--ci",
+    "-p",
+    password,
+    "-w",
+    privateKey,
+  ]
+
+  if (platform === "win32") {
+    return {
+      command: comSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", "pnpm.cmd", ...signerArgs],
+    }
+  }
+
+  return { command: "pnpm", args: signerArgs }
+}
+
 export function updatePublicKey(config, publicKey) {
   if (
     !config ||
@@ -217,20 +244,16 @@ function prepareUpdaterSigningKey() {
 
     const password = randomBytes(32).toString("base64url")
     process.env.PNPM_CONFIG_REPORTER = "silent"
-    execFileSync(
-      process.platform === "win32" ? "pnpm.cmd" : "pnpm",
-      [
-        "tauri",
-        "signer",
-        "generate",
-        "--ci",
-        "-p",
-        password,
-        "-w",
-        paths.privateKey,
-      ],
-      { cwd: repoRoot, stdio: ["ignore", "ignore", "inherit"] }
-    )
+    const signerProcess = buildSignerProcessInvocation({
+      platform: process.platform,
+      comSpec: process.env.ComSpec,
+      password,
+      privateKey: paths.privateKey,
+    })
+    execFileSync(signerProcess.command, signerProcess.args, {
+      cwd: repoRoot,
+      stdio: ["ignore", "ignore", "inherit"],
+    })
 
     chmodSync(paths.privateKey, 0o600)
     const publicKey = validateGeneratedPublicKey(

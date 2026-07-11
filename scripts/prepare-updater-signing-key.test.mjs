@@ -16,6 +16,7 @@ import { delimiter, join } from "node:path"
 import { spawnSync } from "node:child_process"
 import test from "node:test"
 import {
+  buildSignerProcessInvocation,
   buildSigningPaths,
   replacePublicKeyInConfigText,
   updatePublicKey,
@@ -38,6 +39,59 @@ function makePublicKeyDocument({
 }
 
 const validPublicKey = makePublicKeyDocument()
+
+test("buildSignerProcessInvocation uses pnpm directly on POSIX", () => {
+  assert.deepEqual(
+    buildSignerProcessInvocation({
+      platform: "darwin",
+      comSpec: "C:\\Windows\\System32\\cmd.exe",
+      password: "base64url-password",
+      privateKey: "/home/test/.config/mycodebuddy/signing/updater-signing.key",
+    }),
+    {
+      command: "pnpm",
+      args: [
+        "tauri",
+        "signer",
+        "generate",
+        "--ci",
+        "-p",
+        "base64url-password",
+        "-w",
+        "/home/test/.config/mycodebuddy/signing/updater-signing.key",
+      ],
+    }
+  )
+})
+
+test("buildSignerProcessInvocation uses cmd.exe for pnpm.cmd on Windows", () => {
+  assert.deepEqual(
+    buildSignerProcessInvocation({
+      platform: "win32",
+      comSpec: "C:\\Windows\\System32\\cmd.exe",
+      password: "base64url-password",
+      privateKey:
+        "C:\\Users\\test\\.config\\mycodebuddy\\signing\\updater-signing.key",
+    }),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/c",
+        "pnpm.cmd",
+        "tauri",
+        "signer",
+        "generate",
+        "--ci",
+        "-p",
+        "base64url-password",
+        "-w",
+        "C:\\Users\\test\\.config\\mycodebuddy\\signing\\updater-signing.key",
+      ],
+    }
+  )
+})
 
 test("validateGeneratedPublicKey accepts a canonical minisign public key", () => {
   assert.equal(validateGeneratedPublicKey(validPublicKey), validPublicKey)
