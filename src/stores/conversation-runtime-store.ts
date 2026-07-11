@@ -1495,7 +1495,9 @@ function reducer(
             : (turn.completed_at ?? patch.completed_at)
         const toolMetaById =
           patch.tool_meta && patch.tool_meta.length > 0
-            ? new Map(patch.tool_meta.map((item) => [item.tool_use_id, item.meta]))
+            ? new Map(
+                patch.tool_meta.map((item) => [item.tool_use_id, item.meta])
+              )
             : null
         let nextBlocks = turn.blocks
         if (toolMetaById) {
