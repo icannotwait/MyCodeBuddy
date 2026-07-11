@@ -135,12 +135,18 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
 
 test("release workflow publishes only Windows MyCodeBuddy artifacts", () => {
   const workflowText = readRepositoryFile(".github/workflows/release.yml")
+  const desktopJob = workflowText.match(
+    /^  build-desktop:\n([\s\S]*?)(?=^  build-server:)/m
+  )?.[1]
 
   assertWindowsReleaseWorkflow(workflowText)
   assert.match(workflowText, /MyCodeBuddy \$\{tag\}/)
   assert.match(workflowText, /prerelease:\s*false/)
   assert.match(workflowText, /codeg-server-windows-x64/)
   assert.doesNotMatch(workflowText, /includeUpdaterJson:\s*false/)
+  assert.ok(desktopJob, "build-desktop job is missing")
+  assert.match(desktopJob, /^      max-parallel:\s*1\s*$/m)
+  assert.match(desktopJob, /^          includeUpdaterJson:\s*true\s*$/m)
 })
 
 test("accepts the complete Windows release policy", () => {
