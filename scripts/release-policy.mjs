@@ -323,20 +323,32 @@ export function assertServerInstallerCompliance(installScriptText) {
       "server installer required installed files must include both executables and all compliance files"
     )
   }
-  if (
-    !/\$RequiredInstalledDirectories\s*=\s*@\("web"\)/.test(installScriptText)
-  ) {
+  if (!installScriptText.includes('$RequiredWebFiles = @("web\\index.html")')) {
     throw new Error(
-      "server installer required installed directories must include web"
+      "server installer required web entry must be web/index.html"
     )
   }
   if (
-    !/function Test-InstalledFilesComplete\(\[string\]\$Directory\)\s*\{[\s\S]*?foreach \(\$filename in \$RequiredInstalledFiles\)[\s\S]*?Test-Path -LiteralPath \$path -PathType Leaf[\s\S]*?foreach \(\$directoryName in \$RequiredInstalledDirectories\)[\s\S]*?Test-Path -LiteralPath \$path -PathType Container[\s\S]*?return \$true\s*\}/.test(
+    !/function Test-NonEmptyRegularFile\(\[string\]\$Path\)\s*\{[\s\S]*?\$item\s*=\s*Get-Item -LiteralPath \$Path -Force -ErrorAction SilentlyContinue[\s\S]*?\$item -is \[System\.IO\.FileInfo\][\s\S]*?\$item\.Length -gt 0[\s\S]*?\}/.test(
       installScriptText
     )
   ) {
+    throw new Error("server installer must validate a nonempty regular file")
+  }
+  const installedCompleteness = installScriptText.match(
+    /function Test-InstalledFilesComplete\(\[string\]\$Directory\)\s*\{[\s\S]*?# ── Resolve version ──/
+  )?.[0]
+  if (
+    !installedCompleteness ||
+    !/foreach \(\$filename in \$RequiredInstalledFiles\)[\s\S]*?Test-NonEmptyRegularFile -Path \$path/.test(
+      installedCompleteness
+    ) ||
+    !/foreach \(\$relativePath in \$RequiredWebFiles\)[\s\S]*?Test-NonEmptyRegularFile -Path \$path/.test(
+      installedCompleteness
+    )
+  ) {
     throw new Error(
-      "server installer must check every required installed file and directory"
+      "server installer must check every required installed file and web entry as a nonempty regular file"
     )
   }
 
@@ -369,12 +381,13 @@ export function assertServerInstallerCompliance(installScriptText) {
   const validationBlocks = [
     "foreach ($name in $ManagedBins)",
     "foreach ($filename in $ComplianceFiles)",
+    "foreach ($relativePath in $RequiredWebFiles)",
   ]
   for (const block of validationBlocks) {
     const blockIndex = installSection.indexOf(block)
     if (blockIndex < 0 || blockIndex >= firstInstallWrite) {
       throw new Error(
-        "server installer must validate binaries and compliance files before writing InstallDir"
+        "server installer must validate binaries, compliance files, and web/index.html before writing InstallDir"
       )
     }
   }
@@ -399,15 +412,18 @@ export function assertServerInstallerCompliance(installScriptText) {
 
   const validationPrefix = installSection.slice(0, firstInstallWrite)
   if (
-    [
-      ...validationPrefix.matchAll(
-        /Test-Path -LiteralPath \$src -PathType Leaf/g
-      ),
-    ].length < 2 ||
-    !/foreach \(\$filename in \$ComplianceFiles\)/.test(validationPrefix)
+    !/foreach \(\$name in \$ManagedBins\)[\s\S]*?Test-NonEmptyRegularFile -Path \$src/.test(
+      validationPrefix
+    ) ||
+    !/foreach \(\$filename in \$ComplianceFiles\)[\s\S]*?Test-NonEmptyRegularFile -Path \$src/.test(
+      validationPrefix
+    ) ||
+    !/foreach \(\$relativePath in \$RequiredWebFiles\)[\s\S]*?Join-Path \$TmpDir \$Artifact \$relativePath[\s\S]*?Test-NonEmptyRegularFile -Path \$src/.test(
+      validationPrefix
+    )
   ) {
     throw new Error(
-      "server installer must validate every archive file as a regular file"
+      "server installer must validate nonempty binaries, compliance files, and web/index.html before writing InstallDir"
     )
   }
   const writeSection = installSection.slice(firstInstallWrite)

@@ -184,11 +184,19 @@ test("server installer validates and copies compliance files before install writ
   const installScript = readRepositoryFile("install.ps1")
 
   assert.doesNotThrow(() => assertServerInstallerCompliance(installScript))
+  assert.match(installScript, /\$item\.Length -gt 0/)
+  assert.match(
+    installScript,
+    /\$RequiredWebFiles\s*=\s*@\("web\\index\.html"\)/
+  )
   assert.match(
     installScript,
     /\$RequiredInstalledFiles\s*=\s*@\("codeg-server\.exe",\s*"codeg-mcp\.exe",\s*"LICENSE",\s*"NOTICE",\s*"THIRD_PARTY_LICENSES\.txt"\)/
   )
-  assert.match(installScript, /\$RequiredInstalledDirectories\s*=\s*@\("web"\)/)
+  assert.match(
+    installScript,
+    /\$RequiredWebFiles\s*=\s*@\("web\\index\.html"\)/
+  )
   assert.match(
     installScript,
     /-and \(Test-InstalledFilesComplete -Directory \$InstallDir\)/
@@ -199,12 +207,8 @@ test("server installer validates and copies compliance files before install writ
     "LICENSE",
     "NOTICE",
     "THIRD_PARTY_LICENSES.txt",
-    "web",
   ]) {
-    const requiredListName =
-      requiredEntry === "web"
-        ? "$RequiredInstalledDirectories"
-        : "$RequiredInstalledFiles"
+    const requiredListName = "$RequiredInstalledFiles"
     const requiredListLine = installScript
       .split("\n")
       .find((line) => line.startsWith(requiredListName))
@@ -249,6 +253,58 @@ test("server installer validates and copies compliance files before install writ
         )
       ),
     /before writing InstallDir/
+  )
+  const withoutZeroSizeCheck = installScript.replace(
+    "$item.Length -gt 0",
+    "$item.Length -ge 0"
+  )
+  assert.notEqual(
+    withoutZeroSizeCheck,
+    installScript,
+    "fixture failed to remove the zero-size check"
+  )
+  assert.throws(
+    () => assertServerInstallerCompliance(withoutZeroSizeCheck),
+    /nonempty regular file/,
+    "policy accepted an installer that permits zero-byte files"
+  )
+  const withoutWebEntry = installScript.replace(
+    '$RequiredWebFiles = @("web\\index.html")',
+    "$RequiredWebFiles = @()"
+  )
+  assert.notEqual(
+    withoutWebEntry,
+    installScript,
+    "fixture failed to remove web/index.html"
+  )
+  assert.throws(
+    () => assertServerInstallerCompliance(withoutWebEntry),
+    /web\/index\.html/,
+    "policy accepted an installer without the static web entry"
+  )
+  const archiveWebValidation = "foreach ($relativePath in $RequiredWebFiles) {"
+  const archiveWebValidationIndex = installScript.indexOf(
+    archiveWebValidation,
+    installScript.indexOf("# ── Install ──")
+  )
+  assert.notEqual(
+    archiveWebValidationIndex,
+    -1,
+    "fixture failed to find archive web validation"
+  )
+  const withoutArchiveWebValidation =
+    installScript.slice(0, archiveWebValidationIndex) +
+    "foreach ($relativePath in @()) {" +
+    installScript.slice(archiveWebValidationIndex + archiveWebValidation.length)
+  assert.notEqual(
+    withoutArchiveWebValidation,
+    installScript,
+    "fixture failed to remove archive web validation"
+  )
+  assert.throws(
+    () => assertServerInstallerCompliance(withoutArchiveWebValidation),
+    /web\/index\.html.*before writing InstallDir/,
+    "policy accepted an archive validation that skips web/index.html"
   )
 })
 

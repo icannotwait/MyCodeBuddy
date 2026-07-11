@@ -23,7 +23,7 @@ $Artifact = "codeg-server-windows-x64"
 $ManagedBins = @("codeg-server", "codeg-mcp")
 $ComplianceFiles = @("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
 $RequiredInstalledFiles = @("codeg-server.exe", "codeg-mcp.exe", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
-$RequiredInstalledDirectories = @("web")
+$RequiredWebFiles = @("web\index.html")
 
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly
@@ -65,16 +65,21 @@ function Read-BinVersion([string]$BinPath) {
     }
 }
 
+function Test-NonEmptyRegularFile([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return $item -is [System.IO.FileInfo] -and $item.Length -gt 0
+}
+
 function Test-InstalledFilesComplete([string]$Directory) {
     foreach ($filename in $RequiredInstalledFiles) {
         $path = Join-Path $Directory $filename
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if (-not (Test-NonEmptyRegularFile -Path $path)) {
             return $false
         }
     }
-    foreach ($directoryName in $RequiredInstalledDirectories) {
-        $path = Join-Path $Directory $directoryName
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+    foreach ($relativePath in $RequiredWebFiles) {
+        $path = Join-Path $Directory $relativePath
+        if (-not (Test-NonEmptyRegularFile -Path $path)) {
             return $false
         }
     }
@@ -255,15 +260,22 @@ Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 
 foreach ($name in $ManagedBins) {
     $src = Join-Path $TmpDir $Artifact "$name.exe"
-    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-        Write-Error "$name.exe not found in archive $Artifact.zip — release is incomplete, please report."
+    if (-not (Test-NonEmptyRegularFile -Path $src)) {
+        Write-Error "$name.exe missing or empty in archive $Artifact.zip — release is incomplete, please report."
         exit 1
     }
 }
 foreach ($filename in $ComplianceFiles) {
     $src = Join-Path $TmpDir $Artifact $filename
-    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-        Write-Error "$filename not found in archive $Artifact.zip — release is incomplete, please report."
+    if (-not (Test-NonEmptyRegularFile -Path $src)) {
+        Write-Error "$filename missing or empty in archive $Artifact.zip — release is incomplete, please report."
+        exit 1
+    }
+}
+foreach ($relativePath in $RequiredWebFiles) {
+    $src = Join-Path $TmpDir $Artifact $relativePath
+    if (-not (Test-NonEmptyRegularFile -Path $src)) {
+        Write-Error "$relativePath missing or empty in archive $Artifact.zip — release is incomplete, please report."
         exit 1
     }
 }
