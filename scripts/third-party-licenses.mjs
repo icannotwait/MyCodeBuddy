@@ -354,14 +354,29 @@ export const renderLicenseReport = (records) => {
   return `${lines.join("\n")}\n`
 }
 
-const readJsonCommand = (command, args, cwd) =>
-  JSON.parse(
-    execFileSync(command, args, {
+export const buildCommandInvocation = ({ command, args, platform, comSpec }) =>
+  platform === "win32" && command.toLowerCase().endsWith(".cmd")
+    ? {
+        command: comSpec || "cmd.exe",
+        args: ["/d", "/s", "/c", command, ...args],
+      }
+    : { command, args }
+
+const readJsonCommand = (command, args, cwd) => {
+  const invocation = buildCommandInvocation({
+    command,
+    args,
+    platform: process.platform,
+    comSpec: process.env.ComSpec,
+  })
+  return JSON.parse(
+    execFileSync(invocation.command, invocation.args, {
       cwd,
       encoding: "utf8",
       maxBuffer: 100 * 1024 * 1024,
     })
   )
+}
 
 export const generateLicenseReport = () => {
   const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm"

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 import {
+  buildCommandInvocation,
   collectCargoPackageUnion,
   collectCargoPackages,
   collectNpmPackages,
@@ -32,6 +33,45 @@ test.afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
   }
+})
+
+test("buildCommandInvocation runs pnpm directly on POSIX", () => {
+  assert.deepEqual(
+    buildCommandInvocation({
+      command: "pnpm",
+      args: ["licenses", "list", "--prod", "--json"],
+      platform: "darwin",
+      comSpec: "C:\\Windows\\System32\\cmd.exe",
+    }),
+    {
+      command: "pnpm",
+      args: ["licenses", "list", "--prod", "--json"],
+    }
+  )
+})
+
+test("buildCommandInvocation uses cmd.exe for pnpm.cmd on Windows", () => {
+  assert.deepEqual(
+    buildCommandInvocation({
+      command: "pnpm.cmd",
+      args: ["licenses", "list", "--prod", "--json"],
+      platform: "win32",
+      comSpec: "C:\\Windows\\System32\\cmd.exe",
+    }),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/c",
+        "pnpm.cmd",
+        "licenses",
+        "list",
+        "--prod",
+        "--json",
+      ],
+    }
+  )
 })
 
 test("finds supported license filenames case-insensitively", () => {
