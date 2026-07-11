@@ -122,9 +122,24 @@ export function validateGeneratedPublicKey(publicKey) {
   }
 
   const keyPayload = lines[1]
+  if (!isCanonicalBase64(keyPayload)) {
+    throw new Error("generated updater public key is invalid")
+  }
+
+  const decodedPayload = Buffer.from(keyPayload, "base64")
+  const displayedKeyId = decodedPayload
+    .subarray(2, 10)
+    .reverse()
+    .toString("hex")
+    .toUpperCase()
+  const commentKeyId = lines[0].slice(
+    "untrusted comment: minisign public key: ".length
+  )
   if (
-    !isCanonicalBase64(keyPayload) ||
-    Buffer.from(keyPayload, "base64").length !== 42
+    decodedPayload.length !== 42 ||
+    decodedPayload[0] !== 0x45 ||
+    decodedPayload[1] !== 0x64 ||
+    commentKeyId !== displayedKeyId
   ) {
     throw new Error("generated updater public key is invalid")
   }
@@ -217,6 +232,7 @@ function prepareUpdaterSigningKey() {
       { cwd: repoRoot, stdio: ["ignore", "ignore", "inherit"] }
     )
 
+    chmodSync(paths.privateKey, 0o600)
     const publicKey = validateGeneratedPublicKey(
       readFileSync(paths.publicKey, "utf8").trim()
     )

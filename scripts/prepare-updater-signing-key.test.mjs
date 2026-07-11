@@ -22,18 +22,56 @@ import {
   validateGeneratedPublicKey,
 } from "./prepare-updater-signing-key.mjs"
 
-const validPublicKey =
-  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDA4QUIwRUY2OUVCRTczM0EKUldRNmM3NmU5ZzZyQ0NmdlEzNmc2czl1UnRVSnpQTGMzRW1SbXFtdWx4dVVyYU5DMGVPYzkxYk8K"
+function makePublicKeyDocument({
+  algorithm = Buffer.from([0x45, 0x64]),
+  keyId = Buffer.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+  keyBytes = Buffer.from({ length: 32 }, (_, index) => index),
+  commentId = Buffer.from(keyId).reverse().toString("hex").toUpperCase(),
+} = {}) {
+  const keyPayload = Buffer.concat([algorithm, keyId, keyBytes])
+  assert.equal(keyPayload.length, 42)
 
-function makePublicKeyDocument(keyLine) {
   return Buffer.from(
-    `untrusted comment: minisign public key: 0123456789ABCDEF\n${keyLine}\n`,
+    `untrusted comment: minisign public key: ${commentId}\n${keyPayload.toString("base64")}\n`,
     "utf8"
   ).toString("base64")
 }
 
+const validPublicKey = makePublicKeyDocument()
+
 test("validateGeneratedPublicKey accepts a canonical minisign public key", () => {
   assert.equal(validateGeneratedPublicKey(validPublicKey), validPublicKey)
+})
+
+test("the synthetic public key fixture differs from the committed updater key", () => {
+  const committedPublicKey = JSON.parse(
+    readFileSync(
+      join(import.meta.dirname, "..", "src-tauri", "tauri.conf.json"),
+      "utf8"
+    )
+  ).plugins.updater.pubkey
+
+  assert.notEqual(validPublicKey, committedPublicKey)
+})
+
+test("validateGeneratedPublicKey rejects a non-Ed minisign algorithm", () => {
+  assert.throws(
+    () =>
+      validateGeneratedPublicKey(
+        makePublicKeyDocument({ algorithm: Buffer.from([0x45, 0x65]) })
+      ),
+    /generated updater public key is invalid/
+  )
+})
+
+test("validateGeneratedPublicKey rejects a comment with a mismatched key ID", () => {
+  assert.throws(
+    () =>
+      validateGeneratedPublicKey(
+        makePublicKeyDocument({ commentId: "0123456789ABCDEF" })
+      ),
+    /generated updater public key is invalid/
+  )
 })
 
 test("validateGeneratedPublicKey rejects malformed public key documents", () => {
@@ -50,13 +88,14 @@ test("validateGeneratedPublicKey rejects malformed public key documents", () => 
       `not a minisign public key\n${Buffer.from(validPublicKey, "base64").toString("utf8").split("\n")[1]}\n`,
       "utf8"
     ).toString("base64"),
-    makePublicKeyDocument(
-      `XX${Buffer.from(validPublicKey, "base64").toString("utf8").split("\n")[1].slice(2)}`
-    ),
-    makePublicKeyDocument(canonicalWrongLengthPayload),
-    makePublicKeyDocument(
-      `${Buffer.from(validPublicKey, "base64").toString("utf8").split("\n")[1]}=`
-    ),
+    Buffer.from(
+      `untrusted comment: minisign public key: 0123456789ABCDEF\n${canonicalWrongLengthPayload}\n`,
+      "utf8"
+    ).toString("base64"),
+    Buffer.from(
+      `${Buffer.from(validPublicKey, "base64").toString("utf8").slice(0, -1)}=\n`,
+      "utf8"
+    ).toString("base64"),
   ]
 
   for (const publicKey of cases) {
@@ -66,6 +105,12 @@ test("validateGeneratedPublicKey rejects malformed public key documents", () => 
     )
   }
 })
+
+function assertModeIfPosix(filePath, mode) {
+  if (process.platform !== "win32") {
+    assert.equal(statSync(filePath).mode & 0o777, mode)
+  }
+}
 
 test("updatePublicKey changes only plugins.updater.pubkey", () => {
   const config = {
@@ -166,10 +211,10 @@ test("CLI safely generates, validates, and installs updater signing files", () =
       })}\n`
     )
 
-    const fakePnpm = join(fixtureBin, "pnpm")
+    const fakeSigner = join(fixtureBin, "fake-pnpm.mjs")
     writeFileSync(
-      fakePnpm,
-      `#!/usr/bin/env node
+      fakeSigner,
+      `
 import { writeFileSync } from "node:fs"
 const args = process.argv.slice(2)
 if (process.env.PNPM_CONFIG_REPORTER !== "silent") {
@@ -188,7 +233,19 @@ writeFileSync(
 )
 `
     )
-    chmodSync(fakePnpm, 0o755)
+    if (process.platform === "win32") {
+      writeFileSync(
+        join(fixtureBin, "pnpm.cmd"),
+        `@echo off\r\n"${process.execPath}" "%~dp0fake-pnpm.mjs" %*\r\n`
+      )
+    } else {
+      const fakePnpm = join(fixtureBin, "pnpm")
+      writeFileSync(
+        fakePnpm,
+        `#!/bin/sh\nexec "${process.execPath}" "${fakeSigner}" "$@"\n`
+      )
+      chmodSync(fakePnpm, 0o755)
+    }
 
     const signingDir = join(fixtureHome, ".config", "mycodebuddy", "signing")
     const privateKey = join(signingDir, "updater-signing.key")
@@ -199,6 +256,7 @@ writeFileSync(
     const baseEnv = {
       ...process.env,
       HOME: fixtureHome,
+      USERPROFILE: fixtureHome,
       PATH: `${fixtureBin}${delimiter}${process.env.PATH}`,
       PNPM_CONFIG_REPORTER: "",
     }
@@ -259,7 +317,7 @@ writeFileSync(
       failedResult.stderr === "updater signing key generation failed\n",
       "signer failure output must be a fixed safe error"
     )
-    assert.equal(statSync(privateKey).mode & 0o777, 0o600)
+    assertModeIfPosix(privateKey, 0o600)
     assert.ok(existsSync(privateKey), "signer private key must be preserved")
     assert.ok(!existsSync(lockFile), "failed generation must release its lock")
     rmSync(signingDir, { recursive: true, force: true })
@@ -283,7 +341,7 @@ writeFileSync(
       "updater signing key generation failed\n"
     )
     assert.equal(readFileSync(configPath, "utf8"), configBeforeInvalidPublicKey)
-    assert.equal(statSync(privateKey).mode & 0o777, 0o600)
+    assertModeIfPosix(privateKey, 0o600)
     assert.ok(existsSync(join(signingDir, "updater-signing.key.pub")))
     assert.ok(!existsSync(passwordFile))
     assert.ok(!existsSync(lockFile), "invalid public key must release its lock")
@@ -309,11 +367,11 @@ writeFileSync(
       "successful CLI output must not include the password"
     )
 
-    assert.equal(statSync(signingDir).mode & 0o777, 0o700)
-    assert.equal(statSync(privateKey).mode & 0o777, 0o600)
-    assert.equal(statSync(passwordFile).mode & 0o777, 0o600)
-    assert.equal(statSync(localEnv).mode & 0o777, 0o600)
-    assert.equal(statSync(githubSecrets).mode & 0o777, 0o600)
+    assertModeIfPosix(signingDir, 0o700)
+    assertModeIfPosix(privateKey, 0o600)
+    assertModeIfPosix(passwordFile, 0o600)
+    assertModeIfPosix(localEnv, 0o600)
+    assertModeIfPosix(githubSecrets, 0o600)
 
     const localEnvText = readFileSync(localEnv, "utf8")
     const localEnvLines = localEnvText.split("\n")

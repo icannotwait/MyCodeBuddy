@@ -28,6 +28,11 @@ location. Losing either prevents publishing updates that existing
 installations will trust. Replacing the key requires distributing a trusted
 application build with the replacement public key.
 
+If the helper is interrupted, it fails closed on its generation lock. Verify
+no helper is active, then delete only
+`~/.config/mycodebuddy/signing/.updater-signing-generation.lock` before
+rerunning it. The helper never deletes a stale lock automatically.
+
 ## Configure GitHub Secrets
 
 Do not push a release tag until both repository secrets are configured.
