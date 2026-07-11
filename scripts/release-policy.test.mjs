@@ -6,6 +6,8 @@ import {
   assertForkVersion,
   assertMatchingVersions,
   assertNoAuthenticodeConfig,
+  assertServerInstallerCompliance,
+  assertUpdaterArtifactPolicy,
   assertWindowsReleaseWorkflow,
   findForbiddenRuntimeUrls,
   readCargoVersion,
@@ -147,6 +149,114 @@ test("release workflow publishes only Windows MyCodeBuddy artifacts", () => {
   assert.ok(desktopJob, "build-desktop job is missing")
   assert.match(desktopJob, /^      max-parallel:\s*1\s*$/m)
   assert.match(desktopJob, /^          includeUpdaterJson:\s*true\s*$/m)
+})
+
+test("uses updater artifacts only through the release Tauri config", () => {
+  const defaultConfig = JSON.parse(
+    readRepositoryFile("src-tauri/tauri.conf.json")
+  )
+  const releaseConfig = JSON.parse(
+    readRepositoryFile("src-tauri/tauri.release.conf.json")
+  )
+  const workflowText = readRepositoryFile(".github/workflows/release.yml")
+  const desktopJob = workflowText.match(
+    /^  build-desktop:\n([\s\S]*?)(?=^  build-server:)/m
+  )?.[1]
+
+  assert.equal(defaultConfig.bundle.createUpdaterArtifacts, false)
+  assert.equal(releaseConfig.bundle.createUpdaterArtifacts, true)
+  assert.ok(desktopJob, "build-desktop job is missing")
+  assert.match(
+    desktopJob,
+    /args:\s*.*--config\s+src-tauri\/tauri\.release\.conf\.json.*--target\s+\$\{\{\s*matrix\.target\s*\}\}.*--bundles\s+nsis/
+  )
+  assert.match(desktopJob, /^          includeUpdaterJson:\s*true\s*$/m)
+  assert.doesNotThrow(() =>
+    assertUpdaterArtifactPolicy({
+      defaultConfig,
+      releaseConfig,
+      workflowText,
+    })
+  )
+})
+
+test("server installer validates and copies compliance files before install writes", () => {
+  const installScript = readRepositoryFile("install.ps1")
+
+  assert.doesNotThrow(() => assertServerInstallerCompliance(installScript))
+  assert.throws(
+    () =>
+      assertServerInstallerCompliance(
+        installScript.replace(
+          '$ComplianceFiles = @("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")',
+          '$ComplianceFiles = @("LICENSE", "NOTICE")'
+        )
+      ),
+    /LICENSE.*NOTICE.*THIRD_PARTY_LICENSES/
+  )
+  assert.throws(
+    () =>
+      assertServerInstallerCompliance(
+        installScript.replace(
+          "# ── Install ──",
+          [
+            "# ── Install ──",
+            "New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null",
+          ].join("\n")
+        )
+      ),
+    /before writing InstallDir/
+  )
+})
+
+test("server READMEs require manual Windows upgrades and current examples", () => {
+  const paths = [
+    "README.md",
+    "docs/readme/README.ar.md",
+    "docs/readme/README.de.md",
+    "docs/readme/README.es.md",
+    "docs/readme/README.fr.md",
+    "docs/readme/README.ja.md",
+    "docs/readme/README.ko.md",
+    "docs/readme/README.pt.md",
+    "docs/readme/README.zh-CN.md",
+    "docs/readme/README.zh-TW.md",
+  ]
+
+  for (const path of paths) {
+    const text = readRepositoryFile(path)
+    const releaseSectionStart = text.indexOf("codeg-server-windows-x64.zip")
+    const releaseSection = text.slice(
+      releaseSectionStart,
+      releaseSectionStart + 1000
+    )
+
+    assert.notEqual(
+      releaseSectionStart,
+      -1,
+      `${path} lacks the Windows server artifact`
+    )
+    assert.doesNotMatch(text, /v0\.5\.2/, `${path} has the old version`)
+    assert.match(
+      text,
+      /\.\\install\.ps1 -Version v0\.18\.8-mycodebuddy\.1/,
+      `${path} lacks the current installer example`
+    )
+    assert.ok(
+      text.split("install.ps1").length - 1 >= 3,
+      `${path} must tell Windows users to rerun install.ps1`
+    )
+    assert.ok(
+      text.split("codeg-server-windows-x64.zip").length - 1 >= 2,
+      `${path} must describe replacement from the next Windows ZIP`
+    )
+    assert.match(
+      releaseSection,
+      /Linux\/macOS/,
+      `${path} must qualify Linux/macOS updates as source-built/local only`
+    )
+    assert.match(releaseSection, /GitHub\s+Releases/)
+  }
 })
 
 test("accepts the complete Windows release policy", () => {

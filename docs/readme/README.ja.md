@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 または特定のバージョンをインストール:
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### オプション 2: GitHub Releases からダウンロード
@@ -263,6 +263,12 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 | プラットフォーム | ファイル                        |
 | ---------------- | ------------------------------- |
 | Windows x64      | `codeg-server-windows-x64.zip` |
+
+Windows のビルド済みサーバーは手動でアップグレードします。
+`install.ps1` を再実行するか、次の `codeg-server-windows-x64.zip` の
+ファイルで既存のインストールを置き換えてください。このフォークは
+GitHub Releases でビルド済み Linux/macOS サーバー成果物を公開しません。
+Linux/macOS のインプレース更新は、ローカルのソースビルドだけが対象です。
 
 #### オプション 3: Docker
 

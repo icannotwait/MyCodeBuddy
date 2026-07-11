@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 或安装指定版本：
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### 方式二：从 GitHub Releases 下载
@@ -263,6 +263,11 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 | 平台        | 文件                            |
 | ----------- | ------------------------------- |
 | Windows x64 | `codeg-server-windows-x64.zip` |
+
+Windows 预构建服务器需要手动升级：重新运行 `install.ps1`，或使用下一版
+`codeg-server-windows-x64.zip` 中的文件替换现有安装。本分支不会在 GitHub
+Releases 发布预构建 Linux/macOS 服务器产物；Linux/macOS 的原地更新仅适用于
+本地源码构建。
 
 #### 方式三：Docker
 

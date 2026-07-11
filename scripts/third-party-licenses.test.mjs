@@ -159,6 +159,115 @@ test("collects Cargo Windows metadata and excludes the workspace root", () => {
   )
 })
 
+test("unions the four bundled Cargo targets and deduplicates shared packages", async () => {
+  const { CARGO_TARGETS, collectCargoPackageUnion } =
+    await import("./third-party-licenses.mjs")
+  const shared = makePackageDirectory("shared", { LICENSE: "Shared terms" })
+  const windowsArmOnly = makePackageDirectory("windows-arm-only", {
+    LICENSE: "Windows ARM terms",
+  })
+  const macOnly = makePackageDirectory("mac-only", {
+    LICENSE: "macOS terms",
+  })
+  const cargoPackage = (directory, name, version = "1.0.0") => ({
+    id: `registry+https://example.test#${name}@${version}`,
+    name,
+    version,
+    license: "MIT",
+    manifest_path: join(directory, "Cargo.toml"),
+    homepage: `https://example.test/${name}`,
+  })
+  const metadata = (packages) => ({
+    workspace_members: [],
+    packages,
+  })
+
+  assert.deepEqual(CARGO_TARGETS, [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+  ])
+
+  const records = collectCargoPackageUnion([
+    metadata([cargoPackage(shared, "shared")]),
+    metadata([
+      cargoPackage(shared, "shared"),
+      cargoPackage(windowsArmOnly, "windows-arm-only"),
+    ]),
+    metadata([
+      cargoPackage(shared, "shared"),
+      cargoPackage(macOnly, "mac-only"),
+    ]),
+    metadata([
+      cargoPackage(shared, "shared"),
+      cargoPackage(macOnly, "mac-only"),
+    ]),
+  ])
+
+  assert.deepEqual(
+    records.map(({ name, version }) => ({ name, version })),
+    [
+      { name: "mac-only", version: "1.0.0" },
+      { name: "shared", version: "1.0.0" },
+      { name: "windows-arm-only", version: "1.0.0" },
+    ]
+  )
+})
+
+test("rejects conflicting Cargo metadata while merging equivalent records", async () => {
+  const { collectCargoPackageUnion } =
+    await import("./third-party-licenses.mjs")
+  const first = makePackageDirectory("conflict-first", {
+    LICENSE: "First terms",
+  })
+  const second = makePackageDirectory("conflict-second", {
+    LICENSE: "Second terms",
+  })
+  const cargoPackage = (directory, overrides = {}) => ({
+    id: "registry+https://example.test#conflict@1.0.0",
+    name: "conflict",
+    version: "1.0.0",
+    license: "MIT",
+    manifest_path: join(directory, "Cargo.toml"),
+    homepage: "https://example.test/conflict",
+    ...overrides,
+  })
+  const metadata = (cargoPackageRecord) => ({
+    workspace_members: [],
+    packages: [cargoPackageRecord],
+  })
+
+  assert.throws(
+    () =>
+      collectCargoPackageUnion([
+        metadata(cargoPackage(first)),
+        metadata(cargoPackage(second, { license: "Apache-2.0" })),
+      ]),
+    /conflicting.*license/i
+  )
+  assert.throws(
+    () =>
+      collectCargoPackageUnion([
+        metadata(cargoPackage(first)),
+        metadata(
+          cargoPackage(second, {
+            homepage: "https://example.test/different",
+          })
+        ),
+      ]),
+    /conflicting.*homepage/i
+  )
+  assert.throws(
+    () =>
+      collectCargoPackageUnion([
+        metadata(cargoPackage(first)),
+        metadata(cargoPackage(second)),
+      ]),
+    /conflicting.*license text/i
+  )
+})
+
 test("sorts packages, omits paths, and deduplicates license text by hash", () => {
   const absolutePath = join(makeTemporaryDirectory(), "must-not-appear")
   const sharedText = "Shared license terms"
@@ -202,6 +311,10 @@ test("sorts packages, omits paths, and deduplicates license text by hash", () =>
   assert.match(output, /cargo:alpha@1\.0\.0/)
   assert.match(output, /npm:zeta@2\.0\.0/)
   assert.doesNotMatch(output, new RegExp(absolutePath.replaceAll("/", "\\/")))
+  assert.match(output, /x86_64-pc-windows-msvc/)
+  assert.match(output, /aarch64-pc-windows-msvc/)
+  assert.match(output, /x86_64-apple-darwin/)
+  assert.match(output, /aarch64-apple-darwin/)
 })
 
 test("rejects packages missing both a declaration and license text", () => {

@@ -19,7 +19,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "publisher": "MyCodeBuddy contributors",
     "homepage": "https://github.com/icannotwait/MyCodeBuddy",
     "license": "Apache-2.0",

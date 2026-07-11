@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 또는 특정 버전 설치:
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### 옵션 2: GitHub Releases에서 다운로드
@@ -263,6 +263,12 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 | 플랫폼      | 파일                            |
 | ----------- | ------------------------------- |
 | Windows x64 | `codeg-server-windows-x64.zip` |
+
+Windows 사전 빌드 서버 업그레이드는 수동으로 진행합니다. `install.ps1`을
+다시 실행하거나 다음 `codeg-server-windows-x64.zip`의 파일로 기존 설치를
+교체하세요. 이 포크는 GitHub Releases에 사전 빌드된 Linux/macOS 서버
+아티팩트를 게시하지 않으며, Linux/macOS 인플레이스 업데이트는 로컬 소스
+빌드에서만 사용할 수 있습니다.
 
 #### 옵션 3: Docker
 

@@ -2,7 +2,7 @@
 # Codeg Server installer for Windows
 # Usage:
 #   irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
-#   .\install.ps1 -Version v0.5.0
+#   .\install.ps1 -Version v0.18.8-mycodebuddy.1
 #
 
 param(
@@ -21,6 +21,7 @@ $Artifact = "codeg-server-windows-x64"
 # directory — `locate_codeg_mcp_binary()` in src-tauri/src/acp/connection.rs
 # resolves the companion as a sibling of the running server executable.
 $ManagedBins = @("codeg-server", "codeg-mcp")
+$ComplianceFiles = @("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.txt")
 
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly
@@ -230,23 +231,36 @@ Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 
 # ── Install ──
 #
-# Verify both binaries are present in the archive BEFORE writing anything
-# to InstallDir. Without the companion, delegation degrades silently on
-# every new ACP session — fail fast instead.
+# Verify both binaries and every compliance file are present in the archive
+# BEFORE writing anything to InstallDir. Without the companion, delegation
+# degrades silently; without the notices, the install is non-compliant.
+
+foreach ($name in $ManagedBins) {
+    $src = Join-Path $TmpDir $Artifact "$name.exe"
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        Write-Error "$name.exe not found in archive $Artifact.zip — release is incomplete, please report."
+        exit 1
+    }
+}
+foreach ($filename in $ComplianceFiles) {
+    $src = Join-Path $TmpDir $Artifact $filename
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        Write-Error "$filename not found in archive $Artifact.zip — release is incomplete, please report."
+        exit 1
+    }
+}
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 foreach ($name in $ManagedBins) {
     $src = Join-Path $TmpDir $Artifact "$name.exe"
-    if (-not (Test-Path $src)) {
-        Write-Error "$name.exe not found in archive $Artifact.zip — release is incomplete, please report."
-        exit 1
-    }
-}
-foreach ($name in $ManagedBins) {
-    $src = Join-Path $TmpDir $Artifact "$name.exe"
     $dst = Join-Path $InstallDir "$name.exe"
-    Copy-Item $src -Destination $dst -Force
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+}
+foreach ($filename in $ComplianceFiles) {
+    $src = Join-Path $TmpDir $Artifact $filename
+    $dst = Join-Path $InstallDir $filename
+    Copy-Item -LiteralPath $src -Destination $dst -Force
 }
 
 # Re-canonicalize destination now that the file exists. Pre-install canon may

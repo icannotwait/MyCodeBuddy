@@ -1,16 +1,27 @@
 # macOS Developer ID Signing
 
-This release workflow signs and notarizes the Tauri desktop app for macOS
-outside the App Store. It uses a Developer ID Application certificate, imports it
-into a temporary GitHub Actions keychain, and lets Tauri notarize the generated
-macOS bundles with Apple credentials.
+This fork does not publish prebuilt macOS artifacts. Its GitHub release
+workflow is Windows-only. The instructions below apply only to an optional
+manually distributed macOS build outside the App Store; they are not required
+for normal local development.
+
+A normal local app build is secret-free because the default Tauri config sets
+`bundle.createUpdaterArtifacts` to `false`:
+
+```bash
+pnpm tauri build --bundles app
+```
+
+Run that command with Tauri signing variables unset and without sourcing
+`local-build.env`. The resulting app still includes `LICENSE`, `NOTICE`, and
+`THIRD_PARTY_LICENSES.txt`.
 
 References:
 
 - Tauri macOS code signing: https://v2.tauri.app/distribute/sign/macos/
 - Apple Developer ID: https://developer.apple.com/support/developer-id/
 
-## Required GitHub Secrets
+## Optional Distribution Credentials
 
 | Secret | Value |
 | --- | --- |
@@ -21,9 +32,9 @@ References:
 | `APPLE_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-The existing `TAURI_SIGNING_PRIVATE_KEY` and
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets are still required for Tauri updater
-signatures. They are separate from Apple code signing.
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are used
+by the Windows release workflow for updater artifacts. They are separate from
+Apple code signing and are not needed for a normal local macOS `.app` build.
 
 ## Generate The Certificate Secret
 
@@ -90,16 +101,7 @@ spctl -a -vvv -t install src-tauri/target/release/bundle/dmg/*.dmg
 
 ## CI Behavior
 
-On tag releases, the macOS build matrix imports the `.p12` into a temporary
-keychain, resolves the `Developer ID Application` signing identity, and passes
-`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` to
-Tauri. Missing secrets fail the macOS job before the build starts.
-
-macOS signing and notarization are a release gate. If the Apple secrets are
-missing or notarization fails, the draft release is left unpublished even if the
-Linux, Windows, server, and Docker jobs produced artifacts. This avoids
-publishing a release with unsigned or unnotarized macOS desktop packages.
-
-The Apple keychain setup only runs for the `*-apple-darwin` matrix entries. The
-Linux desktop, Windows desktop, standalone server, and Docker build jobs do not
-depend on the Apple certificate or notarization secrets.
+The current GitHub Actions release workflow has no macOS matrix and reads no
+Apple signing or notarization secrets. Adding macOS distribution later would
+require a separate reviewed release-policy change; these optional credentials
+must not be added to the existing Windows-only workflow.

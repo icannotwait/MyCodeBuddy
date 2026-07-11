@@ -5,6 +5,8 @@ import {
   assertComplianceResources,
   assertMatchingVersions,
   assertNoAuthenticodeConfig,
+  assertServerInstallerCompliance,
+  assertUpdaterArtifactPolicy,
   assertWindowsReleaseWorkflow,
   findForbiddenRuntimeUrls,
   readCargoVersion,
@@ -25,6 +27,7 @@ const [
   packageText,
   cargoText,
   tauriConfigText,
+  tauriReleaseConfigText,
   workflowText,
   versionText,
   settingsText,
@@ -33,6 +36,7 @@ const [
   readRootFile("package.json"),
   readRootFile("src-tauri/Cargo.toml"),
   readRootFile("src-tauri/tauri.conf.json"),
+  readRootFile("src-tauri/tauri.release.conf.json"),
   readRootFile(".github/workflows/release.yml"),
   readRootFile("src-tauri/src/update/version.rs"),
   readRootFile("src/components/settings/system-network-settings.tsx"),
@@ -41,6 +45,7 @@ const [
 
 const packageConfig = JSON.parse(packageText)
 const tauriConfig = JSON.parse(tauriConfigText)
+const tauriReleaseConfig = JSON.parse(tauriReleaseConfigText)
 
 assertMatchingVersions({
   packageVersion: packageConfig.version,
@@ -51,6 +56,13 @@ assertMatchingVersions({
 assertWindowsReleaseWorkflow(workflowText)
 assertComplianceResources(tauriConfig)
 assertNoAuthenticodeConfig(tauriConfig)
+assertNoAuthenticodeConfig(tauriReleaseConfig)
+assertUpdaterArtifactPolicy({
+  defaultConfig: tauriConfig,
+  releaseConfig: tauriReleaseConfig,
+  workflowText,
+})
+assertServerInstallerCompliance(installScriptText)
 
 const forbiddenFiles = findForbiddenRuntimeUrls({
   "src-tauri/tauri.conf.json": tauriConfigText,

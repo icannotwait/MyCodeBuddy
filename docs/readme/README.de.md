@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 Oder eine bestimmte Version installieren:
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### Option 2: Von GitHub Releases herunterladen
@@ -263,6 +263,13 @@ Vorkompilierte Windows-Binärdateien (mit gebündelten Web-Assets) sind auf der 
 | Plattform   | Datei                           |
 | ----------- | ------------------------------ |
 | Windows x64 | `codeg-server-windows-x64.zip` |
+
+Upgrades des vorkompilierten Windows-Servers erfolgen manuell. Führen Sie
+`install.ps1` erneut aus oder ersetzen Sie die bestehende Installation durch
+die Dateien aus der nächsten `codeg-server-windows-x64.zip`. Dieser Fork
+veröffentlicht keine vorkompilierten Linux/macOS-Serverartefakte in GitHub
+Releases; direkte Updates unter Linux/macOS gelten nur für lokale
+Quellcode-Builds.
 
 #### Option 3: Docker
 

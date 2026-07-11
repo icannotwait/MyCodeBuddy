@@ -12,8 +12,9 @@
 
 - Fork repository is exactly `icannotwait/MyCodeBuddy`.
 - GitHub Release automation publishes Windows artifacts only.
-- Local `pnpm tauri dev` and `pnpm tauri build --bundles app` on macOS must remain supported.
+- Local `pnpm tauri dev` and secret-free `pnpm tauri build --bundles app` on macOS must remain supported.
 - Windows installers are not Authenticode-signed; Tauri updater artifacts must be signed.
+- Updater artifacts are disabled in the default Tauri config and enabled only through `src-tauri/tauri.release.conf.json`.
 - The private updater key and password must never enter the repository or command output.
 - Versions must use `MAJOR.MINOR.PATCH-mycodebuddy.COUNTER`, starting with `0.18.8-mycodebuddy.1`.
 - Package, Cargo, Tauri, and tag versions must match exactly.
@@ -243,7 +244,8 @@ export function assertComplianceResources(tauriConfig) {
 Create `scripts/check-release-config.mjs`. It must:
 
 1. read `package.json`, `src-tauri/Cargo.toml`,
-   `src-tauri/tauri.conf.json`, `.github/workflows/release.yml`,
+   `src-tauri/tauri.conf.json`, `src-tauri/tauri.release.conf.json`,
+   `.github/workflows/release.yml`,
    `src-tauri/src/update/version.rs`,
    `src/components/settings/system-network-settings.tsx`, and `install.ps1`;
 2. accept optional `--tag v0.18.8-mycodebuddy.1`;
@@ -386,7 +388,10 @@ https://github.com/icannotwait/MyCodeBuddy
 
 in Tauri updater config, Rust server updater constants, settings links, and
 `install.ps1`. Set `$Repo = "icannotwait/MyCodeBuddy"` in the PowerShell
-installer.
+installer. Before creating or writing `InstallDir`, validate
+`codeg-server.exe`, `codeg-mcp.exe`, `LICENSE`, `NOTICE`, and
+`THIRD_PARTY_LICENSES.txt`; then copy all five files while preserving the web
+asset copy behavior.
 
 Delete `install.sh` because the fork no longer publishes Unix server artifacts.
 
@@ -399,6 +404,10 @@ Update the root README and every localized README so:
 - the prebuilt server table contains only
   `Windows x64 | codeg-server-windows-x64.zip`;
 - the Windows PowerShell example points to the fork;
+- Windows prebuilt upgrades require rerunning `install.ps1` or replacing files
+  from the next Windows ZIP;
+- Linux/macOS in-place updates are described only as local source-built
+  behavior because this fork publishes no prebuilt Linux/macOS server assets;
 - Docker instructions describe local `docker compose up -d` builds only and
   contain no `ghcr.io/xintaofei/codeg` image;
 - the license section links to `LICENSE`;
@@ -472,6 +481,7 @@ git commit -m "chore: establish MyCodeBuddy release identity"
 - Produces: `findLicenseFiles(packageDir) -> Array<{ name, text }>`
 - Produces: `collectNpmPackages(pnpmReport) -> PackageRecord[]`
 - Produces: `collectCargoPackages(cargoMetadata) -> PackageRecord[]`
+- Produces: `collectCargoPackageUnion(cargoMetadataRecords) -> PackageRecord[]`
 - Produces: `renderLicenseReport(records) -> string`
 - Produces: CLI output at
   `src-tauri/resources/THIRD_PARTY_LICENSES.txt`.
@@ -487,6 +497,9 @@ Use temporary fixture directories and assert:
 - identical license texts are emitted once and reference all packages;
 - a package with neither declaration nor license file throws;
 - running the renderer twice returns byte-identical output.
+- Cargo records present only on Windows ARM64 or macOS remain in the union;
+- duplicate Cargo ecosystem/name/version records merge only equivalent
+  declarations, homepages, and license texts, and conflicts throw.
 
 Run:
 
@@ -516,9 +529,11 @@ Create `scripts/third-party-licenses.mjs` using only Node built-ins.
 Implementation requirements:
 
 - run `pnpm licenses list --prod --json` from the repository root;
-- run
-  `cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc`
-  from `src-tauri`;
+- run Cargo metadata from `src-tauri` for exactly
+  `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
+  `x86_64-apple-darwin`, and `aarch64-apple-darwin`;
+- collect npm production metadata once and form a deterministic Cargo union;
+- merge equivalent duplicate metadata and reject conflicting metadata;
 - exclude the workspace root `codeg` package from third-party Cargo records;
 - inspect each package directory for files matching
   `/^(license|licence|copying|notice)(\..+)?$/i`;
@@ -676,6 +691,8 @@ git commit -m "docs: bundle license and attribution notices"
 **Files:**
 - Replace: `.github/workflows/release.yml`
 - Modify: `scripts/release-policy.test.mjs`
+- Modify: `src-tauri/tauri.conf.json`
+- Create: `src-tauri/tauri.release.conf.json`
 
 **Interfaces:**
 - Consumes: `pnpm release:check`, `pnpm licenses:generate`,
@@ -737,7 +754,9 @@ Required details:
   `codeg-mcp-x86_64-pc-windows-msvc.exe` and
   `codeg-mcp-aarch64-pc-windows-msvc.exe` in their matrix jobs;
 - invoke `tauri-apps/tauri-action@v0.6.1` with
-  `--target ${{ matrix.target }} --bundles nsis`;
+  `--config src-tauri/tauri.release.conf.json --target ${{ matrix.target }} --bundles nsis`;
+- set default `bundle.createUpdaterArtifacts` to `false` and the release
+  override to `true`;
 - set `includeUpdaterJson: true`;
 - pass only `GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, and
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`;
@@ -997,17 +1016,16 @@ Expected: all tests and clippy checks PASS.
 
 - [ ] **Step 3: Build a local macOS app bundle**
 
-Load the generated local signing environment without printing it:
+Ensure all Tauri signing variables are unset. Do not source
+`local-build.env`, then run the exact local command:
 
 ```bash
-set -a
-source "$HOME/.config/mycodebuddy/signing/local-build.env"
-set +a
 pnpm tauri build --bundles app
 ```
 
 Expected: a MyCodeBuddy `.app` bundle is created under the macOS target release
-bundle directory. Verify it contains the license resources:
+bundle directory without updater signing secrets or updater artifacts. Verify
+it contains the license resources:
 
 ```bash
 find src-tauri/target -path '*MyCodeBuddy.app*' \

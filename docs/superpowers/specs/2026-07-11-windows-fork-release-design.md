@@ -120,9 +120,19 @@ A root `NOTICE` file will:
 
 A generated third-party license report will list bundled production npm and
 Cargo packages, their versions, declared licenses, and available license text.
-The generator must be deterministic and must fail when a bundled package has no
-discoverable license declaration or license file, unless that package is
-explicitly documented in a small reviewed exception list.
+The generator will collect npm production dependencies once and use the
+deterministic union of Cargo packages resolved for exactly:
+
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+Cargo records with the same ecosystem, name, and version will be deduplicated.
+Equivalent declarations, homepages, and license texts may be merged; conflicting
+metadata will fail generation. The generator must also fail when a bundled
+package has no discoverable license declaration or license file, unless that
+package is explicitly documented in a small reviewed exception list.
 
 Tauri will bundle `LICENSE`, `NOTICE`, and the generated third-party license
 report on every desktop platform. Therefore the compliance resources are also
@@ -146,6 +156,12 @@ certificate is available. Documentation will state that Windows SmartScreen
 may warn on first installation. This is independent of the Tauri updater
 signature, which protects update artifact integrity.
 
+The default `src-tauri/tauri.conf.json` will set
+`bundle.createUpdaterArtifacts` to `false`. A minimal
+`src-tauri/tauri.release.conf.json` override will set it to `true`, and only
+the Windows desktop release workflow will pass that override explicitly.
+`includeUpdaterJson: true` remains required for release publication.
+
 ## Release Workflow
 
 The existing tag-triggered release workflow will be simplified rather than
@@ -159,6 +175,11 @@ The workflow will:
 4. build and upload Windows x64 and ARM64 NSIS/updater artifacts;
 5. build, smoke-test, sign, and upload the Windows x64 server ZIP;
 6. publish the release only after all Windows jobs succeed.
+
+The server installer will validate both executables plus `LICENSE`, `NOTICE`,
+and `THIRD_PARTY_LICENSES.txt` before writing to its destination, then install
+all five files. Windows prebuilt server upgrades are manual: users rerun
+`install.ps1` or replace the installation from the next Windows ZIP.
 
 Apple certificates, Linux cross-compilers, Docker buildx, Docker Hub secrets,
 and unrelated release jobs will be removed from this workflow.
@@ -174,18 +195,28 @@ pnpm tauri build --bundles app
 
 No macOS icons, Cargo target dependencies, Tauri macOS settings, or
 platform-specific Rust code will be removed. Local macOS `.app` builds do not
-require the Windows release workflow or Authenticode certificate.
+require the Windows release workflow, Authenticode certificate, updater
+private key, or updater password.
 
-Updater artifacts are not required for the local self-use `.app` command. The
-verification process will build the frontend, run Rust tests, and perform a
-local macOS app-only build when the local signing environment permits it.
+Updater artifacts are disabled by default and enabled only by the release
+override. The normal local command is:
+
+```bash
+pnpm tauri build --bundles app
+```
+
+It must succeed with all Tauri signing variables unset and must retain
+`LICENSE`, `NOTICE`, and `THIRD_PARTY_LICENSES.txt` in the `.app`.
 
 ## Tests And Verification
 
 Automated verification will cover:
 
 - deterministic third-party license report generation;
+- four-target Cargo union, deterministic deduplication, and conflict rejection;
 - required compliance files appearing in Tauri resource configuration;
+- release-only updater artifact configuration and workflow usage;
+- installer validation and copying of all compliance files;
 - no runtime updater URL pointing to `xintaofei/codeg`;
 - package, Cargo, Tauri, and tag version consistency;
 - release workflow containing only Windows build targets;

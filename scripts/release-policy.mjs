@@ -12,7 +12,7 @@ const UPDATER_SIGNING_SECRETS = [
 ]
 const FORK_REPOSITORY = "icannotwait/MyCodeBuddy"
 const TAURI_RELEASE_ACTION_RE =
-  /^\s*-\s*uses\s*:\s*tauri-apps\/tauri-action(?:@|\s|$)/im
+  /^\s*(?:-\s*)?uses\s*:\s*tauri-apps\/tauri-action(?:@|\s|$)/im
 const TAURI_BUILD_COMMAND_RE = /\bpnpm\s+(?:exec\s+)?tauri\s+build\b/i
 
 function uncommentedWorkflowText(workflowText) {
@@ -272,6 +272,113 @@ export function assertComplianceResources(tauriConfig) {
     if (resources[source] !== target) {
       throw new Error(`missing compliance resource ${source} -> ${target}`)
     }
+  }
+}
+
+export function assertUpdaterArtifactPolicy({
+  defaultConfig,
+  releaseConfig,
+  workflowText,
+}) {
+  if (defaultConfig.bundle?.createUpdaterArtifacts !== false) {
+    throw new Error(
+      "default Tauri config must set bundle.createUpdaterArtifacts to false"
+    )
+  }
+  if (releaseConfig.bundle?.createUpdaterArtifacts !== true) {
+    throw new Error(
+      "release Tauri config must set bundle.createUpdaterArtifacts to true"
+    )
+  }
+
+  const releaseConfigArgument =
+    /--config\s+["']?src-tauri\/tauri\.release\.conf\.json["']?/i
+  const updaterJsonEnabled = /^\s*includeUpdaterJson\s*:\s*true\s*$/im
+  const releaseSteps = workflowStepBlocks(
+    uncommentedWorkflowText(workflowText)
+  ).filter((stepText) => TAURI_RELEASE_ACTION_RE.test(stepText))
+
+  if (releaseSteps.length === 0) {
+    throw new Error("release workflow has no Tauri desktop release step")
+  }
+  for (const stepText of releaseSteps) {
+    if (!releaseConfigArgument.test(stepText)) {
+      throw new Error(
+        "release Tauri build must use src-tauri/tauri.release.conf.json"
+      )
+    }
+    if (!updaterJsonEnabled.test(stepText)) {
+      throw new Error("release Tauri build must set includeUpdaterJson: true")
+    }
+  }
+}
+
+export function assertServerInstallerCompliance(installScriptText) {
+  const installMarker = installScriptText.indexOf("# ── Install ──")
+  if (installMarker < 0) {
+    throw new Error("server installer is missing the install section")
+  }
+  const installSection = installScriptText.slice(installMarker)
+  const firstInstallWrite = installSection.indexOf(
+    "New-Item -ItemType Directory -Force -Path $InstallDir"
+  )
+  if (firstInstallWrite < 0) {
+    throw new Error("server installer does not create InstallDir")
+  }
+
+  const validationBlocks = [
+    "foreach ($name in $ManagedBins)",
+    "foreach ($filename in $ComplianceFiles)",
+  ]
+  for (const block of validationBlocks) {
+    const blockIndex = installSection.indexOf(block)
+    if (blockIndex < 0 || blockIndex >= firstInstallWrite) {
+      throw new Error(
+        "server installer must validate binaries and compliance files before writing InstallDir"
+      )
+    }
+  }
+  if (
+    !/\$ManagedBins\s*=\s*@\("codeg-server",\s*"codeg-mcp"\)/.test(
+      installScriptText
+    )
+  ) {
+    throw new Error(
+      "server installer must manage codeg-server.exe and codeg-mcp.exe"
+    )
+  }
+  if (
+    !/\$ComplianceFiles\s*=\s*@\("LICENSE",\s*"NOTICE",\s*"THIRD_PARTY_LICENSES\.txt"\)/.test(
+      installScriptText
+    )
+  ) {
+    throw new Error(
+      "server installer must manage LICENSE, NOTICE, and THIRD_PARTY_LICENSES.txt"
+    )
+  }
+
+  const validationPrefix = installSection.slice(0, firstInstallWrite)
+  if (
+    [
+      ...validationPrefix.matchAll(
+        /Test-Path -LiteralPath \$src -PathType Leaf/g
+      ),
+    ].length < 2 ||
+    !/foreach \(\$filename in \$ComplianceFiles\)/.test(validationPrefix)
+  ) {
+    throw new Error(
+      "server installer must validate every archive file as a regular file"
+    )
+  }
+  const writeSection = installSection.slice(firstInstallWrite)
+  if (
+    !/foreach \(\$filename in \$ComplianceFiles\)[\s\S]*?Copy-Item -LiteralPath \$src -Destination \$dst -Force/.test(
+      writeSection
+    )
+  ) {
+    throw new Error(
+      "server installer must copy all compliance files to InstallDir"
+    )
   }
 }
 

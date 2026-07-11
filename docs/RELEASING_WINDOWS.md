@@ -23,6 +23,18 @@ The repository contains only the generated public key in
 `src-tauri/tauri.conf.json`. Do not commit the private key, password,
 `local-build.env`, or copies of their contents.
 
+Normal local desktop builds do not use this signing material.
+`src-tauri/tauri.conf.json` sets `bundle.createUpdaterArtifacts` to `false`, so
+the following command must run with all Tauri signing variables unset:
+
+```bash
+pnpm tauri build --bundles app
+```
+
+The command still bundles `LICENSE`, `NOTICE`, and
+`THIRD_PARTY_LICENSES.txt`. Do not source `local-build.env` for a normal local
+app build.
+
 Back up the private key and password together in an encrypted, access-controlled
 location. Losing either prevents publishing updates that existing
 installations will trust. Replacing the key requires distributing a trusted
@@ -66,3 +78,9 @@ The tag starts the Windows release workflow. After all builds and uploads
 succeed, the workflow publishes the release automatically. Inspect the
 published release afterward to confirm it contains the Windows x64 and ARM64
 desktop updater artifacts and the signed Windows x64 server ZIP.
+
+The desktop release step explicitly passes
+`--config src-tauri/tauri.release.conf.json`. That minimal override enables
+`bundle.createUpdaterArtifacts`, while `includeUpdaterJson: true` publishes the
+combined updater manifest. The signing secrets are therefore required only by
+release jobs that create signed updater artifacts or sign the server ZIP.

@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 Or install a specific version:
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### Option 2: Download from GitHub Releases
@@ -264,7 +264,10 @@ Pre-built Windows binaries (with bundled web assets) are available on the [Relea
 | ----------- | ------------------------------ |
 | Windows x64 | `codeg-server-windows-x64.zip` |
 
-> For unattended deployments, start it with `--supervise` so a failed in-place upgrade is automatically rolled back — see [In-place updates](#in-place-updates).
+Windows prebuilt server upgrades are manual. Rerun `install.ps1`, or replace
+the existing installation with files from the next
+`codeg-server-windows-x64.zip`. This fork publishes no prebuilt Linux/macOS
+server artifacts in GitHub Releases.
 
 #### Option 3: Docker
 
@@ -286,9 +289,13 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp is pi
 
 If you keep the two binaries in separate directories, set `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` so the runtime can still find the companion; without it, multi-agent delegation is silently disabled.
 
-#### In-place updates
+#### Source-built Linux/macOS updates
 
-The server can update itself from **Settings → Software Update**: it downloads the signed release for its platform, swaps the binaries and web assets on disk, and restarts — no manual re-deploy. This is Linux/macOS only (disabled on Windows). The previous version is kept as a backup, so the same screen offers a **Roll back** action to return to it.
+In-place updates from **Settings → Software Update** are local, source-built
+Linux/macOS behavior only. This fork does not publish prebuilt Linux/macOS
+server artifacts in GitHub Releases. The updater swaps locally installed
+binaries and web assets, restarts the server, and retains the previous version
+for the **Roll back** action.
 
 **Run under the supervisor for auto-rollback.** Start the standalone server with `--supervise` so a freshly-upgraded process that fails to boot within the trial window is automatically reverted to the previous version:
 

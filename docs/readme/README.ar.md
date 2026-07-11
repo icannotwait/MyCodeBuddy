@@ -253,7 +253,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 أو تثبيت إصدار محدد:
 
 ```powershell
-.\install.ps1 -Version v0.5.2
+.\install.ps1 -Version v0.18.8-mycodebuddy.1
 ```
 
 #### الخيار 2: التنزيل من GitHub Releases
@@ -263,6 +263,11 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 | المنصة      | الملف                           |
 | ----------- | ------------------------------ |
 | Windows x64 | `codeg-server-windows-x64.zip` |
+
+ترقيات خادم Windows الجاهز تتم يدويًا. أعد تشغيل `install.ps1`، أو استبدل
+التثبيت الحالي بملفات `codeg-server-windows-x64.zip` التالية. لا ينشر هذا
+التفرع حزم خادم Linux/macOS جاهزة ضمن GitHub Releases؛ والتحديث الموضعي على
+Linux/macOS متاح فقط للبناء المحلي من المصدر.
 
 #### الخيار 3: Docker
 

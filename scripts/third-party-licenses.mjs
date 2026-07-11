@@ -15,6 +15,13 @@ const cargoRoot = join(repositoryRoot, "src-tauri")
 const outputPath = join(cargoRoot, "resources", "THIRD_PARTY_LICENSES.txt")
 const licenseFilenamePattern = /^(license|licence|copying|notice)(\..+)?$/i
 
+export const CARGO_TARGETS = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
 const compareStrings = (left, right) =>
   left < right ? -1 : left > right ? 1 : 0
 
@@ -127,6 +134,88 @@ export const collectCargoPackages = (cargoMetadata) => {
     .sort(compareRecords)
 }
 
+const mergeEquivalentValue = (identifier, field, left, right) => {
+  if (!left) return right
+  if (!right) return left
+  if (left !== right) {
+    throw new Error(
+      `${identifier} has conflicting ${field} metadata: ${left} !== ${right}`
+    )
+  }
+  return left
+}
+
+const mergeEquivalentLicenseTexts = (identifier, left, right) => {
+  if (left.length === 0) return right
+  if (right.length === 0) return left
+
+  const leftTexts = [...new Set(left.map(({ text }) => text))].sort(
+    compareStrings
+  )
+  const rightTexts = [...new Set(right.map(({ text }) => text))].sort(
+    compareStrings
+  )
+  if (
+    leftTexts.length !== rightTexts.length ||
+    leftTexts.some((text, index) => text !== rightTexts[index])
+  ) {
+    throw new Error(`${identifier} has conflicting license text metadata`)
+  }
+
+  const namesByText = new Map()
+  for (const { name, text } of [...left, ...right]) {
+    const currentName = namesByText.get(text)
+    if (!currentName || compareStrings(name, currentName) < 0) {
+      namesByText.set(text, name)
+    }
+  }
+  return [...namesByText]
+    .map(([text, name]) => ({ name, text }))
+    .sort(
+      (leftText, rightText) =>
+        compareStrings(leftText.name, rightText.name) ||
+        compareStrings(leftText.text, rightText.text)
+    )
+}
+
+export const collectCargoPackageUnion = (cargoMetadataRecords) => {
+  const packagesByIdentifier = new Map()
+
+  for (const cargoMetadata of cargoMetadataRecords) {
+    for (const record of collectCargoPackages(cargoMetadata)) {
+      const identifier = packageIdentifier(record)
+      const existing = packagesByIdentifier.get(identifier)
+      if (!existing) {
+        packagesByIdentifier.set(identifier, record)
+        continue
+      }
+
+      packagesByIdentifier.set(identifier, {
+        ...existing,
+        declaredLicense: mergeEquivalentValue(
+          identifier,
+          "license",
+          existing.declaredLicense,
+          record.declaredLicense
+        ),
+        homepage: mergeEquivalentValue(
+          identifier,
+          "homepage",
+          existing.homepage,
+          record.homepage
+        ),
+        licenseTexts: mergeEquivalentLicenseTexts(
+          identifier,
+          existing.licenseTexts,
+          record.licenseTexts
+        ),
+      })
+    }
+  }
+
+  return [...packagesByIdentifier.values()].sort(compareRecords)
+}
+
 export const renderLicenseReport = (records) => {
   const sortedRecords = records
     .map((record) =>
@@ -171,7 +260,8 @@ export const renderLicenseReport = (records) => {
     "THIRD-PARTY SOFTWARE LICENSES",
     "",
     "This report covers locked npm production dependencies and Cargo",
-    "dependencies resolved for x86_64-pc-windows-msvc.",
+    "dependencies resolved for the deterministic union of these targets:",
+    ...CARGO_TARGETS.map((target) => `- ${target}`),
     "",
     "PACKAGE INVENTORY",
     "=================",
@@ -220,21 +310,23 @@ export const generateLicenseReport = () => {
     ["licenses", "list", "--prod", "--json"],
     repositoryRoot
   )
-  const cargoMetadata = readJsonCommand(
-    "cargo",
-    [
-      "metadata",
-      "--format-version",
-      "1",
-      "--locked",
-      "--filter-platform",
-      "x86_64-pc-windows-msvc",
-    ],
-    cargoRoot
+  const cargoMetadataRecords = CARGO_TARGETS.map((target) =>
+    readJsonCommand(
+      "cargo",
+      [
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--filter-platform",
+        target,
+      ],
+      cargoRoot
+    )
   )
   const records = [
     ...collectNpmPackages(pnpmReport),
-    ...collectCargoPackages(cargoMetadata),
+    ...collectCargoPackageUnion(cargoMetadataRecords),
   ]
   const report = renderLicenseReport(records)
 
