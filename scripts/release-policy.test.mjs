@@ -122,6 +122,14 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
     tauriVersion: tauriConfig.version,
   })
   assert.equal(packageJson.version, version)
+  assertComplianceResources(tauriConfig)
+  for (const path of [
+    "LICENSE",
+    "NOTICE",
+    "src-tauri/resources/THIRD_PARTY_LICENSES.txt",
+  ]) {
+    assert.ok(readRepositoryFile(path).trim().length > 0, `${path} is empty`)
+  }
   assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
 })
 

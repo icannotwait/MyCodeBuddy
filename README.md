@@ -389,3 +389,6 @@ Next.js 16 (Static Export) + React 19
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).
+
+Installed desktop bundles include the Apache-2.0 license, modification
+attribution, and generated third-party notices under their resources directory.

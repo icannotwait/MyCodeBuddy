@@ -20,6 +20,10 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
+    "publisher": "MyCodeBuddy contributors",
+    "homepage": "https://github.com/icannotwait/MyCodeBuddy",
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
     "targets": "all",
     "icon": [
       "icons/32x32.png",
@@ -29,7 +33,10 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../out": "web/"
+      "../out": "web/",
+      "../LICENSE": "licenses/LICENSE",
+      "../NOTICE": "licenses/NOTICE",
+      "resources/THIRD_PARTY_LICENSES.txt": "licenses/THIRD_PARTY_LICENSES.txt"
     },
     "externalBin": ["binaries/codeg-mcp"],
     "windows": {
