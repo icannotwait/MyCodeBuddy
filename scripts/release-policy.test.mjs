@@ -410,6 +410,22 @@ test("requires recursive checkout in the desktop job itself", () => {
   )
 })
 
+test("requires recursive checkout when the server job generates licenses", () => {
+  const serverWithoutSubmodules = `${validWindowsWorkflow}
+  build-server:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate third-party licenses
+        run: pnpm licenses:generate
+`
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(serverWithoutSubmodules),
+    /server release must checkout submodules recursively/
+  )
+})
+
 test("rejects every release target except Windows x64 MSVC", () => {
   for (const target of [
     "aarch64-pc-windows-msvc",

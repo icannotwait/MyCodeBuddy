@@ -179,6 +179,19 @@ export function assertWindowsReleaseWorkflow(workflowText) {
   if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
     throw new Error("checkout step must contain exactly one with block")
   }
+  const serverJob = policyText.match(
+    /^  build-server:\s*\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:\s*$|(?![\s\S]))/m
+  )?.[0]
+  if (serverJob?.includes("licenses:generate")) {
+    const serverCheckout = workflowStepBlocks(serverJob).find(
+      (stepText) =>
+        /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
+        /submodules\s*:\s*recursive/i.test(stepText)
+    )
+    if (!serverCheckout) {
+      throw new Error("server release must checkout submodules recursively")
+    }
+  }
   if (
     !/oven-sh\/setup-bun@v2/i.test(desktopJob) ||
     !/bun-version\s*:\s*1\.3\.14/i.test(desktopJob)
