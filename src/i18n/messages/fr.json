@@ -51,6 +51,7 @@
       "experts": "Experts",
       "science": "Science",
       "office_tools": "Outils bureautiques",
+      "skill_packs": "Packs de compétences",
       "quick_messages": "Messages rapides",
       "logs": "Journaux d'exécution"
     }
@@ -1049,7 +1050,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "Chargement des paramètres des agents..."
+    "agentsLoading": "Chargement des paramètres des agents...",
+    "skillPacksLoading": "Chargement des packs de compétences…"
   },
   "GeneralSettings": {
     "loading": "Chargement...",
@@ -2037,6 +2039,7 @@
           "spawnFailed": "Impossible de démarrer {agent} : {message}",
           "downloadFailed": "Échec du téléchargement de {agent} : {message}",
           "sessionLoadResourceNotFound": "Échec du chargement de la session de {agent}. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
+          "sessionLoadUnavailable": "{agent} n'a pas pu restaurer cette session ; elle a peut-être pris fin ou l'agent s'est arrêté. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
           "turnFailedRefusal": "{agent} a refusé de poursuivre ce tour. Cela indique souvent une erreur de backend ou de passerelle. Vérifiez les journaux de l'agent.",
           "turnFailedMaxTokens": "{agent} a atteint la limite maximale de jetons pour ce tour.",
           "turnFailedMaxTurnRequests": "{agent} a atteint le nombre maximal de requêtes autorisées pour ce tour.",
@@ -2121,6 +2124,7 @@
         "slashSearchEmpty": "Aucune commande correspondante",
         "experts": "Experts",
         "office": "Bureautique",
+        "research": "Recherche",
         "attachLocalUpload": "Téléverser un fichier local",
         "attachServerFile": "Sélectionner un fichier serveur",
         "attachUploadTooLarge": "{names} dépasse la limite de téléversement de {limit} Mo et a été ignoré.",
@@ -3168,6 +3172,22 @@
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
     "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct."
+  },
+  "SkillPacksSettings": {
+    "title": "Packs de compétences",
+    "description": "Ensembles de compétences sélectionnés que codeg gère de manière centralisée et relie à vos agents IA : experts en programmation, recherche scientifique et outils de documents bureautiques. Activez-les par agent ci-dessous.",
+    "tabs": {
+      "experts": "Experts",
+      "science": "Science",
+      "office": "Outils bureautiques"
+    },
+    "actions": {
+      "openCentralDir": "Ouvrir le dossier central",
+      "refresh": "Actualiser"
+    },
+    "toasts": {
+      "openFolderFailed": "Échec de l'ouverture du dossier"
+    }
   },
   "QuickMessagesSettings": {
     "title": "Messages rapides",

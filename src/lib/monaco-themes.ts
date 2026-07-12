@@ -2,9 +2,32 @@
 
 import { useEffect, useState } from "react"
 import type { BeforeMount } from "@monaco-editor/react"
+import type { editor as MonacoEditorNs } from "monaco-editor"
 
 export const MONACO_LIGHT_THEME = "codeg-light"
 export const MONACO_DARK_THEME = "codeg-dark"
+
+// Monaco's "unicode highlight" feature boxes characters it deems ambiguous with
+// ASCII or non-basic-ASCII. Its default flags ordinary CJK full-width
+// punctuation — `：` `；` `，` `！` `？` `（` `）` etc. — turning normal
+// Chinese/Japanese prose into a wall of orange boxes (issue #329).
+//
+// We disable the two mechanisms that flag *visible* characters
+// (`ambiguousCharacters`, `nonBasicASCII`) so CJK punctuation renders as plain
+// text on every surface. `invisibleCharacters` is left at its default (on):
+// surfacing zero-width / BOM characters is genuinely useful and never boxes
+// legible text.
+//
+// Tradeoff, made deliberately: this also stops highlighting genuine homoglyph
+// look-alikes (e.g. a Cyrillic `а` posing as `a` in an identifier). For a
+// CJK-first editor the false-positive noise on every line of prose far outweighs
+// that rare hint. Shared by the file editor, diff viewer, and merge editor so
+// they behave consistently.
+export const MONACO_UNICODE_HIGHLIGHT_OPTIONS: MonacoEditorNs.IUnicodeHighlightOptions =
+  {
+    ambiguousCharacters: false,
+    nonBasicASCII: false,
+  }
 
 export const monacoTokenRules = {
   light: [
@@ -350,9 +373,79 @@ const fixPythonTripleQuotes: BeforeMount = (monaco) => {
   })
 }
 
+// Codeg renders files from arbitrary projects but never loads their build
+// context — there is no tsconfig, no `node_modules`, no `--jsx` flag, and no
+// network access to fetch a `$schema` URL. Monaco's bundled TypeScript and JSON
+// language services don't know that, so they decorate ordinary files with
+// squiggles that are *always* false positives here:
+//
+//   - "Cannot find namespace 'React'."              (no @types/react resolved)
+//   - "Cannot find module '@/components/…'."         (path alias unresolved)
+//   - "Cannot use JSX unless the '--jsx' flag …"     (no compiler config)
+//   - "Unable to load schema from 'https://…'."      (no schema request service)
+//
+// In a read-oriented viewer these mislead far more than they help, so we switch
+// off the *environment-dependent* checks (type/module resolution, remote-schema
+// validation) while keeping the checks that are genuinely context-free and
+// still useful: plain TS/JS *syntax* errors and JSON *structural* errors.
+//
+// These settings are global to Monaco (not per-editor) and idempotent, so
+// running them from every surface's `beforeMount` is safe.
+export const configureLanguageValidation: BeforeMount = (monaco) => {
+  const ts = monaco.languages.typescript
+  if (ts) {
+    // Permissive baseline so JSX/TSX parses and no compiler-flag diagnostic can
+    // fire. Module resolution is moot with semantic validation off, but the
+    // values keep tokenization and other language features well-behaved.
+    const compilerOptions = {
+      allowJs: true,
+      allowNonTsExtensions: true,
+      jsx: ts.JsxEmit.Preserve,
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeJs,
+      esModuleInterop: true,
+      noEmit: true,
+    }
+    const diagnosticsOptions = {
+      // Type/module/namespace/JSX-flag errors all need a real project graph we
+      // never load → false positives without exception.
+      noSemanticValidation: true,
+      // Genuinely malformed code is context-free; keep surfacing it.
+      noSyntaxValidation: false,
+      // Suggestion-level hints (unused symbol, "could be const", …) also lean
+      // on project context.
+      noSuggestionDiagnostics: true,
+    }
+    ts.typescriptDefaults.setCompilerOptions(compilerOptions)
+    ts.javascriptDefaults.setCompilerOptions(compilerOptions)
+    ts.typescriptDefaults.setDiagnosticsOptions(diagnosticsOptions)
+    ts.javascriptDefaults.setDiagnosticsOptions(diagnosticsOptions)
+  }
+
+  const json = monaco.languages.json
+  if (json) {
+    json.jsonDefaults.setDiagnosticsOptions({
+      // Keep JSON structural validation — a stray comma or missing brace is a
+      // real, context-free error worth flagging.
+      validate: true,
+      // Never reach out for a remote schema: we're often offline, and the fetch
+      // failure is exactly what surfaces as "No schema request service
+      // available".
+      enableSchemaRequest: false,
+      // Suppress any leftover schema-resolution problems …
+      schemaRequest: "ignore",
+      // … and don't validate a perfectly valid config against a schema we can't
+      // load or that doesn't apply outside its own project.
+      schemaValidation: "ignore",
+    })
+  }
+}
+
 export const defineMonacoThemes: BeforeMount = (monaco) => {
   defineDiffLanguage(monaco)
   fixPythonTripleQuotes(monaco)
+  configureLanguageValidation(monaco)
 
   monaco.editor.defineTheme(MONACO_LIGHT_THEME, {
     base: "vs",

@@ -2,8 +2,9 @@
 
 import { useCallback, useId, useMemo, useRef, useState } from "react"
 import { Check, Search } from "lucide-react"
-import { VList, type VListHandle } from "virtua"
+import { Virtualizer, type VirtualizerHandle } from "virtua"
 import { cn } from "@/lib/utils"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
 import {
   filterModelGroups,
@@ -32,7 +33,10 @@ const MAX_LIST_HEIGHT_PX = 320
 // popover and the collapsed cog panel). Deliberately NOT a Radix menu and NOT
 // cmdk: a Radix menu's roving focus over hundreds of items is the scroll jank we
 // are fixing, and cmdk + virtua was the combination that previously broke item
-// clicks. Instead: a plain search box drives a virtua `VList` of plain option
+// clicks. Instead: a plain search box drives a virtua `Virtualizer` (scrolled by
+// an OverlayScrollbars `ScrollArea` — a real DOM scrollbar the popover contains,
+// so grabbing it keeps Radix's pointer path clean; the focus bounce it still
+// triggers on WebKit is handled by `useScrollbarSafeDismiss`) of plain option
 // buttons, with arrow/Enter keyboard handled here and listbox a11y on the list.
 export function ModelOptionList({
   groups,
@@ -46,7 +50,17 @@ export function ModelOptionList({
 }: ModelOptionListProps) {
   const [query, setQuery] = useState("")
   const [activeIndex, setActiveIndex] = useState(0)
-  const vlistRef = useRef<VListHandle>(null)
+  const virtualizerRef = useRef<VirtualizerHandle>(null)
+  // virtua scrolls the real OverlayScrollbars viewport (surfaced by ScrollArea's
+  // `onViewportRef` once OS initializes). We keep both a ref (for the Virtualizer
+  // `scrollRef` prop) and a state flag so the Virtualizer only mounts after that
+  // viewport exists — reading it synchronously at mount is racy (OS defers init).
+  const viewportRef = useRef<HTMLElement | null>(null)
+  const [viewportEl, setViewportEl] = useState<HTMLElement | null>(null)
+  const handleViewportRef = useCallback((element: HTMLElement | null) => {
+    viewportRef.current = element
+    setViewportEl(element)
+  }, [])
   const baseId = useId()
   const listId = `${baseId}-list`
   const optionId = useCallback(
@@ -59,7 +73,7 @@ export function ModelOptionList({
     [groups, query]
   )
   // Flat row indices that are options (skipping headers) — the keyboard cursor
-  // walks these, and they map an option position back to its `VList` row index.
+  // walks these, and they map an option position back to its flat row index.
   const optionRowIndices = useMemo(
     () => rows.flatMap((row, index) => (row.kind === "option" ? [index] : [])),
     [rows]
@@ -85,7 +99,7 @@ export function ModelOptionList({
       if (optionCount === 0) return
       const clamped = Math.max(0, Math.min(optionCount - 1, next))
       setActiveIndex(clamped)
-      vlistRef.current?.scrollToIndex(optionRowIndices[clamped], {
+      virtualizerRef.current?.scrollToIndex(optionRowIndices[clamped], {
         align: "nearest",
       })
     },
@@ -178,57 +192,76 @@ export function ModelOptionList({
           {emptyLabel}
         </div>
       ) : (
-        <VList
-          ref={vlistRef}
-          role="listbox"
-          id={listId}
-          aria-label={listAriaLabel}
-          keepMounted={activeFlatIndex != null ? [activeFlatIndex] : undefined}
-          style={{ height: listHeight }}
-          className="p-1"
-        >
-          {rows.map((row, flatIndex) => {
-            if (row.kind === "header") {
-              return (
-                <div
-                  key={row.key}
-                  role="presentation"
-                  className="truncate px-2 pt-2 pb-0.5 text-xs font-medium text-muted-foreground"
+        // A real DOM scrollbar (OverlayScrollbars `ScrollArea`) that lives INSIDE
+        // the Radix popover, replacing virtua's native `VList` scrollbar. Because
+        // the content `contains()` it, Radix never reads grabbing it as an
+        // outside *pointer* interaction. (The remaining WebKit dismiss — the grab
+        // blurring focus to an outside element — is handled separately by
+        // `useScrollbarSafeDismiss` on the popover.) The `Virtualizer` scrolls the
+        // OS viewport (bound via `scrollRef`) and mounts only once that viewport
+        // exists (surfaced through `onViewportRef`).
+        <div style={{ height: listHeight }}>
+          <ScrollArea onViewportRef={handleViewportRef} className="h-full">
+            <div
+              role="listbox"
+              id={listId}
+              aria-label={listAriaLabel}
+              className="p-1"
+            >
+              {viewportEl ? (
+                <Virtualizer
+                  ref={virtualizerRef}
+                  scrollRef={viewportRef}
+                  keepMounted={
+                    activeFlatIndex != null ? [activeFlatIndex] : undefined
+                  }
                 >
-                  {row.name}
-                </div>
-              )
-            }
-            const optionIndex = optionIndexByRow.get(flatIndex) ?? 0
-            const selected = row.option.value === currentValue
-            const active = optionIndex === activeIndexClamped
-            return (
-              <button
-                key={row.key}
-                type="button"
-                role="option"
-                id={optionId(optionIndex)}
-                aria-selected={selected}
-                title={row.option.name}
-                onMouseMove={() => setActiveIndex(optionIndex)}
-                onClick={() => onSelect(row.option.value)}
-                className={cn(
-                  "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
-                  active && "bg-accent text-accent-foreground",
-                  selected && !active && "bg-accent/60"
-                )}
-              >
-                <span className="flex size-4 shrink-0 items-center justify-center pt-0.5">
-                  {selected ? <Check className="size-4" /> : null}
-                </span>
-                <DropdownRadioItemContent
-                  label={row.option.name}
-                  description={row.option.description}
-                />
-              </button>
-            )
-          })}
-        </VList>
+                  {rows.map((row, flatIndex) => {
+                    if (row.kind === "header") {
+                      return (
+                        <div
+                          key={row.key}
+                          role="presentation"
+                          className="truncate px-2 pt-2 pb-0.5 text-xs font-medium text-muted-foreground"
+                        >
+                          {row.name}
+                        </div>
+                      )
+                    }
+                    const optionIndex = optionIndexByRow.get(flatIndex) ?? 0
+                    const selected = row.option.value === currentValue
+                    const active = optionIndex === activeIndexClamped
+                    return (
+                      <button
+                        key={row.key}
+                        type="button"
+                        role="option"
+                        id={optionId(optionIndex)}
+                        aria-selected={selected}
+                        title={row.option.name}
+                        onMouseMove={() => setActiveIndex(optionIndex)}
+                        onClick={() => onSelect(row.option.value)}
+                        className={cn(
+                          "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
+                          active && "bg-accent text-accent-foreground",
+                          selected && !active && "bg-accent/60"
+                        )}
+                      >
+                        <span className="flex size-4 shrink-0 items-center justify-center pt-0.5">
+                          {selected ? <Check className="size-4" /> : null}
+                        </span>
+                        <DropdownRadioItemContent
+                          label={row.option.name}
+                          description={row.option.description}
+                        />
+                      </button>
+                    )
+                  })}
+                </Virtualizer>
+              ) : null}
+            </div>
+          </ScrollArea>
+        </div>
       )}
     </div>
   )

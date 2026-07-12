@@ -10,9 +10,8 @@ import {
 import {
   Bot,
   BookOpenText,
+  Boxes,
   FileSpreadsheet,
-  FileStack,
-  FlaskConical,
   GitBranch,
   Globe,
   Keyboard,
@@ -24,7 +23,6 @@ import {
   Server,
   Settings,
   SlidersHorizontal,
-  Sparkles,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { usePathname } from "next/navigation"
@@ -47,9 +45,7 @@ interface SettingsNavItem {
     | "model_providers"
     | "mcp"
     | "skills"
-    | "experts"
-    | "science"
-    | "office_tools"
+    | "skill_packs"
     | "quick_messages"
     | "shortcuts"
     | "version_control"
@@ -82,19 +78,9 @@ const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
     icon: BookOpenText,
   },
   {
-    href: "/settings/experts",
-    labelKey: "experts",
-    icon: Sparkles,
-  },
-  {
-    href: "/settings/science",
-    labelKey: "science",
-    icon: FlaskConical,
-  },
-  {
-    href: "/settings/office-tools",
-    labelKey: "office_tools",
-    icon: FileStack,
+    href: "/settings/skill-packs",
+    labelKey: "skill_packs",
+    icon: Boxes,
   },
   {
     href: "/settings/agents",

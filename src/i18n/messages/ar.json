@@ -51,6 +51,7 @@
       "experts": "الخبراء",
       "science": "البحث العلمي",
       "office_tools": "أدوات المكتب",
+      "skill_packs": "حزم المهارات",
       "quick_messages": "رسائل سريعة",
       "logs": "سجلات التشغيل"
     }
@@ -1049,7 +1050,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "جارٍ تحميل إعدادات الوكلاء..."
+    "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
+    "skillPacksLoading": "جارٍ تحميل حزم المهارات…"
   },
   "GeneralSettings": {
     "loading": "جارٍ التحميل...",
@@ -2037,6 +2039,7 @@
           "spawnFailed": "تعذر بدء تشغيل {agent}: {message}",
           "downloadFailed": "فشل تنزيل {agent}: {message}",
           "sessionLoadResourceNotFound": "فشل تحميل جلسة {agent}. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
+          "sessionLoadUnavailable": "تعذّر على {agent} استعادة هذه الجلسة، فقد تكون انتهت أو توقّف الوكيل. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
           "turnFailedRefusal": "رفض {agent} متابعة هذه الجولة. يدل ذلك غالبًا على خطأ في الخلفية أو البوابة. يرجى مراجعة سجلات الوكيل.",
           "turnFailedMaxTokens": "بلغ {agent} الحد الأقصى للرموز المسموح بها في هذه الجولة.",
           "turnFailedMaxTurnRequests": "بلغ {agent} الحد الأقصى لعدد الطلبات المسموح بها في هذه الجولة.",
@@ -2121,6 +2124,7 @@
         "slashSearchEmpty": "لا توجد أوامر مطابقة",
         "experts": "الخبراء",
         "office": "الأعمال المكتبية",
+        "research": "البحث العلمي",
         "attachLocalUpload": "تحميل ملف محلي",
         "attachServerFile": "اختيار ملف من الخادم",
         "attachUploadTooLarge": "{names} يتجاوز حد التحميل {limit}MB وتم تخطيه.",
@@ -3168,6 +3172,22 @@
     },
     "autoPreviewLabel": "فتح المعاينة تلقائيًا",
     "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا."
+  },
+  "SkillPacksSettings": {
+    "title": "حزم المهارات",
+    "description": "حزم مهارات منسّقة يديرها codeg مركزيًا ويربطها بوكلاء الذكاء الاصطناعي لديك — خبراء البرمجة، والبحث العلمي، وأدوات مستندات المكتب. فعّلها لكل وكيل أدناه.",
+    "tabs": {
+      "experts": "الخبراء",
+      "science": "البحث العلمي",
+      "office": "أدوات المكتب"
+    },
+    "actions": {
+      "openCentralDir": "فتح المجلد المركزي",
+      "refresh": "تحديث"
+    },
+    "toasts": {
+      "openFolderFailed": "فشل فتح المجلد"
+    }
   },
   "QuickMessagesSettings": {
     "title": "رسائل سريعة",

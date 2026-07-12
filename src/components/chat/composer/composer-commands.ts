@@ -89,6 +89,56 @@ export function applyExpertReference(
 }
 
 /**
+ * Re-stamp the invocation prefix of every agent-dependent skill / expert badge
+ * in the document to `prefix`. Codex triggers skills with `$`, every other agent
+ * with `/`, and a badge freezes its prefix in at insert time (see
+ * {@link applyExpertReference} and `skillToReference`). A badge inserted under
+ * one agent and then sent under another would carry the wrong trigger — most
+ * visibly a `/`-baked skill sent to Codex, which parses the leading `/skill` as a
+ * slash COMMAND and rejects the turn. Calling this whenever the effective agent
+ * changes keeps the leading invocation in sync with the selected agent.
+ *
+ * Only skill references carrying a `meta.scope` (skills + experts) are
+ * agent-dependent. Bare ACP slash commands (`commandToReference`, no scope) are
+ * always `/` and are left untouched. The rewrite is a single attrs-only
+ * transaction kept out of the undo history. Returns true if anything changed.
+ */
+export function restampSkillPrefixes(
+  editor: Editor,
+  prefix: "/" | "$"
+): boolean {
+  const updates: { pos: number; attrs: ReferenceAttrs }[] = []
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name !== "reference") return true
+    const attrs = node.attrs as ReferenceAttrs
+    if (
+      attrs.refType === "skill" &&
+      attrs.meta?.scope != null &&
+      attrs.meta.invocationPrefix !== prefix
+    ) {
+      updates.push({
+        pos,
+        attrs: {
+          ...attrs,
+          meta: { ...attrs.meta, invocationPrefix: prefix },
+        },
+      })
+    }
+    return true
+  })
+  if (updates.length === 0) return false
+  // Attrs-only `setNodeMarkup` never changes node sizes, so earlier positions
+  // stay valid as later nodes are updated in the same transaction.
+  const tr = editor.state.tr
+  for (const { pos, attrs } of updates) {
+    tr.setNodeMarkup(pos, undefined, attrs)
+  }
+  tr.setMeta("addToHistory", false)
+  editor.view.dispatch(tr)
+  return true
+}
+
+/**
  * Replay a previously-sent `PromptInputBlock[]` (a queued message's draft) back
  * into the editor: prose + reference badges in order, returning the out-of-band
  * attachments (images / embedded resources / non-composer links) for the host to

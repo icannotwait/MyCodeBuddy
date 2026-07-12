@@ -51,6 +51,7 @@
       "experts": "전문가",
       "science": "과학 연구",
       "office_tools": "오피스 도구",
+      "skill_packs": "스킬 팩",
       "quick_messages": "빠른 메시지",
       "logs": "실행 로그"
     }
@@ -1049,7 +1050,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "에이전트 설정을 불러오는 중..."
+    "agentsLoading": "에이전트 설정을 불러오는 중...",
+    "skillPacksLoading": "스킬 팩 로딩 중…"
   },
   "GeneralSettings": {
     "loading": "로딩 중...",
@@ -2037,6 +2039,7 @@
           "spawnFailed": "{agent} 시작 실패: {message}",
           "downloadFailed": "{agent} 다운로드 실패: {message}",
           "sessionLoadResourceNotFound": "{agent} 세션 불러오기에 실패했습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
+          "sessionLoadUnavailable": "{agent}에서 이 세션을 복원할 수 없습니다. 세션이 종료되었거나 에이전트가 중지되었을 수 있습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
           "turnFailedRefusal": "{agent}이(가) 이번 턴을 계속하지 않았습니다. 백엔드나 게이트웨이 오류일 수 있습니다. 에이전트 로그를 확인하세요.",
           "turnFailedMaxTokens": "{agent}이(가) 이번 턴의 최대 토큰 한도에 도달했습니다.",
           "turnFailedMaxTurnRequests": "{agent}이(가) 이번 턴에서 허용된 최대 요청 수에 도달했습니다.",
@@ -2121,6 +2124,7 @@
         "slashSearchEmpty": "일치하는 명령이 없습니다",
         "experts": "전문가",
         "office": "일상 업무",
+        "research": "과학 연구",
         "attachLocalUpload": "로컬 파일 첨부",
         "attachServerFile": "서버 파일 첨부",
         "attachUploadTooLarge": "{names}이(가) {limit}MB 업로드 한도를 초과하여 건너뛰었습니다.",
@@ -3168,6 +3172,22 @@
     },
     "autoPreviewLabel": "미리보기 자동 열기",
     "autoPreviewHint": "에이전트가 Word, Excel, PowerPoint 파일을 만들거나 편집하면 실시간 미리보기를 자동으로 엽니다."
+  },
+  "SkillPacksSettings": {
+    "title": "스킬 팩",
+    "description": "codeg가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
+    "tabs": {
+      "experts": "전문가",
+      "science": "과학 연구",
+      "office": "오피스 도구"
+    },
+    "actions": {
+      "openCentralDir": "중앙 폴더 열기",
+      "refresh": "새로고침"
+    },
+    "toasts": {
+      "openFolderFailed": "폴더를 열지 못했습니다"
+    }
   },
   "QuickMessagesSettings": {
     "title": "빠른 메시지",

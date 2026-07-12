@@ -24,7 +24,7 @@ history without rebasing:
 git fetch upstream
 git switch main
 git pull --ff-only origin main
-git switch -c sync/codeg-0.20.1
+git switch -c sync/codeg-0.20.2
 git merge --no-ff upstream/main
 ```
 
@@ -32,9 +32,9 @@ Resolve conflicts on the sync branch, then open a pull request into
 MyCodeBuddy `main`. Do not rebase published MyCodeBuddy history. Run the full
 repository verification suite before merging the pull request.
 
-For an upstream Codeg `0.20.1` sync, reset the fork version in `package.json`,
+For an upstream Codeg `0.20.2` sync, reset the fork version in `package.json`,
 `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
-`src-tauri/tauri.conf.json` to `0.20.1-mycodebuddy.1`. Run
+`src-tauri/tauri.conf.json` to `0.20.2-mycodebuddy.1`. Run
 `pnpm test:release` to verify that the versions and runtime URLs remain
 consistent.
 

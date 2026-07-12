@@ -51,6 +51,7 @@
       "experts": "專家",
       "science": "科學研究",
       "office_tools": "辦公工具",
+      "skill_packs": "技能包",
       "quick_messages": "快捷訊息",
       "logs": "執行日誌"
     }
@@ -1049,7 +1050,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "載入 Agent 設定中..."
+    "agentsLoading": "載入 Agent 設定中...",
+    "skillPacksLoading": "正在載入技能包…"
   },
   "GeneralSettings": {
     "loading": "載入中...",
@@ -2037,6 +2039,7 @@
           "spawnFailed": "啟動 {agent} 失敗：{message}",
           "downloadFailed": "{agent} 下載失敗：{message}",
           "sessionLoadResourceNotFound": "{agent} 會話載入失敗，可重新載入重試，或開始新會話。",
+          "sessionLoadUnavailable": "{agent} 無法還原此會話，它可能已結束或 agent 已停止。可重新載入重試，或開始新會話。",
           "turnFailedRefusal": "{agent} 拒絕繼續此輪回覆，通常代表後端或網關出錯，請檢查代理日誌。",
           "turnFailedMaxTokens": "{agent} 已達到此輪回覆的最大 Token 限制。",
           "turnFailedMaxTurnRequests": "{agent} 已達到此輪回覆允許的最大請求次數。",
@@ -2121,6 +2124,7 @@
         "slashSearchEmpty": "沒有符合的指令",
         "experts": "專家",
         "office": "日常辦公",
+        "research": "科學研究",
         "attachLocalUpload": "附加本機檔案",
         "attachServerFile": "附加伺服器檔案",
         "attachUploadTooLarge": "{names} 超過 {limit}MB 上傳上限，已略過。",
@@ -3168,6 +3172,22 @@
     },
     "autoPreviewLabel": "自動開啟預覽",
     "autoPreviewHint": "當智慧代理建立或編輯 Word、Excel、PowerPoint 檔案時，自動開啟其即時預覽。"
+  },
+  "SkillPacksSettings": {
+    "title": "技能包",
+    "description": "由 codeg 集中管理、並連結到各 AI 智慧代理的成套技能——程式設計專家、科學研究與辦公文件工具。可在下方依代理分別啟用。",
+    "tabs": {
+      "experts": "專家",
+      "science": "科學研究",
+      "office": "辦公工具"
+    },
+    "actions": {
+      "openCentralDir": "開啟中央目錄",
+      "refresh": "重新整理"
+    },
+    "toasts": {
+      "openFolderFailed": "開啟目錄失敗"
+    }
   },
   "QuickMessagesSettings": {
     "title": "快捷訊息",

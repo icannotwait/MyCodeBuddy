@@ -9,38 +9,42 @@ import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   forwardRef,
+  useEffect,
   useImperativeHandle,
-  type CSSProperties,
   type ReactNode,
+  type Ref,
 } from "react"
 
-// virtua renders ZERO rows under jsdom (no layout), so mock it to render every
-// child directly — the established pattern (see sidebar-conversation-list.test).
-// Forward a no-op scrollToIndex handle so keyboard nav doesn't throw.
+// virtua renders ZERO rows under jsdom (no layout), so mock the `Virtualizer` to
+// render every child directly — the established pattern (see logs-settings and
+// sidebar-conversation-list tests). Forward a no-op scrollToIndex handle so the
+// keyboard navigation doesn't throw.
 vi.mock("virtua", () => ({
-  VList: forwardRef(function VListMock(
-    props: {
-      children: ReactNode
-      role?: string
-      id?: string
-      "aria-label"?: string
-      style?: CSSProperties
-      className?: string
-    },
-    ref: React.Ref<{ scrollToIndex: (i: number) => void }>
+  Virtualizer: forwardRef(function VirtualizerMock(
+    props: { children?: ReactNode },
+    ref: Ref<{ scrollToIndex: (i: number) => void }>
   ) {
     useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }))
-    return (
-      <div
-        role={props.role}
-        id={props.id}
-        aria-label={props["aria-label"]}
-        className={props.className}
-      >
-        {props.children}
-      </div>
-    )
+    return <>{props.children}</>
   }),
+}))
+
+// The list mounts virtua only after the OverlayScrollbars viewport exists, which
+// it learns via `onViewportRef`. jsdom never lays out / initializes OS, so drive
+// that callback synchronously here (with a real element) so the options render.
+vi.mock("@/components/ui/scroll-area", () => ({
+  ScrollArea: ({
+    children,
+    onViewportRef,
+  }: {
+    children?: ReactNode
+    onViewportRef?: (el: HTMLElement | null) => void
+  }) => {
+    useEffect(() => {
+      onViewportRef?.(document.createElement("div"))
+    }, [onViewportRef])
+    return <>{children}</>
+  },
 }))
 
 import { ModelOptionList } from "./model-option-list"

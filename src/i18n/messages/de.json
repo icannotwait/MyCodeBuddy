@@ -51,6 +51,7 @@
       "experts": "Experten",
       "science": "Wissenschaft",
       "office_tools": "Office-Tools",
+      "skill_packs": "Skill-Pakete",
       "quick_messages": "Schnellnachrichten",
       "logs": "Laufzeitprotokolle"
     }
@@ -1049,7 +1050,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "Agent-Einstellungen werden geladen..."
+    "agentsLoading": "Agent-Einstellungen werden geladen...",
+    "skillPacksLoading": "Skill-Pakete werden geladen…"
   },
   "GeneralSettings": {
     "loading": "Wird geladen...",
@@ -2037,6 +2039,7 @@
           "spawnFailed": "{agent} konnte nicht gestartet werden: {message}",
           "downloadFailed": "{agent}-Download fehlgeschlagen: {message}",
           "sessionLoadResourceNotFound": "{agent}-Sitzung konnte nicht geladen werden. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
+          "sessionLoadUnavailable": "{agent} konnte diese Sitzung nicht wiederherstellen – sie wurde möglicherweise beendet oder der Agent wurde gestoppt. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
           "turnFailedRefusal": "{agent} hat die Fortsetzung dieser Runde abgelehnt. Häufig deutet das auf einen Backend- oder Gateway-Fehler hin. Bitte prüfen Sie die Agent-Logs.",
           "turnFailedMaxTokens": "{agent} hat das Token-Limit für diese Runde erreicht.",
           "turnFailedMaxTurnRequests": "{agent} hat die maximale Anzahl zulässiger Anfragen für diese Runde erreicht.",
@@ -2121,6 +2124,7 @@
         "slashSearchEmpty": "Keine passenden Befehle",
         "experts": "Experten",
         "office": "Büroarbeit",
+        "research": "Forschung",
         "attachLocalUpload": "Lokale Datei hochladen",
         "attachServerFile": "Serverdatei auswählen",
         "attachUploadTooLarge": "{names} überschreitet das Upload-Limit von {limit}MB und wurde übersprungen.",
@@ -3168,6 +3172,22 @@
     },
     "autoPreviewLabel": "Vorschau automatisch öffnen",
     "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet."
+  },
+  "SkillPacksSettings": {
+    "title": "Skill-Pakete",
+    "description": "Kuratierte Skill-Pakete, die codeg zentral verwaltet und mit deinen KI-Agenten verknüpft – Programmierexperten, wissenschaftliche Forschung und Office-Dokumenttools. Unten pro Agent aktivierbar.",
+    "tabs": {
+      "experts": "Experten",
+      "science": "Wissenschaft",
+      "office": "Office-Tools"
+    },
+    "actions": {
+      "openCentralDir": "Zentralen Ordner öffnen",
+      "refresh": "Aktualisieren"
+    },
+    "toasts": {
+      "openFolderFailed": "Ordner konnte nicht geöffnet werden"
+    }
   },
   "QuickMessagesSettings": {
     "title": "Schnellnachrichten",

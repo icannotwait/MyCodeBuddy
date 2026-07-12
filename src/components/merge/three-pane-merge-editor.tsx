@@ -6,7 +6,11 @@ import type { OnMount } from "@monaco-editor/react"
 import type { editor as MonacoEditorNs, IRange } from "monaco-editor"
 import { ArrowLeft, ArrowRight, CheckCheck } from "lucide-react"
 import { useTranslations } from "next-intl"
-import { defineMonacoThemes, useMonacoThemeSync } from "@/lib/monaco-themes"
+import {
+  defineMonacoThemes,
+  MONACO_UNICODE_HIGHLIGHT_OPTIONS,
+  useMonacoThemeSync,
+} from "@/lib/monaco-themes"
 import { useZoomLevel, useEditorFont } from "@/hooks/use-appearance"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -515,6 +519,7 @@ export function ThreePaneMergeEditor({
         folding: false,
         wordWrap: editorWordWrap ? "on" : "off",
         overviewRulerLanes: 0,
+        unicodeHighlight: MONACO_UNICODE_HIGHLIGHT_OPTIONS,
       }),
       [
         zoomLevel,
