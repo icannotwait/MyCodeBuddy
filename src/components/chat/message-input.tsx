@@ -3284,6 +3284,9 @@ export function MessageInput({
                           onPointerDownOutside={
                             collapsedSelectorsGuard.onPointerDownOutside
                           }
+                          onFocusOutside={
+                            collapsedSelectorsGuard.onFocusOutside
+                          }
                           className="w-[22rem] max-w-[calc(100vw-1rem)] p-1"
                         >
                           {showConfigLoading && (

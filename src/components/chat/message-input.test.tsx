@@ -86,17 +86,33 @@ vi.mock("@/lib/transport", () => ({
 vi.mock("virtua", async () => {
   const { forwardRef, useImperativeHandle } = await import("react")
   return {
-    VList: forwardRef(function VListMock(
-      props: { children: React.ReactNode; role?: string; id?: string },
+    Virtualizer: forwardRef(function VirtualizerMock(
+      props: { children?: React.ReactNode },
       ref: React.Ref<{ scrollToIndex: () => void }>
     ) {
       useImperativeHandle(ref, () => ({ scrollToIndex: () => {} }))
-      return (
-        <div role={props.role} id={props.id}>
-          {props.children}
-        </div>
-      )
+      return <>{props.children}</>
     }),
+  }
+})
+
+// ModelOptionList mounts virtua only after the OverlayScrollbars viewport is
+// surfaced via `onViewportRef`; jsdom never initializes OS, so drive it here.
+vi.mock("@/components/ui/scroll-area", async () => {
+  const { useEffect } = await import("react")
+  return {
+    ScrollArea: ({
+      children,
+      onViewportRef,
+    }: {
+      children?: React.ReactNode
+      onViewportRef?: (el: HTMLElement | null) => void
+    }) => {
+      useEffect(() => {
+        onViewportRef?.(document.createElement("div"))
+      }, [onViewportRef])
+      return <>{children}</>
+    },
   }
 })
 
