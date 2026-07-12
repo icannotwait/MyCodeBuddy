@@ -38,9 +38,6 @@ jobs:
           - name: Windows x64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
-          - name: Windows ARM64
-            runner: windows-latest
-            target: aarch64-pc-windows-msvc
     runs-on: \${{ matrix.runner }}
     steps:
       - uses: tauri-apps/tauri-action@v0.6.1
@@ -151,7 +148,9 @@ test("release workflow publishes only Windows MyCodeBuddy artifacts", () => {
   assert.match(workflowText, /codeg-server-windows-x64/)
   assert.doesNotMatch(workflowText, /includeUpdaterJson:\s*false/)
   assert.ok(desktopJob, "build-desktop job is missing")
-  assert.match(desktopJob, /^      max-parallel:\s*1\s*$/m)
+  assert.doesNotMatch(desktopJob, /Windows ARM64/)
+  assert.doesNotMatch(desktopJob, /aarch64-pc-windows-msvc/)
+  assert.doesNotMatch(desktopJob, /^      max-parallel:/m)
   assert.match(desktopJob, /^          includeUpdaterJson:\s*true\s*$/m)
 })
 
@@ -377,8 +376,9 @@ test("accepts the complete Windows release policy", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
 })
 
-test("rejects every release target except the two Windows MSVC targets", () => {
+test("rejects every release target except Windows x64 MSVC", () => {
   for (const target of [
+    "aarch64-pc-windows-msvc",
     "x86_64-apple-darwin",
     "aarch64-unknown-linux-gnu",
     "i686-pc-windows-msvc",

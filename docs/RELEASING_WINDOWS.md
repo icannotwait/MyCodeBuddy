@@ -76,8 +76,8 @@ git push origin v0.20.2-mycodebuddy.1
 
 The tag starts the Windows release workflow. After all builds and uploads
 succeed, the workflow publishes the release automatically. Inspect the
-published release afterward to confirm it contains the Windows x64 and ARM64
-desktop updater artifacts and the signed Windows x64 server ZIP.
+published release afterward to confirm it contains the Windows x64 desktop
+updater artifacts and the signed Windows x64 server ZIP.
 
 The desktop release step explicitly passes
 `--config src-tauri/tauri.release.conf.json`. That minimal override enables

@@ -153,17 +153,12 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - name: Windows x64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
             sidecar: codeg-mcp-x86_64-pc-windows-msvc.exe
-          - name: Windows ARM64
-            runner: windows-latest
-            target: aarch64-pc-windows-msvc
-            sidecar: codeg-mcp-aarch64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@v4
 

@@ -2,10 +2,7 @@ const FORK_VERSION_RE = /^\d+\.\d+\.\d+-mycodebuddy\.[1-9]\d*$/
 const UPSTREAM_REPO_RE =
   /https:\/\/(?:github\.com|raw\.githubusercontent\.com)\/xintaofei\/codeg/gi
 const ALLOWED_UPSTREAM_FILES = new Set(["NOTICE", "docs/UPSTREAM_SYNC.md"])
-const WINDOWS_RELEASE_TARGETS = new Set([
-  "x86_64-pc-windows-msvc",
-  "aarch64-pc-windows-msvc",
-])
+const WINDOWS_RELEASE_TARGETS = new Set(["x86_64-pc-windows-msvc"])
 const UPDATER_SIGNING_SECRETS = [
   "TAURI_SIGNING_PRIVATE_KEY",
   "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
