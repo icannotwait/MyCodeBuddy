@@ -27,7 +27,7 @@ version plus a MyCodeBuddy revision. For example, another patch on upstream
 ```bash
 npm run build
 node dist/index.js --version
-git add package.json package-lock.json src vitest.config.ts
+git add package.json package-lock.json src tsconfig.json vitest.config.ts
 git commit -m "chore: update MyCodeBuddy codex-acp"
 git push origin codex/codex-acp-cli-runtime
 ```

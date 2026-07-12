@@ -396,6 +396,20 @@ test("rejects duplicate checkout configuration in the desktop release", () => {
   )
 })
 
+test("requires recursive checkout in the desktop job itself", () => {
+  const misplacedSubmodules = validWindowsWorkflow
+    .replace("        with:\n          submodules: recursive\n", "")
+    .replace(
+      "      - name: Verify fork repository",
+      "      - uses: actions/checkout@v4\n        with:\n          submodules: recursive\n      - name: Verify fork repository"
+    )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(misplacedSubmodules),
+    /desktop release must checkout submodules recursively/
+  )
+})
+
 test("rejects every release target except Windows x64 MSVC", () => {
   for (const target of [
     "aarch64-pc-windows-msvc",
