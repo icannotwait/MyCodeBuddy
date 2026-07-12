@@ -514,12 +514,6 @@ mod tests {
             "@moonshot-ai/kimi-code@0.23.5",
             Some("22.19.0"),
         );
-        assert_npx_version(
-            AgentType::Codex,
-            "1.1.2",
-            "@agentclientprotocol/codex-acp@1.1.2",
-            Some("20.0.0"),
-        );
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
@@ -549,13 +543,19 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            codex_distribution_for("darwin-aarch64"),
+        match codex_distribution_for("darwin-aarch64") {
             AgentDistribution::Npx {
-                package: "@agentclientprotocol/codex-acp@1.1.2",
+                version,
+                package,
+                node_required,
                 ..
+            } => {
+                assert_eq!(version, "1.1.2");
+                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
+                assert_eq!(node_required, Some("20.0.0"));
             }
-        ));
+            other => panic!("expected npx Codex distribution on macOS, got {other:?}"),
+        }
     }
 
     #[test]
