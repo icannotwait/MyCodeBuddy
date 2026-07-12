@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
+Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
 
 ![gallery](../images/gallery.svg)
 
@@ -66,6 +66,7 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 - 内置 `git worktree` 并行开发流程
 - **项目启动器** — 可视化创建新项目，实时预览效果
 - **Office 文档** — 通过内置的 officecli 工具集创建、分析、校对和编辑 .docx / .xlsx / .pptx 文件，支持在文件标签页内实时预览，随智能体编辑即时刷新
+- **科学研究** — 内置科研技能（假设生成、实验设计、统计、可视化、批判性评估、文献检索），任意智能体均可调用，按智能体管理
 - **自动化** — 将任意输入框配置保存为可复用的自动化任务，按 cron 计划或手动触发、无界面自动运行
 - **消息渠道** — 连接 Telegram、飞书、iLink（微信）等即时通讯应用到编码代理，实时接收通知、完整会话交互、远程任务控制
 - MCP 管理（本地扫描 + 市场搜索/安装）
@@ -90,6 +91,7 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > 注意：环境变量的优先级高于默认路径。
 
@@ -140,8 +142,21 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 - **创建与编辑** — 生成新文档或修改现有 .docx / .xlsx / .pptx 文件，支持图表、表格和格式设置
 - **分析与校对** — 检查文档结构、发现格式问题、校对内容
 - **实时预览** — 在文件标签页中打开 .docx / .xlsx / .pptx，即可内联渲染，随智能体编辑自动刷新——底层由常驻的 `officecli watch` 服务支撑（在 Web 和独立服务器部署中经反向代理转发，按能力鉴权）
-- **快捷操作** — 欢迎页提供「编码」和「Office」两个标签，一键将对应技能调用和提示词模板填入输入框；未对所选智能体启用的技能会显示锁定标记，并引导你前往可开启的位置
+- **快捷操作** — 欢迎页提供「编码」、「Office」和「科学研究」三个标签，一键将对应技能调用和提示词模板填入输入框；未对所选智能体启用的技能会显示锁定标记，并引导你前往可开启的位置
 - **Office 工具设置** — 专属设置页可安装 `officecli` 并通过技能×智能体矩阵管理文档技能：切换任意（技能，智能体）组合，支持一键批量启停
+
+</details>
+
+<details>
+<summary><h2>科学研究</h2></summary>
+
+将任意智能体变为严谨的科研助手。Codeg 内置一套精选的、采用 MIT 许可证的**科研技能**——从选题构思到分析再到论文撰写——它们会安装到共享的中央技能库，并按你的选择链接到相应智能体，与专家和 Office 工具集的方式完全一致。
+
+### 功能特性
+
+- **精选技能** — 假设生成、实验设计、统计功效、统计分析、探索性数据分析、科学可视化、批判性评估、同行评审、引文管理、学者评估、论文检索以及 AI 示意图
+- **快捷操作** — 欢迎页的「科学研究」标签一键将对应的技能调用和本地化提示词模板填入输入框
+- **科学研究设置** — 专属设置页通过技能×智能体矩阵管理这些技能，并以徽标标记需要 API 密钥或 Python 环境的技能
 
 </details>
 
@@ -253,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 或安装指定版本：
 
 ```powershell
-.\install.ps1 -Version v0.20.0-mycodebuddy.1
+.\install.ps1 -Version v0.20.1-mycodebuddy.1
 ```
 
 #### 方式二：从 GitHub Releases 下载
@@ -376,19 +391,13 @@ Next.js 16 (Static Export) + React 19
 
 - 感谢 [LinuxDO](https://linux.do) 社区的支持
 
-## Coffee
-
-- 如果 Codeg 对你有帮助，不如请我喝杯咖啡吧
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="赞助 Codeg" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="赞助 Codeg" width="240" />
-
 ## 鸣谢
 
 - MyCodeBuddy 是原始 [Codeg](https://github.com/xintaofei/codeg) 项目的分支。
 - [ACP](https://agentclientprotocol.com)：智能体客户端协议 (ACP) 是 codeg 实现多智能体连接的基础
 - [Superpowers](https://github.com/obra/superpowers)：为 Codeg 的专家技能模块提供支持
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI)：为 Codeg 的 Office 文档工作流提供支持
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills)：为 Codeg 的科学研究技能提供支持（MIT 许可的子集）
 
 ## 许可证
 

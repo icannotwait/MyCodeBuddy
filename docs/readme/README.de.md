@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere Agenten (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi usw.) in einem Arbeitsbereich, unterstützt Konversationsaggregation und Multi-Agent-Zusammenarbeit sowie Desktop-Installation und Server-/Docker-Bereitstellung.
+Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere Agenten (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build usw.) in einem Arbeitsbereich, unterstützt Konversationsaggregation und Multi-Agent-Zusammenarbeit sowie Desktop-Installation und Server-/Docker-Bereitstellung.
 
 ![gallery](../images/gallery.svg)
 
@@ -66,6 +66,7 @@ Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere
 - Parallele Entwicklung mit integrierten `git worktree`-Abläufen
 - **Projekt-Starter** — neue Projekte visuell erstellen mit Live-Vorschau
 - **Office-Dokumente** — erstelle, analysiere, überprüfe und bearbeite .docx / .xlsx / .pptx-Dateien mit dem integrierten officecli-Toolset; Live-Vorschau in einer Datei-Registerkarte, die bei Agent-Bearbeitungen sofort aktualisiert wird
+- **Wissenschaftliche Forschung** — gebündelte Wissenschafts-Skills (Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung, Literaturrecherche), die jeder Agent aufrufen kann, pro Agent verwaltet
 - **Automatisierungen** — speichere eine beliebige Composer-Konfiguration als wiederverwendbare Automatisierung, die headless per Cron-Zeitplan oder auf Abruf ausgeführt wird
 - **Chat-Kanäle** — Telegram, Lark (Feishu), iLink (Weixin) und mehr mit Ihren Coding-Agenten verbinden für Echtzeit-Benachrichtigungen, vollständige Sitzungsinteraktion und Remote-Aufgabensteuerung
 - MCP-Verwaltung (lokaler Scan + Registry-Suche/Installation)
@@ -90,6 +91,7 @@ Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > Hinweis: Umgebungsvariablen haben Vorrang vor Fallback-Pfaden.
 
@@ -140,8 +142,21 @@ Arbeiten Sie mit Word-, Excel- und PowerPoint-Dateien als erstklassigen Workflow
 - **Erstellen und Bearbeiten** — neue Dokumente generieren oder vorhandene .docx / .xlsx / .pptx-Dateien bearbeiten, einschließlich Diagramme, Tabellen und Formatierung
 - **Analysieren und Korrigieren** — Dokumentstruktur prüfen, Formatierungsprobleme aufdecken und Inhalte korrigieren
 - **Live-Vorschau** — öffnen Sie eine .docx / .xlsx / .pptx-Datei in einem Datei-Tab; sie wird inline gerendert und aktualisiert sich automatisch, wenn der Agent Änderungen vornimmt — unterstützt durch einen dauerhaft laufenden `officecli watch`-Server (mit Reverse-Proxy und Fähigkeits-Authentifizierung für Web- und Serverumgebungen)
-- **Schnellaktionen** — die Willkommensseite bietet Tabs für Codierung und Office, die mit einem Klick den passenden Skill-Aufruf und eine Prompt-Vorlage in den Composer einfügen; nicht aktivierte Skills zeigen ein Schloss-Badge und verlinken zur Aktivierung
+- **Schnellaktionen** — die Willkommensseite bietet Tabs für Codierung, Office und Wissenschaftliche Forschung, die mit einem Klick den passenden Skill-Aufruf und eine Prompt-Vorlage in den Composer einfügen; nicht aktivierte Skills zeigen ein Schloss-Badge und verlinken zur Aktivierung
 - **Office-Tools-Einstellungen** — eine dedizierte Einstellungsseite installiert `officecli` und verwaltet dessen Dokument-Skills über eine Skill×Agent-Matrix: beliebige (Skill, Agent)-Paare umschalten und Massenänderungen anwenden
+
+</details>
+
+<details>
+<summary><h2>Wissenschaftliche Forschung</h2></summary>
+
+Verwandeln Sie jeden Agenten in einen rigorosen Forschungsassistenten. Codeg bündelt eine kuratierte Sammlung MIT-lizenzierter **wissenschaftlicher Forschungs-Skills** — von der Ideenfindung über die Analyse bis zur Ausarbeitung —, die sich in den gemeinsamen zentralen Skill-Speicher installieren und in beliebige von Ihnen ausgewählte Agenten einbinden lassen, genau wie die Experten- und Office-Toolsets.
+
+### Funktionen
+
+- **Kuratierte Skills** — Hypothesengenerierung, Versuchsplanung, statistische Power, statistische Analyse, explorative Datenanalyse, wissenschaftliche Visualisierung, kritische Bewertung, Peer-Review, Zitationsverwaltung, Scholar-Bewertung, Paper-Suche und KI-Schaubilder
+- **Schnellaktionen** — der Tab „Wissenschaftliche Forschung" der Willkommensseite fügt mit einem Klick den passenden Skill-Aufruf und eine lokalisierte Prompt-Vorlage in den Composer ein
+- **Wissenschafts-Einstellungen** — eine dedizierte Einstellungsseite verwaltet die Skills über eine Skill×Agent-Matrix, mit Badges, die Skills kennzeichnen, die einen API-Schlüssel oder eine Python-Umgebung benötigen
 
 </details>
 
@@ -253,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 Oder eine bestimmte Version installieren:
 
 ```powershell
-.\install.ps1 -Version v0.20.0-mycodebuddy.1
+.\install.ps1 -Version v0.20.1-mycodebuddy.1
 ```
 
 #### Option 2: Von GitHub Releases herunterladen
@@ -379,19 +394,13 @@ Next.js 16 (Static Export) + React 19
 
 - Danke an die [LinuxDO](https://linux.do)-Community für ihre Unterstützung
 
-## Coffee
-
-- Wenn Codeg Ihnen geholfen hat, spendieren Sie mir gerne einen Kaffee
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Codeg unterstützen" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Codeg unterstützen" width="240" />
-
 ## Danksagungen
 
 - MyCodeBuddy ist ein Fork des ursprünglichen [Codeg](https://github.com/xintaofei/codeg)-Projekts.
 - [ACP](https://agentclientprotocol.com) — das Agent Client Protocol (ACP) ist die Grundlage, die es Codeg ermöglicht, sich mit mehreren Agenten zu verbinden
 - [Superpowers](https://github.com/obra/superpowers) — unterstützt das Experten-Skills-Modul von Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — unterstützt den Office-Dokument-Workflow von Codeg
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — unterstützt die wissenschaftlichen Forschungs-Skills von Codeg (MIT-lizenzierte Teilmenge)
 
 ## Lizenz
 

@@ -1,7 +1,7 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.20.0-mycodebuddy.1",
+  "version": "0.20.1-mycodebuddy.1",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

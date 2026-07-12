@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.20.0-mycodebuddy.1"
+version = "0.20.1-mycodebuddy.1"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"

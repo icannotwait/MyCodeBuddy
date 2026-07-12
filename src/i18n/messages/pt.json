@@ -612,7 +612,7 @@
       "notRun": "As verificações ainda não foram executadas."
     },
     "grok": {
-      "configDescription": "Configure o Grok aqui. Os controles abaixo (modo de permissão e esforço de raciocínio) são mesclados em ~/.grok/config.toml, preservando suas outras chaves e comentários. O login usa sua XAI_API_KEY ou `grok login`. As demais chaves permanecem editáveis em Avançado.",
+      "configDescription": "Configure o Grok aqui. Os controles abaixo — modo de permissão, esforço de raciocínio, um modelo personalizado opcional (endpoint próprio) e a compactação — são mesclados em ~/.grok/config.toml, preservando suas outras chaves e comentários. O login usa seu XAI_API_KEY ou `grok login`. As demais chaves continuam editáveis em Avançado.",
       "permissionModeLabel": "Modo de permissão",
       "permissionAsk": "Perguntar sempre",
       "permissionAlwaysApprove": "Sempre aprovar",
@@ -629,7 +629,24 @@
       "advancedToggle": "Avançado (config.toml bruto)",
       "configTomlNative": "config.toml (nativo)",
       "configTomlHint": "Salvo literalmente como todo o ~/.grok/config.toml. TOML inválido é rejeitado para que um erro de digitação nunca trunque seu arquivo.",
-      "configTomlPlaceholder": "# Chaves além dos controles acima, por ex.\n# [mcp_servers.*], [cli], regras [permission]."
+      "configTomlPlaceholder": "# Chaves além dos controles acima, por ex.\n# [mcp_servers.*], [cli], regras [permission].",
+      "customModelTitle": "Modelo personalizado (endpoint próprio)",
+      "customModelHint": "Aponte o Grok para um endpoint personalizado ou auto-hospedado. O codeg grava um bloco `[model.*]` por modelo e o define como padrão. Deixe o ID do modelo vazio para removê-lo.",
+      "customModelIdLabel": "ID do modelo",
+      "customModelIdPlaceholder": "ex.: grok-custom",
+      "customModelIdHint": "Registrado como um bloco `[model.*]` e enviado à API como nome do modelo; também definido como `[models].default`.",
+      "customBaseUrlLabel": "URL base",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1 (padrão)",
+      "customApiBackendLabel": "Backend da API",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages (Anthropic)",
+      "customApiKeyLabel": "Chave de API",
+      "customApiKeyHint": "Armazenada em linha em `[model.*].api_key`, restrita a este endpoint.",
+      "customContextWindowLabel": "Janela de contexto (tokens)",
+      "customContextWindowHint": "Opcional. Define o momento da autocompactação; deixe vazio para o padrão do endpoint.",
+      "autoCompactLabel": "Limite de autocompactação (%)",
+      "autoCompactHint": "Compacta a conversa quando o uso do contexto atinge esta porcentagem (padrão do Grok: 85). Gravado em `[session]`."
     },
     "codex": {
       "configDescription": "Suporta configuração rápida de URL da API, API Key, nome do modelo e reasoning effort, com sincronização para `auth.json` / `config.toml`.",

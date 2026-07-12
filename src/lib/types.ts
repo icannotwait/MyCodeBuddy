@@ -1561,22 +1561,42 @@ export interface AcpAgentInfo {
   model_provider_id: number | null
 }
 
-/** Parsed scalar keys from ~/.grok/config.toml (mode / reasoning effort).
- * `null` means the key is absent. Serialized snake_case to match AcpAgentInfo.
- * The default model is intentionally NOT here — it's chosen per session from the
- * composer, and a persistent [models].default is overridden at launch by the
- * GROK_DEFAULT_MODEL env var. */
+/** Parsed keys from ~/.grok/config.toml. `null` means the key is absent.
+ * Serialized snake_case to match AcpAgentInfo. The stock per-session model is
+ * NOT here — it's chosen from the composer. But a codeg-managed custom (BYO
+ * endpoint) model IS: it's the `[model.<id>]` block whose id equals
+ * [models].default, read back through the custom_* fields. */
 export interface GrokSettings {
   default_reasoning_effort: string | null
   permission_mode: string | null
+  /** The codeg-managed custom model id ([model.<id>] == [models].default). */
+  custom_model_id: string | null
+  /** [model.<id>].base_url — null ⇒ Grok's official xAI endpoint. */
+  custom_base_url: string | null
+  /** [model.<id>].api_key — inline key scoped to the custom endpoint. */
+  custom_api_key: string | null
+  /** [model.<id>].api_backend — chat_completions | responses | messages. */
+  custom_api_backend: string | null
+  /** [model.<id>].context_window — context size in tokens. */
+  custom_context_window: number | null
+  /** [session].auto_compact_threshold_percent — 0–100 (Grok default 85). */
+  auto_compact_threshold_percent: number | null
 }
 
 /** Structured-control values the Grok settings panel sends on save. Each
  * non-null value sets its config.toml key; each null removes it. camelCase on
- * the wire to match the request body. */
+ * the wire to match the request body. A non-empty customModelId writes (or
+ * renames to) [model.<id>] + [models].default; empty/null removes the managed
+ * block. Within an active model, an empty sub-field omits its key. */
 export interface GrokStructuredConfig {
   defaultReasoningEffort: string | null
   permissionMode: string | null
+  customModelId: string | null
+  customBaseUrl: string | null
+  customApiKey: string | null
+  customApiBackend: string | null
+  customContextWindow: number | null
+  autoCompactThresholdPercent: number | null
 }
 
 // Lightweight agent status returned by acp_get_agent_status

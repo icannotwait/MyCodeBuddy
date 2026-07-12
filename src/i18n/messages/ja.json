@@ -612,7 +612,7 @@
       "notRun": "チェックはまだ実行されていません。"
     },
     "grok": {
-      "configDescription": "ここで Grok を設定します。下のコントロール（権限モード・推論レベル）は ~/.grok/config.toml にマージされ、他のキーとコメントは保持されます。サインインは XAI_API_KEY または `grok login` を使用します。その他のキーは「詳細」で編集できます。",
+      "configDescription": "ここで Grok を設定します。以下のコントロール（権限モード、推論の強さ、任意のカスタム（独自エンドポイント）モデル、圧縮）は ~/.grok/config.toml にマージされ、他のキーやコメントは保持されます。サインインは XAI_API_KEY または `grok login` を使用します。その他のキーは「詳細」で編集できます。",
       "permissionModeLabel": "権限モード",
       "permissionAsk": "毎回確認",
       "permissionAlwaysApprove": "常に許可",
@@ -629,7 +629,24 @@
       "advancedToggle": "詳細（生の config.toml）",
       "configTomlNative": "config.toml（ネイティブ）",
       "configTomlHint": "~/.grok/config.toml 全体としてそのまま書き込まれます。無効な TOML は拒否され、タイプミスでファイルが切り詰められることはありません。",
-      "configTomlPlaceholder": "# 上のコントロール以外のキー。例:\n# [mcp_servers.*]、[cli]、[permission] ルール。"
+      "configTomlPlaceholder": "# 上のコントロール以外のキー。例:\n# [mcp_servers.*]、[cli]、[permission] ルール。",
+      "customModelTitle": "カスタムモデル（独自エンドポイント）",
+      "customModelHint": "Grok をカスタムまたは自己ホストのエンドポイントに向けます。codeg はモデルごとの `[model.*]` ブロックを書き込み、既定モデルに設定します。モデル ID を空にすると削除されます。",
+      "customModelIdLabel": "モデル ID",
+      "customModelIdPlaceholder": "例: grok-custom",
+      "customModelIdHint": "`[model.*]` ブロックとして登録され、モデル名として API に送信されます。`[models].default` にも設定されます。",
+      "customBaseUrlLabel": "Base URL",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1（既定）",
+      "customApiBackendLabel": "API バックエンド",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages（Anthropic）",
+      "customApiKeyLabel": "API キー",
+      "customApiKeyHint": "`[model.*].api_key` にインラインで保存され、このエンドポイントにのみ適用されます。",
+      "customContextWindowLabel": "コンテキストウィンドウ（トークン）",
+      "customContextWindowHint": "任意。自動圧縮のタイミングに使われます。空欄の場合はエンドポイントの既定値を使用します。",
+      "autoCompactLabel": "自動圧縮のしきい値（%）",
+      "autoCompactHint": "コンテキスト使用率がこの割合に達したら会話を圧縮します（Grok の既定は 85）。`[session]` に書き込まれます。"
     },
     "codex": {
       "configDescription": "API URL、API Key、モデル名、reasoning effort を素早く設定でき、`auth.json` / `config.toml` と同期します。",

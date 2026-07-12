@@ -1727,10 +1727,89 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
             .as_str()
             .map(str::to_string)
     };
+
+    // Read a scalar / integer from a `[model.<id>]` block for a given id.
+    let model_str = |id: &str, key: &str| -> Option<String> {
+        table
+            .as_ref()?
+            .get("model")?
+            .as_table()?
+            .get(id)?
+            .as_table()?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    };
+    let model_int = |id: &str, key: &str| -> Option<i64> {
+        table
+            .as_ref()?
+            .get("model")?
+            .as_table()?
+            .get(id)?
+            .as_table()?
+            .get(key)?
+            .as_integer()
+    };
+
+    // The codeg-managed custom model = `[models].default`, but only when a
+    // matching `[model.<default>]` table exists — a hand-set stock default that
+    // has no `[model.*]` block is left untracked (the panel shows it empty).
+    let custom_model_id = get("models", "default").filter(|id| {
+        table
+            .as_ref()
+            .and_then(|t| t.get("model"))
+            .and_then(|m| m.as_table())
+            .and_then(|m| m.get(id.as_str()))
+            .and_then(|entry| entry.as_table())
+            .is_some()
+    });
+
+    let (custom_base_url, custom_api_key, custom_api_backend, custom_context_window) =
+        match custom_model_id.as_deref() {
+            Some(id) => (
+                model_str(id, "base_url"),
+                model_str(id, "api_key"),
+                model_str(id, "api_backend"),
+                model_int(id, "context_window"),
+            ),
+            None => (None, None, None, None),
+        };
+
+    let auto_compact_threshold_percent = table
+        .as_ref()
+        .and_then(|t| t.get("session"))
+        .and_then(|s| s.as_table())
+        .and_then(|s| s.get("auto_compact_threshold_percent"))
+        .and_then(|v| v.as_integer());
+
     GrokSettings {
         default_reasoning_effort: get("models", "default_reasoning_effort"),
         permission_mode: get("ui", "permission_mode"),
+        custom_model_id,
+        custom_base_url,
+        custom_api_key,
+        custom_api_backend,
+        custom_context_window,
+        auto_compact_threshold_percent,
     }
+}
+
+/// Pure predicate: does this Grok `config.toml` select the "always-approve"
+/// permission mode? Drives whether the ACP launch carries the explicit
+/// `--always-approve` flag. Anything else — "ask", unset, or malformed — is
+/// `false`, so ACP permission requests keep flowing to codeg's UI.
+fn grok_config_selects_always_approve(config_toml: &str) -> bool {
+    parse_grok_settings(config_toml).permission_mode.as_deref() == Some("always-approve")
+}
+
+/// Whether Grok's ACP launch should carry `--always-approve`, read from the
+/// global `~/.grok/config.toml` (the same `[ui].permission_mode` the settings
+/// panel writes). Best-effort: a missing/unreadable config reads as `false`, so
+/// the default preserves codeg's ability to prompt for approvals.
+pub(crate) fn grok_launch_always_approve() -> bool {
+    load_grok_config_toml_raw()
+        .map(|raw| grok_config_selects_always_approve(&raw))
+        .unwrap_or(false)
 }
 
 /// Merge the Grok panel's structured control values into the raw config.toml
@@ -1757,7 +1836,177 @@ fn apply_grok_structured_config(
         "default_reasoning_effort",
         settings.default_reasoning_effort.as_deref(),
     )?;
+    apply_grok_custom_model(&mut doc, settings)?;
+    // `[session].auto_compact_threshold_percent` — clamp to the documented 0–100
+    // range so an out-of-band value can never write an invalid config.
+    set_or_remove_grok_number(
+        &mut doc,
+        "session",
+        "auto_compact_threshold_percent",
+        settings
+            .auto_compact_threshold_percent
+            .map(|n| n.clamp(0, 100)),
+    )?;
     Ok(doc.to_string())
+}
+
+/// Write / rename / remove the codeg-managed custom Grok model. The managed block
+/// is anchored as "the `[model.<id>]` whose id equals `[models].default`":
+///  - a non-empty `custom_model_id` writes (or renames the previous managed block
+///    to) `[model.<id>]` and points `[models].default` at it;
+///  - an empty / absent id removes the previously-managed block and, when it still
+///    points there, `[models].default`.
+///
+/// Within an active block `model = "<id>"` is always set and each empty sub-field
+/// OMITS its key (empty `base_url` ⇒ Grok's official endpoint). Unmanaged keys the
+/// user hand-added to the block are preserved; a rename starts a fresh block.
+fn apply_grok_custom_model(
+    doc: &mut toml_edit::Document,
+    settings: &GrokStructuredConfig,
+) -> Result<(), AcpError> {
+    // Previously-managed id = current `[models].default`, but only when a matching
+    // `[model.<default>]` table exists (so a hand-set stock default is never
+    // mistaken for a codeg block and removed).
+    let prev_id = doc
+        .get("models")
+        .and_then(|m| m.as_table_like())
+        .and_then(|m| m.get("default"))
+        .and_then(|d| d.as_str())
+        .filter(|id| grok_model_block_exists(doc, id))
+        .map(str::to_string);
+
+    let target_id = settings
+        .custom_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match target_id {
+        Some(id) => {
+            // A rename removes the stale block before writing the new one.
+            if let Some(prev) = prev_id.as_deref() {
+                if prev != id {
+                    remove_grok_model_block(doc, prev);
+                }
+            }
+            {
+                let tbl = grok_model_table_mut(doc, id)?;
+                // `model` is the id sent to the API; always kept in sync with <id>.
+                grok_tbl_set_str(tbl, "model", Some(id));
+                grok_tbl_set_str(tbl, "base_url", trimmed_opt(settings.custom_base_url.as_deref()));
+                grok_tbl_set_str(tbl, "api_key", trimmed_opt(settings.custom_api_key.as_deref()));
+                grok_tbl_set_str(
+                    tbl,
+                    "api_backend",
+                    trimmed_opt(settings.custom_api_backend.as_deref()),
+                );
+                grok_tbl_set_int(
+                    tbl,
+                    "context_window",
+                    settings.custom_context_window.filter(|n| *n > 0),
+                );
+            }
+            // Make the managed model the default for new sessions.
+            set_or_remove_grok_key(doc, "models", "default", Some(id))?;
+        }
+        None => {
+            if let Some(prev) = prev_id.as_deref() {
+                remove_grok_model_block(doc, prev);
+                // Clear the default only when it still points at the removed block.
+                let default_still_points_here = doc
+                    .get("models")
+                    .and_then(|m| m.as_table_like())
+                    .and_then(|m| m.get("default"))
+                    .and_then(|d| d.as_str())
+                    == Some(prev);
+                if default_still_points_here {
+                    set_or_remove_grok_key(doc, "models", "default", None)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when `[model.<id>]` exists as a table (standard or inline).
+fn grok_model_block_exists(doc: &toml_edit::Document, id: &str) -> bool {
+    doc.get("model")
+        .and_then(|m| m.as_table_like())
+        .and_then(|m| m.get(id))
+        .map(|entry| entry.as_table_like().is_some())
+        .unwrap_or(false)
+}
+
+/// Mutable handle to `[model.<id>]`, creating the implicit `[model]` parent and
+/// the `<id>` sub-table as needed. Errors (rather than clobbering) if either
+/// exists but is not a table.
+fn grok_model_table_mut<'a>(
+    doc: &'a mut toml_edit::Document,
+    id: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, AcpError> {
+    let model = &mut doc["model"];
+    if model.is_none() {
+        // Implicit so a `[model]` header is never emitted for the sub-tables.
+        let mut parent = toml_edit::Table::new();
+        parent.set_implicit(true);
+        *model = toml_edit::Item::Table(parent);
+    }
+    let parent = model.as_table_like_mut().ok_or_else(|| {
+        AcpError::protocol("cannot write [model.<id>]: [model] exists but is not a table")
+    })?;
+    if parent.get(id).is_none() {
+        parent.insert(id, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    parent
+        .get_mut(id)
+        .and_then(|entry| entry.as_table_like_mut())
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "cannot write [model.{id}]: it exists but is not a table"
+            ))
+        })
+}
+
+/// Remove `[model.<id>]`; drop the now-empty `[model]` parent so no stray header
+/// lingers.
+fn remove_grok_model_block(doc: &mut toml_edit::Document, id: &str) {
+    let Some(parent) = doc.get_mut("model").and_then(|m| m.as_table_like_mut()) else {
+        return;
+    };
+    parent.remove(id);
+    if parent.iter().next().is_none() {
+        doc.remove("model");
+    }
+}
+
+/// Set (`Some`) / remove (`None`) a scalar string key in a table.
+fn grok_tbl_set_str(tbl: &mut dyn toml_edit::TableLike, key: &str, value: Option<&str>) {
+    match value {
+        Some(v) => {
+            tbl.insert(key, toml_edit::value(v));
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+/// Set (`Some`) / remove (`None`) an integer key in a table.
+fn grok_tbl_set_int(tbl: &mut dyn toml_edit::TableLike, key: &str, value: Option<i64>) {
+    match value {
+        Some(v) => {
+            tbl.insert(key, toml_edit::value(v));
+        }
+        None => {
+            tbl.remove(key);
+        }
+    }
+}
+
+/// `Some(trimmed)` only when non-empty after trimming, else `None` (so an empty
+/// field omits its key rather than writing `""`).
+fn trimmed_opt(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Set (`Some`) or remove (`None`) a scalar `[section].key` in a `toml_edit`
@@ -1772,6 +2021,40 @@ fn set_or_remove_grok_key(
     section: &str,
     key: &str,
     value: Option<&str>,
+) -> Result<(), AcpError> {
+    match value {
+        Some(v) => {
+            let item = &mut doc[section];
+            if item.is_none() {
+                *item = toml_edit::Item::Table(toml_edit::Table::new());
+            } else if item.as_table_like_mut().is_none() {
+                return Err(AcpError::protocol(format!(
+                    "cannot set [{section}].{key}: [{section}] exists but is not a table"
+                )));
+            }
+            if let Some(table) = item.as_table_like_mut() {
+                table.insert(key, toml_edit::value(v));
+            }
+        }
+        None => {
+            if let Some(table) = doc.get_mut(section).and_then(|item| item.as_table_like_mut())
+            {
+                table.remove(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Integer twin of [`set_or_remove_grok_key`], for numeric `[section].key`s such
+/// as `[session].auto_compact_threshold_percent`. Same table-like handling: a
+/// missing section is auto-created; an incompatible non-table section errors
+/// rather than being clobbered.
+fn set_or_remove_grok_number(
+    doc: &mut toml_edit::Document,
+    section: &str,
+    key: &str,
+    value: Option<i64>,
 ) -> Result<(), AcpError> {
     match value {
         Some(v) => {
@@ -7981,6 +8264,7 @@ mod tests {
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("high".into()),
                 permission_mode: Some("ask".into()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -7998,6 +8282,7 @@ mod tests {
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("low".into()),
                 permission_mode: Some("always-approve".into()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -8023,6 +8308,7 @@ mod tests {
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("high".into()),
                 permission_mode: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -8058,12 +8344,196 @@ mod tests {
             &GrokStructuredConfig {
                 default_reasoning_effort: None,
                 permission_mode: Some("ask".into()),
+                ..Default::default()
             },
         );
         assert!(
             incompatible.is_err(),
             "an incompatible non-table section must error, not clobber"
         );
+    }
+
+    #[test]
+    fn parse_grok_settings_reads_custom_model_and_session() {
+        let toml = "[model.foo]\nmodel = \"foo\"\nbase_url = \"https://api/v1\"\n\
+                    api_key = \"sk-1\"\napi_backend = \"responses\"\ncontext_window = 262144\n\n\
+                    [models]\ndefault = \"foo\"\n\n\
+                    [session]\nauto_compact_threshold_percent = 90\n";
+        let s = parse_grok_settings(toml);
+        assert_eq!(s.custom_model_id.as_deref(), Some("foo"));
+        assert_eq!(s.custom_base_url.as_deref(), Some("https://api/v1"));
+        assert_eq!(s.custom_api_key.as_deref(), Some("sk-1"));
+        assert_eq!(s.custom_api_backend.as_deref(), Some("responses"));
+        assert_eq!(s.custom_context_window, Some(262144));
+        assert_eq!(s.auto_compact_threshold_percent, Some(90));
+    }
+
+    #[test]
+    fn parse_grok_settings_untracks_default_without_model_block() {
+        // `[models].default` naming a stock model (no `[model.*]` block) is not a
+        // codeg-managed custom model — the panel must show the custom fields empty.
+        let toml = "[model.foo]\nbase_url = \"x\"\n\n[models]\ndefault = \"grok-4.5\"\n";
+        let s = parse_grok_settings(toml);
+        assert!(s.custom_model_id.is_none());
+        assert!(s.custom_base_url.is_none());
+    }
+
+    #[test]
+    fn apply_grok_custom_model_round_trips_through_parse() {
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                custom_model_id: Some("my-grok".into()),
+                custom_base_url: Some("https://gw/v1".into()),
+                custom_api_key: Some("sk-x".into()),
+                custom_api_backend: Some("responses".into()),
+                custom_context_window: Some(131072),
+                auto_compact_threshold_percent: Some(80),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The model becomes the default, and the block carries `model = <id>`.
+        assert!(merged.contains("[model.my-grok]") || merged.contains("[model.\"my-grok\"]"));
+        assert!(merged.contains("model = \"my-grok\""));
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_model_id.as_deref(), Some("my-grok"));
+        assert_eq!(back.custom_base_url.as_deref(), Some("https://gw/v1"));
+        assert_eq!(back.custom_api_key.as_deref(), Some("sk-x"));
+        assert_eq!(back.custom_api_backend.as_deref(), Some("responses"));
+        assert_eq!(back.custom_context_window, Some(131072));
+        assert_eq!(back.auto_compact_threshold_percent, Some(80));
+    }
+
+    #[test]
+    fn apply_grok_custom_model_empty_base_url_omits_key() {
+        // "Leave empty ⇒ official endpoint": no `base_url` key is written.
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                custom_model_id: Some("foo".into()),
+                custom_base_url: Some("   ".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged.contains("base_url"), "empty base_url must omit the key");
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_model_id.as_deref(), Some("foo"));
+        assert!(back.custom_base_url.is_none());
+    }
+
+    #[test]
+    fn apply_grok_custom_model_non_positive_context_window_omitted() {
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                custom_model_id: Some("foo".into()),
+                custom_context_window: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged.contains("context_window"));
+        assert!(parse_grok_settings(&merged).custom_context_window.is_none());
+    }
+
+    #[test]
+    fn apply_grok_custom_model_rename_moves_block() {
+        let base = "[model.old]\nmodel = \"old\"\nbase_url = \"https://old/v1\"\n\n\
+                    [models]\ndefault = \"old\"\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                custom_model_id: Some("new".into()),
+                custom_base_url: Some("https://new/v1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged.contains("old"), "the stale block + default must be gone");
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_model_id.as_deref(), Some("new"));
+        assert_eq!(back.custom_base_url.as_deref(), Some("https://new/v1"));
+    }
+
+    #[test]
+    fn apply_grok_custom_model_update_preserves_unmanaged_block_keys() {
+        // Editing a managed block keeps keys codeg doesn't own (e.g. temperature).
+        let base = "[model.foo]\nmodel = \"foo\"\ntemperature = 0.7\nbase_url = \"https://old/v1\"\n\n\
+                    [models]\ndefault = \"foo\"\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                custom_model_id: Some("foo".into()),
+                custom_base_url: Some("https://new/v1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.contains("temperature"), "unmanaged key preserved");
+        let back = parse_grok_settings(&merged);
+        assert_eq!(back.custom_base_url.as_deref(), Some("https://new/v1"));
+    }
+
+    #[test]
+    fn apply_grok_custom_model_clear_removes_managed_block_and_default() {
+        let base = "[model.foo]\nmodel = \"foo\"\nbase_url = \"https://x/v1\"\n\n\
+                    [models]\ndefault = \"foo\"\n";
+        let merged =
+            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        assert!(!merged.contains("[model."), "managed block removed");
+        let back = parse_grok_settings(&merged);
+        assert!(back.custom_model_id.is_none());
+    }
+
+    #[test]
+    fn apply_grok_custom_model_clear_leaves_handset_stock_default() {
+        // Clearing the (empty) custom form must NOT delete a hand-set stock
+        // `[models].default` that was never codeg-managed.
+        let base = "[models]\ndefault = \"grok-4.5\"\n";
+        let merged =
+            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        assert!(merged.contains("default = \"grok-4.5\""));
+    }
+
+    #[test]
+    fn apply_grok_session_compaction_clamps_and_removes() {
+        // Out-of-range value clamps into 0–100.
+        let over = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                auto_compact_threshold_percent: Some(150),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parse_grok_settings(&over).auto_compact_threshold_percent,
+            Some(100)
+        );
+        // `None` removes an existing key.
+        let base = "[session]\nauto_compact_threshold_percent = 70\n";
+        let cleared =
+            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        assert!(parse_grok_settings(&cleared)
+            .auto_compact_threshold_percent
+            .is_none());
+    }
+
+    #[test]
+    fn grok_config_selects_always_approve_only_for_that_mode() {
+        // Only an explicit always-approve arms the launch flag.
+        assert!(grok_config_selects_always_approve(
+            "[ui]\npermission_mode = \"always-approve\"\n"
+        ));
+        // "ask" keeps the flag off so ACP permission requests reach codeg.
+        assert!(!grok_config_selects_always_approve(
+            "[ui]\npermission_mode = \"ask\"\n"
+        ));
+        // Unset / malformed ⇒ false (preserve the ability to prompt).
+        assert!(!grok_config_selects_always_approve(""));
+        assert!(!grok_config_selects_always_approve("== not toml =="));
     }
 
     /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,

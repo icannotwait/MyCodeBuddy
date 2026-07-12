@@ -612,7 +612,7 @@
       "notRun": "Checks have not run yet."
     },
     "grok": {
-      "configDescription": "Configure Grok here. The controls below — permission mode and reasoning effort — merge into ~/.grok/config.toml, preserving your other keys and comments. Sign-in uses your XAI_API_KEY or `grok login`. Other keys stay editable under Advanced.",
+      "configDescription": "Configure Grok here. The controls below — permission mode, reasoning effort, an optional custom (BYO endpoint) model, and compaction — merge into ~/.grok/config.toml, preserving your other keys and comments. Sign-in uses your XAI_API_KEY or `grok login`. Other keys stay editable under Advanced.",
       "permissionModeLabel": "Permission mode",
       "permissionAsk": "Ask every time",
       "permissionAlwaysApprove": "Always approve",
@@ -629,7 +629,24 @@
       "advancedToggle": "Advanced (raw config.toml)",
       "configTomlNative": "config.toml (native)",
       "configTomlHint": "Saved verbatim as the whole ~/.grok/config.toml. Invalid TOML is rejected so a typo never truncates your file.",
-      "configTomlPlaceholder": "# Keys other than the controls above, e.g.\n# [mcp_servers.*], [cli], [permission] rules."
+      "configTomlPlaceholder": "# Keys other than the controls above, e.g.\n# [mcp_servers.*], [cli], [permission] rules.",
+      "customModelTitle": "Custom model (BYO endpoint)",
+      "customModelHint": "Point Grok at a custom or self-hosted endpoint. codeg writes a per-model `[model.*]` block and makes it the default. Leave the Model ID empty to remove it.",
+      "customModelIdLabel": "Model ID",
+      "customModelIdPlaceholder": "e.g. grok-custom",
+      "customModelIdHint": "Registered as a `[model.*]` block and sent to the API as the model name; also set as `[models].default`.",
+      "customBaseUrlLabel": "Base URL",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1 (default)",
+      "customApiBackendLabel": "API backend",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages (Anthropic)",
+      "customApiKeyLabel": "API Key",
+      "customApiKeyHint": "Stored inline in `[model.*].api_key`, scoped to this endpoint.",
+      "customContextWindowLabel": "Context window (tokens)",
+      "customContextWindowHint": "Optional. Drives auto-compact timing; leave empty for the endpoint default.",
+      "autoCompactLabel": "Auto-compact threshold (%)",
+      "autoCompactHint": "Compact the conversation when context usage reaches this percent (Grok default 85). Written to `[session]`."
     },
     "codex": {
       "configDescription": "Supports quick configuration for API URL, API Key, model name and reasoning effort, and syncs with `auth.json` / `config.toml`.",

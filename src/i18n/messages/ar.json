@@ -612,7 +612,7 @@
       "notRun": "لم يتم تشغيل الفحوصات بعد."
     },
     "grok": {
-      "configDescription": "اضبط Grok هنا. تُدمج عناصر التحكم أدناه (وضع الأذونات وجهد الاستدلال) في ~/.grok/config.toml مع الحفاظ على مفاتيحك وتعليقاتك الأخرى. يستخدم تسجيل الدخول XAI_API_KEY أو `grok login`. تبقى المفاتيح الأخرى قابلة للتحرير ضمن «متقدم».",
+      "configDescription": "اضبط Grok هنا. عناصر التحكم أدناه — وضع الأذونات، وجهد الاستدلال، ونموذج مخصّص اختياري (نقطة نهاية خاصة)، والضغط — تُدمج في ~/.grok/config.toml مع الحفاظ على مفاتيحك وتعليقاتك الأخرى. يستخدم تسجيل الدخول XAI_API_KEY أو `grok login`. تبقى المفاتيح الأخرى قابلة للتحرير ضمن «متقدم».",
       "permissionModeLabel": "وضع الأذونات",
       "permissionAsk": "السؤال في كل مرة",
       "permissionAlwaysApprove": "الموافقة دائمًا",
@@ -629,7 +629,24 @@
       "advancedToggle": "متقدم (config.toml الخام)",
       "configTomlNative": "config.toml (أصلي)",
       "configTomlHint": "يُحفظ حرفيًا كملف ~/.grok/config.toml بالكامل. يُرفض TOML غير الصالح حتى لا يقتطع خطأ مطبعي ملفك أبدًا.",
-      "configTomlPlaceholder": "# مفاتيح غير عناصر التحكم أعلاه، مثل\n# [mcp_servers.*] و[cli] وقواعد [permission]."
+      "configTomlPlaceholder": "# مفاتيح غير عناصر التحكم أعلاه، مثل\n# [mcp_servers.*] و[cli] وقواعد [permission].",
+      "customModelTitle": "نموذج مخصّص (نقطة نهاية خاصة)",
+      "customModelHint": "وجِّه Grok إلى نقطة نهاية مخصّصة أو مستضافة ذاتيًا. يكتب codeg كتلة `[model.*]` لكل نموذج ويجعلها النموذج الافتراضي. اترك معرّف النموذج فارغًا لإزالته.",
+      "customModelIdLabel": "معرّف النموذج",
+      "customModelIdPlaceholder": "مثال: grok-custom",
+      "customModelIdHint": "يُسجَّل ككتلة `[model.*]` ويُرسَل إلى الـ API كاسم للنموذج؛ ويُضبط أيضًا كـ `[models].default`.",
+      "customBaseUrlLabel": "عنوان URL الأساسي",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1 (الافتراضي)",
+      "customApiBackendLabel": "الواجهة الخلفية لـ API",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages (Anthropic)",
+      "customApiKeyLabel": "مفتاح API",
+      "customApiKeyHint": "يُخزَّن ضمن `[model.*].api_key`، مقصورًا على نقطة النهاية هذه.",
+      "customContextWindowLabel": "نافذة السياق (رموز)",
+      "customContextWindowHint": "اختياري. يحدّد توقيت الضغط التلقائي؛ اتركه فارغًا لاستخدام القيمة الافتراضية لنقطة النهاية.",
+      "autoCompactLabel": "عتبة الضغط التلقائي (%)",
+      "autoCompactHint": "يضغط المحادثة عندما يبلغ استخدام السياق هذه النسبة المئوية (الافتراضي في Grok هو 85). يُكتَب في `[session]`."
     },
     "codex": {
       "configDescription": "يدعم الإعداد السريع لعنوان API ومفتاح API واسم النموذج وجهد الاستدلال، مع المزامنة مع `auth.json` / `config.toml`.",

@@ -564,20 +564,38 @@ pub struct AcpAgentInfo {
     pub model_provider_id: Option<i32>,
 }
 
-/// The subset of `~/.grok/config.toml` scalar keys surfaced as structured
-/// controls in the Grok settings panel. Each field mirrors one documented key
-/// (see docs.x.ai/build/settings/reference); `None` means the key is absent.
+/// The subset of `~/.grok/config.toml` keys surfaced as structured controls in
+/// the Grok settings panel. Each field mirrors one documented key (see
+/// docs.x.ai/build/settings/reference); `None` means the key is absent.
 ///
-/// The default *model* is deliberately NOT surfaced here: it is chosen per
-/// session from the composer, and a persistent `[models].default` is overridden
-/// at launch by the `GROK_DEFAULT_MODEL` env var, so a settings control could
-/// silently have no effect.
+/// The *stock* per-session model is NOT surfaced here — it is chosen from the
+/// composer's model selector. But a codeg-managed **custom (BYO endpoint) model**
+/// IS: codeg writes a `[model.<id>]` block and points `[models].default` at it,
+/// then reads it back through `custom_*` below. The managed block is anchored as
+/// "the `[model.<id>]` whose id equals `[models].default`", giving clean
+/// edit/rename/remove without leaving orphans.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrokSettings {
     /// `[models].default_reasoning_effort` — one of low/medium/high/xhigh.
     pub default_reasoning_effort: Option<String>,
     /// `[ui].permission_mode` — one of ask/always-approve.
     pub permission_mode: Option<String>,
+    /// The codeg-managed custom model id: the `[model.<id>]` block whose id
+    /// equals `[models].default`. `None` when there is no such managed block.
+    pub custom_model_id: Option<String>,
+    /// `[model.<id>].base_url` — the custom endpoint. `None` ⇒ Grok's official
+    /// xAI API (`https://api.x.ai/v1`).
+    pub custom_base_url: Option<String>,
+    /// `[model.<id>].api_key` — inline key scoped to the custom endpoint
+    /// (distinct from the global `XAI_API_KEY` env credential).
+    pub custom_api_key: Option<String>,
+    /// `[model.<id>].api_backend` — chat_completions | responses | messages.
+    pub custom_api_backend: Option<String>,
+    /// `[model.<id>].context_window` — context size in tokens.
+    pub custom_context_window: Option<i64>,
+    /// `[session].auto_compact_threshold_percent` — auto-compact trigger, 0–100
+    /// (Grok's default is 85).
+    pub auto_compact_threshold_percent: Option<i64>,
 }
 
 /// The structured-control values the Grok settings panel sends on save. Each
@@ -585,11 +603,23 @@ pub struct GrokSettings {
 /// (format-preserving, via `toml_edit`) onto the current on-disk config.toml so
 /// unmanaged keys/comments are preserved. camelCase on the wire to match the
 /// enclosing request body (`AcpUpdateAgentConfigParams`).
+///
+/// The custom-model group is driven by `custom_model_id`: a non-empty id writes
+/// (or renames to) `[model.<id>]` + `[models].default = "<id>"`; an empty/`None`
+/// id removes the codeg-managed block and its default. Within an active model,
+/// each empty sub-field omits its key (e.g. empty `custom_base_url` ⇒ Grok falls
+/// back to the official endpoint).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokStructuredConfig {
     pub default_reasoning_effort: Option<String>,
     pub permission_mode: Option<String>,
+    pub custom_model_id: Option<String>,
+    pub custom_base_url: Option<String>,
+    pub custom_api_key: Option<String>,
+    pub custom_api_backend: Option<String>,
+    pub custom_context_window: Option<i64>,
+    pub auto_compact_threshold_percent: Option<i64>,
 }
 
 /// Lightweight status info for a single agent, used by connect() pre-check.

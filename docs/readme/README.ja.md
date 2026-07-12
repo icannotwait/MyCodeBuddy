@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg（Code Generation）は、マルチエージェント・コーディングワークスペースです。Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi などの複数のエージェントを 1 つのワークスペースに統合し、会話の集約とマルチエージェント協働に対応します。デスクトップへのインストールに加え、サーバー/Docker デプロイにも対応しています。
+Codeg（Code Generation）は、マルチエージェント・コーディングワークスペースです。Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build などの複数のエージェントを 1 つのワークスペースに統合し、会話の集約とマルチエージェント協働に対応します。デスクトップへのインストールに加え、サーバー/Docker デプロイにも対応しています。
 
 ![gallery](../images/gallery.svg)
 
@@ -66,6 +66,7 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 - 内蔵 `git worktree` フローによる並列開発
 - **プロジェクトブート** — ビジュアル設定とライブプレビューで新規プロジェクトを作成
 - **Office ドキュメント** — 内蔵の officecli ツールセットで .docx / .xlsx / .pptx ファイルを作成・分析・校正・編集。ファイルタブ内でリアルタイムプレビューが可能で、エージェントの編集に合わせて即時更新
+- **科学研究** — 科学系スキル（仮説生成、実験計画、統計、可視化、批判的評価、文献検索）を内蔵し、任意のエージェントから呼び出し可能。エージェントごとに管理
 - **オートメーション** — 任意のコンポーザー設定を再利用可能なオートメーションとして保存し、cron スケジュールまたは手動トリガーでヘッドレス実行
 - **チャットチャンネル** — Telegram、Lark（Feishu）、iLink（Weixin）などをコーディング Agent に接続し、リアルタイム通知の受信、フルセッション操作、リモートタスク制御を実行
 - MCP 管理（ローカルスキャン + レジストリ検索/インストール）
@@ -90,6 +91,7 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > 注: 環境変数はフォールバックパスより優先されます。
 
@@ -140,8 +142,21 @@ Word、Excel、PowerPoint ファイルをファーストクラスのワークフ
 - **作成・編集** — 新規ドキュメントの生成や既存 .docx / .xlsx / .pptx ファイルの編集（グラフ、表、書式設定を含む）
 - **分析・校正** — ドキュメント構造の確認、書式の問題の発見、内容の校正
 - **ライブプレビュー** — ファイルタブで .docx / .xlsx / .pptx を開くとインライン表示され、エージェントの編集に合わせて自動更新——常駐の `officecli watch` サーバーが支え（Web およびスタンドアロンサーバー環境ではリバースプロキシ経由で配信、ケイパビリティ認証）
-- **クイックアクション** — ウェルカムページの「コーディング」と「Office」タブから、対応するスキル呼び出しとプロンプトテンプレートをワンクリックで入力欄に挿入；選択中のエージェントで有効化されていないスキルはロックバッジで表示され、有効化画面へ誘導
+- **クイックアクション** — ウェルカムページの「コーディング」「Office」「科学研究」タブから、対応するスキル呼び出しとプロンプトテンプレートをワンクリックで入力欄に挿入；選択中のエージェントで有効化されていないスキルはロックバッジで表示され、有効化画面へ誘導
 - **Office ツール設定** — 専用設定ページで `officecli` のインストールとドキュメントスキルをスキル×エージェントマトリクスで管理：任意の（スキル、エージェント）ペアを切り替え、一括で有効化/無効化も可能
+
+</details>
+
+<details>
+<summary><h2>科学研究</h2></summary>
+
+任意のエージェントを、厳密なリサーチアシスタントに変えます。Codeg には、着想から分析、執筆までをカバーする、MIT ライセンスで厳選された一連の**科学研究スキル**が同梱されています。これらはエキスパートや Office のツールセットとまったく同じように、共有の中央スキルストアにインストールされ、選択した任意のエージェントにリンクされます。
+
+### 機能
+
+- **厳選スキル** — 仮説生成、実験計画、統計的検出力、統計解析、探索的データ解析、科学的可視化、批判的評価、査読、引用管理、研究者評価、論文検索、AI 模式図
+- **クイックアクション** — ウェルカムページの「科学研究」タブから、対応するスキル呼び出しとローカライズされたプロンプトテンプレートをワンクリックで入力欄に挿入
+- **科学研究設定** — 専用設定ページで、スキルをスキル×エージェントマトリクスで管理。API キーや Python 環境が必要なスキルにはバッジを表示
 
 </details>
 
@@ -253,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 または特定のバージョンをインストール:
 
 ```powershell
-.\install.ps1 -Version v0.20.0-mycodebuddy.1
+.\install.ps1 -Version v0.20.1-mycodebuddy.1
 ```
 
 #### オプション 2: GitHub Releases からダウンロード
@@ -379,19 +394,13 @@ Next.js 16 (Static Export) + React 19
 
 - [LinuxDO](https://linux.do) コミュニティのサポートに感謝します
 
-## Coffee
-
-- Codeg が役に立ったら、コーヒーを一杯おごっていただけるとうれしいです
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Codeg を支援" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Codeg を支援" width="240" />
-
 ## 謝辞
 
 - MyCodeBuddy はオリジナルの [Codeg](https://github.com/xintaofei/codeg) プロジェクトのフォークです。
 - [ACP](https://agentclientprotocol.com) — Agent Client Protocol (ACP) は、Codeg が複数のエージェントに接続できる基盤です
 - [Superpowers](https://github.com/obra/superpowers) — Codeg のエキスパートスキルモジュールを支えるプロジェクト
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — Codeg の Office ドキュメントワークフローを支えるプロジェクト
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — Codeg の科学研究スキルを支えるプロジェクト（MIT ライセンスのサブセット）
 
 ## ライセンス
 

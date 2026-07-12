@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다. Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi 등의 여러 에이전트를 하나의 워크스페이스로 통합하며, 대화 집계와 멀티 에이전트 협업을 지원하고 데스크톱 설치와 서버/Docker 배포를 지원합니다.
+Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다. Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build 등의 여러 에이전트를 하나의 워크스페이스로 통합하며, 대화 집계와 멀티 에이전트 협업을 지원하고 데스크톱 설치와 서버/Docker 배포를 지원합니다.
 
 ![gallery](../images/gallery.svg)
 
@@ -66,6 +66,7 @@ Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다
 - 내장 `git worktree` 플로를 통한 병렬 개발
 - **프로젝트 부트** — 시각적 설정과 실시간 미리보기로 새 프로젝트 생성
 - **Office 문서** — 내장 officecli 툴셋으로 .docx / .xlsx / .pptx 파일 생성, 분석, 교정, 편집. 파일 탭 내 실시간 미리보기 지원, 에이전트 편집 시 즉시 갱신
+- **과학 연구** — 모든 에이전트가 호출할 수 있는 내장 과학 스킬(가설 생성, 실험 설계, 통계, 시각화, 비판적 평가, 문헌 검색); 에이전트별로 관리
 - **자동화** — 컴포저 설정을 재사용 가능한 자동화로 저장하고, cron 스케줄 또는 수동 트리거로 헤드리스 실행
 - **채팅 채널** — Telegram, Lark(Feishu), iLink(Weixin) 등을 코딩 에이전트에 연결하여 실시간 알림 수신, 전체 세션 상호작용 및 원격 작업 제어
 - MCP 관리 (로컬 스캔 + 레지스트리 검색/설치)
@@ -90,6 +91,7 @@ Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > 참고: 환경 변수가 기본 경로보다 우선합니다.
 
@@ -140,8 +142,21 @@ Word, Excel, PowerPoint 파일을 일급 워크플로우로 사용하세요. 내
 - **생성 및 편집** — 새 문서 생성 또는 기존 .docx / .xlsx / .pptx 파일 수정 (차트, 표, 서식 포함)
 - **분석 및 교정** — 문서 구조 검사, 서식 문제 발견, 내용 교정
 - **실시간 미리보기** — 파일 탭에서 .docx / .xlsx / .pptx 를 열면 인라인으로 렌더링되고, 에이전트 편집 시 자동 갱신——상시 실행되는 `officecli watch` 서버가 지원 (웹 및 독립 서버 환경에서는 리버스 프록시를 통해 제공, 기능 인증 적용)
-- **빠른 실행** — 웰컴 페이지의 「코딩」과 「Office」 탭에서 해당 스킬 호출과 프롬프트 템플릿을 한 번의 클릭으로 입력창에 삽입; 선택된 에이전트에 활성화되지 않은 스킬은 잠금 뱃지로 표시되며 활성화 위치로 안내
+- **빠른 실행** — 웰컴 페이지의 「코딩」, 「Office」, 「과학 연구」 탭에서 해당 스킬 호출과 프롬프트 템플릿을 한 번의 클릭으로 입력창에 삽입; 선택된 에이전트에 활성화되지 않은 스킬은 잠금 뱃지로 표시되며 활성화 위치로 안내
 - **Office 도구 설정** — 전용 설정 페이지에서 `officecli` 설치 및 스킬×에이전트 매트릭스로 문서 스킬 관리: 임의의 (스킬, 에이전트) 쌍 토글, 일괄 활성화/비활성화 지원
+
+</details>
+
+<details>
+<summary><h2>과학 연구</h2></summary>
+
+모든 에이전트를 엄밀한 연구 조수로 탈바꿈시키세요. Codeg는 아이디어 구상부터 분석, 작성까지 아우르는 엄선된 MIT 라이선스 **과학 연구 스킬** 세트를 내장하며, 이 스킬들은 전문가 및 Office 툴셋과 똑같이 공유 중앙 스킬 저장소에 설치되어 원하는 에이전트에 연결됩니다.
+
+### 기능
+
+- **엄선된 스킬** — 가설 생성, 실험 설계, 통계적 검정력, 통계 분석, 탐색적 데이터 분석, 과학적 시각화, 비판적 평가, 동료 심사, 인용 관리, 학자 평가, 논문 검색, AI 도식
+- **빠른 실행** — 웰컴 페이지의 「과학 연구」 탭에서 해당 스킬 호출과 현지화된 프롬프트 템플릿을 한 번의 클릭으로 입력창에 삽입
+- **과학 설정** — 전용 설정 페이지에서 스킬×에이전트 매트릭스로 스킬을 관리하며, API 키나 Python 환경이 필요한 스킬은 뱃지로 표시
 
 </details>
 
@@ -253,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 또는 특정 버전 설치:
 
 ```powershell
-.\install.ps1 -Version v0.20.0-mycodebuddy.1
+.\install.ps1 -Version v0.20.1-mycodebuddy.1
 ```
 
 #### 옵션 2: GitHub Releases에서 다운로드
@@ -378,19 +393,13 @@ Next.js 16 (Static Export) + React 19
 
 - [LinuxDO](https://linux.do) 커뮤니티의 지원에 감사드립니다
 
-## Coffee
-
-- Codeg가 도움이 되었다면 커피 한 잔을 후원해 주세요
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Codeg 후원" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Codeg 후원" width="240" />
-
 ## 감사의 말
 
 - MyCodeBuddy는 원본 [Codeg](https://github.com/xintaofei/codeg) 프로젝트의 포크입니다.
 - [ACP](https://agentclientprotocol.com) — Agent Client Protocol(ACP)은 Codeg가 여러 에이전트에 연결할 수 있게 해주는 기반입니다
 - [Superpowers](https://github.com/obra/superpowers) — Codeg의 전문가 스킬 모듈을 지원하는 프로젝트
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — Codeg의 Office 문서 워크플로우를 지원하는 프로젝트
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — Codeg의 과학 연구 스킬을 지원하는 프로젝트 (MIT 라이선스 서브셋)
 
 ## 라이선스
 

@@ -356,6 +356,20 @@ async fn build_agent(
                             .to_string()
                     }),
             );
+            // Grok's root-level launch flags go BEFORE its `agent stdio`
+            // subcommand (which rejects them):
+            //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
+            //    CLI's background self-update (it would drift off the pin and can
+            //    break the ACP contract). Config twin: `[cli].auto_update = false`.
+            //  - `--always-approve`: auto-approve tool executions, but ONLY when the
+            //    user selected that permission mode in the Grok panel. "ask"/unset
+            //    leaves it off so ACP permission requests still reach codeg's UI.
+            if agent_type == AgentType::Grok {
+                parts.push("--no-auto-update".into());
+                if crate::commands::acp::grok_launch_always_approve() {
+                    parts.push("--always-approve".into());
+                }
+            }
             for a in args {
                 parts.push((*a).into());
             }

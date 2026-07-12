@@ -11,7 +11,8 @@ use crate::models::{
     TurnUsage,
 };
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, relocate_orphaned_tool_results,
+    compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
+    latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
     structurize_read_tool_output, title_from_user_text, truncate_str, AgentParser, ParseError,
 };
 
@@ -163,7 +164,18 @@ impl GrokParser {
             }
         }
 
-        let session_stats = compute_session_stats(&parsed.turns);
+        // Grok sends no ACP `usage_update`, so the live meter stays empty; derive
+        // the context ring here instead. Grok reports a cumulative per-turn token
+        // count (mapped to `usage.input_tokens`), which is exactly the context
+        // "used"; pair it with the model's window so the status bar shows the ring
+        // (mirrors gemini/kimi/opencode — the bare `compute_session_stats` leaves
+        // the context fields `None`).
+        let session_model = meta.model.as_deref().or(parsed.model.as_deref());
+        let session_stats = merge_context_window_stats(
+            compute_session_stats(&parsed.turns),
+            latest_turn_total_usage_tokens(&parsed.turns),
+            infer_context_window_max_tokens(session_model),
+        );
         let summary = self.summary_from(session_id, &meta, &parsed);
 
         ConversationDetail {
@@ -960,6 +972,15 @@ mod tests {
         let stats = detail.session_stats.expect("session stats");
         assert_eq!(stats.total_usage.as_ref().unwrap().input_tokens, 500);
         assert_eq!(stats.total_duration_ms, 4000);
+        // Context ring: cumulative tokens (500) as "used", paired with the
+        // session model's window (summary current_model_id = grok-4.5 → 500K).
+        // Without this the status bar shows no context ring for Grok.
+        assert_eq!(stats.context_window_used_tokens, Some(500));
+        assert_eq!(stats.context_window_max_tokens, Some(500_000));
+        let pct = stats
+            .context_window_usage_percent
+            .expect("context window percent");
+        assert!((pct - 0.1).abs() < 1e-6, "pct = {pct}");
     }
 
     #[test]

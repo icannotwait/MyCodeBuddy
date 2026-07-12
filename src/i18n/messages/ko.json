@@ -612,7 +612,7 @@
       "notRun": "점검이 아직 실행되지 않았습니다."
     },
     "grok": {
-      "configDescription": "여기에서 Grok을 구성합니다. 아래 컨트롤(권한 모드, 추론 강도)은 ~/.grok/config.toml에 병합되어 다른 키와 주석을 유지합니다. 로그인은 XAI_API_KEY 또는 `grok login`을 사용합니다. 다른 키는 고급에서 편집할 수 있습니다.",
+      "configDescription": "여기에서 Grok을 설정합니다. 아래 컨트롤(권한 모드, 추론 강도, 선택적 사용자 지정(자체 엔드포인트) 모델, 압축)은 ~/.grok/config.toml에 병합되며 다른 키와 주석은 유지됩니다. 로그인은 XAI_API_KEY 또는 `grok login`을 사용합니다. 기타 키는 '고급'에서 편집할 수 있습니다.",
       "permissionModeLabel": "권한 모드",
       "permissionAsk": "매번 확인",
       "permissionAlwaysApprove": "항상 허용",
@@ -629,7 +629,24 @@
       "advancedToggle": "고급(원본 config.toml)",
       "configTomlNative": "config.toml(네이티브)",
       "configTomlHint": "~/.grok/config.toml 전체로 그대로 저장됩니다. 잘못된 TOML은 거부되어 오타로 파일이 잘리지 않습니다.",
-      "configTomlPlaceholder": "# 위 컨트롤 이외의 키, 예:\n# [mcp_servers.*], [cli], [permission] 규칙."
+      "configTomlPlaceholder": "# 위 컨트롤 이외의 키, 예:\n# [mcp_servers.*], [cli], [permission] 규칙.",
+      "customModelTitle": "사용자 지정 모델(자체 엔드포인트)",
+      "customModelHint": "Grok을 사용자 지정 또는 자체 호스팅 엔드포인트로 연결합니다. codeg는 모델별 `[model.*]` 블록을 작성하고 기본 모델로 설정합니다. 모델 ID를 비우면 제거됩니다.",
+      "customModelIdLabel": "모델 ID",
+      "customModelIdPlaceholder": "예: grok-custom",
+      "customModelIdHint": "`[model.*]` 블록으로 등록되어 모델 이름으로 API에 전송되며 `[models].default`로도 설정됩니다.",
+      "customBaseUrlLabel": "Base URL",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1(기본값)",
+      "customApiBackendLabel": "API 백엔드",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages(Anthropic)",
+      "customApiKeyLabel": "API 키",
+      "customApiKeyHint": "`[model.*].api_key`에 인라인으로 저장되며 이 엔드포인트에만 적용됩니다.",
+      "customContextWindowLabel": "컨텍스트 윈도우(토큰)",
+      "customContextWindowHint": "선택 사항. 자동 압축 타이밍에 사용됩니다. 비워 두면 엔드포인트 기본값을 사용합니다.",
+      "autoCompactLabel": "자동 압축 임계값(%)",
+      "autoCompactHint": "컨텍스트 사용량이 이 비율에 도달하면 대화를 압축합니다(Grok 기본값 85). `[session]`에 기록됩니다."
     },
     "codex": {
       "configDescription": "API URL, API Key, 모델 이름, reasoning effort를 빠르게 설정하고 `auth.json` / `config.toml`과 동기화합니다.",

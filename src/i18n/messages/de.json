@@ -612,7 +612,7 @@
       "notRun": "Prüfungen wurden noch nicht ausgeführt."
     },
     "grok": {
-      "configDescription": "Konfiguriere Grok hier. Die Steuerelemente unten (Berechtigungsmodus, Denkaufwand) werden in ~/.grok/config.toml zusammengeführt und behalten deine anderen Schlüssel und Kommentare. Die Anmeldung nutzt deinen XAI_API_KEY oder `grok login`. Andere Schlüssel bleiben unter Erweitert bearbeitbar.",
+      "configDescription": "Konfiguriere Grok hier. Die folgenden Steuerelemente – Berechtigungsmodus, Reasoning-Aufwand, ein optionales benutzerdefiniertes Modell (eigener Endpunkt) und die Verdichtung – werden in ~/.grok/config.toml zusammengeführt, wobei deine anderen Schlüssel und Kommentare erhalten bleiben. Die Anmeldung nutzt deinen XAI_API_KEY oder `grok login`. Weitere Schlüssel bleiben unter „Erweitert“ bearbeitbar.",
       "permissionModeLabel": "Berechtigungsmodus",
       "permissionAsk": "Jedes Mal fragen",
       "permissionAlwaysApprove": "Immer zulassen",
@@ -629,7 +629,24 @@
       "advancedToggle": "Erweitert (rohe config.toml)",
       "configTomlNative": "config.toml (nativ)",
       "configTomlHint": "Wird wortwörtlich als gesamte ~/.grok/config.toml gespeichert. Ungültiges TOML wird abgelehnt, sodass ein Tippfehler deine Datei nie abschneidet.",
-      "configTomlPlaceholder": "# Andere Schlüssel als die Steuerelemente oben, z. B.\n# [mcp_servers.*], [cli], [permission]-Regeln."
+      "configTomlPlaceholder": "# Andere Schlüssel als die Steuerelemente oben, z. B.\n# [mcp_servers.*], [cli], [permission]-Regeln.",
+      "customModelTitle": "Benutzerdefiniertes Modell (eigener Endpunkt)",
+      "customModelHint": "Richte Grok auf einen benutzerdefinierten oder selbst gehosteten Endpunkt. codeg schreibt einen `[model.*]`-Block pro Modell und legt es als Standard fest. Lasse die Modell-ID leer, um es zu entfernen.",
+      "customModelIdLabel": "Modell-ID",
+      "customModelIdPlaceholder": "z. B. grok-custom",
+      "customModelIdHint": "Wird als `[model.*]`-Block registriert und als Modellname an die API gesendet; außerdem als `[models].default` gesetzt.",
+      "customBaseUrlLabel": "Basis-URL",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1 (Standard)",
+      "customApiBackendLabel": "API-Backend",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages (Anthropic)",
+      "customApiKeyLabel": "API-Schlüssel",
+      "customApiKeyHint": "Inline in `[model.*].api_key` gespeichert, nur für diesen Endpunkt.",
+      "customContextWindowLabel": "Kontextfenster (Tokens)",
+      "customContextWindowHint": "Optional. Steuert den Zeitpunkt der automatischen Verdichtung; leer lassen für den Standard des Endpunkts.",
+      "autoCompactLabel": "Schwellenwert für Auto-Verdichtung (%)",
+      "autoCompactHint": "Verdichtet die Unterhaltung, wenn die Kontextnutzung diesen Prozentsatz erreicht (Grok-Standard 85). Wird in `[session]` geschrieben."
     },
     "codex": {
       "configDescription": "Unterstützt schnelle Konfiguration von API-URL, API-Key, Modellname und reasoning effort und synchronisiert mit `auth.json` / `config.toml`.",

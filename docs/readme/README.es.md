@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. Unifica varios agentes (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, etc.) en un único espacio de trabajo, admite agregación de conversaciones y colaboración multiagente, y permite instalación de escritorio y despliegue en servidor/Docker.
+Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. Unifica varios agentes (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, etc.) en un único espacio de trabajo, admite agregación de conversaciones y colaboración multiagente, y permite instalación de escritorio y despliegue en servidor/Docker.
 
 ![gallery](../images/gallery.svg)
 
@@ -66,6 +66,7 @@ Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. U
 - Desarrollo paralelo con flujos integrados de `git worktree`
 - **Inicio de Proyecto** — crea nuevos proyectos visualmente con vista previa en tiempo real
 - **Documentos Office** — crea, analiza, revisa y edita archivos .docx / .xlsx / .pptx con el toolset officecli integrado; vista previa en tiempo real en pestaña de archivo que se actualiza mientras el agente edita
+- **Investigación científica** — habilidades científicas integradas (generación de hipótesis, diseño experimental, estadística, visualización, evaluación crítica, búsqueda bibliográfica) que cualquier agente puede invocar, gestionadas por agente
 - **Automatizaciones** — guarda cualquier configuración del compositor como automatización reutilizable que se ejecuta de forma desatendida según cron o bajo demanda
 - **Canales de Chat** — conecta Telegram, Lark (Feishu), iLink (Weixin) y más a tus agentes de codificación para notificaciones en tiempo real, interacción completa con sesiones y control remoto de tareas
 - Gestión de MCP (escaneo local + búsqueda/instalación desde registro)
@@ -90,6 +91,7 @@ Codeg (Code Generation) es un espacio de trabajo de codificación multiagente. U
 | CodeBuddy    | `$CODEBUDDY_CONFIG_DIR/projects`      | `~/.codebuddy/projects`               | `%USERPROFILE%\\.codebuddy\\projects`                 |
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
+| Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 
 > Nota: las variables de entorno tienen prioridad sobre las rutas de respaldo.
 
@@ -140,8 +142,21 @@ Trabaja con archivos Word, Excel y PowerPoint como un flujo de trabajo de primer
 - **Crear y editar** — genera nuevos documentos o modifica .docx / .xlsx / .pptx existentes, incluyendo gráficos, tablas y formato
 - **Analizar y revisar** — inspecciona la estructura del documento, detecta problemas de formato y revisa el contenido
 - **Vista previa en vivo** — abre un .docx / .xlsx / .pptx en una pestaña de archivo y se renderiza en línea, actualizándose automáticamente mientras el agente edita — respaldado por un servidor `officecli watch` permanente (con proxy inverso y autenticación por capacidad para entornos web y servidor)
-- **Acciones rápidas** — la página de bienvenida ofrece pestañas de Codificación y Office que insertan la invocación de habilidad correspondiente y una plantilla de prompt con un solo clic; las habilidades no habilitadas muestran un badge de bloqueo y enlazan a donde puedes activarlas
+- **Acciones rápidas** — la página de bienvenida ofrece pestañas de Codificación, Office e Investigación científica que insertan la invocación de habilidad correspondiente y una plantilla de prompt con un solo clic; las habilidades no habilitadas muestran un badge de bloqueo y enlazan a donde puedes activarlas
 - **Configuración de Office Tools** — una página de ajustes dedicada instala `officecli` y gestiona sus habilidades mediante una matriz de habilidad×agente: alterna cualquier par (habilidad, agente) y aplica cambios masivos
+
+</details>
+
+<details>
+<summary><h2>Investigación científica</h2></summary>
+
+Convierte cualquier agente en un asistente de investigación riguroso. Codeg incluye un conjunto curado de **habilidades de investigación científica** con licencia MIT — desde la ideación hasta el análisis y la redacción — que se instalan en el almacén central de habilidades compartido y se vinculan a los agentes que elijas, exactamente igual que los toolsets de expertos y de office.
+
+### Qué ofrece
+
+- **Habilidades curadas** — generación de hipótesis, diseño experimental, potencia estadística, análisis estadístico, análisis exploratorio de datos, visualización científica, evaluación crítica, revisión por pares, gestión de citas, evaluación de académicos, búsqueda de artículos y esquemas de IA
+- **Acciones rápidas** — la pestaña de Investigación científica de la página de bienvenida inserta la invocación de habilidad correspondiente junto con una plantilla de prompt localizada en el compositor con un solo clic
+- **Configuración de Ciencia** — una página de ajustes dedicada gestiona las habilidades mediante una matriz de habilidad×agente, con badges que señalan las habilidades que necesitan una clave de API o un entorno de Python
 
 </details>
 
@@ -253,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 O instalar una versión específica:
 
 ```powershell
-.\install.ps1 -Version v0.20.0-mycodebuddy.1
+.\install.ps1 -Version v0.20.1-mycodebuddy.1
 ```
 
 #### Opción 2: Descargar desde GitHub Releases
@@ -380,19 +395,13 @@ Next.js 16 (Static Export) + React 19
 
 - Gracias a la comunidad de [LinuxDO](https://linux.do) por su apoyo
 
-## Coffee
-
-- Si Codeg te ha resultado útil, considera invitarme a un café
-
-<img src="../images/weixin-sponsor-light.jpg#gh-light-mode-only" alt="Patrocinar Codeg" width="240" />
-<img src="../images/weixin-sponsor-dark.jpg#gh-dark-mode-only" alt="Patrocinar Codeg" width="240" />
-
 ## Agradecimientos
 
 - MyCodeBuddy es un fork del proyecto original [Codeg](https://github.com/xintaofei/codeg).
 - [ACP](https://agentclientprotocol.com) — el Agent Client Protocol (ACP) es la base que permite a Codeg conectarse con múltiples agentes
 - [Superpowers](https://github.com/obra/superpowers) — impulsa el módulo de habilidades de expertos de Codeg
 - [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — impulsa el flujo de trabajo de documentos Office de Codeg
+- [scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills) — impulsa las habilidades de Investigación científica de Codeg (subconjunto con licencia MIT)
 
 ## Licencia
 

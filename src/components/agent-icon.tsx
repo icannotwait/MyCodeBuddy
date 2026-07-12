@@ -301,7 +301,9 @@ const MONO_ICONS: Partial<Record<AgentType, AnyIcon>> = {
   grok: GrokMonoIcon,
 }
 
-// Text-color versions for Mono icons
+// Per-agent color override for mono marks, layered on top of the default
+// `text-foreground` below. Empty today — mono icons render at full foreground
+// strength unless a specific brand tint is ever needed here.
 const AGENT_TEXT_COLORS: Partial<Record<AgentType, string>> = {}
 
 export function AgentIcon({ agentType, className }: AgentIconProps) {
@@ -316,10 +318,15 @@ export function AgentIcon({ agentType, className }: AgentIconProps) {
 
   const MonoIcon = MONO_ICONS[agentType]
   if (MonoIcon) {
+    // Mono marks fill with `currentColor`, so without an explicit color they
+    // inherit the parent's text color and look faint in muted contexts (agent
+    // pills, status bar, sidebar rows), only brightening on hover/active. Pin
+    // them to `text-foreground` so they read at full strength like the
+    // hardcoded-color icons; an explicit `text-*` in `className` still wins.
     return (
       <span
         className={cn(
-          "inline-flex shrink-0",
+          "inline-flex shrink-0 text-foreground",
           AGENT_TEXT_COLORS[agentType],
           className
         )}

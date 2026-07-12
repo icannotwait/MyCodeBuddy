@@ -612,7 +612,7 @@
       "notRun": "尚未執行檢測。"
     },
     "grok": {
-      "configDescription": "在此設定 Grok。下方的控制項（權限模式、推理級別）會合併寫入 ~/.grok/config.toml，保留你的其他鍵與註解。登入使用 XAI_API_KEY 或 `grok login`。其他鍵可在「進階」中編輯。",
+      "configDescription": "在此設定 Grok。下方控制項——權限模式、推理強度、選用的自訂（自帶端點）模型與壓縮——會合併寫入 ~/.grok/config.toml，並保留你的其他鍵與註解。登入使用你的 XAI_API_KEY 或 `grok login`。其他鍵可在「進階」中編輯。",
       "permissionModeLabel": "權限模式",
       "permissionAsk": "每次詢問",
       "permissionAlwaysApprove": "永遠允許",
@@ -629,7 +629,24 @@
       "advancedToggle": "進階（原始 config.toml）",
       "configTomlNative": "config.toml（原生）",
       "configTomlHint": "按原樣整體寫入 ~/.grok/config.toml。非法 TOML 會被拒絕，絕不因筆誤截斷檔案。",
-      "configTomlPlaceholder": "# 上面控制項之外的鍵，例如\n# [mcp_servers.*]、[cli]、[permission] 規則。"
+      "configTomlPlaceholder": "# 上面控制項之外的鍵，例如\n# [mcp_servers.*]、[cli]、[permission] 規則。",
+      "customModelTitle": "自訂模型（自帶端點）",
+      "customModelHint": "讓 Grok 指向自訂或自架端點。codeg 會寫入按模型的 `[model.*]` 區塊並設為預設模型。清空模型 ID 即可移除。",
+      "customModelIdLabel": "模型 ID",
+      "customModelIdPlaceholder": "例如 grok-custom",
+      "customModelIdHint": "註冊為 `[model.*]` 區塊，並作為模型名稱傳送給 API；同時設為 `[models].default`。",
+      "customBaseUrlLabel": "Base URL",
+      "customBaseUrlPlaceholder": "https://api.x.ai/v1（預設）",
+      "customApiBackendLabel": "API 後端",
+      "backendResponses": "Responses",
+      "backendChatCompletions": "Chat Completions",
+      "backendMessages": "Messages（Anthropic）",
+      "customApiKeyLabel": "API Key",
+      "customApiKeyHint": "內聯儲存於 `[model.*].api_key`，僅作用於此端點。",
+      "customContextWindowLabel": "上下文視窗（tokens）",
+      "customContextWindowHint": "選填。用於自動壓縮計時；留空則使用端點預設值。",
+      "autoCompactLabel": "自動壓縮閾值（%）",
+      "autoCompactHint": "當上下文使用率達到此百分比時壓縮對話（Grok 預設 85）。寫入 `[session]`。"
     },
     "codex": {
       "configDescription": "支援 API URL、API Key、模型名稱、Reasoning Effort 快捷配置，並與 `auth.json` / `config.toml` 雙向聯動。",

@@ -281,8 +281,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.117.2",
-                package: "@tencent-ai/codebuddy-code@2.117.2",
+                version: "2.118.2",
+                package: "@tencent-ai/codebuddy-code@2.118.2",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -295,8 +295,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "0.23.3",
-                package: "@moonshot-ai/kimi-code@0.23.3",
+                version: "0.23.5",
+                package: "@moonshot-ai/kimi-code@0.23.5",
                 cmd: "kimi",
                 args: &["acp"],
                 env: &[],
@@ -354,6 +354,13 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 version: "0.2.94",
                 package: "@xai-official/grok@0.2.94",
                 cmd: "grok",
+                // Only the ACP subcommand lives here. Grok's ROOT-level launch
+                // flags (`--no-auto-update` always, `--always-approve` only when
+                // the user picked that permission mode) MUST precede this
+                // subcommand — `grok agent stdio` itself rejects them (verified
+                // against 0.2.94: it only accepts --debug/--debug-file/
+                // --leader-socket) — so `build_agent` inserts them ahead of these
+                // args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
                 // `@xai-official/grok@0.2.94` declares `engines.node: ">=20"`;
@@ -470,14 +477,14 @@ mod tests {
         );
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.117.2",
-            "@tencent-ai/codebuddy-code@2.117.2",
+            "2.118.2",
+            "@tencent-ai/codebuddy-code@2.118.2",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::KimiCode,
-            "0.23.3",
-            "@moonshot-ai/kimi-code@0.23.3",
+            "0.23.5",
+            "@moonshot-ai/kimi-code@0.23.5",
             Some("22.19.0"),
         );
         assert_npx_version(

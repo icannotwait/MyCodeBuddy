@@ -182,6 +182,14 @@ interface AgentDraft {
   // merged onto the current on-disk config server-side on save.
   grokPermissionMode: string
   grokReasoningEffort: string
+  // Grok custom model (BYO endpoint) → [model.<id>] + [models].default. Numeric
+  // fields are held as strings for their inputs and parsed on save.
+  grokCustomModelId: string
+  grokCustomBaseUrl: string
+  grokCustomApiKey: string
+  grokCustomApiBackend: string
+  grokCustomContextWindow: string
+  grokAutoCompactThreshold: string
   openCodeAuthJsonText: string
   clineProvider: ClineProvider
   clineApiKey: string
@@ -395,6 +403,11 @@ interface ConfigParseResult {
 /** Sentinel for the Grok structured selects' "unset / use default" choice
  * (Radix Select forbids an empty-string item value). Maps to `null` on save. */
 const GROK_UNSET = "__grok_unset__"
+
+/** Grok custom-model `api_backend` options (docs.x.ai). Default `responses` —
+ * what Grok's own build models use; a BYO OpenAI-compatible proxy would pick
+ * `chat_completions`, an Anthropic-format endpoint `messages`. */
+const GROK_DEFAULT_API_BACKEND = "responses"
 
 function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
   if (agentType === "claude_code") {
@@ -2292,10 +2305,41 @@ function patchCodexConfigTomlText(
 export function buildGrokStructuredConfig(draft: {
   grokPermissionMode: string
   grokReasoningEffort: string
+  grokCustomModelId: string
+  grokCustomBaseUrl: string
+  grokCustomApiKey: string
+  grokCustomApiBackend: string
+  grokCustomContextWindow: string
+  grokAutoCompactThreshold: string
 }): GrokStructuredConfig {
+  const modelId = draft.grokCustomModelId.trim()
+  const positiveInt = (raw: string): number | null => {
+    const n = Number.parseInt(raw.trim(), 10)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  const percent = (raw: string): number | null => {
+    const trimmed = raw.trim()
+    if (!trimmed) return null
+    const n = Number.parseInt(trimmed, 10)
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null
+  }
   return {
     permissionMode: draft.grokPermissionMode || null,
     defaultReasoningEffort: draft.grokReasoningEffort || null,
+    customModelId: modelId || null,
+    // The model-scoped fields only matter when a model id is set; the backend
+    // writes them inside the [model.<id>] block. api_backend defaults to
+    // `responses` (Grok's build backend) whenever a model is configured.
+    customBaseUrl: modelId ? draft.grokCustomBaseUrl.trim() || null : null,
+    customApiKey: modelId ? draft.grokCustomApiKey.trim() || null : null,
+    customApiBackend: modelId
+      ? draft.grokCustomApiBackend || GROK_DEFAULT_API_BACKEND
+      : null,
+    customContextWindow: modelId
+      ? positiveInt(draft.grokCustomContextWindow)
+      : null,
+    // Compaction is session-global, independent of the custom model.
+    autoCompactThresholdPercent: percent(draft.grokAutoCompactThreshold),
   }
 }
 
@@ -2311,6 +2355,12 @@ export function buildGrokSaveOptions(
   draft: {
     grokPermissionMode: string
     grokReasoningEffort: string
+    grokCustomModelId: string
+    grokCustomBaseUrl: string
+    grokCustomApiKey: string
+    grokCustomApiBackend: string
+    grokCustomContextWindow: string
+    grokAutoCompactThreshold: string
     grokConfigTomlText: string
   },
   agentGrokConfigToml: string | null
@@ -2686,6 +2736,19 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     grokConfigTomlText,
     grokPermissionMode,
     grokReasoningEffort,
+    grokCustomModelId: agent.grok_settings?.custom_model_id ?? "",
+    grokCustomBaseUrl: agent.grok_settings?.custom_base_url ?? "",
+    grokCustomApiKey: agent.grok_settings?.custom_api_key ?? "",
+    grokCustomApiBackend:
+      agent.grok_settings?.custom_api_backend ?? GROK_DEFAULT_API_BACKEND,
+    grokCustomContextWindow:
+      agent.grok_settings?.custom_context_window != null
+        ? String(agent.grok_settings.custom_context_window)
+        : "",
+    grokAutoCompactThreshold:
+      agent.grok_settings?.auto_compact_threshold_percent != null
+        ? String(agent.grok_settings.auto_compact_threshold_percent)
+        : "",
     openCodeAuthJsonText,
     clineProvider: clineImportant.provider,
     clineApiKey: clineImportant.apiKey,
@@ -3775,6 +3838,9 @@ export function AcpAgentSettings() {
   >({})
   // Whether the Grok panel's "advanced (raw config.toml)" escape hatch is open.
   const [grokAdvancedOpen, setGrokAdvancedOpen] = useState(false)
+  // Show/hide toggle for the Grok custom-model API key (kept separate from the
+  // per-agent `showApiKeys` map, which is keyed by AgentType only).
+  const [showGrokCustomKey, setShowGrokCustomKey] = useState(false)
   // True for the WHOLE duration of a Grok save (write + post-save reseed), so
   // both Grok save buttons stay disabled and can't interleave while the draft
   // is being rebuilt from disk.
@@ -4209,6 +4275,18 @@ export function AcpAgentSettings() {
                         default_reasoning_effort:
                           options.grokStructured.defaultReasoningEffort,
                         permission_mode: options.grokStructured.permissionMode,
+                        // buildGrokStructuredConfig already trims/gates/clamps
+                        // these to what the backend writes, so mirror them
+                        // directly (reseedGrokDraft re-reads disk right after).
+                        custom_model_id: options.grokStructured.customModelId,
+                        custom_base_url: options.grokStructured.customBaseUrl,
+                        custom_api_key: options.grokStructured.customApiKey,
+                        custom_api_backend:
+                          options.grokStructured.customApiBackend,
+                        custom_context_window:
+                          options.grokStructured.customContextWindow,
+                        auto_compact_threshold_percent:
+                          options.grokStructured.autoCompactThresholdPercent,
                       }
                     : agent.grok_settings,
                 }
@@ -9424,6 +9502,202 @@ supports_websockets = true`}
                       </div>
                       <p className="text-[11px] text-muted-foreground">
                         {t("grok.authLoginHint")}
+                      </p>
+                    </div>
+
+                    {/* Custom model (BYO endpoint) → [model.<id>] + [models].default.
+                        A model id here registers a custom Grok model and makes it
+                        the default; empty id removes the codeg-managed block. */}
+                    <div className="space-y-2.5 rounded-md border p-2.5">
+                      <div>
+                        <label className="text-[11px] font-medium">
+                          {t("grok.customModelTitle")}
+                        </label>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {t("grok.customModelHint")}
+                        </p>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("grok.customModelIdLabel")}
+                        </label>
+                        <Input
+                          value={selectedDraft.grokCustomModelId}
+                          onChange={(event) =>
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              grokCustomModelId: event.target.value,
+                            }))
+                          }
+                          placeholder={t("grok.customModelIdPlaceholder")}
+                          aria-label={t("grok.customModelIdLabel")}
+                          autoComplete="off"
+                          spellCheck={false}
+                          disabled={grokSaving}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          {t("grok.customModelIdHint")}
+                        </p>
+                      </div>
+
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("grok.customBaseUrlLabel")}
+                          </label>
+                          <Input
+                            value={selectedDraft.grokCustomBaseUrl}
+                            onChange={(event) =>
+                              updateSelectedDraft((current) => ({
+                                ...current,
+                                grokCustomBaseUrl: event.target.value,
+                              }))
+                            }
+                            placeholder={t("grok.customBaseUrlPlaceholder")}
+                            aria-label={t("grok.customBaseUrlLabel")}
+                            autoComplete="off"
+                            spellCheck={false}
+                            disabled={grokSaving}
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("grok.customApiBackendLabel")}
+                          </label>
+                          <Select
+                            value={
+                              selectedDraft.grokCustomApiBackend ||
+                              GROK_DEFAULT_API_BACKEND
+                            }
+                            disabled={grokSaving}
+                            onValueChange={(value) =>
+                              updateSelectedDraft((current) => ({
+                                ...current,
+                                grokCustomApiBackend: value,
+                              }))
+                            }
+                          >
+                            <SelectTrigger
+                              className="w-full"
+                              aria-label={t("grok.customApiBackendLabel")}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="responses">
+                                {t("grok.backendResponses")}
+                              </SelectItem>
+                              <SelectItem value="chat_completions">
+                                {t("grok.backendChatCompletions")}
+                              </SelectItem>
+                              <SelectItem value="messages">
+                                {t("grok.backendMessages")}
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("grok.customApiKeyLabel")}
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type={showGrokCustomKey ? "text" : "password"}
+                            value={selectedDraft.grokCustomApiKey}
+                            onChange={(event) =>
+                              updateSelectedDraft((current) => ({
+                                ...current,
+                                grokCustomApiKey: event.target.value,
+                              }))
+                            }
+                            placeholder="xai-..."
+                            aria-label={t("grok.customApiKeyLabel")}
+                            name="grok-custom-api-key"
+                            autoComplete="off"
+                            spellCheck={false}
+                            disabled={grokSaving}
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={grokSaving}
+                            onClick={() =>
+                              setShowGrokCustomKey((prev) => !prev)
+                            }
+                            aria-label={
+                              showGrokCustomKey
+                                ? t("actions.hideApiKey")
+                                : t("actions.showApiKey")
+                            }
+                            title={
+                              showGrokCustomKey
+                                ? t("actions.hideApiKey")
+                                : t("actions.showApiKey")
+                            }
+                          >
+                            {showGrokCustomKey ? (
+                              <EyeOff className="h-3.5 w-3.5" />
+                            ) : (
+                              <Eye className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        </div>
+                        <p className="text-[11px] text-muted-foreground">
+                          {t("grok.customApiKeyHint")}
+                        </p>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("grok.customContextWindowLabel")}
+                        </label>
+                        <Input
+                          type="number"
+                          inputMode="numeric"
+                          value={selectedDraft.grokCustomContextWindow}
+                          onChange={(event) =>
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              grokCustomContextWindow: event.target.value,
+                            }))
+                          }
+                          placeholder="500000"
+                          aria-label={t("grok.customContextWindowLabel")}
+                          disabled={grokSaving}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          {t("grok.customContextWindowHint")}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Compaction — session-global auto-compact threshold. */}
+                    <div className="space-y-1.5">
+                      <label className="text-[11px] text-muted-foreground">
+                        {t("grok.autoCompactLabel")}
+                      </label>
+                      <Input
+                        type="number"
+                        inputMode="numeric"
+                        min={0}
+                        max={100}
+                        value={selectedDraft.grokAutoCompactThreshold}
+                        onChange={(event) =>
+                          updateSelectedDraft((current) => ({
+                            ...current,
+                            grokAutoCompactThreshold: event.target.value,
+                          }))
+                        }
+                        placeholder="85"
+                        aria-label={t("grok.autoCompactLabel")}
+                        disabled={grokSaving}
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        {t("grok.autoCompactHint")}
                       </p>
                     </div>
 
