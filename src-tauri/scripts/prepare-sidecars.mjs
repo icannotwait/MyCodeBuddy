@@ -19,8 +19,9 @@
 //   - Skippable: set `CODEG_SKIP_SIDECAR=1` when iterating on the frontend
 //     and you don't care about delegation.
 //
-// Intentionally Node-only (no shell): runs identically on macOS, Linux,
-// Windows GitHub runners.
+// Intentionally Node-only: runs identically on macOS, Linux, and Windows
+// GitHub runners. Windows npm.cmd invocations go through cmd.exe because Node
+// cannot execute command scripts directly there.
 
 import { execFileSync } from "node:child_process"
 import {
@@ -50,6 +51,20 @@ export function codexBundleScript(target) {
 export function sidecarDestination(name, target) {
   const ext = target.includes("windows") ? ".exe" : ""
   return `${name}-${target}${ext}`
+}
+
+export function npmCommandInvocation(
+  args,
+  platform = process.platform,
+  comSpec = process.env.ComSpec
+) {
+  if (platform === "win32") {
+    return {
+      command: comSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", "npm.cmd", ...args],
+    }
+  }
+  return { command: "npm", args }
 }
 
 export function readCodexAcpVersion(sourceDir) {
@@ -157,14 +172,17 @@ function main() {
   if (version !== CODEX_ACP_VERSION) {
     die(`expected codex-acp ${CODEX_ACP_VERSION}, found ${version}`)
   }
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
   for (const args of [
     ["ci"],
     ["run", "typecheck"],
     ["test"],
     ["run", codexScript],
   ]) {
-    execFileSync(npm, args, { stdio: "inherit", cwd: CODEX_ACP_DIR })
+    const invocation = npmCommandInvocation(args)
+    execFileSync(invocation.command, invocation.args, {
+      stdio: "inherit",
+      cwd: CODEX_ACP_DIR,
+    })
   }
   const codexBuilt = join(
     CODEX_ACP_DIR,

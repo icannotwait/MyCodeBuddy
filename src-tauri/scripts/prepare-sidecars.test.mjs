@@ -6,6 +6,7 @@ import test from "node:test"
 
 import {
   codexBundleScript,
+  npmCommandInvocation,
   readCodexAcpVersion,
   sidecarDestination,
 } from "./prepare-sidecars.mjs"
@@ -20,6 +21,23 @@ test("uses Tauri target-qualified sidecar names", () => {
   assert.equal(
     sidecarDestination("codex-acp", "x86_64-pc-windows-msvc"),
     "codex-acp-x86_64-pc-windows-msvc.exe"
+  )
+})
+
+test("runs npm directly on POSIX", () => {
+  assert.deepEqual(npmCommandInvocation(["ci"], "darwin"), {
+    command: "npm",
+    args: ["ci"],
+  })
+})
+
+test("runs npm.cmd through cmd.exe on Windows", () => {
+  assert.deepEqual(
+    npmCommandInvocation(["ci"], "win32", "C:\\Windows\\System32\\cmd.exe"),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "npm.cmd", "ci"],
+    }
   )
 })
 
