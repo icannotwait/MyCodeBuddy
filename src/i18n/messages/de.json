@@ -2038,6 +2038,7 @@
           "spawnFailed": "{agent} konnte nicht gestartet werden: {message}",
           "downloadFailed": "{agent}-Download fehlgeschlagen: {message}",
           "sessionLoadResourceNotFound": "{agent}-Sitzung konnte nicht geladen werden. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
+          "sessionLoadUnavailable": "{agent} konnte diese Sitzung nicht wiederherstellen – sie wurde möglicherweise beendet oder der Agent wurde gestoppt. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
           "turnFailedRefusal": "{agent} hat die Fortsetzung dieser Runde abgelehnt. Häufig deutet das auf einen Backend- oder Gateway-Fehler hin. Bitte prüfen Sie die Agent-Logs.",
           "turnFailedMaxTokens": "{agent} hat das Token-Limit für diese Runde erreicht.",
           "turnFailedMaxTurnRequests": "{agent} hat die maximale Anzahl zulässiger Anfragen für diese Runde erreicht.",

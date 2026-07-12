@@ -2038,6 +2038,7 @@
           "spawnFailed": "تعذر بدء تشغيل {agent}: {message}",
           "downloadFailed": "فشل تنزيل {agent}: {message}",
           "sessionLoadResourceNotFound": "فشل تحميل جلسة {agent}. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
+          "sessionLoadUnavailable": "تعذّر على {agent} استعادة هذه الجلسة، فقد تكون انتهت أو توقّف الوكيل. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
           "turnFailedRefusal": "رفض {agent} متابعة هذه الجولة. يدل ذلك غالبًا على خطأ في الخلفية أو البوابة. يرجى مراجعة سجلات الوكيل.",
           "turnFailedMaxTokens": "بلغ {agent} الحد الأقصى للرموز المسموح بها في هذه الجولة.",
           "turnFailedMaxTurnRequests": "بلغ {agent} الحد الأقصى لعدد الطلبات المسموح بها في هذه الجولة.",

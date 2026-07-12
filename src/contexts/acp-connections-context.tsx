@@ -3315,6 +3315,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 return t("backendErrors.sessionLoadResourceNotFound", {
                   agent: agentLabel,
                 })
+              case "session_unavailable":
+                return t("backendErrors.sessionLoadUnavailable", {
+                  agent: agentLabel,
+                })
               default:
                 return e.message
             }

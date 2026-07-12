@@ -2423,37 +2423,29 @@ async fn run_connection(
                         .await
                     }
                     Err(e) => {
-                        // session/load failed (e.g. agent doesn't support resume,
-                        // or ephemeral forked session).
-                        // Fall back to session/new so the tab still works.
+                        // session/load failed. Classify it: an unrecoverable
+                        // historical session — the agent has no record of it
+                        // (ResourceNotFound, -32002) or the agent process/session
+                        // died mid-load (Claude 0.58.1 reports this as a -32603
+                        // Internal error, not -32002) — is surfaced to the
+                        // frontend as SessionLoadFailed so the user can choose
+                        // Reload vs New conversation. It is NOT auto-fallen-back
+                        // to session/new, which would silently orphan the
+                        // historical context (and, on a dead process, fail anyway
+                        // and leak a raw protocol error). Every other failure
+                        // keeps the session/new fallback below.
                         let err_str = e.to_string();
-                        let is_resource_not_found = matches!(
-                            e.code,
-                            sacp::schema::ErrorCode::ResourceNotFound
-                        );
-                        tracing::warn!(
-                            "[ACP] session/load failed ({}){}",
-                            err_str,
-                            if is_resource_not_found {
-                                ", surfacing as session_load_failed"
-                            } else {
-                                ", falling back to session/new"
-                            }
-                        );
-                        // ResourceNotFound (-32002): the agent has no record of
-                        // this session_id (deleted/expired/never existed).
-                        // Don't auto-fallback to session/new — that would
-                        // silently orphan the historical context. Surface to
-                        // the frontend so the user can choose between Reload
-                        // (transient agent restart) and New conversation.
-                        if is_resource_not_found {
+                        if let Some(code) = classify_session_load_failure(e.code, &err_str) {
+                            tracing::warn!(
+                                "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
+                            );
                             emit_with_state(
                                 &state,
                                 &emitter_clone,
                                 AcpEvent::SessionLoadFailed {
                                     session_id: sid.clone(),
                                     message: err_str,
-                                    code: "resource_not_found".to_string(),
+                                    code: code.to_string(),
                                 },
                             )
                             .await;
@@ -2467,6 +2459,9 @@ async fn run_connection(
                             .await;
                             return Ok(());
                         }
+                        tracing::warn!(
+                            "[ACP] session/load failed ({err_str}), falling back to session/new"
+                        );
                         // Only emit a visible error for unexpected failures;
                         // "Method not found" is expected for agents that don't
                         // support session resume (e.g. Cline).
@@ -3606,6 +3601,40 @@ fn stop_reason_to_str(reason: StopReason) -> &'static str {
         StopReason::MaxTurnRequests => "max_turn_requests",
         _ => "unknown",
     }
+}
+
+/// Classify a `session/load` failure into a stable frontend `code` when the
+/// historical session cannot be restored — either the agent has no record of
+/// it (`ResourceNotFound`, -32002) or the agent process/session died mid-load.
+/// Claude 0.58.1 surfaces the latter as a -32603 Internal error whose message
+/// contains "process exited with code N" (its `getOrCreateSession` only maps
+/// "Query closed…"/"No conversation found…" to `ResourceNotFound`), so the
+/// crash/ended family is matched on the wire message. Both codes route to the
+/// same `SessionLoadFailed` banner (Reload / New conversation) instead of a raw
+/// protocol error.
+///
+/// Returns `None` for failures that must keep the existing behavior:
+/// "Method not found" (agent lacks resume → silent `session/new` fallback),
+/// "Authentication required" (silent stop), and any other error (emit
+/// "starting new" then fall through to `session/new`).
+fn classify_session_load_failure(
+    code: sacp::schema::ErrorCode,
+    message: &str,
+) -> Option<&'static str> {
+    if matches!(code, sacp::schema::ErrorCode::ResourceNotFound) {
+        return Some("resource_not_found");
+    }
+    // Upstream signals for an unrecoverable session (claude-agent-acp 0.58.1):
+    //  - "process exited"    → "Claude Code process exited with code 1",
+    //                          "The Claude Agent process exited unexpectedly…"
+    //  - "session has ended" → SESSION_ENDED_MESSAGE
+    //  - "Session not found" → a plain Error rethrown as an Internal error
+    const UNRECOVERABLE: &[&str] =
+        &["process exited", "session has ended", "Session not found"];
+    if UNRECOVERABLE.iter().any(|s| message.contains(s)) {
+        return Some("session_unavailable");
+    }
+    None
 }
 
 /// True when a `SessionUpdate` represents actual agent-produced output for
@@ -5549,6 +5578,81 @@ mod tests {
             d = d.old_text(o.to_string());
         }
         ToolCallContent::Diff(d)
+    }
+
+    #[test]
+    fn classify_load_failure_resource_not_found_maps_to_code() {
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "session abc not found",
+            ),
+            Some("resource_not_found"),
+        );
+        // The structured -32002 code takes precedence even when the message
+        // would otherwise match the crash/ended family.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "process exited with code 1",
+            ),
+            Some("resource_not_found"),
+        );
+    }
+
+    #[test]
+    fn classify_load_failure_crash_and_ended_map_to_unavailable() {
+        // The reported Claude 0.58.1 case: native CLI exits 1, wrapped as -32603.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::InternalError,
+                "Internal error: { \"details\": \"Claude Code process exited with code 1\" }",
+            ),
+            Some("session_unavailable"),
+        );
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::InternalError,
+                "The Claude Agent session has ended. Please start a new session.",
+            ),
+            Some("session_unavailable"),
+        );
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::InternalError,
+                "Session not found",
+            ),
+            Some("session_unavailable"),
+        );
+    }
+
+    #[test]
+    fn classify_load_failure_keeps_existing_behavior_for_recoverable_errors() {
+        // "Method not found" (agent lacks resume) and "Authentication required"
+        // must fall through to the existing session/new + silent-stop paths.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::MethodNotFound,
+                "Method not found",
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::AuthRequired,
+                "Authentication required",
+            ),
+            None,
+        );
+        // Any other internal error without a crash/ended signature stays a
+        // session/new fallback.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::InternalError,
+                "some unrelated transient failure",
+            ),
+            None,
+        );
     }
 
     #[test]

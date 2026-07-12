@@ -2038,6 +2038,7 @@
           "spawnFailed": "Impossible de démarrer {agent} : {message}",
           "downloadFailed": "Échec du téléchargement de {agent} : {message}",
           "sessionLoadResourceNotFound": "Échec du chargement de la session de {agent}. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
+          "sessionLoadUnavailable": "{agent} n'a pas pu restaurer cette session ; elle a peut-être pris fin ou l'agent s'est arrêté. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
           "turnFailedRefusal": "{agent} a refusé de poursuivre ce tour. Cela indique souvent une erreur de backend ou de passerelle. Vérifiez les journaux de l'agent.",
           "turnFailedMaxTokens": "{agent} a atteint la limite maximale de jetons pour ce tour.",
           "turnFailedMaxTurnRequests": "{agent} a atteint le nombre maximal de requêtes autorisées pour ce tour.",
