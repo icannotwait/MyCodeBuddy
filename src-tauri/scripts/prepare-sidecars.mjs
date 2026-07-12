@@ -43,6 +43,8 @@ const BINARIES_DIR = join(SRC_TAURI, "binaries")
 const BIN_NAME = "codeg-mcp"
 const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.1"
 const CODEX_ACP_DIR = join(SRC_TAURI, "vendor", "codex-acp")
+const CODEX_COMPILE_RUNTIME_PACKAGE = "bun-windows-x64-baseline"
+const CODEX_COMPILE_RUNTIME = `${CODEX_COMPILE_RUNTIME_PACKAGE}-v1.3.14`
 
 export function codexBundleScript(target) {
   return target === "x86_64-pc-windows-msvc" ? "bundle:win-x64" : null
@@ -74,6 +76,28 @@ export function readCodexAcpVersion(sourceDir) {
     throw new Error(`codex-acp submodule is not initialized at ${sourceDir}`)
   }
   return JSON.parse(readFileSync(manifest, "utf8")).version
+}
+
+export function stageCodexCompileRuntime(sourceDir, target) {
+  if (target !== "x86_64-pc-windows-msvc") {
+    return null
+  }
+  const runtime = join(
+    sourceDir,
+    "node_modules",
+    "@oven",
+    CODEX_COMPILE_RUNTIME_PACKAGE,
+    "bin",
+    "bun.exe"
+  )
+  if (!existsSync(runtime)) {
+    throw new Error(
+      `locked Bun compile runtime is missing at ${runtime}; run npm ci on Windows`
+    )
+  }
+  const staged = join(sourceDir, CODEX_COMPILE_RUNTIME)
+  copyFileSync(runtime, staged)
+  return staged
 }
 
 function log(msg) {
@@ -172,17 +196,22 @@ function main() {
   if (version !== CODEX_ACP_VERSION) {
     die(`expected codex-acp ${CODEX_ACP_VERSION}, found ${version}`)
   }
-  for (const args of [
-    ["ci"],
-    ["run", "typecheck"],
-    ["test"],
-    ["run", codexScript],
-  ]) {
+  for (const args of [["ci"], ["run", "typecheck"], ["test"]]) {
     const invocation = npmCommandInvocation(args)
     execFileSync(invocation.command, invocation.args, {
       stdio: "inherit",
       cwd: CODEX_ACP_DIR,
     })
+  }
+  const compileRuntime = stageCodexCompileRuntime(CODEX_ACP_DIR, target)
+  try {
+    const invocation = npmCommandInvocation(["run", codexScript])
+    execFileSync(invocation.command, invocation.args, {
+      stdio: "inherit",
+      cwd: CODEX_ACP_DIR,
+    })
+  } finally {
+    rmSync(compileRuntime, { force: true })
   }
   const codexBuilt = join(
     CODEX_ACP_DIR,

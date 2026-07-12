@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -9,6 +9,7 @@ import {
   npmCommandInvocation,
   readCodexAcpVersion,
   sidecarDestination,
+  stageCodexCompileRuntime,
 } from "./prepare-sidecars.mjs"
 
 test("maps only the Windows x64 target to the codex bundle", () => {
@@ -38,6 +39,34 @@ test("runs npm.cmd through cmd.exe on Windows", () => {
       command: "C:\\Windows\\System32\\cmd.exe",
       args: ["/d", "/s", "/c", "npm.cmd", "ci"],
     }
+  )
+})
+
+test("stages the locked Bun Windows runtime for offline compilation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codeg-bun-runtime-"))
+  const runtime = join(
+    dir,
+    "node_modules",
+    "@oven",
+    "bun-windows-x64-baseline",
+    "bin",
+    "bun.exe"
+  )
+  mkdirSync(join(runtime, ".."), { recursive: true })
+  writeFileSync(runtime, "bun-runtime")
+
+  const staged = stageCodexCompileRuntime(dir, "x86_64-pc-windows-msvc")
+
+  assert.equal(staged, join(dir, "bun-windows-x64-baseline-v1.3.14"))
+  assert.equal(readFileSync(staged, "utf8"), "bun-runtime")
+})
+
+test("requires the locked Bun Windows runtime before compilation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codeg-bun-runtime-missing-"))
+
+  assert.throws(
+    () => stageCodexCompileRuntime(dir, "x86_64-pc-windows-msvc"),
+    /locked Bun compile runtime is missing/
   )
 })
 
