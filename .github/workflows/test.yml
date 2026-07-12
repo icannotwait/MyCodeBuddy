@@ -45,6 +45,9 @@ jobs:
       - name: Unit tests (vitest)
         run: pnpm test
 
+      - name: Release script tests
+        run: pnpm test:release
+
       - name: Static export build
         run: pnpm build
 

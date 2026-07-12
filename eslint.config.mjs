@@ -16,6 +16,7 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     "src-tauri/target/**",
     "src-tauri/experts/**",
+    "src-tauri/vendor/**",
     "public/vs/**",
   ]),
   eslintConfigPrettier,

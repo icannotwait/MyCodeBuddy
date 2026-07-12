@@ -1540,6 +1540,7 @@ export interface AcpAgentInfo {
   name: string
   description: string
   available: boolean
+  /** Backend distribution: npx, binary, uvx, or bundled. */
   distribution_type: string
   enabled: boolean
   sort_order: number

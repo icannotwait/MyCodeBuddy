@@ -40,6 +40,14 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: \${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Verify sidecars
+        run: Test-Path src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe
       - uses: tauri-apps/tauri-action@v0.6.1
         with:
           prerelease: false
@@ -68,7 +76,7 @@ test("requires a positive MyCodeBuddy version counter", () => {
 })
 
 test("requires package Cargo Tauri and tag versions to match", () => {
-  const version = "0.20.2-mycodebuddy.1"
+  const version = "0.20.2-mycodebuddy.2"
   assert.doesNotThrow(() =>
     assertMatchingVersions({
       packageVersion: version,
@@ -100,7 +108,7 @@ test("finds upstream URLs in runtime-owned files", () => {
 })
 
 test("repository identity matches the MyCodeBuddy release policy", () => {
-  const version = "0.20.2-mycodebuddy.1"
+  const version = "0.20.2-mycodebuddy.2"
   const packageJson = JSON.parse(readRepositoryFile("package.json"))
   const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
   const tauriConfig = JSON.parse(
@@ -337,7 +345,7 @@ test("server READMEs require manual Windows upgrades and current examples", () =
     assert.doesNotMatch(text, /v0\.5\.2/, `${path} has the old version`)
     assert.match(
       text,
-      /\.\\install\.ps1 -Version v0\.20\.2-mycodebuddy\.1/,
+      /\.\\install\.ps1 -Version v0\.20\.2-mycodebuddy\.2/,
       `${path} lacks the current installer example`
     )
     assert.ok(
@@ -374,6 +382,48 @@ test("server READMEs require manual Windows upgrades and current examples", () =
 
 test("accepts the complete Windows release policy", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
+})
+
+test("rejects duplicate checkout configuration in the desktop release", () => {
+  const duplicateWith = validWindowsWorkflow.replace(
+    "        with:\n          submodules: recursive",
+    "        with:\n          submodules: recursive\n        with:\n          fetch-depth: 0"
+  )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(duplicateWith),
+    /checkout step must contain exactly one with block/
+  )
+})
+
+test("requires recursive checkout in the desktop job itself", () => {
+  const misplacedSubmodules = validWindowsWorkflow
+    .replace("        with:\n          submodules: recursive\n", "")
+    .replace(
+      "      - name: Verify fork repository",
+      "      - uses: actions/checkout@v4\n        with:\n          submodules: recursive\n      - name: Verify fork repository"
+    )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(misplacedSubmodules),
+    /desktop release must checkout submodules recursively/
+  )
+})
+
+test("requires recursive checkout when the server job generates licenses", () => {
+  const serverWithoutSubmodules = `${validWindowsWorkflow}
+  build-server:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate third-party licenses
+        run: pnpm licenses:generate
+`
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(serverWithoutSubmodules),
+    /server release must checkout submodules recursively/
+  )
 })
 
 test("rejects every release target except Windows x64 MSVC", () => {

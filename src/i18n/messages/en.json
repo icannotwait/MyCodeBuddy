@@ -972,7 +972,9 @@
       "localUnrecognized": "{versionText}. Local version is not comparable; try upgrade to overwrite install.",
       "upgradeAvailable": "{versionText}. Upgrade available.",
       "remoteUnavailable": "{versionText}. Remote version is currently unavailable.",
-      "latest": "{versionText}. Already latest."
+      "latest": "{versionText}. Already latest.",
+      "bundled": "Built in: {version}",
+      "bundledMissing": "Built-in adapter is missing. Reinstall or update MyCodeBuddy."
     },
     "cline": {
       "configDescription": "Configure Cline API provider and credentials. Settings are saved to ~/.cline/data/."

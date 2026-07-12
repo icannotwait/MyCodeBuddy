@@ -19,19 +19,86 @@
 //   - Skippable: set `CODEG_SKIP_SIDECAR=1` when iterating on the frontend
 //     and you don't care about delegation.
 //
-// Intentionally Node-only (no shell): runs identically on macOS, Linux,
-// Windows GitHub runners.
+// Intentionally Node-only: runs identically on macOS, Linux, and Windows
+// GitHub runners. Windows npm.cmd invocations go through cmd.exe because Node
+// cannot execute command scripts directly there.
 
 import { execFileSync } from "node:child_process"
-import { existsSync, copyFileSync, mkdirSync, chmodSync } from "node:fs"
+import {
+  existsSync,
+  copyFileSync,
+  mkdirSync,
+  chmodSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs"
 import { dirname, join, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import process from "node:process"
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const SRC_TAURI = resolve(SCRIPT_DIR, "..")
 const BINARIES_DIR = join(SRC_TAURI, "binaries")
 const BIN_NAME = "codeg-mcp"
+const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.1"
+const CODEX_ACP_DIR = join(SRC_TAURI, "vendor", "codex-acp")
+const CODEX_COMPILE_RUNTIME_PACKAGE = "bun-windows-x64-baseline"
+const CODEX_COMPILE_RUNTIME = `${CODEX_COMPILE_RUNTIME_PACKAGE}-v1.3.14`
+
+export function codexBundleScript(target) {
+  return target === "x86_64-pc-windows-msvc" ? "bundle:win-x64" : null
+}
+
+export function sidecarDestination(name, target) {
+  const ext = target.includes("windows") ? ".exe" : ""
+  return `${name}-${target}${ext}`
+}
+
+export function npmCommandInvocation(
+  args,
+  platform = process.platform,
+  comSpec = process.env.ComSpec
+) {
+  if (platform === "win32") {
+    return {
+      command: comSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", "npm.cmd", ...args],
+    }
+  }
+  return { command: "npm", args }
+}
+
+export function readCodexAcpVersion(sourceDir) {
+  const manifest = join(sourceDir, "package.json")
+  const lockfile = join(sourceDir, "package-lock.json")
+  if (!existsSync(manifest) || !existsSync(lockfile)) {
+    throw new Error(`codex-acp submodule is not initialized at ${sourceDir}`)
+  }
+  return JSON.parse(readFileSync(manifest, "utf8")).version
+}
+
+export function stageCodexCompileRuntime(sourceDir, target) {
+  if (target !== "x86_64-pc-windows-msvc") {
+    return null
+  }
+  const runtime = join(
+    sourceDir,
+    "node_modules",
+    "@oven",
+    CODEX_COMPILE_RUNTIME_PACKAGE,
+    "bin",
+    "bun.exe"
+  )
+  if (!existsSync(runtime)) {
+    throw new Error(
+      `locked Bun compile runtime is missing at ${runtime}; run npm ci on Windows`
+    )
+  }
+  const staged = join(sourceDir, CODEX_COMPILE_RUNTIME)
+  copyFileSync(runtime, staged)
+  return staged
+}
 
 function log(msg) {
   console.log(`[prepare-sidecars] ${msg}`)
@@ -112,7 +179,7 @@ function main() {
   }
 
   mkdirSync(BINARIES_DIR, { recursive: true })
-  const dest = join(BINARIES_DIR, `${BIN_NAME}-${target}${ext}`)
+  const dest = join(BINARIES_DIR, sidecarDestination(BIN_NAME, target))
   copyFileSync(built, dest)
   if (!isWindows) {
     // copyFileSync preserves modes on POSIX, but be explicit for tarball
@@ -120,6 +187,54 @@ function main() {
     chmodSync(dest, 0o755)
   }
   log(`sidecar staged at ${dest}`)
+
+  const codexScript = codexBundleScript(target)
+  if (!codexScript || process.env.CODEG_SKIP_CODEX_ACP_SIDECAR === "1") {
+    return
+  }
+  const version = readCodexAcpVersion(CODEX_ACP_DIR)
+  if (version !== CODEX_ACP_VERSION) {
+    die(`expected codex-acp ${CODEX_ACP_VERSION}, found ${version}`)
+  }
+  for (const args of [["ci"], ["run", "typecheck"], ["test"]]) {
+    const invocation = npmCommandInvocation(args)
+    execFileSync(invocation.command, invocation.args, {
+      stdio: "inherit",
+      cwd: CODEX_ACP_DIR,
+    })
+  }
+  const compileRuntime = stageCodexCompileRuntime(CODEX_ACP_DIR, target)
+  try {
+    const invocation = npmCommandInvocation(["run", codexScript])
+    execFileSync(invocation.command, invocation.args, {
+      stdio: "inherit",
+      cwd: CODEX_ACP_DIR,
+    })
+  } finally {
+    rmSync(compileRuntime, { force: true })
+  }
+  const codexBuilt = join(
+    CODEX_ACP_DIR,
+    "dist",
+    "bin",
+    "codex-acp-x64-windows.exe"
+  )
+  const codexDest = join(BINARIES_DIR, sidecarDestination("codex-acp", target))
+  rmSync(codexDest, { force: true })
+  copyFileSync(codexBuilt, codexDest)
+  if (statSync(codexDest).size <= 0) {
+    die(`staged codex-acp is empty: ${codexDest}`)
+  }
+  const reported = execFileSync(codexDest, ["--version"], {
+    encoding: "utf8",
+  }).trim()
+  const expected = `@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}`
+  if (reported !== expected) {
+    die(`codex-acp version mismatch: expected ${expected}, got ${reported}`)
+  }
+  log(`sidecar staged at ${codexDest}`)
 }
 
-main()
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+}

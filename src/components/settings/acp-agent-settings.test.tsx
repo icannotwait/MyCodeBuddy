@@ -221,6 +221,36 @@ describe("buildGrokSaveOptions — one save persists both surfaces", () => {
 })
 
 describe("buildVersionCheck", () => {
+  it("shows bundled Codex as built in without management actions", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "codex" as AgentType,
+        distribution_type: "bundled",
+        available: true,
+        registry_version: "1.1.2-mycodebuddy.1",
+        installed_version: "1.1.2-mycodebuddy.1",
+      })
+    )
+
+    expect(check?.status).toBe("pass")
+    expect(check?.fixes).toEqual([])
+    expect(check?.message).toContain("Built in")
+  })
+
+  it("reports a missing bundled Codex without install actions", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "codex" as AgentType,
+        distribution_type: "bundled",
+        available: false,
+        installed_version: null,
+      })
+    )
+
+    expect(check?.status).toBe("fail")
+    expect(check?.fixes).toEqual([])
+  })
+
   // uv runtime not ready: a uvx agent (Hermes) must surface a blocked
   // version-status with the agent-install action DISABLED — the actual install
   // happens via the separate "Install uv" preflight action, not here.

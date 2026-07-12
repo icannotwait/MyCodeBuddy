@@ -47,7 +47,7 @@ the release workflow does not require a deploy key or private-repository token.
 ## Adapter Versioning
 
 The first bundled fork release uses the distinct valid semver
-`1.1.0-mycodebuddy.1`. Every subsequent change to the customized adapter
+`1.1.2-mycodebuddy.1`. Every subsequent change to the customized adapter
 increments the MyCodeBuddy prerelease revision. The
 version printed by `codex-acp.exe --version`, the version shown in Codeg settings,
 and the submodule commit used for the release must describe the same source.

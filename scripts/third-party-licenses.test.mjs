@@ -7,6 +7,7 @@ import {
   buildCommandInvocation,
   collectCargoPackageUnion,
   collectCargoPackages,
+  collectCodexAcpPackages,
   collectNpmPackages,
   findLicenseFiles,
   renderLicenseReport,
@@ -138,6 +139,42 @@ test("collects npm versions and accepts khroma's lowercase license file", () => 
   assert.deepEqual(records[2].licenseTexts, [
     { name: "license", text: "Khroma text" },
   ])
+})
+
+test("collects the bundled codex fork and locked production dependencies", () => {
+  const root = makePackageDirectory("codex-acp", {
+    LICENSE: "Apache license",
+    "package.json": JSON.stringify({
+      name: "@agentclientprotocol/codex-acp",
+      version: "1.1.2-mycodebuddy.1",
+      license: "Apache-2.0",
+    }),
+    "package-lock.json": JSON.stringify({
+      packages: {
+        "": { version: "1.1.2-mycodebuddy.1" },
+        "node_modules/@openai/codex": {
+          version: "0.144.1",
+          license: "Apache-2.0",
+        },
+        "node_modules/dev-only": {
+          version: "1.0.0",
+          license: "MIT",
+          dev: true,
+        },
+      },
+    }),
+  })
+
+  const records = collectCodexAcpPackages(root)
+
+  assert.deepEqual(
+    records.map(({ name, version }) => [name, version]),
+    [
+      ["@agentclientprotocol/codex-acp", "1.1.2-mycodebuddy.1"],
+      ["@openai/codex", "0.144.1"],
+    ]
+  )
+  assert.equal(records[0].licenseTexts[0].text, "Apache license")
 })
 
 test("collects Cargo Windows metadata and excludes the workspace root", () => {
