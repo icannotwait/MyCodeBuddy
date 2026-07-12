@@ -972,7 +972,9 @@
       "localUnrecognized": "{versionText}. 로컬 버전을 비교할 수 없습니다. 덮어쓰기 설치를 위해 업그레이드를 시도하세요.",
       "upgradeAvailable": "{versionText}. 업그레이드가 가능합니다.",
       "remoteUnavailable": "{versionText}. 현재 원격 버전을 사용할 수 없습니다.",
-      "latest": "{versionText}. 이미 최신입니다."
+      "latest": "{versionText}. 이미 최신입니다.",
+      "bundled": "내장 버전: {version}",
+      "bundledMissing": "내장 어댑터가 없습니다. MyCodeBuddy를 다시 설치하거나 업데이트하세요."
     },
     "cline": {
       "configDescription": "Cline API 제공자와 자격 증명을 구성합니다. 설정은 ~/.cline/data/에 저장됩니다."

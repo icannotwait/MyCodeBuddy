@@ -2803,6 +2803,26 @@ export function buildVersionCheck(
   agent: AcpAgentInfo,
   uvReady: boolean = true
 ): UiCheckItem | null {
+  if (agent.distribution_type === "bundled") {
+    const localVersion =
+      agent.installed_version ??
+      acpText("version.notInstalled", "Not installed")
+    return {
+      check_id: "version_status",
+      label: acpText("version.statusLabel", "Version Status"),
+      status: agent.available ? "pass" : "fail",
+      message: agent.available
+        ? acpText("version.bundled", "Built in: {version}", {
+            version: localVersion,
+          })
+        : acpText(
+            "version.bundledMissing",
+            "Built-in adapter is missing. Reinstall or update MyCodeBuddy."
+          ),
+      fixes: [],
+    }
+  }
+
   if (
     agent.distribution_type !== "binary" &&
     agent.distribution_type !== "npx" &&

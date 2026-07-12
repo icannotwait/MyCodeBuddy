@@ -23,15 +23,43 @@
 // Windows GitHub runners.
 
 import { execFileSync } from "node:child_process"
-import { existsSync, copyFileSync, mkdirSync, chmodSync } from "node:fs"
+import {
+  existsSync,
+  copyFileSync,
+  mkdirSync,
+  chmodSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs"
 import { dirname, join, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import process from "node:process"
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const SRC_TAURI = resolve(SCRIPT_DIR, "..")
 const BINARIES_DIR = join(SRC_TAURI, "binaries")
 const BIN_NAME = "codeg-mcp"
+const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.1"
+const CODEX_ACP_DIR = join(SRC_TAURI, "vendor", "codex-acp")
+
+export function codexBundleScript(target) {
+  return target === "x86_64-pc-windows-msvc" ? "bundle:win-x64" : null
+}
+
+export function sidecarDestination(name, target) {
+  const ext = target.includes("windows") ? ".exe" : ""
+  return `${name}-${target}${ext}`
+}
+
+export function readCodexAcpVersion(sourceDir) {
+  const manifest = join(sourceDir, "package.json")
+  const lockfile = join(sourceDir, "package-lock.json")
+  if (!existsSync(manifest) || !existsSync(lockfile)) {
+    throw new Error(`codex-acp submodule is not initialized at ${sourceDir}`)
+  }
+  return JSON.parse(readFileSync(manifest, "utf8")).version
+}
 
 function log(msg) {
   console.log(`[prepare-sidecars] ${msg}`)
@@ -112,7 +140,7 @@ function main() {
   }
 
   mkdirSync(BINARIES_DIR, { recursive: true })
-  const dest = join(BINARIES_DIR, `${BIN_NAME}-${target}${ext}`)
+  const dest = join(BINARIES_DIR, sidecarDestination(BIN_NAME, target))
   copyFileSync(built, dest)
   if (!isWindows) {
     // copyFileSync preserves modes on POSIX, but be explicit for tarball
@@ -120,6 +148,46 @@ function main() {
     chmodSync(dest, 0o755)
   }
   log(`sidecar staged at ${dest}`)
+
+  const codexScript = codexBundleScript(target)
+  if (!codexScript || process.env.CODEG_SKIP_CODEX_ACP_SIDECAR === "1") {
+    return
+  }
+  const version = readCodexAcpVersion(CODEX_ACP_DIR)
+  if (version !== CODEX_ACP_VERSION) {
+    die(`expected codex-acp ${CODEX_ACP_VERSION}, found ${version}`)
+  }
+  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
+  for (const args of [
+    ["ci"],
+    ["run", "typecheck"],
+    ["test"],
+    ["run", codexScript],
+  ]) {
+    execFileSync(npm, args, { stdio: "inherit", cwd: CODEX_ACP_DIR })
+  }
+  const codexBuilt = join(
+    CODEX_ACP_DIR,
+    "dist",
+    "bin",
+    "codex-acp-x64-windows.exe"
+  )
+  const codexDest = join(BINARIES_DIR, sidecarDestination("codex-acp", target))
+  rmSync(codexDest, { force: true })
+  copyFileSync(codexBuilt, codexDest)
+  if (statSync(codexDest).size <= 0) {
+    die(`staged codex-acp is empty: ${codexDest}`)
+  }
+  const reported = execFileSync(codexDest, ["--version"], {
+    encoding: "utf8",
+  }).trim()
+  const expected = `@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}`
+  if (reported !== expected) {
+    die(`codex-acp version mismatch: expected ${expected}, got ${reported}`)
+  }
+  log(`sidecar staged at ${codexDest}`)
 }
 
-main()
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+}

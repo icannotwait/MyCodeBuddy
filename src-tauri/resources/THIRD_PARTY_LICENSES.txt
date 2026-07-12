@@ -3319,6 +3319,15 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/gyscos/zstd-rs
 License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9, 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e, 30367d9a4eadd6c9dcd719ea082ac9f6c499cdbd9976b246bdf2153ebe8e53f6, 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
 
+npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.1
+Declared license: Apache-2.0
+Homepage: https://github.com/agentclientprotocol/codex-acp#readme
+License text SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
+
+npm:@agentclientprotocol/sdk@1.2.1
+Declared license: Apache-2.0
+License text SHA-256: none
+
 npm:@ai-sdk/gateway@3.0.39
 Declared license: Apache-2.0
 Homepage: https://ai-sdk.dev/docs
@@ -3802,6 +3811,34 @@ npm:@open-draft/until@2.1.0
 Declared license: MIT
 Homepage: https://github.com/open-draft/until#readme
 License text SHA-256: f699b579a195d53125172da775f8a4af8d90897ac0c9160f7f69c179af0a031b
+
+npm:@openai/codex@0.144.1
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-darwin-arm64@0.144.1-darwin-arm64
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-darwin-x64@0.144.1-darwin-x64
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-linux-arm64@0.144.1-linux-arm64
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-linux-x64@0.144.1-linux-x64
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-win32-arm64@0.144.1-win32-arm64
+Declared license: Apache-2.0
+License text SHA-256: none
+
+npm:@openai/codex-win32-x64@0.144.1-win32-x64
+Declared license: Apache-2.0
+License text SHA-256: none
 
 npm:@opentelemetry/api@1.9.0
 Declared license: Apache-2.0
@@ -4891,7 +4928,11 @@ License text SHA-256: 2bccca04141ded409b82d07b1783909d66d53d2530ae60f9c39806695d
 npm:bundle-name@4.1.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/bundle-name#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:bundle-name@4.1.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:bytes@3.1.2
 Declared license: MIT
@@ -5356,17 +5397,29 @@ License text SHA-256: b23418f8823ead328ac9ef75fb29b907065c18464ff0bec999bb61b054
 npm:default-browser@5.5.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/default-browser#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:default-browser@5.5.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:default-browser-id@5.0.1
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/default-browser-id#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:default-browser-id@5.0.1
+Declared license: MIT
+License text SHA-256: none
 
 npm:define-lazy-prop@3.0.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/define-lazy-prop#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:define-lazy-prop@3.0.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:delaunator@5.0.1
 Declared license: ISC
@@ -5402,6 +5455,10 @@ npm:diff@8.0.3
 Declared license: BSD-3-Clause
 Homepage: https://github.com/kpdecker/jsdiff#readme
 License text SHA-256: ef7eb99d9a97cb70eea06d108eb68f0448dac208ed55f1c56a147252cc4328fa
+
+npm:diff@9.0.0
+Declared license: BSD-3-Clause
+License text SHA-256: none
 
 npm:dompurify@3.2.7
 Declared license: (MPL-2.0 OR Apache-2.0)
@@ -5956,7 +6013,11 @@ License text SHA-256: d9c32f07344cb9c8160725e998daa6a4bf5760ff6508ee645e0f192a06
 npm:is-docker@3.0.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/is-docker#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:is-docker@3.0.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:is-extglob@2.1.1
 Declared license: MIT
@@ -5981,12 +6042,20 @@ License text SHA-256: d9c32f07344cb9c8160725e998daa6a4bf5760ff6508ee645e0f192a06
 npm:is-in-ssh@1.0.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/is-in-ssh#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:is-in-ssh@1.0.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:is-inside-container@1.0.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/is-inside-container#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:is-inside-container@1.0.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:is-interactive@2.0.0
 Declared license: MIT
@@ -6047,6 +6116,10 @@ npm:is-wsl@3.1.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/is-wsl#readme
 License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+
+npm:is-wsl@3.1.1
+Declared license: MIT
+License text SHA-256: none
 
 npm:isexe@2.0.0
 Declared license: ISC
@@ -6671,7 +6744,11 @@ License text SHA-256: f526adb7b81e5d0b296715f70db2b3ac5fa9e40c651e1658a30dc65157
 npm:open@11.0.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/open#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:open@11.0.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:opentype.js@0.8.0
 Declared license: MIT
@@ -6841,7 +6918,11 @@ License text SHA-256: none
 npm:powershell-utils@0.1.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/powershell-utils#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:powershell-utils@0.1.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:pretty-ms@9.3.0
 Declared license: MIT
@@ -7143,7 +7224,11 @@ License text SHA-256: 59ebe0cf27c449a5bf54db06b0a0d622752725ffe72cff64deba876b3e
 npm:run-applescript@7.1.0
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/run-applescript#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:run-applescript@7.1.0
+Declared license: MIT
+License text SHA-256: none
 
 npm:run-parallel@1.2.0
 Declared license: MIT
@@ -7620,6 +7705,10 @@ Declared license: MIT
 Homepage: https://github.com/Microsoft/vscode-languageserver-node#readme
 License text SHA-256: ae00cb6006eaaa72d9b56c1d66cc8033398ec51f06add68be4e69742f9e63ea7
 
+npm:vscode-jsonrpc@9.0.1
+Declared license: MIT
+License text SHA-256: none
+
 npm:vscode-languageserver@9.0.1
 Declared license: MIT
 Homepage: https://github.com/Microsoft/vscode-languageserver-node#readme
@@ -7688,7 +7777,11 @@ License text SHA-256: 0ae52fe329ccfd23fedbd688361bd0dedaf5cae3e3516eb2ad17831f2d
 npm:wsl-utils@0.3.1
 Declared license: MIT
 Homepage: https://github.com/sindresorhus/wsl-utils#readme
-License text SHA-256: 1529f88b3675095087120854c6fa2cc1113ab2da2f88c4f6aa4ffe52e98ef81b
+License text SHA-256: none
+
+npm:wsl-utils@0.3.1
+Declared license: MIT
+License text SHA-256: none
 
 npm:y18n@5.0.8
 Declared license: ISC
@@ -7734,6 +7827,10 @@ npm:zod@3.25.76
 Declared license: MIT
 Homepage: https://zod.dev
 License text SHA-256: f61cacc2acb8b71aa79a128b3e732bf25e02aab40747bbbd5bf00c97c9cda28d
+
+npm:zod@4.4.3
+Declared license: MIT
+License text SHA-256: none
 
 npm:zod-to-json-schema@3.25.1
 Declared license: ISC
@@ -13498,6 +13595,201 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 [others]: https://github.com/json5/json5/contributors
+
+SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
+Packages:
+- npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.1
+
+   Copyright 2025 JetBrains s.r.o.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+                                Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
 
 SHA-256: 5c07409e7457212808b3bc8775a3aa15599017f283cb7fd317687e47e639d983
 Packages:

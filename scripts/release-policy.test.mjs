@@ -40,6 +40,14 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: \${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Verify sidecars
+        run: Test-Path src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe
       - uses: tauri-apps/tauri-action@v0.6.1
         with:
           prerelease: false
@@ -374,6 +382,32 @@ test("server READMEs require manual Windows upgrades and current examples", () =
 
 test("accepts the complete Windows release policy", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
+})
+
+test("rejects duplicate checkout configuration in the desktop release", () => {
+  const duplicateWith = validWindowsWorkflow.replace(
+    "        with:\n          submodules: recursive",
+    "        with:\n          submodules: recursive\n        with:\n          fetch-depth: 0"
+  )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(duplicateWith),
+    /checkout step must contain exactly one with block/
+  )
+})
+
+test("requires recursive checkout in the desktop job itself", () => {
+  const misplacedSubmodules = validWindowsWorkflow
+    .replace("        with:\n          submodules: recursive\n", "")
+    .replace(
+      "      - name: Verify fork repository",
+      "      - uses: actions/checkout@v4\n        with:\n          submodules: recursive\n      - name: Verify fork repository"
+    )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(misplacedSubmodules),
+    /desktop release must checkout submodules recursively/
+  )
 })
 
 test("rejects every release target except Windows x64 MSVC", () => {

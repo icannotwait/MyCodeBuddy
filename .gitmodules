@@ -1,0 +1,4 @@
+[submodule "src-tauri/vendor/codex-acp"]
+	path = src-tauri/vendor/codex-acp
+	url = https://github.com/icannotwait/codex-acp.git
+	branch = codex/codex-acp-cli-runtime

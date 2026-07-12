@@ -162,6 +162,35 @@ export function findForbiddenRuntimeUrls(files) {
 
 export function assertWindowsReleaseWorkflow(workflowText) {
   const policyText = uncommentedWorkflowText(workflowText)
+  const desktopJob = policyText.match(
+    /^  build-desktop:\s*\n([\s\S]*?)(?=^  [A-Za-z0-9_-]+:\s*$|(?![\s\S]))/m
+  )?.[0]
+  if (!desktopJob) {
+    throw new Error("release workflow is missing the desktop build job")
+  }
+  const recursiveCheckout = workflowStepBlocks(desktopJob).find(
+    (stepText) =>
+      /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
+      /submodules\s*:\s*recursive/i.test(stepText)
+  )
+  if (!recursiveCheckout) {
+    throw new Error("desktop release must checkout submodules recursively")
+  }
+  if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
+    throw new Error("checkout step must contain exactly one with block")
+  }
+  if (
+    !/oven-sh\/setup-bun@v2/i.test(desktopJob) ||
+    !/bun-version\s*:\s*1\.3\.14/i.test(desktopJob)
+  ) {
+    throw new Error("desktop release must pin Bun 1.3.14")
+  }
+  if (!desktopJob.includes("codex-acp-x86_64-pc-windows-msvc.exe")) {
+    throw new Error("desktop release must verify the codex-acp x64 sidecar")
+  }
+  if (policyText.includes("CODEG_SKIP_CODEX_ACP_SIDECAR")) {
+    throw new Error("desktop release must not skip the codex-acp sidecar")
+  }
   const targets = releaseTargets(policyText)
   for (const target of WINDOWS_RELEASE_TARGETS) {
     if (!targets.has(target)) {

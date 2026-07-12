@@ -19,6 +19,14 @@ pub enum AgentDistribution {
         env: &'static [(&'static str, &'static str)],
         platforms: &'static [PlatformBinary],
     },
+    Bundled {
+        version: &'static str,
+        cmd: &'static str,
+        args: &'static [&'static str],
+        env: &'static [(&'static str, &'static str)],
+        override_env: &'static str,
+        platforms: &'static [&'static str],
+    },
     /// Python agents launched through `uvx` (the `uv` tool runner), which
     /// fetches + caches the pinned package on first use — analogous to npx.
     /// Used for ACP agents distributed as Python packages (e.g. Hermes).
@@ -66,6 +74,7 @@ impl AcpAgentMeta {
         match &self.distribution {
             AgentDistribution::Npx { version, .. }
             | AgentDistribution::Binary { version, .. }
+            | AgentDistribution::Bundled { version, .. }
             | AgentDistribution::Uvx { version, .. } => Some(*version),
         }
     }
@@ -144,6 +153,31 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
     }
 }
 
+fn codex_distribution_for(platform: &str) -> AgentDistribution {
+    if platform == "windows-x86_64" {
+        AgentDistribution::Bundled {
+            version: "1.1.2-mycodebuddy.1",
+            cmd: "codex-acp",
+            args: &[],
+            env: &[
+                ("CODEX_ACP_USE_CLI", "1"),
+                ("CODEX_ACP_CLI_MODEL", "gpt-5.5"),
+            ],
+            override_env: crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV,
+            platforms: &["windows-x86_64"],
+        }
+    } else {
+        AgentDistribution::Npx {
+            version: "1.1.2",
+            package: "@agentclientprotocol/codex-acp@1.1.2",
+            cmd: "codex-acp",
+            args: &[],
+            env: &[],
+            node_required: Some("20.0.0"),
+        }
+    }
+}
+
 pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
     debug_assert_eq!(
         from_registry_id(registry_id_for(agent_type)),
@@ -178,14 +212,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // custom provider. 1.1.0 (#263) also reports `/goal` transitions as a
             // structured `session_info_update` (`_meta.codex.goal`) rather than
             // live agent text — see `crate::acp::codex_goal`.
-            distribution: AgentDistribution::Npx {
-                version: "1.1.2",
-                package: "@agentclientprotocol/codex-acp@1.1.2",
-                cmd: "codex-acp",
-                args: &[],
-                env: &[],
-                node_required: Some("20.0.0"),
-            },
+            distribution: codex_distribution_for(current_platform()),
         },
         AgentType::Gemini => AcpAgentMeta {
             agent_type,
@@ -487,12 +514,6 @@ mod tests {
             "@moonshot-ai/kimi-code@0.23.5",
             Some("22.19.0"),
         );
-        assert_npx_version(
-            AgentType::Codex,
-            "1.1.2",
-            "@agentclientprotocol/codex-acp@1.1.2",
-            Some("20.0.0"),
-        );
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
@@ -510,6 +531,31 @@ mod tests {
             // interpreter it (and its win32 `pywinpty` dep) supports.
             Some("3.13"),
         );
+    }
+
+    #[test]
+    fn codex_is_bundled_only_on_windows_x64() {
+        assert!(matches!(
+            codex_distribution_for("windows-x86_64"),
+            AgentDistribution::Bundled {
+                version: "1.1.2-mycodebuddy.1",
+                override_env: "CODEG_CODEX_ACP_BIN",
+                ..
+            }
+        ));
+        match codex_distribution_for("darwin-aarch64") {
+            AgentDistribution::Npx {
+                version,
+                package,
+                node_required,
+                ..
+            } => {
+                assert_eq!(version, "1.1.2");
+                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
+                assert_eq!(node_required, Some("20.0.0"));
+            }
+            other => panic!("expected npx Codex distribution on macOS, got {other:?}"),
+        }
     }
 
     #[test]
