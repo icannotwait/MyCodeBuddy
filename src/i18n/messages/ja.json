@@ -972,7 +972,9 @@
       "localUnrecognized": "{versionText}。ローカルバージョンは比較できません。上書きインストールのためアップグレードを試してください。",
       "upgradeAvailable": "{versionText}。アップグレード可能です。",
       "remoteUnavailable": "{versionText}。現在リモートバージョンは取得できません。",
-      "latest": "{versionText}。すでに最新です。"
+      "latest": "{versionText}。すでに最新です。",
+      "bundled": "内蔵バージョン: {version}",
+      "bundledMissing": "内蔵アダプターがありません。MyCodeBuddy を再インストールまたは更新してください。"
     },
     "cline": {
       "configDescription": "Cline API プロバイダーと認証情報を設定します。設定は ~/.cline/data/ に保存されます。"

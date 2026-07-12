@@ -972,7 +972,9 @@
       "localUnrecognized": "{versionText}. الإصدار المحلي غير قابل للمقارنة؛ جرّب الترقية للكتابة فوق التثبيت.",
       "upgradeAvailable": "{versionText}. تتوفر ترقية.",
       "remoteUnavailable": "{versionText}. الإصدار البعيد غير متاح حاليًا.",
-      "latest": "{versionText}. أنت على أحدث إصدار."
+      "latest": "{versionText}. أنت على أحدث إصدار.",
+      "bundled": "مدمج: {version}",
+      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت MyCodeBuddy أو حدّثه."
     },
     "cline": {
       "configDescription": "تكوين مزود واجهة برمجة التطبيقات وبيانات اعتماد Cline. يتم حفظ الإعدادات في ~/.cline/data/."
