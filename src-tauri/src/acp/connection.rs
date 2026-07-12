@@ -385,6 +385,36 @@ async fn build_agent(
                 })
                 .map_err(|e| AcpError::SpawnFailed(e.to_string()))
         }
+        AgentDistribution::Bundled {
+            cmd, args, env, override_env, platforms, ..
+        } => {
+            let platform = registry::current_platform();
+            if !platforms.contains(&platform) {
+                return Err(AcpError::PlatformNotSupported(format!(
+                    "{} is not available on {platform}", meta.name
+                )));
+            }
+            let binary_path = crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)?
+                .ok_or_else(|| AcpError::SdkNotInstalled(format!(
+                    "Bundled {} executable is missing; reinstall or update MyCodeBuddy.", meta.name
+                )))?;
+            let merged_env = merge_agent_env(env, runtime_env);
+            let mut parts: Vec<String> = merged_env.iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            parts.push(binary_path.to_string_lossy().to_string());
+            parts.extend(args.iter().map(|arg| (*arg).to_string()));
+            let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            let agent_name = meta.name.to_string();
+            tracing::info!("[ACP][{}] Using bundled executable {}", meta.name, binary_path.display());
+            AcpAgent::from_args(&refs)
+                .map(|agent| agent.with_debug(move |line, direction| {
+                    if direction == sacp_tokio::LineDirection::Stderr {
+                        tracing::debug!("[ACP][{agent_name}][stderr] {line}");
+                    }
+                }))
+                .map_err(|error| AcpError::SpawnFailed(error.to_string()))
+        }
         AgentDistribution::Binary {
             version: registry_version,
             cmd,

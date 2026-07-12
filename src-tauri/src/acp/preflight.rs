@@ -65,6 +65,9 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
             platforms,
             ..
         } => check_binary_environment(agent_type, version, cmd, platforms).await,
+        AgentDistribution::Bundled { cmd, override_env, platforms, .. } => {
+            check_bundled_environment(cmd, override_env, platforms)
+        }
         AgentDistribution::Uvx {
             uv_required,
             system_cmd,
@@ -82,6 +85,41 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
         passed,
         checks,
     }
+}
+
+fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) -> Vec<CheckItem> {
+    let platform = registry::current_platform();
+    let supported = platforms.contains(&platform);
+    let mut checks = vec![CheckItem {
+        check_id: "platform_supported".into(),
+        label: "Platform".into(),
+        status: if supported { CheckStatus::Pass } else { CheckStatus::Fail },
+        message: if supported {
+            format!("Platform {platform} is supported")
+        } else {
+            format!("Platform {platform} is not supported")
+        },
+        fixes: vec![],
+    }];
+    if supported {
+        checks.push(match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
+            Ok(Some(path)) => CheckItem {
+                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
+                status: CheckStatus::Pass,
+                message: format!("Built-in adapter available at {}", path.display()), fixes: vec![],
+            },
+            Ok(None) => CheckItem {
+                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
+                status: CheckStatus::Fail,
+                message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(), fixes: vec![],
+            },
+            Err(error) => CheckItem {
+                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
+                status: CheckStatus::Fail, message: error.to_string(), fixes: vec![],
+            },
+        });
+    }
+    checks
 }
 
 async fn check_npm_environment(node_required: Option<&str>) -> Vec<CheckItem> {

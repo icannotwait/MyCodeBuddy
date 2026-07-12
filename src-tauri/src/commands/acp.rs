@@ -482,6 +482,20 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             Ok(())
         }
+        registry::AgentDistribution::Bundled { cmd, override_env, platforms, .. } => {
+            let platform = registry::current_platform();
+            if !platforms.contains(&platform) {
+                return Err(AcpError::PlatformNotSupported(format!(
+                    "{} is not available on {platform}", meta.name
+                )));
+            }
+            if crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)?.is_none() {
+                return Err(AcpError::SdkNotInstalled(format!(
+                    "Bundled {} executable is missing; reinstall or update MyCodeBuddy.", meta.name
+                )));
+            }
+            Ok(())
+        }
         registry::AgentDistribution::Uvx { system_cmd, .. } => {
             // Launchable when uvx is resolvable (codeg auto-provisions it on
             // install, so this holds post-prepare) or the agent's own CLI is on
@@ -565,6 +579,10 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
             binary_cache::detect_installed_version(agent_type, cmd)
                 .ok()
                 .flatten()
+        }
+        registry::AgentDistribution::Bundled { version, cmd, override_env, .. } => {
+            crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
+                .ok().flatten().map(|_| version.to_string())
         }
         registry::AgentDistribution::Uvx { .. } => binary_cache::uvx_prepared_version(agent_type),
     }
@@ -6185,6 +6203,12 @@ pub(crate) async fn acp_get_agent_status_core(
                 .flatten();
             (platforms.iter().any(|p| p.platform == platform), detected)
         }
+        registry::AgentDistribution::Bundled { version, cmd, override_env, platforms, .. } => {
+            let available = platforms.contains(&platform)
+                && crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
+                    .ok().flatten().is_some();
+            (available, available.then(|| version.to_string()))
+        }
         registry::AgentDistribution::Uvx { system_cmd, .. } => (
             uvx_agent_launchable(*system_cmd),
             binary_cache::uvx_prepared_version(agent_type),
@@ -6256,6 +6280,12 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                     "binary",
                     detected,
                 )
+            }
+            registry::AgentDistribution::Bundled { version, cmd, override_env, platforms, .. } => {
+                let available = platforms.contains(&platform)
+                    && crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
+                        .ok().flatten().is_some();
+                (available, "bundled", available.then(|| version.to_string()))
             }
             registry::AgentDistribution::Uvx { system_cmd, .. } => (
                 uvx_agent_launchable(*system_cmd),
@@ -7227,6 +7257,9 @@ pub(crate) async fn acp_download_agent_binary_core(
         registry::AgentDistribution::Npx { .. } => Err(AcpError::protocol(
             "download is only supported for binary agents",
         )),
+        registry::AgentDistribution::Bundled { .. } => Err(AcpError::protocol(
+            "bundled agents are updated with MyCodeBuddy",
+        )),
         registry::AgentDistribution::Uvx { .. } => Err(AcpError::protocol(
             "download is only supported for binary agents",
         )),
@@ -7347,6 +7380,7 @@ pub(crate) async fn acp_detect_agent_local_version_core(
     if matches!(
         registry::get_agent_meta(agent_type).distribution,
         registry::AgentDistribution::Binary { .. }
+            | registry::AgentDistribution::Bundled { .. }
     ) {
         let _ = agent_setting_service::set_installed_version(conn, agent_type, None).await;
         return Ok(None);
@@ -7468,6 +7502,9 @@ pub(crate) async fn acp_prepare_npx_agent_core(
         registry::AgentDistribution::Binary { .. } => Err(AcpError::protocol(
             "prepare is only supported for npx agents",
         )),
+        registry::AgentDistribution::Bundled { .. } => Err(AcpError::protocol(
+            "bundled agents are updated with MyCodeBuddy",
+        )),
         registry::AgentDistribution::Uvx {
             package,
             cmd,
@@ -7588,6 +7625,11 @@ pub(crate) async fn acp_uninstall_agent_core(
             }
             registry::AgentDistribution::Npx { package, .. } => {
                 uninstall_npm_global_package(package).await?;
+            }
+            registry::AgentDistribution::Bundled { .. } => {
+                return Err(AcpError::protocol(
+                    "bundled agents are updated with MyCodeBuddy",
+                ));
             }
             registry::AgentDistribution::Uvx { .. } => {
                 binary_cache::clear_uvx_agent_prepared(agent_type)?;
