@@ -482,7 +482,12 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             Ok(())
         }
-        registry::AgentDistribution::Bundled { cmd, override_env, platforms, .. } => {
+        registry::AgentDistribution::Bundled {
+            cmd,
+            override_env,
+            platforms,
+            ..
+        } => {
             let platform = registry::current_platform();
             if !platforms.contains(&platform) {
                 return Err(AcpError::PlatformNotSupported(format!(
@@ -580,9 +585,16 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
                 .ok()
                 .flatten()
         }
-        registry::AgentDistribution::Bundled { version, cmd, override_env, .. } => {
+        registry::AgentDistribution::Bundled {
+            version,
+            cmd,
+            override_env,
+            ..
+        } => {
             crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
-                .ok().flatten().map(|_| version.to_string())
+                .ok()
+                .flatten()
+                .map(|_| version.to_string())
         }
         registry::AgentDistribution::Uvx { .. } => binary_cache::uvx_prepared_version(agent_type),
     }
@@ -6203,10 +6215,18 @@ pub(crate) async fn acp_get_agent_status_core(
                 .flatten();
             (platforms.iter().any(|p| p.platform == platform), detected)
         }
-        registry::AgentDistribution::Bundled { version, cmd, override_env, platforms, .. } => {
+        registry::AgentDistribution::Bundled {
+            version,
+            cmd,
+            override_env,
+            platforms,
+            ..
+        } => {
             let available = platforms.contains(&platform)
                 && crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
-                    .ok().flatten().is_some();
+                    .ok()
+                    .flatten()
+                    .is_some();
             (available, available.then(|| version.to_string()))
         }
         registry::AgentDistribution::Uvx { system_cmd, .. } => (
@@ -6281,10 +6301,18 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                     detected,
                 )
             }
-            registry::AgentDistribution::Bundled { version, cmd, override_env, platforms, .. } => {
+            registry::AgentDistribution::Bundled {
+                version,
+                cmd,
+                override_env,
+                platforms,
+                ..
+            } => {
                 let available = platforms.contains(&platform)
                     && crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)
-                        .ok().flatten().is_some();
+                        .ok()
+                        .flatten()
+                        .is_some();
                 (available, "bundled", available.then(|| version.to_string()))
             }
             registry::AgentDistribution::Uvx { system_cmd, .. } => (

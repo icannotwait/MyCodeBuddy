@@ -172,10 +172,7 @@ function main() {
     "bin",
     "codex-acp-x64-windows.exe"
   )
-  const codexDest = join(
-    BINARIES_DIR,
-    sidecarDestination("codex-acp", target)
-  )
+  const codexDest = join(BINARIES_DIR, sidecarDestination("codex-acp", target))
   rmSync(codexDest, { force: true })
   copyFileSync(codexBuilt, codexDest)
   if (statSync(codexDest).size <= 0) {

@@ -22,8 +22,7 @@ const run = (args) =>
 const adapter = run(["--version"])
 if (
   adapter.status !== 0 ||
-  adapter.stdout.trim() !==
-    "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1"
+  adapter.stdout.trim() !== "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1"
 ) {
   throw new Error(`adapter version smoke test failed: ${adapter.stderr}`)
 }

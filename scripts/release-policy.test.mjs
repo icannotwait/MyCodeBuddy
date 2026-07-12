@@ -384,6 +384,18 @@ test("accepts the complete Windows release policy", () => {
   assert.doesNotThrow(() => assertWindowsReleaseWorkflow(validWindowsWorkflow))
 })
 
+test("rejects duplicate checkout configuration in the desktop release", () => {
+  const duplicateWith = validWindowsWorkflow.replace(
+    "        with:\n          submodules: recursive",
+    "        with:\n          submodules: recursive\n        with:\n          fetch-depth: 0"
+  )
+
+  assert.throws(
+    () => assertWindowsReleaseWorkflow(duplicateWith),
+    /checkout step must contain exactly one with block/
+  )
+})
+
 test("rejects every release target except Windows x64 MSVC", () => {
   for (const target of [
     "aarch64-pc-windows-msvc",

@@ -65,7 +65,12 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
             platforms,
             ..
         } => check_binary_environment(agent_type, version, cmd, platforms).await,
-        AgentDistribution::Bundled { cmd, override_env, platforms, .. } => {
+        AgentDistribution::Bundled {
+            cmd,
+            override_env,
+            platforms,
+            ..
+        } => {
             check_bundled_environment(cmd, override_env, platforms)
         }
         AgentDistribution::Uvx {
@@ -104,18 +109,25 @@ fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) 
     if supported {
         checks.push(match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
             Ok(Some(path)) => CheckItem {
-                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
+                check_id: "bundled_executable".into(),
+                label: "Built-in adapter".into(),
                 status: CheckStatus::Pass,
-                message: format!("Built-in adapter available at {}", path.display()), fixes: vec![],
+                message: format!("Built-in adapter available at {}", path.display()),
+                fixes: vec![],
             },
             Ok(None) => CheckItem {
-                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
+                check_id: "bundled_executable".into(),
+                label: "Built-in adapter".into(),
                 status: CheckStatus::Fail,
-                message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(), fixes: vec![],
+                message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(),
+                fixes: vec![],
             },
             Err(error) => CheckItem {
-                check_id: "bundled_executable".into(), label: "Built-in adapter".into(),
-                status: CheckStatus::Fail, message: error.to_string(), fixes: vec![],
+                check_id: "bundled_executable".into(),
+                label: "Built-in adapter".into(),
+                status: CheckStatus::Fail,
+                message: error.to_string(),
+                fixes: vec![],
             },
         });
     }

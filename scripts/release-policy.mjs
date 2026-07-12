@@ -162,8 +162,16 @@ export function findForbiddenRuntimeUrls(files) {
 
 export function assertWindowsReleaseWorkflow(workflowText) {
   const policyText = uncommentedWorkflowText(workflowText)
-  if (!/submodules\s*:\s*recursive/i.test(policyText)) {
+  const recursiveCheckout = workflowStepBlocks(policyText).find(
+    (stepText) =>
+      /uses\s*:\s*actions\/checkout@/i.test(stepText) &&
+      /submodules\s*:\s*recursive/i.test(stepText)
+  )
+  if (!recursiveCheckout) {
     throw new Error("desktop release must checkout submodules recursively")
+  }
+  if ((recursiveCheckout.match(/^\s*with\s*:/gim) ?? []).length !== 1) {
+    throw new Error("checkout step must contain exactly one with block")
   }
   if (
     !/oven-sh\/setup-bun@v2/i.test(policyText) ||
