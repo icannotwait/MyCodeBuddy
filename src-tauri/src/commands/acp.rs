@@ -8956,21 +8956,23 @@ wire_api = "chat"
 
     #[test]
     fn fingerprint_config_is_deterministic_and_excludes_volatile_keys() {
-        let agent = AgentType::Codex;
-        let mut env = BTreeMap::new();
-        env.insert("OPENAI_BASE_URL".to_string(), "https://a".to_string());
-        env.insert("OPENAI_API_KEY".to_string(), "k1".to_string());
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("CODEX_HOME", Some(dir.path()), || {
+            let agent = AgentType::Codex;
+            let mut env = BTreeMap::new();
+            env.insert("OPENAI_BASE_URL".to_string(), "https://a".to_string());
+            env.insert("OPENAI_API_KEY".to_string(), "k1".to_string());
 
-        // Same inputs → same fingerprint (the native-config read is identical
-        // across all calls in this test, so only the env varies).
-        let fp1 = fingerprint_config(agent, &env);
-        assert_eq!(fp1, fingerprint_config(agent, &env));
+            // Same inputs → same fingerprint while the isolated native config
+            // remains unchanged.
+            let fp1 = fingerprint_config(agent, &env);
+            assert_eq!(fp1, fingerprint_config(agent, &env));
 
-        // Changing a real config value changes the fingerprint.
-        let mut env_changed = env.clone();
-        env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
-        assert_ne!(fp1, fingerprint_config(agent, &env_changed));
-
+            // Changing a real config value changes the fingerprint.
+            let mut env_changed = env.clone();
+            env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
+            assert_ne!(fp1, fingerprint_config(agent, &env_changed));
+        });
     }
 
     #[test]
