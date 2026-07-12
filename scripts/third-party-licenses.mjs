@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url"
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const cargoRoot = join(repositoryRoot, "src-tauri")
 const outputPath = join(cargoRoot, "resources", "THIRD_PARTY_LICENSES.txt")
+const codexAcpRoot = join(cargoRoot, "vendor", "codex-acp")
 const licenseFilenamePattern = /^(license|licence|copying|notice)(\..+)?$/i
 
 export const CARGO_TARGETS = [
@@ -107,6 +108,38 @@ export const collectNpmPackages = (pnpmReport) => {
   }
 
   return records.sort(compareRecords)
+}
+
+export const collectCodexAcpPackages = (sourceRoot = codexAcpRoot) => {
+  const manifest = JSON.parse(readFileSync(join(sourceRoot, "package.json")))
+  const lock = JSON.parse(readFileSync(join(sourceRoot, "package-lock.json")))
+  const records = [
+    assertLicensed({
+      ecosystem: "npm",
+      name: manifest.name,
+      version: manifest.version,
+      declaredLicense: manifest.license ?? "",
+      homepage: normalizeHomepage(manifest.homepage),
+      licenseTexts: findLicenseFiles(sourceRoot),
+    }),
+  ]
+  for (const [packagePath, entry] of Object.entries(lock.packages ?? {})) {
+    if (!packagePath || entry.dev) continue
+    const marker = "node_modules/"
+    const markerIndex = packagePath.lastIndexOf(marker)
+    if (markerIndex < 0) continue
+    records.push(
+      assertLicensed({
+        ecosystem: "npm",
+        name: packagePath.slice(markerIndex + marker.length),
+        version: String(entry.version),
+        declaredLicense: String(entry.license ?? ""),
+        homepage: "",
+        licenseTexts: [],
+      })
+    )
+  }
+  return records
 }
 
 export const collectCargoPackages = (cargoMetadata) => {
@@ -401,6 +434,7 @@ export const generateLicenseReport = () => {
   )
   const records = [
     ...collectNpmPackages(pnpmReport),
+    ...collectCodexAcpPackages(),
     ...collectCargoPackageUnion(cargoMetadataRecords),
   ]
   const report = renderLicenseReport(records)

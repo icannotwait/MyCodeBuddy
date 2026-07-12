@@ -14,7 +14,7 @@
 - Users receive one NSIS installer; codex-acp is not a separate release asset.
 - The fork repository is public at `https://github.com/icannotwait/codex-acp.git`.
 - The submodule path is `src-tauri/vendor/codex-acp`.
-- The first bundled adapter version is `1.1.0-mycodebuddy.1`.
+- The first bundled adapter version is `1.1.2-mycodebuddy.1`.
 - Windows defaults are `CODEX_ACP_USE_CLI=1` and `CODEX_ACP_CLI_MODEL=gpt-5.5`; saved per-agent environment values override them.
 - Packaged Windows builds never install, update, or uninstall global npm codex-acp.
 - macOS development retains the existing npm/PATH Codex behavior.
@@ -32,7 +32,7 @@
 
 **Interfaces:**
 - Consumes: the existing local `/Users/pengchao/Documents/Codeg_Fork/codex-acp` branch and its uncommitted customization.
-- Produces: public fork commit `1.1.0-mycodebuddy.1` and a Codeg gitlink pinned to that exact commit.
+- Produces: public fork commit `1.1.2-mycodebuddy.1` and a Codeg gitlink pinned to that exact commit.
 
 - [ ] **Step 1: Create the public fork before changing remotes**
 
@@ -59,10 +59,10 @@ Expected: `git diff --check`, typecheck, and Vitest all exit 0. Review every mod
 
 - [ ] **Step 3: Assign the fork version**
 
-Change both package manifests from `1.1.0` to the exact value:
+Change both package manifests from `1.1.2` to the exact value:
 
 ```json
-"version": "1.1.0-mycodebuddy.1"
+"version": "1.1.2-mycodebuddy.1"
 ```
 
 Run:
@@ -76,7 +76,7 @@ node dist/index.js --version
 Expected final output:
 
 ```text
-@agentclientprotocol/codex-acp 1.1.0-mycodebuddy.1
+@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1
 ```
 
 - [ ] **Step 4: Commit the complete fork customization**
@@ -216,7 +216,7 @@ Include `Bundled` in `registry_version()`. Extract Codex recipe construction int
 
 ```rust
 AgentDistribution::Bundled {
-    version: "1.1.0-mycodebuddy.1",
+    version: "1.1.2-mycodebuddy.1",
     cmd: "codex-acp",
     args: &[],
     env: &[
@@ -238,7 +238,7 @@ fn codex_is_bundled_only_on_windows_x64() {
     assert!(matches!(
         codex_distribution_for("windows-x86_64"),
         AgentDistribution::Bundled {
-            version: "1.1.0-mycodebuddy.1",
+            version: "1.1.2-mycodebuddy.1",
             override_env: "CODEG_CODEX_ACP_BIN",
             ..
         }
@@ -313,8 +313,8 @@ Add tests named `bundled_codex_status_does_not_require_npm`,
 
 ```rust
 assert_eq!(codex_info.distribution_type, "bundled");
-assert_eq!(codex_info.registry_version.as_deref(), Some("1.1.0-mycodebuddy.1"));
-assert_eq!(codex_info.installed_version.as_deref(), Some("1.1.0-mycodebuddy.1"));
+assert_eq!(codex_info.registry_version.as_deref(), Some("1.1.2-mycodebuddy.1"));
+assert_eq!(codex_info.installed_version.as_deref(), Some("1.1.2-mycodebuddy.1"));
 ```
 
 Use a temporary executable through `CODEG_CODEX_ACP_BIN` under the repository's existing serialized environment-test guard. Exercise a factored status-projection helper with `codex_distribution_for("windows-x86_64")`, so the test remains valid when run on a macOS host. Add a preflight test asserting its checks contain `bundled_executable` and contain neither `node_available` nor `npm_available`. Add command tests asserting prepare, download, and uninstall reject `Bundled` with `"bundled agents are updated with MyCodeBuddy"`.
@@ -402,7 +402,7 @@ Expected: all four commands pass and compiler exhaustiveness confirms every dist
 - Modify: the other locale JSON files under `src/i18n/messages/`
 
 **Interfaces:**
-- Consumes: backend `distribution_type = "bundled"` and installed/registry version `1.1.0-mycodebuddy.1`.
+- Consumes: backend `distribution_type = "bundled"` and installed/registry version `1.1.2-mycodebuddy.1`.
 - Produces: a pass/fail version check with no npm management actions and localized built-in labeling.
 
 - [ ] **Step 1: Write the failing UI unit tests**
@@ -416,8 +416,8 @@ it("shows bundled Codex as built in without management actions", () => {
       agent_type: "codex" as AgentType,
       distribution_type: "bundled",
       available: true,
-      registry_version: "1.1.0-mycodebuddy.1",
-      installed_version: "1.1.0-mycodebuddy.1",
+      registry_version: "1.1.2-mycodebuddy.1",
+      installed_version: "1.1.2-mycodebuddy.1",
     })
   )
   expect(check?.status).toBe("pass")
@@ -520,7 +520,7 @@ assert.equal(
 )
 ```
 
-Also test that submodule validation rejects a missing `package-lock.json` and that expected version parsing returns `1.1.0-mycodebuddy.1`.
+Also test that submodule validation rejects a missing `package-lock.json` and that expected version parsing returns `1.1.2-mycodebuddy.1`.
 
 Guard the script entry point so importing helpers does not execute a build:
 
@@ -549,7 +549,7 @@ npm test
 npm run bundle:win-x64
 ```
 
-Copy `dist/bin/codex-acp-x64-windows.exe` to `src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe`. Delete any existing destination before building so stale output cannot pass. Validate non-zero size and execute `--version`; require exact stdout `@agentclientprotocol/codex-acp 1.1.0-mycodebuddy.1`.
+Copy `dist/bin/codex-acp-x64-windows.exe` to `src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe`. Delete any existing destination before building so stale output cannot pass. Validate non-zero size and execute `--version`; require exact stdout `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1`.
 
 Add `CODEG_SKIP_CODEX_ACP_SIDECAR=1` only for local diagnostic builds. The release policy must reject this variable in release workflow steps.
 
@@ -620,7 +620,7 @@ Require all of the following in `assertWindowsReleaseWorkflow` and its tests:
 - no `CODEG_SKIP_CODEX_ACP_SIDECAR` in release steps;
 - release config lists both external binaries.
 
-Extend license generation to read the fork `LICENSE`, `NOTICE.md`, package manifest, and locked production dependency graph. Add a fixture test proving the generated report contains `@agentclientprotocol/codex-acp 1.1.0-mycodebuddy.1`, its Apache-2.0 text reference, and embedded production dependencies.
+Extend license generation to read the fork `LICENSE`, `NOTICE.md`, package manifest, and locked production dependency graph. Add a fixture test proving the generated report contains `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1`, its Apache-2.0 text reference, and embedded production dependencies.
 
 - [ ] **Step 7: Run build-policy tests and commit**
 
@@ -664,7 +664,7 @@ git add src-tauri/vendor/codex-acp
 git commit -m "chore: update bundled codex-acp"
 ```
 
-Document that each adapter change increments `1.1.0-mycodebuddy.N` and that MyCodeBuddy updates, not Agent Settings, distribute it.
+Document that each adapter change increments `1.1.2-mycodebuddy.N` and that MyCodeBuddy updates, not Agent Settings, distribute it.
 
 - [ ] **Step 2: Run complete repository verification**
 
@@ -702,7 +702,7 @@ Get-Command node -ErrorAction SilentlyContinue
 Get-Command codex-acp -ErrorAction SilentlyContinue
 ```
 
-Expected: both return no command. Install MyCodeBuddy, confirm `codex-acp.exe` is beside `MyCodeBuddy.exe`, start a Codex session, and inspect logs for the absolute sibling path and version `1.1.0-mycodebuddy.1`.
+Expected: both return no command. Install MyCodeBuddy, confirm `codex-acp.exe` is beside `MyCodeBuddy.exe`, start a Codex session, and inspect logs for the absolute sibling path and version `1.1.2-mycodebuddy.1`.
 
 - [ ] **Step 5: Verify bundled precedence and Defender behavior**
 

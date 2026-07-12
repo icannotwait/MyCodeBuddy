@@ -162,6 +162,21 @@ export function findForbiddenRuntimeUrls(files) {
 
 export function assertWindowsReleaseWorkflow(workflowText) {
   const policyText = uncommentedWorkflowText(workflowText)
+  if (!/submodules\s*:\s*recursive/i.test(policyText)) {
+    throw new Error("desktop release must checkout submodules recursively")
+  }
+  if (
+    !/oven-sh\/setup-bun@v2/i.test(policyText) ||
+    !/bun-version\s*:\s*1\.3\.14/i.test(policyText)
+  ) {
+    throw new Error("desktop release must pin Bun 1.3.14")
+  }
+  if (!policyText.includes("codex-acp-x86_64-pc-windows-msvc.exe")) {
+    throw new Error("desktop release must verify the codex-acp x64 sidecar")
+  }
+  if (policyText.includes("CODEG_SKIP_CODEX_ACP_SIDECAR")) {
+    throw new Error("desktop release must not skip the codex-acp sidecar")
+  }
   const targets = releaseTargets(policyText)
   for (const target of WINDOWS_RELEASE_TARGETS) {
     if (!targets.has(target)) {

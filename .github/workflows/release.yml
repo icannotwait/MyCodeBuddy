@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          submodules: recursive
+        with:
           fetch-depth: 0
 
       - name: Verify fork repository
@@ -161,6 +163,8 @@ jobs:
             sidecar: codeg-mcp-x86_64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -172,6 +176,11 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -190,19 +199,29 @@ jobs:
       - name: Generate third-party licenses
         run: pnpm licenses:generate
 
-      - name: Stage codeg-mcp sidecar
+      - name: Stage desktop sidecars
         run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
 
-      - name: Verify codeg-mcp sidecar
+      - name: Verify desktop sidecars
         shell: pwsh
         run: |
-          $sidecar = "src-tauri/binaries/${{ matrix.sidecar }}"
-          if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
-            throw "Missing staged sidecar: $sidecar"
+          $sidecars = @(
+            "src-tauri/binaries/${{ matrix.sidecar }}",
+            "src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe"
+          )
+          foreach ($sidecar in $sidecars) {
+            if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
+              throw "Missing staged sidecar: $sidecar"
+            }
+            if ((Get-Item -LiteralPath $sidecar).Length -le 0) {
+              throw "Staged sidecar is empty: $sidecar"
+            }
           }
-          if ((Get-Item -LiteralPath $sidecar).Length -le 0) {
-            throw "Staged sidecar is empty: $sidecar"
-          }
+
+      - name: Smoke test bundled Codex ACP
+        run: >-
+          node src-tauri/scripts/smoke-codex-acp.mjs
+          src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe
 
       - name: Build and upload desktop release
         uses: tauri-apps/tauri-action@v0.6.1
