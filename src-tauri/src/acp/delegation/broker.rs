@@ -62,8 +62,8 @@ use crate::acp::delegation::meta_writer::{
 };
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
 use crate::acp::delegation::types::{
-    AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationRequest,
-    DelegationTaskReport, TaskStatus,
+    AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
+    DelegationRequest, DelegationTaskReport, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::models::AgentType;
@@ -147,6 +147,7 @@ pub struct DelegationConfig {
     /// to `ConnectionSpawner::spawn` as `preferred_mode_id` /
     /// `preferred_config_values`.
     pub agent_defaults: BTreeMap<AgentType, AgentDelegationDefaults>,
+    pub profiles: BTreeMap<String, DelegationProfile>,
     /// Per-parent byte budget for cached completed-task result text. `0`
     /// disables eviction (unlimited). Surfaced from the settings page in MB and
     /// converted to bytes in `into_broker_config`. Pushed into the pending-calls
@@ -160,6 +161,7 @@ impl Default for DelegationConfig {
             enabled: false,
             depth_limit: 1,
             agent_defaults: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             completed_cache_cap_bytes: DEFAULT_COMPLETED_CACHE_CAP_BYTES,
         }
     }
@@ -1796,6 +1798,10 @@ impl DelegationBroker {
         inner.enforce_completed_cap_all_parents();
     }
 
+    pub async fn set_profiles(&self, profiles: BTreeMap<String, DelegationProfile>) {
+        self.config.lock().await.profiles = profiles;
+    }
+
     pub async fn config_snapshot(&self) -> DelegationConfig {
         self.config.lock().await.clone()
     }
@@ -1994,11 +2000,39 @@ impl DelegationBroker {
         // Pull per-agent overrides from the broker config (defaults to empty).
         // Cloning is cheap — `AgentDelegationDefaults` is at most one Option<String>
         // and a small BTreeMap, and the spawner consumes both fields by value.
-        let (preferred_mode_id, preferred_config_values) = cfg
-            .agent_defaults
-            .get(&req.agent_type)
-            .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
-            .unwrap_or((None, BTreeMap::new()));
+        let (preferred_mode_id, preferred_config_values) =
+            if let Some(profile_id) = req.profile_id.as_deref() {
+                let Some(profile) = cfg.profiles.get(profile_id) else {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::InvalidDelegationProfile(profile_id.into()),
+                        None,
+                    );
+                };
+                if !profile.enabled {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::DelegationProfileDisabled(profile_id.into()),
+                        None,
+                    );
+                }
+                if profile.agent_type != req.agent_type {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::DelegationProfileAgentMismatch(profile_id.into()),
+                        None,
+                    );
+                }
+                (profile.mode_id.clone(), profile.config_values.clone())
+            } else {
+                cfg.agent_defaults
+                    .get(&req.agent_type)
+                    .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
+                    .unwrap_or((None, BTreeMap::new()))
+            };
         // Checkpoint #1 (opportunistic): if a parent cancel already landed
         // during the claim/depth phase, bail before spawning a child the parent
         // has abandoned. No child exists yet, so there's nothing to tear down.
@@ -3280,6 +3314,7 @@ mod tests {
             parent_conversation_id: parent_conv,
             parent_tool_use_id: tool_use.into(),
             agent_type: AgentType::ClaudeCode,
+            profile_id: None,
             task: "do x".into(),
             working_dir: None,
             requested_working_dir: None,
@@ -3809,6 +3844,112 @@ mod tests {
         assert_eq!(call.agent_type, AgentType::ClaudeCode);
         assert_eq!(call.preferred_mode_id.as_deref(), Some("auto"));
         assert_eq!(call.preferred_config_values, claude_cfg);
+    }
+
+    #[tokio::test]
+    async fn delegation_profile_overrides_agent_defaults() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-1".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "GLM5.2".into(),
+            mode_id: Some("auto".into()),
+            config_values: BTreeMap::from([("model".into(), "glm-5.2".into())]),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let mut req = request(1, "pt-1");
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(profile_id.into());
+        let _ = broker.handle_request(req).await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_mode_id.as_deref(), Some("auto"));
+        assert_eq!(args[0].preferred_config_values["model"], "glm-5.2");
+    }
+
+    #[tokio::test]
+    async fn unknown_delegation_profile_never_falls_back_or_spawns() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+        let mut req = request(1, "pt-1");
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some("11111111-1111-4111-8111-111111111111".into());
+
+        let outcome = broker.handle_request(req).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "invalid_delegation_profile")
+            }
+            other => panic!("expected profile error, got {other:?}"),
+        }
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_or_mismatched_profile_never_spawns() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let mut profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "GLM5.2".into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: false,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile.clone())]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        let mut req = request(1, "pt-disabled");
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(profile_id.into());
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("delegation_profile_disabled")
+        );
+
+        profile.enabled = true;
+        profile.agent_type = AgentType::Codex;
+        broker
+            .set_profiles(BTreeMap::from([(profile_id.into(), profile)]))
+            .await;
+        let mut req = request(1, "pt-mismatch");
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(profile_id.into());
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("delegation_profile_agent_mismatch")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
     }
 
     #[tokio::test]

@@ -41,7 +41,8 @@ export function ReferenceIcon({
           <FileText className={ICON_CLASS} />
         )
       break
-    case "agent": {
+    case "agent":
+    case "delegation_profile": {
       const agentType = meta?.agentType ?? (data.id as AgentType)
       icon = agentType ? (
         <AgentIcon agentType={agentType} className={ICON_CLASS} />
@@ -104,6 +105,7 @@ function badgeColorClass(data: ReferenceAttrs): string {
     case "file":
       return "text-blue-700 dark:text-blue-400"
     case "agent":
+    case "delegation_profile":
       return "text-violet-700 dark:text-violet-400"
     case "session":
       return "text-emerald-700 dark:text-emerald-400"

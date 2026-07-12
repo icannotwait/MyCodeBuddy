@@ -935,6 +935,21 @@ export interface AgentDelegationDefaults {
   config_values: Record<string, string>
 }
 
+export interface DelegationProfile {
+  id: string
+  agent_type: AgentType
+  name: string
+  mode_id?: string | null
+  config_values: Record<string, string>
+  enabled: boolean
+  created_at: number
+  updated_at: number
+}
+
+export interface DelegationProfileDocument {
+  profiles: DelegationProfile[]
+}
+
 // ─── Automations ───────────────────────────────────────────────────────────
 // Mirrors src-tauri/src/models/automation.rs. Wire form is snake_case (serde
 // default), matching AgentDelegationDefaults.

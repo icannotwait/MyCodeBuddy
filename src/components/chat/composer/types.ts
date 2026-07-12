@@ -1,11 +1,18 @@
 import type { AgentType } from "@/lib/types"
 
 /** The five kinds of inline reference the composer can embed. */
-export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill"
+export type ReferenceKind =
+  | "file"
+  | "agent"
+  | "delegation_profile"
+  | "session"
+  | "commit"
+  | "skill"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "file",
   "agent",
+  "delegation_profile",
   "session",
   "commit",
   "skill",
@@ -28,6 +35,8 @@ export interface ReferenceMeta {
   agentType?: AgentType
   /** agent: whether the agent is currently available. */
   available?: boolean
+  /** delegation_profile: immutable persisted profile identity. */
+  profileId?: string
   /** session: conversation status snapshot (not rendered — the inline badge has no status dot). */
   status?: string
   /** session: git branch snapshot (carried with the reference; not rendered on the badge). */

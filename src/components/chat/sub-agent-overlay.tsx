@@ -117,6 +117,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   const [dialogOpen, setDialogOpen] = useState(false)
   const {
     agentType,
+    agentDisplayLabel,
     task,
     taskId,
     status,
@@ -145,7 +146,8 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           )}
         </span>
         <span className="min-w-0 truncate text-xs font-semibold text-foreground">
-          {agentType ? AGENT_LABELS[agentType] : t("unknownAgent")}
+          {agentDisplayLabel ??
+            (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
         </span>
         {taskId && (
           <span

@@ -88,6 +88,36 @@ describe("docToPromptBlocks", () => {
     expect(textBlock(blocks)).toContain("[@Codex](codeg://agent/codex)")
   })
 
+  it("adds one mandatory route for each distinct delegation profile", () => {
+    const glm = "11111111-1111-4111-8111-111111111111"
+    const opus = "22222222-2222-4222-8222-222222222222"
+    const insertProfile = (id: string, label: string) =>
+      editor.commands.insertReference(
+        ref({
+          refType: "delegation_profile",
+          id,
+          label,
+          uri: `codeg://delegation-profile/${id}`,
+          meta: { agentType: "code_buddy", profileId: id },
+        })
+      )
+    insertProfile(glm, "CodeBuddy:GLM5.2")
+    editor.commands.insertContent(" and ")
+    insertProfile(opus, "CodeBuddy:Opus4.8")
+    editor.commands.insertContent(" and again ")
+    insertProfile(glm, "CodeBuddy:GLM5.2")
+
+    const blocks = docToPromptBlocks(editor).filter(
+      (block) => block.type === "text"
+    )
+    expect(blocks).toHaveLength(2)
+    const directive = blocks[0].text
+    expect(directive.match(new RegExp(glm, "g"))).toHaveLength(1)
+    expect(directive.match(new RegExp(opus, "g"))).toHaveLength(1)
+    expect(directive).toContain('agent_type="code_buddy"')
+    expect(blocks[1].text).toContain("[@CodeBuddy:GLM5.2]")
+  })
+
   it("keeps a skill reference inline as the /id token", () => {
     editor.commands.insertReference(
       ref({ refType: "skill", id: "code-review", label: "Code Review" })

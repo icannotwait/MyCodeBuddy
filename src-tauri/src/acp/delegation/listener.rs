@@ -487,6 +487,18 @@ impl DelegationListener {
                 return report_failed("invalid_working_dir", "missing or empty task");
             }
         };
+        let profile_id = match req.input.get("profile_id") {
+            None => None,
+            Some(value) => match value.as_str().map(str::trim) {
+                Some(id) if uuid::Uuid::parse_str(id).is_ok() => Some(id.to_string()),
+                _ => {
+                    return report_failed(
+                        "invalid_delegation_profile",
+                        "profile_id must be a valid UUID",
+                    );
+                }
+            },
+        };
         // The `working_dir` the LLM explicitly passed (before defaulting),
         // used by the broker's correlation key. `None` when omitted —
         // symmetric with the ACP `raw_input`, which also omits it then.
@@ -504,6 +516,7 @@ impl DelegationListener {
             parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id,
             agent_type,
+            profile_id,
             task,
             working_dir,
             requested_working_dir,
@@ -1101,6 +1114,7 @@ mod tests {
                 parent_conversation_id: 1,
                 parent_tool_use_id: "pt-1".into(),
                 agent_type: AgentType::Codex,
+                profile_id: None,
                 task: "do x".into(),
                 working_dir: None,
                 requested_working_dir: None,
@@ -1254,6 +1268,7 @@ mod tests {
                         parent_conversation_id: 1,
                         parent_tool_use_id: tool_use.into(),
                         agent_type: AgentType::Codex,
+                        profile_id: None,
                         task: "do x".into(),
                         working_dir: None,
                         requested_working_dir: None,
@@ -1356,6 +1371,7 @@ mod tests {
                 parent_conversation_id: 1,
                 parent_tool_use_id: "pt-1".into(),
                 agent_type: AgentType::Codex,
+                profile_id: None,
                 task: "do x".into(),
                 working_dir: None,
                 requested_working_dir: None,
@@ -1403,6 +1419,7 @@ mod tests {
                 parent_conversation_id: 1,
                 parent_tool_use_id: "pt-1".into(),
                 agent_type: AgentType::Codex,
+                profile_id: None,
                 task: "do x".into(),
                 working_dir: None,
                 requested_working_dir: None,
@@ -1456,6 +1473,7 @@ mod tests {
                     parent_conversation_id: 1,
                     parent_tool_use_id: "pt-cancel".into(),
                     agent_type: AgentType::Codex,
+                    profile_id: None,
                     task: "do x".into(),
                     working_dir: None,
                     requested_working_dir: None,

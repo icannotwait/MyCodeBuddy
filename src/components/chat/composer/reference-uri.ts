@@ -8,6 +8,7 @@ import type { ReferenceAttrs } from "./types"
 // (ai-elements/markdown-link.tsx). Mirrors the schemes the adapters emit
 // (suggestion/adapters.ts) and the node's allow-list (nodes/reference-node.ts).
 const AGENT_URI = /^codeg:\/\/agent\/(.+)$/i
+const DELEGATION_PROFILE_URI = /^codeg:\/\/delegation-profile\/([^/]+)$/i
 const SESSION_URI = /^codeg:\/\/session\/(.+)$/i
 const COMMIT_URI = /^codeg:\/\/commit\/.*@(.+)$/i
 // command / skill / expert tokens, surfaced as badges in transcript user messages
@@ -70,6 +71,18 @@ export function parseCodegReferenceUri(
       label: (label || type).replace(/^@/, "") || type,
       uri,
       meta: { agentType: type as AgentType },
+    }
+  }
+
+  const delegationProfile = uri.match(DELEGATION_PROFILE_URI)
+  if (delegationProfile) {
+    const id = delegationProfile[1]
+    return {
+      refType: "delegation_profile",
+      id,
+      label: (label || id).replace(/^@/, "") || id,
+      uri,
+      meta: { profileId: id, agentType: "code_buddy" },
     }
   }
 

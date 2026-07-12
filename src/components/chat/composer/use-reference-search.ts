@@ -4,17 +4,19 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
 
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
-import { gitLog, listAllConversations } from "@/lib/api"
+import { getDelegationProfiles, gitLog, listAllConversations } from "@/lib/api"
 import type {
   AcpAgentInfo,
   DbConversationSummary,
   GitLogEntry,
+  DelegationProfile,
 } from "@/lib/types"
 
 import {
   agentToSuggestion,
   commitToSuggestion,
   fileToSuggestion,
+  profileToSuggestion,
   sessionToSuggestion,
 } from "./suggestion/adapters"
 import type {
@@ -63,6 +65,7 @@ export interface ReferenceSearchSources {
   /** Workspace root the `files` were loaded under; null disables the group. */
   workspaceRoot: string | null
   agents: AcpAgentInfo[]
+  profiles?: DelegationProfile[]
   sessions: DbConversationSummary[]
   commits: GitLogEntry[]
   /** Repo identity for commit URIs; null disables the commit group. */
@@ -117,9 +120,15 @@ export function buildReferenceGroups(
   // Only enabled agents are mentionable — a disabled agent (toggled off in
   // settings) can't be referenced, so it never appears in the `@` panel (its
   // tab count and `truncated` flag follow from this filtered set too).
+  const profiles = (sources.profiles ?? []).filter((profile) => profile.enabled)
   const agentMatches = sources.agents
     .filter((agent) => agent.enabled)
-    .map(agentToSuggestion)
+    .flatMap((agent) => [
+      agentToSuggestion(agent),
+      ...profiles
+        .filter((profile) => profile.agent_type === agent.agent_type)
+        .map(profileToSuggestion),
+    ])
     .filter((item) => suggestionMatches(item, q))
   const agentItems = agentMatches.slice(0, MAX_PER_GROUP)
 
@@ -263,6 +272,7 @@ export function useReferenceSearch({
     key: string
     promise: Promise<GitLogEntry[]>
   } | null>(null)
+  const profilesRef = useRef<Promise<DelegationProfile[]> | null>(null)
 
   // Bust the lazy caches when the window regains focus so a session created in
   // another window (or new commits) show up on the next `@` — matching the
@@ -271,6 +281,7 @@ export function useReferenceSearch({
     const onFocus = () => {
       sessionsRef.current = null
       commitsRef.current = null
+      profilesRef.current = null
     }
     window.addEventListener("focus", onFocus)
     return () => window.removeEventListener("focus", onFocus)
@@ -319,9 +330,17 @@ export function useReferenceSearch({
       commitsRef.current = null
     }
 
-    const [sessions, commits] = await Promise.all([
+    profilesRef.current ??= getDelegationProfiles()
+      .then((document) => document.profiles)
+      .catch(() => {
+        profilesRef.current = null
+        return []
+      })
+
+    const [sessions, commits, profiles] = await Promise.all([
       sessionsEntry.promise,
       commitsPromise,
+      profilesRef.current,
     ])
     // Discard this result if it can no longer be trusted for the live panel: a
     // newer query aborted us, the composer was disabled, or the workspace folder
@@ -340,6 +359,7 @@ export function useReferenceSearch({
         files: fileState.files,
         workspaceRoot: fileState.root,
         agents: agentsRef.current,
+        profiles,
         sessions,
         commits,
         repoKey: path,

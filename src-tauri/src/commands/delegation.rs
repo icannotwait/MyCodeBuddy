@@ -16,7 +16,7 @@
 //! no longer applies a timeout; cancellation flows through MCP
 //! `notifications/cancelled` instead).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 #[cfg(any(test, feature = "tauri-runtime"))]
 use std::sync::Arc;
@@ -25,7 +25,9 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
-use crate::acp::delegation::types::AgentDelegationDefaults;
+use crate::acp::delegation::types::{
+    AgentDelegationDefaults, DelegationProfile, DelegationProfileDocument,
+};
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
 use crate::models::AgentType;
@@ -38,6 +40,7 @@ pub const KEY_DELEGATION_DEPTH: &str = "delegation.depth_limit";
 pub const KEY_DELEGATION_AGENT_DEFAULTS: &str = "delegation.agent_defaults";
 /// Per-parent completed-result cache budget, in MB. `0` = unlimited.
 pub const KEY_DELEGATION_COMPLETED_CACHE_MB: &str = "delegation.completed_cache_max_mb";
+pub const KEY_DELEGATION_PROFILES_V1: &str = "delegation.profiles.v1";
 
 pub const DEPTH_MIN: u32 = 1;
 pub const DEPTH_MAX: u32 = 8;
@@ -105,6 +108,7 @@ impl DelegationSettings {
             enabled: self.enabled,
             depth_limit: self.depth_limit,
             agent_defaults: self.agent_defaults,
+            profiles: BTreeMap::new(),
             // MB → bytes. `saturating_mul` guards a pathologically large MB
             // value from wrapping on 32-bit `usize` targets.
             completed_cache_cap_bytes: (self.completed_cache_max_mb as usize)
@@ -154,7 +158,18 @@ pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSe
 /// after any external write to `app_metadata`.
 pub async fn apply_persisted_config(conn: &DatabaseConnection, broker: &DelegationBroker) {
     let settings = load_delegation_settings(conn).await;
-    broker.set_config(settings.into_broker_config()).await;
+    let mut config = settings.into_broker_config();
+    match load_delegation_profiles(conn).await {
+        Ok(document) => {
+            config.profiles = document
+                .profiles
+                .into_iter()
+                .map(|profile| (profile.id.clone(), profile))
+                .collect();
+        }
+        Err(error) => eprintln!("[Delegation] failed to load profiles: {error}"),
+    }
+    broker.set_config(config).await;
 }
 
 /// Persist + apply. Used by both the Tauri command and the HTTP handler so
@@ -191,10 +206,81 @@ pub async fn set_delegation_settings_core(
     app_metadata_service::upsert_value(conn, KEY_DELEGATION_AGENT_DEFAULTS, &agent_defaults_json)
         .await
         .map_err(AppCommandError::from)?;
-    broker
-        .set_config(clamped.clone().into_broker_config())
-        .await;
+    let profiles = broker.config_snapshot().await.profiles;
+    let mut config = clamped.clone().into_broker_config();
+    config.profiles = profiles;
+    broker.set_config(config).await;
     Ok(clamped)
+}
+
+fn normalize_profiles(
+    profiles: Vec<DelegationProfile>,
+) -> Result<Vec<DelegationProfile>, AppCommandError> {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(profiles.len());
+    for mut profile in profiles {
+        if uuid::Uuid::parse_str(&profile.id).is_err() {
+            return Err(AppCommandError::configuration_invalid(format!(
+                "invalid delegation profile id: {}",
+                profile.id
+            )));
+        }
+        if !ids.insert(profile.id.clone()) {
+            return Err(AppCommandError::configuration_invalid(format!(
+                "duplicate delegation profile id: {}",
+                profile.id
+            )));
+        }
+        profile.name = profile.name.trim().to_string();
+        if profile.name.is_empty() || profile.name.chars().count() > 80 {
+            return Err(AppCommandError::configuration_invalid(
+                "delegation profile name must contain 1-80 characters",
+            ));
+        }
+        let name_key = (profile.agent_type, profile.name.to_lowercase());
+        if !names.insert(name_key) {
+            return Err(AppCommandError::configuration_invalid(format!(
+                "duplicate profile name for {}: {}",
+                profile.agent_type, profile.name
+            )));
+        }
+        normalized.push(profile);
+    }
+    Ok(normalized)
+}
+
+pub async fn load_delegation_profiles(
+    conn: &DatabaseConnection,
+) -> Result<DelegationProfileDocument, AppCommandError> {
+    let Some(raw) = app_metadata_service::get_value(conn, KEY_DELEGATION_PROFILES_V1)
+        .await
+        .map_err(AppCommandError::from)?
+    else {
+        return Ok(DelegationProfileDocument::default());
+    };
+    let document: DelegationProfileDocument = serde_json::from_str(&raw).map_err(|e| {
+        AppCommandError::configuration_invalid(format!("parse delegation profiles: {e}"))
+    })?;
+    Ok(DelegationProfileDocument {
+        profiles: normalize_profiles(document.profiles)?,
+    })
+}
+
+pub async fn set_delegation_profiles_core(
+    conn: &DatabaseConnection,
+    desired: DelegationProfileDocument,
+) -> Result<DelegationProfileDocument, AppCommandError> {
+    let normalized = DelegationProfileDocument {
+        profiles: normalize_profiles(desired.profiles)?,
+    };
+    let json = serde_json::to_string(&normalized).map_err(|e| {
+        AppCommandError::configuration_invalid(format!("serialize delegation profiles: {e}"))
+    })?;
+    app_metadata_service::upsert_value(conn, KEY_DELEGATION_PROFILES_V1, &json)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(normalized)
 }
 
 // -------- Tauri commands -----------------------------------------------------
@@ -231,6 +317,48 @@ pub async fn set_delegation_settings(
     }
 }
 
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_delegation_profiles(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+) -> Result<DelegationProfileDocument, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        load_delegation_profiles(&db.conn).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_delegation_profiles(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
+    document: DelegationProfileDocument,
+) -> Result<DelegationProfileDocument, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let saved = set_delegation_profiles_core(&db.conn, document).await?;
+        broker
+            .set_profiles(
+                saved
+                    .profiles
+                    .iter()
+                    .cloned()
+                    .map(|profile| (profile.id.clone(), profile))
+                    .collect(),
+            )
+            .await;
+        Ok(saved)
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = document;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +380,58 @@ mod tests {
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
         )
+    }
+
+    fn profile(id: &str, name: &str) -> DelegationProfile {
+        DelegationProfile {
+            id: id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: name.into(),
+            mode_id: Some("default".into()),
+            config_values: BTreeMap::from([("model".into(), "glm-5.2".into())]),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn profiles_trim_names_and_reject_case_folded_duplicates() {
+        let profiles = vec![
+            profile("11111111-1111-4111-8111-111111111111", " GLM5.2 "),
+            profile("22222222-2222-4222-8222-222222222222", "glm5.2"),
+        ];
+        let err = normalize_profiles(profiles).unwrap_err();
+        assert!(err.to_string().contains("duplicate profile name"));
+    }
+
+    #[test]
+    fn profile_name_limit_counts_unicode_scalars() {
+        let mut p = profile("11111111-1111-4111-8111-111111111111", &"模".repeat(81));
+        assert!(normalize_profiles(vec![p.clone()]).is_err());
+        p.name = "模".repeat(80);
+        assert_eq!(
+            normalize_profiles(vec![p]).unwrap()[0].name.chars().count(),
+            80
+        );
+    }
+
+    #[tokio::test]
+    async fn profiles_round_trip_and_corrupt_json_is_not_silently_empty() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let document = DelegationProfileDocument {
+            profiles: vec![profile("11111111-1111-4111-8111-111111111111", " GLM5.2 ")],
+        };
+        let saved = set_delegation_profiles_core(&db.conn, document)
+            .await
+            .unwrap();
+        assert_eq!(saved.profiles[0].name, "GLM5.2");
+        assert_eq!(load_delegation_profiles(&db.conn).await.unwrap(), saved);
+
+        app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_PROFILES_V1, "{")
+            .await
+            .unwrap();
+        assert!(load_delegation_profiles(&db.conn).await.is_err());
     }
 
     #[test]

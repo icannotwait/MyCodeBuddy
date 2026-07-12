@@ -38,6 +38,26 @@ impl AgentDelegationDefaults {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationProfile {
+    pub id: String,
+    pub agent_type: AgentType,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_values: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationProfileDocument {
+    #[serde(default)]
+    pub profiles: Vec<DelegationProfile>,
+}
+
 /// Everything the broker needs to dispatch a single delegation call.
 ///
 /// `parent_connection_id` is the codeg-internal ACP connection UUID for the
@@ -56,6 +76,8 @@ pub struct DelegationRequest {
     pub parent_conversation_id: i32,
     pub parent_tool_use_id: String,
     pub agent_type: AgentType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     pub task: String,
     pub working_dir: Option<String>,
     /// The `working_dir` exactly as the LLM passed it in the
@@ -101,6 +123,12 @@ pub enum DelegationError {
     DepthLimitExceeded { current_depth: u32, limit: u32 },
     #[error("invalid agent type")]
     InvalidAgentType,
+    #[error("invalid delegation profile: {0}")]
+    InvalidDelegationProfile(String),
+    #[error("delegation profile is disabled: {0}")]
+    DelegationProfileDisabled(String),
+    #[error("delegation profile agent does not match request: {0}")]
+    DelegationProfileAgentMismatch(String),
     #[error("invalid working dir: {0}")]
     InvalidWorkingDir(String),
     #[error("spawn failed: {0}")]
@@ -212,6 +240,11 @@ impl DelegationOutcome {
         let code = match &err {
             DelegationError::DepthLimitExceeded { .. } => "depth_limit",
             DelegationError::InvalidAgentType => "invalid_agent_type",
+            DelegationError::InvalidDelegationProfile(_) => "invalid_delegation_profile",
+            DelegationError::DelegationProfileDisabled(_) => "delegation_profile_disabled",
+            DelegationError::DelegationProfileAgentMismatch(_) => {
+                "delegation_profile_agent_mismatch"
+            }
             DelegationError::InvalidWorkingDir(_) => "invalid_working_dir",
             DelegationError::SpawnFailed(_) => "spawn_failed",
             DelegationError::SubagentRuntimeError(_) => "subagent_error",

@@ -47,6 +47,7 @@ export interface DelegationCardSource {
 
 export interface DelegationCardModel {
   agentType: AgentType | null
+  agentDisplayLabel: string | null
   task: string | null
   taskId: string | null
   status: DelegationCardStatus
@@ -140,6 +141,7 @@ export function useDelegationCardModel(
 
   return {
     agentType,
+    agentDisplayLabel: parsed.profileLabel,
     task: parsed.task,
     taskId,
     status,

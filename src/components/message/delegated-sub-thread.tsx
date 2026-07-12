@@ -62,6 +62,7 @@ export function DelegatedSubThread({
   const [dialogOpen, setDialogOpen] = useState(false)
   const {
     agentType,
+    agentDisplayLabel,
     task,
     taskId,
     status,
@@ -102,7 +103,8 @@ export function DelegatedSubThread({
           <div className="min-w-0 flex-1 space-y-0.5">
             <div className="flex items-center gap-2">
               <span className="text-sm font-semibold text-foreground">
-                {agentType ? AGENT_LABELS[agentType] : t("unknownAgent")}
+                {agentDisplayLabel ??
+                  (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
               </span>
               {taskId && (
                 <span

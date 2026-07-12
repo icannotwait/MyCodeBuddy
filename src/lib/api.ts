@@ -14,6 +14,7 @@ import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
   AgentDelegationDefaults,
+  DelegationProfileDocument,
   AgentOptionsSnapshot,
   Automation,
   AutomationRun,
@@ -3210,6 +3211,16 @@ export async function setDelegationSettings(
   settings: DelegationSettings
 ): Promise<DelegationSettings> {
   return getTransport().call("set_delegation_settings", { settings })
+}
+
+export async function getDelegationProfiles(): Promise<DelegationProfileDocument> {
+  return getTransport().call("get_delegation_profiles")
+}
+
+export async function setDelegationProfiles(
+  document: DelegationProfileDocument
+): Promise<DelegationProfileDocument> {
+  return getTransport().call("set_delegation_profiles", { document })
 }
 
 // ─── Live feedback settings + submit ───────────────────────────────────

@@ -5,12 +5,14 @@ import type {
   AcpAgentInfo,
   DbConversationSummary,
   GitLogEntry,
+  DelegationProfile,
 } from "@/lib/types"
 
 import {
   agentToSuggestion,
   commitToSuggestion,
   fileToSuggestion,
+  profileToSuggestion,
   sessionToSuggestion,
 } from "./adapters"
 
@@ -55,6 +57,27 @@ describe("agentToSuggestion", () => {
       label: "Claude Code",
       uri: "codeg://agent/claude_code",
       meta: { agentType: "claude_code", available: true },
+    })
+  })
+})
+
+describe("profileToSuggestion", () => {
+  it("maps a profile to a stable delegation route", () => {
+    const profile: DelegationProfile = {
+      id: "11111111-1111-4111-8111-111111111111",
+      agent_type: "code_buddy",
+      name: "GLM5.2",
+      config_values: { model: "glm-5.2" },
+      enabled: true,
+      created_at: 1,
+      updated_at: 1,
+    }
+    expect(profileToSuggestion(profile).reference).toEqual({
+      refType: "delegation_profile",
+      id: profile.id,
+      label: "CodeBuddy:GLM5.2",
+      uri: `codeg://delegation-profile/${profile.id}`,
+      meta: { agentType: "code_buddy", profileId: profile.id },
     })
   })
 })

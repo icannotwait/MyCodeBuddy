@@ -1263,6 +1263,12 @@ mod tests {
         assert!(agents.iter().any(|a| a == "kimi_code"));
         assert!(agents.iter().any(|a| a == "pi"));
         assert!(agents.iter().any(|a| a == "grok"));
+        assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
+        assert!(!delegate["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "profile_id"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools

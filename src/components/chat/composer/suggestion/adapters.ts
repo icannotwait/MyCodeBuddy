@@ -5,6 +5,7 @@ import {
   AGENT_LABELS,
   type AcpAgentInfo,
   type DbConversationSummary,
+  type DelegationProfile,
   type GitLogEntry,
 } from "@/lib/types"
 
@@ -14,6 +15,23 @@ function joinPath(root: string, relative: string): string {
   const left = root.replace(/[/\\]+$/, "")
   const right = relative.replace(/^[/\\]+/, "")
   return left ? `${left}/${right}` : right
+}
+
+export function profileToSuggestion(
+  profile: DelegationProfile
+): SuggestionItem {
+  const agentLabel = AGENT_LABELS[profile.agent_type]
+  return {
+    reference: {
+      refType: "delegation_profile",
+      id: profile.id,
+      label: `${agentLabel}:${profile.name}`,
+      uri: `codeg://delegation-profile/${profile.id}`,
+      meta: { agentType: profile.agent_type, profileId: profile.id },
+    },
+    detail: profile.config_values.model ?? null,
+    keywords: `${profile.name} ${profile.agent_type} ${profile.config_values.model ?? ""}`,
+  }
 }
 
 /** Workspace file → file reference (uri built from the workspace root). */

@@ -2561,6 +2561,7 @@ mod tests {
             parent_conversation_id: 1,
             parent_tool_use_id: format!("tu-{child_conn_id}"),
             agent_type: AgentType::ClaudeCode,
+            profile_id: None,
             task: "do x".into(),
             working_dir: None,
             requested_working_dir: None,

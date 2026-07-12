@@ -286,6 +286,7 @@ const mocks = vi.hoisted(() => ({
   files: { allFiles: [] as FlatFileEntry[], loaded: false },
   listAllConversations: vi.fn(),
   gitLog: vi.fn(),
+  getDelegationProfiles: vi.fn(),
 }))
 
 vi.mock("@/hooks/use-file-tree", () => ({
@@ -303,6 +304,8 @@ vi.mock("@/lib/api", () => ({
   listAllConversations: (...args: unknown[]) =>
     mocks.listAllConversations(...args),
   gitLog: (...args: unknown[]) => mocks.gitLog(...args),
+  getDelegationProfiles: (...args: unknown[]) =>
+    mocks.getDelegationProfiles(...args),
 }))
 
 describe("useReferenceSearch", () => {
@@ -313,6 +316,7 @@ describe("useReferenceSearch", () => {
     mocks.gitLog
       .mockReset()
       .mockResolvedValue({ entries: [], has_upstream: false })
+    mocks.getDelegationProfiles.mockReset().mockResolvedValue({ profiles: [] })
   })
 
   it("returns a referentially stable search across data-source updates (R7)", async () => {

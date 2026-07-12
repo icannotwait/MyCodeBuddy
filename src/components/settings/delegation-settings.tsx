@@ -32,11 +32,18 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   type DelegationSettings,
   getDelegationSettings,
+  getDelegationProfiles,
+  setDelegationProfiles,
   setDelegationSettings,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
-import type { AgentDelegationDefaults, AgentType } from "@/lib/types"
+import type {
+  AgentDelegationDefaults,
+  AgentType,
+  DelegationProfile,
+} from "@/lib/types"
 import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
+import { DelegationProfilesPanel } from "./delegation-profiles"
 
 const DEPTH_MIN = 1
 const DEPTH_MAX = 8
@@ -65,17 +72,19 @@ export function DelegationSettingsSection() {
   const [agentDefaults, setAgentDefaults] = useState<
     Partial<Record<AgentType, AgentDelegationDefaults>>
   >({})
+  const [profiles, setProfiles] = useState<DelegationProfile[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    void getDelegationSettings()
-      .then((s) => {
+    void Promise.all([getDelegationSettings(), getDelegationProfiles()])
+      .then(([s, profileDocument]) => {
         if (cancelled) return
         setEnabled(s.enabled)
         setDepth(s.depth_limit)
         setCacheMb(s.completed_cache_max_mb)
         setAgentDefaults(s.agent_defaults ?? {})
+        setProfiles(profileDocument.profiles)
         setLoadError(null)
       })
       .catch((err: unknown) => {
@@ -101,12 +110,14 @@ export function DelegationSettingsSection() {
     setSaving(true)
     try {
       const applied = await setDelegationSettings(payload)
+      const savedProfiles = await setDelegationProfiles({ profiles })
       // Mirror any server-side clamps / filter passes back into the UI so the
       // inputs reflect what was actually persisted.
       setEnabled(applied.enabled)
       setDepth(applied.depth_limit)
       setCacheMb(applied.completed_cache_max_mb)
       setAgentDefaults(applied.agent_defaults ?? {})
+      setProfiles(savedProfiles.profiles)
       toast.success(t("saved"))
     } catch (err: unknown) {
       toast.error(t("saveFailed"), {
@@ -115,7 +126,7 @@ export function DelegationSettingsSection() {
     } finally {
       setSaving(false)
     }
-  }, [enabled, depth, cacheMb, agentDefaults, t])
+  }, [enabled, depth, cacheMb, agentDefaults, profiles, t])
 
   return (
     <section className="rounded-xl border bg-card p-4 space-y-4">
@@ -139,6 +150,7 @@ export function DelegationSettingsSection() {
           <TabsTrigger value="agentDefaults">
             {t("tabAgentDefaults")}
           </TabsTrigger>
+          <TabsTrigger value="profiles">{t("tabProfiles")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="general" className="space-y-4 pt-2">
@@ -217,6 +229,17 @@ export function DelegationSettingsSection() {
           <DelegationAgentDefaultsPanel
             value={agentDefaults}
             onChange={setAgentDefaults}
+            disabled={loading || !enabled}
+          />
+        </TabsContent>
+
+        <TabsContent value="profiles" className="pt-2">
+          <DelegationProfilesPanel
+            value={profiles}
+            codeBuddyDefaults={
+              agentDefaults.code_buddy ?? { config_values: {} }
+            }
+            onChange={setProfiles}
             disabled={loading || !enabled}
           />
         </TabsContent>

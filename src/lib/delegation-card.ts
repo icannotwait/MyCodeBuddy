@@ -33,6 +33,7 @@ export type DelegationCardStatus =
 
 export type ParsedInput = {
   agentType: AgentType | null
+  profileLabel: string | null
   task: string | null
   workingDir: string | null
 }
@@ -105,6 +106,7 @@ export function parseDelegationMeta(
 
 const EMPTY_PARSED_INPUT: ParsedInput = {
   agentType: null,
+  profileLabel: null,
   task: null,
   workingDir: null,
 }
@@ -145,6 +147,7 @@ function findDelegationArgs(
   if (
     typeof obj.task === "string" ||
     typeof obj.agent_type === "string" ||
+    typeof obj.profile_label === "string" ||
     typeof obj.working_dir === "string"
   ) {
     return obj
@@ -216,6 +219,8 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   const at = typeof obj.agent_type === "string" ? obj.agent_type : null
   return {
     agentType: at && KNOWN_AGENT_TYPES.has(at) ? (at as AgentType) : null,
+    profileLabel:
+      typeof obj.profile_label === "string" ? obj.profile_label : null,
     task: typeof obj.task === "string" ? obj.task : null,
     workingDir: typeof obj.working_dir === "string" ? obj.working_dir : null,
   }

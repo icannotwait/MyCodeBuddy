@@ -5,6 +5,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 vi.mock("@/lib/api", () => ({
   getDelegationSettings: vi.fn(),
   setDelegationSettings: vi.fn(),
+  getDelegationProfiles: vi.fn(),
+  setDelegationProfiles: vi.fn(),
+  describeAgentOptions: vi.fn(),
 }))
 
 vi.mock("sonner", () => ({
@@ -19,11 +22,15 @@ import enMessages from "@/i18n/messages/en.json"
 import {
   getDelegationSettings,
   setDelegationSettings,
+  getDelegationProfiles,
+  setDelegationProfiles,
   type DelegationSettings,
 } from "@/lib/api"
 
 const mockGetDelegationSettings = vi.mocked(getDelegationSettings)
 const mockSetDelegationSettings = vi.mocked(setDelegationSettings)
+const mockGetDelegationProfiles = vi.mocked(getDelegationProfiles)
+const mockSetDelegationProfiles = vi.mocked(setDelegationProfiles)
 
 function renderWithIntl() {
   return render(
@@ -52,6 +59,10 @@ function settings(
 beforeEach(() => {
   mockGetDelegationSettings.mockReset()
   mockSetDelegationSettings.mockReset()
+  mockGetDelegationProfiles.mockReset().mockResolvedValue({ profiles: [] })
+  mockSetDelegationProfiles
+    .mockReset()
+    .mockImplementation(async (document) => document)
 })
 
 describe("DelegationSettingsSection", () => {

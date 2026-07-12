@@ -66,6 +66,14 @@ pub fn build_router(
             post(handlers::delegation::set_delegation_settings),
         )
         .route(
+            "/get_delegation_profiles",
+            post(handlers::delegation::get_delegation_profiles),
+        )
+        .route(
+            "/set_delegation_profiles",
+            post(handlers::delegation::set_delegation_profiles),
+        )
+        .route(
             "/get_feedback_settings",
             post(handlers::feedback::get_feedback_settings),
         )

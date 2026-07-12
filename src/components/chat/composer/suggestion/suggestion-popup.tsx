@@ -42,6 +42,7 @@ const TAB_ORDER: readonly ReferenceKind[] = [
 // is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
 const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
   agent: "Agents",
+  delegation_profile: "Agents",
   file: "Files",
   session: "Sessions",
   commit: "Commits",
@@ -87,7 +88,7 @@ export interface SuggestionPopupProps {
   /** Non-selectable hint shown under a tab whose matches were capped. */
   moreLabel?: string
   /** Localized per-kind tab labels (English fallbacks apply when omitted). */
-  tabLabels?: Record<ReferenceKind, string>
+  tabLabels?: Partial<Record<ReferenceKind, string>>
   /**
    * Reports the active option's element id (or null when nothing is
    * selectable), so the host can mirror it onto the editor's
@@ -294,7 +295,7 @@ export const SuggestionPopup = forwardRef<
     [flat, selectedIndex, activeTab, onSelect, onClose, state.range]
   )
 
-  const activeLabel = tabLabels[activeTab]
+  const activeLabel = tabLabels[activeTab] ?? DEFAULT_TAB_LABELS[activeTab]
   const truncated = !stale && activeGroup?.truncated === true
   const liveStatus = stale
     ? loadingLabel
@@ -360,7 +361,7 @@ export const SuggestionPopup = forwardRef<
                     : "text-muted-foreground hover:bg-accent/50"
                 )}
               >
-                <span>{tabLabels[kind]}</span>
+                <span>{tabLabels[kind] ?? DEFAULT_TAB_LABELS[kind]}</span>
                 {!stale && count > 0 && (
                   <span className="rounded bg-muted px-1 text-[0.7rem] tabular-nums text-muted-foreground">
                     {count}

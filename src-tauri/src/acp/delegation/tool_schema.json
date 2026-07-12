@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id, reason). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
+    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id, reason). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. A codeg://delegation-profile/<uuid> mention is an explicit route: pass that UUID as profile_id, call once for every distinct mentioned profile, and fan those calls out before collecting results. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task"],
@@ -21,6 +21,14 @@
             "grok"
           ],
           "description": "Which local agent runs the sub-task. Pick the one best suited to the work."
+        },
+        "profile_id": {
+          "type": "string",
+          "description": "Optional immutable delegation-profile UUID. When supplied, the broker runs exactly this profile and never falls back to the base agent defaults."
+        },
+        "profile_label": {
+          "type": "string",
+          "description": "Display label from the matching explicit profile mention, for example CodeBuddy:GLM5.2. It does not affect routing."
         },
         "task": {
           "type": "string",

@@ -2,6 +2,7 @@ import type { Editor } from "@tiptap/core"
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model"
 
 import type { PromptInputBlock } from "@/lib/types"
+import type { AgentType } from "@/lib/types"
 
 import { referenceToMarkdown } from "./reference-text"
 import { isEmbeddedReferenceUri } from "./reference-uri"
@@ -36,7 +37,42 @@ import type { ReferenceAttrs } from "./types"
  */
 export function docToPromptBlocks(editor: Editor): PromptInputBlock[] {
   const text = serializeDocToText(editor.state.doc).trim()
-  return text ? [{ type: "text", text }] : []
+  if (!text) return []
+  const routes = collectDelegationProfileRoutes(editor.state.doc)
+  if (routes.length === 0) return [{ type: "text", text }]
+  const directive = routes
+    .map(
+      (route) =>
+        `Codeg mandatory delegation route: call delegate_to_agent exactly once with agent_type="${route.agentType}", profile_id="${route.profileId}", and profile_label="${route.label}" for @${route.label}. Fan out all mandatory routes before collecting results. Do not substitute another profile or the base agent default.`
+    )
+    .join("\n")
+  return [
+    { type: "text", text: directive },
+    { type: "text", text },
+  ]
+}
+
+export function collectDelegationProfileRoutes(
+  doc: ProseMirrorNode
+): Array<{ profileId: string; agentType: AgentType; label: string }> {
+  const routes = new Map<
+    string,
+    { profileId: string; agentType: AgentType; label: string }
+  >()
+  doc.descendants((node) => {
+    if (node.type.name !== "reference") return
+    const attrs = node.attrs as ReferenceAttrs
+    if (attrs.refType !== "delegation_profile") return
+    const profileId = attrs.meta?.profileId ?? attrs.id
+    const agentType = attrs.meta?.agentType
+    if (!profileId || !agentType || routes.has(profileId)) return
+    routes.set(profileId, {
+      profileId,
+      agentType,
+      label: attrs.label || attrs.id,
+    })
+  })
+  return [...routes.values()]
 }
 
 /**

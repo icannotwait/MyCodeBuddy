@@ -246,7 +246,7 @@ export function DelegationAgentDefaultsPanel({
         )}
 
         {!loading && !error && snapshot && (
-          <SnapshotEditor
+          <DelegationOptionEditor
             snapshot={snapshot}
             overrideModeId={currentModeId}
             overrideConfigValues={currentConfigValues}
@@ -260,7 +260,7 @@ export function DelegationAgentDefaultsPanel({
   )
 }
 
-interface SnapshotEditorProps {
+export interface DelegationOptionEditorProps {
   snapshot: AgentOptionsSnapshot
   overrideModeId: string | null
   overrideConfigValues: Record<string, string>
@@ -269,14 +269,14 @@ interface SnapshotEditorProps {
   disabled?: boolean
 }
 
-function SnapshotEditor({
+export function DelegationOptionEditor({
   snapshot,
   overrideModeId,
   overrideConfigValues,
   onModeChange,
   onConfigChange,
   disabled,
-}: SnapshotEditorProps) {
+}: DelegationOptionEditorProps) {
   const t = useTranslations("AcpAgentSettings.multiAgent")
   const hasModes =
     snapshot.modes !== null &&

@@ -111,6 +111,12 @@ export function referenceToMarkdown(attrs: ReferenceAttrs): string {
         ? `[@${escapeMarkdownText(text)}](${escapeLinkDestination(attrs.uri)})`
         : `@${inlineText(attrs.label || attrs.id)}`
     }
+    case "delegation_profile": {
+      const text = collapseNewlines(attrs.label || attrs.id)
+      return attrs.uri
+        ? `[@${escapeMarkdownText(text)}](${escapeLinkDestination(attrs.uri)})`
+        : `@${inlineText(text)}`
+    }
     case "skill": {
       // Invocation token: the stable id is what the agent executes, prefixed by
       // the trigger it was created from (`/` commands & most skills, `$` Codex
