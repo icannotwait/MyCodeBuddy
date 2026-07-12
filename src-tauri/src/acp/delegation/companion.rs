@@ -865,7 +865,7 @@ fn timeout_cancel_guidance_report(task_id: &str) -> Value {
     json!({
         "task_id": task_id,
         "status": "running",
-        "message": "不要取消仍在 running 的子代理"
+        "message": crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE
     })
 }
 
@@ -1356,7 +1356,7 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(
             result["content"][0]["text"],
-            "不要取消仍在 running 的子代理"
+            crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE
         );
         assert_eq!(result["isError"], false);
         assert_eq!(result["structuredContent"]["status"], "running");

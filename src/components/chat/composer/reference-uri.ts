@@ -8,7 +8,12 @@ import type { ReferenceAttrs } from "./types"
 // (ai-elements/markdown-link.tsx). Mirrors the schemes the adapters emit
 // (suggestion/adapters.ts) and the node's allow-list (nodes/reference-node.ts).
 const AGENT_URI = /^codeg:\/\/agent\/(.+)$/i
-const DELEGATION_PROFILE_URI = /^codeg:\/\/delegation-profile\/([^/]+)$/i
+// New: codeg://delegation-profile/<agent_type>/<uuid>
+// Legacy: codeg://delegation-profile/<uuid> (assumes code_buddy)
+const DELEGATION_PROFILE_URI_TYPED =
+  /^codeg:\/\/delegation-profile\/([a-z0-9_]+)\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/i
+const DELEGATION_PROFILE_URI_LEGACY =
+  /^codeg:\/\/delegation-profile\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/i
 const SESSION_URI = /^codeg:\/\/session\/(.+)$/i
 const COMMIT_URI = /^codeg:\/\/commit\/.*@(.+)$/i
 // command / skill / expert tokens, surfaced as badges in transcript user messages
@@ -74,9 +79,29 @@ export function parseCodegReferenceUri(
     }
   }
 
-  const delegationProfile = uri.match(DELEGATION_PROFILE_URI)
-  if (delegationProfile) {
-    const id = delegationProfile[1]
+  const typedProfile = uri.match(DELEGATION_PROFILE_URI_TYPED)
+  if (typedProfile) {
+    const agentType = typedProfile[1]
+    const id = typedProfile[2]
+    // Unknown agent segments are not coerced — fail closed so a typo cannot
+    // silently become code_buddy and mis-route after reload.
+    if (!ALL_AGENT_TYPES.includes(agentType as AgentType)) {
+      return null
+    }
+    return {
+      refType: "delegation_profile",
+      id,
+      label: (label || id).replace(/^@/, "") || id,
+      uri,
+      meta: {
+        profileId: id,
+        agentType: agentType as AgentType,
+      },
+    }
+  }
+  const legacyProfile = uri.match(DELEGATION_PROFILE_URI_LEGACY)
+  if (legacyProfile) {
+    const id = legacyProfile[1]
     return {
       refType: "delegation_profile",
       id,

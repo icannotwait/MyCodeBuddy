@@ -1040,6 +1040,7 @@ mod tauri_app {
                 delegation_commands::set_delegation_settings,
                 delegation_commands::get_delegation_profiles,
                 delegation_commands::set_delegation_profiles,
+                delegation_commands::set_delegation_bundle,
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,

@@ -654,7 +654,7 @@ fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
         agent_type: None,
         text: None,
         error_code: None,
-        message: Some("不要取消仍在 running 的子代理".into()),
+        message: Some(crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE.into()),
         duration_ms: None,
     }
 }
@@ -1442,7 +1442,10 @@ mod tests {
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
         server_task.await.unwrap();
         assert_eq!(resp.outcome["status"], "running");
-        assert_eq!(resp.outcome["message"], "不要取消仍在 running 的子代理");
+        assert_eq!(
+            resp.outcome["message"],
+            crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE
+        );
         assert_eq!(broker.pending_count().await, 1);
     }
 

@@ -37,6 +37,34 @@ describe("parseCodegReferenceUri", () => {
     })
   })
 
+  it("parses typed and legacy delegation-profile uris", () => {
+    const id = "11111111-1111-4111-8111-111111111111"
+    expect(
+      parseCodegReferenceUri(
+        `codeg://delegation-profile/codex/${id}`,
+        "@Codex:Fast"
+      )
+    ).toMatchObject({
+      refType: "delegation_profile",
+      id,
+      label: "Codex:Fast",
+      meta: { profileId: id, agentType: "codex" },
+    })
+    expect(
+      parseCodegReferenceUri(`codeg://delegation-profile/${id}`, "GLM")
+    ).toMatchObject({
+      refType: "delegation_profile",
+      id,
+      meta: { profileId: id, agentType: "code_buddy" },
+    })
+    expect(
+      parseCodegReferenceUri(
+        `codeg://delegation-profile/not_an_agent/${id}`,
+        "x"
+      )
+    ).toBeNull()
+  })
+
   it("falls back to the agent type when the agent label is empty", () => {
     expect(
       parseCodegReferenceUri("codeg://agent/claude_code", "")

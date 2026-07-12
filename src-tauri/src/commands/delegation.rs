@@ -156,9 +156,15 @@ pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSe
 /// Pull settings from the DB and push the resulting `DelegationConfig` onto
 /// the broker. Idempotent — safe to call on startup, after settings save, or
 /// after any external write to `app_metadata`.
+///
+/// Profile load failures do **not** wipe a healthy live profile map: we keep
+/// whatever the broker currently holds and log. Corrupt DB rows still fail
+/// hard on explicit `get_delegation_profiles`.
 pub async fn apply_persisted_config(conn: &DatabaseConnection, broker: &DelegationBroker) {
     let settings = load_delegation_settings(conn).await;
     let mut config = settings.into_broker_config();
+    // Preserve currently-live profiles unless a replacement loads cleanly.
+    config.profiles = broker.config_snapshot().await.profiles;
     match load_delegation_profiles(conn).await {
         Ok(document) => {
             config.profiles = document
@@ -167,19 +173,19 @@ pub async fn apply_persisted_config(conn: &DatabaseConnection, broker: &Delegati
                 .map(|profile| (profile.id.clone(), profile))
                 .collect();
         }
-        Err(error) => eprintln!("[Delegation] failed to load profiles: {error}"),
+        Err(error) => {
+            eprintln!(
+                "[Delegation] failed to load profiles; keeping live map: {error}"
+            );
+        }
     }
     broker.set_config(config).await;
 }
 
-/// Persist + apply. Used by both the Tauri command and the HTTP handler so
-/// the clamp / re-apply chain is in exactly one place.
-pub async fn set_delegation_settings_core(
-    conn: &DatabaseConnection,
-    broker: &DelegationBroker,
-    desired: DelegationSettings,
-) -> Result<DelegationSettings, AppCommandError> {
-    let clamped = desired.clamped();
+async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    clamped: &DelegationSettings,
+) -> Result<(), AppCommandError> {
     app_metadata_service::upsert_value(conn, KEY_DELEGATION_ENABLED, &clamped.enabled.to_string())
         .await
         .map_err(AppCommandError::from)?;
@@ -206,11 +212,85 @@ pub async fn set_delegation_settings_core(
     app_metadata_service::upsert_value(conn, KEY_DELEGATION_AGENT_DEFAULTS, &agent_defaults_json)
         .await
         .map_err(AppCommandError::from)?;
+    Ok(())
+}
+
+/// Persist + apply. Used by both the Tauri command and the HTTP handler so
+/// the clamp / re-apply chain is in exactly one place. Settings keys are
+/// written in one DB transaction so a mid-write failure does not leave a
+/// partial settings document.
+pub async fn set_delegation_settings_core(
+    conn: &DatabaseConnection,
+    broker: &DelegationBroker,
+    desired: DelegationSettings,
+) -> Result<DelegationSettings, AppCommandError> {
+    use sea_orm::TransactionTrait;
+    let clamped = desired.clamped();
+    let txn = conn
+        .begin()
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
+    persist_settings_keys(&txn, &clamped).await?;
+    txn.commit()
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
     let profiles = broker.config_snapshot().await.profiles;
     let mut config = clamped.clone().into_broker_config();
     config.profiles = profiles;
     broker.set_config(config).await;
     Ok(clamped)
+}
+
+/// Combined settings + profiles document saved in one DB transaction, then
+/// applied to the broker in a single `set_config` so concurrent delegations
+/// never observe "new settings + old profiles".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationBundle {
+    pub settings: DelegationSettings,
+    pub profiles: DelegationProfileDocument,
+}
+
+pub async fn set_delegation_bundle_core(
+    conn: &DatabaseConnection,
+    broker: &DelegationBroker,
+    desired: DelegationBundle,
+) -> Result<DelegationBundle, AppCommandError> {
+    use sea_orm::TransactionTrait;
+    let clamped = desired.settings.clamped();
+    let normalized = DelegationProfileDocument {
+        profiles: normalize_profiles(desired.profiles.profiles)?,
+    };
+    let profiles_json = serde_json::to_string(&normalized).map_err(|e| {
+        AppCommandError::configuration_invalid(format!("serialize delegation profiles: {e}"))
+    })?;
+    let txn = conn
+        .begin()
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
+    persist_settings_keys(&txn, &clamped).await?;
+    app_metadata_service::upsert_value(&txn, KEY_DELEGATION_PROFILES_V1, &profiles_json)
+        .await
+        .map_err(AppCommandError::from)?;
+    txn.commit()
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
+
+    let mut config = clamped.clone().into_broker_config();
+    config.profiles = normalized
+        .profiles
+        .iter()
+        .cloned()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect();
+    broker.set_config(config).await;
+    Ok(DelegationBundle {
+        settings: clamped,
+        profiles: normalized,
+    })
 }
 
 fn normalize_profiles(
@@ -283,6 +363,25 @@ pub async fn set_delegation_profiles_core(
     Ok(normalized)
 }
 
+/// Apply profiles to the broker after a successful profiles-only persist.
+/// Kept separate so the web/Tauri commands share the same sequence:
+/// DB write first, then live map (best-effort consistency on process death).
+pub async fn apply_profiles_to_broker(
+    broker: &DelegationBroker,
+    document: &DelegationProfileDocument,
+) {
+    broker
+        .set_profiles(
+            document
+                .profiles
+                .iter()
+                .cloned()
+                .map(|profile| (profile.id.clone(), profile))
+                .collect(),
+        )
+        .await;
+}
+
 // -------- Tauri commands -----------------------------------------------------
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -340,21 +439,29 @@ pub async fn set_delegation_profiles(
     #[cfg(feature = "tauri-runtime")]
     {
         let saved = set_delegation_profiles_core(&db.conn, document).await?;
-        broker
-            .set_profiles(
-                saved
-                    .profiles
-                    .iter()
-                    .cloned()
-                    .map(|profile| (profile.id.clone(), profile))
-                    .collect(),
-            )
-            .await;
+        apply_profiles_to_broker(broker.inner(), &saved).await;
         Ok(saved)
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
         let _ = document;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_delegation_bundle(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
+    bundle: DelegationBundle,
+) -> Result<DelegationBundle, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        set_delegation_bundle_core(&db.conn, broker.inner(), bundle).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = bundle;
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }
@@ -432,6 +539,58 @@ mod tests {
             .await
             .unwrap();
         assert!(load_delegation_profiles(&db.conn).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_persisted_config_keeps_live_profiles_when_db_corrupt() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
+        let live = profile("11111111-1111-4111-8111-111111111111", "Live");
+        broker
+            .set_profiles(BTreeMap::from([(live.id.clone(), live.clone())]))
+            .await;
+        app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_PROFILES_V1, "{")
+            .await
+            .unwrap();
+        apply_persisted_config(&db.conn, &broker).await;
+        let cfg = broker.config_snapshot().await;
+        assert_eq!(cfg.profiles.get(&live.id).map(|p| p.name.as_str()), Some("Live"));
+    }
+
+    #[tokio::test]
+    async fn bundle_save_writes_settings_and_profiles_atomically() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
+        let bundle = DelegationBundle {
+            settings: DelegationSettings {
+                enabled: true,
+                depth_limit: 3,
+                ..DelegationSettings::default()
+            },
+            profiles: DelegationProfileDocument {
+                profiles: vec![profile("11111111-1111-4111-8111-111111111111", " GLM5.2 ")],
+            },
+        };
+        let saved = set_delegation_bundle_core(&db.conn, &broker, bundle)
+            .await
+            .unwrap();
+        assert!(saved.settings.enabled);
+        assert_eq!(saved.settings.depth_limit, 3);
+        assert_eq!(saved.profiles.profiles[0].name, "GLM5.2");
+        assert_eq!(load_delegation_settings(&db.conn).await.depth_limit, 3);
+        assert_eq!(
+            load_delegation_profiles(&db.conn).await.unwrap().profiles[0].name,
+            "GLM5.2"
+        );
+        let cfg = broker.config_snapshot().await;
+        assert!(cfg.enabled);
+        assert_eq!(cfg.depth_limit, 3);
+        assert_eq!(
+            cfg.profiles
+                .get("11111111-1111-4111-8111-111111111111")
+                .map(|p| p.name.as_str()),
+            Some("GLM5.2")
+        );
     }
 
     #[test]

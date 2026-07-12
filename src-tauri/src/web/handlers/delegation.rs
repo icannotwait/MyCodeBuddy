@@ -14,8 +14,9 @@ use crate::acp::delegation::types::DelegationProfileDocument;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::delegation::{
-    load_delegation_profiles, load_delegation_settings, set_delegation_profiles_core,
-    set_delegation_settings_core, DelegationSettings,
+    apply_profiles_to_broker, load_delegation_profiles, load_delegation_settings,
+    set_delegation_bundle_core, set_delegation_profiles_core, set_delegation_settings_core,
+    DelegationBundle, DelegationSettings,
 };
 
 pub async fn get_delegation_settings(
@@ -55,16 +56,20 @@ pub async fn set_delegation_profiles(
     Json(params): Json<SetDelegationProfilesParams>,
 ) -> Result<Json<DelegationProfileDocument>, AppCommandError> {
     let saved = set_delegation_profiles_core(&state.db.conn, params.document).await?;
-    state
-        .delegation_broker
-        .set_profiles(
-            saved
-                .profiles
-                .iter()
-                .cloned()
-                .map(|profile| (profile.id.clone(), profile))
-                .collect(),
-        )
-        .await;
+    apply_profiles_to_broker(&state.delegation_broker, &saved).await;
+    Ok(Json(saved))
+}
+
+#[derive(Deserialize)]
+pub struct SetDelegationBundleParams {
+    pub bundle: DelegationBundle,
+}
+
+pub async fn set_delegation_bundle(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SetDelegationBundleParams>,
+) -> Result<Json<DelegationBundle>, AppCommandError> {
+    let saved =
+        set_delegation_bundle_core(&state.db.conn, &state.delegation_broker, params.bundle).await?;
     Ok(Json(saved))
 }

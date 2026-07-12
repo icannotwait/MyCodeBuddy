@@ -656,6 +656,11 @@ impl ConnectionManager {
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        // When true, scan the prompt for composer-emitted profile mentions and
+        // register them as mandatory routes for this connection. Must be false
+        // for broker-generated child/delegation tasks so nested task text
+        // cannot install routes on the child connection.
+        register_mandatory_routes: bool,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -668,6 +673,25 @@ impl ConnectionManager {
                 "prompt must contain at least one content block".to_string(),
             ));
         }
+        // Precompute mandatory ids only if this is a root user prompt. Applied
+        // AFTER the turn is admitted (below) so a rejected concurrent send
+        // cannot overwrite the live turn's routes.
+        let pending_mandatory_ids = if register_mandatory_routes {
+            let mut joined = String::new();
+            for block in &blocks {
+                if let PromptInputBlock::Text { text } = block {
+                    if !joined.is_empty() {
+                        joined.push('\n');
+                    }
+                    joined.push_str(text);
+                }
+            }
+            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(
+                &joined,
+            ))
+        } else {
+            None
+        };
         let (cmd_tx, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -700,6 +724,18 @@ impl ConnectionManager {
             }
             s.turn_in_flight = true;
         }
+        // Admitted: install/clear mandatory routes for this root prompt only.
+        // Must stay synchronous (no `.await`) between setting `turn_in_flight`
+        // and `permit.send` so a dropped future cannot strand the gate or
+        // mutate routes for a prompt that never enqueued. Child paths pass
+        // register_mandatory_routes=false and skip this.
+        if let Some(ids) = pending_mandatory_ids {
+            if let Some(injection) = self.delegation_snapshot() {
+                injection
+                    .broker
+                    .set_mandatory_profile_routes(conn_id, ids);
+            }
+        }
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
@@ -728,7 +764,8 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None).await
+        // Non-linked sends are always user-facing root prompts.
+        self.send_prompt_inner(conn_id, blocks, None, true).await
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -1071,7 +1108,12 @@ impl ConnectionManager {
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
-        match self.send_prompt_inner(conn_id, blocks, user_message).await {
+        // Only root (non-delegation) prompts install mandatory profile routes.
+        // Child tasks go through the same helper but must not scan task text.
+        match self
+            .send_prompt_inner(conn_id, blocks, user_message, delegation.is_none())
+            .await
+        {
             Ok(()) => {
                 // The prompt reached the agent: surface it to the chat-channel
                 // "user message" event feed. Notification-only — never gates the
@@ -3202,6 +3244,7 @@ mod tests {
                 text: "blocked".into(),
             }],
             None,
+            true,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(

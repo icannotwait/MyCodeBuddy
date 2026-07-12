@@ -33,8 +33,7 @@ import {
   type DelegationSettings,
   getDelegationSettings,
   getDelegationProfiles,
-  setDelegationProfiles,
-  setDelegationSettings,
+  setDelegationBundle,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import type {
@@ -109,20 +108,37 @@ export function DelegationSettingsSection() {
     }
     setSaving(true)
     try {
-      const applied = await setDelegationSettings(payload)
-      const savedProfiles = await setDelegationProfiles({ profiles })
+      const saved = await setDelegationBundle({
+        settings: payload,
+        profiles: { profiles },
+      })
       // Mirror any server-side clamps / filter passes back into the UI so the
       // inputs reflect what was actually persisted.
-      setEnabled(applied.enabled)
-      setDepth(applied.depth_limit)
-      setCacheMb(applied.completed_cache_max_mb)
-      setAgentDefaults(applied.agent_defaults ?? {})
-      setProfiles(savedProfiles.profiles)
+      setEnabled(saved.settings.enabled)
+      setDepth(saved.settings.depth_limit)
+      setCacheMb(saved.settings.completed_cache_max_mb)
+      setAgentDefaults(saved.settings.agent_defaults ?? {})
+      setProfiles(saved.profiles.profiles)
       toast.success(t("saved"))
     } catch (err: unknown) {
       toast.error(t("saveFailed"), {
         description: toErrorMessage(err),
       })
+      // Re-sync from server so a failed partial attempt never leaves the
+      // form claiming dirty state that no longer matches persistence.
+      try {
+        const [s, profileDocument] = await Promise.all([
+          getDelegationSettings(),
+          getDelegationProfiles(),
+        ])
+        setEnabled(s.enabled)
+        setDepth(s.depth_limit)
+        setCacheMb(s.completed_cache_max_mb)
+        setAgentDefaults(s.agent_defaults ?? {})
+        setProfiles(profileDocument.profiles)
+      } catch (reloadErr: unknown) {
+        toast.error(t("loadFailed", { detail: toErrorMessage(reloadErr) }))
+      }
     } finally {
       setSaving(false)
     }

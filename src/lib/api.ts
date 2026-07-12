@@ -3223,6 +3223,17 @@ export async function setDelegationProfiles(
   return getTransport().call("set_delegation_profiles", { document })
 }
 
+/** Atomic settings + profiles save (single DB transaction + one broker apply). */
+export async function setDelegationBundle(bundle: {
+  settings: DelegationSettings
+  profiles: DelegationProfileDocument
+}): Promise<{
+  settings: DelegationSettings
+  profiles: DelegationProfileDocument
+}> {
+  return getTransport().call("set_delegation_bundle", { bundle })
+}
+
 // ─── Live feedback settings + submit ───────────────────────────────────
 
 /** Mirror of Rust `FeedbackSettings`. */

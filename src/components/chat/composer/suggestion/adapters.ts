@@ -26,7 +26,7 @@ export function profileToSuggestion(
       refType: "delegation_profile",
       id: profile.id,
       label: `${agentLabel}:${profile.name}`,
-      uri: `codeg://delegation-profile/${profile.id}`,
+      uri: `codeg://delegation-profile/${profile.agent_type}/${profile.id}`,
       meta: { agentType: profile.agent_type, profileId: profile.id },
     },
     detail: profile.config_values.model ?? null,

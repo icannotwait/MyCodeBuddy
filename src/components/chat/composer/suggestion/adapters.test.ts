@@ -76,7 +76,7 @@ describe("profileToSuggestion", () => {
       refType: "delegation_profile",
       id: profile.id,
       label: "CodeBuddy:GLM5.2",
-      uri: `codeg://delegation-profile/${profile.id}`,
+      uri: `codeg://delegation-profile/code_buddy/${profile.id}`,
       meta: { agentType: "code_buddy", profileId: profile.id },
     })
   })

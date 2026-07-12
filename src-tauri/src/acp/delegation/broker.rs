@@ -48,7 +48,7 @@
 //! to every running child of that parent. A normal `end_turn` does NOT cancel
 //! children — they keep running in the background (the whole point of async).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1127,6 +1127,15 @@ pub struct DelegationBroker {
     tool_calls: Arc<ToolCallTracker>,
     pre_canceled_handles: Arc<PreCanceledHandles>,
     config: Arc<Mutex<DelegationConfig>>,
+    /// Parent-connection → profile UUIDs mentioned in the latest user prompt.
+    /// When non-empty, `start_delegation` requires a `profile_id` (or auto-fills
+    /// when exactly one mandatory profile matches the requested agent type).
+    ///
+    /// `std::sync::Mutex` (not tokio) so `set_mandatory_profile_routes` can run
+    /// synchronously between admitting a root prompt (`turn_in_flight = true`)
+    /// and `permit.send` — no async cancel point that could strand the gate or
+    /// leave routes half-applied relative to the enqueue.
+    mandatory_profile_routes: Arc<std::sync::Mutex<HashMap<String, BTreeSet<String>>>>,
     /// Woken after every terminal `record_completed` so a `get_delegation_status`
     /// long-poll wakes the instant its task finishes instead of busy-polling.
     result_notify: Arc<Notify>,
@@ -1184,6 +1193,7 @@ impl DelegationBroker {
             tool_calls: Arc::new(ToolCallTracker::default()),
             pre_canceled_handles: Arc::new(PreCanceledHandles::default()),
             config: Arc::new(Mutex::new(DelegationConfig::default())),
+            mandatory_profile_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             result_notify: Arc::new(Notify::new()),
         }
     }
@@ -1806,6 +1816,43 @@ impl DelegationBroker {
         self.config.lock().await.clone()
     }
 
+    /// Record profile UUIDs mentioned in the parent user prompt for this
+    /// connection. Empty `profile_ids` clears the mandatory set (normal send
+    /// without profile mentions). Synchronous so callers can install routes
+    /// between prompt admission and enqueue without introducing an await.
+    pub fn set_mandatory_profile_routes(
+        &self,
+        parent_connection_id: &str,
+        profile_ids: impl IntoIterator<Item = String>,
+    ) {
+        let mut map = self
+            .mandatory_profile_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let set: BTreeSet<String> = profile_ids.into_iter().collect();
+        if set.is_empty() {
+            map.remove(parent_connection_id);
+        } else {
+            map.insert(parent_connection_id.to_string(), set);
+        }
+    }
+
+    pub fn clear_mandatory_profile_routes(&self, parent_connection_id: &str) {
+        self.mandatory_profile_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(parent_connection_id);
+    }
+
+    fn mandatory_profile_routes_for(&self, parent_connection_id: &str) -> BTreeSet<String> {
+        self.mandatory_profile_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(parent_connection_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// If this in-flight setup has been flagged canceled by a parent cancel,
     /// deregister it and return true. One lock acquisition; used at the
     /// pre-spawn / post-spawn checkpoints in `handle_request`.
@@ -2000,6 +2047,46 @@ impl DelegationBroker {
         // Pull per-agent overrides from the broker config (defaults to empty).
         // Cloning is cheap — `AgentDelegationDefaults` is at most one Option<String>
         // and a small BTreeMap, and the spawner consumes both fields by value.
+        //
+        // When the parent user prompt mentioned profiles, soft prompt routing is
+        // hardened here:
+        // - omitted profile_id → auto-fill only when a unique enabled match
+        //   exists for the requested agent_type; otherwise fail closed
+        // - explicit profile_id must be one of the mandatory UUIDs (no substitute
+        //   profile / base defaults while a mention set is active)
+        let mandatory = self.mandatory_profile_routes_for(&req.parent_connection_id);
+        if !mandatory.is_empty() {
+            if let Some(profile_id) = req.profile_id.as_deref() {
+                if !mandatory.contains(profile_id) {
+                    self.drop_inflight(inflight_id).await;
+                    let list = mandatory.into_iter().collect::<Vec<_>>().join(", ");
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::MandatoryProfileRequired(format!(
+                            "profile_id {profile_id} is not among mandatory routes: {list}"
+                        )),
+                        None,
+                    );
+                }
+            } else {
+                let matches: Vec<&DelegationProfile> = mandatory
+                    .iter()
+                    .filter_map(|id| cfg.profiles.get(id))
+                    .filter(|p| p.enabled && p.agent_type == req.agent_type)
+                    .collect();
+                if matches.len() == 1 {
+                    req.profile_id = Some(matches[0].id.clone());
+                } else {
+                    self.drop_inflight(inflight_id).await;
+                    let list = mandatory.into_iter().collect::<Vec<_>>().join(", ");
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::MandatoryProfileRequired(list),
+                        None,
+                    );
+                }
+            }
+        }
         let (preferred_mode_id, preferred_config_values) =
             if let Some(profile_id) = req.profile_id.as_deref() {
                 let Some(profile) = cfg.profiles.get(profile_id) else {
@@ -2729,6 +2816,7 @@ impl DelegationBroker {
     /// `consumed`) since the connection is going away. Runs fully inline — the
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
+        self.clear_mandatory_profile_routes(parent_connection_id);
         let drained = self
             .drain_for_parent_cancel(parent_connection_id, false)
             .await;
@@ -2754,6 +2842,9 @@ impl DelegationBroker {
     /// mis-bind the next same-key delegation on this live connection — see
     /// `drop_tool_calls_for_parent`.
     pub async fn cancel_by_parent_turn(&self, parent_connection_id: &str) {
+        // Drop the canceled turn's mention set so a late MCP call cannot ride
+        // the previous prompt's mandatory routes before the next user send.
+        self.clear_mandatory_profile_routes(parent_connection_id);
         let drained = self
             .drain_for_parent_cancel(parent_connection_id, true)
             .await;
@@ -3948,6 +4039,125 @@ mod tests {
         assert_eq!(
             broker.start_delegation(req).await.error_code.as_deref(),
             Some("delegation_profile_agent_mismatch")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profile_auto_fills_unique_match_when_profile_id_omitted() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-1".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "GLM5.2".into(),
+            mode_id: Some("auto".into()),
+            config_values: BTreeMap::from([("model".into(), "glm-5.2".into())]),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [profile_id.to_string()]);
+
+        let mut req = request(1, "pt-mandatory");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = None;
+        let _ = broker.handle_request(req).await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_config_values["model"], "glm-5.2");
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_reject_omitted_profile_id_when_ambiguous() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let mk = |id: &str, name: &str| DelegationProfile {
+            id: id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: name.into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(a.into(), mk(a, "A")), (b.into(), mk(b, "B"))]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [a.to_string(), b.to_string()]);
+
+        let mut req = request(1, "pt-ambig");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = None;
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_reject_explicit_profile_outside_set() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let mandatory_id = "11111111-1111-4111-8111-111111111111";
+        let other_id = "22222222-2222-4222-8222-222222222222";
+        let mk = |id: &str, name: &str| DelegationProfile {
+            id: id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: name.into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([
+                    (mandatory_id.into(), mk(mandatory_id, "Must")),
+                    (other_id.into(), mk(other_id, "Other")),
+                ]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [mandatory_id.to_string()]);
+
+        let mut req = request(1, "pt-bypass");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(other_id.into());
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("mandatory_profile_required")
         );
         assert!(mock.spawn_args.lock().await.is_empty());
     }

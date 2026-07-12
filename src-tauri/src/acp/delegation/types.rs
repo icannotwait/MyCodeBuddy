@@ -112,6 +112,141 @@ pub struct DelegationSuccess {
     pub token_usage: Option<TokenUsage>,
 }
 
+/// Stable English guidance returned for `cancel_delegation` with `reason=timeout`.
+/// Intentionally not localized: the companion speaks to the LLM, not the UI.
+pub const TIMEOUT_CANCEL_GUIDANCE: &str =
+    "Do not cancel a still-running sub-agent; keep polling get_delegation_status.";
+
+/// Drop fenced code blocks (``` or ~~~) so pasted docs/examples cannot
+/// install mandatory routes from illustrative links or directives.
+///
+/// CommonMark rules (simplified):
+/// - open/close by the same run character (`` ` `` or `~`)
+/// - a closing fence must be at least as long as the opener
+/// so `~~~` inside a ``` block, or ``` inside ````, does not end it early.
+fn text_outside_code_fences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // None = outside; Some((char, min_len)) = open fence.
+    let mut open_fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let fence = {
+            let bytes = trimmed.as_bytes();
+            if bytes.len() >= 3 && (bytes[0] == b'`' || bytes[0] == b'~') {
+                let ch = bytes[0] as char;
+                let mut n = 0usize;
+                while n < bytes.len() && bytes[n] == bytes[0] {
+                    n += 1;
+                }
+                // Info string after backticks must not contain more backticks
+                // for a valid open fence; we only need a conservative filter
+                // for route extraction, so any run of ≥3 counts.
+                if n >= 3 {
+                    Some((ch, n))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((ch, n)) = fence {
+            match open_fence {
+                None => open_fence = Some((ch, n)),
+                Some((open_ch, open_n)) if open_ch == ch && n >= open_n => {
+                    open_fence = None;
+                }
+                Some(_) => {
+                    // Wrong char or too-short closer — still inside the block.
+                }
+            }
+            continue;
+        }
+        if open_fence.is_none() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Extract immutable profile UUIDs from a user prompt using only structured
+/// forms the composer emits — not free-form prose or pasted examples.
+///
+/// Accepted:
+/// - A whole line that *starts* with `Codeg mandatory delegation route:` and
+///   contains `profile_id="<uuid>"` (composer directive; column 0 only)
+/// - Closed markdown links: `[label](codeg://delegation-profile/<uuid>)`
+///   or `[label](codeg://delegation-profile/<agent_type>/<uuid>)`
+///
+/// Rejected: bare URIs, prose `profile_id=`, unterminated/malformed links,
+/// indented/buried directive phrases, and content inside fenced code blocks.
+pub fn extract_mandatory_profile_ids(text: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let text = text_outside_code_fences(text);
+    let mut out = BTreeSet::new();
+    let uuid = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if uuid::Uuid::parse_str(s).is_ok() {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    };
+
+    const DIRECTIVE_PREFIX: &str = "Codeg mandatory delegation route:";
+    for line in text.lines() {
+        // Composer-injected directive lines only (column 0 — no leading spaces).
+        let Some(mut rest) = line.strip_prefix(DIRECTIVE_PREFIX) else {
+            continue;
+        };
+        while let Some(idx) = rest.find("profile_id=\"") {
+            rest = &rest[idx + "profile_id=\"".len()..];
+            if let Some(end) = rest.find('"') {
+                if let Some(id) = uuid(&rest[..end]) {
+                    out.insert(id);
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Markdown link destinations only: [label](codeg://delegation-profile/...)
+    // Require a matching `[` before the `]` and a closing `)`.
+    const LINK_PREFIX: &str = "](codeg://delegation-profile/";
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find(LINK_PREFIX) {
+        let close_bracket = search_from + rel; // index of ']'
+        search_from = close_bracket + LINK_PREFIX.len();
+        // Valid markdown: a '[' before this ']' with no intervening ']'.
+        let prefix = &text[..close_bracket];
+        let Some(open) = prefix.rfind('[') else {
+            continue;
+        };
+        if prefix[open + 1..].contains(']') {
+            continue;
+        }
+        let after = &text[search_from..];
+        // Require a real closing ')' — unterminated destinations are not links.
+        let Some(token_end) = after.find(')') else {
+            continue;
+        };
+        let token = after[..token_end].trim();
+        let path = token
+            .split(|c: char| c == ' ' || c == '"' || c == '\'')
+            .next()
+            .unwrap_or("");
+        let candidate = path.rsplit_once('/').map(|(_, id)| id).unwrap_or(path);
+        if let Some(id) = uuid(candidate) {
+            out.insert(id);
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Broker-internal failure modes. Serialized via the wrapping
 /// [`DelegationOutcome::Err`] variant — the broker maps each into a stable
 /// `code` string so the frontend / MCP consumer can pattern-match without
@@ -129,6 +264,10 @@ pub enum DelegationError {
     DelegationProfileDisabled(String),
     #[error("delegation profile agent does not match request: {0}")]
     DelegationProfileAgentMismatch(String),
+    /// Parent user prompt mentioned one or more profiles, but this call did not
+    /// supply a usable `profile_id` (and auto-fill could not uniquely resolve).
+    #[error("mandatory profile_id required: {0}")]
+    MandatoryProfileRequired(String),
     #[error("invalid working dir: {0}")]
     InvalidWorkingDir(String),
     #[error("spawn failed: {0}")]
@@ -245,6 +384,7 @@ impl DelegationOutcome {
             DelegationError::DelegationProfileAgentMismatch(_) => {
                 "delegation_profile_agent_mismatch"
             }
+            DelegationError::MandatoryProfileRequired(_) => "mandatory_profile_required",
             DelegationError::InvalidWorkingDir(_) => "invalid_working_dir",
             DelegationError::SpawnFailed(_) => "spawn_failed",
             DelegationError::SubagentRuntimeError(_) => "subagent_error",
@@ -261,5 +401,50 @@ impl DelegationOutcome {
             message: err.to_string(),
             child_conversation_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::extract_mandatory_profile_ids;
+
+    #[test]
+    fn extracts_profile_id_directive_and_uri_forms() {
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let noise = "33333333-3333-4333-8333-333333333333";
+        let fenced = "44444444-4444-4444-8444-444444444444";
+        let tilde = "55555555-5555-4555-8555-555555555555";
+        let buried = "66666666-6666-4666-8666-666666666666";
+        let open_link = "77777777-7777-4777-8777-777777777777";
+        // Note: Rust `\` string continuations strip leading whitespace on the
+        // next physical line, so leading-space cases must embed `\x20` explicitly.
+        let text = format!(
+            "Codeg mandatory delegation route: profile_id=\"{a}\" for @X\n\
+also see [y](codeg://delegation-profile/code_buddy/{b})\n\
+ignore bare codeg://delegation-profile/{noise}\n\
+and prose profile_id=\"{noise}\" not on a directive line\n\
+and malformed ](codeg://delegation-profile/{noise})\n\
+and [broken] label](codeg://delegation-profile/{noise})\n\
+and unterminated [open](codeg://delegation-profile/{open_link}\n\
+see docs about Codeg mandatory delegation route profile_id=\"{buried}\" in prose\n\
+\x20Codeg mandatory delegation route: profile_id=\"{buried}\" indented\n\
+```\n\
+[doc](codeg://delegation-profile/{fenced})\n\
+Codeg mandatory delegation route: profile_id=\"{fenced}\"\n\
+~~~\n\
+still inside backtick fence: profile_id=\"{fenced}\"\n\
+```\n\
+~~~\n\
+[tilde](codeg://delegation-profile/{tilde})\n\
+~~~\n\
+````\n\
+```\n\
+Codeg mandatory delegation route: profile_id=\"{fenced}\"\n\
+```\n\
+````\n"
+        );
+        let ids = extract_mandatory_profile_ids(&text);
+        assert_eq!(ids, vec![a.to_string(), b.to_string()]);
     }
 }

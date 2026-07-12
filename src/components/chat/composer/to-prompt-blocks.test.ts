@@ -97,7 +97,7 @@ describe("docToPromptBlocks", () => {
           refType: "delegation_profile",
           id,
           label,
-          uri: `codeg://delegation-profile/${id}`,
+          uri: `codeg://delegation-profile/code_buddy/${id}`,
           meta: { agentType: "code_buddy", profileId: id },
         })
       )
