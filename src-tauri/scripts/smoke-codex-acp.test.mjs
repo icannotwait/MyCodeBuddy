@@ -2,7 +2,10 @@ import assert from "node:assert/strict"
 import { join } from "node:path"
 import test from "node:test"
 
-import { resolveHostCodexPath } from "./smoke-codex-acp.mjs"
+import {
+  assertDynamicModelList,
+  resolveHostCodexPath,
+} from "./smoke-codex-acp.mjs"
 
 test("PATH hit wins over APPDATA fallback", () => {
   const appData = join("fixtures", "appdata")
@@ -40,4 +43,20 @@ test("APPDATA cmd wins over JavaScript fallback", () => {
   })
 
   assert.equal(selected, cmd)
+})
+
+test("session/new smoke requires a non-empty dynamic model list", () => {
+  assert.equal(
+    assertDynamicModelList({
+      models: {
+        availableModels: [{ modelId: "gpt-5.5" }, { modelId: "gpt-5.5-codex" }],
+      },
+    }),
+    2
+  )
+
+  assert.throws(
+    () => assertDynamicModelList({ models: { availableModels: [] } }),
+    /did not return any models/
+  )
 })

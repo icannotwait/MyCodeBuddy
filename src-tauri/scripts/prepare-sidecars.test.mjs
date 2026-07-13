@@ -6,6 +6,7 @@ import test from "node:test"
 
 import {
   codexBundleScript,
+  codexBundleEnv,
   npmCommandInvocation,
   readCodexAcpVersion,
   sidecarDestination,
@@ -61,6 +62,27 @@ test("stages the locked Bun Windows runtime for offline compilation", () => {
   assert.equal(readFileSync(staged, "utf8"), "bun-runtime")
 })
 
+test("adds the locked Bun runtime directory to PATH for the Windows bundle", () => {
+  const dir = "C:\\repo\\codex-acp"
+  const env = codexBundleEnv(
+    dir,
+    "x86_64-pc-windows-msvc",
+    { Path: "C:\\Windows\\System32" },
+    ";"
+  )
+
+  assert.equal(
+    env.Path,
+    `${join(
+      dir,
+      "node_modules",
+      "@oven",
+      "bun-windows-x64-baseline",
+      "bin"
+    )};C:\\Windows\\System32`
+  )
+})
+
 test("requires the locked Bun Windows runtime before compilation", () => {
   const dir = mkdtempSync(join(tmpdir(), "codeg-bun-runtime-missing-"))
 
@@ -72,8 +94,8 @@ test("requires the locked Bun Windows runtime before compilation", () => {
 
 test("requires an initialized locked codex submodule", () => {
   const dir = mkdtempSync(join(tmpdir(), "codeg-codex-sidecar-"))
-  writeFileSync(join(dir, "package.json"), '{"version":"1.1.2-mycodebuddy.1"}')
+  writeFileSync(join(dir, "package.json"), '{"version":"1.1.2-mycodebuddy.2"}')
   assert.throws(() => readCodexAcpVersion(dir), /not initialized/)
   writeFileSync(join(dir, "package-lock.json"), "{}")
-  assert.equal(readCodexAcpVersion(dir), "1.1.2-mycodebuddy.1")
+  assert.equal(readCodexAcpVersion(dir), "1.1.2-mycodebuddy.2")
 })

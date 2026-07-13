@@ -2041,6 +2041,7 @@
           "spawnFailed": "{agent} 시작 실패: {message}",
           "downloadFailed": "{agent} 다운로드 실패: {message}",
           "sessionLoadResourceNotFound": "{agent} 세션 불러오기에 실패했습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
+          "sessionLoadLegacyCliSession": "이 {agent} 세션은 이전 CLI 런타임에서 생성되어 다시 시작할 수 없습니다. 새 대화를 시작하세요.",
           "sessionLoadUnavailable": "{agent}에서 이 세션을 복원할 수 없습니다. 세션이 종료되었거나 에이전트가 중지되었을 수 있습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
           "turnFailedRefusal": "{agent}이(가) 이번 턴을 계속하지 않았습니다. 백엔드나 게이트웨이 오류일 수 있습니다. 에이전트 로그를 확인하세요.",
           "turnFailedMaxTokens": "{agent}이(가) 이번 턴의 최대 토큰 한도에 도달했습니다.",

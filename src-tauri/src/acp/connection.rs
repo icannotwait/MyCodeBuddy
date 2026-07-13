@@ -47,7 +47,8 @@ use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
 
-/// Inject host `CODEX_PATH` into Codex launch env when CLI mode is enabled.
+/// Inject host `CODEX_PATH` into Codex launch env when a host binary is required
+/// (always on Windows bundled adapter; also when experimental CLI mode is on).
 /// No-ops for non-Codex agents; maps prepare failures to `SdkNotInstalled`.
 fn apply_codex_cli_path_env(
     agent_type: AgentType,
@@ -366,8 +367,9 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
-            // When CODEX_ACP_USE_CLI is on, inject host CODEX_PATH (never overwriting
-            // an explicit user value). Fail with SdkNotInstalled if CLI is missing.
+            // Inject host CODEX_PATH when required (Windows app-server host, or
+            // experimental CODEX_ACP_USE_CLI). Never overwrites an explicit user
+            // value; fails with SdkNotInstalled if host Codex is missing.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {
@@ -3666,6 +3668,13 @@ fn classify_session_load_failure(
     code: sacp::schema::ErrorCode,
     message: &str,
 ) -> Option<&'static str> {
+    // Before the app-server switch, the bundled Codex adapter generated its
+    // own ACP UUIDs and persisted a CLI-runtime mapping. Those IDs are not
+    // Codex thread IDs, so the adapter explicitly asks the user to start a
+    // new session rather than attempting an invalid resume or silent fallback.
+    if message.contains("This Codex session was created by the legacy CLI runtime") {
+        return Some("legacy_cli_session");
+    }
     if matches!(code, sacp::schema::ErrorCode::ResourceNotFound) {
         return Some("resource_not_found");
     }
@@ -5641,6 +5650,17 @@ mod tests {
                 "process exited with code 1",
             ),
             Some("resource_not_found"),
+        );
+    }
+
+    #[test]
+    fn classify_load_failure_legacy_codex_cli_session_requires_new_session() {
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "This Codex session was created by the legacy CLI runtime and cannot be resumed. Create a new session.",
+            ),
+            Some("legacy_cli_session"),
         );
     }
 

@@ -563,6 +563,31 @@ describe("AcpConnectionsProvider permission request details", () => {
   })
 })
 
+describe("AcpConnectionsProvider session load failures", () => {
+  it("localizes legacy Codex CLI sessions and preserves the recovery code", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: "sess-1",
+      message:
+        "This Codex session was created by the legacy CLI runtime and cannot be resumed.",
+      code: "legacy_cli_session",
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.loadError).toBe(
+      "backendErrors.sessionLoadLegacyCliSession"
+    )
+    expect(connection?.loadErrorCode).toBe("legacy_cli_session")
+  })
+})
+
 describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => {
   async function connectOwner(): Promise<AttachHandlers> {
     await mountProvider()

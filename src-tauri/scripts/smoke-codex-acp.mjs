@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * Smoke-test the bundled codex-acp sidecar under CLI mode.
+ * Smoke-test the bundled codex-acp sidecar (host app-server path).
  *
  * Exit 0 only if:
- *  1. `--version` equals `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1`
- *  2. ACP `initialize` succeeds with CODEX_ACP_USE_CLI=1 and CODEX_PATH set
+ *  1. `--version` equals `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.2`
+ *  2. ACP `initialize` and `session/new` succeed with host `CODEX_PATH`
+ *     (no CODEX_ACP_USE_CLI), and `session/new` returns dynamic models
  *  3. stdout/stderr do not contain `Cannot find module '@openai/codex/bin/codex.js'`
  *
  * Usage: node smoke-codex-acp.mjs <codex-acp.exe>
@@ -16,7 +17,7 @@ import { existsSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const EXPECTED_VERSION = "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1"
+const EXPECTED_VERSION = "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.2"
 const MISSING_MODULE = "Cannot find module '@openai/codex/bin/codex.js'"
 const INIT_TIMEOUT_MS = 15_000
 
@@ -110,7 +111,17 @@ function checkVersion(binary, env) {
   return (adapter.stdout ?? "").trim()
 }
 
-function initializeOnce(binary, env) {
+export function assertDynamicModelList(sessionResult) {
+  const models = sessionResult?.models?.availableModels
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new Error(
+      "ACP session/new did not return any models from Codex app-server"
+    )
+  }
+  return models.length
+}
+
+function initializeAndCreateSession(binary, env) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(binary, [], {
       env,
@@ -137,12 +148,14 @@ function initializeOnce(binary, env) {
     const timer = setTimeout(() => {
       finish(
         new Error(
-          `ACP initialize timed out after ${INIT_TIMEOUT_MS}ms\n` +
+          `ACP initialize/session smoke timed out after ${INIT_TIMEOUT_MS}ms\n` +
             `stdout:\n${stdout}\nstderr:\n${stderr}`
         )
       )
     }, INIT_TIMEOUT_MS)
 
+    let stdoutBuffer = ""
+    let initialized = false
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString()
       try {
@@ -152,9 +165,58 @@ function initializeOnce(binary, env) {
         return
       }
 
-      // Success: a JSON-RPC response line with id 1 and a result.
-      if (stdout.includes('"id":1') && stdout.includes("result")) {
-        finish(null, { stdout, stderr })
+      stdoutBuffer += chunk.toString()
+      const lines = stdoutBuffer.split(/\r?\n/)
+      stdoutBuffer = lines.pop() ?? ""
+      for (const line of lines) {
+        if (!line.trim()) continue
+        let message
+        try {
+          message = JSON.parse(line)
+        } catch {
+          continue
+        }
+
+        if (message.id === 1) {
+          if (message.error) {
+            finish(
+              new Error(
+                `ACP initialize failed: ${JSON.stringify(message.error)}`
+              )
+            )
+            return
+          }
+          if (!initialized && message.result) {
+            initialized = true
+            child.stdin.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "session/new",
+                params: { cwd: process.cwd(), mcpServers: [] },
+              })}\n`
+            )
+          }
+          continue
+        }
+
+        if (message.id === 2) {
+          if (message.error) {
+            finish(
+              new Error(
+                `ACP session/new failed: ${JSON.stringify(message.error)}`
+              )
+            )
+            return
+          }
+          try {
+            const modelCount = assertDynamicModelList(message.result)
+            finish(null, { stdout, stderr, modelCount })
+          } catch (err) {
+            finish(err)
+          }
+          return
+        }
       }
     })
 
@@ -223,21 +285,28 @@ async function main() {
     )
   }
 
+  // Product default: custom ACP + host `codex app-server` (not experimental CLI).
+  // Clear any ambient USE_CLI so CI smoke matches Windows registry distribution.
   const env = {
     ...process.env,
-    CODEX_ACP_USE_CLI: "1",
-    CODEX_ACP_CLI_MODEL: "gpt-5.5",
     CODEX_PATH: codexPath,
   }
+  delete env.CODEX_ACP_USE_CLI
+  delete env.CODEX_ACP_CLI_MODEL
 
   const version = checkVersion(binary, env)
-  const { stdout, stderr } = await initializeOnce(binary, env)
+  const { stdout, stderr, modelCount } = await initializeAndCreateSession(
+    binary,
+    env
+  )
 
   assertNoMissingModule("initialize stdout", stdout)
   assertNoMissingModule("initialize stderr", stderr)
 
   process.stdout.write(`${version}\n`)
-  process.stdout.write(`initialize ok via CODEX_PATH=${codexPath}\n`)
+  process.stdout.write(
+    `initialize + session/new ok (${modelCount} models) via host app-server CODEX_PATH=${codexPath}\n`
+  )
 }
 
 if (

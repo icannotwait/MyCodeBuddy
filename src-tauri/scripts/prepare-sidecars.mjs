@@ -33,7 +33,7 @@ import {
   rmSync,
   statSync,
 } from "node:fs"
-import { dirname, join, resolve } from "node:path"
+import { delimiter, dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import process from "node:process"
 
@@ -41,7 +41,7 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const SRC_TAURI = resolve(SCRIPT_DIR, "..")
 const BINARIES_DIR = join(SRC_TAURI, "binaries")
 const BIN_NAME = "codeg-mcp"
-const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.1"
+const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.2"
 const CODEX_ACP_DIR = join(SRC_TAURI, "vendor", "codex-acp")
 const CODEX_COMPILE_RUNTIME_PACKAGE = "bun-windows-x64-baseline"
 const CODEX_COMPILE_RUNTIME = `${CODEX_COMPILE_RUNTIME_PACKAGE}-v1.3.14`
@@ -98,6 +98,32 @@ export function stageCodexCompileRuntime(sourceDir, target) {
   const staged = join(sourceDir, CODEX_COMPILE_RUNTIME)
   copyFileSync(runtime, staged)
   return staged
+}
+
+export function codexBundleEnv(
+  sourceDir,
+  target,
+  env = process.env,
+  pathSeparator = delimiter
+) {
+  if (target !== "x86_64-pc-windows-msvc") return env
+
+  const pathKey =
+    Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH"
+  const runtimeBinDir = join(
+    sourceDir,
+    "node_modules",
+    "@oven",
+    CODEX_COMPILE_RUNTIME_PACKAGE,
+    "bin"
+  )
+  const existingPath = env[pathKey]
+  return {
+    ...env,
+    [pathKey]: existingPath
+      ? `${runtimeBinDir}${pathSeparator}${existingPath}`
+      : runtimeBinDir,
+  }
 }
 
 function log(msg) {
@@ -209,6 +235,7 @@ function main() {
     execFileSync(invocation.command, invocation.args, {
       stdio: "inherit",
       cwd: CODEX_ACP_DIR,
+      env: codexBundleEnv(CODEX_ACP_DIR, target),
     })
   } finally {
     rmSync(compileRuntime, { force: true })

@@ -85,7 +85,7 @@ pub async fn run_preflight(
         } => check_uv_environment(*uv_required, *system_cmd).await,
     };
 
-    // Windows bundled codex-acp needs a host Codex CLI (CODEX_ACP_USE_CLI).
+    // Windows bundled codex-acp needs a host Codex to spawn `codex app-server`.
     // Non-Windows Npx packages already ship the codex dependency.
     if agent_type == AgentType::Codex && cfg!(windows) {
         checks.push(check_codex_cli_host(runtime_env));
@@ -145,7 +145,7 @@ fn codex_cli_host_check_item(path: Option<PathBuf>) -> CheckItem {
             check_id: "codex_cli".into(),
             label: "Codex CLI".into(),
             status: CheckStatus::Fail,
-            message: "Host Codex CLI not found. The built-in codex-acp adapter needs a local Codex CLI (CODEX_ACP_USE_CLI).".into(),
+            message: "Host Codex CLI not found. The built-in codex-acp adapter needs a local Codex CLI to run app-server (install @openai/codex or set CODEX_PATH).".into(),
             fixes: vec![FixAction {
                 label: "Install Codex CLI".into(),
                 kind: FixActionKind::OpenUrl,

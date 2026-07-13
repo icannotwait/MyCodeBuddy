@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
-import { singletonSourceTurns } from "./message-list-view"
+import {
+  canReloadSessionLoadError,
+  singletonSourceTurns,
+} from "./message-list-view"
 import type { MessageTurn } from "@/lib/types"
 
 function turn(id: string): MessageTurn {
@@ -22,5 +25,13 @@ describe("singletonSourceTurns", () => {
     const a = singletonSourceTurns(turn("a"))
     const b = singletonSourceTurns(turn("b"))
     expect(a).not.toBe(b)
+  })
+})
+
+describe("canReloadSessionLoadError", () => {
+  it("requires a fresh conversation for legacy Codex CLI sessions", () => {
+    expect(canReloadSessionLoadError("legacy_cli_session")).toBe(false)
+    expect(canReloadSessionLoadError("resource_not_found")).toBe(true)
+    expect(canReloadSessionLoadError(null)).toBe(true)
   })
 })

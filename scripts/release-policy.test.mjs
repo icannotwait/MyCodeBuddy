@@ -14,7 +14,10 @@ import {
 } from "./release-policy.mjs"
 
 const readRepositoryFile = (path) =>
-  readFileSync(new URL(`../${path}`, import.meta.url), "utf8")
+  readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replace(
+    /\r\n/g,
+    "\n"
+  )
 
 const validWindowsWorkflow = `
 name: Release MyCodeBuddy

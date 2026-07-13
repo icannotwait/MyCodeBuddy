@@ -155,14 +155,15 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
 
 fn codex_distribution_for(platform: &str) -> AgentDistribution {
     if platform == "windows-x86_64" {
+        // Bundled MyCodeBuddy fork keeps custom ACP behavior. Host Codex is
+        // injected as CODEX_PATH at launch so the adapter drives
+        // `codex app-server` (model/list, turns, sessions) rather than the
+        // experimental single-model CLI runtime (`CODEX_ACP_USE_CLI`).
         AgentDistribution::Bundled {
-            version: "1.1.2-mycodebuddy.1",
+            version: "1.1.2-mycodebuddy.2",
             cmd: "codex-acp",
             args: &[],
-            env: &[
-                ("CODEX_ACP_USE_CLI", "1"),
-                ("CODEX_ACP_CLI_MODEL", "gpt-5.5"),
-            ],
+            env: &[],
             override_env: crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV,
             platforms: &["windows-x86_64"],
         }
@@ -535,14 +536,23 @@ mod tests {
 
     #[test]
     fn codex_is_bundled_only_on_windows_x64() {
-        assert!(matches!(
-            codex_distribution_for("windows-x86_64"),
+        match codex_distribution_for("windows-x86_64") {
             AgentDistribution::Bundled {
-                version: "1.1.2-mycodebuddy.1",
-                override_env: "CODEG_CODEX_ACP_BIN",
+                version,
+                override_env,
+                env,
                 ..
+            } => {
+                assert_eq!(version, "1.1.2-mycodebuddy.2");
+                assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
+                // App-server path: no CODEX_ACP_USE_CLI / CODEX_ACP_CLI_MODEL pin.
+                assert!(
+                    env.is_empty(),
+                    "Windows bundled codex-acp must not force CLI runtime env, got {env:?}"
+                );
             }
-        ));
+            other => panic!("expected bundled Codex on windows-x86_64, got {other:?}"),
+        }
         match codex_distribution_for("darwin-aarch64") {
             AgentDistribution::Npx {
                 version,

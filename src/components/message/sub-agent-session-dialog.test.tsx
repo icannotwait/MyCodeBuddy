@@ -210,6 +210,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     claudeApiRetry: null,
     error: null,
     loadError: null,
+    loadErrorCode: null,
     lastAppliedSeq: 0,
     isDelegationChild: true,
     parentToolUseId: "pt-1",
