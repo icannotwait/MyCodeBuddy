@@ -588,6 +588,28 @@ describe("AcpConnectionsProvider session load failures", () => {
   })
 })
 
+describe("AcpConnectionsProvider terminal shell config stale", () => {
+  it("applies session_config_stale terminal_shell into connection state", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_stale",
+      stale: true,
+      kind: "terminal_shell",
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.configStale).toBe(true)
+    expect(connection?.configStaleKind).toBe("terminal_shell")
+    expect(connection?.configStaleDismissed).toBe(false)
+  })
+})
+
 describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => {
   async function connectOwner(): Promise<AttachHandlers> {
     await mountProvider()

@@ -10,7 +10,9 @@ use sea_orm::{
     TransactionTrait,
 };
 
-use crate::acp::connection::{spawn_agent_connection, AgentConnection, ConnectionCommand};
+use crate::acp::connection::{
+    matching_config_pair, spawn_agent_connection, AgentConnection, ConnectionCommand,
+};
 use crate::acp::error::AcpError;
 use crate::acp::terminal_context::{
     finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
@@ -48,6 +50,19 @@ const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 fn is_reserved_turn_id(id: &str) -> bool {
     matches!(id.strip_prefix("turn-"), Some(rest)
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Prefer shell drift over agent drift so the banner wording matches the most
+/// recent surface the user still needs to reapply. When both components match
+/// spawn, returns `None` (not stale).
+fn effective_stale_kind(conn: &AgentConnection) -> Option<ConfigStaleKind> {
+    if conn.observed_config.fingerprint.terminal_shell != conn.spawn_config.terminal_shell {
+        Some(ConfigStaleKind::TerminalShell)
+    } else if conn.observed_config.fingerprint.agent_config != conn.spawn_config.agent_config {
+        Some(conn.observed_config.agent_kind)
+    } else {
+        None
+    }
 }
 
 /// Build the bounded preview string for a `user_prompt_sent` notification from
@@ -307,6 +322,9 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let (spawn_config, observed_config) =
+            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
@@ -316,9 +334,9 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
-            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            spawn_config,
+            observed_config,
+            terminal_shell,
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -350,6 +368,9 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let (spawn_config, observed_config) =
+            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
@@ -359,9 +380,9 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
-            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            spawn_config,
+            observed_config,
+            terminal_shell,
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -563,22 +584,22 @@ impl ConnectionManager {
         disconnected
     }
 
-    /// Compare each running connection's spawn-time config fingerprint against a
-    /// freshly recomputed one (keyed by agent type in `fresh`) and notify those
-    /// that drifted. Drives the conversation-side "restart to apply" banner after
-    /// a settings save.
+    /// Compare each running connection's spawn-time **agent** config fingerprint
+    /// against a freshly recomputed one (keyed by agent type in `fresh`) and
+    /// notify those that drifted. Shell drift is tracked separately via
+    /// [`Self::refresh_terminal_shell_staleness`].
     ///
     /// Emit policy, per connection:
-    /// - emit `SessionConfigStale { stale }` only when the current fingerprint
-    ///   differs from the one we last observed for it — a no-op save (identical
-    ///   values) stays silent, while a second real change re-emits so a dismissed
-    ///   banner reappears.
-    /// - `stale = (current != spawn)`, so reverting a setting back to its
-    ///   launch-time value emits `stale = false` and clears the banner.
+    /// - updates only the agent component of `observed_config` (plus `agent_kind`);
+    /// - emits `SessionConfigStale` only when that observed component **or** the
+    ///   effective stale kind changes — a no-op save stays silent, a second real
+    ///   change re-emits so a dismissed banner reappears;
+    /// - effective kind prefers shell drift over agent drift (see
+    ///   [`effective_stale_kind`]).
     ///
-    /// Returns the count of running connections currently on stale config across
-    /// the affected agents (for the settings-side "N sessions need restart"
-    /// toast). Connections whose agent type isn't in `fresh` are left untouched.
+    /// Returns the count of affected connections whose **agent** component is
+    /// currently stale (for the settings-side "N sessions need restart" toast).
+    /// Connections whose agent type isn't in `fresh` are left untouched.
     ///
     /// `emit_with_state` is deferred until AFTER the connections-map lock is
     /// released (we collect targets first) so the SessionState write lock is
@@ -596,17 +617,84 @@ impl ConnectionManager {
                 let Some(current) = fresh.get(&conn.agent_type) else {
                     continue;
                 };
-                let stale = *current != conn.config_fingerprint;
-                if stale {
+                let prev_agent = conn.observed_config.fingerprint.agent_config.clone();
+                let prev_kind = conn.observed_config.agent_kind;
+                let prev_effective = effective_stale_kind(conn);
+
+                conn.observed_config.fingerprint.agent_config = current.clone();
+                conn.observed_config.agent_kind = kind;
+
+                let agent_stale =
+                    conn.observed_config.fingerprint.agent_config != conn.spawn_config.agent_config;
+                if agent_stale {
                     stale_count += 1;
                 }
-                if *current != conn.last_observed_fingerprint {
-                    conn.last_observed_fingerprint = current.clone();
-                    targets.push((Arc::clone(&conn.state), conn.emitter.clone(), stale));
+
+                let new_effective = effective_stale_kind(conn);
+                let observed_changed = prev_agent != conn.observed_config.fingerprint.agent_config
+                    || prev_kind != conn.observed_config.agent_kind;
+                if observed_changed || prev_effective != new_effective {
+                    let stale = new_effective.is_some();
+                    let emit_kind = new_effective.unwrap_or(kind);
+                    targets.push((
+                        Arc::clone(&conn.state),
+                        conn.emitter.clone(),
+                        stale,
+                        emit_kind,
+                    ));
                 }
             }
         }
-        for (state, emitter, stale) in targets {
+        for (state, emitter, stale, kind) in targets {
+            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+        }
+        stale_count
+    }
+
+    /// Compare every running connection's spawn-time terminal-shell selection
+    /// key against the freshly saved global setting and notify those that
+    /// drifted. Agent-config drift is tracked separately via
+    /// [`Self::refresh_connection_staleness`].
+    ///
+    /// Updates only the `terminal_shell` observed component. Emits after the
+    /// connections-map lock is released, and only when that component or the
+    /// effective stale kind changes. Returns the count of connections whose
+    /// **shell** component is currently stale.
+    pub async fn refresh_terminal_shell_staleness(&self, selection_key: &str) -> usize {
+        let mut targets = Vec::new();
+        let mut stale_count = 0usize;
+        {
+            let mut connections = self.connections.lock().await;
+            for conn in connections.values_mut() {
+                let prev_shell = conn.observed_config.fingerprint.terminal_shell.clone();
+                let prev_effective = effective_stale_kind(conn);
+
+                if prev_shell != selection_key {
+                    conn.observed_config.fingerprint.terminal_shell = selection_key.to_string();
+                }
+
+                let shell_stale = conn.observed_config.fingerprint.terminal_shell
+                    != conn.spawn_config.terminal_shell;
+                if shell_stale {
+                    stale_count += 1;
+                }
+
+                let new_effective = effective_stale_kind(conn);
+                let observed_changed =
+                    prev_shell != conn.observed_config.fingerprint.terminal_shell;
+                if observed_changed || prev_effective != new_effective {
+                    let stale = new_effective.is_some();
+                    let emit_kind = new_effective.unwrap_or(ConfigStaleKind::TerminalShell);
+                    targets.push((
+                        Arc::clone(&conn.state),
+                        conn.emitter.clone(),
+                        stale,
+                        emit_kind,
+                    ));
+                }
+            }
+        }
+        for (state, emitter, stale, kind) in targets {
             emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
         }
         stale_count
@@ -2641,8 +2729,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: matching_config_pair(String::new(), "system").0,
+            observed_config: matching_config_pair(String::new(), "system").1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         }
     }
@@ -2673,7 +2761,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_connection_staleness_flags_only_drifted_running_sessions() {
         let mgr = ConnectionManager::new();
-        // Test connections spawn with an empty fingerprint (insert_test_connection).
+        // Test connections spawn with an empty agent fingerprint (insert_test_connection).
         insert_fake_connection(&mgr, "c1", AgentType::Codex, None, EventEmitter::Noop).await;
         // A different agent type that must stay untouched.
         insert_fake_connection(&mgr, "c2", AgentType::ClaudeCode, None, EventEmitter::Noop).await;
@@ -2711,6 +2799,59 @@ mod tests {
             !mgr.get_state("c1").await.unwrap().read().await.config_stale,
             "staleness cleared after revert"
         );
+    }
+
+    /// Seed a single Codex connection whose spawn and observed components both
+    /// start at the given agent / shell fingerprints.
+    async fn manager_with_fingerprints(agent_fp: &str, shell_fp: &str) -> ConnectionManager {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(&mgr, "c1", AgentType::Codex, None, EventEmitter::Noop).await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("c1").unwrap();
+            let (spawn_config, observed_config) =
+                matching_config_pair(agent_fp.to_string(), shell_fp.to_string());
+            conn.spawn_config = spawn_config;
+            conn.observed_config = observed_config;
+        }
+        mgr
+    }
+
+    #[tokio::test]
+    async fn shell_change_marks_all_running_connections_stale() {
+        let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
+        let count = mgr.refresh_terminal_shell_staleness("shell-v2").await;
+        assert_eq!(count, 1);
+        let state = mgr.get_state("c1").await.unwrap();
+        let state = state.read().await;
+        assert!(state.config_stale);
+        assert_eq!(state.config_stale_kind, Some(ConfigStaleKind::TerminalShell));
+    }
+
+    #[tokio::test]
+    async fn reverting_shell_keeps_agent_config_drift_visible() {
+        let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
+        let mut fresh = HashMap::new();
+        fresh.insert(AgentType::Codex, "agent-v2".to_string());
+        mgr.refresh_connection_staleness(&fresh, ConfigStaleKind::AgentConfig)
+            .await;
+        mgr.refresh_terminal_shell_staleness("shell-v2").await;
+        mgr.refresh_terminal_shell_staleness("shell-v1").await;
+
+        let state = mgr.get_state("c1").await.unwrap();
+        let state = state.read().await;
+        assert!(state.config_stale);
+        assert_eq!(state.config_stale_kind, Some(ConfigStaleKind::AgentConfig));
+    }
+
+    #[tokio::test]
+    async fn no_op_shell_save_emits_no_new_stale_event() {
+        let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
+        let mut receiver = subscribe_conn_stream(&mgr, "c1").await;
+        assert_eq!(mgr.refresh_terminal_shell_staleness("shell-v1").await, 0);
+        assert!(tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err());
     }
 
     /// Subscribe directly to the per-connection event stream. Phase 4b
@@ -2814,8 +2955,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: matching_config_pair(String::new(), "system").0,
+            observed_config: matching_config_pair(String::new(), "system").1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         mgr.connections
@@ -3148,8 +3289,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: matching_config_pair(String::new(), "system").0,
+            observed_config: matching_config_pair(String::new(), "system").1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = ConnectionManager::new();
@@ -4911,8 +5052,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: matching_config_pair(String::new(), "system").0,
+            observed_config: matching_config_pair(String::new(), "system").1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = Arc::new(ConnectionManager::new());
@@ -5285,8 +5426,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: matching_config_pair(String::new(), "system").0,
+            observed_config: matching_config_pair(String::new(), "system").1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = ConnectionManager::new();

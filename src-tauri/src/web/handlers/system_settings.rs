@@ -13,6 +13,7 @@ use crate::commands::system_settings::{
 use crate::db::service::app_metadata_service;
 use crate::models::*;
 use crate::network::proxy;
+use crate::terminal::shell::terminal_shell_selection_key;
 
 // Wrapper structs to match Tauri's named parameter convention.
 // Frontend sends `{ settings: <T> }` which Tauri `invoke()` unwraps automatically,
@@ -150,6 +151,12 @@ pub async fn update_system_terminal_settings(
     app_metadata_service::upsert_value(&db.conn, SYSTEM_TERMINAL_SETTINGS_KEY, &serialized)
         .await
         .map_err(AppCommandError::from)?;
+
+    let selection_key = terminal_shell_selection_key(&settings);
+    state
+        .connection_manager
+        .refresh_terminal_shell_staleness(&selection_key)
+        .await;
 
     crate::web::event_bridge::emit_event(
         &state.emitter,

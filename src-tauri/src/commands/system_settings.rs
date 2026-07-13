@@ -2,6 +2,8 @@ use sea_orm::DatabaseConnection;
 #[cfg(feature = "tauri-runtime")]
 use tauri::State;
 
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::manager::ConnectionManager;
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
 #[cfg(feature = "tauri-runtime")]
@@ -17,6 +19,8 @@ use crate::network::proxy;
 #[cfg(feature = "tauri-runtime")]
 use crate::preferences;
 use crate::terminal::shell::effective_shell_for_display;
+#[cfg(feature = "tauri-runtime")]
+use crate::terminal::shell::terminal_shell_selection_key;
 
 pub(crate) const SYSTEM_PROXY_SETTINGS_KEY: &str = "system_proxy_settings";
 pub(crate) const SYSTEM_LANGUAGE_SETTINGS_KEY: &str = "system_language_settings";
@@ -306,6 +310,7 @@ pub async fn update_system_language_settings(
 pub async fn update_system_terminal_settings(
     settings: SystemTerminalSettings,
     db: State<'_, AppDatabase>,
+    manager: State<'_, ConnectionManager>,
     app: tauri::AppHandle,
 ) -> Result<SystemTerminalSettings, AppCommandError> {
     let normalized = normalize_terminal_settings(settings);
@@ -317,6 +322,11 @@ pub async fn update_system_terminal_settings(
     app_metadata_service::upsert_value(&db.conn, SYSTEM_TERMINAL_SETTINGS_KEY, &serialized)
         .await
         .map_err(AppCommandError::from)?;
+
+    let selection_key = terminal_shell_selection_key(&normalized);
+    manager
+        .refresh_terminal_shell_staleness(&selection_key)
+        .await;
 
     let emitter = crate::web::event_bridge::EventEmitter::Tauri(app);
     crate::web::event_bridge::emit_event(

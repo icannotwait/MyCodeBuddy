@@ -35,11 +35,11 @@ use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
 use crate::acp::types::{
-    AcpEvent, AvailableCommandInfo, ConnectionInfo, ConnectionStatus, PermissionOptionInfo,
-    PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock, SessionConfigKindInfo,
-    SessionConfigOptionInfo, SessionConfigSelectGroupInfo, SessionConfigSelectInfo,
-    SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo, ToolCallImageInfo,
-    UserMessageBlock,
+    AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
+    PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectGroupInfo,
+    SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
+    ToolCallImageInfo, UserMessageBlock,
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
@@ -235,6 +235,41 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
+/// Per-component config fingerprint captured at spawn and compared after
+/// settings saves. Agent config and terminal shell are tracked independently
+/// so one surface can stay stale while the other is reverted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionConfigFingerprint {
+    pub agent_config: String,
+    pub terminal_shell: String,
+}
+
+/// Latest settings values observed by staleness refresh (not necessarily the
+/// spawn snapshot). `agent_kind` remembers whether the last agent-side drift
+/// came from agent settings or a model-provider edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionObservedConfig {
+    pub fingerprint: ConnectionConfigFingerprint,
+    pub agent_kind: ConfigStaleKind,
+}
+
+/// Build matching spawn + observed fingerprints (used at connection launch and
+/// by tests that seed synthetic connections).
+pub fn matching_config_pair(
+    agent_config: impl Into<String>,
+    terminal_shell: impl Into<String>,
+) -> (ConnectionConfigFingerprint, ConnectionObservedConfig) {
+    let fingerprint = ConnectionConfigFingerprint {
+        agent_config: agent_config.into(),
+        terminal_shell: terminal_shell.into(),
+    };
+    let observed = ConnectionObservedConfig {
+        fingerprint: fingerprint.clone(),
+        agent_kind: ConfigStaleKind::AgentConfig,
+    };
+    (fingerprint, observed)
+}
+
 /// Represents a single active ACP agent connection.
 pub struct AgentConnection {
     pub id: String,
@@ -256,18 +291,16 @@ pub struct AgentConnection {
     /// in the same turn.
     pub prompt_lock: Arc<tokio::sync::Mutex<()>>,
 
-    /// Canonical fingerprint of the agent's effective config (env vars + model
-    /// provider creds + native config file content) captured at spawn. The
-    /// running process is locked to THIS config; comparing it against a freshly
-    /// recomputed fingerprint after a settings save tells us whether the session
-    /// has drifted onto stale config. Immutable for the connection's lifetime.
-    pub config_fingerprint: String,
-    /// The most recent fingerprint seen by `refresh_connection_staleness`.
-    /// Tracks "did anything change since we last looked" so a second settings
-    /// save re-emits `SessionConfigStale` (re-showing a dismissed banner) while a
-    /// no-op save (identical values) stays silent. Starts equal to
-    /// `config_fingerprint`.
-    pub last_observed_fingerprint: String,
+    /// Component fingerprints captured when this process was spawned. The
+    /// running process is locked to THESE values; comparing them against
+    /// `observed_config` after a settings save detects drift. Immutable for
+    /// the connection's lifetime.
+    pub spawn_config: ConnectionConfigFingerprint,
+    /// Most recent settings values seen by staleness refresh. Starts equal to
+    /// `spawn_config`. Tracks "did anything change since we last looked" so a
+    /// second real change re-emits `SessionConfigStale` while a no-op save
+    /// stays silent. Agent and shell components update independently.
+    pub observed_config: ConnectionObservedConfig,
     /// Immutable terminal shell snapshot captured when this connection's
     /// process was spawned. Never re-read from settings after launch; reuse
     /// and reconnect keep this value for the connection's lifetime.
@@ -801,12 +834,15 @@ pub async fn spawn_agent_connection(
     let cleanup_connection_id = connection_id.clone();
     let state_clone = Arc::clone(&session_state);
 
-    // Canonical config fingerprint of what this process is launching with.
-    // Derived from the same `runtime_env` we hand the agent (minus per-launch
-    // volatile keys) plus the agent's native config file content, so a later
-    // settings save can be compared against it to detect a stale running session.
-    let config_fingerprint =
-        crate::commands::acp::fingerprint_config(agent_type, &runtime_env);
+    // Component fingerprints of what this process is launching with.
+    // Agent config is derived from the same `runtime_env` we hand the agent
+    // (minus per-launch volatile keys) plus native config file content; shell
+    // is the selection key from the immutable launch snapshot. Later settings
+    // saves compare against these independently.
+    let (spawn_config, observed_config) = matching_config_pair(
+        crate::commands::acp::fingerprint_config(agent_type, &runtime_env),
+        terminal_shell.selection_key.clone(),
+    );
 
     // Insert the entry BEFORE spawning the background task so that a
     // fast-failing `run_connection` can never remove it before it was
@@ -822,8 +858,8 @@ pub async fn spawn_agent_connection(
             state: Arc::clone(&session_state),
             emitter: emitter.clone(),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            last_observed_fingerprint: config_fingerprint.clone(),
-            config_fingerprint,
+            spawn_config,
+            observed_config,
             terminal_shell: terminal_shell.clone(),
         },
     );

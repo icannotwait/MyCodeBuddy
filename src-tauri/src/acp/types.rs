@@ -353,7 +353,8 @@ pub struct BackgroundSettledInfo {
 }
 
 /// Which settings surface drifted, so the frontend can word the
-/// "restart to apply" banner precisely ("agent config" vs "model provider").
+/// "restart to apply" banner precisely ("agent config" vs "model provider"
+/// vs "terminal shell").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigStaleKind {
@@ -361,6 +362,8 @@ pub enum ConfigStaleKind {
     AgentConfig,
     /// A model provider row this agent is bound to (url / key / model) changed.
     ModelProvider,
+    /// Global terminal shell selection changed after this connection spawned.
+    TerminalShell,
 }
 
 /// A block of the user's submitted prompt, broadcast via [`AcpEvent::UserMessage`]
