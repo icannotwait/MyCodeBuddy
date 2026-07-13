@@ -1722,13 +1722,20 @@ impl CodexParser {
                                             continue;
                                         }
 
+                                        // Title from visible block text; image turns with
+                                        // only stripped terminal context still get the
+                                        // same "Attached resources" fallback as summary.
                                         if title.is_none() {
-                                            if let Some(text) = first_text_block(&blocks) {
-                                                title = extract_codex_title_candidate(
-                                                    text.as_str(),
-                                                    true,
-                                                );
-                                            }
+                                            title = first_text_block(&blocks)
+                                                .and_then(|text| {
+                                                    extract_codex_title_candidate(
+                                                        text.as_str(),
+                                                        true,
+                                                    )
+                                                })
+                                                .or_else(|| {
+                                                    Some("Attached resources".to_string())
+                                                });
                                         }
 
                                         messages.push(UnifiedMessage {
@@ -2344,8 +2351,10 @@ fn extract_response_item_user_image_blocks(
         return None;
     }
 
-    let text = strip_blocked_resource_mentions(&text_parts.join("\n"));
-    if !text.is_empty() {
+    // Blocked-resource cleanup first, then hide the wire-only terminal context
+    // envelope so "Selected shell:" never lands in history text blocks.
+    let after_blocked = strip_blocked_resource_mentions(&text_parts.join("\n"));
+    if let Some(text) = super::visible_user_text(&after_blocked) {
         blocks.insert(0, ContentBlock::Text { text });
     }
 
@@ -2544,6 +2553,61 @@ mod tests {
                 assert_eq!(data, "QUJD");
             }
             _ => panic!("expected image block"),
+        }
+    }
+
+    #[test]
+    fn response_item_image_blocks_strip_terminal_context_text() {
+        // Context-only input_text must not become a history Text block; image stays.
+        let ctx = test_codeg_terminal_context();
+        let payload = serde_json::json!({
+            "content": [
+                {"type": "input_text", "text": ctx},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,QUJD"
+                }
+            ]
+        });
+
+        let blocks = extract_response_item_user_image_blocks(&payload).expect("blocks");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block"
+        );
+        assert!(
+            !blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text }
+                    if text.contains("Selected shell:")
+                        || text.contains("codeg_terminal_context")
+            )),
+            "terminal context must not emit a text block"
+        );
+
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let payload_real = serde_json::json!({
+            "content": [
+                {"type": "input_text", "text": real_plus},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,QUJD"
+                }
+            ]
+        });
+        let blocks_real =
+            extract_response_item_user_image_blocks(&payload_real).expect("blocks");
+        match blocks_real
+            .iter()
+            .find(|b| matches!(b, ContentBlock::Text { .. }))
+        {
+            Some(ContentBlock::Text { text }) => {
+                assert_eq!(text, "real prompt");
+                assert!(!text.contains("Selected shell:"));
+            }
+            _ => panic!("expected visible user text block"),
         }
     }
 
@@ -4679,5 +4743,36 @@ earlier terminal context records.\n\
 
         assert_eq!(detail.summary.title.as_deref(), Some("Attached resources"));
         assert_eq!(summary.title.as_deref(), Some("Attached resources"));
+
+        let user_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(
+            user_turns[0]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block on the user turn"
+        );
+        // Residual Task 9: response_item image path must strip terminal context
+        // from history blocks, not only from the title candidate.
+        assert!(
+            !user_turn_texts(&detail)
+                .iter()
+                .any(|t| t.contains("Selected shell:") || t.contains("codeg_terminal_context")),
+            "terminal context must not appear as user history text"
+        );
+        assert!(
+            !user_turns[0].blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text }
+                    if text.contains("Selected shell:")
+                        || text.contains("codeg_terminal_context")
+            )),
+            "history blocks must not contain envelope markers"
+        );
     }
 }
