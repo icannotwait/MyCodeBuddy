@@ -130,9 +130,15 @@ impl CodexParser {
                                     .get("message")
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("");
-                                // Context-only records do not set has_real_user / title.
+                                // Pure wire context does not set has_real_user / title.
+                                // Image + context-only still needs the attached-resources
+                                // fallback (Task 8 image-first prompts with Task 9 strip).
+                                let has_images = payload
+                                    .get("images")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|imgs| !imgs.is_empty());
                                 let Some(candidate) =
-                                    extract_codex_title_candidate(text, true)
+                                    extract_codex_title_candidate(text, has_images)
                                 else {
                                     continue;
                                 };
@@ -218,8 +224,11 @@ impl CodexParser {
                             if role == "user" && response_item_user_has_image(payload) {
                                 has_real_user = true;
                                 if title.is_none() {
+                                    // Has image ⇒ fallback_attached so context-only
+                                    // (or empty) text still yields "Attached resources".
                                     title = extract_codex_text_content(payload)
-                                        .and_then(|t| extract_codex_title_candidate(&t, false));
+                                        .and_then(|t| extract_codex_title_candidate(&t, true))
+                                        .or_else(|| Some("Attached resources".to_string()));
                                 }
                             }
                         }
@@ -2180,8 +2189,14 @@ fn extract_codex_title_candidate(input: &str, fallback_attached: bool) -> Option
         };
     }
     let Some(visible) = super::visible_user_text(&cleaned) else {
-        // Complete terminal-context envelope only — not a title source.
-        return None;
+        // Complete terminal-context envelope only — never show the envelope as a
+        // title. When the turn has attached resources/images, restore the same
+        // fallback used for image-only / blocked-placeholder turns.
+        return if fallback_attached {
+            Some("Attached resources".to_string())
+        } else {
+            None
+        };
     };
     Some(title_from_user_text(&visible))
 }
@@ -2474,6 +2489,28 @@ mod tests {
         let input = "修复 codex 会话标题";
         let got = extract_codex_title_candidate(input, true);
         assert_eq!(got.as_deref(), Some("修复 codex 会话标题"));
+    }
+
+    #[test]
+    fn context_only_title_uses_attached_resources_when_fallback() {
+        // Image/resource turns whose text is only the Task 8 wire envelope must
+        // keep the existing "Attached resources" title, not None / the XML.
+        let ctx = test_codeg_terminal_context();
+        assert_eq!(
+            extract_codex_title_candidate(&ctx, true).as_deref(),
+            Some("Attached resources")
+        );
+        assert_eq!(extract_codex_title_candidate(&ctx, false), None);
+
+        let real_plus = format!("real prompt\n\n{ctx}");
+        assert_eq!(
+            extract_codex_title_candidate(&real_plus, true).as_deref(),
+            Some("real prompt")
+        );
+        assert_eq!(
+            extract_codex_title_candidate(&real_plus, false).as_deref(),
+            Some("real prompt")
+        );
     }
 
     #[test]
@@ -4534,5 +4571,113 @@ earlier terminal context records.\n\
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
         assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+    }
+
+    #[test]
+    fn image_plus_context_only_title_is_attached_resources() {
+        // Task 8 appends wire context on image-first prompts; after Task 9 strip
+        // the title must stay "Attached resources", not None / the envelope.
+        let ctx = test_codeg_terminal_context();
+        let image_uri = "data:image/png;base64,QUJD";
+        let lines = vec![
+            rollout_line(
+                "2026-06-29T08:40:00Z",
+                "session_meta",
+                serde_json::json!({"id": "img-ctx", "cwd": "/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "user_message",
+                    "message": ctx,
+                    "images": [image_uri]
+                }),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "ok"}),
+            ),
+        ];
+        let path = write_temp_rollout("img-ctx", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "img-ctx")
+            .expect("detail");
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("summary ok")
+            .expect("summary present");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(detail.summary.title.as_deref(), Some("Attached resources"));
+        assert_eq!(summary.title.as_deref(), Some("Attached resources"));
+        assert!(summary.message_count >= 1);
+
+        let user_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(
+            user_turns[0]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block on the user turn"
+        );
+        assert!(
+            !user_turn_texts(&detail)
+                .iter()
+                .any(|t| t.contains("Selected shell:") || t.contains("codeg_terminal_context")),
+            "terminal context must not appear as user text"
+        );
+    }
+
+    #[test]
+    fn response_item_image_plus_context_only_title_is_attached_resources() {
+        let ctx = test_codeg_terminal_context();
+        let lines = vec![
+            rollout_line(
+                "2026-06-29T08:40:00Z",
+                "session_meta",
+                serde_json::json!({"id": "ri-img-ctx", "cwd": "/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": ctx},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,QUJD"
+                        }
+                    ]
+                }),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "ok"}),
+            ),
+        ];
+        let path = write_temp_rollout("ri-img-ctx", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "ri-img-ctx")
+            .expect("detail");
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("summary ok")
+            .expect("summary present");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(detail.summary.title.as_deref(), Some("Attached resources"));
+        assert_eq!(summary.title.as_deref(), Some("Attached resources"));
     }
 }
