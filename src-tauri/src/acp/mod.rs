@@ -1,6 +1,7 @@
 pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
+pub mod codex_cli;
 pub mod codex_goal;
 pub mod connection;
 pub mod delegation;
