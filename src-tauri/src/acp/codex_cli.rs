@@ -84,9 +84,10 @@ pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<()
     {
         return Ok(());
     }
-    // Also honor process-level CODEX_PATH if user set it outside agent env_json.
+    // Honor process-level CODEX_PATH only when it points at a usable file.
+    // Stale User/System CODEX_PATH must not block auto-detect / PATH resolve.
     if let Ok(v) = std::env::var(CODEX_PATH_ENV) {
-        if !v.trim().is_empty() {
+        if !v.trim().is_empty() && Path::new(&v).is_file() {
             env.insert(CODEX_PATH_ENV.to_string(), v);
             return Ok(());
         }
@@ -275,6 +276,71 @@ mod tests {
                 env.insert(CODEX_PATH_ENV.into(), map_path.into());
                 let out = prepare_codex_launch_env(env).unwrap();
                 assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(map_path));
+            },
+        );
+    }
+
+    #[test]
+    fn ensure_skips_nonexistent_process_codex_path() {
+        // Stale process CODEX_PATH must not be injected as success, and must not
+        // block resolve from finding a real CLI (or Err when nothing is available).
+        let temp = tempfile::tempdir().unwrap();
+        let real = touch_file(temp.path(), "codex.cmd");
+        let stale = temp
+            .path()
+            .join("does-not-exist-codex.cmd")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!Path::new(&stale).is_file());
+
+        // Prepend temp dir so which::which can find codex.cmd as a fallback.
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::new();
+        new_path.push(temp.path().as_os_str());
+        #[cfg(windows)]
+        new_path.push(";");
+        #[cfg(not(windows))]
+        new_path.push(":");
+        new_path.push(&path_var);
+        let new_path_str = new_path.to_string_lossy().into_owned();
+
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(stale.as_str())),
+                ("PATH", Some(new_path_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                match ensure_codex_path_in_env(&mut env) {
+                    Ok(()) => {
+                        let injected = env.get(CODEX_PATH_ENV).expect("CODEX_PATH injected");
+                        assert_ne!(
+                            injected, &stale,
+                            "stale process CODEX_PATH must not be injected"
+                        );
+                        assert!(
+                            Path::new(injected).is_file(),
+                            "injected CODEX_PATH must be a real file: {injected}"
+                        );
+                        // Prefer the PATH hit we planted when resolve finds it.
+                        assert_eq!(
+                            Path::new(injected).file_name(),
+                            real.file_name(),
+                            "expected resolve to surface the real CLI under PATH"
+                        );
+                    }
+                    Err(msg) => {
+                        assert!(
+                            !env.contains_key(CODEX_PATH_ENV),
+                            "must not insert stale CODEX_PATH on failure"
+                        );
+                        assert!(
+                            msg.contains("Codex CLI not found"),
+                            "unexpected error: {msg}"
+                        );
+                    }
+                }
             },
         );
     }
