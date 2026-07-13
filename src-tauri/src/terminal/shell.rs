@@ -195,8 +195,9 @@ pub(crate) fn resolve_from_candidates(
     }
 
     // System branch: try SHELL, then COMSPEC; skip unavailable/unsupported.
+    // Only this branch continues after a bad candidate — explicit/custom fail closed.
     for candidate in [shell_env, comspec].into_iter().flatten() {
-        match classify_resolved_shell(candidate, ShellSource::System) {
+        match classify_system_candidate(candidate) {
             Ok(spec) => {
                 return Ok(ResolvedShellSnapshot {
                     selection_key: terminal_shell_selection_key(&SystemTerminalSettings {
@@ -217,6 +218,10 @@ pub(crate) fn resolve_from_candidates(
 }
 
 /// Classify a concrete executable path into dialect + command strategy.
+///
+/// Basename-only: does not probe the filesystem. Callers that require a
+/// usable file (System candidates, explicit/custom path resolution) must
+/// gate with [`is_usable_executable`] or use [`classify_system_candidate`].
 pub(crate) fn classify_resolved_shell(
     executable: PathBuf,
     source: ShellSource,
@@ -249,6 +254,19 @@ pub(crate) fn classify_resolved_shell(
         source,
         command_strategy,
     })
+}
+
+/// System-branch classification: missing/non-executable paths are
+/// [`ShellResolveError::Unavailable`] so the fallback chain can continue.
+fn classify_system_candidate(executable: PathBuf) -> Result<ResolvedShellSpec, ShellResolveError> {
+    if !is_usable_executable(&executable) {
+        let display_name = display_name_for_path(&executable);
+        return Err(ShellResolveError::Unavailable {
+            display_name,
+            executable: executable.display().to_string(),
+        });
+    }
+    classify_resolved_shell(executable, ShellSource::System)
 }
 
 /// Build a non-interactive process that runs `line` through the resolved shell.
@@ -509,17 +527,9 @@ fn env_var_path(key: &str) -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
-    resolve_setting_path(trimmed).or_else(|| {
-        // System env may point at a path that is not yet validated as a
-        // regular file; still surface it so classify can accept/reject by
-        // basename. Availability for system continues on Unsupported.
-        let path = PathBuf::from(trimmed);
-        if looks_like_path(trimmed) {
-            Some(path)
-        } else {
-            which::which(trimmed).ok()
-        }
-    })
+    // Only surface resolvable, usable executables. Stale SHELL/COMSPEC values
+    // must not block the System fallback chain.
+    resolve_setting_path(trimmed)
 }
 
 #[cfg(test)]
@@ -587,35 +597,101 @@ mod tests {
         assert!(matches!(err, ShellResolveError::Unavailable { .. }));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn system_selection_uses_comspec_after_invalid_shell() {
-        let comspec = PathBuf::from(r"C:\Windows\System32\cmd.exe");
-        let snapshot = resolve_from_candidates(None, None, None, Some(comspec.clone())).unwrap();
-        assert_eq!(snapshot.spec.executable, comspec);
-        assert_eq!(snapshot.spec.source, ShellSource::System);
-        assert_eq!(snapshot.spec.dialect, ShellDialect::Cmd);
+    /// Create a regular file that passes [`is_usable_executable`] (Unix: +x).
+    fn make_usable_shell(dir: &std::path::Path, basename: &str) -> PathBuf {
+        let path = dir.join(basename);
+        std::fs::write(&path, b"").expect("write temp shell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
     }
 
-    #[cfg(windows)]
     #[test]
-    fn system_selection_skips_existing_but_unsupported_shell() {
-        let unsupported = PathBuf::from(r"C:\tools\mystery.exe");
-        let comspec = PathBuf::from(r"C:\Windows\System32\cmd.exe");
-        let snapshot =
-            resolve_from_candidates(None, None, Some(unsupported), Some(comspec.clone())).unwrap();
-        assert_eq!(snapshot.spec.executable, comspec);
-        assert_eq!(snapshot.spec.dialect, ShellDialect::Cmd);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn system_selection_uses_resolved_shell_candidate() {
-        let shell = PathBuf::from("/bin/zsh");
+    fn system_selection_uses_usable_shell_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = make_usable_shell(dir.path(), if cfg!(windows) { "cmd.exe" } else { "zsh" });
         let snapshot = resolve_from_candidates(None, None, Some(shell.clone()), None).unwrap();
         assert_eq!(snapshot.spec.executable, shell);
         assert_eq!(snapshot.spec.source, ShellSource::System);
-        assert_eq!(snapshot.spec.dialect, ShellDialect::Posix);
+        assert_eq!(
+            snapshot.spec.dialect,
+            if cfg!(windows) {
+                ShellDialect::Cmd
+            } else {
+                ShellDialect::Posix
+            }
+        );
+    }
+
+    #[test]
+    fn system_selection_skips_existing_but_unsupported_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsupported = make_usable_shell(
+            dir.path(),
+            if cfg!(windows) {
+                "mystery.exe"
+            } else {
+                "mystery"
+            },
+        );
+        let fallback = make_usable_shell(dir.path(), if cfg!(windows) { "cmd.exe" } else { "sh" });
+        let snapshot =
+            resolve_from_candidates(None, None, Some(unsupported), Some(fallback.clone())).unwrap();
+        assert_eq!(snapshot.spec.executable, fallback);
+        assert_eq!(
+            snapshot.spec.dialect,
+            if cfg!(windows) {
+                ShellDialect::Cmd
+            } else {
+                ShellDialect::Posix
+            }
+        );
+    }
+
+    #[test]
+    fn system_selection_skips_unusable_known_basename_shell() {
+        // Stale SHELL with a known basename (missing/non-executable) must not
+        // block COMSPEC / the next System candidate.
+        let unusable = PathBuf::from(if cfg!(windows) {
+            r"C:\definitely\missing\Git\bin\bash.exe"
+        } else {
+            "/definitely/missing/bin/bash"
+        });
+        assert!(
+            !is_usable_executable(&unusable),
+            "precondition: path must be unusable"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = make_usable_shell(dir.path(), if cfg!(windows) { "cmd.exe" } else { "sh" });
+        let snapshot =
+            resolve_from_candidates(None, None, Some(unusable), Some(fallback.clone())).unwrap();
+        assert_eq!(snapshot.spec.executable, fallback);
+        assert_eq!(snapshot.spec.source, ShellSource::System);
+        assert_eq!(
+            snapshot.spec.dialect,
+            if cfg!(windows) {
+                ShellDialect::Cmd
+            } else {
+                ShellDialect::Posix
+            }
+        );
+    }
+
+    #[test]
+    fn system_unusable_only_candidate_is_unavailable() {
+        let unusable = PathBuf::from(if cfg!(windows) {
+            r"C:\definitely\missing\bash.exe"
+        } else {
+            "/definitely/missing/bash"
+        });
+        let err = resolve_from_candidates(None, None, Some(unusable), None).unwrap_err();
+        assert!(matches!(err, ShellResolveError::Unavailable { .. }));
     }
 
     #[test]
