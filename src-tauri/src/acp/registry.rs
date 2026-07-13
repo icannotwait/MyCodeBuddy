@@ -155,14 +155,15 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
 
 fn codex_distribution_for(platform: &str) -> AgentDistribution {
     if platform == "windows-x86_64" {
+        // Bundled MyCodeBuddy fork keeps custom ACP behavior. Host Codex is
+        // injected as CODEX_PATH at launch so the adapter drives
+        // `codex app-server` (model/list, turns, sessions) rather than the
+        // experimental single-model CLI runtime (`CODEX_ACP_USE_CLI`).
         AgentDistribution::Bundled {
-            version: "1.1.2-mycodebuddy.1",
+            version: "1.1.2-mycodebuddy.2",
             cmd: "codex-acp",
             args: &[],
-            env: &[
-                ("CODEX_ACP_USE_CLI", "1"),
-                ("CODEX_ACP_CLI_MODEL", "gpt-5.5"),
-            ],
+            env: &[],
             override_env: crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV,
             platforms: &["windows-x86_64"],
         }
@@ -378,19 +379,19 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
             // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
             distribution: AgentDistribution::Npx {
-                version: "0.2.94",
-                package: "@xai-official/grok@0.2.94",
+                version: "0.2.98",
+                package: "@xai-official/grok@0.2.98",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
                 // flags (`--no-auto-update` always, `--always-approve` only when
                 // the user picked that permission mode) MUST precede this
                 // subcommand — `grok agent stdio` itself rejects them (verified
-                // against 0.2.94: it only accepts --debug/--debug-file/
-                // --leader-socket) — so `build_agent` inserts them ahead of these
-                // args rather than appending after.
+                // against 0.2.94; still applies on 0.2.98: it only accepts
+                // --debug/--debug-file/--leader-socket) — so `build_agent`
+                // inserts them ahead of these args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@0.2.94` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@0.2.98` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
@@ -517,8 +518,8 @@ mod tests {
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "0.2.94",
-            "@xai-official/grok@0.2.94",
+            "0.2.98",
+            "@xai-official/grok@0.2.98",
             Some("20.0.0"),
         );
         assert_binary_version(AgentType::OpenCode, "1.17.18", "/releases/download/v1.17.18/");
@@ -535,14 +536,23 @@ mod tests {
 
     #[test]
     fn codex_is_bundled_only_on_windows_x64() {
-        assert!(matches!(
-            codex_distribution_for("windows-x86_64"),
+        match codex_distribution_for("windows-x86_64") {
             AgentDistribution::Bundled {
-                version: "1.1.2-mycodebuddy.1",
-                override_env: "CODEG_CODEX_ACP_BIN",
+                version,
+                override_env,
+                env,
                 ..
+            } => {
+                assert_eq!(version, "1.1.2-mycodebuddy.2");
+                assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
+                // App-server path: no CODEX_ACP_USE_CLI / CODEX_ACP_CLI_MODEL pin.
+                assert!(
+                    env.is_empty(),
+                    "Windows bundled codex-acp must not force CLI runtime env, got {env:?}"
+                );
             }
-        ));
+            other => panic!("expected bundled Codex on windows-x86_64, got {other:?}"),
+        }
         match codex_distribution_for("darwin-aarch64") {
             AgentDistribution::Npx {
                 version,

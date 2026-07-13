@@ -628,13 +628,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Seed a live watch entry (backed by a real long-lived child bound to `port`)
 /// so proxy integration tests can exercise the gate without a real officecli.
-/// Unix-only at runtime (`sleep`); on Windows CI `cargo test` is `--no-run`.
 #[cfg(feature = "test-utils")]
 pub fn insert_known_port_for_test(port: u16, cap: &str) {
-    let child = tokio_command("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn test sleeper");
+    #[cfg(windows)]
+    let mut sleeper = {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let mut command =
+            tokio_command(system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 600",
+        ]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut sleeper = {
+        let mut command = tokio_command("sleep");
+        command.arg("600");
+        command
+    };
+    let child = sleeper.spawn().expect("spawn test sleeper");
     lock_watches().insert(
         format!("__test__:{port}"),
         WatchInstance {

@@ -1,0 +1,410 @@
+//! Host Codex binary path resolution for `CODEX_PATH`.
+//!
+//! Windows ships a bundled `codex-acp` adapter that cannot resolve the npm-packaged
+//! `@openai/codex` dependency, so it always needs a host Codex binary to spawn
+//! `codex app-server` (and, when `CODEX_ACP_USE_CLI=1`, `codex exec`). Non-Windows
+//! npx packages embed `@openai/codex` and only need `CODEX_PATH` when CLI mode is on.
+//!
+//! Pure selection prefers: explicit path → PATH hit → npm global `@openai/codex` entry.
+//! Auto-detect never overwrites an existing non-empty `CODEX_PATH`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+pub const CODEX_PATH_ENV: &str = "CODEX_PATH";
+
+/// Prefer explicit path, then PATH hit, then npm global `@openai/codex` entry.
+pub fn select_codex_cli_path(
+    explicit: Option<&Path>,
+    on_path: Option<PathBuf>,
+    npm_global_prefix: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        if is_usable_cli_path(p) {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Some(p) = on_path {
+        if is_usable_cli_path(&p) {
+            return Some(p);
+        }
+    }
+    if let Some(prefix) = npm_global_prefix {
+        // Prefer executable npm shims; use the JS entry only as a fallback.
+        for name in ["codex.cmd", "codex.exe", "codex"] {
+            let cand = prefix.join(name);
+            if is_usable_cli_path(&cand) {
+                return Some(cand);
+            }
+        }
+        let js = prefix
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        if is_usable_cli_path(&js) {
+            return Some(js);
+        }
+    }
+    None
+}
+
+fn is_usable_cli_path(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Host resolution used at launch/preflight time.
+pub fn resolve_codex_cli_path() -> Option<PathBuf> {
+    let explicit = std::env::var_os(CODEX_PATH_ENV).map(PathBuf::from);
+    let on_path = which::which("codex")
+        .ok()
+        .or_else(|| which::which("codex.cmd").ok());
+    // Best-effort sync npm prefix: APPDATA\npm on Windows, or `npm root -g` parent.
+    // Keep this function free of async; use known Windows location first:
+    let npm_prefix = default_npm_global_prefix();
+    select_codex_cli_path(explicit.as_deref(), on_path, npm_prefix.as_deref())
+}
+
+fn default_npm_global_prefix() -> Option<PathBuf> {
+    // Windows: %APPDATA%\npm is the default global bin/prefix layout for npm shims.
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let p = PathBuf::from(appdata).join("npm");
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    // Non-Windows: ~/.npm-global is not reliable; which::which already covers PATH.
+    None
+}
+
+fn missing_codex_cli_message() -> &'static str {
+    "Codex CLI is not installed. Install with `npm install -g @openai/codex`, \
+     or set CODEX_PATH to your codex executable (or codex.js). \
+     MyCodeBuddy's bundled codex-acp adapter requires a host Codex CLI \
+     to run `codex app-server`."
+}
+
+pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<(), String> {
+    if env
+        .get(CODEX_PATH_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    // Honor process-level CODEX_PATH only when it points at a usable file.
+    // Stale User/System CODEX_PATH must not block auto-detect / PATH resolve.
+    if let Ok(v) = std::env::var(CODEX_PATH_ENV) {
+        if !v.trim().is_empty() && Path::new(&v).is_file() {
+            env.insert(CODEX_PATH_ENV.to_string(), v);
+            return Ok(());
+        }
+    }
+    match resolve_codex_cli_path() {
+        Some(path) => {
+            env.insert(
+                CODEX_PATH_ENV.to_string(),
+                path.to_string_lossy().into_owned(),
+            );
+            Ok(())
+        }
+        None => Err(missing_codex_cli_message().to_string()),
+    }
+}
+
+/// True when the effective launch env asks for the experimental CLI exec runtime.
+pub fn cli_mode_enabled(env: &BTreeMap<String, String>) -> bool {
+    env.get("CODEX_ACP_USE_CLI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or_else(|| {
+            std::env::var("CODEX_ACP_USE_CLI")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+}
+
+/// True when this Codex launch must resolve a host Codex binary into `CODEX_PATH`.
+///
+/// - Windows: always (bundled adapter spawns host `codex app-server`).
+/// - Elsewhere: only when experimental `CODEX_ACP_USE_CLI` is enabled.
+pub fn host_codex_required(env: &BTreeMap<String, String>) -> bool {
+    cfg!(windows) || cli_mode_enabled(env)
+}
+
+/// Prepare env for a Codex ACP launch: inject host `CODEX_PATH` when required.
+///
+/// Does not overwrite an explicit non-empty `CODEX_PATH` already present in `env`.
+/// Returns `Err` with a user-facing message when a host Codex is required but none
+/// can be resolved (caller maps this to `AcpError::SdkNotInstalled`).
+pub fn prepare_codex_launch_env(
+    mut env: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if host_codex_required(&env) {
+        ensure_codex_path_in_env(&mut env)?;
+    }
+    Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn touch_file(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    #[test]
+    fn explicit_wins_over_path_and_npm() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit = touch_file(temp.path(), "explicit-codex.cmd");
+        let on_path = touch_file(temp.path(), "path-codex.cmd");
+        let prefix = temp.path().join("npm-prefix");
+        fs::create_dir_all(prefix.join("node_modules").join("@openai").join("codex").join("bin"))
+            .unwrap();
+        let npm_js = touch_file(
+            &prefix
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin"),
+            "codex.js",
+        );
+        let _ = npm_js;
+        let selected =
+            select_codex_cli_path(Some(&explicit), Some(on_path), Some(&prefix)).unwrap();
+        assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn path_wins_over_npm_when_no_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let on_path = touch_file(temp.path(), "path-codex.cmd");
+        let prefix = temp.path().join("npm-prefix");
+        fs::create_dir_all(prefix.join("node_modules").join("@openai").join("codex").join("bin"))
+            .unwrap();
+        touch_file(
+            &prefix
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin"),
+            "codex.js",
+        );
+        let selected = select_codex_cli_path(None, Some(on_path.clone()), Some(&prefix)).unwrap();
+        assert_eq!(selected, on_path);
+    }
+
+    #[test]
+    fn npm_global_shim_wins_over_js() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("npm-prefix");
+        let bin = prefix
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        touch_file(&bin, "codex.js");
+        let shim = touch_file(&prefix, "codex.cmd");
+
+        let selected = select_codex_cli_path(None, None, Some(&prefix)).unwrap();
+
+        assert_eq!(selected, shim);
+    }
+
+    #[test]
+    fn npm_global_js_used_when_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("npm-prefix");
+        let bin = prefix
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let js = touch_file(&bin, "codex.js");
+        let selected = select_codex_cli_path(None, None, Some(&prefix)).unwrap();
+        assert_eq!(selected, js);
+    }
+
+    #[test]
+    fn missing_everything_returns_none() {
+        assert!(select_codex_cli_path(None, None, None).is_none());
+    }
+
+    #[test]
+    fn ensure_does_not_overwrite_existing_codex_path() {
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_PATH".into(), "C:\\already\\set\\codex.cmd".into());
+        ensure_codex_path_in_env(&mut env).unwrap();
+        assert_eq!(env.get("CODEX_PATH").unwrap(), "C:\\already\\set\\codex.cmd");
+    }
+
+    #[test]
+    fn missing_codex_cli_message_keeps_frontend_routing_token() {
+        assert!(missing_codex_cli_message().contains("is not installed"));
+    }
+
+    #[test]
+    fn prepare_injects_when_cli_mode_and_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = touch_file(temp.path(), "codex.cmd");
+        let fake_str = fake.to_string_lossy().into_owned();
+
+        // Map lacks CODEX_PATH; process CODEX_PATH points at a usable fake CLI.
+        // Unset process CODEX_ACP_USE_CLI so map key alone drives cli mode.
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(fake_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(fake_str.as_str()));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn prepare_skips_when_cli_mode_off_on_non_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = touch_file(temp.path(), "codex.cmd");
+        let fake_str = fake.to_string_lossy().into_owned();
+
+        // Non-Windows app-server uses the npm-packaged codex; no host inject.
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(fake_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let env = BTreeMap::new();
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert!(!out.contains_key(CODEX_PATH_ENV));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn prepare_injects_on_windows_even_without_cli_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = touch_file(temp.path(), "codex.cmd");
+        let fake_str = fake.to_string_lossy().into_owned();
+
+        // Windows bundled adapter always needs host codex for app-server.
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(fake_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let env = BTreeMap::new();
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(fake_str.as_str()));
+            },
+        );
+    }
+
+    #[test]
+    fn prepare_preserves_existing_map_codex_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let process_path = touch_file(temp.path(), "process-codex.cmd");
+        let process_str = process_path.to_string_lossy().into_owned();
+        let map_path = "C:\\already\\set\\codex.cmd";
+
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(process_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                // Force host_codex_required on all platforms via CLI mode flag.
+                env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
+                env.insert(CODEX_PATH_ENV.into(), map_path.into());
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(map_path));
+            },
+        );
+    }
+
+    #[test]
+    fn host_codex_required_when_cli_mode() {
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
+        assert!(host_codex_required(&env));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn host_codex_not_required_off_cli_non_windows() {
+        assert!(!host_codex_required(&BTreeMap::new()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_codex_required_on_windows_without_cli() {
+        assert!(host_codex_required(&BTreeMap::new()));
+    }
+
+    #[test]
+    fn ensure_skips_nonexistent_process_codex_path() {
+        // Stale process CODEX_PATH must not be injected as success or block PATH
+        // resolution from finding the real CLI fixture.
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let real = touch_file(temp.path(), "codex.cmd");
+        #[cfg(unix)]
+        let real = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = touch_file(temp.path(), "codex");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let stale = temp
+            .path()
+            .join("does-not-exist-codex.cmd")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!Path::new(&stale).is_file());
+
+        // Prepend temp dir so which::which can find codex.cmd as a fallback.
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::new();
+        new_path.push(temp.path().as_os_str());
+        #[cfg(windows)]
+        new_path.push(";");
+        #[cfg(not(windows))]
+        new_path.push(":");
+        new_path.push(&path_var);
+        let new_path_str = new_path.to_string_lossy().into_owned();
+
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(stale.as_str())),
+                ("PATH", Some(new_path_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                ensure_codex_path_in_env(&mut env)
+                    .expect("PATH fixture should resolve after stale CODEX_PATH is skipped");
+                let injected = env.get(CODEX_PATH_ENV).expect("CODEX_PATH injected");
+                assert_eq!(Path::new(injected), real.as_path());
+            },
+        );
+    }
+}

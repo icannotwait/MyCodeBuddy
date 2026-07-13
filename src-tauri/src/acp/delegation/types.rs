@@ -123,6 +123,7 @@ pub const TIMEOUT_CANCEL_GUIDANCE: &str =
 /// CommonMark rules (simplified):
 /// - open/close by the same run character (`` ` `` or `~`)
 /// - a closing fence must be at least as long as the opener
+///
 /// so `~~~` inside a ``` block, or ``` inside ````, does not end it early.
 fn text_outside_code_fences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -236,7 +237,7 @@ pub fn extract_mandatory_profile_ids(text: &str) -> Vec<String> {
         };
         let token = after[..token_end].trim();
         let path = token
-            .split(|c: char| c == ' ' || c == '"' || c == '\'')
+            .split([' ', '"', '\''])
             .next()
             .unwrap_or("");
         let candidate = path.rsplit_once('/').map(|(_, id)| id).unwrap_or(path);

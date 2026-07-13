@@ -576,6 +576,7 @@ const ConversationTabView = memo(function ConversationTabView({
   // can surface it next to detail-load errors. Cleared automatically when
   // the connection's loadError clears (e.g. via Reload).
   const connLoadError = conn.loadError
+  const connLoadErrorCode = conn.loadErrorCode
   useEffect(() => {
     setAcpLoadError(effectiveConversationId, connLoadError ?? null)
   }, [connLoadError, effectiveConversationId, setAcpLoadError])
@@ -1365,6 +1366,7 @@ const ConversationTabView = memo(function ConversationTabView({
       detailLoading={detailLoading}
       detailError={detailError}
       acpLoadError={acpLoadError}
+      acpLoadErrorCode={connLoadErrorCode}
       hideEmptyState={!hasPersistedConversation || hasSentMessage}
       onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
       onNewSession={

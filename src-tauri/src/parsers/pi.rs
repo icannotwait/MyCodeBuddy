@@ -15,7 +15,7 @@ use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
     latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
     resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, truncate_str,
-    AgentParser, ParseError,
+    visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve the `pi` coding agent's sessions directory, honoring (highest
@@ -304,9 +304,7 @@ fn parse_session(path: &Path) -> SessionParse {
                     sp.session_name = value
                         .get("name")
                         .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
+                        .and_then(|s| visible_title(Some(s.to_string())));
                 }
             }
             "model_change" => {
@@ -341,13 +339,13 @@ fn parse_message_record(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>,
     match role {
         "user" => {
             let text = user_content_text(message.get("content"));
-            if text.trim().is_empty() {
+            let Some(text) = visible_user_text(&text) else {
                 return;
-            }
+            };
             sp.content_events += 1;
             sp.message_count += 1;
             if sp.first_user_text.is_none() {
-                sp.first_user_text = Some(title_from_user_text(text.trim()));
+                sp.first_user_text = Some(title_from_user_text(&text));
             }
             sp.messages.push(text_message(
                 format!("pi-user-{idx}"),
@@ -1101,5 +1099,65 @@ mod tests {
             parser.get_conversation("nope"),
             Err(ParseError::ConversationNotFound(_))
         ));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path();
+        let id = "0f3c1d2e-term-ctx-3333-444455556666";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        write_session(
+            base,
+            "--Users-demo-my-app--",
+            "2026-06-27T10-00-00_0f3c1d2e-term.jsonl",
+            &[
+                json!({"type":"session","version":3,"id":id,"timestamp":"2026-06-27T10:00:00.000Z","cwd":"/Users/demo/my-app"}),
+                json!({"type":"session_info","id":"i1","parentId":null,"timestamp":"2026-06-27T10:00:00.100Z","name":ctx}),
+                json!({"type":"message","id":"m0","parentId":null,"timestamp":"2026-06-27T10:00:01.000Z",
+                       "message":{"role":"user","content":[{"type":"text","text":ctx}]}}),
+                json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-06-27T10:00:02.000Z",
+                       "message":{"role":"user","content":[{"type":"text","text":real_plus}]}}),
+                json!({"type":"message","id":"m2","parentId":null,"timestamp":"2026-06-27T10:00:03.000Z",
+                       "message":{"role":"user","content":[{"type":"text","text":"<codeg_terminal_context version=\"1\">partial"}]}}),
+            ],
+        );
+
+        let parser = PiParser::with_base_dir(base.to_path_buf());
+        let detail = parser.get_conversation(id).unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

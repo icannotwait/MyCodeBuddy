@@ -5,15 +5,31 @@ use tauri::Manager;
 #[cfg(feature = "tauri-runtime")]
 use tauri::State;
 
+use crate::db::AppDatabase;
 use crate::git_credential;
-#[cfg(feature = "tauri-runtime")]
 use crate::terminal::error::TerminalError;
+use crate::terminal::shell::{resolve_terminal_shell, ResolvedShellSpec};
 #[cfg(feature = "tauri-runtime")]
 use crate::terminal::manager::{SpawnOptions, TerminalManager};
 #[cfg(feature = "tauri-runtime")]
 use crate::terminal::types::TerminalInfo;
 #[cfg(feature = "tauri-runtime")]
 use crate::web::event_bridge::EventEmitter;
+
+/// Load the persisted default shell and resolve it for interactive spawn.
+///
+/// Called by both the Tauri command and the web handler so every new terminal
+/// tab rereads SQLite — running PTYs keep whatever executable they already own.
+pub(crate) async fn resolve_interactive_shell(
+    db: &AppDatabase,
+) -> Result<ResolvedShellSpec, TerminalError> {
+    let settings = crate::commands::system_settings::load_system_terminal_settings(&db.conn)
+        .await
+        .map_err(|error| TerminalError::SpawnFailed(error.to_string()))?;
+    resolve_terminal_shell(&settings)
+        .map(|snapshot| snapshot.spec)
+        .map_err(|error| TerminalError::SpawnFailed(error.to_string()))
+}
 
 /// Build extra env vars for the terminal session.
 ///
@@ -66,10 +82,10 @@ pub(crate) fn prepare_credential_env(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn terminal_spawn(
     working_dir: String,
-    shell: Option<String>,
     initial_command: Option<String>,
     terminal_id: Option<String>,
     manager: State<'_, TerminalManager>,
+    db: State<'_, AppDatabase>,
     app_handle: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<String, TerminalError> {
@@ -89,6 +105,7 @@ pub async fn terminal_spawn(
     let effective_data_dir = crate::paths::resolve_effective_data_dir(&app_data_dir);
 
     let extra_env = prepare_credential_env(&effective_data_dir);
+    let shell = resolve_interactive_shell(&db).await?;
 
     manager.spawn_with_id(
         SpawnOptions {

@@ -1,4 +1,6 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::acp::binary_cache;
@@ -54,10 +56,13 @@ pub fn clear_npm_env_cache() {
     *NPM_ENV_CACHE.lock().unwrap() = None;
 }
 
-pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
+pub async fn run_preflight(
+    agent_type: AgentType,
+    runtime_env: &BTreeMap<String, String>,
+) -> PreflightResult {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
-    let checks = match &meta.distribution {
+    let mut checks = match &meta.distribution {
         AgentDistribution::Npx { node_required, .. } => check_npm_environment(*node_required).await,
         AgentDistribution::Binary {
             version,
@@ -80,6 +85,12 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
         } => check_uv_environment(*uv_required, *system_cmd).await,
     };
 
+    // Windows bundled codex-acp needs a host Codex to spawn `codex app-server`.
+    // Non-Windows Npx packages already ship the codex dependency.
+    if agent_type == AgentType::Codex && cfg!(windows) {
+        checks.push(check_codex_cli_host(runtime_env));
+    }
+
     let passed = checks
         .iter()
         .all(|c| !matches!(c.status, CheckStatus::Fail));
@@ -89,6 +100,58 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
         agent_name: meta.name.to_string(),
         passed,
         checks,
+    }
+}
+
+/// Prefer a non-empty saved `CODEX_PATH`. An invalid saved path is an explicit
+/// failure because launch preserves that same value instead of auto-detecting.
+fn select_codex_cli_host_path<F>(
+    runtime_env: &BTreeMap<String, String>,
+    fallback: F,
+) -> Option<PathBuf>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(saved) = runtime_env
+        .get(crate::acp::codex_cli::CODEX_PATH_ENV)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(saved);
+        return path.is_file().then_some(path);
+    }
+
+    fallback()
+}
+
+/// Resolve host Codex CLI from saved settings, then process/PATH/npm fallback.
+fn check_codex_cli_host(runtime_env: &BTreeMap<String, String>) -> CheckItem {
+    let path = select_codex_cli_host_path(runtime_env, || {
+        crate::acp::codex_cli::resolve_codex_cli_path()
+    });
+    codex_cli_host_check_item(path)
+}
+
+/// Pure mapping from resolved path → preflight `CheckItem` (unit-testable).
+fn codex_cli_host_check_item(path: Option<PathBuf>) -> CheckItem {
+    match path {
+        Some(path) => CheckItem {
+            check_id: "codex_cli".into(),
+            label: "Codex CLI".into(),
+            status: CheckStatus::Pass,
+            message: format!("Codex CLI available at {}", path.display()),
+            fixes: vec![],
+        },
+        None => CheckItem {
+            check_id: "codex_cli".into(),
+            label: "Codex CLI".into(),
+            status: CheckStatus::Fail,
+            message: "Host Codex CLI not found. The built-in codex-acp adapter needs a local Codex CLI to run app-server (install @openai/codex or set CODEX_PATH).".into(),
+            fixes: vec![FixAction {
+                label: "Install Codex CLI".into(),
+                kind: FixActionKind::OpenUrl,
+                payload: "https://www.npmjs.com/package/@openai/codex".into(),
+            }],
+        },
     }
 }
 
@@ -627,4 +690,91 @@ async fn check_binary_environment(
     }
 
     checks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn valid_saved_codex_cli_path_wins_over_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = temp.path().join("saved-codex.cmd");
+        let fallback = temp.path().join("fallback-codex.cmd");
+        fs::write(&saved, b"saved").unwrap();
+        fs::write(&fallback, b"fallback").unwrap();
+        let runtime_env = BTreeMap::from([(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            saved.to_string_lossy().into_owned(),
+        )]);
+
+        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
+
+        assert_eq!(selected.as_deref(), Some(saved.as_path()));
+    }
+
+    #[test]
+    fn invalid_saved_codex_cli_path_is_not_masked_by_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-codex.cmd");
+        let fallback = temp.path().join("fallback-codex.cmd");
+        fs::write(&fallback, b"fallback").unwrap();
+        let runtime_env = BTreeMap::from([(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            missing.to_string_lossy().into_owned(),
+        )]);
+
+        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn codex_cli_host_pass_when_path_present() {
+        let path = PathBuf::from(r"C:\tools\codex.cmd");
+        let item = codex_cli_host_check_item(Some(path.clone()));
+        assert_eq!(item.check_id, "codex_cli");
+        assert_eq!(item.label, "Codex CLI");
+        assert!(matches!(item.status, CheckStatus::Pass));
+        assert!(item.message.contains(path.to_string_lossy().as_ref()));
+        assert!(item.fixes.is_empty());
+    }
+
+    #[test]
+    fn codex_cli_host_fail_when_path_missing() {
+        let item = codex_cli_host_check_item(None);
+        assert_eq!(item.check_id, "codex_cli");
+        assert_eq!(item.label, "Codex CLI");
+        assert!(matches!(item.status, CheckStatus::Fail));
+        assert!(item.message.contains("Host Codex CLI not found"));
+        assert_eq!(item.fixes.len(), 1);
+        assert!(matches!(item.fixes[0].kind, FixActionKind::OpenUrl));
+        assert_eq!(
+            item.fixes[0].payload,
+            "https://www.npmjs.com/package/@openai/codex"
+        );
+        assert_eq!(item.fixes[0].label, "Install Codex CLI");
+    }
+
+    #[test]
+    fn codex_cli_host_fail_blocks_preflight_passed() {
+        let fail = codex_cli_host_check_item(None);
+        let checks = [
+            CheckItem {
+                check_id: "platform_supported".into(),
+                label: "Platform".into(),
+                status: CheckStatus::Pass,
+                message: "ok".into(),
+                fixes: vec![],
+            },
+            fail,
+        ];
+        let passed = checks
+            .iter()
+            .all(|c| !matches!(c.status, CheckStatus::Fail));
+        assert!(!passed);
+    }
 }

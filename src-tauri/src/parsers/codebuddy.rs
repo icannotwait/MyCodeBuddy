@@ -15,7 +15,7 @@ use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
     is_safe_subagent_id, latest_turn_total_usage_tokens, merge_context_window_stats,
     relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
-    title_from_user_text, truncate_str, AgentParser, ParseError,
+    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve CodeBuddy's config dir, honoring `CODEBUDDY_CONFIG_DIR`, else
@@ -107,19 +107,18 @@ impl CodeBuddyParser {
                         ai_title = value
                             .get("aiTitle")
                             .and_then(|t| t.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(String::from);
+                            .and_then(|t| visible_title(Some(t.to_string())));
                     }
                 }
                 "message" => match value.get("role").and_then(|r| r.as_str()).unwrap_or("") {
                     "user" => {
+                        let text = collect_text(&value, "input_text");
+                        let Some(visible) = visible_user_text(&text) else {
+                            continue;
+                        };
                         message_count += 1;
                         if first_user_text.is_none() {
-                            let text = collect_text(&value, "input_text");
-                            if !text.trim().is_empty() {
-                                first_user_text = Some(title_from_user_text(text.trim()));
-                            }
+                            first_user_text = Some(title_from_user_text(&visible));
                         }
                     }
                     "assistant" => message_count += 1,
@@ -211,28 +210,27 @@ impl CodeBuddyParser {
                         ai_title = value
                             .get("aiTitle")
                             .and_then(|t| t.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(String::from);
+                            .and_then(|t| visible_title(Some(t.to_string())));
                     }
                 }
                 "message" => match value.get("role").and_then(|r| r.as_str()).unwrap_or("") {
                     "user" => {
-                        message_count += 1;
                         let text = collect_text(&value, "input_text");
-                        if first_user_text.is_none() && !text.trim().is_empty() {
-                            first_user_text = Some(title_from_user_text(text.trim()));
+                        let Some(visible) = visible_user_text(&text) else {
+                            continue;
+                        };
+                        message_count += 1;
+                        if first_user_text.is_none() {
+                            first_user_text = Some(title_from_user_text(&visible));
                         }
-                        if !text.trim().is_empty() {
-                            messages.push(text_message(
-                                format!("cb-user-{idx}"),
-                                MessageRole::User,
-                                text,
-                                ts,
-                                None,
-                                None,
-                            ));
-                        }
+                        messages.push(text_message(
+                            format!("cb-user-{idx}"),
+                            MessageRole::User,
+                            visible,
+                            ts,
+                            None,
+                            None,
+                        ));
                     }
                     "assistant" => {
                         message_count += 1;
@@ -1776,6 +1774,66 @@ mod tests {
             parser.get_conversation(sid).is_ok(),
             "the session must be openable, not skipped as a transcript"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-term-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-term-ctx";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1781821844000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":ctx}]}),
+                json!({"type":"message","role":"user","timestamp":1781821844100i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":real_plus}]}),
+                json!({"type":"message","role":"user","timestamp":1781821844200i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"<codeg_terminal_context version=\"1\">partial"}]}),
+                json!({"type":"ai-title","timestamp":1781821845000i64,"aiTitle":ctx,"cwd":"/Users/demo/app","sessionId":sid}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
 
         std::fs::remove_dir_all(&root).ok();
     }

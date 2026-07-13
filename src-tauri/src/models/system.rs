@@ -67,9 +67,10 @@ pub struct TerminalShellOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableTerminalShells {
     pub options: Vec<TerminalShellOption>,
-    /// What `resolve_shell()` would currently fall back to. Surfaced read-only
-    /// in the UI so users can see what "system default" actually maps to.
-    pub resolved_shell: String,
+    /// Resolved path for the *selected* setting (not only system default).
+    /// Explicit/custom values surface their resolved executable when available,
+    /// otherwise the stored value; system surfaces the system snapshot path.
+    pub effective_shell: String,
 }
 
 #[cfg(feature = "tauri-runtime")]

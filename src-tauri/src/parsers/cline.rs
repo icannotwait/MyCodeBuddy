@@ -10,8 +10,8 @@ use crate::models::{
 };
 
 use super::{
-    compute_session_stats, folder_name_from_path, title_from_user_text, truncate_str, AgentParser,
-    ParseError,
+    compute_session_stats, folder_name_from_path, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,7 +161,11 @@ impl AgentParser for ClineParser {
             let folder_path = entry.cwd_on_task_initialization.clone();
             let folder_name = folder_path.as_deref().map(folder_name_from_path);
 
-            let title = entry.task.as_deref().map(|t| title_from_user_text(t.trim()));
+            let title = entry
+                .task
+                .as_deref()
+                .and_then(|t| visible_title(Some(t.trim().to_string())))
+                .map(|t| title_from_user_text(&t));
 
             // Count messages from api_conversation_history.json
             let api_path = tasks_dir.join("api_conversation_history.json");
@@ -239,10 +243,11 @@ impl AgentParser for ClineParser {
             .as_ref()
             .and_then(|e| e.cwd_on_task_initialization.clone());
         let folder_name = folder_path.as_deref().map(folder_name_from_path);
-        let title = history_entry
+        let mut title = history_entry
             .as_ref()
             .and_then(|e| e.task.as_deref())
-            .map(|t| title_from_user_text(t.trim()));
+            .and_then(|t| visible_title(Some(t.trim().to_string())))
+            .map(|t| title_from_user_text(&t));
 
         let mut turns: Vec<MessageTurn> = Vec::new();
         let mut turn_counter = 0u32;
@@ -331,6 +336,22 @@ impl AgentParser for ClineParser {
         let started_at = turns.first().map(|t| t.timestamp).unwrap_or_else(Utc::now);
         let ended_at = turns.last().map(|t| t.timestamp);
 
+        // When the task field was only terminal context (or missing), fall back
+        // to the first visible user-turn text so list title stays useful.
+        if title.is_none() {
+            title = turns.iter().find_map(|turn| {
+                if !matches!(turn.role, TurnRole::User) {
+                    return None;
+                }
+                turn.blocks.iter().find_map(|b| match b {
+                    ContentBlock::Text { text } if !text.is_empty() => {
+                        Some(title_from_user_text(text))
+                    }
+                    _ => None,
+                })
+            });
+        }
+
         let session_stats = compute_session_stats(&turns);
 
         let summary = ConversationSummary {
@@ -396,11 +417,8 @@ fn parse_user_message_parts(content: &serde_json::Value) -> UserMessageParts {
 
             // If the tool result also contains <feedback>, extract it
             if let Some(feedback) = extract_feedback(&text) {
-                let fb = feedback.trim();
-                if !fb.is_empty() {
-                    user_blocks.push(ContentBlock::Text {
-                        text: fb.to_string(),
-                    });
+                if let Some(fb) = visible_user_text(feedback.trim()) {
+                    user_blocks.push(ContentBlock::Text { text: fb });
                 }
             }
             // After extracting tool result, also check for non-feedback user
@@ -412,17 +430,16 @@ fn parse_user_message_parts(content: &serde_json::Value) -> UserMessageParts {
 
         // Pure feedback without tool result prefix
         if let Some(feedback) = extract_feedback(&cleaned) {
-            let fb = feedback.trim();
-            if !fb.is_empty() {
-                user_blocks.push(ContentBlock::Text {
-                    text: fb.to_string(),
-                });
+            if let Some(fb) = visible_user_text(feedback.trim()) {
+                user_blocks.push(ContentBlock::Text { text: fb });
             }
             continue;
         }
 
         // Regular user text (initial task, etc.)
-        user_blocks.push(ContentBlock::Text { text: cleaned });
+        if let Some(visible) = visible_user_text(&cleaned) {
+            user_blocks.push(ContentBlock::Text { text: visible });
+        }
     }
 
     UserMessageParts {
@@ -651,4 +668,95 @@ fn strip_environment_details(text: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::TurnRole;
+    use std::fs;
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let task_id = "1782276649227";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+
+        let tasks_dir = base.join("tasks").join(task_id);
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::create_dir_all(base.join("state")).unwrap();
+
+        let history = serde_json::json!([{
+            "id": task_id,
+            "ts": 1782276649227i64,
+            "task": ctx,
+            "cwdOnTaskInitialization": "/Users/demo/app"
+        }]);
+        fs::write(
+            base.join("state").join("taskHistory.json"),
+            history.to_string(),
+        )
+        .unwrap();
+
+        let api = serde_json::json!([
+            {
+                "role": "user",
+                "ts": 1782276649227i64,
+                "content": ctx
+            },
+            {
+                "role": "user",
+                "ts": 1782276649300i64,
+                "content": real_plus
+            },
+            {
+                "role": "user",
+                "ts": 1782276649400i64,
+                "content": "<codeg_terminal_context version=\"1\">partial"
+            }
+        ]);
+        fs::write(
+            tasks_dir.join("api_conversation_history.json"),
+            api.to_string(),
+        )
+        .unwrap();
+
+        let parser = ClineParser::with_base_dir(base.to_path_buf());
+        let detail = parser.get_conversation(task_id).unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+    }
 }

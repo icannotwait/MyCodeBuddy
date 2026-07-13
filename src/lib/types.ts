@@ -1325,7 +1325,10 @@ export type AcpEvent =
 
 /** Which settings surface drifted (mirror of Rust `ConfigStaleKind`), used to
  *  word the "restart to apply" banner. */
-export type ConfigStaleKind = "agent_config" | "model_provider"
+export type ConfigStaleKind =
+  | "agent_config"
+  | "model_provider"
+  | "terminal_shell"
 
 /** A block of a broadcast user prompt (mirror of Rust `UserMessageBlock`).
  *  Narrower than the persisted `ContentBlock`: only what a viewer needs to
@@ -1790,7 +1793,7 @@ export interface TerminalShellOption {
 
 export interface AvailableTerminalShells {
   options: TerminalShellOption[]
-  resolved_shell: string
+  effective_shell: string
 }
 
 export interface SystemRenderingSettings {

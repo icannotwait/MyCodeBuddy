@@ -25,7 +25,7 @@ use tokio::time::MissedTickBehavior;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
-use crate::commands::acp::{build_session_runtime_env, verify_agent_installed};
+use crate::commands::acp::verify_agent_installed;
 use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
 use crate::commands::folders::{
     emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
@@ -378,11 +378,16 @@ impl AutomationEngine {
             emit_folder_upsert(&self.emitter, detail);
         }
 
-        // Recompute env from current settings (never snapshotted); hard-fail
-        // visibly if the agent is disabled or not installed.
-        let runtime_env = build_session_runtime_env(&self.db, agent_type, None, &self.data_dir)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Recompute launch inputs from current settings (never snapshotted);
+        // hard-fail visibly if the agent is disabled or not installed.
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+            &self.db,
+            agent_type,
+            None,
+            &self.data_dir,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         verify_agent_installed(agent_type)
             .await
             .map_err(|e| e.to_string())?;
@@ -417,7 +422,7 @@ impl AutomationEngine {
                 agent_type,
                 Some(cwd.working_dir.clone()),
                 None,
-                runtime_env,
+                launch_inputs,
                 "automation".to_string(),
                 self.emitter.clone(),
                 cfg.mode_id.clone(),

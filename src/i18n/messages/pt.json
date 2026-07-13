@@ -1060,7 +1060,7 @@
     "sectionTitle": "Geral",
     "sectionDescription": "Preferências centralizadas para o terminal padrão, aceleração de renderização e delegação multi-agente.",
     "terminalTitle": "Terminal padrão",
-    "terminalDescription": "Escolha o shell usado ao abrir novas abas de terminal a partir da barra do terminal ou da árvore de arquivos.",
+    "terminalDescription": "Escolha o shell usado em novas abas de terminal e na execução de ferramentas de novos agentes ACP. Terminais e conexões ACP em execução mantêm o shell atual; reconecte a sessão para aplicar as alterações.",
     "defaultTerminalShell": "Shell padrão",
     "terminalSystemDefault": "Padrão do sistema",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "Informe um caminho absoluto ou um nome resolvível pelo PATH.",
     "terminalShellNotInstalled": "não instalado",
     "terminalShellNotFoundWarning": "Este caminho não existe neste host.",
-    "terminalCurrentShell": "Em uso: {path}",
+    "terminalCurrentShell": "Shell efetivo para novos terminais e conexões ACP: {path}",
     "renderingTitle": "Renderização",
     "renderingDescription": "Desative a aceleração de hardware se o aplicativo apresentar tela preta ou falhas de renderização (comum em certas GPUs AMD ou GPUs Intel integradas). Aplica-se apenas à versão desktop do Windows.",
     "disableHardwareAcceleration": "Desativar aceleração de hardware",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "Falha ao iniciar {agent}: {message}",
           "downloadFailed": "Falha no download de {agent}: {message}",
           "sessionLoadResourceNotFound": "Falha ao carregar a sessão de {agent}. Recarregue para tentar novamente ou inicie uma nova conversa.",
+          "sessionLoadLegacyCliSession": "Esta sessão do {agent} foi criada com o ambiente de execução de CLI anterior e não pode ser retomada. Inicie uma nova conversa.",
           "sessionLoadUnavailable": "{agent} não conseguiu restaurar esta sessão; ela pode ter terminado ou o agente parou. Recarregue para tentar novamente ou inicie uma nova conversa.",
           "turnFailedRefusal": "{agent} recusou continuar este turno. Costuma indicar um erro de backend ou gateway. Confira os logs do agente.",
           "turnFailedMaxTokens": "{agent} atingiu o limite máximo de tokens para este turno.",
           "turnFailedMaxTurnRequests": "{agent} atingiu o número máximo de solicitações permitidas para este turno.",
           "turnFailedUnknown": "{agent} encerrou o turno com um motivo de parada desconhecido.",
           "grokModelSwitchIncompatibleAgent": "{agent} não pode mudar para esse modelo em uma conversa existente. Inicie uma nova sessão para usá-lo.",
-          "turnFailedEmpty": "{agent} encerrou o turno sem produzir nenhuma resposta. Confira a configuração do agente."
+          "turnFailedEmpty": "{agent} encerrou o turno sem produzir nenhuma resposta. Confira a configuração do agente.",
+          "terminalShellUnavailable": "{shell} não está disponível. Escolha um shell disponível nas configurações gerais.",
+          "terminalShellUnsupported": "{shell} não é compatível com a execução no terminal ACP. Escolha um shell compatível nas configurações gerais."
         },
         "unableReadAgentConfig": "Não foi possível ler a configuração do agente: {message}",
         "connectFailedTitle": "Falha na conexão de {agent}",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "Disponível quando o turno atual terminar",
         "dismiss": "Dispensar",
         "reconnectFailed": "Falha ao reconectar a sessão",
-        "applied": "Nova configuração aplicada"
+        "applied": "Nova configuração aplicada",
+        "terminalShellTitle": "Shell do terminal atualizado"
       },
       "collabAgent": {
         "title": "Subagente",

@@ -172,4 +172,18 @@ describe("useConnection snapshot stability", () => {
     expect(probe.renders).toBe(mounted + 1)
     expect(probe.result.current.status).toBe("connected")
   })
+
+  it("exposes the ACP load failure code for recovery UI", () => {
+    fake.reset()
+    fake.setConn(
+      makeConn({
+        loadError: "This Codex session cannot be resumed.",
+        loadErrorCode: "legacy_cli_session",
+      })
+    )
+
+    const { result } = renderHook(() => useConnection("k"))
+
+    expect(result.current.loadErrorCode).toBe("legacy_cli_session")
+  })
 })

@@ -89,6 +89,8 @@ interface MessageListViewProps {
    * conversation since the agent can't continue this thread.
    */
   acpLoadError?: string | null
+  /** Stable backend code for the ACP load failure. */
+  acpLoadErrorCode?: string | null
   hideEmptyState?: boolean
   onReload?: () => void
   onNewSession?: () => void
@@ -97,6 +99,12 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
+}
+
+export function canReloadSessionLoadError(
+  code: string | null | undefined
+): boolean {
+  return code !== "legacy_cli_session"
 }
 
 interface ResolvedMessageGroup {
@@ -542,6 +550,7 @@ export function MessageListView({
   detailLoading = false,
   detailError = null,
   acpLoadError = null,
+  acpLoadErrorCode = null,
   hideEmptyState = false,
   onReload,
   onNewSession,
@@ -878,7 +887,10 @@ export function MessageListView({
     detailError && !hasRenderableContent ? detailError : null
   const renderedLoadError = blockingLoadError ?? fallbackLoadError
   if (renderedLoadError) {
-    const showActions = Boolean(onReload || onNewSession)
+    const showReload = Boolean(
+      onReload && canReloadSessionLoadError(acpLoadErrorCode)
+    )
+    const showActions = showReload || Boolean(onNewSession)
     const reloading = detailLoading
     return (
       <div role="alert" className="flex h-full items-center justify-center p-6">
@@ -895,7 +907,7 @@ export function MessageListView({
           </div>
           {showActions && (
             <div className="flex flex-wrap items-center justify-center gap-2">
-              {onReload && (
+              {showReload && onReload && (
                 <Button
                   size="sm"
                   onClick={onReload}

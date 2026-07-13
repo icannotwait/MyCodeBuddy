@@ -5193,7 +5193,7 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // also takes priority over `~/.kimi-code/config.toml`.
         AgentType::KimiCode => ("KIMI_MODEL_BASE_URL", "KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME"),
         // Grok's non-interactive credential is `XAI_API_KEY`. Model + endpoint
-        // also have working env overrides (verified against the 0.2.94 binary):
+        // also have working env overrides (verified against the 0.2.98 binary):
         // `GROK_DEFAULT_MODEL` selects the default model and `GROK_XAI_API_BASE_URL`
         // overrides the API base URL (both win over ~/.grok/config.toml). Note:
         // `XAI_MODEL` is NOT read by Grok — the earlier placeholder was inert.
@@ -5644,15 +5644,30 @@ pub(crate) async fn cascade_update_model_provider(
     Ok(())
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_preflight(
+pub async fn acp_preflight_core(
     agent_type: AgentType,
     force_refresh: Option<bool>,
+    db: &AppDatabase,
 ) -> Result<PreflightResult, AcpError> {
     if force_refresh.unwrap_or(false) {
         preflight::clear_npm_env_cache();
     }
-    Ok(preflight::run_preflight(agent_type).await)
+
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let runtime_env = build_runtime_env_from_setting(agent_type, setting.as_ref(), None);
+    Ok(preflight::run_preflight(agent_type, &runtime_env).await)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_preflight(
+    agent_type: AgentType,
+    force_refresh: Option<bool>,
+    db: State<'_, AppDatabase>,
+) -> Result<PreflightResult, AcpError> {
+    acp_preflight_core(agent_type, force_refresh, &db).await
 }
 
 /// Resolve the full runtime env every ACP spawn should receive — settings
@@ -5730,7 +5745,12 @@ pub(crate) fn fingerprint_config(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // BTreeMap iterates in sorted key order → deterministic across calls.
+    // Terminal declaration keys (SHELL / CODEG_TERMINAL_*) are excluded: the
+    // shell selection is tracked as its own fingerprint component (Task 5).
     for (k, v) in runtime_env {
+        if crate::acp::terminal_context::is_terminal_declaration_env_key(k) {
+            continue;
+        }
         hasher.update(k.as_bytes());
         hasher.update([0u8]);
         hasher.update(v.as_bytes());
@@ -5873,8 +5893,13 @@ pub async fn acp_connect(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_env =
-        build_session_runtime_env(&db, agent_type, session_id.as_deref(), &app_data_dir).await?;
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+        &db,
+        agent_type,
+        session_id.as_deref(),
+        &app_data_dir,
+    )
+    .await?;
 
     // Guard: the session page must never trigger a download or install.
     // If the agent isn't ready, return SdkNotInstalled here so the frontend
@@ -5887,7 +5912,7 @@ pub async fn acp_connect(
             agent_type,
             working_dir,
             session_id,
-            runtime_env,
+            launch_inputs,
             window.label().to_string(),
             emitter,
             preferred_mode_id,
@@ -5961,14 +5986,16 @@ pub async fn acp_describe_agent_options_core(
     working_dir: Option<String>,
 ) -> Result<crate::acp::types::AgentOptionsSnapshot, AcpError> {
     verify_agent_installed(agent_type).await?;
-    // Build the same runtime env delegation/acp_connect would build so
+    // Build the same launch inputs delegation/acp_connect would build so
     // probe sees exactly what `delegate_to_agent` will see at runtime.
     // Without this, the settings UI could show options that the agent
     // never advertises in production (settings override an API URL,
     // model_provider injects a different model list, etc.).
-    let runtime_env = build_session_runtime_env(db, agent_type, None, data_dir).await?;
+    let launch_inputs =
+        crate::acp::terminal_context::build_acp_launch_inputs(db, agent_type, None, data_dir)
+            .await?;
     manager
-        .probe_agent_options(agent_type, working_dir, runtime_env)
+        .probe_agent_options(agent_type, working_dir, launch_inputs)
         .await
 }
 

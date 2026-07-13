@@ -1060,7 +1060,7 @@
     "sectionTitle": "一般",
     "sectionDescription": "デフォルトターミナル、レンダリング高速化、マルチエージェント委譲などの共通設定をここで一括管理します。",
     "terminalTitle": "デフォルトターミナル",
-    "terminalDescription": "ターミナルバーやファイルツリーから新しいターミナルタブを開く際に使うシェルを選択します。",
+    "terminalDescription": "新しいターミナルタブと新しい ACP エージェントのツール実行で使うシェルを選択します。実行中のターミナルと ACP 接続は現在のシェルを維持し、再接続後に変更が適用されます。",
     "defaultTerminalShell": "デフォルトシェル",
     "terminalSystemDefault": "システムデフォルト",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "絶対パス、または PATH で解決可能なコマンド名を指定します。",
     "terminalShellNotInstalled": "未インストール",
     "terminalShellNotFoundWarning": "このパスはホスト上に存在しません。",
-    "terminalCurrentShell": "現在使用中: {path}",
+    "terminalCurrentShell": "新しいターミナルと ACP 接続で有効なシェル: {path}",
     "renderingTitle": "レンダリング",
     "renderingDescription": "アプリで黒画面や描画不具合が発生する場合（一部の AMD GPU や Intel 内蔵 GPU で報告あり）、ハードウェアアクセラレーションを無効化してください。Windows デスクトップ版のみ有効です。",
     "disableHardwareAcceleration": "ハードウェアアクセラレーションを無効化",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "{agent} の起動に失敗しました: {message}",
           "downloadFailed": "{agent} のダウンロードに失敗しました: {message}",
           "sessionLoadResourceNotFound": "{agent} セッションの読み込みに失敗しました。再読み込みして再試行するか、新しい会話を開始してください。",
+          "sessionLoadLegacyCliSession": "この {agent} セッションは以前の CLI ランタイムで作成されたため、再開できません。新しい会話を開始してください。",
           "sessionLoadUnavailable": "{agent} はこのセッションを復元できませんでした。セッションが終了したか、エージェントが停止した可能性があります。再読み込みして再試行するか、新しい会話を開始してください。",
           "turnFailedRefusal": "{agent} がこのターンの続行を拒否しました。バックエンドまたはゲートウェイのエラーが原因の可能性があります。エージェントのログを確認してください。",
           "turnFailedMaxTokens": "{agent} がこのターンの最大トークン数に達しました。",
           "turnFailedMaxTurnRequests": "{agent} がこのターンで許可された最大リクエスト数に達しました。",
           "turnFailedUnknown": "{agent} が不明な停止理由でターンを終了しました。",
           "grokModelSwitchIncompatibleAgent": "{agent} は既存の会話ではこのモデルに切り替えられません。新しいセッションを開始して使用してください。",
-          "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。"
+          "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。",
+          "terminalShellUnavailable": "{shell} は利用できません。一般設定で利用可能なシェルを選択してください。",
+          "terminalShellUnsupported": "ACP ターミナル実行では {shell} はサポートされていません。一般設定でサポート対象のシェルを選択してください。"
         },
         "unableReadAgentConfig": "エージェント設定を読み取れません: {message}",
         "connectFailedTitle": "{agent} の接続に失敗しました",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "現在のターンが完了すると再接続できます",
         "dismiss": "閉じる",
         "reconnectFailed": "セッションの再接続に失敗しました",
-        "applied": "新しい設定を適用しました"
+        "applied": "新しい設定を適用しました",
+        "terminalShellTitle": "ターミナルシェルが更新されました"
       },
       "collabAgent": {
         "title": "サブエージェント",

@@ -59,6 +59,7 @@ export interface UseConnectionReturn {
   claudeApiRetry: ClaudeApiRetryState | null
   error: string | null
   loadError: string | null
+  loadErrorCode: string | null
   /** True when the running session is on stale (launch-time) config after a
    *  later settings save. Drives the "restart to apply" banner. */
   configStale: boolean
@@ -214,6 +215,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const claudeApiRetry = connection?.claudeApiRetry ?? null
   const error = connection?.error ?? null
   const loadError = connection?.loadError ?? null
+  const loadErrorCode = connection?.loadErrorCode ?? null
   const configStale = connection?.configStale ?? false
   const configStaleKind = connection?.configStaleKind ?? null
   const configStaleDismissed = connection?.configStaleDismissed ?? false
@@ -315,6 +317,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       claudeApiRetry,
       error,
       loadError,
+      loadErrorCode,
       configStale,
       configStaleKind,
       configStaleDismissed,
@@ -352,6 +355,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       claudeApiRetry,
       error,
       loadError,
+      loadErrorCode,
       configStale,
       configStaleKind,
       configStaleDismissed,

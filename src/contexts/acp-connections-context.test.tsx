@@ -40,11 +40,24 @@ const h = vi.hoisted(() => {
     acpGetSessionSnapshot: vi.fn(),
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
+    pushAlert: vi.fn(),
   }
 })
 
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  // Emulate next-intl resolving a real message (never identity-returns the
+  // key) so toLocalizedErrorMessage accepts structured i18n_key payloads.
+  // Existing tests match on the key substring.
+  useTranslations:
+    () => (key: string, params?: Record<string, string | number>) => {
+      if (params && Object.keys(params).length > 0) {
+        const rendered = Object.entries(params)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(",")
+        return `${key}(${rendered})`
+      }
+      return `§${key}`
+    },
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -57,7 +70,7 @@ vi.mock("@/lib/delegation-seed", () => ({
 }))
 
 vi.mock("@/contexts/alert-context", () => ({
-  useAlertContext: () => ({ pushAlert: vi.fn() }),
+  useAlertContext: () => ({ pushAlert: h.pushAlert }),
 }))
 
 vi.mock("@/contexts/active-folder-context", () => ({
@@ -134,6 +147,7 @@ beforeEach(() => {
   h.acpDisconnect.mockReset()
   h.acpGetSessionSnapshot.mockReset()
   h.denormalizeSnapshot.mockReset()
+  h.pushAlert.mockReset()
   h.denormalizeSnapshot.mockReturnValue({
     connectionId: "owner-conn",
     eventSeq: 0,
@@ -563,6 +577,136 @@ describe("AcpConnectionsProvider permission request details", () => {
   })
 })
 
+describe("AcpConnectionsProvider session load failures", () => {
+  it("localizes legacy Codex CLI sessions and preserves the recovery code", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_load_failed",
+      session_id: "sess-1",
+      message:
+        "This Codex session was created by the legacy CLI runtime and cannot be resumed.",
+      code: "legacy_cli_session",
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.loadError).toMatch(
+      /^backendErrors\.sessionLoadLegacyCliSession/
+    )
+    expect(connection?.loadErrorCode).toBe("legacy_cli_session")
+  })
+})
+
+describe("AcpConnectionsProvider structured shell connect errors", () => {
+  async function connectAndCatch() {
+    await mountProvider()
+    await act(async () => {
+      // No conversationId → owner spawn via acpConnect.
+      try {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+      } catch {
+        // connect rethrows after alerting; swallow for assertions.
+      }
+    })
+  }
+
+  it("localizes terminal_shell_unavailable from structured i18n_key", async () => {
+    h.acpConnect.mockRejectedValue({
+      code: "terminal_shell_unavailable",
+      message: "selected terminal shell is unavailable",
+      detail: "C:\\missing\\pwsh.exe",
+      i18n_key: "backendErrors.terminalShellUnavailable",
+      i18n_params: { shell: "PowerShell 7" },
+    })
+
+    await connectAndCatch()
+
+    expect(h.pushAlert).toHaveBeenCalled()
+    const call = h.pushAlert.mock.calls.find(
+      (c) =>
+        typeof c[2] === "string" &&
+        (c[2] as string).includes("backendErrors.terminalShellUnavailable")
+    )
+    expect(call).toBeTruthy()
+    expect(call![2]).toContain("shell=PowerShell 7")
+    // Must not fall back to English message substring matching.
+    expect(call![2]).not.toMatch(/selected terminal shell is unavailable/i)
+    // Not the SDK-missing branch (no Open Agents settings action payload).
+    expect(call![0]).toBe("error")
+    expect(String(call![1])).toMatch(/connectFailedTitle/)
+  })
+
+  it("localizes terminal_shell_unsupported from structured i18n_key", async () => {
+    h.acpConnect.mockRejectedValue({
+      code: "terminal_shell_unsupported",
+      message: "selected terminal shell is unsupported",
+      detail: "C:\\tools\\mystery.exe",
+      i18n_key: "backendErrors.terminalShellUnsupported",
+      i18n_params: { shell: "mystery.exe" },
+    })
+
+    await connectAndCatch()
+
+    expect(h.pushAlert).toHaveBeenCalled()
+    const call = h.pushAlert.mock.calls.find(
+      (c) =>
+        typeof c[2] === "string" &&
+        (c[2] as string).includes("backendErrors.terminalShellUnsupported")
+    )
+    expect(call).toBeTruthy()
+    expect(call![2]).toContain("shell=mystery.exe")
+    expect(call![2]).not.toMatch(/selected terminal shell is unsupported/i)
+    expect(String(call![1])).toMatch(/connectFailedTitle/)
+  })
+
+  it("still surfaces SDK-missing alert for legacy install string", async () => {
+    h.acpConnect.mockRejectedValue(
+      "Codex is not installed. Please install it in Agent Settings."
+    )
+
+    await connectAndCatch()
+
+    const call = h.pushAlert.mock.calls.find(
+      (c) =>
+        typeof c[1] === "string" &&
+        (c[1] as string).includes("blocked.sdkMissing")
+    )
+    expect(call).toBeTruthy()
+    expect(String(call![2])).toMatch(/agentsSetupHint/)
+    // Open Agent Settings action is attached as 4th arg.
+    expect(call![3]).toBeTruthy()
+    expect(Array.isArray(call![3])).toBe(true)
+    expect((call![3] as unknown[]).length).toBeGreaterThan(0)
+  })
+})
+
+describe("AcpConnectionsProvider terminal shell config stale", () => {
+  it("applies session_config_stale terminal_shell into connection state", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_config_stale",
+      stale: true,
+      kind: "terminal_shell",
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.configStale).toBe(true)
+    expect(connection?.configStaleKind).toBe("terminal_shell")
+    expect(connection?.configStaleDismissed).toBe(false)
+  })
+})
+
 describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => {
   async function connectOwner(): Promise<AttachHandlers> {
     await mountProvider()
@@ -932,7 +1076,7 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       agent_type: "grok",
       enabled: true,
       available: true,
-      installed_version: "0.2.94",
+      installed_version: "0.2.98",
     })
     await mountProvider()
     await act(async () => {
@@ -993,7 +1137,9 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
     expect(conn.configOptions?.[0]?.kind.current_value).toBe("grok-4.5")
     // The coded error is localized (the useTranslations mock echoes the key) —
     // NOT the raw fallback message.
-    expect(conn.error).toBe("backendErrors.grokModelSwitchIncompatibleAgent")
+    expect(conn.error).toMatch(
+      /^backendErrors\.grokModelSwitchIncompatibleAgent/
+    )
     // The attempted model stays the saved preference (no revert of the persisted
     // choice), so a fresh session lands on Composer where the switch succeeds.
     expect(saveConfigPreference).toHaveBeenCalledTimes(1)

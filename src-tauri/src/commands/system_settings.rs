@@ -2,6 +2,8 @@ use sea_orm::DatabaseConnection;
 #[cfg(feature = "tauri-runtime")]
 use tauri::State;
 
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::manager::ConnectionManager;
 use crate::app_error::AppCommandError;
 use crate::db::service::app_metadata_service;
 #[cfg(feature = "tauri-runtime")]
@@ -16,7 +18,9 @@ use crate::models::{
 use crate::network::proxy;
 #[cfg(feature = "tauri-runtime")]
 use crate::preferences;
-use crate::terminal::manager::resolve_shell;
+use crate::terminal::shell::effective_shell_for_display;
+#[cfg(feature = "tauri-runtime")]
+use crate::terminal::shell::terminal_shell_selection_key;
 
 pub(crate) const SYSTEM_PROXY_SETTINGS_KEY: &str = "system_proxy_settings";
 pub(crate) const SYSTEM_LANGUAGE_SETTINGS_KEY: &str = "system_language_settings";
@@ -141,14 +145,20 @@ pub(crate) fn normalize_terminal_settings(
 /// The frontend renders these verbatim, looking each `label_key` up under its
 /// `GeneralSettings` namespace — so adding a new shell here requires zero
 /// frontend code changes (only a new translation key).
-pub(crate) fn build_available_terminal_shells() -> AvailableTerminalShells {
+///
+/// `settings` drives `effective_shell` so the subtitle reflects the selected
+/// value (resolved path when available, stored value when not), not only the
+/// system default.
+pub(crate) fn build_available_terminal_shells(
+    settings: &SystemTerminalSettings,
+) -> AvailableTerminalShells {
     let mut options: Vec<TerminalShellOption> = Vec::new();
 
     options.push(TerminalShellOption {
         id: TERMINAL_SHELL_OPTION_SYSTEM.to_string(),
         label_key: "terminalSystemDefault".to_string(),
         value: None,
-        // System default always "exists" — resolve_shell() has its own fallback chain.
+        // System default always "exists" — shared shell resolution has a fallback chain.
         exists: true,
         accepts_custom_path: false,
     });
@@ -181,7 +191,7 @@ pub(crate) fn build_available_terminal_shells() -> AvailableTerminalShells {
 
     AvailableTerminalShells {
         options,
-        resolved_shell: resolve_shell(),
+        effective_shell: effective_shell_for_display(settings),
     }
 }
 
@@ -256,8 +266,11 @@ pub async fn get_system_terminal_settings(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn get_available_terminal_shells() -> Result<AvailableTerminalShells, AppCommandError> {
-    Ok(build_available_terminal_shells())
+pub async fn get_available_terminal_shells(
+    db: State<'_, AppDatabase>,
+) -> Result<AvailableTerminalShells, AppCommandError> {
+    let settings = load_system_terminal_settings(&db.conn).await?;
+    Ok(build_available_terminal_shells(&settings))
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -297,6 +310,7 @@ pub async fn update_system_language_settings(
 pub async fn update_system_terminal_settings(
     settings: SystemTerminalSettings,
     db: State<'_, AppDatabase>,
+    manager: State<'_, ConnectionManager>,
     app: tauri::AppHandle,
 ) -> Result<SystemTerminalSettings, AppCommandError> {
     let normalized = normalize_terminal_settings(settings);
@@ -308,6 +322,11 @@ pub async fn update_system_terminal_settings(
     app_metadata_service::upsert_value(&db.conn, SYSTEM_TERMINAL_SETTINGS_KEY, &serialized)
         .await
         .map_err(AppCommandError::from)?;
+
+    let selection_key = terminal_shell_selection_key(&normalized);
+    manager
+        .refresh_terminal_shell_staleness(&selection_key)
+        .await;
 
     let emitter = crate::web::event_bridge::EventEmitter::Tauri(app);
     crate::web::event_bridge::emit_event(

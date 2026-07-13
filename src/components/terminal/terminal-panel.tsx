@@ -19,7 +19,6 @@ export function TerminalPanel() {
             key={tab.id}
             terminalId={tab.id}
             workingDir={tab.workingDir}
-            shell={tab.shell}
             initialCommand={tab.initialCommand}
             isActive={tab.id === activeTabId}
             isVisible={isOpen}

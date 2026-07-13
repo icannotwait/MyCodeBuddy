@@ -6,7 +6,7 @@ use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
+    KillTerminalResponse, LoadSessionRequest, Meta, NewSessionRequest, NewSessionResponse,
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
@@ -33,19 +33,47 @@ use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
+use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
+use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
+use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
-    AcpEvent, AvailableCommandInfo, ConnectionInfo, ConnectionStatus, PermissionOptionInfo,
-    PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock, SessionConfigKindInfo,
-    SessionConfigOptionInfo, SessionConfigSelectGroupInfo, SessionConfigSelectInfo,
-    SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo, ToolCallImageInfo,
-    UserMessageBlock,
+    AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
+    PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectGroupInfo,
+    SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
+    ToolCallImageInfo, UserMessageBlock,
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
+
+/// Inject host `CODEX_PATH` into Codex launch env when a host binary is required
+/// (always on Windows bundled adapter; also when experimental CLI mode is on).
+/// No-ops for non-Codex agents; maps prepare failures to `SdkNotInstalled`.
+fn apply_codex_cli_path_env(
+    agent_type: AgentType,
+    merged_env: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, AcpError> {
+    if agent_type != AgentType::Codex {
+        return Ok(merged_env);
+    }
+    let map: BTreeMap<String, String> = merged_env.into_iter().collect();
+    match crate::acp::codex_cli::prepare_codex_launch_env(map) {
+        Ok(map) => {
+            tracing::info!(
+                "[ACP][Codex] CODEX_PATH={}",
+                map.get(crate::acp::codex_cli::CODEX_PATH_ENV)
+                    .map(|s| s.as_str())
+                    .unwrap_or("(unset)")
+            );
+            Ok(map.into_iter().collect())
+        }
+        Err(message) => Err(AcpError::SdkNotInstalled(message)),
+    }
+}
 
 fn merge_agent_env(
     env: &[(&'static str, &'static str)],
@@ -210,6 +238,41 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
+/// Per-component config fingerprint captured at spawn and compared after
+/// settings saves. Agent config and terminal shell are tracked independently
+/// so one surface can stay stale while the other is reverted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionConfigFingerprint {
+    pub agent_config: String,
+    pub terminal_shell: String,
+}
+
+/// Latest settings values observed by staleness refresh (not necessarily the
+/// spawn snapshot). `agent_kind` remembers whether the last agent-side drift
+/// came from agent settings or a model-provider edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionObservedConfig {
+    pub fingerprint: ConnectionConfigFingerprint,
+    pub agent_kind: ConfigStaleKind,
+}
+
+/// Build matching spawn + observed fingerprints (used at connection launch and
+/// by tests that seed synthetic connections).
+pub fn matching_config_pair(
+    agent_config: impl Into<String>,
+    terminal_shell: impl Into<String>,
+) -> (ConnectionConfigFingerprint, ConnectionObservedConfig) {
+    let fingerprint = ConnectionConfigFingerprint {
+        agent_config: agent_config.into(),
+        terminal_shell: terminal_shell.into(),
+    };
+    let observed = ConnectionObservedConfig {
+        fingerprint: fingerprint.clone(),
+        agent_kind: ConfigStaleKind::AgentConfig,
+    };
+    (fingerprint, observed)
+}
+
 /// Represents a single active ACP agent connection.
 pub struct AgentConnection {
     pub id: String,
@@ -231,18 +294,20 @@ pub struct AgentConnection {
     /// in the same turn.
     pub prompt_lock: Arc<tokio::sync::Mutex<()>>,
 
-    /// Canonical fingerprint of the agent's effective config (env vars + model
-    /// provider creds + native config file content) captured at spawn. The
-    /// running process is locked to THIS config; comparing it against a freshly
-    /// recomputed fingerprint after a settings save tells us whether the session
-    /// has drifted onto stale config. Immutable for the connection's lifetime.
-    pub config_fingerprint: String,
-    /// The most recent fingerprint seen by `refresh_connection_staleness`.
-    /// Tracks "did anything change since we last looked" so a second settings
-    /// save re-emits `SessionConfigStale` (re-showing a dismissed banner) while a
-    /// no-op save (identical values) stays silent. Starts equal to
-    /// `config_fingerprint`.
-    pub last_observed_fingerprint: String,
+    /// Component fingerprints captured when this process was spawned. The
+    /// running process is locked to THESE values; comparing them against
+    /// `observed_config` after a settings save detects drift. Immutable for
+    /// the connection's lifetime.
+    pub spawn_config: ConnectionConfigFingerprint,
+    /// Most recent settings values seen by staleness refresh. Starts equal to
+    /// `spawn_config`. Tracks "did anything change since we last looked" so a
+    /// second real change re-emits `SessionConfigStale` while a no-op save
+    /// stays silent. Agent and shell components update independently.
+    pub observed_config: ConnectionObservedConfig,
+    /// Immutable terminal shell snapshot captured when this connection's
+    /// process was spawned. Never re-read from settings after launch; reuse
+    /// and reconnect keep this value for the connection's lifetime.
+    pub terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
 }
 
 impl AgentConnection {
@@ -252,6 +317,37 @@ impl AgentConnection {
             agent_type: self.agent_type,
             status: self.status.clone(),
         }
+    }
+}
+
+/// Placeholder shell snapshot for unit/integration test connections that never
+/// run a real terminal. Not used by production spawn (which always finalizes).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_placeholder_terminal_shell() -> crate::terminal::shell::ResolvedShellSnapshot {
+    use crate::terminal::shell::{
+        ResolvedShellSnapshot, ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
+    };
+    ResolvedShellSnapshot {
+        selection_key: "system".into(),
+        spec: ResolvedShellSpec {
+            executable: PathBuf::from(if cfg!(windows) {
+                r"C:\Windows\System32\cmd.exe"
+            } else {
+                "/bin/sh"
+            }),
+            dialect: if cfg!(windows) {
+                ShellDialect::Cmd
+            } else {
+                ShellDialect::Posix
+            },
+            display_name: "test-shell".into(),
+            source: ShellSource::System,
+            command_strategy: if cfg!(windows) {
+                ShellCommandStrategy::Cmd
+            } else {
+                ShellCommandStrategy::Posix
+            },
+        },
     }
 }
 
@@ -342,6 +438,10 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
+            // Inject host CODEX_PATH when required (Windows app-server host, or
+            // experimental CODEX_ACP_USE_CLI). Never overwrites an explicit user
+            // value; fails with SdkNotInstalled if host Codex is missing.
+            merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
@@ -408,7 +508,10 @@ async fn build_agent(
                             meta.name
                         ))
                     })?;
-            let merged_env = merge_agent_env(env, runtime_env);
+            let merged_env = apply_codex_cli_path_env(
+                agent_type,
+                merge_agent_env(env, runtime_env),
+            )?;
             let mut parts: Vec<String> = merged_env
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
@@ -659,6 +762,7 @@ pub async fn spawn_agent_connection(
     working_dir: Option<String>,
     session_id: Option<String>,
     runtime_env: BTreeMap<String, String>,
+    terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
     owner_window_label: String,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
@@ -715,11 +819,11 @@ pub async fn spawn_agent_connection(
     // `terminal/create` tool authenticate via the same helper path the
     // agent process uses, while keeping unrelated secrets scoped to the
     // agent and out of arbitrary shell commands it runs.
-    let mut terminal_base_env: BTreeMap<String, String> = runtime_env
-        .iter()
-        .filter(|(k, _)| k.starts_with("GIT_CONFIG_"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    //
+    // `runtime_env` may already carry SHELL / CODEG_TERMINAL_* declarations
+    // and API keys; `build_terminal_base_env` keeps only GIT_CONFIG_* here.
+    let mut terminal_base_env =
+        crate::acp::terminal_context::build_terminal_base_env(&runtime_env);
     // Also surface a codeg-installed OfficeCLI on the terminal's PATH: agents run
     // office skills' `officecli …` through this `terminal/create` tool, not as a
     // child of the agent process, so the agent-env injection alone wouldn't reach
@@ -733,12 +837,15 @@ pub async fn spawn_agent_connection(
     let cleanup_connection_id = connection_id.clone();
     let state_clone = Arc::clone(&session_state);
 
-    // Canonical config fingerprint of what this process is launching with.
-    // Derived from the same `runtime_env` we hand the agent (minus per-launch
-    // volatile keys) plus the agent's native config file content, so a later
-    // settings save can be compared against it to detect a stale running session.
-    let config_fingerprint =
-        crate::commands::acp::fingerprint_config(agent_type, &runtime_env);
+    // Component fingerprints of what this process is launching with.
+    // Agent config is derived from the same `runtime_env` we hand the agent
+    // (minus per-launch volatile keys) plus native config file content; shell
+    // is the selection key from the immutable launch snapshot. Later settings
+    // saves compare against these independently.
+    let (spawn_config, observed_config) = matching_config_pair(
+        crate::commands::acp::fingerprint_config(agent_type, &runtime_env),
+        terminal_shell.selection_key.clone(),
+    );
 
     // Insert the entry BEFORE spawning the background task so that a
     // fast-failing `run_connection` can never remove it before it was
@@ -754,8 +861,9 @@ pub async fn spawn_agent_connection(
             state: Arc::clone(&session_state),
             emitter: emitter.clone(),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            last_observed_fingerprint: config_fingerprint.clone(),
-            config_fingerprint,
+            spawn_config,
+            observed_config,
+            terminal_shell: terminal_shell.clone(),
         },
     );
 
@@ -778,6 +886,7 @@ pub async fn spawn_agent_connection(
             emitter_clone.clone(),
             Arc::clone(&state_clone),
             terminal_base_env,
+            terminal_shell,
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
@@ -1390,19 +1499,48 @@ fn claude_raw_sdk_session_meta(
     Some(meta)
 }
 
+/// Merge Claude raw-SDK meta (when applicable) with the connection's
+/// authoritative terminal snapshot and any adapter contributions.
+fn session_request_meta(
+    agent_type: AgentType,
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<Meta, AcpError> {
+    let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
+    terminal_metadata(existing, spec, adapter)
+}
+
+/// Build the ACP `initialize` request, declaring client capabilities and the
+/// connection's terminal shell dialect under `_meta["codeg.dev/terminal"]`.
+fn build_initialize_request(
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<InitializeRequest, AcpError> {
+    let meta = terminal_metadata(Meta::default(), spec, adapter)?;
+    Ok(InitializeRequest::new(ProtocolVersion::LATEST)
+        .client_capabilities(
+            ClientCapabilities::new()
+                .terminal(true)
+                .fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)),
+        )
+        .meta(meta))
+}
+
 fn build_new_session_request(
     agent_type: AgentType,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> NewSessionRequest {
-    let mut req = NewSessionRequest::new(cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<NewSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = NewSessionRequest::new(cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 fn build_load_session_request(
@@ -1410,36 +1548,36 @@ fn build_load_session_request(
     session_id: SessionId,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> LoadSessionRequest {
-    let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<LoadSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 /// Build a `session/resume` request. Mirrors `build_load_session_request`
-/// (same fields + ClaudeCode raw-SDK meta + non-empty mcp_servers); the only
-/// wire difference is that `ResumeSessionRequest.mcp_servers` is
-/// `skip_serializing_if = Vec::is_empty`, so an empty list is omitted from the
-/// payload rather than emitted as `[]`.
+/// (same fields + ClaudeCode raw-SDK meta + terminal meta + non-empty
+/// mcp_servers); the only wire difference is that
+/// `ResumeSessionRequest.mcp_servers` is `skip_serializing_if = Vec::is_empty`,
+/// so an empty list is omitted from the payload rather than emitted as `[]`.
 fn build_resume_session_request(
     agent_type: AgentType,
     session_id: SessionId,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> ResumeSessionRequest {
-    let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<ResumeSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 /// Wire-level half of `session/resume`: send the request and deserialize the
@@ -1858,6 +1996,7 @@ async fn run_connection(
     emitter: EventEmitter,
     state: Arc<RwLock<SessionState>>,
     terminal_base_env: BTreeMap<String, String>,
+    terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
@@ -1866,12 +2005,21 @@ async fn run_connection(
     // `terminal_base_env` already filtered to just the credential helper
     // keys upstream — see `spawn_agent_connection` for the rationale and
     // why we don't forward the full agent runtime_env here.
+    //
+    // `terminal_shell` is the immutable launch snapshot; the runtime uses its
+    // `ResolvedShellSpec` for ShellCommandLine execution and diagnostics and
+    // never re-reads system terminal settings after the connection starts.
     let cwd = resolve_working_dir(working_dir.as_deref());
     // Default terminals to the session working directory so an agent that calls
     // `terminal/create` without a `cwd` (e.g. CodeBuddy) runs in the folder the
     // conversation runs in rather than codeg's own process cwd.
     let terminal_runtime = Arc::new(
-        TerminalRuntime::with_base_env(terminal_base_env).with_default_cwd(Some(cwd.clone())),
+        TerminalRuntime::new(
+            terminal_base_env,
+            terminal_shell.spec.clone(),
+            adapter_for(agent_type),
+        )
+        .with_default_cwd(Some(cwd.clone())),
     );
     let cwd_string = cwd.to_string_lossy().to_string();
     let file_system_runtime = Arc::new(FileSystemRuntime::new(cwd.clone()));
@@ -1896,6 +2044,10 @@ async fn run_connection(
     // exists) is what lets the first arm process records written before the
     // transcript file is discovered.
     let prompt_ledger = background_watch::PromptLedger::shared();
+    // Wire-only first-prompt shell context: one-shot per spawned process.
+    // Shared across fork restarts of this conversation loop; browser/transport
+    // reattachment reuses the live AgentConnection and never re-enters here.
+    let terminal_prompt_context = Arc::new(TerminalPromptContext::new(terminal_shell.spec.clone()));
     let _bg_watch = background_watch::spawn_if_claude(
         &connection_id,
         agent_type,
@@ -2019,14 +2171,13 @@ async fn run_connection(
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
-            // Advertise filesystem + terminal capabilities for ACP tool execution.
-            let init_request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
-                ClientCapabilities::new()
-                    .terminal(true)
-                    .fs(FileSystemCapabilities::new()
-                        .read_text_file(true)
-                        .write_text_file(true)),
-            );
+            // Advertise filesystem + terminal capabilities for ACP tool execution,
+            // and declare the connection's shell snapshot under `_meta`.
+            let init_request = build_initialize_request(
+                &terminal_shell.spec,
+                adapter_for(agent_type),
+            )
+            .map_err(|e| sacp::util::internal_error(e.to_string()))?;
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -2202,7 +2353,10 @@ async fn run_connection(
                         SessionId::new(sid.clone()),
                         &cwd,
                         mcp_servers.clone(),
-                    );
+                        &terminal_shell.spec,
+                        adapter_for(agent_type),
+                    )
+                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                     match send_resume_session(&cx, resume_req).await {
                         Ok(resume_resp) => {
                             let initial_config_options = resume_resp.config_options.clone();
@@ -2256,7 +2410,9 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
+                                &terminal_shell.spec,
                                 &prompt_ledger,
+                                &terminal_prompt_context,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -2277,7 +2433,9 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
+                                &terminal_shell.spec,
                                 &prompt_ledger,
+                                &terminal_prompt_context,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -2310,7 +2468,10 @@ async fn run_connection(
                     SessionId::new(sid.clone()),
                     &cwd,
                     mcp_servers.clone(),
-                );
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                 let load_result = cx.send_request_to(Agent, load_req).block_task().await;
 
                 match load_result {
@@ -2415,7 +2576,9 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2432,7 +2595,9 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2508,7 +2673,10 @@ async fn run_connection(
                                     agent_type,
                                     &cwd,
                                     mcp_servers.clone(),
-                                ),
+                                    &terminal_shell.spec,
+                                    adapter_for(agent_type),
+                                )
+                                .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                             )
                             .block_task()
                             .await?;
@@ -2554,7 +2722,9 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2573,7 +2743,9 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2584,7 +2756,14 @@ async fn run_connection(
                 let new_resp = cx
                     .send_request_to(
                         Agent,
-                        build_new_session_request(agent_type, &cwd, mcp_servers.clone()),
+                        build_new_session_request(
+                            agent_type,
+                            &cwd,
+                            mcp_servers.clone(),
+                            &terminal_shell.spec,
+                            adapter_for(agent_type),
+                        )
+                        .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                     )
                     .block_task()
                     .await?;
@@ -2630,7 +2809,9 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    &terminal_shell.spec,
                     &prompt_ledger,
+                    &terminal_prompt_context,
                     delegation_injection.as_ref(),
                 )
                 .await;
@@ -2647,7 +2828,9 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    &terminal_shell.spec,
                     &prompt_ledger,
+                    &terminal_prompt_context,
                     delegation_injection.as_ref(),
                 )
                 .await
@@ -3493,10 +3676,15 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    // Immutable connection shell snapshot — never re-read from settings.
+    shell_spec: &ResolvedShellSpec,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
     prompt_ledger: &background_watch::PromptLedger,
+    // Same process-lifetime one-shot as the original loop — fork must not
+    // re-inject a superseding `<codeg_terminal_context>` block.
+    terminal_prompt_context: &TerminalPromptContext,
     // Threaded through from run_connection so the forked session's
     // run_conversation_loop call has the same delegation cascade
     // capability as the original.
@@ -3574,7 +3762,9 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        shell_spec,
         prompt_ledger,
+        terminal_prompt_context,
         delegation_injection,
     )
     .await;
@@ -3593,7 +3783,9 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        shell_spec,
         prompt_ledger,
+        terminal_prompt_context,
         delegation_injection,
     ))
     .await
@@ -3636,6 +3828,13 @@ fn classify_session_load_failure(
     code: sacp::schema::ErrorCode,
     message: &str,
 ) -> Option<&'static str> {
+    // Before the app-server switch, the bundled Codex adapter generated its
+    // own ACP UUIDs and persisted a CLI-runtime mapping. Those IDs are not
+    // Codex thread IDs, so the adapter explicitly asks the user to start a
+    // new session rather than attempting an invalid resume or silent fallback.
+    if message.contains("This Codex session was created by the legacy CLI runtime") {
+        return Some("legacy_cli_session");
+    }
     if matches!(code, sacp::schema::ErrorCode::ResourceNotFound) {
         return Some("resource_not_found");
     }
@@ -3734,10 +3933,15 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    // Immutable connection shell snapshot for `session/fork` metadata.
+    shell_spec: &ResolvedShellSpec,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
     prompt_ledger: &background_watch::PromptLedger,
+    // Process-lifetime one-shot: first wire prompt gets terminal context;
+    // UI `UserMessage` events still use the original user blocks only.
+    terminal_prompt_context: &TerminalPromptContext,
     // Source of the broker reference used to cascade-cancel pending
     // delegations on parent prompt cancel / non-success TurnComplete.
     // `None` for test paths that don't wire delegation.
@@ -3798,8 +4002,10 @@ async fn run_conversation_loop<'a>(
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
                 // classify as wire-rendered foreground, not overlay.
+                // Ledger + UserMessage use original user content only; the
+                // terminal context block is appended to the wire payload below.
                 prompt_ledger.record_prompt_blocks(&blocks);
-                let prompt_blocks = map_prompt_blocks(blocks);
+                let mut prompt_blocks = map_prompt_blocks(blocks);
                 if prompt_blocks.is_empty() {
                     // Defensive: the manager rejects empty prompts before the
                     // concurrency gate is set / the command is enqueued (see
@@ -3823,6 +4029,11 @@ async fn run_conversation_loop<'a>(
                     continue;
                 }
 
+                // Wire-only mutation: first prompt on this process gets the
+                // versioned shell context. Live UI / optimistic dedup / title
+                // paths never see this block (they use `user_message` below).
+                terminal_prompt_context.append_once(&mut prompt_blocks);
+
                 emit_with_state(
                     state,
                     emitter,
@@ -3841,6 +4052,8 @@ async fn run_conversation_loop<'a>(
                 // dropped) broadcasts nothing. `apply_event` records it as
                 // `pending_user_message` so a client attaching mid-turn still
                 // renders the user turn from the snapshot.
+                // IMPORTANT: uses original projected user blocks — never the
+                // wire-only `<codeg_terminal_context>` append above.
                 if let Some((message_id, blocks)) = user_message {
                     emit_with_state(state, emitter, AcpEvent::UserMessage { message_id, blocks })
                         .await;
@@ -4369,7 +4582,21 @@ async fn run_conversation_loop<'a>(
                     "[ACP] Sending session/fork for session_id={} cwd={}",
                     sid.0, cwd
                 );
-                let result = crate::acp::fork::fork_session(&cx, &sid, cwd).await;
+                // Build from the connection snapshot only — never re-read
+                // global terminal settings during fork.
+                let terminal_meta = match terminal_metadata(
+                    Meta::default(),
+                    shell_spec,
+                    adapter_for(agent_type),
+                ) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+                let result =
+                    crate::acp::fork::fork_session(&cx, &sid, cwd, terminal_meta).await;
                 match result {
                     Ok(fork_response) => {
                         tracing::info!(
@@ -5584,7 +5811,12 @@ async fn emit_conversation_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::terminal_context::TerminalPromptContext;
+    use crate::terminal::shell::test_support::{
+        posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
+    };
     use sacp::schema::Diff;
+    use std::sync::Arc;
 
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {
         let mut d = Diff::new(path, new);
@@ -5592,6 +5824,83 @@ mod tests {
             d = d.old_text(o.to_string());
         }
         ToolCallContent::Diff(d)
+    }
+
+    /// Mirrors the connection-loop prompt path: ledger/UI use original user
+    /// blocks; only the wire `ContentBlock` list receives `append_once`.
+    #[test]
+    fn wire_prompt_gets_context_user_message_does_not() {
+        let injector = TerminalPromptContext::new(test_pwsh_spec());
+        let user_blocks = vec![PromptInputBlock::Text {
+            text: "hello".into(),
+        }];
+        let ui = crate::acp::user_blocks_from_prompt(&user_blocks);
+        let mut wire = map_prompt_blocks(user_blocks);
+        injector.append_once(&mut wire);
+
+        assert_eq!(ui.len(), 1);
+        match &ui[0] {
+            UserMessageBlock::Text { text } => {
+                assert_eq!(text, "hello");
+                assert!(!text.contains("codeg_terminal_context"));
+            }
+            other => panic!("expected text user block, got {other:?}"),
+        }
+        assert_eq!(wire.len(), 2);
+        match &wire[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hello"),
+            other => panic!("expected user text first, got {other:?}"),
+        }
+        match &wire[1] {
+            ContentBlock::Text(t) => {
+                assert!(t.text.contains("<codeg_terminal_context version=\"1\">"));
+            }
+            other => panic!("expected context text second, got {other:?}"),
+        }
+    }
+
+    /// Two prompts on one process-scoped injector: only the first is enriched.
+    #[test]
+    fn terminal_prompt_context_one_shot_across_two_prompts() {
+        let injector = TerminalPromptContext::new(test_pwsh_spec());
+        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "first".into(),
+        }]);
+        injector.append_once(&mut first);
+        let mut second = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "second".into(),
+        }]);
+        injector.append_once(&mut second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 1);
+    }
+
+    /// Fork reuses the same Arc; reattachment never re-enters `run_connection`
+    /// (injector lives only there), so mid-process reconnect cannot append a
+    /// superseding context.
+    #[test]
+    fn terminal_prompt_context_survives_fork_and_reattachment_semantics() {
+        let injector = Arc::new(TerminalPromptContext::new(test_pwsh_spec()));
+        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "pre-fork".into(),
+        }]);
+        injector.append_once(&mut first);
+        // Simulate fork: same Arc into the restarted conversation loop.
+        let forked = Arc::clone(&injector);
+        let mut post_fork = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "post-fork".into(),
+        }]);
+        forked.append_once(&mut post_fork);
+        assert_eq!(first.len(), 2);
+        assert_eq!(post_fork.len(), 1);
+        // "Reattachment" is just another hold on the same process injector —
+        // AgentConnection reuse does not call TerminalPromptContext::new.
+        let reattached = Arc::clone(&injector);
+        let mut mid = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "reattach".into(),
+        }]);
+        reattached.append_once(&mut mid);
+        assert_eq!(mid.len(), 1);
     }
 
     #[test]
@@ -5611,6 +5920,17 @@ mod tests {
                 "process exited with code 1",
             ),
             Some("resource_not_found"),
+        );
+    }
+
+    #[test]
+    fn classify_load_failure_legacy_codex_cli_session_requires_new_session() {
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "This Codex session was created by the legacy CLI runtime and cannot be resumed. Create a new session.",
+            ),
+            Some("legacy_cli_session"),
         );
     }
 
@@ -5919,7 +6239,14 @@ mod tests {
     #[test]
     fn build_new_session_request_sets_claude_raw_meta() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new());
+        let req = build_new_session_request(
+            AgentType::ClaudeCode,
+            &cwd,
+            Vec::new(),
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
 
         assert_eq!(
             req.meta
@@ -5932,16 +6259,22 @@ mod tests {
     }
 
     #[test]
-    fn build_load_session_request_skips_meta_for_non_claude() {
+    fn build_load_session_request_skips_claude_meta_for_non_claude() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let req = build_load_session_request(
             AgentType::Codex,
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
 
-        assert!(req.meta.is_none());
+        // Terminal metadata is always present; Claude raw-SDK meta is not.
+        let meta = req.meta.as_ref().expect("terminal meta required");
+        assert!(!meta.contains_key("claudeCode"));
+        assert!(meta.contains_key("codeg.dev/terminal"));
     }
 
     #[test]
@@ -5952,7 +6285,10 @@ mod tests {
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
 
         assert_eq!(
             req.meta
@@ -5965,16 +6301,137 @@ mod tests {
     }
 
     #[test]
-    fn build_resume_session_request_skips_meta_for_non_claude() {
+    fn build_resume_session_request_skips_claude_meta_for_non_claude() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let req = build_resume_session_request(
             AgentType::Codex,
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
 
-        assert!(req.meta.is_none());
+        let meta = req.meta.as_ref().expect("terminal meta required");
+        assert!(!meta.contains_key("claudeCode"));
+        assert!(meta.contains_key("codeg.dev/terminal"));
+    }
+
+    fn assert_codeg_terminal_meta(value: &serde_json::Value, dialect: &str, shell: &str) {
+        let term = &value["_meta"]["codeg.dev/terminal"];
+        assert_eq!(term["dialect"], dialect);
+        assert_eq!(term["shell"], shell);
+        assert_eq!(term["platform"], std::env::consts::OS);
+        assert_eq!(term["commandMode"], "selected-shell-for-command-lines");
+    }
+
+    #[test]
+    fn initialize_contains_terminal_metadata() {
+        let spec = test_pwsh_spec();
+        let request =
+            build_initialize_request(&spec, adapter_for(AgentType::Codex)).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+    }
+
+    #[test]
+    fn claude_and_terminal_metadata_are_merged() {
+        let request = build_new_session_request(
+            AgentType::ClaudeCode,
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
+        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
+    }
+
+    #[test]
+    fn load_session_contains_terminal_metadata() {
+        let spec = test_pwsh_spec();
+        let request = build_load_session_request(
+            AgentType::Codex,
+            SessionId::new("sess-load"),
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &spec,
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+    }
+
+    #[test]
+    fn resume_session_contains_terminal_metadata() {
+        let spec = test_posix_spec();
+        let request = build_resume_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-resume"),
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &spec,
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
+        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
+    }
+
+    /// Fake adapter that tries to inject a conflicting `codeg.dev/terminal`
+    /// value. Codeg's authoritative snapshot must win after merge.
+    struct ConflictingTerminalAdapter;
+
+    impl AcpTerminalAdapter for ConflictingTerminalAdapter {
+        fn agent_metadata(
+            &self,
+            _shell: &ResolvedShellSpec,
+        ) -> Result<Meta, AcpError> {
+            let mut meta = Meta::default();
+            meta.insert(
+                "codeg.dev/terminal".into(),
+                serde_json::json!({
+                    "shell": "/bogus/from-adapter",
+                    "dialect": "cmd",
+                    "platform": "bogus",
+                    "commandMode": "adapter-lies",
+                }),
+            );
+            meta.insert(
+                "adapterExtra".into(),
+                serde_json::json!({"ok": true}),
+            );
+            Ok(meta)
+        }
+    }
+
+    #[test]
+    fn terminal_metadata_overwrites_adapter_collision() {
+        let spec = test_pwsh_spec();
+        let request =
+            build_initialize_request(&spec, &ConflictingTerminalAdapter).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        // Codeg snapshot wins on the reserved namespace.
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+        // Non-colliding adapter keys are still merged in.
+        assert_eq!(value["_meta"]["adapterExtra"]["ok"], true);
     }
 
     #[test]
@@ -6024,7 +6481,7 @@ mod tests {
     fn grok_incompatible_agent_switch_detects_stable_code() {
         // Exact shape Grok returns when switching to a model whose agentType
         // differs from the established conversation's (captured from a live
-        // `session/set_model` probe against grok 0.2.94).
+        // `session/set_model` probe against grok 0.2.98).
         let err = sacp::Error::new(-32600, "Cannot switch to model ...").data(serde_json::json!({
             "code": "MODEL_SWITCH_INCOMPATIBLE_AGENT",
             "activeAgentType": "grok-build-plan",

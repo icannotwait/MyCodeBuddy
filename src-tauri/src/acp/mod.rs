@@ -1,6 +1,7 @@
 pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
+pub mod codex_cli;
 pub mod codex_goal;
 pub mod connection;
 pub mod delegation;
@@ -20,6 +21,8 @@ pub mod question;
 pub mod registry;
 pub mod session_info;
 pub mod session_state;
+pub mod terminal_adapter;
+pub mod terminal_context;
 pub mod terminal_runtime;
 pub mod types;
 

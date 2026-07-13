@@ -1060,7 +1060,7 @@
     "sectionTitle": "عام",
     "sectionDescription": "تفضيلات موحّدة للطرفية الافتراضية وتسريع العرض وتفويض الوكلاء المتعدّدين.",
     "terminalTitle": "الطرفية الافتراضية",
-    "terminalDescription": "اختر الصدفة المستخدمة عند فتح علامات تبويب طرفية جديدة من شريط الطرفية أو شجرة الملفات.",
+    "terminalDescription": "اختر الصدفة المستخدمة لعلامات تبويب الطرفية الجديدة ولتنفيذ أدوات وكلاء ACP الجدد. تحتفظ الطرفيات واتصالات ACP الجارية بصدفتها الحالية؛ أعد اتصال جلسة ACP لتطبيق التغييرات.",
     "defaultTerminalShell": "الصدفة الافتراضية",
     "terminalSystemDefault": "افتراضي النظام",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "أدخل مساراً مطلقاً أو اسماً يمكن حلّه عبر PATH.",
     "terminalShellNotInstalled": "غير مثبّت",
     "terminalShellNotFoundWarning": "هذا المسار غير موجود على هذا المضيف.",
-    "terminalCurrentShell": "قيد الاستخدام: {path}",
+    "terminalCurrentShell": "الصدفة الفعلية للطرفيات واتصالات ACP الجديدة: {path}",
     "renderingTitle": "العرض",
     "renderingDescription": "أوقف تشغيل تسريع الأجهزة إذا ظهرت شاشة سوداء أو أخطاء في العرض (شائع على بعض كروت AMD أو كروت Intel المدمجة). يسري على إصدار سطح المكتب لويندوز فقط.",
     "disableHardwareAcceleration": "تعطيل تسريع الأجهزة",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "تعذر بدء تشغيل {agent}: {message}",
           "downloadFailed": "فشل تنزيل {agent}: {message}",
           "sessionLoadResourceNotFound": "فشل تحميل جلسة {agent}. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
+          "sessionLoadLegacyCliSession": "تم إنشاء جلسة {agent} هذه باستخدام وقت تشغيل CLI السابق ولا يمكن استئنافها. ابدأ محادثة جديدة.",
           "sessionLoadUnavailable": "تعذّر على {agent} استعادة هذه الجلسة، فقد تكون انتهت أو توقّف الوكيل. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
           "turnFailedRefusal": "رفض {agent} متابعة هذه الجولة. يدل ذلك غالبًا على خطأ في الخلفية أو البوابة. يرجى مراجعة سجلات الوكيل.",
           "turnFailedMaxTokens": "بلغ {agent} الحد الأقصى للرموز المسموح بها في هذه الجولة.",
           "turnFailedMaxTurnRequests": "بلغ {agent} الحد الأقصى لعدد الطلبات المسموح بها في هذه الجولة.",
           "turnFailedUnknown": "أنهى {agent} الجولة بسبب توقف غير معروف.",
           "grokModelSwitchIncompatibleAgent": "لا يمكن لـ {agent} التبديل إلى هذا النموذج في محادثة قائمة. ابدأ جلسة جديدة لاستخدامه.",
-          "turnFailedEmpty": "أنهى {agent} الجولة دون إنتاج أي رد. يرجى التحقق من إعدادات الوكيل."
+          "turnFailedEmpty": "أنهى {agent} الجولة دون إنتاج أي رد. يرجى التحقق من إعدادات الوكيل.",
+          "terminalShellUnavailable": "الصدفة {shell} غير متاحة. اختر صدفة متاحة في الإعدادات العامة.",
+          "terminalShellUnsupported": "الصدفة {shell} غير مدعومة لتنفيذ أوامر طرفية ACP. اختر صدفة مدعومة في الإعدادات العامة."
         },
         "unableReadAgentConfig": "تعذر قراءة إعدادات الوكيل: {message}",
         "connectFailedTitle": "فشل اتصال {agent}",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "متاح بعد انتهاء الدور الحالي",
         "dismiss": "تجاهل",
         "reconnectFailed": "فشل في إعادة الاتصال بالجلسة",
-        "applied": "تم تطبيق الإعدادات الجديدة"
+        "applied": "تم تطبيق الإعدادات الجديدة",
+        "terminalShellTitle": "تم تحديث صدفة الطرفية"
       },
       "collabAgent": {
         "title": "وكيل فرعي",

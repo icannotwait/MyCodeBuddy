@@ -126,13 +126,26 @@ impl CodexParser {
                             payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match payload_type {
                             "user_message" => {
+                                let text = payload
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                // Pure wire context does not set has_real_user / title.
+                                // Image + context-only still needs the attached-resources
+                                // fallback (Task 8 image-first prompts with Task 9 strip).
+                                let has_images = payload
+                                    .get("images")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|imgs| !imgs.is_empty());
+                                let Some(candidate) =
+                                    extract_codex_title_candidate(text, has_images)
+                                else {
+                                    continue;
+                                };
                                 message_count += 1;
                                 has_real_user = true;
                                 if title.is_none() {
-                                    title = payload
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .and_then(|text| extract_codex_title_candidate(text, true));
+                                    title = Some(candidate);
                                 }
                             }
                             "agent_message" => {
@@ -175,15 +188,16 @@ impl CodexParser {
                                 // Codex native thread name — newest non-empty wins
                                 // (parity with the detail parser). Accept both the
                                 // rollout `thread_name` and the live `threadName`.
+                                // Strip a complete Codeg terminal-context envelope
+                                // before truncate so it cannot become a list title.
                                 if let Some(name) = payload
                                     .get("thread_name")
                                     .or_else(|| payload.get("threadName"))
                                     .or_else(|| payload.get("name"))
                                     .and_then(|n| n.as_str())
-                                    .map(str::trim)
-                                    .filter(|n| !n.is_empty())
+                                    .and_then(|n| super::visible_title(Some(n.to_string())))
                                 {
-                                    title = Some(truncate_str(name, 100));
+                                    title = Some(truncate_str(&name, 100));
                                 }
                             }
                             _ => {}
@@ -210,8 +224,11 @@ impl CodexParser {
                             if role == "user" && response_item_user_has_image(payload) {
                                 has_real_user = true;
                                 if title.is_none() {
+                                    // Has image ⇒ fallback_attached so context-only
+                                    // (or empty) text still yields "Attached resources".
                                     title = extract_codex_text_content(payload)
-                                        .and_then(|t| extract_codex_title_candidate(&t, false));
+                                        .and_then(|t| extract_codex_title_candidate(&t, true))
+                                        .or_else(|| Some("Attached resources".to_string()));
                                 }
                             }
                         }
@@ -1014,9 +1031,12 @@ impl CodexParser {
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let normalized = strip_blocked_resource_mentions(&text);
+                                // Blocked-resource cleanup first, then hide the
+                                // wire-only terminal context envelope.
+                                let after_blocked = strip_blocked_resource_mentions(&text);
+                                let visible_text = super::visible_user_text(&after_blocked);
                                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                                if !normalized.is_empty() {
+                                if let Some(normalized) = visible_text.clone() {
                                     blocks.push(ContentBlock::Text { text: normalized });
                                 }
 
@@ -1040,6 +1060,12 @@ impl CodexParser {
                                 }
 
                                 if blocks.is_empty() {
+                                    // Pure terminal-context records produce no user turn.
+                                    if visible_text.is_none()
+                                        && !after_blocked.trim().is_empty()
+                                    {
+                                        continue;
+                                    }
                                     blocks.push(ContentBlock::Text {
                                         text: "Attached resources".to_string(),
                                     });
@@ -1179,15 +1205,15 @@ impl CodexParser {
                                 // Rollout persists `thread_name` (snake_case); the
                                 // live ACP notification uses `threadName`. Accept
                                 // both so the parser is robust to either source.
+                                // Reject a complete Codeg terminal-context envelope.
                                 if let Some(name) = payload
                                     .get("thread_name")
                                     .or_else(|| payload.get("threadName"))
                                     .or_else(|| payload.get("name"))
                                     .and_then(|n| n.as_str())
-                                    .map(str::trim)
-                                    .filter(|n| !n.is_empty())
+                                    .and_then(|n| super::visible_title(Some(n.to_string())))
                                 {
-                                    title = Some(truncate_str(name, 100));
+                                    title = Some(truncate_str(&name, 100));
                                 }
                             }
                             "agent_reasoning" => {
@@ -1696,13 +1722,20 @@ impl CodexParser {
                                             continue;
                                         }
 
+                                        // Title from visible block text; image turns with
+                                        // only stripped terminal context still get the
+                                        // same "Attached resources" fallback as summary.
                                         if title.is_none() {
-                                            if let Some(text) = first_text_block(&blocks) {
-                                                title = extract_codex_title_candidate(
-                                                    text.as_str(),
-                                                    true,
-                                                );
-                                            }
+                                            title = first_text_block(&blocks)
+                                                .and_then(|text| {
+                                                    extract_codex_title_candidate(
+                                                        text.as_str(),
+                                                        true,
+                                                    )
+                                                })
+                                                .or_else(|| {
+                                                    Some("Attached resources".to_string())
+                                                });
                                         }
 
                                         messages.push(UnifiedMessage {
@@ -2153,16 +2186,26 @@ fn extract_codex_title_candidate(input: &str, fallback_attached: bool) -> Option
         return None;
     }
 
+    // Blocked-resource cleanup first, then exact Codeg terminal-context strip.
     let cleaned = strip_blocked_resource_mentions(&without_agents);
-    if cleaned.is_empty() {
-        if fallback_attached {
+    if cleaned.trim().is_empty() {
+        return if fallback_attached {
             Some("Attached resources".to_string())
         } else {
             None
-        }
-    } else {
-        Some(title_from_user_text(&cleaned))
+        };
     }
+    let Some(visible) = super::visible_user_text(&cleaned) else {
+        // Complete terminal-context envelope only — never show the envelope as a
+        // title. When the turn has attached resources/images, restore the same
+        // fallback used for image-only / blocked-placeholder turns.
+        return if fallback_attached {
+            Some("Attached resources".to_string())
+        } else {
+            None
+        };
+    };
+    Some(title_from_user_text(&visible))
 }
 
 fn extract_codex_text_content(payload: &serde_json::Value) -> Option<String> {
@@ -2308,8 +2351,10 @@ fn extract_response_item_user_image_blocks(
         return None;
     }
 
-    let text = strip_blocked_resource_mentions(&text_parts.join("\n"));
-    if !text.is_empty() {
+    // Blocked-resource cleanup first, then hide the wire-only terminal context
+    // envelope so "Selected shell:" never lands in history text blocks.
+    let after_blocked = strip_blocked_resource_mentions(&text_parts.join("\n"));
+    if let Some(text) = super::visible_user_text(&after_blocked) {
         blocks.insert(0, ContentBlock::Text { text });
     }
 
@@ -2456,6 +2501,28 @@ mod tests {
     }
 
     #[test]
+    fn context_only_title_uses_attached_resources_when_fallback() {
+        // Image/resource turns whose text is only the Task 8 wire envelope must
+        // keep the existing "Attached resources" title, not None / the XML.
+        let ctx = test_codeg_terminal_context();
+        assert_eq!(
+            extract_codex_title_candidate(&ctx, true).as_deref(),
+            Some("Attached resources")
+        );
+        assert_eq!(extract_codex_title_candidate(&ctx, false), None);
+
+        let real_plus = format!("real prompt\n\n{ctx}");
+        assert_eq!(
+            extract_codex_title_candidate(&real_plus, true).as_deref(),
+            Some("real prompt")
+        );
+        assert_eq!(
+            extract_codex_title_candidate(&real_plus, false).as_deref(),
+            Some("real prompt")
+        );
+    }
+
+    #[test]
     fn strips_image_placeholders_from_user_text() {
         let input = "这个图片里面是什么\n</image>\n<image>\n";
         let got = strip_blocked_resource_mentions(input);
@@ -2486,6 +2553,61 @@ mod tests {
                 assert_eq!(data, "QUJD");
             }
             _ => panic!("expected image block"),
+        }
+    }
+
+    #[test]
+    fn response_item_image_blocks_strip_terminal_context_text() {
+        // Context-only input_text must not become a history Text block; image stays.
+        let ctx = test_codeg_terminal_context();
+        let payload = serde_json::json!({
+            "content": [
+                {"type": "input_text", "text": ctx},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,QUJD"
+                }
+            ]
+        });
+
+        let blocks = extract_response_item_user_image_blocks(&payload).expect("blocks");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block"
+        );
+        assert!(
+            !blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text }
+                    if text.contains("Selected shell:")
+                        || text.contains("codeg_terminal_context")
+            )),
+            "terminal context must not emit a text block"
+        );
+
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let payload_real = serde_json::json!({
+            "content": [
+                {"type": "input_text", "text": real_plus},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,QUJD"
+                }
+            ]
+        });
+        let blocks_real =
+            extract_response_item_user_image_blocks(&payload_real).expect("blocks");
+        match blocks_real
+            .iter()
+            .find(|b| matches!(b, ContentBlock::Text { .. }))
+        {
+            Some(ContentBlock::Text { text }) => {
+                assert_eq!(text, "real prompt");
+                assert!(!text.contains("Selected shell:"));
+            }
+            _ => panic!("expected visible user text block"),
         }
     }
 
@@ -4443,5 +4565,214 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let lines = vec![
+            rollout_line(
+                "2026-06-29T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": ctx}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:01Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": real_plus}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "user_message",
+                    "message": "<codeg_terminal_context version=\"1\">partial"
+                }),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:03Z",
+                "event_msg",
+                serde_json::json!({"type": "thread_name_updated", "thread_name": ctx}),
+            ),
+        ];
+        let path = write_temp_rollout("term-ctx", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "term-ctx")
+            .expect("detail");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+    }
+
+    #[test]
+    fn image_plus_context_only_title_is_attached_resources() {
+        // Task 8 appends wire context on image-first prompts; after Task 9 strip
+        // the title must stay "Attached resources", not None / the envelope.
+        let ctx = test_codeg_terminal_context();
+        let image_uri = "data:image/png;base64,QUJD";
+        let lines = vec![
+            rollout_line(
+                "2026-06-29T08:40:00Z",
+                "session_meta",
+                serde_json::json!({"id": "img-ctx", "cwd": "/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "user_message",
+                    "message": ctx,
+                    "images": [image_uri]
+                }),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "ok"}),
+            ),
+        ];
+        let path = write_temp_rollout("img-ctx", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "img-ctx")
+            .expect("detail");
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("summary ok")
+            .expect("summary present");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(detail.summary.title.as_deref(), Some("Attached resources"));
+        assert_eq!(summary.title.as_deref(), Some("Attached resources"));
+        assert!(summary.message_count >= 1);
+
+        let user_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(
+            user_turns[0]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block on the user turn"
+        );
+        assert!(
+            !user_turn_texts(&detail)
+                .iter()
+                .any(|t| t.contains("Selected shell:") || t.contains("codeg_terminal_context")),
+            "terminal context must not appear as user text"
+        );
+    }
+
+    #[test]
+    fn response_item_image_plus_context_only_title_is_attached_resources() {
+        let ctx = test_codeg_terminal_context();
+        let lines = vec![
+            rollout_line(
+                "2026-06-29T08:40:00Z",
+                "session_meta",
+                serde_json::json!({"id": "ri-img-ctx", "cwd": "/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": ctx},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,QUJD"
+                        }
+                    ]
+                }),
+            ),
+            rollout_line(
+                "2026-06-29T08:40:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "ok"}),
+            ),
+        ];
+        let path = write_temp_rollout("ri-img-ctx", &lines);
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "ri-img-ctx")
+            .expect("detail");
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("summary ok")
+            .expect("summary present");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(detail.summary.title.as_deref(), Some("Attached resources"));
+        assert_eq!(summary.title.as_deref(), Some("Attached resources"));
+
+        let user_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(
+            user_turns[0]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "expected image block on the user turn"
+        );
+        // Residual Task 9: response_item image path must strip terminal context
+        // from history blocks, not only from the title candidate.
+        assert!(
+            !user_turn_texts(&detail)
+                .iter()
+                .any(|t| t.contains("Selected shell:") || t.contains("codeg_terminal_context")),
+            "terminal context must not appear as user history text"
+        );
+        assert!(
+            !user_turns[0].blocks.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text }
+                    if text.contains("Selected shell:")
+                        || text.contains("codeg_terminal_context")
+            )),
+            "history blocks must not contain envelope markers"
+        );
     }
 }

@@ -34,7 +34,7 @@ repository verification suite before merging the pull request.
 
 For an upstream Codeg `0.20.2` sync, reset the fork version in `package.json`,
 `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
-`src-tauri/tauri.conf.json` to `0.20.2-mycodebuddy.2`. Run
+`src-tauri/tauri.conf.json` to `0.20.2-mycodebuddy.3`. Run
 `pnpm test:release` to verify that the versions and runtime URLs remain
 consistent.
 

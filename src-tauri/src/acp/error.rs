@@ -1,4 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
+
+use crate::app_error::{AppCommandError, AppErrorCode};
+use crate::terminal::shell::ShellResolveError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -8,6 +13,16 @@ pub enum AcpError {
     ConnectionNotFound(String),
     #[error("ACP protocol error: {0}")]
     Protocol(String),
+    #[error("selected terminal shell is unavailable: {display_name} ({executable})")]
+    TerminalShellUnavailable {
+        display_name: String,
+        executable: String,
+    },
+    #[error("selected terminal shell is unsupported: {display_name} ({executable})")]
+    TerminalShellUnsupported {
+        display_name: String,
+        executable: String,
+    },
     #[error("agent process exited unexpectedly")]
     ProcessExited,
     /// A prompt arrived while this connection already had a turn in flight.
@@ -83,7 +98,68 @@ impl AcpError {
             Self::SpawnFailed(_) => Some("spawn_failed"),
             Self::DownloadFailed(_) => Some("download_failed"),
             Self::ConnectionNotFound(_) => Some("connection_not_found"),
+            Self::TerminalShellUnavailable { .. } => Some("terminal_shell_unavailable"),
+            Self::TerminalShellUnsupported { .. } => Some("terminal_shell_unsupported"),
             Self::Protocol(_) => None,
+        }
+    }
+
+    /// Structured wire payload for shell preflight failures only.
+    ///
+    /// Non-shell variants return `None` so Tauri serialization stays a bare
+    /// legacy string (preserving SdkNotInstalled substring matching, etc.).
+    pub(crate) fn shell_command_error(&self) -> Option<AppCommandError> {
+        match self {
+            AcpError::TerminalShellUnavailable {
+                display_name,
+                executable,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::TerminalShellUnavailable,
+                    "Selected terminal shell is unavailable",
+                )
+                .with_detail(executable.clone())
+                .with_i18n(
+                    "backendErrors.terminalShellUnavailable",
+                    BTreeMap::from([("shell".into(), display_name.clone())]),
+                ),
+            ),
+            AcpError::TerminalShellUnsupported {
+                display_name,
+                executable,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::TerminalShellUnsupported,
+                    "Selected terminal shell is unsupported",
+                )
+                .with_detail(executable.clone())
+                .with_i18n(
+                    "backendErrors.terminalShellUnsupported",
+                    BTreeMap::from([("shell".into(), display_name.clone())]),
+                ),
+            ),
+            _ => None,
+        }
+    }
+}
+
+impl From<ShellResolveError> for AcpError {
+    fn from(err: ShellResolveError) -> Self {
+        match err {
+            ShellResolveError::Unavailable {
+                display_name,
+                executable,
+            } => Self::TerminalShellUnavailable {
+                display_name,
+                executable,
+            },
+            ShellResolveError::Unsupported {
+                display_name,
+                executable,
+            } => Self::TerminalShellUnsupported {
+                display_name,
+                executable,
+            },
         }
     }
 }
@@ -93,6 +169,9 @@ impl Serialize for AcpError {
     where
         S: serde::Serializer,
     {
+        if let Some(error) = self.shell_command_error() {
+            return error.serialize(serializer);
+        }
         serializer.serialize_str(&self.to_string())
     }
 }
@@ -124,4 +203,47 @@ fn is_executable_format_error(message: &str) -> bool {
         || lowered.contains("bad cpu type in executable")
         || lowered.contains("not a valid win32 application")
         || lowered.contains("is not a valid application for this os platform")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn acp_error_serialization_structures_shell_failure() {
+        let err = AcpError::TerminalShellUnavailable {
+            display_name: "PowerShell 7".into(),
+            executable: r"C:\missing\pwsh.exe".into(),
+        };
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(
+            value,
+            json!({
+                "code": "terminal_shell_unavailable",
+                "message": "Selected terminal shell is unavailable",
+                "detail": r"C:\missing\pwsh.exe",
+                "i18n_key": "backendErrors.terminalShellUnavailable",
+                "i18n_params": { "shell": "PowerShell 7" },
+            })
+        );
+
+        let unsupported = AcpError::TerminalShellUnsupported {
+            display_name: "mystery.exe".into(),
+            executable: r"C:\tools\mystery.exe".into(),
+        };
+        let value = serde_json::to_value(&unsupported).expect("serialize");
+        assert_eq!(value["code"], "terminal_shell_unsupported");
+        assert_eq!(
+            value["i18n_key"],
+            "backendErrors.terminalShellUnsupported"
+        );
+    }
+
+    #[test]
+    fn acp_error_serialization_preserves_sdk_string() {
+        let err = AcpError::SdkNotInstalled("agent is not installed".into());
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(value, json!("agent is not installed"));
+    }
 }

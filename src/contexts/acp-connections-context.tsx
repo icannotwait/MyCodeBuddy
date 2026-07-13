@@ -34,6 +34,10 @@ import {
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import {
+  extractAppCommandError,
+  toLocalizedErrorMessage,
+} from "@/lib/app-error"
+import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -182,14 +186,16 @@ export interface ConnectionState {
   claudeApiRetry: ClaudeApiRetryState | null
   error: string | null
   /**
-   * Set when the agent rejected `session/load` non-recoverably (currently
-   * only `Resource not found` for an expired/missing historical session).
+   * Set when the agent rejected `session/load` non-recoverably because a
+   * historical session cannot be resumed.
    * Distinct from `error` because the UI surfaces it inline in the message
    * list with reload / new-conversation actions, instead of as a toast.
    * Cleared on the next CONNECTION_CREATED for the same key, or by
    * CLEAR_ACP_LOAD_ERROR (Reload button).
    */
   loadError: string | null
+  /** Stable backend code for `loadError`, used to choose valid recovery actions. */
+  loadErrorCode: string | null
   /**
    * Highest envelope.seq applied to this connection. Used to dedup the
    * live `acp://event` stream against the snapshot endpoint: a
@@ -497,7 +503,12 @@ type Action =
       retry: ClaudeApiRetryState | null
     }
   | { type: "ERROR"; contextKey: string; message: string }
-  | { type: "ACP_LOAD_ERROR"; contextKey: string; message: string }
+  | {
+      type: "ACP_LOAD_ERROR"
+      contextKey: string
+      message: string
+      code: string
+    }
   | { type: "CLEAR_ACP_LOAD_ERROR"; contextKey: string }
   | {
       type: "AVAILABLE_COMMANDS"
@@ -1135,6 +1146,7 @@ function connectionsReducer(
         claudeApiRetry: null,
         error: null,
         loadError: null,
+        loadErrorCode: null,
         lastAppliedSeq: 0,
         isDelegationChild: false,
         parentToolUseId: null,
@@ -1191,6 +1203,7 @@ function connectionsReducer(
         claudeApiRetry: null,
         error: null,
         loadError: null,
+        loadErrorCode: null,
         lastAppliedSeq: 0,
         isDelegationChild: true,
         parentToolUseId: action.parentToolUseId,
@@ -2119,6 +2132,7 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         loadError: action.message,
+        loadErrorCode: action.code,
       })
       return next
     }
@@ -2130,6 +2144,7 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         loadError: null,
+        loadErrorCode: null,
       })
       return next
     }
@@ -3303,10 +3318,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         case "session_load_failed": {
           flushStreamingQueue()
-          // Localize via the stable `code` field (currently only
-          // "resource_not_found" — JSON-RPC -32002). Fall back to the raw
-          // agent message so an unknown future code still surfaces something
-          // intelligible rather than getting swallowed.
+          // Localize via the stable `code` field. Fall back to the raw agent
+          // message so an unknown future code still surfaces something useful.
           const nc = storeRef.current.connections.get(contextKey)
           const agentLabel = nc ? AGENT_LABELS[nc.agentType] : ""
           const localizedMessage = (() => {
@@ -3319,6 +3332,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 return t("backendErrors.sessionLoadUnavailable", {
                   agent: agentLabel,
                 })
+              case "legacy_cli_session":
+                return t("backendErrors.sessionLoadLegacyCliSession", {
+                  agent: agentLabel,
+                })
               default:
                 return e.message
             }
@@ -3327,6 +3344,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "ACP_LOAD_ERROR",
             contextKey,
             message: localizedMessage,
+            code: e.code,
           })
           break
         }
@@ -4169,7 +4187,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const superseded =
           pendingRequest != null && !sameConnectRequest(pendingRequest, request)
         if (!superseded && !isAlertedError(err)) {
-          const message = normalizeErrorMessage(err)
+          // Prefer structured AppCommandError payloads (shell preflight
+          // i18n_key) while keeping the legacy SdkNotInstalled string
+          // path. Only shell AcpError variants serialize as objects;
+          // all other ACP errors remain bare strings.
+          const appError = extractAppCommandError(err)
+          const message = toLocalizedErrorMessage(
+            err,
+            t as unknown as (
+              key: string,
+              params?: Record<string, string | number>
+            ) => string
+          )
           const agentLabel = AGENT_LABELS[agentType]
           // Backend safety net: if the agent turned out to be not
           // installed (e.g. the binary was removed between preflight
@@ -4177,17 +4206,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // "Open Agent Settings" action. Title is localized via the
           // same i18n key the preflight path uses.
           //
-          // INVARIANT: `AcpError::SdkNotInstalled` renders its payload
-          // unchanged, and both producers
-          // (`src-tauri/src/commands/acp.rs::verify_agent_installed`
-          // and `src-tauri/src/acp/connection.rs::build_agent` Binary
-          // branch) format the message with the literal English
-          // substring "is not installed". Do NOT translate those two
-          // format strings — this branch matches on them as a stable
-          // identifier, since `AcpError::Serialize` flattens to a bare
-          // message string and does not expose the error `code` for
-          // synchronous Tauri command rejections.
-          if (message.includes("is not installed")) {
+          // INVARIANT: `AcpError::SdkNotInstalled` still serializes as a
+          // bare string whose payload contains "is not installed". Shell
+          // failures serialize as AppCommandError objects with a stable
+          // `code` / `i18n_key` instead.
+          const sdkMissing =
+            appError?.code === "sdk_not_installed" ||
+            message.includes("is not installed")
+          if (sdkMissing) {
             pushAlertRef.current(
               "error",
               t("blocked.sdkMissing", { agent: agentLabel }),

@@ -9,7 +9,10 @@ use sea_orm::{
 };
 
 use crate::models::*;
-use crate::parsers::{folder_name_from_path, AgentParser, ParseError};
+use crate::parsers::{
+    folder_name_from_path, sanitize_user_blocks, title_from_user_text, visible_title, AgentParser,
+    ParseError,
+};
 
 /// Parser for Hermes Agent (Nous Research) transcripts.
 ///
@@ -205,6 +208,12 @@ impl HermesParser {
             .build_session_stats(&conn, conversation_id, summary.model.as_deref())
             .await?;
 
+        let mut summary = summary;
+        // Native session title may have been only terminal context; fall back.
+        if summary.title.is_none() {
+            summary.title = first_user_title_from_turns(&turns);
+        }
+
         Ok(ConversationDetail {
             summary,
             turns,
@@ -267,6 +276,8 @@ impl HermesParser {
             match role {
                 MessageRole::User => {
                     blocks.extend(decode_hermes_content(content.as_deref()));
+                    // Hide wire-only Codeg terminal context; skip context-only rows.
+                    let _ = sanitize_user_blocks(&mut blocks);
                 }
                 MessageRole::Assistant => {
                     msg_model = session_model.map(str::to_string);
@@ -450,6 +461,18 @@ fn resolve_hermes_home(env: Option<String>, home: Option<PathBuf>) -> PathBuf {
     }
 }
 
+fn first_user_title_from_turns(turns: &[MessageTurn]) -> Option<String> {
+    turns.iter().find_map(|turn| {
+        if !matches!(turn.role, TurnRole::User) {
+            return None;
+        }
+        turn.blocks.iter().find_map(|b| match b {
+            ContentBlock::Text { text } if !text.is_empty() => Some(title_from_user_text(text)),
+            _ => None,
+        })
+    })
+}
+
 fn parse_sqlite_summary_row(row: &QueryResult) -> Result<ConversationSummary, ParseError> {
     let id: String = row.try_get("", "id")?;
     let folder_path: Option<String> = row.try_get("", "folder_path")?;
@@ -477,7 +500,7 @@ fn parse_sqlite_summary_row(row: &QueryResult) -> Result<ConversationSummary, Pa
         agent_type: AgentType::Hermes,
         folder_path,
         folder_name,
-        title: normalize_optional_string(title),
+        title: visible_title(normalize_optional_string(title)),
         started_at,
         ended_at,
         message_count,
@@ -925,5 +948,133 @@ mod tests {
         assert_eq!(content_to_text(Some("plain")).as_deref(), Some("plain"));
         assert_eq!(content_to_text(Some("  ")), None);
         assert_eq!(content_to_text(None), None);
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().to_path_buf();
+        let db_path = base.join("state.db");
+        let session_id = "hermes-term-ctx";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+                .await
+                .expect("open");
+            for ddl in [
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, \
+                 model_config TEXT, parent_session_id TEXT, started_at REAL, ended_at REAL, \
+                 cwd TEXT, title TEXT, archived INTEGER, input_tokens INTEGER, \
+                 output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER)",
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, \
+                 role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, \
+                 reasoning TEXT, reasoning_content TEXT, timestamp REAL, finish_reason TEXT, \
+                 active INTEGER)",
+            ] {
+                conn.execute(Statement::from_string(DatabaseBackend::Sqlite, ddl))
+                    .await
+                    .expect("ddl");
+            }
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO sessions (id, source, model, model_config, parent_session_id, \
+                 started_at, ended_at, cwd, title, archived, input_tokens, output_tokens, \
+                 cache_read_tokens, cache_write_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    session_id.into(),
+                    "acp".into(),
+                    "gpt-5.5".into(),
+                    "{}".into(),
+                    "".into(),
+                    1_780_980_974.0f64.into(),
+                    1_780_980_980.0f64.into(),
+                    "/Users/demo/app".into(),
+                    ctx.clone().into(),
+                    0i64.into(),
+                    0i64.into(),
+                    0i64.into(),
+                    0i64.into(),
+                    0i64.into(),
+                ],
+            ))
+            .await
+            .expect("session");
+
+            for (role, content, ts) in [
+                ("user", ctx.as_str(), 1_780_980_975.0),
+                ("user", real_plus.as_str(), 1_780_980_976.0),
+                (
+                    "user",
+                    "<codeg_terminal_context version=\"1\">partial",
+                    1_780_980_977.0,
+                ),
+            ] {
+                conn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, \
+                     tool_name, reasoning, reasoning_content, timestamp, finish_reason, active) \
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        session_id.into(),
+                        role.into(),
+                        content.into(),
+                        "".into(),
+                        "".into(),
+                        "".into(),
+                        "".into(),
+                        "".into(),
+                        ts.into(),
+                        "".into(),
+                        1i64.into(),
+                    ],
+                ))
+                .await
+                .expect("msg");
+            }
+        });
+
+        let parser = HermesParser::with_base_dir(base);
+        let detail = parser.get_conversation(session_id).expect("detail");
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

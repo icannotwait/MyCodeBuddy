@@ -1523,8 +1523,10 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            config_fingerprint: String::new(),
-            last_observed_fingerprint: String::new(),
+            spawn_config: crate::acp::connection::matching_config_pair(String::new(), "system").0,
+            observed_config: crate::acp::connection::matching_config_pair(String::new(), "system")
+                .1,
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         }
     }
 

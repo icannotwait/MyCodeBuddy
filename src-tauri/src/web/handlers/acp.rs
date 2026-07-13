@@ -62,7 +62,7 @@ pub async fn acp_connect(
     let db = &state.db;
     let manager = &state.connection_manager;
 
-    let runtime_env = acp_commands::build_session_runtime_env(
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         db,
         params.agent_type,
         params.session_id.as_deref(),
@@ -84,14 +84,18 @@ pub async fn acp_connect(
             params.agent_type,
             params.working_dir,
             params.session_id,
-            runtime_env,
+            launch_inputs,
             "web".to_string(),
             emitter,
             params.preferred_mode_id,
             params.preferred_config_values.unwrap_or_default(),
         )
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
 
     Ok(Json(connection_id))
 }
@@ -180,11 +184,13 @@ pub struct AcpPreflightParams {
 }
 
 pub async fn acp_preflight(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPreflightParams>,
 ) -> Result<Json<PreflightResult>, AppCommandError> {
-    let result = acp_commands::acp_preflight(params.agent_type, params.force_refresh)
-        .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    let result =
+        acp_commands::acp_preflight_core(params.agent_type, params.force_refresh, &state.db)
+            .await
+            .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
 }
 

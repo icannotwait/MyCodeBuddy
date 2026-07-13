@@ -1060,7 +1060,7 @@
     "sectionTitle": "General",
     "sectionDescription": "Centralized preferences for the default terminal, rendering acceleration, and multi-agent delegation.",
     "terminalTitle": "Default Terminal",
-    "terminalDescription": "Choose the shell used when opening new terminal tabs from the terminal bar or file tree.",
+    "terminalDescription": "Choose the shell used for new terminal tabs and new ACP agent tool execution. Running terminals and ACP connections keep their current shell; reconnect an ACP session to apply changes.",
     "defaultTerminalShell": "Default shell",
     "terminalSystemDefault": "System default",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "Provide an absolute path or a name resolvable on PATH.",
     "terminalShellNotInstalled": "not installed",
     "terminalShellNotFoundWarning": "This path doesn't exist on this host.",
-    "terminalCurrentShell": "Currently using: {path}",
+    "terminalCurrentShell": "Effective shell for new terminals and ACP connections: {path}",
     "renderingTitle": "Rendering",
     "renderingDescription": "Disable hardware acceleration if the app shows a black screen or rendering glitches (common on certain AMD GPUs or Intel integrated GPUs). Only takes effect on the Windows desktop build.",
     "disableHardwareAcceleration": "Disable hardware acceleration",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "Failed to start {agent}: {message}",
           "downloadFailed": "{agent} download failed: {message}",
           "sessionLoadResourceNotFound": "{agent} session failed to load. Reload to retry, or start a new conversation.",
+          "sessionLoadLegacyCliSession": "This {agent} session was created by the legacy CLI runtime and cannot be resumed. Start a new conversation.",
           "sessionLoadUnavailable": "{agent} couldn't restore this session — it may have ended or the agent stopped. Reload to retry, or start a new conversation.",
           "turnFailedRefusal": "{agent} refused to continue this turn. This often indicates a backend or gateway error — check the agent's logs.",
           "turnFailedMaxTokens": "{agent} reached the maximum token limit for this turn.",
           "turnFailedMaxTurnRequests": "{agent} reached the maximum number of allowed requests for this turn.",
           "turnFailedUnknown": "{agent} ended the turn with an unrecognized stop reason.",
           "grokModelSwitchIncompatibleAgent": "{agent} can't switch to that model in an existing conversation. Start a new session to use it.",
-          "turnFailedEmpty": "{agent} ended the turn without producing any response. Please check the agent's configuration."
+          "turnFailedEmpty": "{agent} ended the turn without producing any response. Please check the agent's configuration.",
+          "terminalShellUnavailable": "{shell} is unavailable. Choose an available shell in General settings.",
+          "terminalShellUnsupported": "{shell} is not supported for ACP terminal execution. Choose a supported shell in General settings."
         },
         "unableReadAgentConfig": "Unable to read Agent config: {message}",
         "connectFailedTitle": "{agent} connection failed",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "Available once the current turn finishes",
         "dismiss": "Dismiss",
         "reconnectFailed": "Failed to reconnect session",
-        "applied": "New configuration applied"
+        "applied": "New configuration applied",
+        "terminalShellTitle": "Terminal shell updated"
       },
       "collabAgent": {
         "title": "Sub-agent",

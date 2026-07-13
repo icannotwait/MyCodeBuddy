@@ -1060,7 +1060,7 @@
     "sectionTitle": "一般",
     "sectionDescription": "集中管理預設終端機、渲染加速以及多智能體協同等通用偏好。",
     "terminalTitle": "預設終端",
-    "terminalDescription": "選擇從終端標籤列或檔案樹開啟新終端時使用的 Shell。",
+    "terminalDescription": "選擇新終端標籤和新 ACP Agent 工具執行所使用的 Shell。執行中的終端和 ACP 連線會保留原 Shell；重新連線 ACP 工作階段後套用變更。",
     "defaultTerminalShell": "預設 Shell",
     "terminalSystemDefault": "系統預設",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "支援絕對路徑，或 PATH 中可解析的命令名。",
     "terminalShellNotInstalled": "未安裝",
     "terminalShellNotFoundWarning": "目前主機上不存在此路徑。",
-    "terminalCurrentShell": "目前使用：{path}",
+    "terminalCurrentShell": "新終端和 ACP 連線的有效 Shell：{path}",
     "renderingTitle": "渲染加速",
     "renderingDescription": "若應用出現黑屏或渲染異常（常見於 AMD 顯示卡或部分 Intel 內顯），可關閉硬體加速。僅 Windows 桌面端生效。",
     "disableHardwareAcceleration": "停用硬體加速",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "啟動 {agent} 失敗：{message}",
           "downloadFailed": "{agent} 下載失敗：{message}",
           "sessionLoadResourceNotFound": "{agent} 會話載入失敗，可重新載入重試，或開始新會話。",
+          "sessionLoadLegacyCliSession": "此 {agent} 工作階段由舊版 CLI 執行階段建立，無法還原。請建立新會話。",
           "sessionLoadUnavailable": "{agent} 無法還原此會話，它可能已結束或 agent 已停止。可重新載入重試，或開始新會話。",
           "turnFailedRefusal": "{agent} 拒絕繼續此輪回覆，通常代表後端或網關出錯，請檢查代理日誌。",
           "turnFailedMaxTokens": "{agent} 已達到此輪回覆的最大 Token 限制。",
           "turnFailedMaxTurnRequests": "{agent} 已達到此輪回覆允許的最大請求次數。",
           "turnFailedUnknown": "{agent} 以未知的停止原因結束了此輪回覆。",
           "grokModelSwitchIncompatibleAgent": "{agent} 無法在既有對話中切換到該模型，請新建工作階段以使用它。",
-          "turnFailedEmpty": "{agent} 此輪沒有產生任何回覆就結束了，請檢查代理設定。"
+          "turnFailedEmpty": "{agent} 此輪沒有產生任何回覆就結束了，請檢查代理設定。",
+          "terminalShellUnavailable": "{shell} 無法使用。請在「一般」設定中選擇可用的 Shell。",
+          "terminalShellUnsupported": "ACP 終端執行不支援 {shell}。請在「一般」設定中選擇支援的 Shell。"
         },
         "unableReadAgentConfig": "無法讀取 Agent 設定：{message}",
         "connectFailedTitle": "{agent} 連線失敗",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "目前回合結束後可重新連線",
         "dismiss": "忽略",
         "reconnectFailed": "重新連線工作階段失敗",
-        "applied": "已套用新設定"
+        "applied": "已套用新設定",
+        "terminalShellTitle": "終端 Shell 已更新"
       },
       "collabAgent": {
         "title": "子智能體",

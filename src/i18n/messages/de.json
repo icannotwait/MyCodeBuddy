@@ -1060,7 +1060,7 @@
     "sectionTitle": "Allgemein",
     "sectionDescription": "Zentrale Einstellungen für das Standardterminal, die Rendering-Beschleunigung und die Multi-Agent-Delegation.",
     "terminalTitle": "Standardterminal",
-    "terminalDescription": "Wähle die Shell, die beim Öffnen neuer Terminal-Tabs aus der Terminalleiste oder dem Dateibaum verwendet wird.",
+    "terminalDescription": "Wähle die Shell für neue Terminal-Tabs und die Werkzeugausführung neuer ACP-Agenten. Laufende Terminals und ACP-Verbindungen behalten ihre Shell; verbinde die ACP-Sitzung neu, um Änderungen anzuwenden.",
     "defaultTerminalShell": "Standard-Shell",
     "terminalSystemDefault": "Systemstandard",
     "terminalPowerShell7": "PowerShell 7 (pwsh)",
@@ -1074,7 +1074,7 @@
     "terminalShellCustomHint": "Absoluten Pfad oder einen über PATH auflösbaren Namen angeben.",
     "terminalShellNotInstalled": "nicht installiert",
     "terminalShellNotFoundWarning": "Dieser Pfad existiert auf diesem Host nicht.",
-    "terminalCurrentShell": "Aktuell verwendet: {path}",
+    "terminalCurrentShell": "Effektive Shell für neue Terminals und ACP-Verbindungen: {path}",
     "renderingTitle": "Rendering",
     "renderingDescription": "Deaktivieren Sie die Hardwarebeschleunigung, wenn die App einen schwarzen Bildschirm oder Render-Fehler zeigt (häufig bei bestimmten AMD-GPUs oder integrierten Intel-GPUs). Wirkt sich nur auf die Windows-Desktop-Version aus.",
     "disableHardwareAcceleration": "Hardwarebeschleunigung deaktivieren",
@@ -2041,13 +2041,16 @@
           "spawnFailed": "{agent} konnte nicht gestartet werden: {message}",
           "downloadFailed": "{agent}-Download fehlgeschlagen: {message}",
           "sessionLoadResourceNotFound": "{agent}-Sitzung konnte nicht geladen werden. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
+          "sessionLoadLegacyCliSession": "Diese {agent}-Sitzung wurde mit der vorherigen CLI-Laufzeit erstellt und kann nicht fortgesetzt werden. Starten Sie eine neue Unterhaltung.",
           "sessionLoadUnavailable": "{agent} konnte diese Sitzung nicht wiederherstellen – sie wurde möglicherweise beendet oder der Agent wurde gestoppt. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
           "turnFailedRefusal": "{agent} hat die Fortsetzung dieser Runde abgelehnt. Häufig deutet das auf einen Backend- oder Gateway-Fehler hin. Bitte prüfen Sie die Agent-Logs.",
           "turnFailedMaxTokens": "{agent} hat das Token-Limit für diese Runde erreicht.",
           "turnFailedMaxTurnRequests": "{agent} hat die maximale Anzahl zulässiger Anfragen für diese Runde erreicht.",
           "turnFailedUnknown": "{agent} hat die Runde mit einem unbekannten Stoppgrund beendet.",
           "grokModelSwitchIncompatibleAgent": "{agent} kann in einer bestehenden Unterhaltung nicht zu diesem Modell wechseln. Starte eine neue Sitzung, um es zu verwenden.",
-          "turnFailedEmpty": "{agent} hat die Runde ohne jegliche Antwort beendet. Bitte prüfen Sie die Agent-Konfiguration."
+          "turnFailedEmpty": "{agent} hat die Runde ohne jegliche Antwort beendet. Bitte prüfen Sie die Agent-Konfiguration.",
+          "terminalShellUnavailable": "{shell} ist nicht verfügbar. Wähle in den allgemeinen Einstellungen eine verfügbare Shell aus.",
+          "terminalShellUnsupported": "{shell} wird für die ACP-Terminalausführung nicht unterstützt. Wähle in den allgemeinen Einstellungen eine unterstützte Shell aus."
         },
         "unableReadAgentConfig": "Agenten-Konfiguration kann nicht gelesen werden: {message}",
         "connectFailedTitle": "{agent} Verbindung fehlgeschlagen",
@@ -2606,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "Verfügbar, sobald die aktuelle Runde abgeschlossen ist",
         "dismiss": "Schließen",
         "reconnectFailed": "Sitzung konnte nicht neu verbunden werden",
-        "applied": "Neue Konfiguration angewendet"
+        "applied": "Neue Konfiguration angewendet",
+        "terminalShellTitle": "Terminal-Shell aktualisiert"
       },
       "collabAgent": {
         "title": "Subagent",
