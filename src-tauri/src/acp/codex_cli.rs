@@ -120,6 +120,20 @@ pub fn cli_mode_enabled(env: &BTreeMap<String, String>) -> bool {
         })
 }
 
+/// Prepare env for a Codex ACP launch: inject `CODEX_PATH` when CLI mode is on.
+///
+/// Does not overwrite an explicit non-empty `CODEX_PATH` already present in `env`.
+/// Returns `Err` with a user-facing message when CLI mode is requested but no CLI
+/// can be resolved (caller maps this to `AcpError::SdkNotInstalled`).
+pub fn prepare_codex_launch_env(
+    mut env: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if cli_mode_enabled(&env) {
+        ensure_codex_path_in_env(&mut env)?;
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +213,69 @@ mod tests {
         env.insert("CODEX_PATH".into(), "C:\\already\\set\\codex.cmd".into());
         ensure_codex_path_in_env(&mut env).unwrap();
         assert_eq!(env.get("CODEX_PATH").unwrap(), "C:\\already\\set\\codex.cmd");
+    }
+
+    #[test]
+    fn prepare_injects_when_cli_mode_and_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = touch_file(temp.path(), "codex.cmd");
+        let fake_str = fake.to_string_lossy().into_owned();
+
+        // Map lacks CODEX_PATH; process CODEX_PATH points at a usable fake CLI.
+        // Unset process CODEX_ACP_USE_CLI so map key alone drives cli mode.
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(fake_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(fake_str.as_str()));
+            },
+        );
+    }
+
+    #[test]
+    fn prepare_skips_when_cli_mode_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = touch_file(temp.path(), "codex.cmd");
+        let fake_str = fake.to_string_lossy().into_owned();
+
+        // CLI mode off: even if process has CODEX_PATH, prepare must not inject.
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(fake_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let env = BTreeMap::new();
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert!(!out.contains_key(CODEX_PATH_ENV));
+            },
+        );
+    }
+
+    #[test]
+    fn prepare_preserves_existing_map_codex_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let process_path = touch_file(temp.path(), "process-codex.cmd");
+        let process_str = process_path.to_string_lossy().into_owned();
+        let map_path = "C:\\already\\set\\codex.cmd";
+
+        temp_env::with_vars(
+            [
+                (CODEX_PATH_ENV, Some(process_str.as_str())),
+                ("CODEX_ACP_USE_CLI", None),
+            ],
+            || {
+                let mut env = BTreeMap::new();
+                env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
+                env.insert(CODEX_PATH_ENV.into(), map_path.into());
+                let out = prepare_codex_launch_env(env).unwrap();
+                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(map_path));
+            },
+        );
     }
 }

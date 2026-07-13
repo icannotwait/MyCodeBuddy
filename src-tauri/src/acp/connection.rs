@@ -47,6 +47,30 @@ use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
 
+/// Inject host `CODEX_PATH` into Codex launch env when CLI mode is enabled.
+/// No-ops for non-Codex agents; maps prepare failures to `SdkNotInstalled`.
+fn apply_codex_cli_path_env(
+    agent_type: AgentType,
+    merged_env: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, AcpError> {
+    if agent_type != AgentType::Codex {
+        return Ok(merged_env);
+    }
+    let map: BTreeMap<String, String> = merged_env.into_iter().collect();
+    match crate::acp::codex_cli::prepare_codex_launch_env(map) {
+        Ok(map) => {
+            tracing::info!(
+                "[ACP][Codex] CODEX_PATH={}",
+                map.get(crate::acp::codex_cli::CODEX_PATH_ENV)
+                    .map(|s| s.as_str())
+                    .unwrap_or("(unset)")
+            );
+            Ok(map.into_iter().collect())
+        }
+        Err(message) => Err(AcpError::SdkNotInstalled(message)),
+    }
+}
+
 fn merge_agent_env(
     env: &[(&'static str, &'static str)],
     runtime_env: &BTreeMap<String, String>,
@@ -342,6 +366,9 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
+            // When CODEX_ACP_USE_CLI is on, inject host CODEX_PATH (never overwriting
+            // an explicit user value). Fail with SdkNotInstalled if CLI is missing.
+            merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
@@ -408,7 +435,10 @@ async fn build_agent(
                             meta.name
                         ))
                     })?;
-            let merged_env = merge_agent_env(env, runtime_env);
+            let merged_env = apply_codex_cli_path_env(
+                agent_type,
+                merge_agent_env(env, runtime_env),
+            )?;
             let mut parts: Vec<String> = merged_env
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
