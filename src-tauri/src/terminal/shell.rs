@@ -22,6 +22,18 @@ pub enum ShellDialect {
     Custom,
 }
 
+impl ShellDialect {
+    /// Stable wire / env string for this dialect (`cmd`, `powershell`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd",
+            Self::PowerShell => "powershell",
+            Self::Posix => "posix",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 /// How the resolved shell was selected from settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellSource {

@@ -6,7 +6,7 @@ use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
+    KillTerminalResponse, LoadSessionRequest, Meta, NewSessionRequest, NewSessionResponse,
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
@@ -33,8 +33,10 @@ use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
-use crate::acp::terminal_adapter::adapter_for;
+use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
+use crate::acp::terminal_context::terminal_metadata;
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
+use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
@@ -1497,19 +1499,48 @@ fn claude_raw_sdk_session_meta(
     Some(meta)
 }
 
+/// Merge Claude raw-SDK meta (when applicable) with the connection's
+/// authoritative terminal snapshot and any adapter contributions.
+fn session_request_meta(
+    agent_type: AgentType,
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<Meta, AcpError> {
+    let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
+    terminal_metadata(existing, spec, adapter)
+}
+
+/// Build the ACP `initialize` request, declaring client capabilities and the
+/// connection's terminal shell dialect under `_meta["codeg.dev/terminal"]`.
+fn build_initialize_request(
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<InitializeRequest, AcpError> {
+    let meta = terminal_metadata(Meta::default(), spec, adapter)?;
+    Ok(InitializeRequest::new(ProtocolVersion::LATEST)
+        .client_capabilities(
+            ClientCapabilities::new()
+                .terminal(true)
+                .fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)),
+        )
+        .meta(meta))
+}
+
 fn build_new_session_request(
     agent_type: AgentType,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> NewSessionRequest {
-    let mut req = NewSessionRequest::new(cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<NewSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = NewSessionRequest::new(cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 fn build_load_session_request(
@@ -1517,36 +1548,36 @@ fn build_load_session_request(
     session_id: SessionId,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> LoadSessionRequest {
-    let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<LoadSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 /// Build a `session/resume` request. Mirrors `build_load_session_request`
-/// (same fields + ClaudeCode raw-SDK meta + non-empty mcp_servers); the only
-/// wire difference is that `ResumeSessionRequest.mcp_servers` is
-/// `skip_serializing_if = Vec::is_empty`, so an empty list is omitted from the
-/// payload rather than emitted as `[]`.
+/// (same fields + ClaudeCode raw-SDK meta + terminal meta + non-empty
+/// mcp_servers); the only wire difference is that
+/// `ResumeSessionRequest.mcp_servers` is `skip_serializing_if = Vec::is_empty`,
+/// so an empty list is omitted from the payload rather than emitted as `[]`.
 fn build_resume_session_request(
     agent_type: AgentType,
     session_id: SessionId,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> ResumeSessionRequest {
-    let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
-        req = req.meta(meta);
-    }
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<ResumeSessionRequest, AcpError> {
+    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    Ok(req)
 }
 
 /// Wire-level half of `session/resume`: send the request and deserialize the
@@ -2136,14 +2167,13 @@ async fn run_connection(
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
-            // Advertise filesystem + terminal capabilities for ACP tool execution.
-            let init_request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
-                ClientCapabilities::new()
-                    .terminal(true)
-                    .fs(FileSystemCapabilities::new()
-                        .read_text_file(true)
-                        .write_text_file(true)),
-            );
+            // Advertise filesystem + terminal capabilities for ACP tool execution,
+            // and declare the connection's shell snapshot under `_meta`.
+            let init_request = build_initialize_request(
+                &terminal_shell.spec,
+                adapter_for(agent_type),
+            )
+            .map_err(|e| sacp::util::internal_error(e.to_string()))?;
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -2319,7 +2349,10 @@ async fn run_connection(
                         SessionId::new(sid.clone()),
                         &cwd,
                         mcp_servers.clone(),
-                    );
+                        &terminal_shell.spec,
+                        adapter_for(agent_type),
+                    )
+                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                     match send_resume_session(&cx, resume_req).await {
                         Ok(resume_resp) => {
                             let initial_config_options = resume_resp.config_options.clone();
@@ -2373,6 +2406,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
+                                &terminal_shell.spec,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
@@ -2394,6 +2428,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
+                                &terminal_shell.spec,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
@@ -2427,7 +2462,10 @@ async fn run_connection(
                     SessionId::new(sid.clone()),
                     &cwd,
                     mcp_servers.clone(),
-                );
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                 let load_result = cx.send_request_to(Agent, load_req).block_task().await;
 
                 match load_result {
@@ -2532,6 +2570,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &terminal_shell.spec,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -2549,6 +2588,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &terminal_shell.spec,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -2625,7 +2665,10 @@ async fn run_connection(
                                     agent_type,
                                     &cwd,
                                     mcp_servers.clone(),
-                                ),
+                                    &terminal_shell.spec,
+                                    adapter_for(agent_type),
+                                )
+                                .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                             )
                             .block_task()
                             .await?;
@@ -2671,6 +2714,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            &terminal_shell.spec,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -2690,6 +2734,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            &terminal_shell.spec,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -2701,7 +2746,14 @@ async fn run_connection(
                 let new_resp = cx
                     .send_request_to(
                         Agent,
-                        build_new_session_request(agent_type, &cwd, mcp_servers.clone()),
+                        build_new_session_request(
+                            agent_type,
+                            &cwd,
+                            mcp_servers.clone(),
+                            &terminal_shell.spec,
+                            adapter_for(agent_type),
+                        )
+                        .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                     )
                     .block_task()
                     .await?;
@@ -2747,6 +2799,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    &terminal_shell.spec,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
@@ -2764,6 +2817,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    &terminal_shell.spec,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
@@ -3610,6 +3664,8 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    // Immutable connection shell snapshot — never re-read from settings.
+    shell_spec: &ResolvedShellSpec,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
@@ -3691,6 +3747,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        shell_spec,
         prompt_ledger,
         delegation_injection,
     )
@@ -3710,6 +3767,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        shell_spec,
         prompt_ledger,
         delegation_injection,
     ))
@@ -3858,6 +3916,8 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    // Immutable connection shell snapshot for `session/fork` metadata.
+    shell_spec: &ResolvedShellSpec,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
@@ -4493,7 +4553,21 @@ async fn run_conversation_loop<'a>(
                     "[ACP] Sending session/fork for session_id={} cwd={}",
                     sid.0, cwd
                 );
-                let result = crate::acp::fork::fork_session(&cx, &sid, cwd).await;
+                // Build from the connection snapshot only — never re-read
+                // global terminal settings during fork.
+                let terminal_meta = match terminal_metadata(
+                    Meta::default(),
+                    shell_spec,
+                    adapter_for(agent_type),
+                ) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+                let result =
+                    crate::acp::fork::fork_session(&cx, &sid, cwd, terminal_meta).await;
                 match result {
                     Ok(fork_response) => {
                         tracing::info!(
@@ -5708,6 +5782,9 @@ async fn emit_conversation_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::shell::test_support::{
+        posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
+    };
     use sacp::schema::Diff;
 
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {
@@ -6054,7 +6131,14 @@ mod tests {
     #[test]
     fn build_new_session_request_sets_claude_raw_meta() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new());
+        let req = build_new_session_request(
+            AgentType::ClaudeCode,
+            &cwd,
+            Vec::new(),
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
 
         assert_eq!(
             req.meta
@@ -6067,16 +6151,22 @@ mod tests {
     }
 
     #[test]
-    fn build_load_session_request_skips_meta_for_non_claude() {
+    fn build_load_session_request_skips_claude_meta_for_non_claude() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let req = build_load_session_request(
             AgentType::Codex,
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
 
-        assert!(req.meta.is_none());
+        // Terminal metadata is always present; Claude raw-SDK meta is not.
+        let meta = req.meta.as_ref().expect("terminal meta required");
+        assert!(!meta.contains_key("claudeCode"));
+        assert!(meta.contains_key("codeg.dev/terminal"));
     }
 
     #[test]
@@ -6087,7 +6177,10 @@ mod tests {
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
 
         assert_eq!(
             req.meta
@@ -6100,16 +6193,137 @@ mod tests {
     }
 
     #[test]
-    fn build_resume_session_request_skips_meta_for_non_claude() {
+    fn build_resume_session_request_skips_claude_meta_for_non_claude() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let req = build_resume_session_request(
             AgentType::Codex,
             SessionId::new("abc".to_string()),
             &cwd,
             Vec::new(),
-        );
+            &test_posix_spec(),
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
 
-        assert!(req.meta.is_none());
+        let meta = req.meta.as_ref().expect("terminal meta required");
+        assert!(!meta.contains_key("claudeCode"));
+        assert!(meta.contains_key("codeg.dev/terminal"));
+    }
+
+    fn assert_codeg_terminal_meta(value: &serde_json::Value, dialect: &str, shell: &str) {
+        let term = &value["_meta"]["codeg.dev/terminal"];
+        assert_eq!(term["dialect"], dialect);
+        assert_eq!(term["shell"], shell);
+        assert_eq!(term["platform"], std::env::consts::OS);
+        assert_eq!(term["commandMode"], "selected-shell-for-command-lines");
+    }
+
+    #[test]
+    fn initialize_contains_terminal_metadata() {
+        let spec = test_pwsh_spec();
+        let request =
+            build_initialize_request(&spec, adapter_for(AgentType::Codex)).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+    }
+
+    #[test]
+    fn claude_and_terminal_metadata_are_merged() {
+        let request = build_new_session_request(
+            AgentType::ClaudeCode,
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &test_posix_spec(),
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
+        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
+    }
+
+    #[test]
+    fn load_session_contains_terminal_metadata() {
+        let spec = test_pwsh_spec();
+        let request = build_load_session_request(
+            AgentType::Codex,
+            SessionId::new("sess-load"),
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &spec,
+            adapter_for(AgentType::Codex),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+    }
+
+    #[test]
+    fn resume_session_contains_terminal_metadata() {
+        let spec = test_posix_spec();
+        let request = build_resume_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-resume"),
+            Path::new("/tmp/project"),
+            Vec::new(),
+            &spec,
+            adapter_for(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
+        assert_codeg_terminal_meta(&value, "posix", "/bin/sh");
+    }
+
+    /// Fake adapter that tries to inject a conflicting `codeg.dev/terminal`
+    /// value. Codeg's authoritative snapshot must win after merge.
+    struct ConflictingTerminalAdapter;
+
+    impl AcpTerminalAdapter for ConflictingTerminalAdapter {
+        fn agent_metadata(
+            &self,
+            _shell: &ResolvedShellSpec,
+        ) -> Result<Meta, AcpError> {
+            let mut meta = Meta::default();
+            meta.insert(
+                "codeg.dev/terminal".into(),
+                serde_json::json!({
+                    "shell": "/bogus/from-adapter",
+                    "dialect": "cmd",
+                    "platform": "bogus",
+                    "commandMode": "adapter-lies",
+                }),
+            );
+            meta.insert(
+                "adapterExtra".into(),
+                serde_json::json!({"ok": true}),
+            );
+            Ok(meta)
+        }
+    }
+
+    #[test]
+    fn terminal_metadata_overwrites_adapter_collision() {
+        let spec = test_pwsh_spec();
+        let request =
+            build_initialize_request(&spec, &ConflictingTerminalAdapter).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        // Codeg snapshot wins on the reserved namespace.
+        assert_codeg_terminal_meta(
+            &value,
+            "powershell",
+            &spec.executable.to_string_lossy(),
+        );
+        // Non-colliding adapter keys are still merged in.
+        assert_eq!(value["_meta"]["adapterExtra"]["ok"], true);
     }
 
     #[test]

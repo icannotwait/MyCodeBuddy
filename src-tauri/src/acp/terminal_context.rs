@@ -7,14 +7,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use sacp::schema::Meta;
+
 use crate::acp::error::AcpError;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::SystemTerminalSettings;
-use crate::terminal::shell::{
-    resolve_terminal_shell, ResolvedShellSnapshot, ResolvedShellSpec, ShellDialect,
-};
+use crate::terminal::shell::{resolve_terminal_shell, ResolvedShellSnapshot, ResolvedShellSpec};
 
 /// Inputs loaded before reuse / spawn: agent runtime env + persisted terminal settings.
 #[derive(Debug, Clone)]
@@ -44,15 +44,6 @@ fn set_env_value(env: &mut BTreeMap<String, String>, key: &str, value: String) {
     env.insert(key.to_string(), value);
 }
 
-fn dialect_as_str(dialect: ShellDialect) -> &'static str {
-    match dialect {
-        ShellDialect::Cmd => "cmd",
-        ShellDialect::PowerShell => "powershell",
-        ShellDialect::Posix => "posix",
-        ShellDialect::Custom => "custom",
-    }
-}
-
 /// Declare the selected shell on the agent process environment without
 /// touching `COMSPEC` (never overwrite cmd.exe's COMSPEC with PowerShell).
 pub fn apply_agent_launch_env(env: &mut BTreeMap<String, String>, spec: &ResolvedShellSpec) {
@@ -62,8 +53,40 @@ pub fn apply_agent_launch_env(env: &mut BTreeMap<String, String>, spec: &Resolve
     set_env_value(
         env,
         "CODEG_TERMINAL_DIALECT",
-        dialect_as_str(spec.dialect).to_string(),
+        spec.dialect.as_str().to_string(),
     );
+}
+
+/// Merge adapter contributions with Codeg's authoritative terminal snapshot
+/// into ACP `_meta`.
+///
+/// Adapter keys are inserted only when absent (`or_insert`) so pre-existing
+/// Claude (or other) metadata is preserved. Codeg's `codeg.dev/terminal`
+/// entry is always written last and overwrites any adapter collision.
+pub fn terminal_metadata(
+    mut existing: Meta,
+    spec: &ResolvedShellSpec,
+    adapter: &dyn AcpTerminalAdapter,
+) -> Result<Meta, AcpError> {
+    for (key, value) in adapter.agent_metadata(spec)? {
+        existing.entry(key).or_insert(value);
+    }
+    // Platform: prefer the well-known host triples; otherwise emit the raw
+    // `std::env::consts::OS` string rather than guessing a family name.
+    let platform = match std::env::consts::OS {
+        "windows" | "macos" | "linux" => std::env::consts::OS,
+        other => other,
+    };
+    existing.insert(
+        "codeg.dev/terminal".into(),
+        serde_json::json!({
+            "shell": spec.executable.to_string_lossy(),
+            "dialect": spec.dialect.as_str(),
+            "platform": platform,
+            "commandMode": "selected-shell-for-command-lines",
+        }),
+    );
+    Ok(existing)
 }
 
 /// True when `key` is a terminal-declaration field that must not participate
@@ -154,9 +177,54 @@ mod tests {
     use crate::acp::error::AcpError;
     use crate::db::service::app_metadata_service;
     use crate::db::test_helpers;
-    use crate::terminal::shell::test_support::pwsh_spec as test_pwsh_spec;
+    use crate::terminal::shell::test_support::{
+        posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
+    };
     use crate::terminal::shell::ShellResolveError;
     use std::path::PathBuf;
+
+    #[test]
+    fn terminal_metadata_declares_codeg_namespace() {
+        let spec = test_pwsh_spec();
+        let meta = terminal_metadata(Meta::default(), &spec, adapter_for(AgentType::Codex))
+            .expect("metadata");
+        let term = meta.get("codeg.dev/terminal").expect("namespace");
+        assert_eq!(term["dialect"], "powershell");
+        assert_eq!(term["shell"], spec.executable.to_string_lossy().as_ref());
+        assert_eq!(term["platform"], std::env::consts::OS);
+        assert_eq!(term["commandMode"], "selected-shell-for-command-lines");
+    }
+
+    #[test]
+    fn terminal_metadata_preserves_existing_and_overwrites_adapter_collision() {
+        let mut existing = Meta::default();
+        existing.insert(
+            "claudeCode".into(),
+            serde_json::json!({"emitRawSDKMessages": true}),
+        );
+
+        struct CollidingAdapter;
+        impl AcpTerminalAdapter for CollidingAdapter {
+            fn agent_metadata(
+                &self,
+                _shell: &ResolvedShellSpec,
+            ) -> Result<Meta, AcpError> {
+                let mut m = Meta::default();
+                m.insert(
+                    "codeg.dev/terminal".into(),
+                    serde_json::json!({"dialect": "cmd"}),
+                );
+                m.insert("adapterKey".into(), serde_json::json!(1));
+                Ok(m)
+            }
+        }
+
+        let meta = terminal_metadata(existing, &test_posix_spec(), &CollidingAdapter).unwrap();
+        assert_eq!(meta["claudeCode"]["emitRawSDKMessages"], true);
+        assert_eq!(meta["adapterKey"], 1);
+        assert_eq!(meta["codeg.dev/terminal"]["dialect"], "posix");
+        assert_eq!(meta["codeg.dev/terminal"]["shell"], "/bin/sh");
+    }
 
     #[test]
     fn launch_env_declares_selected_shell_without_touching_comspec() {
