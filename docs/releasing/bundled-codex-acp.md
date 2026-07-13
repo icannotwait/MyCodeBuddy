@@ -4,6 +4,28 @@ MyCodeBuddy's Windows x64 installer includes the customized codex-acp fork as
 `codex-acp.exe`. The source is pinned as the public Git submodule at
 `src-tauri/vendor/codex-acp`; Agent Settings never replaces this executable.
 
+## Runtime dependency: host Codex CLI
+
+MyCodeBuddy ships the **codex-acp adapter** (`codex-acp.exe`) next to the app.
+With `CODEX_ACP_USE_CLI=1`, the adapter drives OpenAI's Codex CLI via `CODEX_PATH`.
+
+Resolution order for `CODEX_PATH`:
+
+1. Explicit `CODEX_PATH` in the process or agent environment
+2. `codex` / `codex.cmd` on `PATH`
+3. npm global prefix (`%APPDATA%\npm`) `codex.cmd` or
+   `node_modules/@openai/codex/bin/codex.js`
+
+Users still do **not** need a global `codex-acp` package; they do need a host
+Codex CLI (e.g. `npm install -g @openai/codex`) unless they set `CODEX_PATH`.
+
+Clean-machine verification:
+
+1. Install MyCodeBuddy only → Codex preflight should fail on "Codex CLI" with install guidance.
+2. `npm install -g @openai/codex` → preflight passes; new Codex session initializes.
+3. With a global official `codex-acp` also installed, logs must still show the sibling
+   bundled `codex-acp.exe` path as the adapter.
+
 ## Update from upstream
 
 Work in the standalone fork clone so its branch and remotes remain explicit:
@@ -47,10 +69,12 @@ git commit -m "chore: update bundled codex-acp"
 
 The Windows release job checks out submodules recursively, pins Bun 1.3.14,
 runs the fork's typecheck and tests, builds the Windows x64 executable, verifies
-its fork version, and invokes its embedded Codex CLI. A failure in any step must
-block the installer release.
+its fork version, and confirms the adapter starts in CLI mode. A failure in any
+step must block the installer release.
 
-On a clean Windows x64 machine, verify that MyCodeBuddy starts Codex without
-Node.js or a global codex-acp installation. Then install the official global
-adapter and confirm MyCodeBuddy logs still identify the sibling bundled
-`codex-acp.exe` path.
+On a clean Windows x64 machine, verify:
+
+1. MyCodeBuddy only (no host Codex CLI) → Codex preflight fails with install guidance.
+2. After `npm install -g @openai/codex` (or `CODEX_PATH` set) → preflight passes and a new Codex session initializes.
+3. Users need **no** global `codex-acp` package; the sibling bundled `codex-acp.exe` is used.
+4. With a global official `codex-acp` also installed, logs must still identify the sibling bundled `codex-acp.exe` path as the adapter.
