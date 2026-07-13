@@ -268,6 +268,10 @@ pub struct AgentConnection {
     /// no-op save (identical values) stays silent. Starts equal to
     /// `config_fingerprint`.
     pub last_observed_fingerprint: String,
+    /// Immutable terminal shell snapshot captured when this connection's
+    /// process was spawned. Never re-read from settings after launch; reuse
+    /// and reconnect keep this value for the connection's lifetime.
+    pub terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
 }
 
 impl AgentConnection {
@@ -277,6 +281,37 @@ impl AgentConnection {
             agent_type: self.agent_type,
             status: self.status.clone(),
         }
+    }
+}
+
+/// Placeholder shell snapshot for unit/integration test connections that never
+/// run a real terminal. Not used by production spawn (which always finalizes).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_placeholder_terminal_shell() -> crate::terminal::shell::ResolvedShellSnapshot {
+    use crate::terminal::shell::{
+        ResolvedShellSnapshot, ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
+    };
+    ResolvedShellSnapshot {
+        selection_key: "system".into(),
+        spec: ResolvedShellSpec {
+            executable: PathBuf::from(if cfg!(windows) {
+                r"C:\Windows\System32\cmd.exe"
+            } else {
+                "/bin/sh"
+            }),
+            dialect: if cfg!(windows) {
+                ShellDialect::Cmd
+            } else {
+                ShellDialect::Posix
+            },
+            display_name: "test-shell".into(),
+            source: ShellSource::System,
+            command_strategy: if cfg!(windows) {
+                ShellCommandStrategy::Cmd
+            } else {
+                ShellCommandStrategy::Posix
+            },
+        },
     }
 }
 
@@ -691,6 +726,7 @@ pub async fn spawn_agent_connection(
     working_dir: Option<String>,
     session_id: Option<String>,
     runtime_env: BTreeMap<String, String>,
+    terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
     owner_window_label: String,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
@@ -747,11 +783,11 @@ pub async fn spawn_agent_connection(
     // `terminal/create` tool authenticate via the same helper path the
     // agent process uses, while keeping unrelated secrets scoped to the
     // agent and out of arbitrary shell commands it runs.
-    let mut terminal_base_env: BTreeMap<String, String> = runtime_env
-        .iter()
-        .filter(|(k, _)| k.starts_with("GIT_CONFIG_"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    //
+    // `runtime_env` may already carry SHELL / CODEG_TERMINAL_* declarations
+    // and API keys; `build_terminal_base_env` keeps only GIT_CONFIG_* here.
+    let mut terminal_base_env =
+        crate::acp::terminal_context::build_terminal_base_env(&runtime_env);
     // Also surface a codeg-installed OfficeCLI on the terminal's PATH: agents run
     // office skills' `officecli …` through this `terminal/create` tool, not as a
     // child of the agent process, so the agent-env injection alone wouldn't reach
@@ -788,6 +824,7 @@ pub async fn spawn_agent_connection(
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_observed_fingerprint: config_fingerprint.clone(),
             config_fingerprint,
+            terminal_shell: terminal_shell.clone(),
         },
     );
 
@@ -810,6 +847,7 @@ pub async fn spawn_agent_connection(
             emitter_clone.clone(),
             Arc::clone(&state_clone),
             terminal_base_env,
+            terminal_shell,
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
@@ -1890,6 +1928,7 @@ async fn run_connection(
     emitter: EventEmitter,
     state: Arc<RwLock<SessionState>>,
     terminal_base_env: BTreeMap<String, String>,
+    terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
@@ -1898,6 +1937,10 @@ async fn run_connection(
     // `terminal_base_env` already filtered to just the credential helper
     // keys upstream — see `spawn_agent_connection` for the rationale and
     // why we don't forward the full agent runtime_env here.
+    //
+    // `terminal_shell` is the immutable launch snapshot; no code below
+    // re-reads system terminal settings (Task 6+ uses this for strategy).
+    let _terminal_shell = terminal_shell;
     let cwd = resolve_working_dir(working_dir.as_deref());
     // Default terminals to the session working directory so an agent that calls
     // `terminal/create` without a `cwd` (e.g. CodeBuddy) runs in the folder the

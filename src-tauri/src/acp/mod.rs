@@ -21,6 +21,8 @@ pub mod question;
 pub mod registry;
 pub mod session_info;
 pub mod session_state;
+pub mod terminal_adapter;
+pub mod terminal_context;
 pub mod terminal_runtime;
 pub mod types;
 

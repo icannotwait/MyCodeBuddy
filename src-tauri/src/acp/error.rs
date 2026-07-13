@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::terminal::shell::ShellResolveError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
     #[error("agent process failed to spawn: {0}")]
@@ -8,6 +10,16 @@ pub enum AcpError {
     ConnectionNotFound(String),
     #[error("ACP protocol error: {0}")]
     Protocol(String),
+    #[error("selected terminal shell is unavailable: {display_name} ({executable})")]
+    TerminalShellUnavailable {
+        display_name: String,
+        executable: String,
+    },
+    #[error("selected terminal shell is unsupported: {display_name} ({executable})")]
+    TerminalShellUnsupported {
+        display_name: String,
+        executable: String,
+    },
     #[error("agent process exited unexpectedly")]
     ProcessExited,
     /// A prompt arrived while this connection already had a turn in flight.
@@ -83,7 +95,30 @@ impl AcpError {
             Self::SpawnFailed(_) => Some("spawn_failed"),
             Self::DownloadFailed(_) => Some("download_failed"),
             Self::ConnectionNotFound(_) => Some("connection_not_found"),
+            Self::TerminalShellUnavailable { .. } => Some("terminal_shell_unavailable"),
+            Self::TerminalShellUnsupported { .. } => Some("terminal_shell_unsupported"),
             Self::Protocol(_) => None,
+        }
+    }
+}
+
+impl From<ShellResolveError> for AcpError {
+    fn from(err: ShellResolveError) -> Self {
+        match err {
+            ShellResolveError::Unavailable {
+                display_name,
+                executable,
+            } => Self::TerminalShellUnavailable {
+                display_name,
+                executable,
+            },
+            ShellResolveError::Unsupported {
+                display_name,
+                executable,
+            } => Self::TerminalShellUnsupported {
+                display_name,
+                executable,
+            },
         }
     }
 }

@@ -12,6 +12,9 @@ use sea_orm::{
 
 use crate::acp::connection::{spawn_agent_connection, AgentConnection, ConnectionCommand};
 use crate::acp::error::AcpError;
+use crate::acp::terminal_context::{
+    finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
+};
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
     SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
@@ -315,6 +318,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -357,6 +361,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -368,7 +373,7 @@ impl ConnectionManager {
         agent_type: AgentType,
         working_dir: Option<String>,
         session_id: Option<String>,
-        runtime_env: BTreeMap<String, String>,
+        launch_inputs: AcpLaunchInputs,
         owner_window_label: String,
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
@@ -419,8 +424,16 @@ impl ConnectionManager {
                 existing,
                 session_id.as_deref().unwrap_or("")
             );
+            // Reuse must not resolve, validate, or apply newly loaded terminal
+            // settings — the live connection keeps its launch-time snapshot.
             return Ok(existing);
         }
+
+        // Only the no-reuse branch finalizes an immutable shell snapshot.
+        let AcpLaunchConfig {
+            runtime_env,
+            terminal_shell,
+        } = finalize_acp_launch_config(launch_inputs, agent_type)?;
 
         let connection_id = uuid::Uuid::new_v4().to_string();
         tracing::info!(
@@ -438,6 +451,7 @@ impl ConnectionManager {
             working_dir,
             session_id,
             runtime_env,
+            terminal_shell,
             owner_window_label,
             emitter,
             self.connections.clone(),
@@ -1644,7 +1658,7 @@ impl ConnectionManager {
         &self,
         agent_type: AgentType,
         working_dir: Option<String>,
-        runtime_env: BTreeMap<String, String>,
+        launch_inputs: AcpLaunchInputs,
     ) -> Result<AgentOptionsSnapshot, AcpError> {
         // Owner window label is informational only (used for
         // disconnect_by_owner_window), but worth being explicit so a probe
@@ -1676,7 +1690,7 @@ impl ConnectionManager {
                 agent_type,
                 working_dir,
                 None, // brand-new session — no resume
-                runtime_env,
+                launch_inputs,
                 owner_window,
                 EventEmitter::Noop,
                 None,
@@ -2399,11 +2413,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         };
         let effective_working_dir = working_dir.or(parent_working_dir);
 
-        // Build the same runtime env `acp_connect` would build for a
+        // Build the same launch inputs `acp_connect` would build for a
         // user-initiated session — disabled check, settings overrides,
-        // model provider creds, git helper. Without this, delegated
-        // subagents would skip the user's configuration entirely.
-        let runtime_env = crate::commands::acp::build_session_runtime_env(
+        // model provider creds, git helper, and terminal settings. Without
+        // this, delegated subagents would skip the user's configuration.
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
@@ -2417,7 +2431,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 agent_type,
                 effective_working_dir,
                 None,
-                runtime_env,
+                launch_inputs,
                 owner_window,
                 emitter,
                 preferred_mode_id,
@@ -2629,6 +2643,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         }
     }
 
@@ -2801,6 +2816,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         mgr.connections
             .lock()
@@ -3134,6 +3150,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -4206,6 +4223,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reuse_bypasses_unavailable_new_shell() {
+        use crate::acp::terminal_context::AcpLaunchInputs;
+        use crate::models::SystemTerminalSettings;
+        use crate::terminal::shell::test_support::{pwsh_spec as test_pwsh_spec, snapshot};
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, _rx) = make_test_broadcaster();
+        let existing_id = "reuse-shell-conn";
+        let working_dir = PathBuf::from("/tmp/reuse-shell");
+        insert_fake_connection(
+            &mgr,
+            existing_id,
+            AgentType::ClaudeCode,
+            Some(working_dir.clone()),
+            EventEmitter::test_web_only(broadcaster),
+        )
+        .await;
+        let original_snapshot = snapshot("pwsh.exe", test_pwsh_spec());
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut(existing_id).unwrap();
+            conn.terminal_shell = original_snapshot.clone();
+            let mut s = conn.state.write().await;
+            s.external_id = Some("ext-shell".into());
+            s.status = ConnectionStatus::Connected;
+        }
+
+        let inputs = AcpLaunchInputs {
+            runtime_env: BTreeMap::new(),
+            terminal_settings: SystemTerminalSettings {
+                default_shell: Some("missing-shell".into()),
+            },
+        };
+        let id = mgr
+            .spawn_agent(
+                AgentType::ClaudeCode,
+                Some(working_dir.to_string_lossy().into_owned()),
+                Some("ext-shell".into()),
+                inputs,
+                "test-window".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .expect("reuse must succeed even when new shell is unavailable");
+        assert_eq!(id, existing_id);
+        let stored = {
+            let map = mgr.connections.lock().await;
+            map.get(existing_id).unwrap().terminal_shell.clone()
+        };
+        assert_eq!(stored, original_snapshot);
+    }
+
+    #[tokio::test]
+    async fn new_connection_rejects_unavailable_shell() {
+        use crate::acp::terminal_context::AcpLaunchInputs;
+        use crate::models::SystemTerminalSettings;
+
+        let mgr = ConnectionManager::new();
+        let inputs = AcpLaunchInputs {
+            runtime_env: BTreeMap::new(),
+            terminal_settings: SystemTerminalSettings {
+                default_shell: Some("missing-shell".into()),
+            },
+        };
+        let err = mgr
+            .spawn_agent(
+                AgentType::ClaudeCode,
+                Some("/tmp/new-shell".into()),
+                None,
+                inputs,
+                "test-window".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .expect_err("unavailable shell must fail before process spawn");
+        assert!(
+            matches!(err, AcpError::TerminalShellUnavailable { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_settings_does_not_mutate_running_snapshot() {
+        use crate::acp::terminal_context::{
+            finalize_acp_launch_config, AcpLaunchInputs,
+        };
+        use crate::models::SystemTerminalSettings;
+        use crate::terminal::shell::ResolvedShellSnapshot;
+
+        fn make_usable_shell(dir: &std::path::Path, basename: &str) -> PathBuf {
+            let path = dir.join(basename);
+            std::fs::write(&path, b"").expect("write temp shell");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+            path
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (name_a, name_b) = if cfg!(windows) {
+            ("pwsh.exe", "cmd.exe")
+        } else {
+            ("bash", "zsh")
+        };
+        let path_a = make_usable_shell(dir.path(), name_a);
+        let path_b = make_usable_shell(dir.path(), name_b);
+
+        let snap_a: ResolvedShellSnapshot = finalize_acp_launch_config(
+            AcpLaunchInputs {
+                runtime_env: BTreeMap::new(),
+                terminal_settings: SystemTerminalSettings {
+                    default_shell: Some(path_a.to_string_lossy().into_owned()),
+                },
+            },
+            AgentType::ClaudeCode,
+        )
+        .expect("shell a")
+        .terminal_shell;
+        let snap_b: ResolvedShellSnapshot = finalize_acp_launch_config(
+            AcpLaunchInputs {
+                runtime_env: BTreeMap::new(),
+                terminal_settings: SystemTerminalSettings {
+                    default_shell: Some(path_b.to_string_lossy().into_owned()),
+                },
+            },
+            AgentType::ClaudeCode,
+        )
+        .expect("shell b")
+        .terminal_shell;
+        assert_ne!(snap_a, snap_b);
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, _rx) = make_test_broadcaster();
+        let existing_id = "snap-immutable";
+        let working_dir = PathBuf::from("/tmp/snap-immutable");
+        insert_fake_connection(
+            &mgr,
+            existing_id,
+            AgentType::ClaudeCode,
+            Some(working_dir.clone()),
+            EventEmitter::test_web_only(broadcaster),
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut(existing_id).unwrap();
+            conn.terminal_shell = snap_a.clone();
+            let mut s = conn.state.write().await;
+            s.external_id = Some("ext-snap".into());
+            s.status = ConnectionStatus::Connected;
+        }
+
+        // Reuse with settings that would resolve to snap_b — must keep snap_a.
+        let id = mgr
+            .spawn_agent(
+                AgentType::ClaudeCode,
+                Some(working_dir.to_string_lossy().into_owned()),
+                Some("ext-snap".into()),
+                AcpLaunchInputs {
+                    runtime_env: BTreeMap::new(),
+                    terminal_settings: SystemTerminalSettings {
+                        default_shell: Some(path_b.to_string_lossy().into_owned()),
+                    },
+                },
+                "test-window".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .expect("reuse");
+        assert_eq!(id, existing_id);
+        let stored = {
+            let map = mgr.connections.lock().await;
+            map.get(existing_id).unwrap().terminal_shell.clone()
+        };
+        assert_eq!(stored, snap_a);
+        assert_ne!(stored, snap_b);
+    }
+
+    #[tokio::test]
     async fn find_connection_for_reuse_skips_disconnected_or_errored() {
         let mgr = ConnectionManager::new();
         let (broadcaster, _rx) = make_test_broadcaster();
@@ -4707,6 +4913,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5080,6 +5287,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         };
         let mgr = ConnectionManager::new();
         {

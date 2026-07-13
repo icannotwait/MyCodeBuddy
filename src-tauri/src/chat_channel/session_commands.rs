@@ -299,13 +299,26 @@ pub async fn handle_task(
     };
 
     // 5. Spawn ACP agent
+    let terminal_settings =
+        match crate::commands::system_settings::load_system_terminal_settings(db).await {
+            Ok(s) => s,
+            Err(e) => {
+                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+            }
+        };
+    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
+        // Chat-channel historically launched without agent credentials; keep
+        // that shape while still snapshotting the global terminal selection.
+        runtime_env: BTreeMap::new(),
+        terminal_settings,
+    };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(
             agent_type,
             Some(folder.path.clone()),
             None,
-            BTreeMap::new(),
+            launch_inputs,
             owner_label,
             emitter.clone(),
             None,
@@ -480,13 +493,24 @@ pub async fn handle_resume(
     };
 
     // Spawn agent with session_id for resume
+    let terminal_settings =
+        match crate::commands::system_settings::load_system_terminal_settings(db).await {
+            Ok(s) => s,
+            Err(e) => {
+                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+            }
+        };
+    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
+        runtime_env: BTreeMap::new(),
+        terminal_settings,
+    };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(
             conv.agent_type,
             Some(folder.path.clone()),
             conv.external_id.clone(),
-            BTreeMap::new(),
+            launch_inputs,
             owner_label,
             emitter.clone(),
             None,

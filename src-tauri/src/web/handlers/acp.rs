@@ -62,7 +62,7 @@ pub async fn acp_connect(
     let db = &state.db;
     let manager = &state.connection_manager;
 
-    let runtime_env = acp_commands::build_session_runtime_env(
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         db,
         params.agent_type,
         params.session_id.as_deref(),
@@ -84,7 +84,7 @@ pub async fn acp_connect(
             params.agent_type,
             params.working_dir,
             params.session_id,
-            runtime_env,
+            launch_inputs,
             "web".to_string(),
             emitter,
             params.preferred_mode_id,

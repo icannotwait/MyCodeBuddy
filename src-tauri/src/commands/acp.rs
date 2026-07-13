@@ -5745,7 +5745,12 @@ pub(crate) fn fingerprint_config(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // BTreeMap iterates in sorted key order → deterministic across calls.
+    // Terminal declaration keys (SHELL / CODEG_TERMINAL_*) are excluded: the
+    // shell selection is tracked as its own fingerprint component (Task 5).
     for (k, v) in runtime_env {
+        if crate::acp::terminal_context::is_terminal_declaration_env_key(k) {
+            continue;
+        }
         hasher.update(k.as_bytes());
         hasher.update([0u8]);
         hasher.update(v.as_bytes());
@@ -5888,8 +5893,13 @@ pub async fn acp_connect(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_env =
-        build_session_runtime_env(&db, agent_type, session_id.as_deref(), &app_data_dir).await?;
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+        &db,
+        agent_type,
+        session_id.as_deref(),
+        &app_data_dir,
+    )
+    .await?;
 
     // Guard: the session page must never trigger a download or install.
     // If the agent isn't ready, return SdkNotInstalled here so the frontend
@@ -5902,7 +5912,7 @@ pub async fn acp_connect(
             agent_type,
             working_dir,
             session_id,
-            runtime_env,
+            launch_inputs,
             window.label().to_string(),
             emitter,
             preferred_mode_id,
@@ -5976,14 +5986,16 @@ pub async fn acp_describe_agent_options_core(
     working_dir: Option<String>,
 ) -> Result<crate::acp::types::AgentOptionsSnapshot, AcpError> {
     verify_agent_installed(agent_type).await?;
-    // Build the same runtime env delegation/acp_connect would build so
+    // Build the same launch inputs delegation/acp_connect would build so
     // probe sees exactly what `delegate_to_agent` will see at runtime.
     // Without this, the settings UI could show options that the agent
     // never advertises in production (settings override an API URL,
     // model_provider injects a different model list, etc.).
-    let runtime_env = build_session_runtime_env(db, agent_type, None, data_dir).await?;
+    let launch_inputs =
+        crate::acp::terminal_context::build_acp_launch_inputs(db, agent_type, None, data_dir)
+            .await?;
     manager
-        .probe_agent_options(agent_type, working_dir, runtime_env)
+        .probe_agent_options(agent_type, working_dir, launch_inputs)
         .await
 }
 

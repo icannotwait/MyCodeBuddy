@@ -1525,6 +1525,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
         }
     }
 
