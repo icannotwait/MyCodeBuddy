@@ -34,7 +34,7 @@ use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError}
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
-use crate::acp::terminal_context::terminal_metadata;
+use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
 use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
@@ -2044,6 +2044,10 @@ async fn run_connection(
     // exists) is what lets the first arm process records written before the
     // transcript file is discovered.
     let prompt_ledger = background_watch::PromptLedger::shared();
+    // Wire-only first-prompt shell context: one-shot per spawned process.
+    // Shared across fork restarts of this conversation loop; browser/transport
+    // reattachment reuses the live AgentConnection and never re-enters here.
+    let terminal_prompt_context = Arc::new(TerminalPromptContext::new(terminal_shell.spec.clone()));
     let _bg_watch = background_watch::spawn_if_claude(
         &connection_id,
         agent_type,
@@ -2408,6 +2412,7 @@ async fn run_connection(
                                 supports_fork,
                                 &terminal_shell.spec,
                                 &prompt_ledger,
+                                &terminal_prompt_context,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -2430,6 +2435,7 @@ async fn run_connection(
                                 &cwd_string,
                                 &terminal_shell.spec,
                                 &prompt_ledger,
+                                &terminal_prompt_context,
                                 delegation_injection.as_ref(),
                             )
                             .await;
@@ -2572,6 +2578,7 @@ async fn run_connection(
                             supports_fork,
                             &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2590,6 +2597,7 @@ async fn run_connection(
                             &cwd_string,
                             &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2716,6 +2724,7 @@ async fn run_connection(
                             supports_fork,
                             &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await;
@@ -2736,6 +2745,7 @@ async fn run_connection(
                             &cwd_string,
                             &terminal_shell.spec,
                             &prompt_ledger,
+                            &terminal_prompt_context,
                             delegation_injection.as_ref(),
                         )
                         .await
@@ -2801,6 +2811,7 @@ async fn run_connection(
                     supports_fork,
                     &terminal_shell.spec,
                     &prompt_ledger,
+                    &terminal_prompt_context,
                     delegation_injection.as_ref(),
                 )
                 .await;
@@ -2819,6 +2830,7 @@ async fn run_connection(
                     &cwd_string,
                     &terminal_shell.spec,
                     &prompt_ledger,
+                    &terminal_prompt_context,
                     delegation_injection.as_ref(),
                 )
                 .await
@@ -3670,6 +3682,9 @@ async fn handle_fork_or_exit(
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
     prompt_ledger: &background_watch::PromptLedger,
+    // Same process-lifetime one-shot as the original loop — fork must not
+    // re-inject a superseding `<codeg_terminal_context>` block.
+    terminal_prompt_context: &TerminalPromptContext,
     // Threaded through from run_connection so the forked session's
     // run_conversation_loop call has the same delegation cascade
     // capability as the original.
@@ -3749,6 +3764,7 @@ async fn handle_fork_or_exit(
         true, // fork already succeeded on this process
         shell_spec,
         prompt_ledger,
+        terminal_prompt_context,
         delegation_injection,
     )
     .await;
@@ -3769,6 +3785,7 @@ async fn handle_fork_or_exit(
         cwd_string,
         shell_spec,
         prompt_ledger,
+        terminal_prompt_context,
         delegation_injection,
     ))
     .await
@@ -3922,6 +3939,9 @@ async fn run_conversation_loop<'a>(
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
     prompt_ledger: &background_watch::PromptLedger,
+    // Process-lifetime one-shot: first wire prompt gets terminal context;
+    // UI `UserMessage` events still use the original user blocks only.
+    terminal_prompt_context: &TerminalPromptContext,
     // Source of the broker reference used to cascade-cancel pending
     // delegations on parent prompt cancel / non-success TurnComplete.
     // `None` for test paths that don't wire delegation.
@@ -3982,8 +4002,10 @@ async fn run_conversation_loop<'a>(
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
                 // classify as wire-rendered foreground, not overlay.
+                // Ledger + UserMessage use original user content only; the
+                // terminal context block is appended to the wire payload below.
                 prompt_ledger.record_prompt_blocks(&blocks);
-                let prompt_blocks = map_prompt_blocks(blocks);
+                let mut prompt_blocks = map_prompt_blocks(blocks);
                 if prompt_blocks.is_empty() {
                     // Defensive: the manager rejects empty prompts before the
                     // concurrency gate is set / the command is enqueued (see
@@ -4007,6 +4029,11 @@ async fn run_conversation_loop<'a>(
                     continue;
                 }
 
+                // Wire-only mutation: first prompt on this process gets the
+                // versioned shell context. Live UI / optimistic dedup / title
+                // paths never see this block (they use `user_message` below).
+                terminal_prompt_context.append_once(&mut prompt_blocks);
+
                 emit_with_state(
                     state,
                     emitter,
@@ -4025,6 +4052,8 @@ async fn run_conversation_loop<'a>(
                 // dropped) broadcasts nothing. `apply_event` records it as
                 // `pending_user_message` so a client attaching mid-turn still
                 // renders the user turn from the snapshot.
+                // IMPORTANT: uses original projected user blocks — never the
+                // wire-only `<codeg_terminal_context>` append above.
                 if let Some((message_id, blocks)) = user_message {
                     emit_with_state(state, emitter, AcpEvent::UserMessage { message_id, blocks })
                         .await;
@@ -5782,10 +5811,12 @@ async fn emit_conversation_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::terminal_context::TerminalPromptContext;
     use crate::terminal::shell::test_support::{
         posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
     };
     use sacp::schema::Diff;
+    use std::sync::Arc;
 
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {
         let mut d = Diff::new(path, new);
@@ -5793,6 +5824,83 @@ mod tests {
             d = d.old_text(o.to_string());
         }
         ToolCallContent::Diff(d)
+    }
+
+    /// Mirrors the connection-loop prompt path: ledger/UI use original user
+    /// blocks; only the wire `ContentBlock` list receives `append_once`.
+    #[test]
+    fn wire_prompt_gets_context_user_message_does_not() {
+        let injector = TerminalPromptContext::new(test_pwsh_spec());
+        let user_blocks = vec![PromptInputBlock::Text {
+            text: "hello".into(),
+        }];
+        let ui = crate::acp::user_blocks_from_prompt(&user_blocks);
+        let mut wire = map_prompt_blocks(user_blocks);
+        injector.append_once(&mut wire);
+
+        assert_eq!(ui.len(), 1);
+        match &ui[0] {
+            UserMessageBlock::Text { text } => {
+                assert_eq!(text, "hello");
+                assert!(!text.contains("codeg_terminal_context"));
+            }
+            other => panic!("expected text user block, got {other:?}"),
+        }
+        assert_eq!(wire.len(), 2);
+        match &wire[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hello"),
+            other => panic!("expected user text first, got {other:?}"),
+        }
+        match &wire[1] {
+            ContentBlock::Text(t) => {
+                assert!(t.text.contains("<codeg_terminal_context version=\"1\">"));
+            }
+            other => panic!("expected context text second, got {other:?}"),
+        }
+    }
+
+    /// Two prompts on one process-scoped injector: only the first is enriched.
+    #[test]
+    fn terminal_prompt_context_one_shot_across_two_prompts() {
+        let injector = TerminalPromptContext::new(test_pwsh_spec());
+        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "first".into(),
+        }]);
+        injector.append_once(&mut first);
+        let mut second = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "second".into(),
+        }]);
+        injector.append_once(&mut second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 1);
+    }
+
+    /// Fork reuses the same Arc; reattachment never re-enters `run_connection`
+    /// (injector lives only there), so mid-process reconnect cannot append a
+    /// superseding context.
+    #[test]
+    fn terminal_prompt_context_survives_fork_and_reattachment_semantics() {
+        let injector = Arc::new(TerminalPromptContext::new(test_pwsh_spec()));
+        let mut first = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "pre-fork".into(),
+        }]);
+        injector.append_once(&mut first);
+        // Simulate fork: same Arc into the restarted conversation loop.
+        let forked = Arc::clone(&injector);
+        let mut post_fork = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "post-fork".into(),
+        }]);
+        forked.append_once(&mut post_fork);
+        assert_eq!(first.len(), 2);
+        assert_eq!(post_fork.len(), 1);
+        // "Reattachment" is just another hold on the same process injector —
+        // AgentConnection reuse does not call TerminalPromptContext::new.
+        let reattached = Arc::clone(&injector);
+        let mut mid = map_prompt_blocks(vec![PromptInputBlock::Text {
+            text: "reattach".into(),
+        }]);
+        reattached.append_once(&mut mid);
+        assert_eq!(mid.len(), 1);
     }
 
     #[test]

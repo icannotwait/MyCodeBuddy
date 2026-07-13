@@ -6,15 +6,18 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use sacp::schema::Meta;
+use sacp::schema::{ContentBlock, Meta, TextContent};
 
 use crate::acp::error::AcpError;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::SystemTerminalSettings;
-use crate::terminal::shell::{resolve_terminal_shell, ResolvedShellSnapshot, ResolvedShellSpec};
+use crate::terminal::shell::{
+    resolve_terminal_shell, ResolvedShellSnapshot, ResolvedShellSpec, ShellDialect,
+};
 
 /// Inputs loaded before reuse / spawn: agent runtime env + persisted terminal settings.
 #[derive(Debug, Clone)]
@@ -87,6 +90,74 @@ pub fn terminal_metadata(
         }),
     );
     Ok(existing)
+}
+
+/// Connection-scoped first-prompt injector: appends a versioned
+/// `<codeg_terminal_context>` text block **once** per spawned
+/// `AgentConnection` process lifetime (wire path only).
+///
+/// Created in `run_connection` beside the prompt ledger; shared across
+/// fork restarts of the conversation loop. Browser/transport reattachment
+/// reuses the live `AgentConnection` and never constructs another injector.
+pub struct TerminalPromptContext {
+    spec: ResolvedShellSpec,
+    pending: AtomicBool,
+}
+
+impl TerminalPromptContext {
+    pub fn new(spec: ResolvedShellSpec) -> Self {
+        Self {
+            spec,
+            pending: AtomicBool::new(true),
+        }
+    }
+
+    /// Append the terminal context block on the first call only.
+    /// Subsequent prompts (including post-fork) are left unchanged.
+    pub fn append_once(&self, blocks: &mut Vec<ContentBlock>) {
+        if self.pending.swap(false, Ordering::AcqRel) {
+            blocks.push(ContentBlock::Text(TextContent::new(
+                render_terminal_prompt_context(&self.spec),
+            )));
+        }
+    }
+}
+
+/// Human dialect label used inside the Generate-syntax instruction line.
+fn dialect_instruction_label(dialect: ShellDialect) -> &'static str {
+    match dialect {
+        ShellDialect::Cmd => "CMD",
+        ShellDialect::PowerShell => "PowerShell",
+        ShellDialect::Posix => "POSIX",
+        // Custom uses a fixed instruction (not this label).
+        ShellDialect::Custom => "custom",
+    }
+}
+
+/// Render the versioned wire-only terminal context envelope from a shell snapshot.
+pub fn render_terminal_prompt_context(spec: &ResolvedShellSpec) -> String {
+    let generate_line = match spec.dialect {
+        ShellDialect::Custom => {
+            "Generate shell command lines using the selected custom shell's syntax.".to_string()
+        }
+        other => format!(
+            "Generate shell command lines using {} syntax.",
+            dialect_instruction_label(other)
+        ),
+    };
+    format!(
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: {}\n\
+Dialect: {}\n\
+{}\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>",
+        spec.display_name,
+        spec.dialect.as_str(),
+        generate_line,
+    )
 }
 
 /// True when `key` is a terminal-declaration field that must not participate
@@ -180,8 +251,108 @@ mod tests {
     use crate::terminal::shell::test_support::{
         posix_spec as test_posix_spec, pwsh_spec as test_pwsh_spec,
     };
-    use crate::terminal::shell::ShellResolveError;
+    use crate::terminal::shell::{ShellCommandStrategy, ShellResolveError, ShellSource};
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn prompt_context_is_versioned_and_derived_from_snapshot() {
+        let context = render_terminal_prompt_context(&test_pwsh_spec());
+        assert_eq!(
+            context,
+            "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+        );
+    }
+
+    #[test]
+    fn prompt_context_maps_cmd_and_posix_dialect_labels() {
+        let mut cmd = test_posix_spec();
+        cmd.dialect = ShellDialect::Cmd;
+        cmd.display_name = "cmd.exe".into();
+        cmd.command_strategy = ShellCommandStrategy::Cmd;
+        let rendered = render_terminal_prompt_context(&cmd);
+        assert!(rendered.contains("Dialect: cmd\n"));
+        assert!(rendered.contains("Generate shell command lines using CMD syntax.\n"));
+
+        let posix = test_posix_spec();
+        let rendered = render_terminal_prompt_context(&posix);
+        assert!(rendered.contains("Dialect: posix\n"));
+        assert!(rendered.contains("Generate shell command lines using POSIX syntax.\n"));
+    }
+
+    #[test]
+    fn prompt_context_custom_dialect_uses_fixed_instruction() {
+        let custom = ResolvedShellSpec {
+            executable: PathBuf::from("/usr/bin/fish"),
+            dialect: ShellDialect::Custom,
+            display_name: "Fish".into(),
+            source: ShellSource::Explicit,
+            command_strategy: ShellCommandStrategy::GenericDashC,
+        };
+        let rendered = render_terminal_prompt_context(&custom);
+        assert!(rendered.contains("Selected shell: Fish\n"));
+        assert!(rendered.contains("Dialect: custom\n"));
+        assert!(rendered.contains(
+            "Generate shell command lines using the selected custom shell's syntax.\n"
+        ));
+        assert!(!rendered.contains("using custom syntax"));
+    }
+
+    #[test]
+    fn injector_appends_context_only_once() {
+        let injector = TerminalPromptContext::new(test_pwsh_spec());
+        let mut first = vec![ContentBlock::Text(TextContent::new("hello"))];
+        injector.append_once(&mut first);
+        let mut second = vec![ContentBlock::Text(TextContent::new("again"))];
+        injector.append_once(&mut second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 1);
+        match &first[1] {
+            ContentBlock::Text(t) => {
+                assert!(t.text.contains("<codeg_terminal_context version=\"1\">"));
+                assert!(t.text.contains("Dialect: powershell"));
+            }
+            other => panic!("expected text context block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_prompt_context_shared_across_fork_does_not_reset() {
+        // Fork restarts the conversation loop but reuses the same Arc injector
+        // created in run_connection — second append must be a no-op.
+        let injector = Arc::new(TerminalPromptContext::new(test_pwsh_spec()));
+        let mut first = vec![ContentBlock::Text(TextContent::new("hello"))];
+        injector.append_once(&mut first);
+        let mut post_fork = vec![ContentBlock::Text(TextContent::new("after fork"))];
+        injector.append_once(&mut post_fork);
+        assert_eq!(first.len(), 2);
+        assert_eq!(post_fork.len(), 1);
+        match &post_fork[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "after fork"),
+            other => panic!("expected original user text only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_connection_gets_fresh_injector() {
+        // A newly spawned / manual-reconnect process constructs a new injector.
+        let first_conn = TerminalPromptContext::new(test_pwsh_spec());
+        let mut a = vec![ContentBlock::Text(TextContent::new("a"))];
+        first_conn.append_once(&mut a);
+        assert_eq!(a.len(), 2);
+
+        let second_conn = TerminalPromptContext::new(test_pwsh_spec());
+        let mut b = vec![ContentBlock::Text(TextContent::new("b"))];
+        second_conn.append_once(&mut b);
+        assert_eq!(b.len(), 2, "fresh injector must still be pending");
+    }
 
     #[test]
     fn terminal_metadata_declares_codeg_namespace() {

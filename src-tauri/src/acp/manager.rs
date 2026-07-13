@@ -3016,6 +3016,15 @@ mod tests {
             um.1.iter().any(|t| t == "hello viewers"),
             "user_message must carry the prompt text, got {um:?}"
         );
+        // Live UI / UserMessage broadcast uses original user content only.
+        // Wire-only `<codeg_terminal_context>` is appended in the connection
+        // loop after this payload is captured for broadcast.
+        assert!(
+            um.1
+                .iter()
+                .all(|t| !t.contains("codeg_terminal_context")),
+            "user_message must never leak terminal context block, got {um:?}"
+        );
     }
 
     #[tokio::test]
