@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -13,6 +14,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::acp::terminal_adapter::AcpTerminalAdapter;
+use crate::terminal::shell::{build_command_line, ResolvedShellSpec};
+
 type TerminalMap = HashMap<String, Arc<TerminalInstance>>;
 const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
 /// After the child process exits, wait up to this long for the stdout/stderr
@@ -22,9 +26,29 @@ const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
 /// exits, turning `wait_for_exit` into a silent hang.
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
+/// How a `terminal/create` request will be executed.
+///
+/// Classification is deterministic and never retries a failed spawn under a
+/// different mode or shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Spawn `program` directly with the request's exact `args` boundaries.
+    DirectProgram(PathBuf),
+    /// Run `request.command` as a single line through the connection's
+    /// snapshotted shell via [`build_command_line`].
+    ShellCommandLine,
+}
+
 #[derive(Debug)]
 pub enum TerminalRuntimeError {
     InvalidParams(String),
+    Spawn {
+        code: &'static str,
+        executable: String,
+        display_name: String,
+        mode: &'static str,
+        os_error: String,
+    },
     Internal(String),
 }
 
@@ -32,6 +56,27 @@ impl TerminalRuntimeError {
     pub fn into_rpc_error(self) -> sacp::Error {
         match self {
             Self::InvalidParams(message) => sacp::Error::invalid_params().data(message),
+            Self::Spawn {
+                code,
+                executable,
+                display_name,
+                mode,
+                os_error,
+            } => {
+                // Stable structured diagnostics only — never attach base_env,
+                // request env, or command text (command lines may hold secrets).
+                sacp::Error::new(
+                    -32603,
+                    format!("failed to spawn terminal ({mode}): {os_error}"),
+                )
+                .data(serde_json::json!({
+                    "code": code,
+                    "executable": executable,
+                    "displayName": display_name,
+                    "mode": mode,
+                    "osError": os_error,
+                }))
+            }
             Self::Internal(message) => sacp::util::internal_error(message),
         }
     }
@@ -229,6 +274,12 @@ pub struct TerminalRuntime {
     /// process cwd (often "/" on desktop, the dev crate dir in development).
     /// `None` leaves the process cwd inherited (legacy behavior).
     default_cwd: Option<PathBuf>,
+    /// Immutable launch-time shell snapshot for this connection. Used for
+    /// `ShellCommandLine` execution and spawn diagnostics; never re-resolved
+    /// from live settings after the connection starts.
+    terminal_shell: ResolvedShellSpec,
+    /// Per-agent request shaping hooks (normalization, validation).
+    adapter: &'static dyn AcpTerminalAdapter,
 }
 
 #[derive(Debug, Clone)]
@@ -241,29 +292,76 @@ pub struct TerminalOutputDelta {
 }
 
 impl TerminalRuntime {
-    /// Construct a runtime where every spawned command starts with `base_env`
-    /// applied, before the agent's per-request env overrides are layered on
-    /// top. Use this to propagate process-level invariants like the git
-    /// credential helper across `terminal/create` invocations.
-    pub fn with_base_env(base_env: BTreeMap<String, String>) -> Self {
+    /// Construct a runtime with the connection's base env, immutable shell
+    /// snapshot, and static terminal adapter.
+    pub fn new(
+        base_env: BTreeMap<String, String>,
+        terminal_shell: ResolvedShellSpec,
+        adapter: &'static dyn AcpTerminalAdapter,
+    ) -> Self {
         Self {
             terminals: Mutex::new(HashMap::new()),
             base_env,
             default_cwd: None,
+            terminal_shell,
+            adapter,
         }
     }
 
     /// Set the fallback working directory used when a `terminal/create` request
-    /// does not specify its own `cwd`. Chainable after `with_base_env`.
+    /// does not specify its own `cwd`. Chainable after [`Self::new`].
     pub fn with_default_cwd(mut self, default_cwd: Option<PathBuf>) -> Self {
         self.default_cwd = default_cwd;
         self
     }
 
+    /// Effective working directory used for executable resolution and as the
+    /// spawn fallback when the request omits `cwd`.
+    fn effective_cwd(&self, request: &CreateTerminalRequest) -> PathBuf {
+        request
+            .cwd
+            .clone()
+            .or_else(|| self.default_cwd.clone().filter(|path| path.is_dir()))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    /// PATH used for classification, layered like the eventual child process:
+    /// request env (last duplicate wins) → runtime base env → process PATH.
+    fn effective_path(&self, request: &CreateTerminalRequest) -> Option<OsString> {
+        request_env_value(request, "PATH")
+            .map(OsString::from)
+            .or_else(|| map_env_value(&self.base_env, "PATH").map(OsString::from))
+            .or_else(|| std::env::var_os("PATH"))
+    }
+
+    /// Deterministically classify how `request` will be spawned.
+    ///
+    /// - Non-empty `args` → [`ExecutionMode::DirectProgram`] (exact argv)
+    /// - Empty `args` + command resolves as an existing executable → DirectProgram
+    /// - Otherwise → [`ExecutionMode::ShellCommandLine`] through the snapshotted shell
+    ///
+    /// Does not strip quotes or parse shell syntax. Never retries under another
+    /// mode after a failed spawn.
+    pub fn classify_request(
+        &self,
+        request: &CreateTerminalRequest,
+    ) -> Result<ExecutionMode, TerminalRuntimeError> {
+        if !request.args.is_empty() {
+            return Ok(ExecutionMode::DirectProgram(PathBuf::from(&request.command)));
+        }
+
+        let cwd = self.effective_cwd(request);
+        if let Ok(path) = which::which_in(&request.command, self.effective_path(request), &cwd) {
+            return Ok(ExecutionMode::DirectProgram(path));
+        }
+
+        Ok(ExecutionMode::ShellCommandLine)
+    }
+
     /// Apply stdio, working directory, and environment to a freshly built
-    /// terminal command. Shared by the direct-exec and shell-fallback spawn
-    /// paths in `create_terminal` so both honor the same cwd precedence and
-    /// env layering.
+    /// terminal command. Shared by direct-exec and shell-line spawn paths so
+    /// both honor the same cwd precedence and env layering.
     fn configure_command(
         &self,
         command: &mut tokio::process::Command,
@@ -306,6 +404,8 @@ impl TerminalRuntime {
         &self,
         request: CreateTerminalRequest,
     ) -> Result<CreateTerminalResponse, TerminalRuntimeError> {
+        let request = self.adapter.normalize_terminal_request(request)?;
+
         if let Some(cwd) = request.cwd.as_ref() {
             if !cwd.is_absolute() {
                 return Err(TerminalRuntimeError::InvalidParams(
@@ -329,44 +429,42 @@ impl TerminalRuntime {
             ));
         }
 
-        // Spawn the command. Try a direct exec first so a real program — one
-        // resolved on PATH, an absolute path, or a relative/space-containing
-        // path reachable through the request's cwd and env — runs exactly as
-        // before, in the real spawn context. Only if the OS cannot find the
-        // program (`NotFound`) AND the request looks like a whole shell line
-        // crammed into `command` (empty args + embedded whitespace, the shape
-        // CodeBuddy sends, e.g. "pnpm build") do we retry through the platform
-        // shell so its `&&`, pipes, `$VAR`, and globs evaluate. Deciding off a
-        // real failed spawn — rather than a pre-spawn `which` guess that runs
-        // in codeg's own cwd/env — means we never reroute a command that would
-        // otherwise have run.
-        let mut direct = crate::process::tokio_command(&request.command);
-        direct.args(&request.args);
-        self.configure_command(&mut direct, &request);
-
-        let mut child = match direct.spawn() {
-            Ok(child) => child,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound
-                    && request.args.is_empty()
-                    && request.command.contains(char::is_whitespace) =>
-            {
-                let mut shell = shell_wrapped_command(&request.command);
-                self.configure_command(&mut shell, &request);
-                shell.spawn().map_err(|err| {
-                    TerminalRuntimeError::Internal(format!(
-                        "failed to spawn terminal command {}: {err}",
-                        request.command
-                    ))
-                })?
+        // Classify once, construct one command, spawn once. No OS-error-driven
+        // fallback onto another shell or dialect translation.
+        let mode = self.classify_request(&request)?;
+        let mut command = match &mode {
+            ExecutionMode::DirectProgram(program) => {
+                let mut cmd = crate::process::tokio_command(program);
+                cmd.args(&request.args);
+                cmd
             }
-            Err(err) => {
-                return Err(TerminalRuntimeError::Internal(format!(
-                    "failed to spawn terminal command {}: {err}",
-                    request.command
-                )));
+            ExecutionMode::ShellCommandLine => {
+                build_command_line(&self.terminal_shell, &request.command)
             }
         };
+        self.configure_command(&mut command, &request);
+
+        let mut child = command.spawn().map_err(|err| {
+            let (code, executable, mode_label) = match &mode {
+                ExecutionMode::DirectProgram(program) => (
+                    "terminal_program_spawn_failed",
+                    program.display().to_string(),
+                    "direct_program",
+                ),
+                ExecutionMode::ShellCommandLine => (
+                    "terminal_shell_spawn_failed",
+                    self.terminal_shell.executable.display().to_string(),
+                    "shell_command_line",
+                ),
+            };
+            TerminalRuntimeError::Spawn {
+                code,
+                executable,
+                display_name: self.terminal_shell.display_name.clone(),
+                mode: mode_label,
+                os_error: err.to_string(),
+            }
+        })?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -556,6 +654,39 @@ impl TerminalRuntime {
     }
 }
 
+/// Look up `key` in the request env list. Scans in reverse so the last
+/// duplicate wins, matching the order used by [`TerminalRuntime::configure_command`].
+/// Key comparison is case-insensitive on Windows.
+fn request_env_value(request: &CreateTerminalRequest, key: &str) -> Option<String> {
+    request
+        .env
+        .iter()
+        .rev()
+        .find(|env_var| env_keys_equal(&env_var.name, key))
+        .map(|env_var| env_var.value.clone())
+}
+
+/// Look up `key` in a base env map. Returns the last case-insensitive match
+/// under BTreeMap iteration order so classification PATH matches what the
+/// child eventually sees when multiple spellings (e.g. `Path` / `PATH`) exist.
+fn map_env_value(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    map.iter()
+        .filter(|(k, _)| env_keys_equal(k, key))
+        .map(|(_, v)| v.clone())
+        .next_back()
+}
+
+fn env_keys_equal(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    {
+        a.eq_ignore_ascii_case(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 async fn read_stream<R>(mut reader: R, terminal: Arc<TerminalInstance>)
 where
     R: AsyncRead + Unpin,
@@ -582,26 +713,6 @@ where
             Err(_) => break,
         }
     }
-}
-
-/// Wrap a full shell command line so it executes through the platform shell.
-/// Used when an agent passes an entire command line in `command` with empty
-/// `args` (see `create_terminal`); the shell preserves the `&&`, pipes,
-/// `$VAR`, and globs the agent's line relies on. Reuses `tokio_command` so the
-/// shell still inherits codeg's UTF-8 env and Windows program normalization.
-#[cfg(not(windows))]
-fn shell_wrapped_command(line: &str) -> tokio::process::Command {
-    let mut command = crate::process::tokio_command("/bin/sh");
-    command.arg("-c").arg(line);
-    command
-}
-
-#[cfg(windows)]
-fn shell_wrapped_command(line: &str) -> tokio::process::Command {
-    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    let mut command = crate::process::tokio_command(comspec);
-    command.arg("/C").arg(line);
-    command
 }
 
 fn map_exit_status(status: std::process::ExitStatus) -> TerminalExitStatus {
@@ -670,10 +781,412 @@ fn decode_available_utf8(pending: &mut Vec<u8>) -> String {
     output
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::terminal_adapter::adapter_for;
+    use crate::models::agent::AgentType;
+    use crate::terminal::shell::{ShellCommandStrategy, ShellDialect, ShellSource};
     use sacp::schema::{EnvVariable, SessionId, WaitForTerminalExitRequest};
+    use std::path::Path;
+
+    fn test_runtime(shell: ResolvedShellSpec) -> TerminalRuntime {
+        TerminalRuntime::new(BTreeMap::new(), shell, adapter_for(AgentType::Codex))
+    }
+
+    fn test_shell_spec() -> ResolvedShellSpec {
+        platform_test_shell()
+    }
+
+    #[cfg(windows)]
+    fn platform_test_shell() -> ResolvedShellSpec {
+        let (executable, display_name) = [
+            ("pwsh.exe", "PowerShell 7"),
+            ("powershell.exe", "Windows PowerShell"),
+        ]
+        .into_iter()
+        .find_map(|(candidate, display_name)| {
+            which::which(candidate)
+                .ok()
+                .map(|path| (path, display_name.to_string()))
+        })
+        .expect("PowerShell is required for Windows ACP terminal runtime tests");
+
+        ResolvedShellSpec {
+            executable,
+            dialect: ShellDialect::PowerShell,
+            display_name,
+            source: ShellSource::System,
+            command_strategy: ShellCommandStrategy::PowerShell,
+        }
+    }
+
+    #[cfg(unix)]
+    fn platform_test_shell() -> ResolvedShellSpec {
+        ResolvedShellSpec {
+            executable: PathBuf::from("/bin/sh"),
+            dialect: ShellDialect::Posix,
+            display_name: "sh".into(),
+            source: ShellSource::System,
+            command_strategy: ShellCommandStrategy::Posix,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_cmd_test_shell() -> ResolvedShellSpec {
+        ResolvedShellSpec {
+            executable: which::which("cmd.exe").expect("cmd.exe is required on Windows"),
+            dialect: ShellDialect::Cmd,
+            display_name: "Command Prompt".into(),
+            source: ShellSource::System,
+            command_strategy: ShellCommandStrategy::Cmd,
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_executable_name(stem: &str) -> String {
+        format!("{stem}.cmd")
+    }
+
+    #[cfg(unix)]
+    fn test_executable_name(stem: &str) -> String {
+        stem.to_string()
+    }
+
+    #[cfg(windows)]
+    fn create_test_executable(path: PathBuf) -> PathBuf {
+        std::fs::write(&path, "@echo off\r\nexit /b 0\r\n").unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn create_test_executable(path: PathBuf) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    fn platform_print_working_directory_line() -> String {
+        "Get-Location".into()
+    }
+
+    #[cfg(unix)]
+    fn platform_print_working_directory_line() -> String {
+        "pwd".into()
+    }
+
+    #[cfg(windows)]
+    fn platform_marker_then_exit_line(marker: &Path, code: i32) -> String {
+        let marker = marker.to_string_lossy().replace('\'', "''");
+        format!("Set-Content -LiteralPath '{marker}' -NoNewline -Value x; exit {code}")
+    }
+
+    #[cfg(unix)]
+    fn platform_marker_then_exit_line(marker: &Path, code: i32) -> String {
+        let marker = marker.to_string_lossy().replace('\'', "'\"'\"'");
+        format!("printf x > '{marker}'; exit {code}")
+    }
+
+    /// Spawn `request`, wait for it to exit, return its captured output, and
+    /// release the session's terminals.
+    async fn run_and_capture(
+        runtime: &TerminalRuntime,
+        session_id: &SessionId,
+        request: CreateTerminalRequest,
+    ) -> String {
+        let response = runtime
+            .create_terminal(request)
+            .await
+            .expect("create terminal");
+        let terminal_id = response.terminal_id.clone();
+        runtime
+            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                session_id.clone(),
+                terminal_id.clone(),
+            ))
+            .await
+            .expect("wait for exit");
+        let out = runtime
+            .terminal_output(TerminalOutputRequest::new(
+                session_id.clone(),
+                terminal_id.clone(),
+            ))
+            .await
+            .expect("get output");
+        runtime.release_all_for_session(session_id.0.as_ref()).await;
+        out.output
+    }
+
+    #[test]
+    fn non_empty_args_are_always_direct() {
+        let runtime = test_runtime(test_shell_spec());
+        let mut request = CreateTerminalRequest::new(SessionId::new("s"), "cargo");
+        request.args = vec![
+            "check".into(),
+            "--manifest-path".into(),
+            r"D:\repo with space\Cargo.toml".into(),
+        ];
+        assert!(matches!(
+            runtime.classify_request(&request).unwrap(),
+            ExecutionMode::DirectProgram(_)
+        ));
+    }
+
+    #[test]
+    fn empty_args_existing_executable_with_spaces_is_direct() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable =
+            create_test_executable(temp.path().join(test_executable_name("my tool")));
+        let runtime = test_runtime(test_shell_spec()).with_default_cwd(Some(temp.path().into()));
+        let request = CreateTerminalRequest::new(
+            SessionId::new("s"),
+            executable.to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            runtime.classify_request(&request).unwrap(),
+            ExecutionMode::DirectProgram(executable)
+        );
+    }
+
+    #[test]
+    fn builtins_and_complete_lines_use_selected_shell() {
+        let runtime = test_runtime(test_shell_spec());
+        for line in [
+            "cd",
+            "Get-Location",
+            "Set-Location 'D:\\repo'; Get-Location",
+            "cd /d D:\\repo && where cargo",
+            "cargo check --manifest-path D:\\repo\\Cargo.toml",
+            "echo x | findstr x",
+            "echo x > output.txt",
+        ] {
+            let request = CreateTerminalRequest::new(SessionId::new("s"), line);
+            assert_eq!(
+                runtime.classify_request(&request).unwrap(),
+                ExecutionMode::ShellCommandLine,
+                "expected shell line for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_path_env_overrides_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let executable =
+            create_test_executable(bin_dir.join(test_executable_name("special-tool")));
+
+        let runtime = test_runtime(test_shell_spec());
+        let mut request =
+            CreateTerminalRequest::new(SessionId::new("s"), "special-tool");
+        // Prefer the Windows-style `Path` key so classification still matches
+        // case-insensitive env layering on Windows (and exact `PATH` on Unix
+        // would also work — here we exercise the override path with PATH).
+        request.env = vec![EnvVariable::new(
+            "PATH",
+            bin_dir.to_string_lossy().into_owned(),
+        )];
+
+        let mode = runtime.classify_request(&request).unwrap();
+        match mode {
+            ExecutionMode::DirectProgram(path) => {
+                assert_eq!(
+                    path.file_name(),
+                    executable.file_name(),
+                    "resolved path {path:?} should match test executable"
+                );
+            }
+            ExecutionMode::ShellCommandLine => {
+                panic!("expected DirectProgram when PATH points at the test binary")
+            }
+        }
+    }
+
+    #[test]
+    fn request_cwd_is_used_for_relative_executable_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable =
+            create_test_executable(temp.path().join(test_executable_name("rel-tool")));
+        let runtime = test_runtime(test_shell_spec());
+
+        #[cfg(windows)]
+        let command = format!(r".\{}", test_executable_name("rel-tool"));
+        #[cfg(unix)]
+        let command = format!("./{}", test_executable_name("rel-tool"));
+
+        let mut request = CreateTerminalRequest::new(SessionId::new("s"), command);
+        request.cwd = Some(temp.path().to_path_buf());
+
+        assert_eq!(
+            runtime.classify_request(&request).unwrap(),
+            ExecutionMode::DirectProgram(executable)
+        );
+    }
+
+    #[test]
+    fn whitespace_only_command_is_rejected() {
+        let runtime = test_runtime(test_shell_spec());
+        let session_id = SessionId::new("blank-command".to_string());
+        let request = CreateTerminalRequest::new(session_id, "   ".to_string());
+
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(runtime.create_terminal(request));
+        assert!(
+            matches!(result, Err(TerminalRuntimeError::InvalidParams(_))),
+            "expected InvalidParams for a whitespace-only command"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_line_runs_through_selected_shell() {
+        let runtime = test_runtime(platform_test_shell());
+        let line = platform_print_working_directory_line();
+        let request = CreateTerminalRequest::new(SessionId::new("s"), line);
+        let response = runtime.create_terminal(request).await.unwrap();
+        let result = runtime
+            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                SessionId::new("s"),
+                response.terminal_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_status.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn nonzero_marker_command_executes_once_without_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("marker.txt");
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(temp.path().into()));
+        let request = CreateTerminalRequest::new(
+            SessionId::new("s"),
+            platform_marker_then_exit_line(&marker, 7),
+        );
+        let response = runtime.create_terminal(request).await.unwrap();
+        runtime
+            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                SessionId::new("s"),
+                response.terminal_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_absolute_complete_line_is_not_spawned_as_a_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let quoted = temp.path().to_string_lossy().replace('\'', "''");
+        let line = format!("Set-Location -LiteralPath '{quoted}'; Get-Location");
+        let runtime = test_runtime(platform_test_shell());
+        let session_id = SessionId::new("powershell-absolute-line");
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(session_id.clone(), line))
+            .await
+            .unwrap();
+        let result = runtime
+            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                session_id,
+                response.terminal_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_status.exit_code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_drive_switch_and_where_run_through_cmd() {
+        let temp = tempfile::tempdir().unwrap();
+        // Avoid nested `"..."` around the path: Rust's Command quotes the whole
+        // `/C` argument, which breaks cmd's nested-quote parsing for
+        // `cd /d "path"`. Temp paths have no spaces, so unquoted `cd /d` is
+        // still a real CMD builtin line under the snapshotted Cmd strategy.
+        let line = format!(
+            "cd /d {} && where cmd.exe",
+            temp.path().to_string_lossy()
+        );
+        let runtime = test_runtime(windows_cmd_test_shell());
+        let session_id = SessionId::new("cmd-builtins");
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(session_id.clone(), line))
+            .await
+            .unwrap();
+        let result = runtime
+            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                session_id,
+                response.terminal_id,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_status.exit_code, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_quotes_pipeline_and_redirect_execute_as_one_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_path = temp.path().join("quoted output.txt");
+        let quoted_path = output_path.to_string_lossy().replace('\'', "''");
+        let line = format!(
+            "'quoted value' | ForEach-Object {{ $_ }} > '{quoted_path}'; Get-Content -LiteralPath '{quoted_path}'"
+        );
+        let runtime = test_runtime(platform_test_shell());
+        let session_id = SessionId::new("powershell-operators");
+        let request = CreateTerminalRequest::new(session_id.clone(), line);
+        let output = run_and_capture(&runtime, &session_id, request).await;
+        assert!(
+            output.contains("quoted value"),
+            "unexpected output: {output}"
+        );
+        assert!(output_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn spawn_diagnostics_are_stable_and_secret_free() {
+        let mut shell_runtime = test_runtime(test_shell_spec());
+        shell_runtime.terminal_shell.executable = PathBuf::from("missing-shell-for-test");
+        shell_runtime
+            .base_env
+            .insert("OPENAI_API_KEY".into(), "test-secret-value".into());
+        let shell_error = shell_runtime
+            .create_terminal(CreateTerminalRequest::new(
+                SessionId::new("shell-error"),
+                "echo test-command-secret",
+            ))
+            .await
+            .unwrap_err();
+        let shell_rpc = serde_json::to_value(shell_error.into_rpc_error()).unwrap();
+        assert_eq!(shell_rpc["data"]["code"], "terminal_shell_spawn_failed");
+        assert_eq!(shell_rpc["data"]["mode"], "shell_command_line");
+        assert!(!shell_rpc.to_string().contains("test-secret-value"));
+        assert!(!shell_rpc.to_string().contains("test-command-secret"));
+
+        let program_runtime = test_runtime(test_shell_spec());
+        let mut direct = CreateTerminalRequest::new(
+            SessionId::new("program-error"),
+            "missing-program-for-test",
+        );
+        direct.args = vec!["--version".into()];
+        let program_error = program_runtime.create_terminal(direct).await.unwrap_err();
+        let program_rpc = serde_json::to_value(program_error.into_rpc_error()).unwrap();
+        assert_eq!(
+            program_rpc["data"]["code"],
+            "terminal_program_spawn_failed"
+        );
+        assert_eq!(program_rpc["data"]["mode"], "direct_program");
+    }
 
     /// Regression: when an ACP agent calls `terminal/create` (e.g. to run
     /// `git push`), the runtime's base env — populated by the connection
@@ -681,12 +1194,17 @@ mod tests {
     /// must reach the spawned process. Per-request `env` from the agent
     /// still wins on key collision so the agent can scrub or override
     /// specific keys for individual commands.
+    #[cfg(unix)]
     #[tokio::test]
     async fn base_env_propagates_and_request_env_overrides() {
         let mut base_env = BTreeMap::new();
         base_env.insert("CODEG_TEST_BASE_VAR".to_string(), "from_base".to_string());
         base_env.insert("CODEG_TEST_OVERRIDE".to_string(), "loses".to_string());
-        let runtime = TerminalRuntime::with_base_env(base_env);
+        let runtime = TerminalRuntime::new(
+            base_env,
+            platform_test_shell(),
+            adapter_for(AgentType::Codex),
+        );
 
         let session_id = SessionId::new("test-session".to_string());
         let mut request = CreateTerminalRequest::new(session_id.clone(), "/bin/sh".to_string());
@@ -741,47 +1259,19 @@ mod tests {
         runtime.release_all_for_session(session_id.0.as_ref()).await;
     }
 
-    /// Spawn `request`, wait for it to exit, return its captured output, and
-    /// release the session's terminals.
-    async fn run_and_capture(
-        runtime: &TerminalRuntime,
-        session_id: &SessionId,
-        request: CreateTerminalRequest,
-    ) -> String {
-        let response = runtime
-            .create_terminal(request)
-            .await
-            .expect("create terminal");
-        let terminal_id = response.terminal_id.clone();
-        runtime
-            .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
-                session_id.clone(),
-                terminal_id.clone(),
-            ))
-            .await
-            .expect("wait for exit");
-        let out = runtime
-            .terminal_output(TerminalOutputRequest::new(
-                session_id.clone(),
-                terminal_id.clone(),
-            ))
-            .await
-            .expect("get output");
-        runtime.release_all_for_session(session_id.0.as_ref()).await;
-        out.output
-    }
-
     /// A `terminal/create` that omits `cwd` defaults to the runtime's
     /// configured working directory rather than codeg's own process cwd.
+    #[cfg(unix)]
     #[tokio::test]
     async fn falls_back_to_default_cwd_when_request_omits_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+        let runtime = test_runtime(platform_test_shell())
             .with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("cwd-default".to_string());
-        // Bare `pwd` (no whitespace) → direct exec; current_dir still applies.
+        // Bare `pwd` (no whitespace) → may be DirectProgram if on PATH;
+        // current_dir still applies either way.
         let request = CreateTerminalRequest::new(session_id.clone(), "pwd".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
 
@@ -793,12 +1283,13 @@ mod tests {
 
     /// An explicit absolute `cwd` in the request takes precedence over the
     /// runtime default.
+    #[cfg(unix)]
     #[tokio::test]
     async fn request_cwd_overrides_default_cwd() {
         let default_dir = tempfile::tempdir().expect("default dir");
         let request_dir = tempfile::tempdir().expect("request dir");
         let request_canonical = request_dir.path().canonicalize().expect("canonicalize");
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+        let runtime = test_runtime(platform_test_shell())
             .with_default_cwd(Some(default_dir.path().to_path_buf()));
 
         let session_id = SessionId::new("cwd-override".to_string());
@@ -812,12 +1303,11 @@ mod tests {
         );
     }
 
-    /// A whitespace-bearing command with empty args runs through the shell. A
-    /// direct exec would ENOENT trying to run a program literally named with
-    /// spaces — this is the shape CodeBuddy sends.
+    /// A whitespace-bearing command with empty args runs through the shell.
+    #[cfg(unix)]
     #[tokio::test]
     async fn whitespace_command_runs_through_shell() {
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new());
+        let runtime = test_runtime(platform_test_shell());
 
         let session_id = SessionId::new("shell-wrap".to_string());
         let request =
@@ -839,17 +1329,16 @@ mod tests {
         );
     }
 
-    /// The shell-wrapped path still honors the working directory, so a
-    /// CodeBuddy-style `pnpm build` runs in the session folder.
+    /// The shell-wrapped path still honors the working directory.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_wrapped_command_respects_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+        let runtime = test_runtime(platform_test_shell())
             .with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("shell-cwd".to_string());
-        // Whitespace → shell-wrapped; must run in the default cwd.
         let request =
             CreateTerminalRequest::new(session_id.clone(), "pwd && echo done".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
@@ -861,9 +1350,10 @@ mod tests {
 
     /// When the agent supplies explicit `args`, the command is exec'd directly
     /// (no shell), so an argument containing spaces stays a single argument.
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_args_bypass_shell_wrap() {
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new());
+        let runtime = test_runtime(platform_test_shell());
 
         let session_id = SessionId::new("direct-exec".to_string());
         let mut request =
@@ -879,10 +1369,11 @@ mod tests {
     /// An explicit but non-existent absolute `cwd` is honored as-is and
     /// surfaces as a spawn failure — never silently downgraded to the default
     /// fallback or the inherited process cwd.
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_missing_cwd_surfaces_as_spawn_failure() {
         let default_dir = tempfile::tempdir().expect("default dir");
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+        let runtime = test_runtime(platform_test_shell())
             .with_default_cwd(Some(default_dir.path().to_path_buf()));
 
         let session_id = SessionId::new("missing-cwd".to_string());
@@ -891,14 +1382,13 @@ mod tests {
 
         let result = runtime.create_terminal(request).await;
         assert!(
-            matches!(result, Err(TerminalRuntimeError::Internal(_))),
-            "expected a spawn failure for a missing explicit cwd"
+            matches!(result, Err(TerminalRuntimeError::Spawn { .. })),
+            "expected a spawn failure for a missing explicit cwd, got {result:?}"
         );
     }
 
-    /// A real executable whose path contains spaces is exec'd directly: the
-    /// direct spawn succeeds, so the shell fallback never fires (shell-wrapping
-    /// would split the path at the space).
+    /// A real executable whose path contains spaces is exec'd directly.
+    #[cfg(unix)]
     #[tokio::test]
     async fn executable_path_with_spaces_is_not_shell_wrapped() {
         use std::os::unix::fs::PermissionsExt;
@@ -910,10 +1400,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&exe, perms).expect("chmod");
 
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new());
+        let runtime = test_runtime(platform_test_shell());
         let session_id = SessionId::new("space-exe".to_string());
-        // Empty args + whitespace in command, but it resolves to a real
-        // executable, so it must run directly rather than via the shell.
         let request =
             CreateTerminalRequest::new(session_id.clone(), exe.to_string_lossy().to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
@@ -923,25 +1411,9 @@ mod tests {
         );
     }
 
-    /// A whitespace-only command is rejected up front rather than spawning a
-    /// shell no-op.
-    #[tokio::test]
-    async fn whitespace_only_command_is_rejected() {
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new());
-        let session_id = SessionId::new("blank-command".to_string());
-        let request = CreateTerminalRequest::new(session_id, "   ".to_string());
-
-        let result = runtime.create_terminal(request).await;
-        assert!(
-            matches!(result, Err(TerminalRuntimeError::InvalidParams(_))),
-            "expected InvalidParams for a whitespace-only command"
-        );
-    }
-
     /// A relative, space-containing executable resolves against the terminal's
-    /// effective cwd and runs directly — the shell fallback fires only on a
-    /// genuine NotFound. This guards the regression where a pre-spawn `which`
-    /// check, run in codeg's own cwd, would shell-wrap and split the path.
+    /// effective cwd and runs directly.
+    #[cfg(unix)]
     #[tokio::test]
     async fn relative_executable_with_spaces_runs_in_effective_cwd() {
         use std::os::unix::fs::PermissionsExt;
@@ -953,11 +1425,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&exe, perms).expect("chmod");
 
-        let runtime = TerminalRuntime::with_base_env(BTreeMap::new())
+        let runtime = test_runtime(platform_test_shell())
             .with_default_cwd(Some(dir.path().to_path_buf()));
         let session_id = SessionId::new("rel-space-exe".to_string());
-        // "./my tool": empty args + whitespace, resolvable only against the
-        // terminal's cwd — must run directly, not via the shell.
         let request = CreateTerminalRequest::new(session_id.clone(), "./my tool".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
         assert!(

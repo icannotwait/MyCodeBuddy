@@ -33,6 +33,7 @@ use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
+use crate::acp::terminal_adapter::adapter_for;
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
@@ -1974,15 +1975,20 @@ async fn run_connection(
     // keys upstream — see `spawn_agent_connection` for the rationale and
     // why we don't forward the full agent runtime_env here.
     //
-    // `terminal_shell` is the immutable launch snapshot; no code below
-    // re-reads system terminal settings (Task 6+ uses this for strategy).
-    let _terminal_shell = terminal_shell;
+    // `terminal_shell` is the immutable launch snapshot; the runtime uses its
+    // `ResolvedShellSpec` for ShellCommandLine execution and diagnostics and
+    // never re-reads system terminal settings after the connection starts.
     let cwd = resolve_working_dir(working_dir.as_deref());
     // Default terminals to the session working directory so an agent that calls
     // `terminal/create` without a `cwd` (e.g. CodeBuddy) runs in the folder the
     // conversation runs in rather than codeg's own process cwd.
     let terminal_runtime = Arc::new(
-        TerminalRuntime::with_base_env(terminal_base_env).with_default_cwd(Some(cwd.clone())),
+        TerminalRuntime::new(
+            terminal_base_env,
+            terminal_shell.spec.clone(),
+            adapter_for(agent_type),
+        )
+        .with_default_cwd(Some(cwd.clone())),
     );
     let cwd_string = cwd.to_string_lossy().to_string();
     let file_system_runtime = Arc::new(FileSystemRuntime::new(cwd.clone()));
