@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-#[cfg(target_os = "windows")]
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use super::error::TerminalError;
+use super::shell::{configure_interactive_command, ResolvedShellSpec};
 use super::types::{TerminalEvent, TerminalInfo};
 use crate::web::event_bridge::EventEmitter;
 
@@ -25,200 +25,15 @@ pub struct TerminalManager {
     terminals: Arc<Mutex<HashMap<String, TerminalInstance>>>,
 }
 
-pub(crate) fn resolve_shell() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(shell) = std::env::var("SHELL") {
-            let trimmed = shell.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-        if let Ok(comspec) = std::env::var("COMSPEC") {
-            let trimmed = comspec.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-        "cmd.exe".to_string()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(shell) = std::env::var("SHELL") {
-            let trimmed = shell.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-        // Try common shells in order of preference
-        for candidate in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
-            if std::path::Path::new(candidate).exists() {
-                return candidate.to_string();
-            }
-        }
-        "/bin/sh".to_string()
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Copy)]
-enum WindowsShellFlavor {
-    Cmd,
-    PowerShell,
-    Posix,
-}
-
-#[cfg(target_os = "windows")]
-fn detect_windows_shell_flavor(shell: &str) -> WindowsShellFlavor {
-    let shell_name = Path::new(shell)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(shell)
-        .to_ascii_lowercase();
-
-    if shell_name.contains("pwsh") || shell_name.contains("powershell") {
-        WindowsShellFlavor::PowerShell
-    } else if shell_name.contains("bash")
-        || shell_name.contains("zsh")
-        || shell_name.contains("fish")
-        || shell_name.ends_with("sh.exe")
-    {
-        WindowsShellFlavor::Posix
-    } else {
-        WindowsShellFlavor::Cmd
-    }
-}
-
-/// POSIX-side shell flavor. We only inject the `-l -i` login/interactive
-/// flags and the `eval "$CODEG_CMD"` wrapping for shells we know speak that
-/// dialect — passing those to nu / xonsh / elvish / pwsh would cause spawn
-/// failures or weird behavior. Unknown shells get raw spawn (no flags) and,
-/// when an `initial_command` is requested, a plain `-c <command>` (the
-/// closest thing to a universal "run this and exit" convention).
-#[cfg(not(target_os = "windows"))]
-#[derive(Debug, Clone, Copy)]
-enum PosixShellFlavor {
-    /// bash / zsh / sh / dash / ksh / ash / mksh / busybox / fish — accept
-    /// `-l -i` and the `eval "$VAR"` pattern.
-    BashLike,
-    /// Anything else. Don't assume POSIX flag conventions.
-    Unknown,
-}
-
-#[cfg(not(target_os = "windows"))]
-fn detect_posix_shell_flavor(shell: &str) -> PosixShellFlavor {
-    let name = std::path::Path::new(shell)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(shell)
-        .to_ascii_lowercase();
-
-    if matches!(
-        name.as_str(),
-        "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash" | "mksh" | "busybox" | "fish"
-    ) {
-        PosixShellFlavor::BashLike
-    } else {
-        PosixShellFlavor::Unknown
-    }
-}
-
-fn configure_shell_command(cmd: &mut CommandBuilder, shell: &str, initial_command: Option<&str>) {
-    #[cfg(target_os = "windows")]
-    {
-        // Force UTF-8 output for all Windows shell flavors
-        cmd.env("PYTHONUTF8", "1");
-        cmd.env("PYTHONIOENCODING", "utf-8");
-
-        match detect_windows_shell_flavor(shell) {
-            WindowsShellFlavor::Cmd => {
-                if let Some(command) = initial_command {
-                    cmd.env("CODEG_CMD", command);
-                    // Set UTF-8 code page before running the actual command
-                    cmd.args(["/D", "/S", "/C", "chcp 65001 >nul & %CODEG_CMD%"]);
-                } else {
-                    // /K runs the command then stays open for interactive use
-                    cmd.args(["/D", "/S", "/K", "chcp 65001 >nul"]);
-                }
-            }
-            WindowsShellFlavor::PowerShell => {
-                if let Some(command) = initial_command {
-                    cmd.env("CODEG_CMD", command);
-                    cmd.args([
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-Command",
-                        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ErrorActionPreference = 'Stop'; Invoke-Expression $env:CODEG_CMD",
-                    ]);
-                } else {
-                    // -NoExit runs the command then stays open for interactive use
-                    cmd.args([
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NoExit",
-                        "-Command",
-                        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $host.UI.RawUI.WindowTitle = 'codeg'",
-                    ]);
-                }
-            }
-            WindowsShellFlavor::Posix => {
-                cmd.env("TERM", "xterm-256color");
-                cmd.env("COLORTERM", "truecolor");
-                cmd.env("TERM_PROGRAM", "codeg");
-                cmd.env("LANG", "C.UTF-8");
-                if let Some(command) = initial_command {
-                    cmd.env("CODEG_CMD", command);
-                    cmd.args(["-l", "-i", "-c", "eval \"$CODEG_CMD\""]);
-                } else {
-                    cmd.args(["-l", "-i"]);
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // GUI app environments often miss TERM; force a sane terminal type so
-        // readline/zle can redraw lines correctly (history navigation, etc.).
-        // Locale env (LANG/LC_ALL) is intentionally NOT injected — interactive
-        // PTYs should respect whatever the user's shell rc files set up.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "codeg");
-
-        match detect_posix_shell_flavor(shell) {
-            PosixShellFlavor::BashLike => {
-                if let Some(command) = initial_command {
-                    // Indirection via env var avoids quoting/escaping bugs
-                    // for arbitrary commands (and keeps long commands off
-                    // argv for readability in `ps`).
-                    cmd.env("CODEG_CMD", command);
-                    cmd.args(["-l", "-i", "-c", "eval \"$CODEG_CMD\""]);
-                } else {
-                    cmd.args(["-l", "-i"]);
-                }
-            }
-            PosixShellFlavor::Unknown => {
-                // No-flag spawn for nu/xonsh/elvish/pwsh on Linux/etc. Most
-                // modern shells default to interactive when stdin is a TTY,
-                // so we get a usable session without guessing flag syntax.
-                if let Some(command) = initial_command {
-                    cmd.args(["-c", command]);
-                }
-            }
-        }
-    }
-}
-
 /// Options for spawning a new terminal session.
 pub struct SpawnOptions {
     pub terminal_id: String,
     pub working_dir: String,
     pub owner_window_label: String,
-    pub shell: Option<String>,
+    pub shell: ResolvedShellSpec,
     pub initial_command: Option<String>,
     pub extra_env: Option<HashMap<String, String>>,
-    pub temp_files: Vec<std::path::PathBuf>,
+    pub temp_files: Vec<PathBuf>,
 }
 
 impl TerminalManager {
@@ -263,15 +78,12 @@ impl TerminalManager {
             })
             .map_err(|e| TerminalError::SpawnFailed(e.to_string()))?;
 
-        let shell = opts
-            .shell
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(resolve_shell);
-        let mut cmd = CommandBuilder::new(&shell);
-        configure_shell_command(&mut cmd, &shell, opts.initial_command.as_deref());
+        let mut cmd = CommandBuilder::new(&opts.shell.executable);
+        configure_interactive_command(
+            &opts.shell,
+            &mut cmd,
+            opts.initial_command.as_deref(),
+        );
         cmd.cwd(&opts.working_dir);
 
         // Inject extra environment variables (e.g. git credential helper config)
