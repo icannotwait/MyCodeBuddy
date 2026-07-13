@@ -1,21 +1,31 @@
 fn main() {
-    embed_common_controls_v6_for_windows_tests();
+    configure_common_controls_v6_manifest();
 
     #[cfg(feature = "tauri-runtime")]
     {
         ensure_sidecar_placeholder();
-        tauri_build::build();
+        // The package-wide linker manifest below also covers lib/bin unit-test
+        // harnesses. Keep Tauri's icon/version resource, but omit its duplicate
+        // ID=1 manifest so normal binaries still link successfully.
+        let attributes = tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
+        tauri_build::try_build(attributes).expect("failed to run Tauri build script");
     }
 }
 
-fn embed_common_controls_v6_for_windows_tests() {
+fn configure_common_controls_v6_manifest() {
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows-msvc") {
+        // `rustc-link-arg-tests` reaches integration tests but not the unit-test
+        // harnesses generated from lib.rs and bin targets. Emit package-wide
+        // link args so every Windows executable gets the same activation
+        // context; library artifacts themselves do not invoke the linker.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         // Do not wrap the dependency string in extra quotes: rustc/Command
         // already quotes space-containing link args for link.exe. Nested
         // quotes here produce LNK1181 (linker treats name='...' as a .lib).
         println!(
-            "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:\
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:\
              type='win32' name='Microsoft.Windows.Common-Controls' \
              version='6.0.0.0' processorArchitecture='*' \
              publicKeyToken='6595b64144ccf1df' language='*'"

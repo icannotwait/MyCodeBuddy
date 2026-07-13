@@ -57,7 +57,9 @@ describe("SessionConfigStaleBanner", () => {
 
   it("renders nothing when config is not stale", () => {
     h.configStale = false
-    const { container } = render(<SessionConfigStaleBanner contextKey="tab-1" />)
+    const { container } = render(
+      <SessionConfigStaleBanner contextKey="tab-1" />
+    )
     expect(container.firstChild).toBeNull()
   })
 

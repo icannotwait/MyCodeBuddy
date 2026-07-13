@@ -3663,15 +3663,10 @@ Declared license: MIT
 Homepage: https://github.com/lovell/colour#readme
 License text SHA-256: da3044f63e02b6d689405434efdd9729918a1578b49101075442d1b394ff2284
 
-npm:@img/sharp-darwin-arm64@0.34.5
-Declared license: Apache-2.0
+npm:@img/sharp-win32-x64@0.34.5
+Declared license: Apache-2.0 AND LGPL-3.0-or-later
 Homepage: https://sharp.pixelplumbing.com
 License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
-
-npm:@img/sharp-libvips-darwin-arm64@1.2.4
-Declared license: LGPL-3.0-or-later
-Homepage: https://sharp.pixelplumbing.com
-License text SHA-256: none
 
 npm:@inquirer/ansi@1.0.2
 Declared license: MIT
@@ -3762,7 +3757,7 @@ Declared license: MIT
 Homepage: https://github.com/vercel/next.js#readme
 License text SHA-256: none
 
-npm:@next/swc-darwin-arm64@16.1.6
+npm:@next/swc-win32-x64-msvc@16.1.6
 Declared license: MIT
 Homepage: https://github.com/vercel/next.js#readme
 License text SHA-256: none
@@ -3854,7 +3849,7 @@ Declared license: MIT
 Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 
-npm:@parcel/watcher-darwin-arm64@2.5.6
+npm:@parcel/watcher-win32-x64@2.5.6
 Declared license: MIT
 Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
@@ -4324,7 +4319,7 @@ Declared license: Apache-2.0
 Homepage: https://swc.rs
 License text SHA-256: none
 
-npm:@swc/core-darwin-arm64@1.15.18
+npm:@swc/core-win32-x64-msvc@1.15.18
 Declared license: Apache-2.0 AND MIT
 Homepage: https://swc.rs
 License text SHA-256: none
@@ -19312,7 +19307,7 @@ THIS SOFTWARE.
 
 SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
 Packages:
-- npm:@img/sharp-darwin-arm64@0.34.5
+- npm:@img/sharp-win32-x64@0.34.5
 - npm:sharp@0.34.5
 
 Apache License
@@ -25198,7 +25193,7 @@ SOFTWARE.
 
 SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 Packages:
-- npm:@parcel/watcher-darwin-arm64@2.5.6
+- npm:@parcel/watcher-win32-x64@2.5.6
 - npm:@parcel/watcher@2.5.6
 
 MIT License
