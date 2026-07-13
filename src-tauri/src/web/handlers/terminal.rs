@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
-use crate::commands::terminal::prepare_credential_env;
+use crate::commands::terminal::{prepare_credential_env, resolve_interactive_shell};
 use crate::terminal::manager::SpawnOptions;
 use crate::terminal::types::TerminalInfo;
 
@@ -17,7 +17,6 @@ use crate::terminal::types::TerminalInfo;
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSpawnParams {
     pub working_dir: String,
-    pub shell: Option<String>,
     pub initial_command: Option<String>,
     pub terminal_id: Option<String>,
 }
@@ -58,6 +57,9 @@ pub async fn terminal_spawn(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let extra_env = prepare_credential_env(&state.data_dir);
+    let shell = resolve_interactive_shell(&state.db)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
 
     let id = manager
         .spawn_with_id(
@@ -65,7 +67,7 @@ pub async fn terminal_spawn(
                 terminal_id,
                 working_dir: params.working_dir,
                 owner_window_label: "web".to_string(),
-                shell: params.shell,
+                shell,
                 initial_command: params.initial_command,
                 extra_env,
                 temp_files: vec![],

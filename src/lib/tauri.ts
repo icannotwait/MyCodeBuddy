@@ -1204,13 +1204,11 @@ export async function gitReset(
 
 export async function terminalSpawn(
   workingDir: string,
-  shell?: string,
   initialCommand?: string,
   terminalId?: string
 ): Promise<string> {
   return invoke("terminal_spawn", {
     workingDir,
-    shell: shell ?? null,
     initialCommand: initialCommand ?? null,
     terminalId: terminalId ?? null,
   })

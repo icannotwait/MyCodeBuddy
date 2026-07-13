@@ -1790,7 +1790,7 @@ export interface TerminalShellOption {
 
 export interface AvailableTerminalShells {
   options: TerminalShellOption[]
-  resolved_shell: string
+  effective_shell: string
 }
 
 export interface SystemRenderingSettings {

@@ -302,7 +302,7 @@ export function GeneralSettings() {
             {availableShells && (
               <p className="text-[11px] text-muted-foreground">
                 {t("terminalCurrentShell", {
-                  path: availableShells.resolved_shell,
+                  path: availableShells.effective_shell,
                 })}
               </p>
             )}

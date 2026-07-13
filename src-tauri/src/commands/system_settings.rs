@@ -16,7 +16,7 @@ use crate::models::{
 use crate::network::proxy;
 #[cfg(feature = "tauri-runtime")]
 use crate::preferences;
-use crate::terminal::manager::resolve_shell;
+use crate::terminal::shell::effective_shell_for_display;
 
 pub(crate) const SYSTEM_PROXY_SETTINGS_KEY: &str = "system_proxy_settings";
 pub(crate) const SYSTEM_LANGUAGE_SETTINGS_KEY: &str = "system_language_settings";
@@ -141,14 +141,20 @@ pub(crate) fn normalize_terminal_settings(
 /// The frontend renders these verbatim, looking each `label_key` up under its
 /// `GeneralSettings` namespace — so adding a new shell here requires zero
 /// frontend code changes (only a new translation key).
-pub(crate) fn build_available_terminal_shells() -> AvailableTerminalShells {
+///
+/// `settings` drives `effective_shell` so the subtitle reflects the selected
+/// value (resolved path when available, stored value when not), not only the
+/// system default.
+pub(crate) fn build_available_terminal_shells(
+    settings: &SystemTerminalSettings,
+) -> AvailableTerminalShells {
     let mut options: Vec<TerminalShellOption> = Vec::new();
 
     options.push(TerminalShellOption {
         id: TERMINAL_SHELL_OPTION_SYSTEM.to_string(),
         label_key: "terminalSystemDefault".to_string(),
         value: None,
-        // System default always "exists" — resolve_shell() has its own fallback chain.
+        // System default always "exists" — shared shell resolution has a fallback chain.
         exists: true,
         accepts_custom_path: false,
     });
@@ -181,7 +187,7 @@ pub(crate) fn build_available_terminal_shells() -> AvailableTerminalShells {
 
     AvailableTerminalShells {
         options,
-        resolved_shell: resolve_shell(),
+        effective_shell: effective_shell_for_display(settings),
     }
 }
 
@@ -256,8 +262,11 @@ pub async fn get_system_terminal_settings(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn get_available_terminal_shells() -> Result<AvailableTerminalShells, AppCommandError> {
-    Ok(build_available_terminal_shells())
+pub async fn get_available_terminal_shells(
+    db: State<'_, AppDatabase>,
+) -> Result<AvailableTerminalShells, AppCommandError> {
+    let settings = load_system_terminal_settings(&db.conn).await?;
+    Ok(build_available_terminal_shells(&settings))
 }
 
 #[cfg(feature = "tauri-runtime")]
