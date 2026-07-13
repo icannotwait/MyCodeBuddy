@@ -5644,15 +5644,30 @@ pub(crate) async fn cascade_update_model_provider(
     Ok(())
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_preflight(
+pub async fn acp_preflight_core(
     agent_type: AgentType,
     force_refresh: Option<bool>,
+    db: &AppDatabase,
 ) -> Result<PreflightResult, AcpError> {
     if force_refresh.unwrap_or(false) {
         preflight::clear_npm_env_cache();
     }
-    Ok(preflight::run_preflight(agent_type).await)
+
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let runtime_env = build_runtime_env_from_setting(agent_type, setting.as_ref(), None);
+    Ok(preflight::run_preflight(agent_type, &runtime_env).await)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_preflight(
+    agent_type: AgentType,
+    force_refresh: Option<bool>,
+    db: State<'_, AppDatabase>,
+) -> Result<PreflightResult, AcpError> {
+    acp_preflight_core(agent_type, force_refresh, &db).await
 }
 
 /// Resolve the full runtime env every ACP spawn should receive — settings

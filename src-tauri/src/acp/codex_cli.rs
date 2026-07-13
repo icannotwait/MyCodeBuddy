@@ -25,6 +25,13 @@ pub fn select_codex_cli_path(
         }
     }
     if let Some(prefix) = npm_global_prefix {
+        // Prefer executable npm shims; use the JS entry only as a fallback.
+        for name in ["codex.cmd", "codex.exe", "codex"] {
+            let cand = prefix.join(name);
+            if is_usable_cli_path(&cand) {
+                return Some(cand);
+            }
+        }
         let js = prefix
             .join("node_modules")
             .join("@openai")
@@ -33,13 +40,6 @@ pub fn select_codex_cli_path(
             .join("codex.js");
         if is_usable_cli_path(&js) {
             return Some(js);
-        }
-        // Windows npm also drops `codex.cmd` next to the prefix root.
-        for name in ["codex.cmd", "codex.exe", "codex"] {
-            let cand = prefix.join(name);
-            if is_usable_cli_path(&cand) {
-                return Some(cand);
-            }
         }
     }
     None
@@ -76,6 +76,13 @@ fn default_npm_global_prefix() -> Option<PathBuf> {
     None
 }
 
+fn missing_codex_cli_message() -> &'static str {
+    "Codex CLI is not installed. Install with `npm install -g @openai/codex`, \
+     or set CODEX_PATH to your codex executable (or codex.js). \
+     MyCodeBuddy's bundled codex-acp adapter requires a host Codex CLI \
+     when CODEX_ACP_USE_CLI=1."
+}
+
 pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<(), String> {
     if env
         .get(CODEX_PATH_ENV)
@@ -100,13 +107,7 @@ pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<()
             );
             Ok(())
         }
-        None => Err(
-            "Codex CLI not found. Install with `npm install -g @openai/codex`, \
-             or set CODEX_PATH to your codex executable (or codex.js). \
-             MyCodeBuddy's bundled codex-acp adapter requires a host Codex CLI \
-             when CODEX_ACP_USE_CLI=1."
-                .to_string(),
-        ),
+        None => Err(missing_codex_cli_message().to_string()),
     }
 }
 
@@ -189,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn npm_global_shim_wins_over_js() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("npm-prefix");
+        let bin = prefix
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        touch_file(&bin, "codex.js");
+        let shim = touch_file(&prefix, "codex.cmd");
+
+        let selected = select_codex_cli_path(None, None, Some(&prefix)).unwrap();
+
+        assert_eq!(selected, shim);
+    }
+
+    #[test]
     fn npm_global_js_used_when_nothing_else() {
         let temp = tempfile::tempdir().unwrap();
         let prefix = temp.path().join("npm-prefix");
@@ -214,6 +233,11 @@ mod tests {
         env.insert("CODEX_PATH".into(), "C:\\already\\set\\codex.cmd".into());
         ensure_codex_path_in_env(&mut env).unwrap();
         assert_eq!(env.get("CODEX_PATH").unwrap(), "C:\\already\\set\\codex.cmd");
+    }
+
+    #[test]
+    fn missing_codex_cli_message_keeps_frontend_routing_token() {
+        assert!(missing_codex_cli_message().contains("is not installed"));
     }
 
     #[test]
@@ -282,10 +306,19 @@ mod tests {
 
     #[test]
     fn ensure_skips_nonexistent_process_codex_path() {
-        // Stale process CODEX_PATH must not be injected as success, and must not
-        // block resolve from finding a real CLI (or Err when nothing is available).
+        // Stale process CODEX_PATH must not be injected as success or block PATH
+        // resolution from finding the real CLI fixture.
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
         let real = touch_file(temp.path(), "codex.cmd");
+        #[cfg(unix)]
+        let real = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = touch_file(temp.path(), "codex");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
         let stale = temp
             .path()
             .join("does-not-exist-codex.cmd")
@@ -312,35 +345,10 @@ mod tests {
             ],
             || {
                 let mut env = BTreeMap::new();
-                match ensure_codex_path_in_env(&mut env) {
-                    Ok(()) => {
-                        let injected = env.get(CODEX_PATH_ENV).expect("CODEX_PATH injected");
-                        assert_ne!(
-                            injected, &stale,
-                            "stale process CODEX_PATH must not be injected"
-                        );
-                        assert!(
-                            Path::new(injected).is_file(),
-                            "injected CODEX_PATH must be a real file: {injected}"
-                        );
-                        // Prefer the PATH hit we planted when resolve finds it.
-                        assert_eq!(
-                            Path::new(injected).file_name(),
-                            real.file_name(),
-                            "expected resolve to surface the real CLI under PATH"
-                        );
-                    }
-                    Err(msg) => {
-                        assert!(
-                            !env.contains_key(CODEX_PATH_ENV),
-                            "must not insert stale CODEX_PATH on failure"
-                        );
-                        assert!(
-                            msg.contains("Codex CLI not found"),
-                            "unexpected error: {msg}"
-                        );
-                    }
-                }
+                ensure_codex_path_in_env(&mut env)
+                    .expect("PATH fixture should resolve after stale CODEX_PATH is skipped");
+                let injected = env.get(CODEX_PATH_ENV).expect("CODEX_PATH injected");
+                assert_eq!(Path::new(injected), real.as_path());
             },
         );
     }

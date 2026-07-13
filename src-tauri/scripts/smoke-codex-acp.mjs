@@ -14,22 +14,52 @@
 import { spawn, spawnSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 
-const EXPECTED_VERSION =
-  "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1"
-const MISSING_MODULE =
-  "Cannot find module '@openai/codex/bin/codex.js'"
+const EXPECTED_VERSION = "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.1"
+const MISSING_MODULE = "Cannot find module '@openai/codex/bin/codex.js'"
 const INIT_TIMEOUT_MS = 15_000
 
-function resolveHostCodexPath() {
-  if (process.env.CODEX_PATH && existsSync(process.env.CODEX_PATH)) {
-    return process.env.CODEX_PATH
+export function findCodexOnPath({
+  platform = process.platform,
+  run = spawnSync,
+  exists = existsSync,
+} = {}) {
+  const locator = platform === "win32" ? "where.exe" : "which"
+  const result = run(locator, ["codex"], {
+    encoding: "utf8",
+    windowsHide: true,
+  })
+  if (result.status !== 0) {
+    return null
   }
 
-  const appData = process.env.APPDATA
+  return (
+    (result.stdout ?? "")
+      .split(/\r?\n/)
+      .map((candidate) => candidate.trim())
+      .find((candidate) => candidate && exists(candidate)) ?? null
+  )
+}
+
+export function resolveHostCodexPath({
+  env = process.env,
+  exists = existsSync,
+  findOnPath,
+} = {}) {
+  if (env.CODEX_PATH && exists(env.CODEX_PATH)) {
+    return env.CODEX_PATH
+  }
+
+  const pathHit = (findOnPath ?? (() => findCodexOnPath({ exists })))()
+  if (pathHit && exists(pathHit)) {
+    return pathHit
+  }
+
+  const appData = env.APPDATA
   if (appData) {
     const cmd = join(appData, "npm", "codex.cmd")
-    if (existsSync(cmd)) {
+    if (exists(cmd)) {
       return cmd
     }
 
@@ -42,7 +72,7 @@ function resolveHostCodexPath() {
       "bin",
       "codex.js"
     )
-    if (existsSync(js)) {
+    if (exists(js)) {
       return js
     }
   }
@@ -187,6 +217,7 @@ async function main() {
       "Host Codex CLI not found. Install with " +
         "`npm install -g @openai/codex@0.144.1`, or set CODEX_PATH " +
         "to codex.cmd / codex.js. Searched: process.env.CODEX_PATH, " +
+        "codex on PATH, " +
         "%APPDATA%\\npm\\codex.cmd, " +
         "%APPDATA%\\npm\\node_modules\\@openai\\codex\\bin\\codex.js"
     )
@@ -209,7 +240,12 @@ async function main() {
   process.stdout.write(`initialize ok via CODEX_PATH=${codexPath}\n`)
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err)
-  process.exit(1)
-})
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err)
+    process.exit(1)
+  })
+}

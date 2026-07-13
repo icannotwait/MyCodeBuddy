@@ -180,11 +180,13 @@ pub struct AcpPreflightParams {
 }
 
 pub async fn acp_preflight(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPreflightParams>,
 ) -> Result<Json<PreflightResult>, AppCommandError> {
-    let result = acp_commands::acp_preflight(params.agent_type, params.force_refresh)
-        .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    let result =
+        acp_commands::acp_preflight_core(params.agent_type, params.force_refresh, &state.db)
+            .await
+            .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
 }
 

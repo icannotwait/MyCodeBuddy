@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -55,7 +56,10 @@ pub fn clear_npm_env_cache() {
     *NPM_ENV_CACHE.lock().unwrap() = None;
 }
 
-pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
+pub async fn run_preflight(
+    agent_type: AgentType,
+    runtime_env: &BTreeMap<String, String>,
+) -> PreflightResult {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
     let mut checks = match &meta.distribution {
@@ -84,7 +88,7 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
     // Windows bundled codex-acp needs a host Codex CLI (CODEX_ACP_USE_CLI).
     // Non-Windows Npx packages already ship the codex dependency.
     if agent_type == AgentType::Codex && cfg!(windows) {
-        checks.push(check_codex_cli_host());
+        checks.push(check_codex_cli_host(runtime_env));
     }
 
     let passed = checks
@@ -99,13 +103,31 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
     }
 }
 
-/// Resolve host Codex CLI for preflight: process `CODEX_PATH` if it is a file,
-/// otherwise `resolve_codex_cli_path` (PATH + npm global).
-fn check_codex_cli_host() -> CheckItem {
-    let path = std::env::var_os(crate::acp::codex_cli::CODEX_PATH_ENV)
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-        .or_else(crate::acp::codex_cli::resolve_codex_cli_path);
+/// Prefer a non-empty saved `CODEX_PATH`. An invalid saved path is an explicit
+/// failure because launch preserves that same value instead of auto-detecting.
+fn select_codex_cli_host_path<F>(
+    runtime_env: &BTreeMap<String, String>,
+    fallback: F,
+) -> Option<PathBuf>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(saved) = runtime_env
+        .get(crate::acp::codex_cli::CODEX_PATH_ENV)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(saved);
+        return path.is_file().then_some(path);
+    }
+
+    fallback()
+}
+
+/// Resolve host Codex CLI from saved settings, then process/PATH/npm fallback.
+fn check_codex_cli_host(runtime_env: &BTreeMap<String, String>) -> CheckItem {
+    let path = select_codex_cli_host_path(runtime_env, || {
+        crate::acp::codex_cli::resolve_codex_cli_path()
+    });
     codex_cli_host_check_item(path)
 }
 
@@ -673,7 +695,42 @@ async fn check_binary_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn valid_saved_codex_cli_path_wins_over_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = temp.path().join("saved-codex.cmd");
+        let fallback = temp.path().join("fallback-codex.cmd");
+        fs::write(&saved, b"saved").unwrap();
+        fs::write(&fallback, b"fallback").unwrap();
+        let runtime_env = BTreeMap::from([(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            saved.to_string_lossy().into_owned(),
+        )]);
+
+        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
+
+        assert_eq!(selected.as_deref(), Some(saved.as_path()));
+    }
+
+    #[test]
+    fn invalid_saved_codex_cli_path_is_not_masked_by_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-codex.cmd");
+        let fallback = temp.path().join("fallback-codex.cmd");
+        fs::write(&fallback, b"fallback").unwrap();
+        let runtime_env = BTreeMap::from([(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            missing.to_string_lossy().into_owned(),
+        )]);
+
+        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
+
+        assert!(selected.is_none());
+    }
 
     #[test]
     fn codex_cli_host_pass_when_path_present() {
@@ -705,7 +762,7 @@ mod tests {
     #[test]
     fn codex_cli_host_fail_blocks_preflight_passed() {
         let fail = codex_cli_host_check_item(None);
-        let checks = vec![
+        let checks = [
             CheckItem {
                 check_id: "platform_supported".into(),
                 label: "Platform".into(),
