@@ -932,7 +932,7 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       agent_type: "grok",
       enabled: true,
       available: true,
-      installed_version: "0.2.94",
+      installed_version: "0.2.98",
     })
     await mountProvider()
     await act(async () => {

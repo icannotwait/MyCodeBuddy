@@ -5193,7 +5193,7 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // also takes priority over `~/.kimi-code/config.toml`.
         AgentType::KimiCode => ("KIMI_MODEL_BASE_URL", "KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME"),
         // Grok's non-interactive credential is `XAI_API_KEY`. Model + endpoint
-        // also have working env overrides (verified against the 0.2.94 binary):
+        // also have working env overrides (verified against the 0.2.98 binary):
         // `GROK_DEFAULT_MODEL` selects the default model and `GROK_XAI_API_BASE_URL`
         // overrides the API base URL (both win over ~/.grok/config.toml). Note:
         // `XAI_MODEL` is NOT read by Grok — the earlier placeholder was inert.

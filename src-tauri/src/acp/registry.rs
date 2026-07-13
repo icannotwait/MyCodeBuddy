@@ -378,19 +378,19 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
             // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
             distribution: AgentDistribution::Npx {
-                version: "0.2.94",
-                package: "@xai-official/grok@0.2.94",
+                version: "0.2.98",
+                package: "@xai-official/grok@0.2.98",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
                 // flags (`--no-auto-update` always, `--always-approve` only when
                 // the user picked that permission mode) MUST precede this
                 // subcommand — `grok agent stdio` itself rejects them (verified
-                // against 0.2.94: it only accepts --debug/--debug-file/
-                // --leader-socket) — so `build_agent` inserts them ahead of these
-                // args rather than appending after.
+                // against 0.2.94; still applies on 0.2.98: it only accepts
+                // --debug/--debug-file/--leader-socket) — so `build_agent`
+                // inserts them ahead of these args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@0.2.94` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@0.2.98` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
@@ -517,8 +517,8 @@ mod tests {
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "0.2.94",
-            "@xai-official/grok@0.2.94",
+            "0.2.98",
+            "@xai-official/grok@0.2.98",
             Some("20.0.0"),
         );
         assert_binary_version(AgentType::OpenCode, "1.17.18", "/releases/download/v1.17.18/");

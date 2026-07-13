@@ -6054,7 +6054,7 @@ mod tests {
     fn grok_incompatible_agent_switch_detects_stable_code() {
         // Exact shape Grok returns when switching to a model whose agentType
         // differs from the established conversation's (captured from a live
-        // `session/set_model` probe against grok 0.2.94).
+        // `session/set_model` probe against grok 0.2.98).
         let err = sacp::Error::new(-32600, "Cannot switch to model ...").data(serde_json::json!({
             "code": "MODEL_SWITCH_INCOMPATIBLE_AGENT",
             "activeAgentType": "grok-build-plan",
