@@ -2048,7 +2048,9 @@
           "turnFailedMaxTurnRequests": "{agent} reached the maximum number of allowed requests for this turn.",
           "turnFailedUnknown": "{agent} ended the turn with an unrecognized stop reason.",
           "grokModelSwitchIncompatibleAgent": "{agent} can't switch to that model in an existing conversation. Start a new session to use it.",
-          "turnFailedEmpty": "{agent} ended the turn without producing any response. Please check the agent's configuration."
+          "turnFailedEmpty": "{agent} ended the turn without producing any response. Please check the agent's configuration.",
+          "terminalShellUnavailable": "{shell} is unavailable. Choose an available shell in General settings.",
+          "terminalShellUnsupported": "{shell} is not supported for ACP terminal execution. Choose a supported shell in General settings."
         },
         "unableReadAgentConfig": "Unable to read Agent config: {message}",
         "connectFailedTitle": "{agent} connection failed",
@@ -2607,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "Available once the current turn finishes",
         "dismiss": "Dismiss",
         "reconnectFailed": "Failed to reconnect session",
-        "applied": "New configuration applied"
+        "applied": "New configuration applied",
+        "terminalShellTitle": "Terminal shell updated"
       },
       "collabAgent": {
         "title": "Sub-agent",

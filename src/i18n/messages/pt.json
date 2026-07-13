@@ -2048,7 +2048,9 @@
           "turnFailedMaxTurnRequests": "{agent} atingiu o número máximo de solicitações permitidas para este turno.",
           "turnFailedUnknown": "{agent} encerrou o turno com um motivo de parada desconhecido.",
           "grokModelSwitchIncompatibleAgent": "{agent} não pode mudar para esse modelo em uma conversa existente. Inicie uma nova sessão para usá-lo.",
-          "turnFailedEmpty": "{agent} encerrou o turno sem produzir nenhuma resposta. Confira a configuração do agente."
+          "turnFailedEmpty": "{agent} encerrou o turno sem produzir nenhuma resposta. Confira a configuração do agente.",
+          "terminalShellUnavailable": "{shell} não está disponível. Escolha um shell disponível nas configurações gerais.",
+          "terminalShellUnsupported": "{shell} não é compatível com a execução no terminal ACP. Escolha um shell compatível nas configurações gerais."
         },
         "unableReadAgentConfig": "Não foi possível ler a configuração do agente: {message}",
         "connectFailedTitle": "Falha na conexão de {agent}",
@@ -2607,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "Disponível quando o turno atual terminar",
         "dismiss": "Dispensar",
         "reconnectFailed": "Falha ao reconectar a sessão",
-        "applied": "Nova configuração aplicada"
+        "applied": "Nova configuração aplicada",
+        "terminalShellTitle": "Shell do terminal atualizado"
       },
       "collabAgent": {
         "title": "Subagente",

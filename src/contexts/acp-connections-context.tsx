@@ -34,6 +34,10 @@ import {
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import {
+  extractAppCommandError,
+  toLocalizedErrorMessage,
+} from "@/lib/app-error"
+import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -4183,7 +4187,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const superseded =
           pendingRequest != null && !sameConnectRequest(pendingRequest, request)
         if (!superseded && !isAlertedError(err)) {
-          const message = normalizeErrorMessage(err)
+          // Prefer structured AppCommandError payloads (shell preflight
+          // i18n_key) while keeping the legacy SdkNotInstalled string
+          // path. Only shell AcpError variants serialize as objects;
+          // all other ACP errors remain bare strings.
+          const appError = extractAppCommandError(err)
+          const message = toLocalizedErrorMessage(
+            err,
+            t as unknown as (
+              key: string,
+              params?: Record<string, string | number>
+            ) => string
+          )
           const agentLabel = AGENT_LABELS[agentType]
           // Backend safety net: if the agent turned out to be not
           // installed (e.g. the binary was removed between preflight
@@ -4191,17 +4206,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // "Open Agent Settings" action. Title is localized via the
           // same i18n key the preflight path uses.
           //
-          // INVARIANT: `AcpError::SdkNotInstalled` renders its payload
-          // unchanged, and both producers
-          // (`src-tauri/src/commands/acp.rs::verify_agent_installed`
-          // and `src-tauri/src/acp/connection.rs::build_agent` Binary
-          // branch) format the message with the literal English
-          // substring "is not installed". Do NOT translate those two
-          // format strings — this branch matches on them as a stable
-          // identifier, since `AcpError::Serialize` flattens to a bare
-          // message string and does not expose the error `code` for
-          // synchronous Tauri command rejections.
-          if (message.includes("is not installed")) {
+          // INVARIANT: `AcpError::SdkNotInstalled` still serializes as a
+          // bare string whose payload contains "is not installed". Shell
+          // failures serialize as AppCommandError objects with a stable
+          // `code` / `i18n_key` instead.
+          const sdkMissing =
+            appError?.code === "sdk_not_installed" ||
+            message.includes("is not installed")
+          if (sdkMissing) {
             pushAlertRef.current(
               "error",
               t("blocked.sdkMissing", { agent: agentLabel }),

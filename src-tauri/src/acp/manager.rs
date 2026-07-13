@@ -10,8 +10,10 @@ use sea_orm::{
     TransactionTrait,
 };
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::connection::matching_config_pair;
 use crate::acp::connection::{
-    matching_config_pair, spawn_agent_connection, AgentConnection, ConnectionCommand,
+    spawn_agent_connection, AgentConnection, ConnectionCommand,
 };
 use crate::acp::error::AcpError;
 use crate::acp::terminal_context::{

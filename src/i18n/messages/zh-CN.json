@@ -2048,7 +2048,9 @@
           "turnFailedMaxTurnRequests": "{agent} 已达到本轮回复允许的最大请求次数。",
           "turnFailedUnknown": "{agent} 以未知的停止原因结束了本轮回复。",
           "grokModelSwitchIncompatibleAgent": "{agent} 无法在已有对话中切换到该模型，请新建会话以使用它。",
-          "turnFailedEmpty": "{agent} 本轮没有产生任何回复就结束了，请检查代理配置。"
+          "turnFailedEmpty": "{agent} 本轮没有产生任何回复就结束了，请检查代理配置。",
+          "terminalShellUnavailable": "{shell} 不可用。请在“常规”设置中选择可用的 Shell。",
+          "terminalShellUnsupported": "ACP 终端执行不支持 {shell}。请在“常规”设置中选择受支持的 Shell。"
         },
         "unableReadAgentConfig": "无法读取 Agent 配置：{message}",
         "connectFailedTitle": "{agent} 连接失败",
@@ -2607,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "当前回合结束后可重连",
         "dismiss": "忽略",
         "reconnectFailed": "重连会话失败",
-        "applied": "新配置已应用"
+        "applied": "新配置已应用",
+        "terminalShellTitle": "终端 Shell 已更新"
       },
       "collabAgent": {
         "title": "子智能体",

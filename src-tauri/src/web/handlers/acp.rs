@@ -91,7 +91,11 @@ pub async fn acp_connect(
             params.preferred_config_values.unwrap_or_default(),
         )
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
 
     Ok(Json(connection_id))
 }

@@ -139,10 +139,10 @@ pub fn resolve_terminal_shell(
         // Last-resort label when nothing is resolvable as a file.
         let fallback = PathBuf::from("cmd.exe");
         let spec = classify_resolved_shell(fallback, ShellSource::System)?;
-        return Ok(ResolvedShellSnapshot {
+        Ok(ResolvedShellSnapshot {
             selection_key: terminal_shell_selection_key(settings),
             spec,
-        });
+        })
     }
 
     #[cfg(not(windows))]

@@ -8,7 +8,9 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 
 fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
-        AppErrorCode::InvalidInput => StatusCode::BAD_REQUEST,
+        AppErrorCode::InvalidInput
+        | AppErrorCode::TerminalShellUnavailable
+        | AppErrorCode::TerminalShellUnsupported => StatusCode::BAD_REQUEST,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
         AppErrorCode::AlreadyExists | AppErrorCode::TurnInProgress => StatusCode::CONFLICT,
         AppErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
@@ -42,6 +44,18 @@ mod tests {
         assert_eq!(
             status_for_app_error_code(AppErrorCode::AuthenticationFailed),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn acp_error_serialization_maps_shell_codes_to_http_400() {
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::TerminalShellUnavailable),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::TerminalShellUnsupported),
+            StatusCode::BAD_REQUEST
         );
     }
 }

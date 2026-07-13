@@ -2048,7 +2048,9 @@
           "turnFailedMaxTurnRequests": "{agent} がこのターンで許可された最大リクエスト数に達しました。",
           "turnFailedUnknown": "{agent} が不明な停止理由でターンを終了しました。",
           "grokModelSwitchIncompatibleAgent": "{agent} は既存の会話ではこのモデルに切り替えられません。新しいセッションを開始して使用してください。",
-          "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。"
+          "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。",
+          "terminalShellUnavailable": "{shell} は利用できません。一般設定で利用可能なシェルを選択してください。",
+          "terminalShellUnsupported": "ACP ターミナル実行では {shell} はサポートされていません。一般設定でサポート対象のシェルを選択してください。"
         },
         "unableReadAgentConfig": "エージェント設定を読み取れません: {message}",
         "connectFailedTitle": "{agent} の接続に失敗しました",
@@ -2607,7 +2609,8 @@
         "reconnectDisabledDuringTurn": "現在のターンが完了すると再接続できます",
         "dismiss": "閉じる",
         "reconnectFailed": "セッションの再接続に失敗しました",
-        "applied": "新しい設定を適用しました"
+        "applied": "新しい設定を適用しました",
+        "terminalShellTitle": "ターミナルシェルが更新されました"
       },
       "collabAgent": {
         "title": "サブエージェント",

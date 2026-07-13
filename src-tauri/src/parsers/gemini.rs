@@ -340,10 +340,7 @@ impl GeminiParser {
             }
         };
 
-        if let Some(text) = content
-            .as_str()
-            .and_then(|s| visible_user_text(s))
-        {
+        if let Some(text) = content.as_str().and_then(visible_user_text) {
             blocks.push(ContentBlock::Text { text });
             return blocks;
         }

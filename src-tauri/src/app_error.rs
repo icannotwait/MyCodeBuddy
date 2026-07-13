@@ -90,6 +90,12 @@ pub enum AppErrorCode {
     /// connection (a second, concurrent send). Maps to HTTP 409 — an expected,
     /// recoverable condition in multi-client co-control, not a server fault.
     TurnInProgress,
+    /// Selected terminal shell path does not exist / is not executable.
+    /// Connection preflight only — maps to HTTP 400.
+    TerminalShellUnavailable,
+    /// Selected terminal shell is not a supported dialect for ACP execution.
+    /// Connection preflight only — maps to HTTP 400.
+    TerminalShellUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
