@@ -268,7 +268,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 または特定のバージョンをインストール:
 
 ```powershell
-.\install.ps1 -Version v0.20.2-mycodebuddy.2
+.\install.ps1 -Version v0.20.2-mycodebuddy.3
 ```
 
 #### オプション 2: GitHub Releases からダウンロード
