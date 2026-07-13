@@ -458,12 +458,12 @@ impl ClaudeParser {
 
             // Claude Code records its own AI-generated title as a dedicated
             // `{"type":"ai-title","aiTitle":...}` entry. Prefer it over the first
-            // user message; the newest non-empty value wins.
+            // user message; the newest non-empty value wins. Reject a complete
+            // Codeg terminal-context envelope so it cannot bypass user fallback.
             if msg_type == "ai-title" {
                 if let Some(t) = value.get("aiTitle").and_then(|v| v.as_str()) {
-                    let t = t.trim();
-                    if !t.is_empty() {
-                        ai_title = Some(truncate_str(t, 100));
+                    if let Some(visible) = super::visible_title(Some(t.to_string())) {
+                        ai_title = Some(truncate_str(&visible, 100));
                     }
                 }
             }
@@ -763,12 +763,12 @@ impl ClaudeRecordAccumulator {
 
         // Claude Code records its own AI-generated title as a dedicated
         // `{"type":"ai-title","aiTitle":...}` entry. Prefer it over the first
-        // user message; the newest non-empty value wins.
+        // user message; the newest non-empty value wins. Reject a complete
+        // Codeg terminal-context envelope so it cannot bypass user fallback.
         if msg_type == "ai-title" {
             if let Some(t) = value.get("aiTitle").and_then(|v| v.as_str()) {
-                let t = t.trim();
-                if !t.is_empty() {
-                    *ai_title = Some(truncate_str(t, 100));
+                if let Some(visible) = super::visible_title(Some(t.to_string())) {
+                    *ai_title = Some(truncate_str(&visible, 100));
                 }
             }
         }
@@ -1347,14 +1347,16 @@ fn extract_user_text(value: &serde_json::Value) -> Option<String> {
     let content = message.get("content")?;
 
     if let Some(text) = content.as_str() {
-        return strip_system_tags(text);
+        return strip_system_tags(text).and_then(|t| super::visible_user_text(&t));
     }
 
     if let Some(arr) = content.as_array() {
         for item in arr {
             if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if let Some(cleaned) = strip_system_tags(text) {
+                    if let Some(cleaned) = strip_system_tags(text)
+                        .and_then(|t| super::visible_user_text(&t))
+                    {
                         return Some(cleaned);
                     }
                 }
@@ -1377,7 +1379,9 @@ fn extract_user_content(value: &serde_json::Value) -> Vec<ContentBlock> {
     };
 
     if let Some(text) = content.as_str() {
-        if let Some(cleaned) = strip_system_tags(text) {
+        if let Some(cleaned) =
+            strip_system_tags(text).and_then(|t| super::visible_user_text(&t))
+        {
             blocks.push(ContentBlock::Text { text: cleaned });
         }
         return blocks;
@@ -1389,7 +1393,9 @@ fn extract_user_content(value: &serde_json::Value) -> Vec<ContentBlock> {
             match block_type {
                 "text" => {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        if let Some(cleaned) = strip_system_tags(text) {
+                        if let Some(cleaned) = strip_system_tags(text)
+                            .and_then(|t| super::visible_user_text(&t))
+                        {
                             blocks.push(ContentBlock::Text { text: cleaned });
                         }
                     }
@@ -2761,5 +2767,93 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-test-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("sess-term-ctx.jsonl");
+        let ctx = test_codeg_terminal_context();
+        let lines = [
+            json!({
+                "type": "user",
+                "timestamp": "2026-07-07T03:40:00.000Z",
+                "uuid": "u0",
+                "sessionId": "sess-term-ctx",
+                "cwd": "/Users/test/proj",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": ctx}
+                ]}
+            })
+            .to_string(),
+            json!({
+                "type": "user",
+                "timestamp": "2026-07-07T03:40:01.000Z",
+                "uuid": "u1",
+                "sessionId": "sess-term-ctx",
+                "cwd": "/Users/test/proj",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "real prompt"},
+                    {"type": "text", "text": ctx}
+                ]}
+            })
+            .to_string(),
+            json!({
+                "type": "user",
+                "timestamp": "2026-07-07T03:40:02.000Z",
+                "uuid": "u2",
+                "sessionId": "sess-term-ctx",
+                "cwd": "/Users/test/proj",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "<codeg_terminal_context version=\"1\">partial"}
+                ]}
+            })
+            .to_string(),
+            json!({
+                "type": "ai-title",
+                "aiTitle": ctx,
+                "sessionId": "sess-term-ctx"
+            })
+            .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let parser = ClaudeParser::with_base_dir(dir.path().to_path_buf());
+        let detail = parser.get_conversation("sess-term-ctx").unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

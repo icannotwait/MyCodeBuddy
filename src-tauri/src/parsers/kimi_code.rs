@@ -15,7 +15,7 @@ use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
     is_safe_subagent_id, latest_turn_total_usage_tokens, merge_context_window_stats,
     relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
-    title_from_user_text, truncate_str, AgentParser, ParseError,
+    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve Kimi Code's data home, honoring `KIMI_CODE_HOME`, else `~/.kimi-code`
@@ -350,12 +350,12 @@ fn parse_wire(path: &Path, agents_dir: Option<&Path>) -> WireParse {
             "turn.prompt" => {
                 flush_usage(&mut wp.messages, &mut pending_usage, &mut last_assistant_idx);
                 let text = collect_prompt_text(&value);
-                if text.trim().is_empty() {
+                let Some(text) = visible_user_text(&text) else {
                     continue;
-                }
+                };
                 let ts = note_content_ts(&mut wp, ts_raw);
                 if wp.first_user_text.is_none() {
-                    wp.first_user_text = Some(title_from_user_text(text.trim()));
+                    wp.first_user_text = Some(title_from_user_text(&text));
                 }
                 wp.content_events += 1;
                 wp.message_count += 1;
@@ -807,9 +807,11 @@ fn read_state_title(session_dir: &Path) -> Option<String> {
     value
         .get("title")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "New Session")
-        .map(String::from)
+        .filter(|s| {
+            let trimmed = s.trim();
+            !trimmed.is_empty() && trimmed != "New Session"
+        })
+        .and_then(|s| visible_title(Some(s.to_string())))
 }
 
 fn resolve_title(state_title: Option<String>, first_user_text: Option<String>) -> Option<String> {
@@ -1386,5 +1388,62 @@ mod tests {
         );
         assert_eq!(subagent_id_from_output("just a normal tool output"), None);
         assert_eq!(subagent_id_from_output("agent_id:   "), None);
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let root = unique_root("term-ctx");
+        let sid = "session_term_ctx";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        write_session(
+            &root,
+            "wd_my-app_termctx",
+            sid,
+            &json!({"title": ctx, "createdAt": "2026-06-24T04:50:44.154Z"}),
+            &[
+                json!({"type":"metadata","protocol_version":"1.4","created_at":1782276644193i64}),
+                json!({"type":"turn.prompt","input":[{"type":"text","text":ctx}],"origin":{"kind":"user"},"time":1782276649227i64}),
+                json!({"type":"turn.prompt","input":[{"type":"text","text":real_plus}],"origin":{"kind":"user"},"time":1782276649300i64}),
+                json!({"type":"turn.prompt","input":[{"type":"text","text":"<codeg_terminal_context version=\"1\">partial"}],"origin":{"kind":"user"},"time":1782276649400i64}),
+            ],
+        );
+        write_session_index(&root, &[(sid, "ignored", "/Users/demo/my-app")]);
+
+        let parser = KimiCodeParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

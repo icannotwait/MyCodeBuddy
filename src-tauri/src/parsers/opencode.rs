@@ -10,7 +10,10 @@ use sea_orm::{
 };
 
 use crate::models::*;
-use crate::parsers::{folder_name_from_path, truncate_str, AgentParser, ParseError};
+use crate::parsers::{
+    folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str, visible_title,
+    AgentParser, ParseError,
+};
 
 pub struct OpenCodeParser {
     base_dir: PathBuf,
@@ -97,7 +100,7 @@ impl OpenCodeParser {
             agent_type: AgentType::OpenCode,
             folder_path,
             folder_name,
-            title: normalize_optional_string(title),
+            title: visible_title(normalize_optional_string(title)),
             started_at: millis_to_datetime(created_ms),
             ended_at: (updated_ms > 0).then(|| millis_to_datetime(updated_ms)),
             message_count,
@@ -217,6 +220,21 @@ impl OpenCodeParser {
             context_window_max_tokens,
         );
 
+        let mut summary = summary;
+        if summary.title.is_none() {
+            summary.title = turns.iter().find_map(|turn| {
+                if !matches!(turn.role, TurnRole::User) {
+                    return None;
+                }
+                turn.blocks.iter().find_map(|b| match b {
+                    ContentBlock::Text { text } if !text.is_empty() => {
+                        Some(title_from_user_text(text))
+                    }
+                    _ => None,
+                })
+            });
+        }
+
         Ok(ConversationDetail {
             summary,
             turns,
@@ -285,9 +303,16 @@ impl OpenCodeParser {
                 None
             };
 
-            let (content_blocks, usage_from_step_finish) = self
+            let (mut content_blocks, usage_from_step_finish) = self
                 .load_sqlite_parts(conn, &msg_id, &subagent_tools)
                 .await?;
+
+            // Hide wire-only Codeg terminal context from user text parts only.
+            if matches!(role, MessageRole::User)
+                && !sanitize_user_blocks(&mut content_blocks)
+            {
+                continue;
+            }
 
             let usage = if is_assistant {
                 extract_opencode_usage(&value).or(usage_from_step_finish)
@@ -992,8 +1017,9 @@ async fn batch_load_subagent_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_opencode_file_image, resolve_xdg_data_home};
+    use super::{extract_opencode_file_image, resolve_xdg_data_home, OpenCodeParser};
     use crate::models::ContentBlock;
+    use crate::parsers::AgentParser;
     use std::path::PathBuf;
 
     #[test]
@@ -1038,5 +1064,135 @@ mod tests {
         });
 
         assert!(extract_opencode_file_image(&value).is_none());
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, crate::models::TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().to_path_buf();
+        let db_path = base.join("opencode.db");
+        let session_id = "oc-term-ctx";
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let t0: i64 = 1_772_020_800_000;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+                .await
+                .expect("open");
+            for ddl in [
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, \
+                 time_created INTEGER, time_updated INTEGER)",
+                "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, \
+                 time_created INTEGER, data TEXT)",
+                "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, \
+                 time_created INTEGER, data TEXT)",
+            ] {
+                conn.execute(Statement::from_string(DatabaseBackend::Sqlite, ddl))
+                    .await
+                    .expect("ddl");
+            }
+            conn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO session (id, directory, title, time_created, time_updated) \
+                 VALUES (?, ?, ?, ?, ?)",
+                [
+                    session_id.into(),
+                    "/tmp/demo".into(),
+                    ctx.clone().into(),
+                    t0.into(),
+                    (t0 + 4000).into(),
+                ],
+            ))
+            .await
+            .expect("session");
+
+            for (mid, content, ts) in [
+                ("m0", ctx.as_str(), t0 + 500),
+                ("m1", real_plus.as_str(), t0 + 600),
+                (
+                    "m2",
+                    "<codeg_terminal_context version=\"1\">partial",
+                    t0 + 700,
+                ),
+            ] {
+                let user_data = serde_json::json!({
+                    "role": "user",
+                    "time": { "created": ts },
+                })
+                .to_string();
+                conn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+                    [
+                        mid.into(),
+                        session_id.into(),
+                        ts.into(),
+                        user_data.into(),
+                    ],
+                ))
+                .await
+                .expect("message");
+                let part_data = serde_json::json!({
+                    "type": "text",
+                    "text": content,
+                })
+                .to_string();
+                conn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+                    [
+                        format!("p-{mid}").into(),
+                        mid.into(),
+                        ts.into(),
+                        part_data.into(),
+                    ],
+                ))
+                .await
+                .expect("part");
+            }
+        });
+
+        let parser = OpenCodeParser::with_base_dir(base);
+        let detail = parser.get_conversation(session_id).expect("detail");
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

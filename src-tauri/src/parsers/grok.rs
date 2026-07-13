@@ -13,7 +13,8 @@ use crate::models::{
 use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
     latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    structurize_read_tool_output, title_from_user_text, truncate_str, AgentParser, ParseError,
+    structurize_read_tool_output, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError,
 };
 
 /// Cap for a single tool result / tool input preview stored on a turn. Grok's
@@ -121,9 +122,7 @@ impl GrokParser {
     ) -> ConversationSummary {
         let cwd = meta.cwd.clone();
         let folder_name = cwd.as_deref().map(folder_name_from_path);
-        let title = meta
-            .title
-            .clone()
+        let title = visible_title(meta.title.clone())
             .or_else(|| parsed.first_user_text.as_deref().map(title_from_user_text));
         ConversationSummary {
             id: session_id.to_string(),
@@ -386,8 +385,11 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
         match kind {
             "user_message_chunk" => {
                 let text = update_text(update);
+                let Some(text) = visible_user_text(&text) else {
+                    continue;
+                };
                 out.content_events += 1;
-                if out.first_user_text.is_none() && !text.trim().is_empty() {
+                if out.first_user_text.is_none() {
                     out.first_user_text = Some(text.clone());
                 }
                 if out.model.is_none() {
@@ -1159,5 +1161,71 @@ mod tests {
         assert_eq!(home, PathBuf::from("/custom/grok"));
         let fallback = resolve_grok_home_from(None, Some("/home/me".into()));
         assert_eq!(fallback, PathBuf::from("/home/me/.grok"));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let summary = format!(
+            r#"{{
+        "info": {{"id": "019f45e3-e1ef-7690-a29f-fe2554382b49", "cwd": "/Users/me/proj"}},
+        "session_summary": {ctx_json},
+        "generated_title": {ctx_json},
+        "created_at": "2026-07-09T07:59:50.598122Z",
+        "updated_at": "2026-07-09T08:02:09.789572Z",
+        "num_messages": 3,
+        "current_model_id": "grok-4.5",
+        "head_branch": "main"
+    }}"#,
+            ctx_json = serde_json::to_string(&ctx).unwrap()
+        );
+        let updates = format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":{ctx_json}}},"_meta":{{"promptIndex":0}}}}}},"timestamp":1783584019}}
+{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":{real_json}}},"_meta":{{"promptIndex":1}}}}}},"timestamp":1783584020}}
+{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"<codeg_terminal_context version=\"1\">partial"}},"_meta":{{"promptIndex":2}}}}}},"timestamp":1783584021}}
+"#,
+            ctx_json = serde_json::to_string(&ctx).unwrap(),
+            real_json = serde_json::to_string(&real_plus).unwrap(),
+        );
+
+        let (_tmp, sessions) = fixture(&summary, &updates);
+        let parser = GrokParser::with_base_dir(sessions);
+        let detail = parser
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
     }
 }

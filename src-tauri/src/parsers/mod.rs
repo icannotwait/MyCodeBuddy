@@ -10,6 +10,7 @@ pub mod opencode;
 pub mod pi;
 mod summary_cache;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -376,6 +377,60 @@ pub fn fold_reference_links(text: &str) -> String {
 /// once truncated, unterminable — Markdown link.
 pub fn title_from_user_text(text: &str) -> String {
     truncate_str(&fold_reference_links(text), 100)
+}
+
+/// Exact Codeg version-1 wire envelope for terminal shell context (see
+/// `acp::terminal_context::render_terminal_prompt_context`). History parsers must
+/// hide only complete envelopes — never partial XML or user-authored similar tags.
+fn terminal_context_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r#"(?ms)<codeg_terminal_context version="1">\r?\n"#,
+            r#"Selected shell: [^\r\n]+\r?\n"#,
+            r#"(?:Dialect: cmd\r?\nGenerate shell command lines using CMD syntax\."#,
+            r#"|Dialect: powershell\r?\nGenerate shell command lines using PowerShell syntax\."#,
+            r#"|Dialect: posix\r?\nGenerate shell command lines using POSIX syntax\."#,
+            r#"|Dialect: custom\r?\nGenerate shell command lines using the selected custom shell's syntax\.)\r?\n"#,
+            r#"ACP command\+args requests may still execute directly\.\r?\n"#,
+            r#"This context is authoritative for the current connection and supersedes\r?\n"#,
+            r#"earlier terminal context records\.\r?\n"#,
+            r#"</codeg_terminal_context>(?:\r?\n)?"#,
+        ))
+        .expect("valid terminal context regex")
+    })
+}
+
+/// Strip complete Codeg version-1 terminal context envelopes from transcript text.
+/// Replaces each match with a single newline so adjacent user prose stays separated.
+pub fn strip_codeg_terminal_context(text: &str) -> Cow<'_, str> {
+    terminal_context_regex().replace_all(text, "\n")
+}
+
+/// User-visible prompt text after removing complete terminal context envelopes.
+/// Returns `None` when nothing remains after strip + trim.
+pub fn visible_user_text(text: &str) -> Option<String> {
+    let stripped = strip_codeg_terminal_context(text);
+    let visible = stripped.trim();
+    (!visible.is_empty()).then(|| visible.to_string())
+}
+
+/// Sanitize a native AI/session title so a complete context envelope cannot
+/// become a list title. Truncate only after this returns `Some`.
+pub fn visible_title(title: Option<String>) -> Option<String> {
+    title.and_then(|value| visible_user_text(&value))
+}
+
+/// Strip terminal context from text blocks; drop empty text blocks.
+/// Returns whether any visible content remains (images/tools count as visible).
+pub fn sanitize_user_blocks(blocks: &mut Vec<ContentBlock>) -> bool {
+    for block in blocks.iter_mut() {
+        if let ContentBlock::Text { text } = block {
+            *text = visible_user_text(text).unwrap_or_default();
+        }
+    }
+    blocks.retain(|block| !matches!(block, ContentBlock::Text { text } if text.is_empty()));
+    !blocks.is_empty()
 }
 
 /// Aggregate turn-level usage and duration into a single `SessionStats`.
@@ -1054,9 +1109,79 @@ mod tests {
     use super::{
         fold_reference_links, infer_context_window_max_tokens, is_safe_subagent_id,
         latest_turn_total_usage_tokens, merge_context_window_stats, path_eq_for_matching,
-        title_from_user_text,
+        title_from_user_text, visible_user_text,
     };
     use crate::models::{MessageTurn, SessionStats, TurnRole, TurnUsage};
+
+    fn test_terminal_context() -> String {
+        test_terminal_context_for("PowerShell 7", "powershell", "PowerShell")
+    }
+
+    fn test_terminal_context_for(
+        selected_shell: &str,
+        dialect: &str,
+        syntax_label: &str,
+    ) -> String {
+        if dialect == "custom" {
+            format!(
+                "<codeg_terminal_context version=\"1\">\n\
+Selected shell: {selected_shell}\n\
+Dialect: custom\n\
+Generate shell command lines using the selected custom shell's syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            )
+        } else {
+            format!(
+                "<codeg_terminal_context version=\"1\">\n\
+Selected shell: {selected_shell}\n\
+Dialect: {dialect}\n\
+Generate shell command lines using {syntax_label} syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            )
+        }
+    }
+
+    #[test]
+    fn strips_context_only_and_appended_context() {
+        let context = test_terminal_context();
+        assert_eq!(visible_user_text(&context), None);
+        assert_eq!(
+            visible_user_text(&format!("real prompt\n\n{context}")),
+            Some("real prompt".to_string())
+        );
+        assert_eq!(
+            visible_user_text(&format!("real prompt{context}")),
+            Some("real prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_multiple_complete_superseded_contexts() {
+        let old = test_terminal_context_for("Command Prompt", "cmd", "CMD");
+        let new = test_terminal_context_for("PowerShell 7", "powershell", "PowerShell");
+        assert_eq!(
+            visible_user_text(&format!("{old}\nreal prompt\n{new}")),
+            Some("real prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_malformed_partial_and_ordinary_xml() {
+        for text in [
+            "<codeg_terminal_context version=\"1\">partial",
+            "<codeg_terminal_context version=\"2\">user text</codeg_terminal_context>",
+            "<codeg_terminal_context version=\"1\">user-authored XML</codeg_terminal_context>",
+            "<terminal>ordinary user XML</terminal>",
+        ] {
+            assert_eq!(visible_user_text(text), Some(text.to_string()));
+        }
+    }
 
     #[test]
     fn safe_subagent_id_accepts_plain_ids_and_rejects_traversal() {

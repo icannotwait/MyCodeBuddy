@@ -8,7 +8,8 @@ use walkdir::WalkDir;
 
 use crate::models::*;
 use crate::parsers::{
-    folder_name_from_path, title_from_user_text, truncate_str, AgentParser, ParseError,
+    folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str,
+    visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 pub struct GeminiParser {
@@ -328,7 +329,11 @@ impl GeminiParser {
         let content = match message.get("content") {
             Some(c) => c,
             None => {
-                if let Some(text) = message.get("message").and_then(Self::extract_text) {
+                if let Some(text) = message
+                    .get("message")
+                    .and_then(Self::extract_text)
+                    .and_then(|t| visible_user_text(&t))
+                {
                     blocks.push(ContentBlock::Text { text });
                 }
                 return blocks;
@@ -337,9 +342,7 @@ impl GeminiParser {
 
         if let Some(text) = content
             .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .and_then(|s| visible_user_text(s))
         {
             blocks.push(ContentBlock::Text { text });
             return blocks;
@@ -347,9 +350,15 @@ impl GeminiParser {
 
         if let Some(parts) = content.as_array() {
             for part in parts {
-                if let Some(text) = part.get("text").and_then(Self::extract_text) {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Self::extract_text)
+                    .and_then(|t| visible_user_text(&t))
+                {
                     blocks.push(ContentBlock::Text { text });
-                } else if let Some(text) = Self::extract_text(part) {
+                } else if let Some(text) =
+                    Self::extract_text(part).and_then(|t| visible_user_text(&t))
+                {
                     blocks.push(ContentBlock::Text { text });
                 }
 
@@ -357,6 +366,8 @@ impl GeminiParser {
                     blocks.push(image);
                 }
             }
+            // Drop any residual empty text; keep images.
+            let _ = sanitize_user_blocks(&mut blocks);
             return blocks;
         }
 
@@ -365,7 +376,7 @@ impl GeminiParser {
             return blocks;
         }
 
-        if let Some(text) = Self::extract_text(content) {
+        if let Some(text) = Self::extract_text(content).and_then(|t| visible_user_text(&t)) {
             blocks.push(ContentBlock::Text { text });
         }
 
@@ -396,7 +407,7 @@ impl GeminiParser {
         // Gemini emits its own AI-generated title through the `update_topic`
         // tool call; prefer the newest non-empty one. Otherwise fall back to the
         // first real user message, skipping the injected `<session_context>`
-        // bootstrap envelope so it never becomes the title.
+        // bootstrap envelope and Codeg terminal-context so they never become the title.
         let topic_title = messages.iter().rev().find_map(|m| {
             m.get("toolCalls")
                 .and_then(|c| c.as_array())
@@ -406,9 +417,8 @@ impl GeminiParser {
                             call.get("args")
                                 .and_then(|a| a.get("title"))
                                 .and_then(|t| t.as_str())
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                .map(|t| truncate_str(t, 100))
+                                .and_then(|t| visible_title(Some(t.to_string())))
+                                .map(|t| truncate_str(&t, 100))
                         } else {
                             None
                         }
@@ -420,6 +430,7 @@ impl GeminiParser {
             .iter()
             .filter(|m| m.get("type").and_then(|t| t.as_str()) == Some("user"))
             .filter_map(Self::extract_message_text)
+            .filter_map(|t| visible_user_text(&t))
             .find(|t| !t.trim_start().starts_with("<session_context"))
             .map(|t| title_from_user_text(&t));
 
@@ -1216,5 +1227,104 @@ mod tests {
             ContentBlock::Image { data, mime_type, uri }
             if data == "QUJD" && mime_type == "image/png" && uri.is_none()
         ));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let base: PathBuf = env::temp_dir().join(format!("codeg-gemini-term-{nanos}"));
+        let chats_dir = base.join("tmp").join("codeg").join("chats");
+        fs::create_dir_all(&chats_dir).expect("create chat dir");
+        fs::write(
+            base.join("tmp").join("codeg").join(".project_root"),
+            "/Users/test/workspace/demo",
+        )
+        .expect("write project root");
+
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("real prompt\n\n{ctx}");
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let file_path = chats_dir.join("session-term-ctx.json");
+        let content = serde_json::json!({
+            "sessionId": session_id,
+            "projectHash": "abc",
+            "startTime": "2026-03-02T04:30:20.796Z",
+            "lastUpdated": "2026-03-02T04:33:13.631Z",
+            "messages": [
+                {
+                    "id": "u0",
+                    "timestamp": "2026-03-02T04:30:20.796Z",
+                    "type": "user",
+                    "content": [{"text": ctx}]
+                },
+                {
+                    "id": "u1",
+                    "timestamp": "2026-03-02T04:30:21.000Z",
+                    "type": "user",
+                    "content": [{"text": real_plus}]
+                },
+                {
+                    "id": "u2",
+                    "timestamp": "2026-03-02T04:30:22.000Z",
+                    "type": "user",
+                    "content": [{"text": "<codeg_terminal_context version=\"1\">partial"}]
+                },
+                {
+                    "id": "a1",
+                    "timestamp": "2026-03-02T04:33:13.631Z",
+                    "type": "gemini",
+                    "content": "ok",
+                    "toolCalls": [{
+                        "id": "ut-1",
+                        "name": "update_topic",
+                        "args": {"title": ctx, "strategic_intent": "x"},
+                        "status": "success"
+                    }],
+                    "model": "gemini-2.5-pro"
+                }
+            ]
+        });
+        fs::write(&file_path, content.to_string()).expect("write chat file");
+
+        let parser = GeminiParser::with_base_dir(base.clone());
+        let detail = parser.get_conversation(session_id).expect("detail");
+
+        assert_eq!(detail.summary.title.as_deref(), Some("real prompt"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
+        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+
+        let _ = fs::remove_dir_all(base);
     }
 }
