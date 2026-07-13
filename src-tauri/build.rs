@@ -1,8 +1,25 @@
 fn main() {
+    embed_common_controls_v6_for_windows_tests();
+
     #[cfg(feature = "tauri-runtime")]
     {
         ensure_sidecar_placeholder();
         tauri_build::build();
+    }
+}
+
+fn embed_common_controls_v6_for_windows_tests() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("windows-msvc") {
+        // Do not wrap the dependency string in extra quotes: rustc/Command
+        // already quotes space-containing link args for link.exe. Nested
+        // quotes here produce LNK1181 (linker treats name='...' as a .lib).
+        println!(
+            "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:\
+             type='win32' name='Microsoft.Windows.Common-Controls' \
+             version='6.0.0.0' processorArchitecture='*' \
+             publicKeyToken='6595b64144ccf1df' language='*'"
+        );
     }
 }
 
