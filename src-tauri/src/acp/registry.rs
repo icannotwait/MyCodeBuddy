@@ -69,6 +69,17 @@ pub struct AcpAgentMeta {
     pub distribution: AgentDistribution,
 }
 
+impl AgentDistribution {
+    pub fn env(&self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Npx { env, .. }
+            | Self::Binary { env, .. }
+            | Self::Bundled { env, .. }
+            | Self::Uvx { env, .. } => env,
+        }
+    }
+}
+
 impl AcpAgentMeta {
     pub fn registry_version(&self) -> Option<&'static str> {
         match &self.distribution {
