@@ -175,7 +175,7 @@ fn codex_distribution_for(platform: &str) -> AgentDistribution {
         // on app-server; Agent Settings can override with CODEX_ACP_USE_CLI=0
         // (user env wins over this distribution pin).
         AgentDistribution::Bundled {
-            version: "1.1.2-mycodebuddy.2",
+            version: "1.1.2-mycodebuddy.3",
             cmd: "codex-acp",
             args: &[],
             env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
@@ -561,7 +561,7 @@ mod tests {
                 env,
                 ..
             } => {
-                assert_eq!(version, "1.1.2-mycodebuddy.2");
+                assert_eq!(version, "1.1.2-mycodebuddy.3");
                 assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
                 // All platforms default CLI exec runtime (opt-out via user env).
                 assert_eq!(

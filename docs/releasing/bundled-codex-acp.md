@@ -97,3 +97,13 @@ On a clean Windows x64 machine, verify:
 3. Users need **no** global `codex-acp` package; the sibling bundled `codex-acp.exe` is used.
 4. With a global official `codex-acp` also installed, logs must still identify the sibling bundled `codex-acp.exe` path as the adapter.
 5. Registry distribution env for Codex (Windows bundled **and** non-Windows npx) **must** include `CODEX_ACP_USE_CLI=1`. Opt-out is user Agent env `CODEX_ACP_USE_CLI=0` (or the settings toggle).
+
+## Hybrid CLI model control plane (Windows bundled fork)
+
+- Windows bundled CLI mode keeps app-server initialized for `model/list` and
+  config defaults, while turns run through `codex exec --json`.
+- The selected ACP model and reasoning effort are forwarded to CLI turns.
+- Non-Windows still uses the official Npx adapter and is outside this hybrid
+  control-plane rollout.
+- Preflight evaluates the effective distribution + Agent Settings env before
+  deciding whether a host Codex CLI is required.
