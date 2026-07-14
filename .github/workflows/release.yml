@@ -217,7 +217,21 @@ jobs:
           }
 
       - name: Install host Codex CLI for smoke
-        run: npm install -g @openai/codex@0.144.1
+        shell: pwsh
+        run: |
+          npm install -g @openai/codex@0.144.1
+          $codex = $null
+          $cmd = Get-Command codex -ErrorAction SilentlyContinue
+          if ($cmd) { $codex = $cmd.Source }
+          if (-not $codex) {
+            $candidate = Join-Path $env:APPDATA "npm\codex.cmd"
+            if (Test-Path -LiteralPath $candidate) { $codex = $candidate }
+          }
+          if (-not $codex) {
+            throw "Host Codex CLI not found after npm install -g @openai/codex@0.144.1"
+          }
+          "CODEX_PATH=$codex" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "CODEX_PATH=$codex"
 
       - name: Smoke test bundled Codex ACP
         run: >-

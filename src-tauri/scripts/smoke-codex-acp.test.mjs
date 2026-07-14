@@ -4,6 +4,8 @@ import test from "node:test"
 
 import {
   assertDynamicModelList,
+  classifySessionNewResponse,
+  isAuthenticationRequiredError,
   resolveHostCodexPath,
 } from "./smoke-codex-acp.mjs"
 
@@ -58,5 +60,51 @@ test("session/new smoke requires a non-empty dynamic model list", () => {
   assert.throws(
     () => assertDynamicModelList({ models: { availableModels: [] } }),
     /did not return any models/
+  )
+})
+
+test("Authentication required is recognized for clean CI packaging smoke", () => {
+  assert.equal(
+    isAuthenticationRequiredError({
+      code: -32000,
+      message: "Authentication required",
+    }),
+    true
+  )
+  assert.equal(
+    isAuthenticationRequiredError("Authentication required"),
+    true
+  )
+  assert.equal(
+    isAuthenticationRequiredError({ code: -32000, message: "other" }),
+    false
+  )
+})
+
+test("session/new classifies models or auth-required packaging paths", () => {
+  assert.deepEqual(
+    classifySessionNewResponse({
+      result: {
+        models: {
+          availableModels: [{ modelId: "gpt-5.5" }],
+        },
+      },
+    }),
+    { kind: "models", modelCount: 1 }
+  )
+
+  assert.deepEqual(
+    classifySessionNewResponse({
+      error: { code: -32000, message: "Authentication required" },
+    }),
+    { kind: "auth_required" }
+  )
+
+  assert.throws(
+    () =>
+      classifySessionNewResponse({
+        error: { code: -32603, message: "internal boom" },
+      }),
+    /session\/new failed/
   )
 })

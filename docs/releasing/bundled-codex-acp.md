@@ -81,8 +81,11 @@ git commit -m "chore: update bundled codex-acp"
 
 The Windows release job checks out submodules recursively, pins Bun 1.3.14,
 runs the fork's typecheck and tests, builds the Windows x64 executable, verifies
-its fork version, and smoke-starts the adapter. A failure in any step must block
-the installer release.
+its fork version, and smoke-starts the adapter against a host Codex CLI
+(`npm install -g @openai/codex`). Packaging smoke requires `initialize` plus
+`session/new` to reach host `app-server` (either a multi-model list when the
+runner is authenticated, or `Authentication required` on a clean CI machine).
+A failure in any step must block the installer release.
 
 On a clean Windows x64 machine, verify:
 
