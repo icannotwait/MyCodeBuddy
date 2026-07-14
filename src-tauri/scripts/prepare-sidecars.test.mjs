@@ -94,8 +94,8 @@ test("requires the locked Bun Windows runtime before compilation", () => {
 
 test("requires an initialized locked codex submodule", () => {
   const dir = mkdtempSync(join(tmpdir(), "codeg-codex-sidecar-"))
-  writeFileSync(join(dir, "package.json"), '{"version":"1.1.2-mycodebuddy.2"}')
+  writeFileSync(join(dir, "package.json"), '{"version":"1.1.2-mycodebuddy.3"}')
   assert.throws(() => readCodexAcpVersion(dir), /not initialized/)
   writeFileSync(join(dir, "package-lock.json"), "{}")
-  assert.equal(readCodexAcpVersion(dir), "1.1.2-mycodebuddy.2")
+  assert.equal(readCodexAcpVersion(dir), "1.1.2-mycodebuddy.3")
 })

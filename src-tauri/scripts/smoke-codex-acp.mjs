@@ -4,7 +4,7 @@
  * Smoke-test the bundled codex-acp sidecar (host app-server path).
  *
  * Exit 0 only if:
- *  1. `--version` equals `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.2`
+ *  1. `--version` equals `@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.3`
  *  2. ACP `initialize` succeeds with host `CODEX_PATH` (no CODEX_ACP_USE_CLI)
  *  3. `session/new` either returns dynamic models (authenticated host Codex)
  *     or fails with Authentication required (clean CI / no login) — both prove
@@ -20,7 +20,7 @@ import { existsSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const EXPECTED_VERSION = "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.2"
+const EXPECTED_VERSION = "@agentclientprotocol/codex-acp 1.1.2-mycodebuddy.3"
 const MISSING_MODULE = "Cannot find module '@openai/codex/bin/codex.js'"
 // Cold `codex app-server` on Windows CI runners often exceeds 15s.
 const INIT_TIMEOUT_MS = 45_000
