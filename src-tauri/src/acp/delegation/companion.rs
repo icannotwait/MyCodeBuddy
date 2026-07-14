@@ -1764,6 +1764,14 @@ mod tests {
         ask: false,
         sessions: true,
     };
+    const ALL_FEATURES: CompanionFeatures = CompanionFeatures {
+        delegation: true,
+        feedback: true,
+        ask: true,
+        sessions: true,
+    };
+
+    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 7_680;
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
         let resp = unwrap_respond(action);
@@ -1773,6 +1781,94 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn collect_descriptions(value: &Value, output: &mut String) {
+        match value {
+            Value::Object(map) => {
+                if let Some(description) = map.get("description").and_then(Value::as_str) {
+                    output.push_str(description);
+                    output.push(' ');
+                }
+                for (key, nested) in map {
+                    if key != "description" {
+                        collect_descriptions(nested, output);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_descriptions(item, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tool_guidance(tool: &Value) -> String {
+        let mut output = String::new();
+        collect_descriptions(tool, &mut output);
+        output.to_ascii_lowercase()
+    }
+
+    #[test]
+    fn tool_schema_retains_essential_agent_guidance() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let tools = schema.as_array().unwrap();
+        let cases: [(&str, &[&str]); 6] = [
+            (
+                "delegate_to_agent",
+                &["asynchronous", "task_id", "cold", "profile_id", "fan out"],
+            ),
+            (
+                "get_delegation_status",
+                &[
+                    "task_ids",
+                    "wait_ms",
+                    "wait_ms=0",
+                    "60000",
+                    "terminal",
+                    "silently",
+                ],
+            ),
+            (
+                "cancel_delegation",
+                &["timeout", "non-canceling", "waiting", "finished"],
+            ),
+            (
+                "check_user_feedback",
+                &[
+                    "non-blocking",
+                    "before starting implementation",
+                    "significant decision",
+                    "high-priority",
+                ],
+            ),
+            (
+                "ask_user_question",
+                &["block", "genuinely", "other", "recommended", "one call"],
+            ),
+            (
+                "get_session_info",
+                &[
+                    "codeg://session/",
+                    "internal conversation id",
+                    "read-only",
+                    "found: false",
+                ],
+            ),
+        ];
+
+        for (name, required_phrases) in cases {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            let guidance = tool_guidance(tool);
+            for phrase in required_phrases {
+                assert!(
+                    guidance.contains(phrase),
+                    "{name} guidance lost required phrase: {phrase}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1804,6 +1900,26 @@ mod tests {
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
         assert_eq!(names.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn all_feature_tools_list_stays_within_grok_stdio_budget() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                ALL_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let mut line = serde_json::to_vec(&response).unwrap();
+        line.push(b'\n');
+
+        assert!(
+            line.len() <= GROK_STDIO_SAFE_TOOLS_LIST_BYTES,
+            "all-feature tools/list line is {} bytes; limit is {} bytes",
+            line.len(),
+            GROK_STDIO_SAFE_TOOLS_LIST_BYTES
+        );
     }
 
     #[tokio::test]
