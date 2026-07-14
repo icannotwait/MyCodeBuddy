@@ -515,12 +515,7 @@ mod tests {
             "@google/gemini-cli@0.50.0",
             Some("20.0.0"),
         );
-        assert_npx_version(
-            AgentType::Cline,
-            "3.0.39",
-            "cline@3.0.39",
-            Some("22.0.0"),
-        );
+        assert_npx_version(AgentType::Cline, "3.0.39", "cline@3.0.39", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
             "2.118.2",
@@ -540,7 +535,11 @@ mod tests {
             "@xai-official/grok@0.2.98",
             Some("20.0.0"),
         );
-        assert_binary_version(AgentType::OpenCode, "1.17.18", "/releases/download/v1.17.18/");
+        assert_binary_version(
+            AgentType::OpenCode,
+            "1.17.18",
+            "/releases/download/v1.17.18/",
+        );
         assert_uvx_version(
             AgentType::Hermes,
             "0.18.2",
@@ -565,8 +564,7 @@ mod tests {
                 assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
                 // All platforms default CLI exec runtime (opt-out via user env).
                 assert_eq!(
-                    env,
-                    CODEX_CLI_RUNTIME_DEFAULT_ENV,
+                    env, CODEX_CLI_RUNTIME_DEFAULT_ENV,
                     "Windows bundled codex-acp must default CLI runtime on, got {env:?}"
                 );
             }
@@ -584,8 +582,7 @@ mod tests {
                 assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
                 assert_eq!(node_required, Some("20.0.0"));
                 assert_eq!(
-                    env,
-                    CODEX_CLI_RUNTIME_DEFAULT_ENV,
+                    env, CODEX_CLI_RUNTIME_DEFAULT_ENV,
                     "npx codex-acp must default CLI runtime on, got {env:?}"
                 );
             }

@@ -75,9 +75,7 @@ pub async fn run_preflight(
             override_env,
             platforms,
             ..
-        } => {
-            check_bundled_environment(cmd, override_env, platforms)
-        }
+        } => check_bundled_environment(cmd, override_env, platforms),
         AgentDistribution::Uvx {
             uv_required,
             system_cmd,
@@ -186,7 +184,11 @@ fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) 
     let mut checks = vec![CheckItem {
         check_id: "platform_supported".into(),
         label: "Platform".into(),
-        status: if supported { CheckStatus::Pass } else { CheckStatus::Fail },
+        status: if supported {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
         message: if supported {
             format!("Platform {platform} is supported")
         } else {
@@ -195,29 +197,31 @@ fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) 
         fixes: vec![],
     }];
     if supported {
-        checks.push(match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
-            Ok(Some(path)) => CheckItem {
-                check_id: "bundled_executable".into(),
-                label: "Built-in adapter".into(),
-                status: CheckStatus::Pass,
-                message: format!("Built-in adapter available at {}", path.display()),
-                fixes: vec![],
+        checks.push(
+            match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
+                Ok(Some(path)) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Pass,
+                    message: format!("Built-in adapter available at {}", path.display()),
+                    fixes: vec![],
+                },
+                Ok(None) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Fail,
+                    message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(),
+                    fixes: vec![],
+                },
+                Err(error) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Fail,
+                    message: error.to_string(),
+                    fixes: vec![],
+                },
             },
-            Ok(None) => CheckItem {
-                check_id: "bundled_executable".into(),
-                label: "Built-in adapter".into(),
-                status: CheckStatus::Fail,
-                message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(),
-                fixes: vec![],
-            },
-            Err(error) => CheckItem {
-                check_id: "bundled_executable".into(),
-                label: "Built-in adapter".into(),
-                status: CheckStatus::Fail,
-                message: error.to_string(),
-                fixes: vec![],
-            },
-        });
+        );
     }
     checks
 }
@@ -512,12 +516,18 @@ async fn run_uv_version(uvx_path: &std::path::Path) -> Option<String> {
 /// `Warn` (not `Fail`): recent uv releases are backward compatible for the
 /// `uvx --from <pkg>==<ver>` invocation, so an old uv should not hard-block.
 fn build_uv_version_check(current: Option<&str>, required: &str) -> CheckItem {
-    match (current.and_then(parse_node_version), parse_node_version(required)) {
+    match (
+        current.and_then(parse_node_version),
+        parse_node_version(required),
+    ) {
         (Some(cur), Some(req)) if cur >= req => CheckItem {
             check_id: "uv_version".into(),
             label: "uv version".into(),
             status: CheckStatus::Pass,
-            message: format!("uv {} meets the minimum requirement (>={required})", current.unwrap_or("")),
+            message: format!(
+                "uv {} meets the minimum requirement (>={required})",
+                current.unwrap_or("")
+            ),
             fixes: vec![],
         },
         (Some(_), Some(_)) => CheckItem {
@@ -806,34 +816,22 @@ mod tests {
     #[test]
     fn codex_distribution_cli_default_requires_host_on_non_windows() {
         let runtime_env = BTreeMap::new();
-        let effective = merge_distribution_env(
-            &[("CODEX_ACP_USE_CLI", "1")],
-            &runtime_env,
-        );
+        let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
 
         assert!(codex_host_preflight_required(false, &effective));
     }
 
     #[test]
     fn codex_user_opt_out_overrides_distribution_default_on_non_windows() {
-        let runtime_env = BTreeMap::from([(
-            "CODEX_ACP_USE_CLI".to_string(),
-            "0".to_string(),
-        )]);
-        let effective = merge_distribution_env(
-            &[("CODEX_ACP_USE_CLI", "1")],
-            &runtime_env,
-        );
+        let runtime_env = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
+        let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
 
         assert!(!codex_host_preflight_required(false, &effective));
     }
 
     #[test]
     fn codex_windows_requires_host_after_cli_opt_out() {
-        let effective = BTreeMap::from([(
-            "CODEX_ACP_USE_CLI".to_string(),
-            "0".to_string(),
-        )]);
+        let effective = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
 
         assert!(codex_host_preflight_required(true, &effective));
     }
