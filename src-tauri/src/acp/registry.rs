@@ -153,17 +153,21 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
     }
 }
 
+/// All platforms default CLI exec on; user Agent env can set `CODEX_ACP_USE_CLI=0`.
+const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "1")];
+
 fn codex_distribution_for(platform: &str) -> AgentDistribution {
     if platform == "windows-x86_64" {
         // Bundled MyCodeBuddy fork keeps custom ACP behavior. Host Codex is
-        // injected as CODEX_PATH at launch so the adapter drives
-        // `codex app-server` (model/list, turns, sessions) rather than the
-        // experimental single-model CLI runtime (`CODEX_ACP_USE_CLI`).
+        // injected as CODEX_PATH at launch. Defaults to CLI exec runtime
+        // (`codex exec --json`) to avoid ChatGPT "official clients only" 403s
+        // on app-server; Agent Settings can override with CODEX_ACP_USE_CLI=0
+        // (user env wins over this distribution pin).
         AgentDistribution::Bundled {
             version: "1.1.2-mycodebuddy.2",
             cmd: "codex-acp",
             args: &[],
-            env: &[],
+            env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
             override_env: crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV,
             platforms: &["windows-x86_64"],
         }
@@ -173,7 +177,7 @@ fn codex_distribution_for(platform: &str) -> AgentDistribution {
             package: "@agentclientprotocol/codex-acp@1.1.2",
             cmd: "codex-acp",
             args: &[],
-            env: &[],
+            env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
             node_required: Some("20.0.0"),
         }
     }
@@ -206,13 +210,16 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.2 depends on `@openai/codex` ^0.144.0 and drives `codex
-            // app-server`; since 1.0.1 it also resolves the resumed
-            // `model_provider` from `~/.codex/config.toml` (#224), so codeg no
-            // longer injects `MODEL_PROVIDER` to keep resumed sessions on the
-            // custom provider. 1.1.0 (#263) also reports `/goal` transitions as a
-            // structured `session_info_update` (`_meta.codex.goal`) rather than
-            // live agent text — see `crate::acp::codex_goal`.
+            // 1.1.2 depends on `@openai/codex` ^0.144.0 and can drive either
+            // `codex app-server` or (when `CODEX_ACP_USE_CLI=1`) `codex exec`.
+            // All platforms default CLI on via distribution env; opt out with
+            // CODEX_ACP_USE_CLI=0 in Agent Settings. Since 1.0.1 it also resolves
+            // the resumed `model_provider` from `~/.codex/config.toml` (#224), so
+            // codeg no longer injects `MODEL_PROVIDER` to keep resumed sessions
+            // on the custom provider. 1.1.0 (#263) also reports `/goal`
+            // transitions as a structured `session_info_update`
+            // (`_meta.codex.goal`) rather than live agent text — see
+            // `crate::acp::codex_goal`.
             distribution: codex_distribution_for(current_platform()),
         },
         AgentType::Gemini => AcpAgentMeta {
@@ -545,10 +552,11 @@ mod tests {
             } => {
                 assert_eq!(version, "1.1.2-mycodebuddy.2");
                 assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
-                // App-server path: no CODEX_ACP_USE_CLI / CODEX_ACP_CLI_MODEL pin.
-                assert!(
-                    env.is_empty(),
-                    "Windows bundled codex-acp must not force CLI runtime env, got {env:?}"
+                // All platforms default CLI exec runtime (opt-out via user env).
+                assert_eq!(
+                    env,
+                    CODEX_CLI_RUNTIME_DEFAULT_ENV,
+                    "Windows bundled codex-acp must default CLI runtime on, got {env:?}"
                 );
             }
             other => panic!("expected bundled Codex on windows-x86_64, got {other:?}"),
@@ -558,11 +566,17 @@ mod tests {
                 version,
                 package,
                 node_required,
+                env,
                 ..
             } => {
                 assert_eq!(version, "1.1.2");
                 assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
                 assert_eq!(node_required, Some("20.0.0"));
+                assert_eq!(
+                    env,
+                    CODEX_CLI_RUNTIME_DEFAULT_ENV,
+                    "npx codex-acp must default CLI runtime on, got {env:?}"
+                );
             }
             other => panic!("expected npx Codex distribution on macOS, got {other:?}"),
         }

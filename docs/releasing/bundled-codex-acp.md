@@ -4,13 +4,15 @@ MyCodeBuddy's Windows x64 installer includes the customized codex-acp fork as
 `codex-acp.exe`. The source is pinned as the public Git submodule at
 `src-tauri/vendor/codex-acp`; Agent Settings never replaces this executable.
 
-## Runtime dependency: host Codex (app-server)
+## Runtime dependency: host Codex (CLI exec default on all platforms)
 
-MyCodeBuddy ships the **codex-acp adapter** (`codex-acp.exe`) next to the app.
-That fork keeps MyCodeBuddy's custom ACP surface. On Windows it does **not**
-force `CODEX_ACP_USE_CLI`; the adapter starts the host Codex as
-`codex app-server` via `CODEX_PATH` so clients get a real `model/list`, normal
-turns, and session APIs.
+MyCodeBuddy ships the **codex-acp adapter** (`codex-acp.exe` on Windows; npx
+package elsewhere). That fork keeps MyCodeBuddy's custom ACP surface. The
+product **defaults** to CLI exec mode via distribution env `CODEX_ACP_USE_CLI=1`
+on **all platforms**, so the adapter runs turns with host `codex exec --json`
+(avoids ChatGPT "official clients only" 403s common on the app-server path).
+Agent Settings exposes a toggle; turning it off writes `CODEX_ACP_USE_CLI=0`
+(user env wins over the distribution pin) and falls back to `codex app-server`.
 
 Resolution order for `CODEX_PATH`:
 
@@ -22,20 +24,21 @@ Resolution order for `CODEX_PATH`:
 Users still do **not** need a global `codex-acp` package; they do need a host
 Codex CLI (e.g. `npm install -g @openai/codex`) unless they set `CODEX_PATH`.
 
-Optional experimental CLI exec mode (`CODEX_ACP_USE_CLI=1` + optional
-`CODEX_ACP_CLI_MODEL`) remains available in the fork for debugging, but is
-**not** the Windows product default (it only advertises a single virtual model).
+Optional `CODEX_ACP_CLI_MODEL` selects the model advertised/passed to `codex exec`
+when CLI mode is on (adapter default `gpt-5`). CLI mode only advertises a single
+virtual model; app-server mode provides a multi-model `model/list`.
 
-Sessions created with the prior CLI-runtime default cannot be resumed after
-switching to app-server because their ACP IDs are not Codex thread IDs. The app
-must tell users to create a new Codex conversation; no session migration or
+Sessions created under one runtime cannot be resumed after switching the other
+because ACP IDs are not interchangeable with Codex thread IDs. The app must tell
+users to create a new Codex conversation; no session migration or
 legacy-runtime fallback is supported.
 
 Clean-machine verification:
 
 1. Install MyCodeBuddy only → Codex preflight should fail on "Codex CLI" with install guidance.
-2. `npm install -g @openai/codex` → preflight passes; new Codex session initializes with a multi-model list from app-server.
-3. With a global official `codex-acp` also installed, logs must still show the sibling
+2. `npm install -g @openai/codex` → preflight passes; new Codex session initializes under CLI exec by default (single virtual model).
+3. Agent Settings → Codex → turn **Use CLI exec runtime** off, save env, new session → app-server path (`model/list` multi-model when authenticated).
+4. With a global official `codex-acp` also installed, logs must still show the sibling
    bundled `codex-acp.exe` path as the adapter.
 
 ## Update from upstream
@@ -90,7 +93,7 @@ A failure in any step must block the installer release.
 On a clean Windows x64 machine, verify:
 
 1. MyCodeBuddy only (no host Codex CLI) → Codex preflight fails with install guidance.
-2. After `npm install -g @openai/codex` (or `CODEX_PATH` set) → preflight passes and a new Codex session initializes with models from app-server `model/list`.
+2. After `npm install -g @openai/codex` (or `CODEX_PATH` set) → preflight passes and a new Codex session initializes under default CLI exec (`CODEX_ACP_USE_CLI=1`).
 3. Users need **no** global `codex-acp` package; the sibling bundled `codex-acp.exe` is used.
 4. With a global official `codex-acp` also installed, logs must still identify the sibling bundled `codex-acp.exe` path as the adapter.
-5. Registry distribution env for Windows Codex must **not** include `CODEX_ACP_USE_CLI` or `CODEX_ACP_CLI_MODEL`.
+5. Registry distribution env for Codex (Windows bundled **and** non-Windows npx) **must** include `CODEX_ACP_USE_CLI=1`. Opt-out is user Agent env `CODEX_ACP_USE_CLI=0` (or the settings toggle).

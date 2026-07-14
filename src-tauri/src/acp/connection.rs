@@ -438,9 +438,9 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
-            // Inject host CODEX_PATH when required (Windows app-server host, or
-            // experimental CODEX_ACP_USE_CLI). Never overwrites an explicit user
-            // value; fails with SdkNotInstalled if host Codex is missing.
+            // Inject host CODEX_PATH when required (Windows host always, or
+            // CODEX_ACP_USE_CLI). Never overwrites an explicit user value;
+            // fails with SdkNotInstalled if host Codex is missing.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {

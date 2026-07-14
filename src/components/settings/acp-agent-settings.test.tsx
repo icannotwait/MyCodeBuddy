@@ -5,8 +5,11 @@ import {
   buildGrokSaveOptions,
   buildGrokStructuredConfig,
   buildVersionCheck,
+  codexCliRuntimeDefaultOn,
   configTextForClaudeSave,
   getAgentChecks,
+  isCodexCliRuntimeEnabled,
+  patchCodexCliRuntimeEnv,
   patchImportantConfigText,
 } from "./acp-agent-settings"
 import type { AcpAgentInfo, AgentType, PreflightResult } from "@/lib/types"
@@ -74,6 +77,43 @@ const emptyCustoms = {
   customContextWindow: null,
   autoCompactThresholdPercent: null,
 }
+
+describe("Codex CLI runtime env toggle", () => {
+  it("defaults on for all platforms", () => {
+    expect(codexCliRuntimeDefaultOn("windows")).toBe(true)
+    expect(codexCliRuntimeDefaultOn("macos")).toBe(true)
+    expect(codexCliRuntimeDefaultOn("linux")).toBe(true)
+    expect(codexCliRuntimeDefaultOn("unknown")).toBe(true)
+    expect(codexCliRuntimeDefaultOn()).toBe(true)
+  })
+
+  it("treats absent env as the platform default", () => {
+    expect(isCodexCliRuntimeEnabled("", true)).toBe(true)
+    expect(isCodexCliRuntimeEnabled("", false)).toBe(false)
+    expect(isCodexCliRuntimeEnabled("OPENAI_API_KEY=sk-test", true)).toBe(true)
+  })
+
+  it("only enables for the literal value 1", () => {
+    expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=1", false)).toBe(true)
+    expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=0", true)).toBe(false)
+    expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=true", true)).toBe(
+      false
+    )
+  })
+
+  it("pins 1/0 so user env overrides distribution defaults", () => {
+    expect(patchCodexCliRuntimeEnv("", true)).toBe("CODEX_ACP_USE_CLI=1")
+    expect(patchCodexCliRuntimeEnv("CODEX_ACP_USE_CLI=1", false)).toBe(
+      "CODEX_ACP_USE_CLI=0"
+    )
+    expect(
+      patchCodexCliRuntimeEnv("FOO=bar\nCODEX_ACP_USE_CLI=0", true)
+    ).toMatch(/CODEX_ACP_USE_CLI=1/)
+    expect(
+      patchCodexCliRuntimeEnv("FOO=bar\nCODEX_ACP_USE_CLI=0", true)
+    ).toMatch(/FOO=bar/)
+  })
+})
 
 describe("buildGrokStructuredConfig — Grok panel save payload", () => {
   // A chosen dropdown value passes through. These become [ui].permission_mode /

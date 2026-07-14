@@ -33,6 +33,7 @@ import {
   Wrench,
 } from "lucide-react"
 import { isDesktop, openUrl } from "@/lib/platform"
+
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { toast } from "sonner"
 import { AgentIcon } from "@/components/agent-icon"
@@ -306,6 +307,43 @@ function patchEnvText(
     }
   }
   return envMapToText(envMap)
+}
+
+/** Adapter only enables CLI runtime when this is exactly `"1"`. */
+export const CODEX_ACP_USE_CLI_ENV = "CODEX_ACP_USE_CLI"
+
+/**
+ * Product default injects `CODEX_ACP_USE_CLI=1` at launch via distribution env
+ * on all platforms. Agent Settings can pin `0` to opt out (user env wins).
+ * Platform arg kept for call-site compatibility; default is platform-independent.
+ */
+export function codexCliRuntimeDefaultOn(
+  _platform?: "macos" | "windows" | "linux" | "unknown"
+): boolean {
+  return true
+}
+
+/** Effective CLI-exec switch from Agent env text + platform default. */
+export function isCodexCliRuntimeEnabled(
+  envText: string,
+  defaultOn: boolean
+): boolean {
+  const raw = parseEnvText(envText)[CODEX_ACP_USE_CLI_ENV]?.trim()
+  if (raw === undefined || raw === "") {
+    return defaultOn
+  }
+  // Match codex-acp: only the literal "1" enables CLI exec.
+  return raw === "1"
+}
+
+/** Pin `CODEX_ACP_USE_CLI` to `1` / `0` so user env overrides distribution. */
+export function patchCodexCliRuntimeEnv(
+  envText: string,
+  enabled: boolean
+): string {
+  return patchEnvText(envText, {
+    [CODEX_ACP_USE_CLI_ENV]: enabled ? "1" : "0",
+  })
 }
 
 interface ImportantEnvKeys {
@@ -3810,6 +3848,7 @@ export function AcpAgentSettings() {
   const rawTranslator = t as unknown as AcpTranslator
   acpTranslator = (key, values) => rawTranslator(key, values)
   const searchParams = useSearchParams()
+  const codexCliRuntimeDefault = codexCliRuntimeDefaultOn()
   const [agents, setAgents] = useState<AcpAgentInfo[]>([])
   const [loadingAgents, setLoadingAgents] = useState(true)
   const [loadingError, setLoadingError] = useState<string | null>(null)
@@ -6720,6 +6759,22 @@ export function AcpAgentSettings() {
     [selectedAgent, selectedDraft, updateSelectedDraft]
   )
 
+  const handleCodexCliRuntimeChange = useCallback(
+    (enabled: boolean) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "codex"
+      )
+        return
+      updateSelectedDraft((current) => ({
+        ...current,
+        envText: patchCodexCliRuntimeEnv(current.envText, enabled),
+      }))
+    },
+    [selectedAgent, selectedDraft, updateSelectedDraft]
+  )
+
   const handleCodexServiceTierFastChange = useCallback(
     (enabled: boolean) => {
       if (
@@ -7560,6 +7615,27 @@ export function AcpAgentSettings() {
                         {selectedCodexReasoningEffortOption?.description ??
                           "Greater reasoning depth for complex problems"}
                       </p>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                        <div className="min-w-0 pr-3">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("codex.enableCliRuntime")}
+                          </label>
+                          <p className="text-[10px] text-muted-foreground/80 mt-0.5">
+                            {t("codex.enableCliRuntimeHint")}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={isCodexCliRuntimeEnabled(
+                            selectedDraft.envText,
+                            codexCliRuntimeDefault
+                          )}
+                          onCheckedChange={handleCodexCliRuntimeChange}
+                          aria-label={t("codex.enableCliRuntimeAria")}
+                        />
+                      </div>
                     </div>
 
                     <div className="space-y-1.5">
