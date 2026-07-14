@@ -25,6 +25,48 @@ const MISSING_MODULE = "Cannot find module '@openai/codex/bin/codex.js'"
 // Cold `codex app-server` on Windows CI runners often exceeds 15s.
 const INIT_TIMEOUT_MS = 45_000
 
+/**
+ * Host `codex app-server` must be launched via a real executable / cmd shim.
+ * PowerShell's `Get-Command codex` often returns `codex.ps1` first; Node and
+ * cmd.exe cannot spawn that shim, which fails initialize with code 1001.
+ */
+export function isUsableHostCodexPath(candidate, platform = process.platform) {
+  if (!candidate || typeof candidate !== "string") {
+    return false
+  }
+  const trimmed = candidate.trim()
+  if (!trimmed) {
+    return false
+  }
+  if (platform === "win32" && /\.ps1$/i.test(trimmed)) {
+    return false
+  }
+  return true
+}
+
+export function preferHostCodexCandidate(
+  candidates,
+  { platform = process.platform, exists = existsSync } = {}
+) {
+  const usable = candidates
+    .map((candidate) =>
+      typeof candidate === "string" ? candidate.trim() : ""
+    )
+    .filter(
+      (candidate) =>
+        candidate && isUsableHostCodexPath(candidate, platform) && exists(candidate)
+    )
+
+  if (platform === "win32") {
+    const cmd = usable.find((candidate) => /\.cmd$/i.test(candidate))
+    if (cmd) {
+      return cmd
+    }
+  }
+
+  return usable[0] ?? null
+}
+
 export function findCodexOnPath({
   platform = process.platform,
   run = spawnSync,
@@ -39,25 +81,32 @@ export function findCodexOnPath({
     return null
   }
 
-  return (
-    (result.stdout ?? "")
-      .split(/\r?\n/)
-      .map((candidate) => candidate.trim())
-      .find((candidate) => candidate && exists(candidate)) ?? null
-  )
+  const candidates = (result.stdout ?? "")
+    .split(/\r?\n/)
+    .map((candidate) => candidate.trim())
+    .filter(Boolean)
+
+  return preferHostCodexCandidate(candidates, { platform, exists })
 }
 
 export function resolveHostCodexPath({
   env = process.env,
   exists = existsSync,
   findOnPath,
+  platform = process.platform,
 } = {}) {
-  if (env.CODEX_PATH && exists(env.CODEX_PATH)) {
-    return env.CODEX_PATH
+  if (env.CODEX_PATH) {
+    const preferred = preferHostCodexCandidate([env.CODEX_PATH], {
+      platform,
+      exists,
+    })
+    if (preferred) {
+      return preferred
+    }
   }
 
-  const pathHit = (findOnPath ?? (() => findCodexOnPath({ exists })))()
-  if (pathHit && exists(pathHit)) {
+  const pathHit = (findOnPath ?? (() => findCodexOnPath({ exists, platform })))()
+  if (pathHit && exists(pathHit) && isUsableHostCodexPath(pathHit, platform)) {
     return pathHit
   }
 

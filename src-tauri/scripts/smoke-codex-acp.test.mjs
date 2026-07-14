@@ -6,6 +6,8 @@ import {
   assertDynamicModelList,
   classifySessionNewResponse,
   isAuthenticationRequiredError,
+  isUsableHostCodexPath,
+  preferHostCodexCandidate,
   resolveHostCodexPath,
 } from "./smoke-codex-acp.mjs"
 
@@ -60,6 +62,44 @@ test("session/new smoke requires a non-empty dynamic model list", () => {
   assert.throws(
     () => assertDynamicModelList({ models: { availableModels: [] } }),
     /did not return any models/
+  )
+})
+
+test("Windows host Codex path rejects PowerShell shims and prefers .cmd", () => {
+  assert.equal(isUsableHostCodexPath("C:\\npm\\codex.ps1", "win32"), false)
+  assert.equal(isUsableHostCodexPath("C:\\npm\\codex.cmd", "win32"), true)
+
+  const existing = new Set([
+    "C:\\npm\\codex.ps1",
+    "C:\\npm\\codex",
+    "C:\\npm\\codex.cmd",
+  ])
+  assert.equal(
+    preferHostCodexCandidate(
+      ["C:\\npm\\codex.ps1", "C:\\npm\\codex", "C:\\npm\\codex.cmd"],
+      {
+        platform: "win32",
+        exists: (candidate) => existing.has(candidate),
+      }
+    ),
+    "C:\\npm\\codex.cmd"
+  )
+
+  // Ambient CODEX_PATH pointing at .ps1 must not win over APPDATA .cmd.
+  const appData = join("fixtures", "appdata")
+  const cmd = join(appData, "npm", "codex.cmd")
+  assert.equal(
+    resolveHostCodexPath({
+      env: {
+        CODEX_PATH: join(appData, "npm", "codex.ps1"),
+        APPDATA: appData,
+      },
+      platform: "win32",
+      exists: (candidate) =>
+        candidate === cmd || candidate.endsWith("codex.ps1"),
+      findOnPath: () => null,
+    }),
+    cmd
   )
 })
 

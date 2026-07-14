@@ -220,17 +220,22 @@ jobs:
         shell: pwsh
         run: |
           npm install -g @openai/codex@0.144.1
-          $codex = $null
-          $cmd = Get-Command codex -ErrorAction SilentlyContinue
-          if ($cmd) { $codex = $cmd.Source }
-          if (-not $codex) {
-            $candidate = Join-Path $env:APPDATA "npm\codex.cmd"
-            if (Test-Path -LiteralPath $candidate) { $codex = $candidate }
-          }
+          # Prefer codex.cmd — Get-Command often returns codex.ps1 first, which
+          # Node/cmd cannot spawn (ACP initialize exits with code 1001).
+          $candidates = @(
+            (Join-Path $env:APPDATA "npm\codex.cmd")
+          )
+          try {
+            $candidates += @(where.exe codex 2>$null)
+          } catch {}
+          $codex = $candidates |
+            Where-Object { $_ -and ($_ -notmatch '\.ps1$') -and (Test-Path -LiteralPath $_) } |
+            Select-Object -First 1
           if (-not $codex) {
             throw "Host Codex CLI not found after npm install -g @openai/codex@0.144.1"
           }
-          "CODEX_PATH=$codex" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Append without BOM so GITHUB_ENV keys stay intact on Windows.
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CODEX_PATH=$codex`n")
           Write-Host "CODEX_PATH=$codex"
 
       - name: Smoke test bundled Codex ACP

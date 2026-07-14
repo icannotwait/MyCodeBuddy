@@ -79,7 +79,7 @@ test("requires a positive MyCodeBuddy version counter", () => {
 })
 
 test("requires package Cargo Tauri and tag versions to match", () => {
-  const version = "0.20.2-mycodebuddy.4"
+  const version = "0.20.2-mycodebuddy.5"
   assert.doesNotThrow(() =>
     assertMatchingVersions({
       packageVersion: version,
@@ -111,7 +111,7 @@ test("finds upstream URLs in runtime-owned files", () => {
 })
 
 test("repository identity matches the MyCodeBuddy release policy", () => {
-  const version = "0.20.2-mycodebuddy.4"
+  const version = "0.20.2-mycodebuddy.5"
   const packageJson = JSON.parse(readRepositoryFile("package.json"))
   const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
   const tauriConfig = JSON.parse(
@@ -348,7 +348,7 @@ test("server READMEs require manual Windows upgrades and current examples", () =
     assert.doesNotMatch(text, /v0\.5\.2/, `${path} has the old version`)
     assert.match(
       text,
-      /\.\\install\.ps1 -Version v0\.20\.2-mycodebuddy\.4/,
+      /\.\\install\.ps1 -Version v0\.20\.2-mycodebuddy\.5/,
       `${path} lacks the current installer example`
     )
     assert.ok(
