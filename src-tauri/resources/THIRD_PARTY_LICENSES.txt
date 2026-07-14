@@ -3319,7 +3319,7 @@ Declared license: MIT/Apache-2.0
 Homepage: https://github.com/gyscos/zstd-rs
 License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9, 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e, 30367d9a4eadd6c9dcd719ea082ac9f6c499cdbd9976b246bdf2153ebe8e53f6, 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
 
-npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.2
+npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.3
 Declared license: Apache-2.0
 Homepage: https://github.com/agentclientprotocol/codex-acp#readme
 License text SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
@@ -13597,7 +13597,7 @@ SOFTWARE.
 
 SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
 Packages:
-- npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.2
+- npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.3
 
    Copyright 2025 JetBrains s.r.o.
 
