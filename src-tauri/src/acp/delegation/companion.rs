@@ -1791,7 +1791,7 @@ mod tests {
                     output.push(' ');
                 }
                 for (key, nested) in map {
-                    if key != "description" {
+                    if key != "description" || !nested.is_string() {
                         collect_descriptions(nested, output);
                     }
                 }
@@ -1815,46 +1815,97 @@ mod tests {
     fn tool_schema_retains_essential_agent_guidance() {
         let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
         let tools = schema.as_array().unwrap();
+        let ask_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "ask_user_question")
+            .unwrap();
+        assert!(
+            tool_guidance(ask_tool).contains("meaning or trade-off"),
+            "ask_user_question guidance lost nested option description"
+        );
         let cases: [(&str, &[&str]); 6] = [
             (
                 "delegate_to_agent",
-                &["asynchronous", "task_id", "cold", "profile_id", "fan out"],
+                &[
+                    "asynchronous",
+                    "task_id",
+                    "cold",
+                    "cannot see this conversation",
+                    "task must include all context",
+                    "fan out",
+                    "each distinct",
+                    "call once",
+                    "profile_id",
+                ],
             ),
             (
                 "get_delegation_status",
                 &[
                     "task_ids",
                     "wait_ms",
-                    "wait_ms=0",
+                    "immediate snapshot",
+                    "wait_ms=0 waits without timeout",
                     "60000",
-                    "terminal",
-                    "silently",
+                    "any requested task is terminal",
+                    "call again for unfinished tasks",
+                    "input order with each task_id",
+                    "running, completed, failed, canceled, or unknown",
+                    "final text when available",
+                    "blocking waits",
+                    "call again silently",
                 ],
             ),
             (
                 "cancel_delegation",
-                &["timeout", "non-canceling", "waiting", "finished"],
+                &[
+                    "only when its result is no longer wanted",
+                    "timeout",
+                    "non-canceling",
+                    "keep waiting",
+                    "wait_ms for slow work",
+                    "already finished",
+                    "final result",
+                    "taskfail, usercancel, and others cancel",
+                ],
             ),
             (
                 "check_user_feedback",
                 &[
+                    "messages are available only through this tool",
                     "non-blocking",
                     "before starting implementation",
                     "significant decision",
+                    "after a meaningful sub-task",
                     "high-priority",
+                    "empty result means continue",
                 ],
             ),
             (
                 "ask_user_question",
-                &["block", "genuinely", "other", "recommended", "one call"],
+                &[
+                    "1-4 related",
+                    "block until submitted or dismissed",
+                    "genuinely user-owned discrete decision",
+                    "cannot be resolved",
+                    "do not ask merely whether to proceed",
+                    "confirm an obvious default",
+                    "open-ended input",
+                    "other is added automatically",
+                    "recommended",
+                    "one call",
+                    "meaning or trade-off",
+                ],
             ),
             (
                 "get_session_info",
                 &[
                     "codeg://session/",
+                    "read-only metadata",
+                    "optional recent messages",
                     "internal conversation id",
-                    "read-only",
+                    "not the agent session id",
                     "found: false",
+                    "not an error",
                 ],
             ),
         ];
@@ -1910,6 +1961,23 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
             )
             .await,
+        );
+        let names: Vec<&str> = response.result.as_ref().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "delegate_to_agent",
+                "get_delegation_status",
+                "cancel_delegation",
+                "check_user_feedback",
+                "ask_user_question",
+                "get_session_info",
+            ]
         );
         let mut line = serde_json::to_vec(&response).unwrap();
         line.push(b'\n');
