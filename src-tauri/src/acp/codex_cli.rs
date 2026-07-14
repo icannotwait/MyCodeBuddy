@@ -116,13 +116,14 @@ pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<()
     }
 }
 
-/// True when the effective launch env asks for the experimental CLI exec runtime.
+/// True when the effective launch env asks for CLI exec runtime. This must match
+/// codex-acp and the Agent Settings toggle: only the literal `"1"` enables it.
 pub fn cli_mode_enabled(env: &BTreeMap<String, String>) -> bool {
     env.get("CODEX_ACP_USE_CLI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| v == "1")
         .unwrap_or_else(|| {
             std::env::var("CODEX_ACP_USE_CLI")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .map(|v| v == "1")
                 .unwrap_or(false)
         })
 }
@@ -345,6 +346,19 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
         assert!(host_codex_required(&env));
+    }
+
+    #[test]
+    fn cli_mode_requires_literal_one() {
+        let env = BTreeMap::from([("CODEX_ACP_USE_CLI".into(), "true".into())]);
+        assert!(!cli_mode_enabled(&env));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn host_codex_not_required_for_true_on_non_windows() {
+        let env = BTreeMap::from([("CODEX_ACP_USE_CLI".into(), "true".into())]);
+        assert!(!host_codex_required(&env));
     }
 
     #[test]
