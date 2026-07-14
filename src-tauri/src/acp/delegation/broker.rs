@@ -91,6 +91,17 @@ const COMPLETED_TEXT_CAP: usize = 256 * 1024;
 /// without re-fetching the child session.
 const STATUS_PREVIEW_CAP: usize = 2 * 1024;
 
+/// MCP / serde wire form for [`AgentType`] (`code_buddy`, `codex`, …).
+/// Used in LLM-facing mandatory-route error details — never use `Display`
+/// labels (`"CodeBuddy"`, `"Codex CLI"`) there.
+fn agent_type_wire(agent_type: AgentType) -> String {
+    match serde_json::to_value(agent_type) {
+        Ok(serde_json::Value::String(s)) => s,
+        // AgentType always serializes as a snake_case string unit variant.
+        other => unreachable!("AgentType must serialize as a string, got {other:?}"),
+    }
+}
+
 /// Lookup the `parent_id` for a conversation. Abstracted so the broker can be
 /// unit-tested against an in-memory chain without touching SeaORM.
 #[async_trait]
@@ -1128,8 +1139,12 @@ pub struct DelegationBroker {
     pre_canceled_handles: Arc<PreCanceledHandles>,
     config: Arc<Mutex<DelegationConfig>>,
     /// Parent-connection → profile UUIDs mentioned in the latest user prompt.
-    /// When non-empty, `start_delegation` requires a `profile_id` (or auto-fills
-    /// when exactly one mandatory profile matches the requested agent type).
+    /// When non-empty, `start_delegation` enforces profile routing **per
+    /// `req.agent_type`**: only UUIDs whose live config profile matches that
+    /// agent type form the type-scoped set `M_T`. For gated types, `profile_id`
+    /// is required (or auto-filled when exactly one *enabled* match exists in
+    /// `M_T`). Agent types with no mandatory profiles in `M` may use base
+    /// defaults even while other types are gated.
     ///
     /// `std::sync::Mutex` (not tokio) so `set_mandatory_profile_routes` can run
     /// synchronously between admitting a root prompt (`turn_in_flight = true`)
@@ -2049,41 +2064,83 @@ impl DelegationBroker {
         // and a small BTreeMap, and the spawner consumes both fields by value.
         //
         // When the parent user prompt mentioned profiles, soft prompt routing is
-        // hardened here:
-        // - omitted profile_id → auto-fill only when a unique enabled match
-        //   exists for the requested agent_type; otherwise fail closed
-        // - explicit profile_id must be one of the mandatory UUIDs (no substitute
-        //   profile / base defaults while a mention set is active)
+        // hardened here **per agent_type** (type-scoped set `M_T`):
+        // - build M_T = mandatory UUIDs whose config profile matches req.agent_type
+        //   (disabled profiles still count for gate presence; missing config
+        //   ids are skipped — fail-open for that id)
+        // - if M_T is empty, this agent_type is unconstrained by the mention set
+        //   (base defaults / optional non-mentioned profiles allowed)
+        // - if M_T is non-empty:
+        //   - omitted profile_id → auto-fill only when a unique *enabled* match
+        //     exists in M_T; otherwise fail closed (incl. all-disabled)
+        //   - explicit profile_id must be in M_T (no substitute profile for
+        //     this agent_type)
         let mandatory = self.mandatory_profile_routes_for(&req.parent_connection_id);
         if !mandatory.is_empty() {
-            if let Some(profile_id) = req.profile_id.as_deref() {
-                if !mandatory.contains(profile_id) {
-                    self.drop_inflight(inflight_id).await;
-                    let list = mandatory.into_iter().collect::<Vec<_>>().join(", ");
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::MandatoryProfileRequired(format!(
-                            "profile_id {profile_id} is not among mandatory routes: {list}"
-                        )),
-                        None,
-                    );
-                }
+            let mut unresolved: Vec<&String> = Vec::new();
+            let mandatory_for_type: BTreeSet<String> = mandatory
+                .iter()
+                .filter_map(|id| match cfg.profiles.get(id) {
+                    Some(p) if p.agent_type == req.agent_type => Some(id.clone()),
+                    Some(_) => None,
+                    None => {
+                        unresolved.push(id);
+                        None
+                    }
+                })
+                .collect();
+            if !unresolved.is_empty() {
+                tracing::warn!(
+                    parent_connection_id = %req.parent_connection_id,
+                    agent_type = %agent_type_wire(req.agent_type),
+                    unresolved_count = unresolved.len(),
+                    unresolved = ?unresolved,
+                    "[delegation] skipping mandatory profile ids missing from config (fail-open for those ids)"
+                );
+            }
+            if mandatory_for_type.is_empty() {
+                tracing::debug!(
+                    parent_connection_id = %req.parent_connection_id,
+                    agent_type = %agent_type_wire(req.agent_type),
+                    mandatory_count = mandatory.len(),
+                    "[delegation] mandatory routes active but none for this agent_type; allowing unscoped path"
+                );
             } else {
-                let matches: Vec<&DelegationProfile> = mandatory
+                let t = agent_type_wire(req.agent_type);
+                let list_m_t = mandatory_for_type
                     .iter()
-                    .filter_map(|id| cfg.profiles.get(id))
-                    .filter(|p| p.enabled && p.agent_type == req.agent_type)
-                    .collect();
-                if matches.len() == 1 {
-                    req.profile_id = Some(matches[0].id.clone());
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if let Some(profile_id) = req.profile_id.as_deref() {
+                    if !mandatory_for_type.contains(profile_id) {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::MandatoryProfileRequired(format!(
+                                "profile_id {profile_id} is not among mandatory routes for agent_type={t}: {list_m_t}"
+                            )),
+                            None,
+                        );
+                    }
                 } else {
-                    self.drop_inflight(inflight_id).await;
-                    let list = mandatory.into_iter().collect::<Vec<_>>().join(", ");
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::MandatoryProfileRequired(list),
-                        None,
-                    );
+                    let matches: Vec<&DelegationProfile> = mandatory_for_type
+                        .iter()
+                        .filter_map(|id| cfg.profiles.get(id))
+                        .filter(|p| p.enabled)
+                        .collect();
+                    if matches.len() == 1 {
+                        req.profile_id = Some(matches[0].id.clone());
+                    } else {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::MandatoryProfileRequired(format!(
+                                "for agent_type={t} (ambiguous or missing): {list_m_t}"
+                            )),
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -4160,6 +4217,473 @@ mod tests {
             Some("mandatory_profile_required")
         );
         assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_allow_unrelated_agent_type_without_profile_id() {
+        // CodeBuddy profiles are mandatory; Codex with no profile_id must still
+        // spawn (type-scoped gate — the mixed @profile + @base-agent bug fix).
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-1".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+            .await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "GLM5.2".into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [profile_id.to_string()]);
+
+        let mut req = request(1, "pt-unrelated");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::Codex;
+        req.profile_id = None;
+        let ack = broker.start_delegation(req).await;
+        assert_ne!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required"),
+            "unrelated agent_type must not hit mandatory gate: {ack:?}"
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_reject_wrong_profile_message_scoped_to_agent_type() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let other = "33333333-3333-4333-8333-333333333333";
+        let mk = |id: &str, name: &str| DelegationProfile {
+            id: id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: name.into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([
+                    (a.into(), mk(a, "A")),
+                    (b.into(), mk(b, "B")),
+                    (other.into(), mk(other, "Other")),
+                ]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [a.to_string(), b.to_string()]);
+
+        let mut req = request(1, "pt-wrong");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(other.into());
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        let msg = ack.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains(&format!(
+                "profile_id {other} is not among mandatory routes for agent_type=code_buddy: {a}, {b}"
+            )) || msg.contains(&format!(
+                "profile_id {other} is not among mandatory routes for agent_type=code_buddy: {b}, {a}"
+            )),
+            "scoped wrong-id message: {msg}"
+        );
+        assert!(
+            !msg.contains("agent_type=CodeBuddy") && !msg.contains("agent_type=Codex CLI"),
+            "Display labels forbidden: {msg}"
+        );
+        assert_eq!(
+            msg.matches("mandatory profile_id required").count(),
+            1,
+            "no double-prefix: {msg}"
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_mixed_agent_types_gate_independently() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-g".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_spawn(Ok("child-cb".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_spawn(Ok("child-cx".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let p_cb = "11111111-1111-4111-8111-111111111111";
+        let p_cx = "22222222-2222-4222-8222-222222222222";
+        let profiles = BTreeMap::from([
+            (
+                p_cb.into(),
+                DelegationProfile {
+                    id: p_cb.into(),
+                    agent_type: AgentType::CodeBuddy,
+                    name: "CB".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::from([("model".into(), "cb-model".into())]),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+            (
+                p_cx.into(),
+                DelegationProfile {
+                    id: p_cx.into(),
+                    agent_type: AgentType::Codex,
+                    name: "CX".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::from([("model".into(), "cx-model".into())]),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+        ]);
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles,
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes(
+            "parent-conn",
+            [p_cb.to_string(), p_cx.to_string()],
+        );
+
+        // Grok unconstrained → allow base
+        let mut req_g = request(1, "pt-g");
+        req_g.parent_connection_id = "parent-conn".into();
+        req_g.agent_type = AgentType::Grok;
+        req_g.profile_id = None;
+        let _ = broker.handle_request(req_g).await;
+
+        // Unique CodeBuddy → autofill
+        let mut req_cb = request(1, "pt-cb");
+        req_cb.parent_connection_id = "parent-conn".into();
+        req_cb.agent_type = AgentType::CodeBuddy;
+        req_cb.profile_id = None;
+        let _ = broker.handle_request(req_cb).await;
+
+        // Unique Codex → autofill
+        let mut req_cx = request(1, "pt-cx");
+        req_cx.parent_connection_id = "parent-conn".into();
+        req_cx.agent_type = AgentType::Codex;
+        req_cx.profile_id = None;
+        let _ = broker.handle_request(req_cx).await;
+
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 3);
+        assert!(args[0].preferred_config_values.is_empty());
+        assert_eq!(args[1].preferred_config_values["model"], "cb-model");
+        assert_eq!(args[2].preferred_config_values["model"], "cx-model");
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_disabled_only_reject_omit_not_base_defaults() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "Disabled".into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: false,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [profile_id.to_string()]);
+
+        let mut req = request(1, "pt-dis-omit");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = None;
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        let msg = ack.message.as_deref().unwrap_or("");
+        assert!(msg.contains("agent_type=code_buddy"), "{msg}");
+        assert!(msg.contains("(ambiguous or missing)"), "{msg}");
+        assert!(msg.contains(profile_id), "{msg}");
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_disabled_explicit_id_returns_disabled() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let profile_id = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: profile_id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "Disabled".into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: false,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(profile_id.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [profile_id.to_string()]);
+
+        let mut req = request(1, "pt-dis-explicit");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(profile_id.into());
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("delegation_profile_disabled")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_gated_type_rejects_cross_type_id_in_global_m() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let p_cb = "11111111-1111-4111-8111-111111111111";
+        let p_cx = "22222222-2222-4222-8222-222222222222";
+        let profiles = BTreeMap::from([
+            (
+                p_cb.into(),
+                DelegationProfile {
+                    id: p_cb.into(),
+                    agent_type: AgentType::CodeBuddy,
+                    name: "CB".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::new(),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+            (
+                p_cx.into(),
+                DelegationProfile {
+                    id: p_cx.into(),
+                    agent_type: AgentType::Codex,
+                    name: "CX".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::new(),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+        ]);
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles,
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes(
+            "parent-conn",
+            [p_cb.to_string(), p_cx.to_string()],
+        );
+
+        let mut req = request(1, "pt-cross");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = Some(p_cx.into());
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_ne!(
+            ack.error_code.as_deref(),
+            Some("delegation_profile_agent_mismatch")
+        );
+        let msg = ack.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains(&format!(
+                "profile_id {p_cx} is not among mandatory routes for agent_type=code_buddy: {p_cb}"
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains("delegation_profile_agent_mismatch"));
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_unconstrained_type_allows_valid_non_mandatory_profile() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-1".into())).await;
+        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let p_cb = "11111111-1111-4111-8111-111111111111";
+        let p_cx = "22222222-2222-4222-8222-222222222222";
+        let profiles = BTreeMap::from([
+            (
+                p_cb.into(),
+                DelegationProfile {
+                    id: p_cb.into(),
+                    agent_type: AgentType::CodeBuddy,
+                    name: "CB".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::new(),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+            (
+                p_cx.into(),
+                DelegationProfile {
+                    id: p_cx.into(),
+                    agent_type: AgentType::Codex,
+                    name: "CX".into(),
+                    mode_id: None,
+                    config_values: BTreeMap::from([("model".into(), "cx-opt".into())]),
+                    enabled: true,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+        ]);
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles,
+                ..DelegationConfig::default()
+            })
+            .await;
+        // Only CodeBuddy is mandatory; Codex profile is optional non-mentioned.
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string()]);
+
+        let mut req = request(1, "pt-opt-cx");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::Codex;
+        req.profile_id = Some(p_cx.into());
+        let _ = broker.handle_request(req).await;
+        let args = mock.spawn_args.lock().await;
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].preferred_config_values["model"], "cx-opt");
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_unconstrained_type_wrong_agent_profile_mismatch() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let p_cb = "11111111-1111-4111-8111-111111111111";
+        let profile = DelegationProfile {
+            id: p_cb.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: "CB".into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(p_cb.into(), profile)]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string()]);
+
+        let mut req = request(1, "pt-mismatch-unscoped");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::Codex;
+        req.profile_id = Some(p_cb.into());
+        assert_eq!(
+            broker.start_delegation(req).await.error_code.as_deref(),
+            Some("delegation_profile_agent_mismatch")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_profiles_omit_message_uses_wire_agent_type() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let mk = |id: &str, name: &str| DelegationProfile {
+            id: id.into(),
+            agent_type: AgentType::CodeBuddy,
+            name: name.into(),
+            mode_id: None,
+            config_values: BTreeMap::new(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 8,
+                profiles: BTreeMap::from([(a.into(), mk(a, "A")), (b.into(), mk(b, "B"))]),
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker.set_mandatory_profile_routes("parent-conn", [a.to_string(), b.to_string()]);
+
+        let mut req = request(1, "pt-omit-msg");
+        req.parent_connection_id = "parent-conn".into();
+        req.agent_type = AgentType::CodeBuddy;
+        req.profile_id = None;
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        let msg = ack.message.as_deref().unwrap_or("");
+        assert!(
+            msg.starts_with("mandatory profile_id required: for agent_type=code_buddy"),
+            "{msg}"
+        );
+        assert!(!msg.contains("CodeBuddy"), "Display label must not appear: {msg}");
+        assert_eq!(msg.matches("mandatory profile_id required").count(), 1);
     }
 
     #[tokio::test]

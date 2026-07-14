@@ -265,8 +265,11 @@ pub enum DelegationError {
     DelegationProfileDisabled(String),
     #[error("delegation profile agent does not match request: {0}")]
     DelegationProfileAgentMismatch(String),
-    /// Parent user prompt mentioned one or more profiles, but this call did not
-    /// supply a usable `profile_id` (and auto-fill could not uniquely resolve).
+    /// Parent user prompt mentioned one or more profiles for this request's
+    /// agent_type (`M_T`), but this call did not supply a usable `profile_id`
+    /// (and auto-fill could not uniquely resolve), or supplied one outside `M_T`.
+    /// The `{0}` payload is **detail-only** (no second "mandatory profile_id
+    /// required" prefix); full wire text is this Display template + detail.
     #[error("mandatory profile_id required: {0}")]
     MandatoryProfileRequired(String),
     #[error("invalid working dir: {0}")]
