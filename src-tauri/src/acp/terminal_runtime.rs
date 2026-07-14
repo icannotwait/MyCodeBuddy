@@ -11,8 +11,9 @@ use sacp::schema::{
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::terminal_adapter::AcpTerminalAdapter;
 use crate::terminal::shell::{build_command_line, ResolvedShellSpec};
@@ -25,6 +26,14 @@ const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
 /// inherit the pipe handle and keep it open long after the direct child
 /// exits, turning `wait_for_exit` into a silent hang.
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// Per-terminal bound for session release / cleanup. If kill+wait exceeds this,
+/// log and continue the kill in the background so cancel/disconnect recovery
+/// is not blocked behind a stuck process wait.
+const RELEASE_KILL_BOUND: Duration = Duration::from_secs(3);
+/// Upper bound for a waiter that has observed cancel (or a missing child) and
+/// is waiting for the kill path to publish `exit_status`. Prevents infinite
+/// hangs if kill fails to publish.
+const EXIT_STATUS_WAIT_BOUND: Duration = Duration::from_secs(10);
 
 /// How a `terminal/create` request will be executed.
 ///
@@ -96,6 +105,11 @@ struct TerminalInstance {
     child: Mutex<Option<tokio::process::Child>>,
     snapshot: Mutex<TerminalSnapshot>,
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Signalled by [`Self::kill_command`] so a concurrent
+    /// [`Self::wait_for_exit`] can drop the child mutex and let kill proceed.
+    cancel: CancellationToken,
+    /// Wakes waiters after `exit_status` is published (natural exit or kill).
+    exit_notify: Notify,
 }
 
 impl TerminalInstance {
@@ -106,6 +120,55 @@ impl TerminalInstance {
             child: Mutex::new(Some(child)),
             snapshot: Mutex::new(TerminalSnapshot::default()),
             reader_handles: Mutex::new(Vec::new()),
+            cancel: CancellationToken::new(),
+            exit_notify: Notify::new(),
+        }
+    }
+
+    async fn publish_exit_status(&self, exit_status: TerminalExitStatus) {
+        {
+            let mut snapshot = self.snapshot.lock().await;
+            if snapshot.exit_status.is_none() {
+                snapshot.exit_status = Some(exit_status);
+            }
+        }
+        self.exit_notify.notify_waiters();
+    }
+
+    /// Wait until `exit_status` is published (or a hard bound elapses).
+    async fn await_published_exit_status(
+        &self,
+    ) -> Result<TerminalExitStatus, TerminalRuntimeError> {
+        let deadline = tokio::time::Instant::now() + EXIT_STATUS_WAIT_BOUND;
+        loop {
+            {
+                let snapshot = self.snapshot.lock().await;
+                if let Some(exit_status) = snapshot.exit_status.clone() {
+                    return Ok(exit_status);
+                }
+            }
+
+            // Opportunistically observe a natural exit if the kill path has
+            // not published yet (e.g. race where the process died first).
+            self.refresh_exit_status().await?;
+            {
+                let snapshot = self.snapshot.lock().await;
+                if let Some(exit_status) = snapshot.exit_status.clone() {
+                    return Ok(exit_status);
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(TerminalRuntimeError::Internal(
+                    "timed out waiting for terminal exit status after cancel/kill".to_string(),
+                ));
+            }
+
+            tokio::select! {
+                _ = self.exit_notify.notified() => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
         }
     }
 
@@ -178,8 +241,7 @@ impl TerminalInstance {
             // snapshot already contains (or has explicitly given up on) all
             // reader output.
             self.drain_readers().await;
-            let mut snapshot = self.snapshot.lock().await;
-            snapshot.exit_status = Some(map_exit_status(status));
+            self.publish_exit_status(map_exit_status(status)).await;
         }
 
         Ok(())
@@ -193,30 +255,56 @@ impl TerminalInstance {
             return Ok(exit_status);
         }
 
-        let exit_status = {
+        // Hold the child mutex only while racing `child.wait()` against cancel.
+        // On cancel we MUST drop the mutex so `kill_command` can acquire it —
+        // previously both paths held the same lock across `wait()`, so cancel
+        // deadlocked behind a long-running agent `waitForExit`.
+        let wait_result = {
             let mut child_guard = self.child.lock().await;
             let Some(child) = child_guard.as_mut() else {
-                return Err(TerminalRuntimeError::Internal(
-                    "terminal process missing while waiting for exit".to_string(),
-                ));
+                // Kill path (or another waiter) already took ownership / finished.
+                drop(child_guard);
+                let exit_status = self.await_published_exit_status().await?;
+                self.drain_readers().await;
+                return Ok(exit_status);
             };
-            let status = child.wait().await.map_err(|err| {
-                TerminalRuntimeError::Internal(format!(
-                    "failed waiting for terminal process to exit: {err}"
-                ))
-            })?;
-            *child_guard = None;
-            map_exit_status(status)
+
+            tokio::select! {
+                status = child.wait() => {
+                    *child_guard = None;
+                    Some(status)
+                }
+                _ = self.cancel.cancelled() => {
+                    // Release the child lock for kill_command before awaiting
+                    // the published exit status.
+                    None
+                }
+            }
         };
 
-        self.drain_readers().await;
-
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.exit_status = Some(exit_status.clone());
-        Ok(exit_status)
+        match wait_result {
+            Some(Ok(status)) => {
+                self.drain_readers().await;
+                let exit_status = map_exit_status(status);
+                self.publish_exit_status(exit_status.clone()).await;
+                Ok(exit_status)
+            }
+            Some(Err(err)) => Err(TerminalRuntimeError::Internal(format!(
+                "failed waiting for terminal process to exit: {err}"
+            ))),
+            None => {
+                let exit_status = self.await_published_exit_status().await?;
+                self.drain_readers().await;
+                Ok(exit_status)
+            }
+        }
     }
 
     async fn kill_command(&self) -> Result<(), TerminalRuntimeError> {
+        // Signal waiters first so any concurrent `wait_for_exit` drops the
+        // child mutex via its cancel branch. Do not acquire `child` before this.
+        self.cancel.cancel();
+
         self.refresh_exit_status().await?;
         let already_exited = self.snapshot.lock().await.exit_status.is_some();
         if already_exited {
@@ -227,6 +315,11 @@ impl TerminalInstance {
         let exit_status = {
             let mut child_guard = self.child.lock().await;
             let Some(child) = child_guard.as_mut() else {
+                // Waiter may still be finishing a natural exit, or another kill
+                // already cleared the child. Wait for the published status.
+                drop(child_guard);
+                let _ = self.await_published_exit_status().await?;
+                self.drain_readers().await;
                 return Ok(());
             };
 
@@ -246,9 +339,7 @@ impl TerminalInstance {
         };
 
         self.drain_readers().await;
-
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.exit_status = Some(exit_status);
+        self.publish_exit_status(exit_status).await;
         Ok(())
     }
 
@@ -625,8 +716,27 @@ impl TerminalRuntime {
         };
 
         for terminal in removed {
-            if let Err(err) = terminal.kill_command().await {
-                tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+            match tokio::time::timeout(RELEASE_KILL_BOUND, terminal.kill_command()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+                }
+                Err(_) => {
+                    // Do not block connection/cancel recovery on a stuck kill.
+                    // The cancel token was already signalled if kill_command
+                    // started; keep trying in the background.
+                    tracing::error!(
+                        "[ACP] terminal kill exceeded {RELEASE_KILL_BOUND:?} during session release; continuing in background"
+                    );
+                    let terminal = Arc::clone(&terminal);
+                    tokio::spawn(async move {
+                        if let Err(err) = terminal.kill_command().await {
+                            tracing::error!(
+                                "[ACP] background terminal kill after release timeout failed: {err:?}"
+                            );
+                        }
+                    });
+                }
             }
         }
     }
@@ -1434,5 +1544,110 @@ mod tests {
             output.contains("ran-relative"),
             "relative space-containing exe was not run in the effective cwd; got:\n{output}"
         );
+    }
+
+    /// Regression: a concurrent `wait_for_terminal_exit` must not hold the
+    /// child mutex across the whole process lifetime in a way that blocks
+    /// `release_all_for_session` / kill. Without CancellationToken, this
+    /// deadlocks for the full sleep duration (and cancel UI hangs forever).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_wait_and_session_release_completes_promptly() {
+        let runtime = Arc::new(test_runtime(platform_test_shell()));
+        let session_id = SessionId::new("wait-release-race");
+
+        #[cfg(windows)]
+        let command = "Start-Sleep -Seconds 3600".to_string();
+        #[cfg(unix)]
+        let command = "sleep 3600".to_string();
+
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(session_id.clone(), command))
+            .await
+            .expect("create long-running terminal");
+        let terminal_id = response.terminal_id.clone();
+
+        // Capture the child PID before concurrent wait/release so we can assert
+        // the process tree was actually terminated (not just that futures
+        // unblocked).
+        let child_pid = {
+            let terminal = runtime
+                .find_terminal(terminal_id.0.as_ref(), session_id.0.as_ref())
+                .await
+                .expect("terminal exists");
+            let guard = terminal.child.lock().await;
+            guard.as_ref().and_then(|child| child.id())
+        };
+        assert!(child_pid.is_some(), "expected a live child pid before release");
+
+        let wait_runtime = Arc::clone(&runtime);
+        let wait_session = session_id.clone();
+        let wait_terminal = terminal_id.clone();
+        let wait_handle = tokio::spawn(async move {
+            wait_runtime
+                .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                    wait_session,
+                    wait_terminal,
+                ))
+                .await
+        });
+
+        // Ensure the waiter has a chance to acquire the child mutex first.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let release_runtime = Arc::clone(&runtime);
+        let release_session = session_id.0.to_string();
+        let release_handle = tokio::spawn(async move {
+            release_runtime
+                .release_all_for_session(&release_session)
+                .await;
+        });
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            let wait_result = wait_handle.await.expect("wait task join");
+            release_handle.await.expect("release task join");
+            wait_result
+        })
+        .await
+        .expect("wait+release must complete within 5s (cancel/kill deadlock regression)");
+
+        let wait_response = joined.expect("wait_for_terminal_exit after kill");
+        // Killed processes may report signal/non-zero code depending on OS;
+        // the critical property is that wait returned at all with a status.
+        assert!(
+            wait_response.exit_status.exit_code.is_some()
+                || wait_response.exit_status.signal.is_some(),
+            "expected an exit code or signal after kill; got {:?}",
+            wait_response.exit_status
+        );
+
+        if let Some(pid) = child_pid {
+            // Give the OS a brief moment to reap; kill_tree should have
+            // terminated the process already by the time wait returned.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !process_is_alive(pid),
+                "process tree root pid {pid} still alive after session release"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_is_alive(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout);
+                text.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 }

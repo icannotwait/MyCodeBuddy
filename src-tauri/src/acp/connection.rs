@@ -4366,9 +4366,26 @@ async fn run_conversation_loop<'a>(
                                         Agent,
                                         CancelNotification::new(sid.clone()),
                                     );
-                                    // Also terminate any command runtimes created for this
-                                    // session so cancellation does not hang on long-running
-                                    // terminal tools.
+                                    // Immediately emit TurnComplete so the frontend
+                                    // transitions out of "prompting" and the user can
+                                    // send new messages. Do this BEFORE terminal cleanup:
+                                    // killing long-running terminal tools can still take
+                                    // time (or hit the release bound), and must not gate
+                                    // UI recovery. Don't wait for the agent either —
+                                    // it may be slow to respond or not respond at all.
+                                    emit_with_state(
+                                        state,
+                                        emitter,
+                                        AcpEvent::TurnComplete {
+                                            session_id: sid.0.to_string(),
+                                            stop_reason: "cancelled".into(),
+                                            agent_type: agent_type.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    // Terminate command runtimes for this session so
+                                    // cancellation does not leave long-running tools
+                                    // alive. Bounded inside TerminalRuntime.
                                     terminal_runtime
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
@@ -4381,20 +4398,6 @@ async fn run_conversation_loop<'a>(
                                         ));
                                     }
                                     drop(locked);
-                                    // Immediately emit TurnComplete so the frontend
-                                    // transitions out of "prompting" and the user can
-                                    // send new messages.  Don't wait for the agent --
-                                    // it may be slow to respond or not respond at all.
-                                    emit_with_state(
-                                        state,
-                                        emitter,
-                                        AcpEvent::TurnComplete {
-                                            session_id: sid.0.to_string(),
-                                            stop_reason: "cancelled".into(),
-                                            agent_type: agent_type.to_string(),
-                                        },
-                                    )
-                                    .await;
                                     // Cascade-cancel any in-flight delegations owned by
                                     // this parent connection. Idempotent with the
                                     // cleanup-guard cancel_by_parent at the end of
