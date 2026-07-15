@@ -2920,6 +2920,37 @@ async fn handle_permission_request(
     .await;
 }
 
+async fn emit_cancelled_permission_events(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    request_ids: impl IntoIterator<Item = String>,
+) {
+    for request_id in request_ids {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PermissionResolved { request_id },
+        )
+        .await;
+    }
+}
+
+async fn cancel_pending_permissions(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    perms: &PendingPermissions,
+) {
+    let drained = perms.lock().await.drain().collect::<Vec<_>>();
+    let mut request_ids = Vec::with_capacity(drained.len());
+    for (request_id, responder) in drained {
+        let _ = responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+        request_ids.push(request_id);
+    }
+    emit_cancelled_permission_events(state, emitter, request_ids).await;
+}
+
 fn respond_terminal_request<T: sacp::JsonRpcResponse>(
     responder: Responder<T>,
     result: Result<T, TerminalRuntimeError>,
@@ -4383,21 +4414,14 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
-                                    // Terminate command runtimes for this session so
-                                    // cancellation does not leave long-running tools
-                                    // alive. Bounded inside TerminalRuntime.
+                                    tracked_terminal_tool_calls.clear();
+                                    cancel_pending_permissions(state, emitter, perms).await;
+                                    // Terminate command runtimes only after turn
+                                    // bookkeeping and permission responders are
+                                    // cleared. Bounded inside TerminalRuntime.
                                     terminal_runtime
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
-                                    tracked_terminal_tool_calls.clear();
-                                    // Also cancel any pending permission requests
-                                    let mut locked = perms.lock().await;
-                                    for (_, responder) in locked.drain() {
-                                        let _ = responder.respond(RequestPermissionResponse::new(
-                                            RequestPermissionOutcome::Cancelled,
-                                        ));
-                                    }
-                                    drop(locked);
                                     // Cascade-cancel any in-flight delegations owned by
                                     // this parent connection. Idempotent with the
                                     // cleanup-guard cancel_by_parent at the end of
@@ -4445,16 +4469,11 @@ async fn run_conversation_loop<'a>(
                                         Agent,
                                         CancelNotification::new(sid.clone()),
                                     );
+                                    tracked_terminal_tool_calls.clear();
+                                    cancel_pending_permissions(state, emitter, perms).await;
                                     terminal_runtime
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
-                                    tracked_terminal_tool_calls.clear();
-                                    let mut locked = perms.lock().await;
-                                    for (_, responder) in locked.drain() {
-                                        let _ = responder.respond(RequestPermissionResponse::new(
-                                            RequestPermissionOutcome::Cancelled,
-                                        ));
-                                    }
                                     disconnect_requested = true;
                                     break;
                                 }
@@ -4545,16 +4564,10 @@ async fn run_conversation_loop<'a>(
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+                cancel_pending_permissions(state, emitter, perms).await;
                 terminal_runtime
                     .release_all_for_session(sid.0.as_ref())
                     .await;
-                let mut locked = perms.lock().await;
-                for (_, responder) in locked.drain() {
-                    let _ = responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ));
-                }
-                drop(locked);
                 // Cascade-cancel any pending delegations owned by this parent.
                 // Reached when Cancel arrives between prompts (idle path); the
                 // inner Cancel handler covers mid-prompt. Both must trigger
@@ -5827,6 +5840,37 @@ mod tests {
             d = d.old_text(o.to_string());
         }
         ToolCallContent::Diff(d)
+    }
+
+    #[tokio::test]
+    async fn cancelled_permission_ids_emit_resolution_events() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-permissions".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "win".to_string(),
+            None,
+        )));
+        let emitter = EventEmitter::Noop;
+
+        emit_cancelled_permission_events(
+            &state,
+            &emitter,
+            vec!["p-1".to_string(), "p-2".to_string()],
+        )
+        .await;
+
+        let guard = state.read().await;
+        let resolved = guard
+            .recent_events_after(0)
+            .expect("events recorded")
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AcpEvent::PermissionResolved { request_id } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resolved, vec!["p-1", "p-2"]);
     }
 
     /// Mirrors the connection-loop prompt path: ledger/UI use original user

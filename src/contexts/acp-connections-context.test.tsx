@@ -575,6 +575,45 @@ describe("AcpConnectionsProvider permission request details", () => {
     expect(parsed.command).toBe("pnpm test -- --runInBand")
     expect(parsed.cwd).toBe("/tmp/x")
   })
+
+  it("clears a pending permission when the turn completes", async () => {
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "permission_request",
+      request_id: "req-cancelled",
+      tool_call: {
+        kind: "execute",
+        status: "pending",
+        toolCallId: "call-cancelled",
+      },
+      options: [],
+    })
+    expect(h.store!.getConnection(TAB)!.pendingPermission).not.toBeNull()
+
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "turn_complete",
+      session_id: "sess-1",
+      stop_reason: "cancelled",
+    })
+
+    expect(h.store!.getConnection(TAB)!.pendingPermission).toBeNull()
+  })
 })
 
 describe("AcpConnectionsProvider session load failures", () => {

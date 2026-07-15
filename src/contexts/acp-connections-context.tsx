@@ -3191,6 +3191,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           flushStreamingQueue()
           flushPendingToolCallUpdates()
           dispatch({
+            type: "PERMISSION_CLEARED",
+            contextKey,
+          })
+          dispatch({
             type: "STATUS_CHANGED",
             contextKey,
             status: "connected",
