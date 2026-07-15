@@ -68,8 +68,16 @@ async fn release_timeout_does_not_cancel_exit_publication() {
         assert!(std::time::Instant::now() < wall_deadline, "kill did not clear child");
         tokio::task::yield_now().await;
     }
+    // Keep publication blocked after the child has been cleared. The pending
+    // reader gives this task time to acquire the snapshot lock first.
+    let snapshot_guard = terminal.snapshot.lock().await;
+    for _ in 0..3 {
+        tokio::time::advance(READER_DRAIN_GRACE).await;
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(RELEASE_KILL_BOUND).await;
     release.await.expect("release task join");
+    drop(snapshot_guard);
 
     for _ in 0..100 {
         if terminal.snapshot().await.exit_status.is_some() {
