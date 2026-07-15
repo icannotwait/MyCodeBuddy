@@ -2,7 +2,7 @@
 
 Date: 2026-07-16
 
-Status: Direction approved; pending written-spec review
+Status: Revised after written-spec review; pending final user approval
 
 ## Summary
 
@@ -576,6 +576,483 @@ or P3 expands the rendering architecture.
 After one stable release, remove the legacy single-event desktop listener and
 temporary flags only if field diagnostics show no integrity or recovery issue.
 
+## Detailed Phase Roadmap
+
+This roadmap covers P0 through P4 at file and task level. Proposed new filenames
+define ownership boundaries; an implementation plan may adjust a filename to
+match local module conventions, but it must not merge the boundaries or change
+behavior without design review.
+
+Execution remains sequential. Every phase produces correctness tests and a
+performance report before the next phase starts. A later phase may be reduced
+or skipped only when the preceding report already meets all final acceptance
+targets and shows that phase's intended hotspot is no longer material.
+
+### P0: Measurement And Baseline
+
+#### P0.1 Backend Delivery Metrics
+
+Modify:
+
+- `src-tauri/src/acp/internal_bus.rs`
+- `src-tauri/src/web/handlers/event_metrics.rs`
+- `src-tauri/src/web/event_bridge.rs`
+- `src-tauri/src/lib.rs`
+
+Tasks:
+
+1. Add desktop-delivery counters alongside the existing event-bus counters.
+2. Count raw desktop envelopes, estimated payload bytes, emit attempts,
+   failures, and fallback selection for the current single-event path.
+3. Expose the combined snapshot through a desktop Tauri diagnostic command as
+   well as the existing authenticated HTTP debug endpoint.
+4. Keep counters atomic and payload-free; no message text enters metrics.
+5. Add unit tests for snapshot values and no-subscriber/no-desktop behavior.
+
+Deliverable: a backend metric snapshot that can compare P0 single-event
+delivery with P1 batched delivery using the same field names.
+
+#### P0.2 Deterministic ACP Performance Fixtures
+
+Add under test-utils ownership:
+
+- `src-tauri/src/acp/perf_fixture.rs`
+- focused Rust fixture tests beside the module
+
+Tasks:
+
+1. Generate the approved prose, CJK, code, table, math, Mermaid, tool, plan,
+   and control-event stream deterministically from a fixture version and seed.
+2. Support 100, 500, and 1,000 envelope-per-second schedules without sleeping
+   inside unit tests; the desktop replay driver applies timing.
+3. Split syntax and tool output at adversarial chunk boundaries, including
+   delimiters divided across envelopes.
+4. Feed events through `emit_with_state` so the fixture uses normal state,
+   sequencing, ring-buffer, and desktop emission behavior.
+5. Register an explicit test-utils-only desktop replay command. Release builds
+   do not expose it.
+6. Assert deterministic event count, final canonical live message, final tool
+   state, and event sequence.
+
+Deliverable: versioned synthetic inputs that do not depend on a Grok account or
+real user transcripts.
+
+#### P0.3 Frontend Recorder And Report
+
+Add:
+
+- `src/lib/perf/streaming-perf-recorder.ts`
+- `src/lib/perf/streaming-perf-report.ts`
+- focused Vitest tests for percentile and fallback calculations
+
+Instrument narrowly in:
+
+- `src/contexts/acp-connections-context.tsx`
+- `src/stores/conversation-runtime-store.ts`
+- `src/components/message/message-list-view.tsx`
+
+Tasks:
+
+1. Mark event receipt, reducer completion, live-store publication, React commit,
+   and next animation frame with a shared replay run ID.
+2. Observe long tasks when supported and otherwise measure animation-frame gaps
+   and event-loop drift.
+3. Add a render counter for the conversation panel, historical rows, live row,
+   Markdown blocks, and tool cards.
+4. Add a synthetic composer-input probe that measures responsiveness without
+   modifying a user's draft.
+5. Produce a local JSON report with fixture/build/platform metadata and pass or
+   fail results. Do not upload it.
+6. Ensure every production hot-path check is one disabled boolean branch when
+   no replay is active.
+
+Deliverables:
+
+- one checked Windows WebView2 baseline report for each rate profile;
+- a short baseline summary identifying IPC, state, render, and paint shares;
+- a repeatable command documented next to the recorder.
+
+#### P0 Exit Gate
+
+P0 is complete when the same fixture produces repeatable reports in three
+consecutive runs, event integrity matches the canonical final state, and the
+report can attribute the visible pause to measured stages rather than a single
+undifferentiated duration.
+
+### P1: Desktop Batching And Transactional Ingestion
+
+#### P1.1 Rust Desktop Batcher
+
+Add:
+
+- `src-tauri/src/acp/desktop_event_batcher.rs`
+
+Modify:
+
+- `src-tauri/src/acp/mod.rs`
+- `src-tauri/src/web/event_bridge.rs`
+- `src-tauri/src/lib.rs`
+
+Tasks:
+
+1. Implement the bounded queue and the 16 ms, 128-envelope, 64 KiB, control
+   event, and shutdown flush rules.
+2. Preserve raw ordered `EventEnvelope` values in `acp://event-batch`.
+3. Add a startup capability/mode query so frontend and backend select exactly
+   one delivery event name.
+4. Record queue pressure, batch size, bytes, latency, failures, and startup
+   fallback in the P0 metric snapshot.
+5. Keep InternalEventBus, recent-event replay, and WebSocket emission unchanged.
+6. Implement runtime batcher-failure signaling without hot-switching event
+   names.
+7. Cover timers with paused Tokio time so tests are deterministic.
+
+Tests:
+
+- every flush trigger;
+- multi-connection order;
+- bounded-queue backpressure;
+- shutdown drain;
+- startup fallback;
+- runtime failure signal;
+- no duplicate desktop emission;
+- unchanged server and internal-bus behavior.
+
+#### P1.2 Batch Types And Event Ingestor
+
+Add:
+
+- `src/lib/acp/event-ingestor.ts`
+- `src/lib/acp/event-ingestor.test.ts`
+
+Modify:
+
+- `src/lib/types.ts`
+- `src/contexts/acp-connections-context.tsx`
+- the desktop transport subscription boundary under `src/lib/transport/`
+
+Tasks:
+
+1. Define and validate the desktop batch payload.
+2. Select batch or legacy subscription once from backend startup capability.
+3. Move connection lookup, cursor checks, pending-frame queue, and raw subscriber
+   ordering into `EventIngestor`.
+4. Compact adjacent content and thinking deltas without crossing another event.
+5. Preserve ordered tool append updates and every control event.
+6. Detect sequence gaps before committing state and request recovery.
+7. Drain all queued Tauri batches once per animation frame.
+
+#### P1.3 One Store Transaction Per Frame
+
+Modify:
+
+- `src/contexts/acp-connections-context.tsx`
+- its focused reducer/provider tests
+
+Tasks:
+
+1. Replace the 16 ms frontend timer, 256-item immediate flush, and tool-forced
+   text flushes with the ingestor frame transaction.
+2. Clone the outer connection map once per committed frame.
+3. Advance `lastAppliedSeq` once per connection.
+4. Mirror the final live message once per connection.
+5. Notify render-relevant listeners once and avoid notifications for cursor-only
+   changes.
+6. Invoke raw event subscribers after the committed state is visible.
+7. Keep the legacy single-envelope path passing through the same transaction
+   helper for behavioral parity.
+
+Tests:
+
+- final reducer state equals sequential application;
+- sink and listener call counts are bounded per frame;
+- permission, question, error, cancellation, and completion ordering;
+- rekey, reconnect, buffered-unmapped-event, and subscriber exception behavior;
+- no duplicate or missing sequence after fallback/recovery.
+
+#### P1 Performance Comparison And Exit Gate
+
+Repeat all P0 reports. P1 exits when:
+
+- event and final-state parity pass;
+- desktop callback and store-commit counts are bounded by emitted batches rather
+  than raw envelopes;
+- IPC plus state-apply cost materially decreases from baseline;
+- no input, control-event latency, or long-task metric regresses;
+- the report identifies whether rendering work still prevents the final user
+  targets from passing.
+
+### P2: Stable History And Incremental Live Projection
+
+#### P2.1 Historical Timeline Selector
+
+Modify:
+
+- `src/stores/conversation-runtime-store.ts`
+- `src/stores/runtime-live-message-slice-decoupling.test.ts`
+- timeline-focused store tests
+
+Tasks:
+
+1. Split historical timeline construction from live-message construction.
+2. Key the historical cache from stable persisted, local, background, and
+   optimistic references instead of the complete session object.
+3. Exclude the active assistant reply from the historical selector.
+4. Preserve existing persisted-partial suppression, optimistic deduplication,
+   delegation kickoff, background ordering, and turn-ID collision rules.
+5. Add an explicit selector invariant: any number of live/cursor-only updates
+   returns the same timeline array and historical turn references.
+
+Tests:
+
+- existing timeline edge cases remain unchanged;
+- hundreds of live updates preserve exact historical references;
+- a real persisted/local/background/optimistic change invalidates the cache;
+- cross-conversation streaming remains isolated.
+
+#### P2.2 Live Transcript Projection Store
+
+Add:
+
+- `src/stores/live-transcript-store.ts`
+- `src/lib/acp/live-transcript-projector.ts`
+- focused projector and store tests
+
+Tasks:
+
+1. Define stable text, thinking, tool, plan, and generated-image segments.
+2. Build a projection once from a canonical live snapshot.
+3. Apply accepted event batches incrementally from `EventIngestor`.
+4. Keep segment-list identity stable for text append and isolated tool updates.
+5. Use stable segment and tool IDs across snapshot, reconnect, and rekey.
+6. Keep canonical `LiveMessage` as the recovery and completion authority.
+7. Rebuild from canonical state after a projection error without advancing a
+   false UI cursor.
+8. Compare the projector's completed render model with
+   `buildStreamingTurnsFromLiveMessage` across every agent fixture.
+
+Tests:
+
+- text/thinking append;
+- text-tool-text round boundaries;
+- tool create/update/finalize and child-agent nesting;
+- Kimi plan replacement;
+- CodeBuddy/Codex delegation metadata;
+- generated image placeholders and completion;
+- snapshot attach, reconnect, rekey, cancellation, and recovery parity.
+
+#### P2.3 Message List Split And Live Footer
+
+Add:
+
+- `src/components/message/live-transcript-row.tsx`
+- focused render-count and handoff tests
+
+Modify:
+
+- `src/components/message/message-list-view.tsx`
+- `src/components/message/virtualized-message-thread.tsx`
+- `src/components/message/message-scroll-context.tsx` only if the footer needs
+  the existing scroll handle
+
+Tasks:
+
+1. Make `MessageListView` subscribe to historical items, not the canonical live
+   message.
+2. Add a stable footer slot inside `MessageThreadContent` but outside Virtua's
+   item array.
+3. Render `LiveTranscriptRow` from narrow live-store selectors.
+4. Move live stats, plan, and delegation overlays to narrow subscriptions.
+5. Promote the completed live projection once, with no blank or duplicate row.
+6. Preserve message navigation indices, user-turn jumps, exports, reply
+   artifacts, and sub-agent dialog behavior.
+
+#### P2 Exit Gate
+
+P2 exits when the historical thread and rows record zero additional renders
+during the active portion of every reference fixture, live snapshot/recovery
+parity passes, and the performance report shows remaining cost localized to the
+live footer or browser layout rather than the full timeline.
+
+### P3: Incremental Rich Content And Tool Isolation
+
+#### P3.1 Incremental Markdown Document
+
+Add:
+
+- `src/lib/markdown/incremental-stream-blocks.ts`
+- `src/components/message/streaming-markdown-document.tsx`
+- `src/components/message/streaming-markdown-document.test.tsx`
+
+Modify:
+
+- `src/components/ai-elements/message.tsx`
+- `src/components/message/content-parts-renderer.tsx`
+
+Tasks:
+
+1. Store immutable sealed blocks plus one active tail per text segment.
+2. Track fence state incrementally across arbitrary chunk boundaries.
+3. Call Streamdown's block splitter only after a possible safe boundary and only
+   on the current tail.
+4. Render sealed blocks as memoized static `MessageResponse` instances.
+5. Render the active tail as escaped, selectable, copyable lightweight text.
+6. Preserve incomplete constructs as text rather than repairing them early.
+7. Transfer sealed partitions through live-to-local completion in a bounded UI
+   cache.
+8. Fall back to canonical full Markdown if incremental partition invariants fail.
+
+Tests:
+
+- paragraphs, headings, lists, blockquotes, HTML blocks, GFM tables, math, CJK,
+  and inline constructs;
+- backtick and tilde fences with split open/close delimiters;
+- extremely long unclosed fences and tables;
+- tool boundaries and turn completion;
+- final rendered text and semantics equal the static renderer;
+- stable blocks do not re-render while the tail grows.
+
+#### P3.2 Deferred Rich Engines
+
+Modify:
+
+- `src/components/ai-elements/code-block.tsx`
+- `src/components/ai-elements/streamdown-plugins.ts`
+- associated tests
+
+Tasks:
+
+1. Remove duplicate highlight starts for one code/language version.
+2. Add shared in-flight highlight entries and stale-callback rejection.
+3. Replace unbounded token storage with a measured bounded LRU.
+4. Keep live code plain and schedule sealed code highlighting during idle time.
+5. Render math only after block sealing.
+6. Defer Mermaid until turn completion and near-viewport visibility.
+7. Add capability fallbacks for WebViews without `requestIdleCallback` or the
+   chosen visibility API behavior.
+8. Move Shiki to a worker only if the P3 report still attributes material long
+   tasks to tokenization.
+
+Tests:
+
+- one in-flight highlighter call per version;
+- LRU eviction and byte/entry cap;
+- stale async result rejection;
+- idle fallback;
+- no live Mermaid render;
+- source-visible fallback after engine failure.
+
+#### P3.3 Per-Tool Subscriptions And Lazy Bodies
+
+Modify:
+
+- `src/stores/live-transcript-store.ts`
+- `src/components/message/content-parts-renderer.tsx`
+- tool, terminal, diff, delegation, and background-task components reached by
+  the live renderer
+
+Tasks:
+
+1. Store tool records by `toolCallId` and expose per-tool selectors.
+2. Update only the affected visible tool card per batch.
+3. Render collapsed-group summaries without mounting hidden child cards.
+4. Keep running terminal output as bounded plain/terminal text.
+5. Delay Markdown, structured JSON, diff parsing, and full output construction
+   until completion or expansion.
+6. Preserve append ordering, truncation indicators, permissions, nested agent
+   summaries, and error states.
+
+Tests:
+
+- unrelated tool cards and historical rows do not re-render;
+- collapsed groups do not mount heavy descendants;
+- ordered output append and truncation;
+- expand-during-stream and collapse-during-stream behavior;
+- final completed tool output matches the canonical renderer.
+
+#### P3 Exit Gate
+
+P3 exits when all 100/500/1,000-rate reference fixtures meet the input and
+batch-to-paint targets, no main-thread task exceeds 200 ms, final rich output
+matches the static path, and any remaining long task has an identified P4
+layout or platform owner.
+
+### P4: Scroll, Layout, Platform Hardening, And Release Gate
+
+#### P4.1 Scroll And Virtualizer Coordination
+
+Modify:
+
+- `src/components/ai-elements/message-thread.tsx`
+- `src/components/message/virtualized-message-thread.tsx`
+- `src/components/message/live-transcript-row.tsx`
+- focused scroll and message-list tests
+
+Tasks:
+
+1. Use explicit instant resize behavior for active streaming and restore normal
+   completed-message behavior after handoff.
+2. Coalesce at-bottom correction with the committed live frame.
+3. Stop following immediately on user scroll and preserve the visible anchor.
+4. Limit high-frequency observation to the live footer.
+5. Prevent a sealed-block height change from causing repeated corrections.
+6. Keep message navigation and `scrollToIndex` correct with the external footer.
+7. Verify keyboard scrolling, selection, wheel/touch cancellation, expanded
+   tools, RTL, and reopen-mid-stream behavior.
+
+#### P4.2 Layout And Cache Budgets
+
+Modify only where profiling proves value:
+
+- message-row and live-row classes in `src/app/globals.css`;
+- virtualizer buffer and estimate configuration;
+- Markdown partition and highlight cache limits.
+
+Tasks:
+
+1. Evaluate `content-visibility` and layout/paint containment on stable historical
+   rows without breaking measurement or accessibility.
+2. Tune Virtua overscan from reference traces, including long conversations.
+3. Define entry and byte budgets for every new cache.
+4. Add reset hooks for conversation removal, logout, tests, and memory pressure
+   where the platform exposes it.
+5. Run a long-session soak with repeated large replies and verify bounded heap
+   growth after garbage collection opportunities.
+
+#### P4.3 Cross-Platform And Failure Recovery
+
+Tasks:
+
+1. Run functional replay on Windows WebView2, macOS WKWebView, and Linux
+   WebKitGTK.
+2. Verify long-task, idle-callback, visibility, and frame-gap fallbacks.
+3. Test hardware acceleration enabled and disabled on Windows.
+4. Exercise startup legacy selection, runtime batcher failure, sequence-gap
+   recovery, projection rebuild, and rich-render fallback.
+5. Confirm server and remote WebSocket sessions retain their existing delivery
+   path and behavior.
+6. Confirm performance mode never writes prompt or response content to reports.
+
+#### P4.4 Final Verification And Release Evidence
+
+Tasks:
+
+1. Run every repository command in `Required Repository Verification`.
+2. Save final reference reports beside the baseline run metadata.
+3. Write a concise before/after summary with P50/P95/max values and render counts.
+4. Document the three internal rollout flags and operator diagnostics.
+5. Keep the legacy listener and flags for the stated one-release observation
+   period; P4 records removal readiness but does not remove them early.
+6. Record any deferred worker migration or platform-specific optimization as a
+   measured follow-up, not an open-ended item in this scope.
+
+#### P4 Exit Gate
+
+P4 exits only when all acceptance criteria, repository checks, Windows absolute
+targets, cross-platform functional smoke tests, recovery scenarios, and privacy
+checks pass. The final report must make clear which phases produced each measured
+gain.
+
 ## Acceptance Criteria
 
 1. The reference Grok-like workload no longer pauses and jumps forward.
@@ -598,22 +1075,19 @@ temporary flags only if field diagnostics show no integrity or recovery issue.
 12. The Windows reference workload meets the stated latency and long-task
     targets, and all required repository checks pass.
 
-## Implementation Sequence
+## Implementation Planning Rules
 
-The implementation plan should preserve these review checkpoints:
+The detailed implementation plan must include P0 through P4 and map every task
+group above to focused tests, files, verification commands, and a review
+checkpoint. The plan may be stored as one roadmap, but execution is gated at
+the end of each phase and must not begin a later phase before the preceding
+performance report is reviewed.
 
-1. Measurement and replay infrastructure, producing a checked baseline report.
-2. Desktop batcher and batch-aware frontend transaction, with legacy fallback.
-3. Historical/live data separation and incremental live projection.
-4. Incremental Markdown tail and completed-turn handoff.
-5. Tool subscriptions, deferred highlighting, math, and Mermaid behavior.
-6. Scroll/layout tuning, cross-platform checks, and removal-readiness review.
+P0/P1 measurements may tune numeric constants, cache budgets, and optional
+worker use in later phases. They may not remove final acceptance criteria or
+collapse the historical/live, event-ingestion, and rich-render ownership
+boundaries without returning to design review.
 
-Do not combine all checkpoints into one unreviewable rewrite. Each checkpoint
-must include its focused tests and before/after performance evidence before the
-next begins.
-
-The first detailed implementation plan should cover P0 and P1. P2 through P4
-remain governed by this design, but each receives a follow-on plan after the
-preceding performance report is reviewed. This prevents unmeasured assumptions
-from hardening into the live-render architecture.
+Do not implement P0 through P4 as one unreviewable change. Each phase should be
+mergeable and reversible with its own correctness evidence and before/after
+performance report.
