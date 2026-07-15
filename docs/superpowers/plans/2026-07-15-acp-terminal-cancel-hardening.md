@@ -37,7 +37,6 @@ Add a current-thread Tokio test that creates a long-running terminal, appends a 
 ```rust
 #[tokio::test]
 async fn release_timeout_does_not_cancel_exit_publication() {
-    tokio::time::pause();
     let runtime = Arc::new(test_runtime(platform_test_shell()));
     let session_id = SessionId::new("release-timeout-publication");
     let response = runtime
@@ -51,14 +50,11 @@ async fn release_timeout_does_not_cancel_exit_publication() {
         .find_terminal(response.terminal_id.0.as_ref(), session_id.0.as_ref())
         .await
         .expect("terminal exists");
-    terminal
-        .reader_handles
-        .lock()
-        .await
-        .push(tokio::spawn(std::future::pending()));
+    let reader_handles_guard = terminal.reader_handles.lock().await;
 
     let release_runtime = Arc::clone(&runtime);
     let release_session = session_id.0.to_string();
+    let release_started = std::time::Instant::now();
     let release = tokio::spawn(async move {
         release_runtime.release_all_for_session(&release_session).await;
     });
@@ -68,16 +64,12 @@ async fn release_timeout_does_not_cancel_exit_publication() {
         assert!(std::time::Instant::now() < wall_deadline, "kill did not clear child");
         tokio::task::yield_now().await;
     }
-    // Keep publication blocked after the child has been cleared. The pending
-    // reader gives this task time to acquire the snapshot lock first.
-    let snapshot_guard = terminal.snapshot.lock().await;
-    for _ in 0..3 {
-        tokio::time::advance(READER_DRAIN_GRACE).await;
-        tokio::task::yield_now().await;
-    }
+    assert!(release_started.elapsed() < RELEASE_KILL_BOUND);
+    tokio::time::pause();
     tokio::time::advance(RELEASE_KILL_BOUND).await;
     release.await.expect("release task join");
-    drop(snapshot_guard);
+    assert!(terminal.snapshot().await.exit_status.is_none());
+    drop(reader_handles_guard);
 
     for _ in 0..100 {
         if terminal.snapshot().await.exit_status.is_some() {
