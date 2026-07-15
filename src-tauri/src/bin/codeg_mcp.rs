@@ -35,7 +35,7 @@ use codeg_lib::acp::delegation::companion::{
     JsonRpcResponse, LineAction, SpawnResult,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 struct Args {
@@ -119,16 +119,16 @@ fn parse_args() -> Result<Args, String> {
 
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
 /// inline so the write-mutex critical section stays tight.
-async fn write_response(
-    stdout: &Arc<Mutex<Stdout>>,
+async fn write_response<W: AsyncWrite + Unpin>(
+    stdout: &Arc<Mutex<W>>,
     resp: &JsonRpcResponse,
 ) -> std::io::Result<()> {
-    let serialized = serde_json::to_string(resp).map_err(|e| {
+    let mut frame = serde_json::to_vec(resp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
     })?;
+    frame.push(b'\n');
     let mut guard = stdout.lock().await;
-    guard.write_all(serialized.as_bytes()).await?;
-    guard.write_all(b"\n").await?;
+    guard.write_all(&frame).await?;
     guard.flush().await?;
     Ok(())
 }
@@ -264,4 +264,62 @@ async fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use serde_json::json;
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_response_emits_one_complete_jsonl_write() {
+        let stdout = Arc::new(Mutex::new(RecordingWriter::default()));
+        let response =
+            codeg_lib::acp::delegation::companion::ok(json!(7), json!({ "ready": true }));
+
+        write_response(&stdout, &response).await.unwrap();
+
+        let writer = stdout.lock().await;
+        assert_eq!(writer.writes.len(), 1, "response must use one write");
+        assert_eq!(writer.flushes, 1, "response must flush once");
+        let frame = &writer.writes[0];
+        assert_eq!(frame.last(), Some(&b'\n'));
+        let decoded: JsonRpcResponse = serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
+        assert_eq!(decoded.id, json!(7));
+        assert_eq!(decoded.result, Some(json!({ "ready": true })));
+    }
 }
