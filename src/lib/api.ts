@@ -2734,11 +2734,13 @@ async function downloadWorkspaceViaRemoteProxy(opts: {
 
 export async function getFileTree(
   path: string,
-  maxDepth?: number
+  maxDepth?: number,
+  includeIgnored = false
 ): Promise<FileTreeNode[]> {
   return getTransport().call("get_file_tree", {
     path,
     maxDepth: maxDepth ?? null,
+    includeIgnored,
   })
 }
 
@@ -2756,6 +2758,11 @@ export interface WorkspaceFileSearchResult {
   truncated: boolean
 }
 
+export interface WorkspaceFileSearchIdentity {
+  searchSessionId: string
+  requestId: string
+}
+
 /**
  * Search workspace files on demand (ignore-aware walk with early exit).
  * Prefer this over `getFileTree` for `@` mentions and the command palette —
@@ -2764,13 +2771,22 @@ export interface WorkspaceFileSearchResult {
 export async function searchWorkspaceFiles(
   path: string,
   query = "",
-  limit = 50
+  limit = 50,
+  identity?: WorkspaceFileSearchIdentity
 ): Promise<WorkspaceFileSearchResult> {
   return getTransport().call("search_workspace_files", {
     path,
     query,
     limit,
+    searchSessionId: identity?.searchSessionId ?? null,
+    requestId: identity?.requestId ?? null,
   })
+}
+
+export async function cancelWorkspaceFileSearch(
+  identity: WorkspaceFileSearchIdentity
+): Promise<boolean> {
+  return getTransport().call("cancel_workspace_file_search", { ...identity })
 }
 
 export async function startWorkspaceStateStream(

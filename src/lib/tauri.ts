@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core"
 import { getCurrentEffectiveAppLocale } from "./i18n"
 import type {
+  WorkspaceFileSearchIdentity,
+  WorkspaceFileSearchResult,
+} from "./api"
+import type {
   AgentType,
   ConversationSummary,
   ConversationDetail,
@@ -1073,20 +1077,35 @@ export async function listDirectoryEntries(
 
 export async function getFileTree(
   path: string,
-  maxDepth?: number
+  maxDepth?: number,
+  includeIgnored = false
 ): Promise<FileTreeNode[]> {
-  return invoke("get_file_tree", { path, maxDepth: maxDepth ?? null })
+  return invoke("get_file_tree", {
+    path,
+    maxDepth: maxDepth ?? null,
+    includeIgnored,
+  })
 }
 
 export async function searchWorkspaceFiles(
   path: string,
   query = "",
-  limit = 50
-): Promise<{
-  files: Array<{ name: string; path: string; kind: "file" | "dir" }>
-  truncated: boolean
-}> {
-  return invoke("search_workspace_files", { path, query, limit })
+  limit = 50,
+  identity?: WorkspaceFileSearchIdentity
+): Promise<WorkspaceFileSearchResult> {
+  return invoke("search_workspace_files", {
+    path,
+    query,
+    limit,
+    searchSessionId: identity?.searchSessionId ?? null,
+    requestId: identity?.requestId ?? null,
+  })
+}
+
+export async function cancelWorkspaceFileSearch(
+  identity: WorkspaceFileSearchIdentity
+): Promise<boolean> {
+  return invoke("cancel_workspace_file_search", { ...identity })
 }
 
 export async function startWorkspaceStateStream(

@@ -287,6 +287,9 @@ const mocks = vi.hoisted(() => ({
   gitLog: vi.fn(),
   getDelegationProfiles: vi.fn(),
   searchWorkspaceFiles: vi.fn(),
+  cancelWorkspaceFileSearch: vi.fn(),
+  randomUUID: vi.fn(),
+  uuidCounter: 0,
 }))
 
 vi.mock("@/hooks/use-acp-agents", () => ({
@@ -300,6 +303,12 @@ vi.mock("@/lib/api", () => ({
     mocks.getDelegationProfiles(...args),
   searchWorkspaceFiles: (...args: unknown[]) =>
     mocks.searchWorkspaceFiles(...args),
+  cancelWorkspaceFileSearch: (...args: unknown[]) =>
+    mocks.cancelWorkspaceFileSearch(...args),
+}))
+vi.mock("@/lib/utils", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/utils")>()),
+  randomUUID: () => mocks.randomUUID(),
 }))
 
 describe("useReferenceSearch", () => {
@@ -313,6 +322,12 @@ describe("useReferenceSearch", () => {
     mocks.searchWorkspaceFiles.mockReset().mockResolvedValue({
       files: [],
       truncated: false,
+    })
+    mocks.cancelWorkspaceFileSearch.mockReset().mockResolvedValue(true)
+    mocks.uuidCounter = 0
+    mocks.randomUUID.mockReset().mockImplementation(() => {
+      mocks.uuidCounter += 1
+      return `uuid-${mocks.uuidCounter}`
     })
   })
 
@@ -364,7 +379,12 @@ describe("useReferenceSearch", () => {
 
     expect(mocks.listAllConversations).toHaveBeenCalledTimes(1)
     expect(mocks.gitLog).toHaveBeenCalledWith("/repo", 100)
-    expect(mocks.searchWorkspaceFiles).toHaveBeenCalledWith("/repo", "", 50)
+    expect(mocks.searchWorkspaceFiles).toHaveBeenCalledWith(
+      "/repo",
+      "",
+      50,
+      { searchSessionId: "uuid-1", requestId: "uuid-2" }
+    )
     expect(itemsOf(groups, "session")).toHaveLength(1)
     expect(itemsOf(groups, "commit")).toHaveLength(1)
     expect(itemsOf(groups, "file")).toHaveLength(1)
@@ -386,7 +406,8 @@ describe("useReferenceSearch", () => {
     expect(mocks.searchWorkspaceFiles).toHaveBeenLastCalledWith(
       "/repo",
       "ab",
-      50
+      50,
+      { searchSessionId: "uuid-1", requestId: "uuid-4" }
     )
   })
 
@@ -422,6 +443,37 @@ describe("useReferenceSearch", () => {
       groups = (await pending) as SuggestionGroup[]
     })
     expect(groups).toEqual([])
+    expect(mocks.cancelWorkspaceFileSearch).toHaveBeenCalledWith({
+      searchSessionId: "uuid-1",
+      requestId: "uuid-2",
+    })
+  })
+
+  it("cancels the matching file request when the hook unmounts", async () => {
+    let resolveFiles!: (value: { files: []; truncated: false }) => void
+    mocks.searchWorkspaceFiles.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFiles = resolve
+        })
+    )
+    const { result, unmount } = renderHook(() =>
+      useReferenceSearch({ defaultPath: "/repo", enabled: true })
+    )
+
+    let pending!: ReturnType<typeof result.current>
+    act(() => {
+      pending = result.current("waiting")
+    })
+    unmount()
+
+    expect(mocks.cancelWorkspaceFileSearch).toHaveBeenCalledWith({
+      searchSessionId: "uuid-1",
+      requestId: "uuid-2",
+    })
+
+    resolveFiles({ files: [], truncated: false })
+    await pending
   })
 
   it("degrades gracefully with no workspace path: agents resolve, files/commits stay empty (R8)", async () => {

@@ -5,11 +5,14 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import {
+  cancelWorkspaceFileSearch,
   getDelegationProfiles,
   gitLog,
   listAllConversations,
   searchWorkspaceFiles,
+  type WorkspaceFileSearchIdentity,
 } from "@/lib/api"
+import { randomUUID } from "@/lib/utils"
 import type {
   AcpAgentInfo,
   DbConversationSummary,
@@ -42,6 +45,10 @@ const MAX_PER_GROUP = 50
 /** How many commits the git-log group pulls (client-filtered down from here). */
 const GIT_LOG_LIMIT = 100
 const EMPTY_COMMITS: Promise<GitLogEntry[]> = Promise.resolve([])
+
+function cancelFileSearchSilently(identity: WorkspaceFileSearchIdentity): void {
+  void cancelWorkspaceFileSearch(identity).catch(() => undefined)
+}
 
 /** Display headings for each group; injected so the host can localize them. */
 export interface ReferenceGroupLabels {
@@ -263,6 +270,8 @@ export function useReferenceSearch({
   const pathRef = useRef(path)
   const enabledRef = useRef(enabled)
   const labelsRef = useRef(labels)
+  const fileSearchSessionIdRef = useRef<string | null>(null)
+  const activeFileSearchRef = useRef<WorkspaceFileSearchIdentity | null>(null)
 
   // `pathRef` and `enabledRef` gate the post-await freshness check in `search`,
   // so they must reflect the *committed* folder/enabled state synchronously at
@@ -273,6 +282,13 @@ export function useReferenceSearch({
   useIsomorphicLayoutEffect(() => {
     pathRef.current = path
     enabledRef.current = enabled
+    return () => {
+      const active = activeFileSearchRef.current
+      if (active) {
+        activeFileSearchRef.current = null
+        cancelFileSearchSilently(active)
+      }
+    }
   }, [path, enabled])
 
   useEffect(() => {
@@ -307,7 +323,7 @@ export function useReferenceSearch({
   }, [])
 
   return useCallback<ReferenceSearch>(async (query, signal) => {
-    if (!enabledRef.current) return []
+    if (!enabledRef.current || signal?.aborted) return []
 
     const path = pathRef.current
 
@@ -358,12 +374,46 @@ export function useReferenceSearch({
 
     // On-demand file search — only when there is a workspace path. No pre-warm:
     // the popup already debounces (~150ms) before calling `search`.
-    const filesPromise = path
-      ? searchWorkspaceFiles(path, query, MAX_PER_GROUP).catch(() => ({
-          files: [],
-          truncated: false,
-        }))
-      : Promise.resolve({ files: [], truncated: false })
+    let filesPromise: ReturnType<typeof searchWorkspaceFiles> = Promise.resolve({
+      files: [],
+      truncated: false,
+    })
+    if (path) {
+      const searchSessionId =
+        fileSearchSessionIdRef.current ??
+        (fileSearchSessionIdRef.current = randomUUID())
+      const identity: WorkspaceFileSearchIdentity = {
+        searchSessionId,
+        requestId: randomUUID(),
+      }
+      const previous = activeFileSearchRef.current
+      if (previous) {
+        activeFileSearchRef.current = null
+        cancelFileSearchSilently(previous)
+      }
+      activeFileSearchRef.current = identity
+
+      const onAbort = () => {
+        if (activeFileSearchRef.current === identity) {
+          activeFileSearchRef.current = null
+        }
+        cancelFileSearchSilently(identity)
+      }
+      signal?.addEventListener("abort", onAbort, { once: true })
+      filesPromise = searchWorkspaceFiles(
+        path,
+        query,
+        MAX_PER_GROUP,
+        identity
+      )
+        .catch(() => ({ files: [], truncated: false }))
+        .finally(() => {
+          signal?.removeEventListener("abort", onAbort)
+          if (activeFileSearchRef.current === identity) {
+            activeFileSearchRef.current = null
+          }
+        })
+    }
 
     const [sessions, commits, profiles, fileSearch] = await Promise.all([
       sessionsEntry.promise,
