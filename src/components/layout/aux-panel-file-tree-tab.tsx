@@ -23,7 +23,11 @@ import {
 } from "@/contexts/workspace-context"
 import { useIgnoredFileTree } from "@/hooks/use-ignored-file-tree"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
-import { finishLazyLoad, isIgnoreFileName } from "@/hooks/use-file-tree"
+import {
+  advanceLazyLoadGeneration,
+  finishLazyLoad,
+  isIgnoreFileName,
+} from "@/hooks/use-file-tree"
 import { findOwningFolder } from "@/lib/file-open-target"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
@@ -994,6 +998,7 @@ export function FileTreeTab() {
   const expandedPathsRef = useRef<Set<string>>(new Set([FILE_TREE_ROOT_PATH]))
   const workspaceTreeRef = useRef<FileTreeNode[]>(sourceTree)
   const appliedTreeGenerationRef = useRef<number | null>(null)
+  const lazyLoadGenerationRef = useRef(0)
   const lazyRequestConfigRef = useRef({
     rootPath: folder?.path ?? null,
     showIgnored,
@@ -1011,7 +1016,10 @@ export function FileTreeTab() {
     expandedPathsRef.current = new Set([FILE_TREE_ROOT_PATH])
     setGitignoreIgnoredPaths(new Set())
     lazyLoadedChildrenByPathRef.current.clear()
-    lazyLoadingDirPathsRef.current.clear()
+    lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+      lazyLoadingDirPathsRef.current,
+      lazyLoadGenerationRef.current
+    )
   }, [folder?.path])
 
   // Handle pending reveal path: expand all ancestor directories once tree is loaded
@@ -1067,7 +1075,10 @@ export function FileTreeTab() {
         (path) => path !== FILE_TREE_ROOT_PATH
       )
       lazyLoadedChildrenByPathRef.current.clear()
-      lazyLoadingDirPathsRef.current.clear()
+      lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+        lazyLoadingDirPathsRef.current,
+        lazyLoadGenerationRef.current
+      )
       await workspaceState.requestResync("manual_refresh")
       if (showIgnored) {
         await refreshIgnoredTree()
@@ -1108,7 +1119,8 @@ export function FileTreeTab() {
       if (!normalizedDirPath) return
       if (lazyLoadedChildrenByPathRef.current.has(normalizedDirPath)) return
       if (
-        lazyLoadingDirPathsRef.current.get(normalizedDirPath) === treeGeneration
+        lazyLoadingDirPathsRef.current.get(normalizedDirPath) ===
+        lazyLoadGenerationRef.current
       ) {
         return
       }
@@ -1131,7 +1143,8 @@ export function FileTreeTab() {
 
       const requestRootPath = rootPath
       const requestShowIgnored = showIgnored
-      const requestGeneration = treeGeneration
+      const requestTreeGeneration = treeGeneration
+      const requestGeneration = lazyLoadGenerationRef.current
       lazyLoadingDirPathsRef.current.set(
         normalizedDirPath,
         requestGeneration
@@ -1146,7 +1159,7 @@ export function FileTreeTab() {
         if (
           current.rootPath !== requestRootPath ||
           current.showIgnored !== requestShowIgnored ||
-          current.treeGeneration !== requestGeneration ||
+          current.treeGeneration !== requestTreeGeneration ||
           lazyLoadingDirPathsRef.current.get(normalizedDirPath) !==
             requestGeneration
         ) {
@@ -1182,7 +1195,10 @@ export function FileTreeTab() {
     if (generationChanged) {
       appliedTreeGenerationRef.current = treeGeneration
       lazyLoadedChildrenByPathRef.current.clear()
-      lazyLoadingDirPathsRef.current.clear()
+      lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+        lazyLoadingDirPathsRef.current,
+        lazyLoadGenerationRef.current
+      )
     }
 
     workspaceTreeRef.current = sourceTree

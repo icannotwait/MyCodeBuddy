@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  advanceLazyLoadGeneration,
   finishLazyLoad,
   hasIgnoredAncestor,
   isIgnoreFileName,
@@ -52,5 +53,15 @@ describe("finishLazyLoad", () => {
 
     finishLazyLoad(inFlight, "src", 2)
     expect(inFlight.has("src")).toBe(false)
+  })
+
+  it("keeps an old same-mode request from owning a post-refresh marker", () => {
+    const inFlight = new Map([["src", 1]])
+
+    const nextGeneration = advanceLazyLoadGeneration(inFlight, 1)
+    inFlight.set("src", nextGeneration)
+
+    finishLazyLoad(inFlight, "src", 1)
+    expect(inFlight.get("src")).toBe(nextGeneration)
   })
 })

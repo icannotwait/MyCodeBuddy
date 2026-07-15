@@ -380,6 +380,14 @@ impl WatchEventBatch {
     }
 }
 
+fn is_ignore_control_path(path: &str) -> bool {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path);
+    matches!(name, ".gitignore" | ".ignore" | ".rgignore")
+}
+
 fn normalize_slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -947,8 +955,11 @@ async fn flush_watch_batch(
     // mid-stream upgrades the very next batch.
     let wants_tree_git = full_subscribers.load(Ordering::Acquire) > 0;
 
+    let ignore_rules_changed = changed_paths
+        .iter()
+        .any(|path| is_ignore_control_path(path));
     let should_refresh_tree =
-        wants_tree_git && (batch.overflowed || event_kind_hint != "modify");
+        wants_tree_git && (batch.overflowed || event_kind_hint != "modify" || ignore_rules_changed);
     let is_git = wants_tree_git && is_git_repo(root_canonical);
     let should_refresh_git = is_git
         && (batch.overflowed
@@ -1800,6 +1811,53 @@ mod tests {
         let event = guard.recent_events.back().expect("recent event");
         assert_eq!(event.fs_event_kind.as_deref(), Some("create"));
         assert_eq!(event.changed_paths, vec!["a.txt".to_string()]);
+        assert!(event
+            .payload
+            .iter()
+            .any(|delta| matches!(delta, WorkspaceDelta::TreeReplace { .. })));
+    }
+
+    #[tokio::test]
+    async fn flush_watch_batch_refreshes_tree_when_ignore_file_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".gitignore"), b"").expect("write ignore file");
+        std::fs::create_dir_all(dir.path().join("generated")).expect("create generated dir");
+        std::fs::write(dir.path().join("generated/out.txt"), b"out").expect("write generated file");
+        let root_display = dir.path().to_string_lossy().to_string();
+        let initial_tree = folders::get_file_tree(root_display.clone(), Some(2), None)
+            .await
+            .expect("initial tree");
+        assert!(initial_tree
+            .iter()
+            .any(|node| { matches!(node, FileTreeNode::Dir { path, .. } if path == "generated") }));
+
+        std::fs::write(dir.path().join(".gitignore"), b"generated/\n").expect("update ignore file");
+        let state = Arc::new(Mutex::new(WorkspaceStateCore::new(
+            root_display.clone(),
+            initial_tree,
+            Vec::new(),
+            false,
+        )));
+        let full_subscribers = AtomicUsize::new(1);
+        let batch = batch_with_paths(&[".gitignore"]);
+
+        flush_watch_batch(
+            &state,
+            &test_emitter(),
+            &root_display,
+            dir.path(),
+            &full_subscribers,
+            &batch,
+        )
+        .await;
+
+        let guard = state.lock().expect("state lock");
+        assert!(!guard
+            .tree_snapshot
+            .iter()
+            .any(|node| { matches!(node, FileTreeNode::Dir { path, .. } if path == "generated") }));
+        let event = guard.recent_events.back().expect("recent event");
+        assert_eq!(event.fs_event_kind.as_deref(), Some("modify"));
         assert!(event
             .payload
             .iter()

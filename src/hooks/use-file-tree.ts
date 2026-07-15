@@ -76,6 +76,14 @@ export function finishLazyLoad(
   }
 }
 
+export function advanceLazyLoadGeneration(
+  inFlight: Map<string, number>,
+  currentGeneration: number
+): number {
+  inFlight.clear()
+  return currentGeneration + 1
+}
+
 interface UseFileTreeOptions {
   folderPath: string | undefined
   enabled: boolean
