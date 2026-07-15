@@ -3,8 +3,13 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
 
 import { useAcpAgents } from "@/hooks/use-acp-agents"
-import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
-import { getDelegationProfiles, gitLog, listAllConversations } from "@/lib/api"
+import type { FlatFileEntry } from "@/hooks/use-file-tree"
+import {
+  getDelegationProfiles,
+  gitLog,
+  listAllConversations,
+  searchWorkspaceFiles,
+} from "@/lib/api"
 import type {
   AcpAgentInfo,
   DbConversationSummary,
@@ -62,6 +67,13 @@ export const DEFAULT_GROUP_LABELS: ReferenceGroupLabels = {
 /** Raw, already-loaded data the pure group builder turns into suggestions. */
 export interface ReferenceSearchSources {
   files: FlatFileEntry[]
+  /**
+   * When true, `files` were already filtered/capped by the backend search
+   * (or a test fixture) for the current query — do not re-filter on the client.
+   */
+  filesAlreadyFiltered?: boolean
+  /** Server-side (or fixture) truncated flag when `filesAlreadyFiltered`. */
+  filesTruncated?: boolean
   /** Workspace root the `files` were loaded under; null disables the group. */
   workspaceRoot: string | null
   agents: AcpAgentInfo[]
@@ -98,22 +110,32 @@ export function buildReferenceGroups(
 ): SuggestionGroup[] {
   const q = query.trim().toLowerCase()
 
-  // Files: filter the (potentially large) list on its pre-lowered fields before
-  // paying to adapt the survivors. `truncated` is a cheap boolean — set when a
-  // match is found past the cap — so we never scan the whole list for a count.
+  // Files: either already filtered by backend search (on-demand path) or a local
+  // list that still needs client-side substring matching (unit tests / legacy).
   const fileItems: SuggestionItem[] = []
   let fileTruncated = false
   const root = sources.workspaceRoot
   if (root) {
-    for (const entry of sources.files) {
-      if (q && !entry.lowerName.includes(q) && !entry.lowerPath.includes(q)) {
-        continue
+    if (sources.filesAlreadyFiltered) {
+      for (const entry of sources.files) {
+        if (fileItems.length >= MAX_PER_GROUP) {
+          fileTruncated = true
+          break
+        }
+        fileItems.push(fileToSuggestion(entry, root))
       }
-      if (fileItems.length >= MAX_PER_GROUP) {
-        fileTruncated = true
-        break
+      fileTruncated = fileTruncated || Boolean(sources.filesTruncated)
+    } else {
+      for (const entry of sources.files) {
+        if (q && !entry.lowerName.includes(q) && !entry.lowerPath.includes(q)) {
+          continue
+        }
+        if (fileItems.length >= MAX_PER_GROUP) {
+          fileTruncated = true
+          break
+        }
+        fileItems.push(fileToSuggestion(entry, root))
       }
-      fileItems.push(fileToSuggestion(entry, root))
     }
   }
 
@@ -188,19 +210,32 @@ export interface UseReferenceSearchOptions {
    */
   defaultPath?: string | null
   /**
-   * Gates loading. When false the search resolves to empty groups and the file
-   * tree is never fetched — let the host pre-warm only the active composer.
+   * Gates searching. When false the search resolves to empty groups and no
+   * network / workspace file search is issued.
    */
   enabled?: boolean
   /** Localized group headings; English fallbacks when omitted. */
   labels?: ReferenceGroupLabels
 }
 
+function hitToFlatEntry(hit: {
+  name: string
+  path: string
+  kind: string
+}): FlatFileEntry {
+  const kind: "file" | "dir" = hit.kind === "dir" ? "dir" : "file"
+  return {
+    name: hit.name,
+    relativePath: hit.path,
+    kind,
+    lowerPath: hit.path.toLowerCase(),
+    lowerName: hit.name.toLowerCase(),
+  }
+}
+
 /**
- * Compose the live data sources (file tree, ACP agents, conversations, git log)
- * into a single {@link ReferenceSearch} for the composer's `@` panel. (Skills,
- * commands and experts are inserted via the `/` / `$` triggers and the expert
- * menu, not this panel.)
+ * Compose the live data sources (workspace file search, ACP agents, conversations,
+ * git log) into a single {@link ReferenceSearch} for the composer's `@` panel.
  *
  * Referential stability is the contract: the suggestion popup re-runs its fetch
  * whenever the `search` identity changes (`suggestion-popup.tsx`), so the
@@ -209,9 +244,10 @@ export interface UseReferenceSearchOptions {
  * on window focus) updates the refs but leaves `search` identity untouched — the
  * open panel keeps its results and the user's selection (R7).
  *
- * Files and agents are hook-loaded (and pre-warmed via `enabled`). Sessions and
- * the git log are fetched lazily on the first `@`, key-cached in a ref, and
- * awaited by `search` so the first open is populated without an extra keystroke;
+ * **Files are never pre-warmed.** Opening `@` (or typing a filter) calls
+ * `search_workspace_files` with limit {@link MAX_PER_GROUP}; the backend walks
+ * with ignore rules and early-exits once enough hits are found. Sessions and
+ * the git log stay lazily fetched on the first `@`, key-cached in a ref;
  * window focus busts those caches so they stay fresh.
  */
 export function useReferenceSearch({
@@ -221,19 +257,8 @@ export function useReferenceSearch({
 }: UseReferenceSearchOptions): ReferenceSearch {
   const path = defaultPath || null
 
-  const { allFiles, loaded } = useFileTree({
-    folderPath: path ?? undefined,
-    enabled,
-  })
   const { agents } = useAcpAgents()
 
-  // Mirror every changing source into a ref so `search` can stay identity-stable
-  // (see the doc comment). Initialized from the first render so the refs are
-  // sane even before the sync effect below runs.
-  const filesRef = useRef<{ root: string | null; files: FlatFileEntry[] }>({
-    root: null,
-    files: [],
-  })
   const agentsRef = useRef(agents)
   const pathRef = useRef(path)
   const enabledRef = useRef(enabled)
@@ -251,16 +276,9 @@ export function useReferenceSearch({
   }, [path, enabled])
 
   useEffect(() => {
-    // Only expose files once the tree has loaded for the *current* path, so the
-    // search never joins the current workspace root onto a previous folder's
-    // relative paths during a folder switch.
-    filesRef.current =
-      loaded && path
-        ? { root: path, files: allFiles }
-        : { root: null, files: [] }
     agentsRef.current = agents
     labelsRef.current = labels
-  }, [allFiles, loaded, path, agents, labels])
+  }, [agents, labels])
 
   // Lazily-fetched network sources, key-cached so repeat searches reuse the
   // in-flight/resolved promise while a folder switch refetches.
@@ -277,6 +295,7 @@ export function useReferenceSearch({
   // Bust the lazy caches when the window regains focus so a session created in
   // another window (or new commits) show up on the next `@` — matching the
   // focus-refresh idiom of the other data hooks, without per-keystroke fetches.
+  // File search is always live (query-keyed); no file cache to bust.
   useEffect(() => {
     const onFocus = () => {
       sessionsRef.current = null
@@ -337,10 +356,20 @@ export function useReferenceSearch({
         return []
       })
 
-    const [sessions, commits, profiles] = await Promise.all([
+    // On-demand file search — only when there is a workspace path. No pre-warm:
+    // the popup already debounces (~150ms) before calling `search`.
+    const filesPromise = path
+      ? searchWorkspaceFiles(path, query, MAX_PER_GROUP).catch(() => ({
+          files: [],
+          truncated: false,
+        }))
+      : Promise.resolve({ files: [], truncated: false })
+
+    const [sessions, commits, profiles, fileSearch] = await Promise.all([
       sessionsEntry.promise,
       commitsPromise,
       profilesRef.current,
+      filesPromise,
     ])
     // Discard this result if it can no longer be trusted for the live panel: a
     // newer query aborted us, the composer was disabled, or the workspace folder
@@ -352,12 +381,13 @@ export function useReferenceSearch({
       return []
     }
 
-    const fileState = filesRef.current
     return buildReferenceGroups(
       query,
       {
-        files: fileState.files,
-        workspaceRoot: fileState.root,
+        files: fileSearch.files.map(hitToFlatEntry),
+        filesAlreadyFiltered: true,
+        filesTruncated: fileSearch.truncated,
+        workspaceRoot: path,
         agents: agentsRef.current,
         profiles,
         sessions,

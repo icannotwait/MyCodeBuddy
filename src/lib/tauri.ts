@@ -1078,6 +1078,17 @@ export async function getFileTree(
   return invoke("get_file_tree", { path, maxDepth: maxDepth ?? null })
 }
 
+export async function searchWorkspaceFiles(
+  path: string,
+  query = "",
+  limit = 50
+): Promise<{
+  files: Array<{ name: string; path: string; kind: "file" | "dir" }>
+  truncated: boolean
+}> {
+  return invoke("search_workspace_files", { path, query, limit })
+}
+
 export async function startWorkspaceStateStream(
   rootPath: string
 ): Promise<WorkspaceSnapshotResponse> {

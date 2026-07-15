@@ -2742,6 +2742,37 @@ export async function getFileTree(
   })
 }
 
+/** Flat hit from on-demand workspace file search (no full tree payload). */
+export interface WorkspaceFileHit {
+  name: string
+  /** Relative path from the workspace root. */
+  path: string
+  kind: "file" | "dir"
+}
+
+export interface WorkspaceFileSearchResult {
+  files: WorkspaceFileHit[]
+  /** True when more matches exist past `limit`. */
+  truncated: boolean
+}
+
+/**
+ * Search workspace files on demand (ignore-aware walk with early exit).
+ * Prefer this over `getFileTree` for `@` mentions and the command palette —
+ * it never materializes the full tree on the client.
+ */
+export async function searchWorkspaceFiles(
+  path: string,
+  query = "",
+  limit = 50
+): Promise<WorkspaceFileSearchResult> {
+  return getTransport().call("search_workspace_files", {
+    path,
+    query,
+    limit,
+  })
+}
+
 export async function startWorkspaceStateStream(
   rootPath: string,
   wantsTreeGit = true

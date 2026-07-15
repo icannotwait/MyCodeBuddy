@@ -22,6 +22,7 @@ import {
   useWorkspaceFileTabs,
 } from "@/contexts/workspace-context"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import { isIgnoreFileName } from "@/hooks/use-file-tree"
 import { findOwningFolder } from "@/lib/file-open-target"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
@@ -1292,14 +1293,26 @@ export function FileTreeTab() {
         const children = dirChildrenByPath.get(dirPath)
         if (!children || children.length === 0) continue
 
-        const gitignoreNode = children.find(
-          (child) => child.kind === "file" && child.name === ".gitignore"
+        // Honor the same gitignore-compatible set as `@` file search:
+        // .gitignore / .ignore / .rgignore (union of patterns in this dir).
+        const ignoreNodes = children.filter(
+          (child) => child.kind === "file" && isIgnoreFileName(child.name)
         )
-        if (!gitignoreNode || gitignoreNode.kind !== "file") continue
+        if (ignoreNodes.length === 0) continue
 
         try {
-          const result = await readFilePreview(folder.path, gitignoreNode.path)
-          const matcher = ignore().add(result.content)
+          const matcher = ignore()
+          for (const ignoreNode of ignoreNodes) {
+            try {
+              const result = await readFilePreview(
+                folder.path,
+                ignoreNode.path
+              )
+              matcher.add(result.content)
+            } catch {
+              // skip unreadable ignore file; others in this dir still apply
+            }
+          }
 
           // Collect all descendant nodes so multi-level patterns like
           // "public/vs" can be matched using relative paths.

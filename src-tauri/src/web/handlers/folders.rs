@@ -265,6 +265,26 @@ pub async fn get_file_tree(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceFilesParams {
+    pub path: String,
+    pub query: Option<String>,
+    pub limit: Option<usize>,
+}
+
+pub async fn search_workspace_files(
+    Json(params): Json<SearchWorkspaceFilesParams>,
+) -> Result<Json<folder_commands::WorkspaceFileSearchResult>, AppCommandError> {
+    let result = folder_commands::search_workspace_files(
+        params.path,
+        params.query,
+        params.limit,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenSettingsWindowParams {
     pub section: Option<String>,
     pub agent_type: Option<String>,

@@ -1,8 +1,7 @@
 "use client"
 
 import { useState, useEffect, useRef, useCallback } from "react"
-import ig from "ignore"
-import { getFileTree, readFilePreview } from "@/lib/api"
+import { getFileTree } from "@/lib/api"
 import type { FileTreeNode } from "@/lib/types"
 
 export interface FlatFileEntry {
@@ -14,6 +13,22 @@ export interface FlatFileEntry {
   lowerPath: string
   /** Pre-computed lowercase name for filtering */
   lowerName: string
+}
+
+/**
+ * Ignore files with gitignore-compatible syntax. The backend walk already
+ * prunes entries matched by these files (same set ripgrep uses by default);
+ * the frontend only uses the names to hide the ignore files themselves from
+ * `@` mentions / command-palette file search.
+ */
+export const IGNORE_FILE_NAMES = new Set([
+  ".gitignore",
+  ".ignore",
+  ".rgignore",
+])
+
+export function isIgnoreFileName(name: string): boolean {
+  return IGNORE_FILE_NAMES.has(name)
 }
 
 export function flattenTree(nodes: FileTreeNode[]): FlatFileEntry[] {
@@ -81,62 +96,14 @@ export function useFileTree({
 
     async function load() {
       try {
+        // Backend `get_file_tree` prunes via .gitignore / .ignore / .rgignore
+        // during the walk (ignore crate, same as ripgrep). No second-pass
+        // read of ignore files here — that used to dominate large-project cost.
         const tree = await getFileTree(folderPath!, 10)
-        const flat = flattenTree(tree)
-
-        // Collect all .gitignore files from the tree
-        const gitignoreEntries = flat.filter(
-          (f) => f.kind === "file" && f.name === ".gitignore"
-        )
-
-        // Build matchers keyed by directory prefix
-        const matchers: {
-          prefix: string
-          matcher: ReturnType<typeof ig>
-        }[] = []
-        await Promise.all(
-          gitignoreEntries.map(async (entry) => {
-            try {
-              const result = await readFilePreview(
-                folderPath!,
-                entry.relativePath
-              )
-              const lastSlash = entry.relativePath.lastIndexOf("/")
-              const dir =
-                lastSlash === -1 ? "" : entry.relativePath.slice(0, lastSlash)
-              matchers.push({
-                prefix: dir ? dir + "/" : "",
-                matcher: ig().add(result.content),
-              })
-            } catch {
-              // skip unreadable .gitignore
-            }
-          })
-        )
-
-        // Sort matchers by prefix length (shortest/root first)
-        matchers.sort((a, b) => a.prefix.length - b.prefix.length)
-
-        // Filter: check each entry against all applicable .gitignore matchers
-        const ignoredDirs = new Set<string>()
-        const filtered = flat.filter((f) => {
-          if (f.name === ".gitignore") return false
-          if (hasIgnoredAncestor(f.relativePath, ignoredDirs)) return false
-          for (const { prefix, matcher } of matchers) {
-            if (!f.relativePath.startsWith(prefix)) continue
-            const relPath = f.relativePath.slice(prefix.length)
-            if (!relPath) continue
-            const testPath = f.kind === "dir" ? `${relPath}/` : relPath
-            if (matcher.ignores(testPath)) {
-              if (f.kind === "dir") ignoredDirs.add(f.relativePath)
-              return false
-            }
-          }
-          return true
-        })
+        const flat = flattenTree(tree).filter((f) => !isIgnoreFileName(f.name))
 
         if (!canceled) {
-          setAllFiles(filtered)
+          setAllFiles(flat)
           loadedForPathRef.current = folderPath!
         }
       } catch {

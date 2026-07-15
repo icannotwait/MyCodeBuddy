@@ -283,20 +283,12 @@ describe("buildReferenceGroups", () => {
 
 const mocks = vi.hoisted(() => ({
   agents: [] as AcpAgentInfo[],
-  files: { allFiles: [] as FlatFileEntry[], loaded: false },
   listAllConversations: vi.fn(),
   gitLog: vi.fn(),
   getDelegationProfiles: vi.fn(),
+  searchWorkspaceFiles: vi.fn(),
 }))
 
-vi.mock("@/hooks/use-file-tree", () => ({
-  useFileTree: () => ({
-    allFiles: mocks.files.allFiles,
-    loaded: mocks.files.loaded,
-    loading: false,
-    reset: () => {},
-  }),
-}))
 vi.mock("@/hooks/use-acp-agents", () => ({
   useAcpAgents: () => ({ agents: mocks.agents, fresh: true, refresh: vi.fn() }),
 }))
@@ -306,17 +298,22 @@ vi.mock("@/lib/api", () => ({
   gitLog: (...args: unknown[]) => mocks.gitLog(...args),
   getDelegationProfiles: (...args: unknown[]) =>
     mocks.getDelegationProfiles(...args),
+  searchWorkspaceFiles: (...args: unknown[]) =>
+    mocks.searchWorkspaceFiles(...args),
 }))
 
 describe("useReferenceSearch", () => {
   beforeEach(() => {
     mocks.agents = []
-    mocks.files = { allFiles: [], loaded: false }
     mocks.listAllConversations.mockReset().mockResolvedValue([])
     mocks.gitLog
       .mockReset()
       .mockResolvedValue({ entries: [], has_upstream: false })
     mocks.getDelegationProfiles.mockReset().mockResolvedValue({ profiles: [] })
+    mocks.searchWorkspaceFiles.mockReset().mockResolvedValue({
+      files: [],
+      truncated: false,
+    })
   })
 
   it("returns a referentially stable search across data-source updates (R7)", async () => {
@@ -352,7 +349,10 @@ describe("useReferenceSearch", () => {
       entries: [makeCommit("abc1234", "fix")],
       has_upstream: false,
     })
-    mocks.files = { allFiles: [makeFile("a.ts")], loaded: true }
+    mocks.searchWorkspaceFiles.mockResolvedValue({
+      files: [{ name: "a.ts", path: "a.ts", kind: "file" }],
+      truncated: false,
+    })
 
     const { result } = renderHook(() =>
       useReferenceSearch({ defaultPath: "/repo", enabled: true })
@@ -364,12 +364,13 @@ describe("useReferenceSearch", () => {
 
     expect(mocks.listAllConversations).toHaveBeenCalledTimes(1)
     expect(mocks.gitLog).toHaveBeenCalledWith("/repo", 100)
+    expect(mocks.searchWorkspaceFiles).toHaveBeenCalledWith("/repo", "", 50)
     expect(itemsOf(groups, "session")).toHaveLength(1)
     expect(itemsOf(groups, "commit")).toHaveLength(1)
     expect(itemsOf(groups, "file")).toHaveLength(1)
   })
 
-  it("reuses the cached network promises across repeated searches", async () => {
+  it("reuses the cached network promises across repeated searches but re-queries files", async () => {
     const { result } = renderHook(() =>
       useReferenceSearch({ defaultPath: "/repo", enabled: true })
     )
@@ -380,6 +381,13 @@ describe("useReferenceSearch", () => {
     })
     expect(mocks.listAllConversations).toHaveBeenCalledTimes(1)
     expect(mocks.gitLog).toHaveBeenCalledTimes(1)
+    // File search is query-keyed (on-demand); each keystroke path hits the API.
+    expect(mocks.searchWorkspaceFiles).toHaveBeenCalledTimes(3)
+    expect(mocks.searchWorkspaceFiles).toHaveBeenLastCalledWith(
+      "/repo",
+      "ab",
+      50
+    )
   })
 
   it("resolves to no groups and touches no network when disabled", async () => {
@@ -393,6 +401,7 @@ describe("useReferenceSearch", () => {
     expect(groups).toEqual([])
     expect(mocks.listAllConversations).not.toHaveBeenCalled()
     expect(mocks.gitLog).not.toHaveBeenCalled()
+    expect(mocks.searchWorkspaceFiles).not.toHaveBeenCalled()
   })
 
   it("returns no groups when the query is aborted mid-fetch", async () => {
@@ -417,7 +426,6 @@ describe("useReferenceSearch", () => {
 
   it("degrades gracefully with no workspace path: agents resolve, files/commits stay empty (R8)", async () => {
     mocks.agents = [makeAgent("codex", { name: "Codex" })]
-    mocks.files = { allFiles: [makeFile("a.ts")], loaded: true }
 
     const { result } = renderHook(() => useReferenceSearch({ enabled: true }))
     let groups!: SuggestionGroup[]
@@ -429,6 +437,7 @@ describe("useReferenceSearch", () => {
     expect(itemsOf(groups, "commit")).toHaveLength(0)
     expect(itemsOf(groups, "agent")).toHaveLength(1)
     expect(mocks.gitLog).not.toHaveBeenCalled()
+    expect(mocks.searchWorkspaceFiles).not.toHaveBeenCalled()
   })
 
   it("does not leak the previous folder's commits when defaultPath changes mid-fetch", async () => {

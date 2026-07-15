@@ -11,7 +11,6 @@ use base64::Engine as _;
 use serde::Serialize;
 
 use tokio::sync::Semaphore;
-use walkdir::WalkDir;
 
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
@@ -2770,6 +2769,280 @@ pub async fn git_continue_operation(
 }
 
 const FILE_TREE_IGNORED_DIRS: &[&str] = &[".git", "__pycache__"];
+/// Ignore-file basenames (gitignore syntax) that we never surface as search hits.
+const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".rgignore"];
+/// Hard ceiling for a single search response (clients request ≤ this).
+const WORKSPACE_FILE_SEARCH_MAX_LIMIT: usize = 500;
+/// Default search limit when the caller omits one (matches `@` mention cap).
+const WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT: usize = 50;
+
+/// Shared walk options for file-tree builds and workspace file search: same
+/// ignore sources ripgrep honors by default (`.gitignore` / `.ignore` /
+/// `.rgignore` + git global/exclude), hard-skip of [FILE_TREE_IGNORED_DIRS]
+/// and `.DS_Store`, and visible dotfiles (e.g. `.env`).
+fn workspace_ignore_walk_builder(
+    root: &Path,
+    max_depth: Option<usize>,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    if let Some(depth) = max_depth {
+        builder.max_depth(Some(depth));
+    }
+    builder
+        // Keep dotfiles like `.env` / `.eslintrc` visible; ignore rules still apply.
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        // Plain `.ignore` files (gitignore syntax).
+        .ignore(true)
+        // `.rgignore` is not covered by `.ignore(true)` in the ignore crate —
+        // ripgrep registers it as a custom ignore filename; match that.
+        .add_custom_ignore_filename(".rgignore")
+        .parents(true)
+        // Apply `.gitignore` even when the folder is not a git worktree.
+        .require_git(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            }
+        });
+    builder
+}
+
+/// One hit from [`search_workspace_files_sync`] (flat, ready for `@` / palette).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileHit {
+    pub name: String,
+    /// Relative path from the workspace root (`/` separators).
+    pub path: String,
+    /// `"file"` or `"dir"`.
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileSearchResult {
+    pub files: Vec<WorkspaceFileHit>,
+    /// True when at least one more match exists past `limit` (cheap early-exit
+    /// probe — the walker stops after `limit + 1` matches).
+    pub truncated: bool,
+}
+
+/// Search workspace files/dirs under `root` without materializing the full tree.
+/// Applies the same ignore rules as [`build_file_tree_sync`], case-insensitive
+/// substring match on file name and relative path, and stops once `limit + 1`
+/// hits are found so large repos never pay a full walk when results are dense.
+pub(crate) fn search_workspace_files_sync(
+    root: PathBuf,
+    query: &str,
+    limit: usize,
+) -> Result<WorkspaceFileSearchResult, AppCommandError> {
+    let limit = limit
+        .clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
+    let q = query.trim().to_lowercase();
+    let mut files: Vec<WorkspaceFileHit> = Vec::with_capacity(limit);
+    let mut truncated = false;
+
+    let mut builder = workspace_ignore_walk_builder(&root, None);
+    // Stable name order within each directory so empty-query results are
+    // deterministic (same spirit as the nested tree builder).
+    builder.sort_by_file_name(|a, b| a.cmp(b));
+
+    for result in builder.build() {
+        let entry = result.map_err(|e| {
+            AppCommandError::io_error("Failed to search workspace files").with_detail(e.to_string())
+        })?;
+        let entry_path = entry.path();
+        if entry_path == root {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+        if IGNORE_FILE_NAMES.iter().any(|n| *n == name.as_ref()) {
+            continue;
+        }
+
+        let rel_path = entry_path
+            .strip_prefix(&root)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let matches = if q.is_empty() {
+            true
+        } else {
+            name.to_ascii_lowercase().contains(&q)
+                || rel_path.to_ascii_lowercase().contains(&q)
+        };
+        if !matches {
+            continue;
+        }
+
+        if files.len() >= limit {
+            truncated = true;
+            break;
+        }
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        files.push(WorkspaceFileHit {
+            name: name.into_owned(),
+            path: rel_path,
+            kind: if is_dir {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            },
+        });
+    }
+
+    Ok(WorkspaceFileSearchResult { files, truncated })
+}
+
+/// Build a nested file tree under `root`, pruning during the walk using the same
+/// ignore sources ripgrep honors by default:
+/// - `.gitignore` (always, even outside a git worktree — matches prior frontend
+///   post-filter behavior used by `@` mentions / file search)
+/// - `.ignore`
+/// - `.rgignore`
+/// - global/exclude git rules when present
+///
+/// Hard-skips [`FILE_TREE_IGNORED_DIRS`] and `.DS_Store` regardless of ignore
+/// files. `max_depth` is measured like `walkdir` (root = 0).
+///
+/// Prefer [`search_workspace_files_sync`] for mention/palette queries — this
+/// builds the full nested payload (used by the aux file tree and similar UIs).
+pub(crate) fn build_file_tree_sync(
+    root: PathBuf,
+    max_depth: usize,
+) -> Result<Vec<FileTreeNode>, AppCommandError> {
+    // Collect all entries, skipping ignored directories during the walk so large
+    // trees (node_modules, target, dist, …) never enter the result payload.
+    let mut dir_children: HashMap<PathBuf, Vec<FileTreeNode>> = HashMap::new();
+    let mut dir_order: Vec<PathBuf> = Vec::new();
+    let mut dir_paths_by_rel: HashMap<String, PathBuf> = HashMap::new();
+
+    let mut builder = workspace_ignore_walk_builder(&root, Some(max_depth));
+    // Stable, case-sensitive name order (same spirit as the previous WalkDir
+    // sort); final per-directory sort below is case-insensitive.
+    builder.sort_by_file_name(|a, b| a.cmp(b));
+
+    for result in builder.build() {
+        let entry = result.map_err(|e| {
+            AppCommandError::io_error("Failed to walk file tree").with_detail(e.to_string())
+        })?;
+        let entry_path = entry.path().to_path_buf();
+
+        // Skip the root itself
+        if entry_path == root {
+            dir_children.entry(root.clone()).or_default();
+            dir_order.push(root.clone());
+            continue;
+        }
+
+        let parent = entry_path.parent().unwrap_or(&root).to_path_buf();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry_path
+            .strip_prefix(&root)
+            .unwrap_or(&entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            dir_paths_by_rel.insert(rel_path.clone(), entry_path.clone());
+            dir_children.entry(entry_path.clone()).or_default();
+            dir_order.push(entry_path);
+            // Add a placeholder Dir node to parent (children filled later)
+            dir_children
+                .entry(parent)
+                .or_default()
+                .push(FileTreeNode::Dir {
+                    name,
+                    path: rel_path,
+                    children: vec![],
+                });
+        } else {
+            dir_children
+                .entry(parent)
+                .or_default()
+                .push(FileTreeNode::File {
+                    name,
+                    path: rel_path,
+                });
+        }
+    }
+
+    // Build tree bottom-up: process dirs in reverse order so children are ready
+    for dir_path in dir_order.iter().rev() {
+        let children = dir_children.remove(dir_path).unwrap_or_default();
+
+        // Sort: dirs first, then files, alphabetically within each group
+        let mut dirs: Vec<FileTreeNode> = Vec::new();
+        let mut files: Vec<FileTreeNode> = Vec::new();
+        for child in children {
+            match &child {
+                FileTreeNode::Dir { .. } => dirs.push(child),
+                FileTreeNode::File { .. } => files.push(child),
+            }
+        }
+        dirs.sort_by(|a, b| {
+            let a_name = match a {
+                FileTreeNode::Dir { name, .. } => name,
+                _ => unreachable!(),
+            };
+            let b_name = match b {
+                FileTreeNode::Dir { name, .. } => name,
+                _ => unreachable!(),
+            };
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        });
+        files.sort_by(|a, b| {
+            let a_name = match a {
+                FileTreeNode::File { name, .. } => name,
+                _ => unreachable!(),
+            };
+            let b_name = match b {
+                FileTreeNode::File { name, .. } => name,
+                _ => unreachable!(),
+            };
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        });
+
+        let mut sorted: Vec<FileTreeNode> = Vec::with_capacity(dirs.len() + files.len());
+
+        // Fill dir children from the map
+        for d in dirs {
+            if let FileTreeNode::Dir {
+                name,
+                path: rel_path,
+                ..
+            } = d
+            {
+                let full_path = dir_paths_by_rel
+                    .get(&rel_path)
+                    .cloned()
+                    .unwrap_or_else(|| root.join(Path::new(&rel_path)));
+                let sub_children = dir_children.remove(&full_path).unwrap_or_default();
+                sorted.push(FileTreeNode::Dir {
+                    name,
+                    path: rel_path,
+                    children: sub_children,
+                });
+            }
+        }
+        sorted.extend(files);
+
+        dir_children.insert(dir_path.clone(), sorted);
+    }
+
+    Ok(dir_children.remove(&root).unwrap_or_default())
+}
 
 /// Hard limit: refuse to open files larger than 50 MB in the text editor.
 const FILE_OPEN_HARD_LIMIT: usize = 50_000_000;
@@ -3215,133 +3488,32 @@ pub async fn get_file_tree(
 ) -> Result<Vec<FileTreeNode>, AppCommandError> {
     let root = PathBuf::from(&path);
     let depth = max_depth.unwrap_or(usize::MAX);
+    // Walk + ignore matching is CPU/IO heavy on large repos; keep it off the
+    // async runtime so concurrent IPC/WebSocket work stays responsive.
+    tokio::task::spawn_blocking(move || build_file_tree_sync(root, depth))
+        .await
+        .map_err(|e| {
+            AppCommandError::io_error("File tree walk task failed").with_detail(e.to_string())
+        })?
+}
 
-    // Collect all entries, skipping ignored directories
-    let mut dir_children: HashMap<PathBuf, Vec<FileTreeNode>> = HashMap::new();
-    let mut dir_order: Vec<PathBuf> = Vec::new();
-    let mut dir_paths_by_rel: HashMap<String, PathBuf> = HashMap::new();
-
-    for entry in WalkDir::new(&root)
-        .max_depth(depth)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if e.file_type().is_dir() {
-                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
-            } else {
-                name != ".DS_Store"
-            }
-        })
-    {
-        let entry = entry.map_err(|e| {
-            AppCommandError::io_error("Failed to walk file tree").with_detail(e.to_string())
-        })?;
-        let entry_path = entry.path().to_path_buf();
-
-        // Skip the root itself
-        if entry_path == root {
-            dir_children.entry(root.clone()).or_default();
-            dir_order.push(root.clone());
-            continue;
-        }
-
-        let parent = entry_path.parent().unwrap_or(&root).to_path_buf();
-        let name = entry.file_name().to_string_lossy().to_string();
-        let rel_path = entry_path
-            .strip_prefix(&root)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if entry.file_type().is_dir() {
-            dir_paths_by_rel.insert(rel_path.clone(), entry_path.clone());
-            dir_children.entry(entry_path.clone()).or_default();
-            dir_order.push(entry_path);
-            // Add a placeholder Dir node to parent (children filled later)
-            dir_children
-                .entry(parent)
-                .or_default()
-                .push(FileTreeNode::Dir {
-                    name,
-                    path: rel_path,
-                    children: vec![],
-                });
-        } else {
-            dir_children
-                .entry(parent)
-                .or_default()
-                .push(FileTreeNode::File {
-                    name,
-                    path: rel_path,
-                });
-        }
-    }
-
-    // Build tree bottom-up: process dirs in reverse order so children are ready
-    for dir_path in dir_order.iter().rev() {
-        let children = dir_children.remove(dir_path).unwrap_or_default();
-
-        // Sort: dirs first, then files, alphabetically within each group
-        let mut dirs: Vec<FileTreeNode> = Vec::new();
-        let mut files: Vec<FileTreeNode> = Vec::new();
-        for child in children {
-            match &child {
-                FileTreeNode::Dir { .. } => dirs.push(child),
-                FileTreeNode::File { .. } => files.push(child),
-            }
-        }
-        dirs.sort_by(|a, b| {
-            let a_name = match a {
-                FileTreeNode::Dir { name, .. } => name,
-                _ => unreachable!(),
-            };
-            let b_name = match b {
-                FileTreeNode::Dir { name, .. } => name,
-                _ => unreachable!(),
-            };
-            a_name.to_lowercase().cmp(&b_name.to_lowercase())
-        });
-        files.sort_by(|a, b| {
-            let a_name = match a {
-                FileTreeNode::File { name, .. } => name,
-                _ => unreachable!(),
-            };
-            let b_name = match b {
-                FileTreeNode::File { name, .. } => name,
-                _ => unreachable!(),
-            };
-            a_name.to_lowercase().cmp(&b_name.to_lowercase())
-        });
-
-        let mut sorted: Vec<FileTreeNode> = Vec::with_capacity(dirs.len() + files.len());
-
-        // Fill dir children from the map
-        for d in dirs {
-            if let FileTreeNode::Dir {
-                name,
-                path: rel_path,
-                ..
-            } = d
-            {
-                let full_path = dir_paths_by_rel
-                    .get(&rel_path)
-                    .cloned()
-                    .unwrap_or_else(|| root.join(Path::new(&rel_path)));
-                let sub_children = dir_children.remove(&full_path).unwrap_or_default();
-                sorted.push(FileTreeNode::Dir {
-                    name,
-                    path: rel_path,
-                    children: sub_children,
-                });
-            }
-        }
-        sorted.extend(files);
-
-        dir_children.insert(dir_path.clone(), sorted);
-    }
-
-    Ok(dir_children.remove(&root).unwrap_or_default())
+/// On-demand workspace file search for `@` mentions and the command palette.
+/// Does **not** return a full tree — only up to `limit` flat hits (default 50).
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn search_workspace_files(
+    path: String,
+    query: Option<String>,
+    limit: Option<usize>,
+) -> Result<WorkspaceFileSearchResult, AppCommandError> {
+    let root = PathBuf::from(&path);
+    let q = query.unwrap_or_default();
+    let lim = limit.unwrap_or(WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT);
+    tokio::task::spawn_blocking(move || search_workspace_files_sync(root, &q, lim))
+        .await
+        .map_err(|e| {
+            AppCommandError::io_error("Workspace file search task failed")
+                .with_detail(e.to_string())
+        })?
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -4741,6 +4913,189 @@ branch refs/heads/main";
             .await
             .expect("clear agent");
         assert_eq!(cleared.default_agent_type, None);
+    }
+
+    fn collect_tree_paths(nodes: &[FileTreeNode], out: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                FileTreeNode::File { path, .. } => out.push(path.clone()),
+                FileTreeNode::Dir {
+                    path, children, ..
+                } => {
+                    out.push(path.clone());
+                    collect_tree_paths(children, out);
+                }
+            }
+        }
+    }
+
+    fn write_tree_fixture(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, contents).expect("write");
+    }
+
+    #[test]
+    fn build_file_tree_prunes_gitignore_ignore_and_rgignore() {
+        // Layout:
+        //   src/a.ts                 kept
+        //   keep/me.ts               kept
+        //   node_modules/pkg/x.js    pruned by .gitignore
+        //   dist/out.js              pruned by .ignore
+        //   target/debug/foo         pruned by .rgignore
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "node_modules/\n");
+        write_tree_fixture(&root.path().join(".ignore"), "dist/\n");
+        write_tree_fixture(&root.path().join(".rgignore"), "target/\n");
+        write_tree_fixture(&root.path().join("src/a.ts"), "export {}\n");
+        write_tree_fixture(&root.path().join("keep/me.ts"), "export {}\n");
+        write_tree_fixture(
+            &root.path().join("node_modules/pkg/x.js"),
+            "module.exports=1\n",
+        );
+        write_tree_fixture(&root.path().join("dist/out.js"), "bundle\n");
+        write_tree_fixture(&root.path().join("target/debug/foo"), "bin\n");
+
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+            .expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        paths.sort();
+
+        assert!(
+            paths.iter().any(|p| p == "src" || p == "src/a.ts"),
+            "src should remain, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "keep/me.ts"),
+            "keep/me.ts should remain, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("node_modules")),
+            ".gitignore should prune node_modules, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("dist")),
+            ".ignore should prune dist, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("target")),
+            ".rgignore should prune target, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_tree_prunes_gitignore_outside_git_repo() {
+        // require_git(false): a non-git folder with only .gitignore still prunes.
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "vendor/\n");
+        write_tree_fixture(&root.path().join("app.rs"), "fn main(){}\n");
+        write_tree_fixture(&root.path().join("vendor/lib.rs"), "// big\n");
+
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+            .expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+
+        assert!(paths.iter().any(|p| p == "app.rs"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("vendor")),
+            "vendor must be pruned without a git repo, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_tree_still_skips_git_dir_and_shows_dotfiles() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".env"), "SECRET=1\n");
+        write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
+        write_tree_fixture(&root.path().join("src/main.rs"), "fn main(){}\n");
+
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+            .expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+
+        assert!(
+            paths.iter().any(|p| p == ".env"),
+            ".env should stay visible, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == ".git" || p.starts_with(".git/")),
+            ".git is a hard skip, got {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_tree_async_respects_ignore_files() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".rgignore"), "heavy/\n");
+        write_tree_fixture(&root.path().join("ok.txt"), "hi\n");
+        write_tree_fixture(&root.path().join("heavy/blob.bin"), "x\n");
+
+        let tree = get_file_tree(
+            root.path().to_string_lossy().into_owned(),
+            Some(10),
+        )
+        .await
+        .expect("async walk");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        assert!(paths.iter().any(|p| p == "ok.txt"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("heavy")),
+            "heavy pruned via .rgignore, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn search_workspace_files_matches_and_early_exits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "node_modules/\n");
+        write_tree_fixture(&root.path().join("src/foo.ts"), "a\n");
+        write_tree_fixture(&root.path().join("src/bar.ts"), "b\n");
+        write_tree_fixture(&root.path().join("docs/foo.md"), "c\n");
+        write_tree_fixture(
+            &root.path().join("node_modules/pkg/index.js"),
+            "skip\n",
+        );
+
+        let by_name = search_workspace_files_sync(
+            root.path().to_path_buf(),
+            "foo",
+            50,
+        )
+        .expect("search");
+        let paths: Vec<_> = by_name.files.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"src/foo.ts"), "got {paths:?}");
+        assert!(paths.contains(&"docs/foo.md"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules")),
+            "ignored paths must not appear, got {paths:?}"
+        );
+
+        let capped = search_workspace_files_sync(root.path().to_path_buf(), "", 2)
+            .expect("capped empty query");
+        assert_eq!(capped.files.len(), 2);
+        assert!(capped.truncated, "more than 2 entries exist under the root");
+    }
+
+    #[tokio::test]
+    async fn search_workspace_files_async_returns_hits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("lib/util.rs"), "fn x(){}\n");
+        let result = search_workspace_files(
+            root.path().to_string_lossy().into_owned(),
+            Some("util".into()),
+            Some(10),
+        )
+        .await
+        .expect("async search");
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "lib/util.rs");
+        assert_eq!(result.files[0].kind, "file");
+        assert!(!result.truncated);
     }
 }
 

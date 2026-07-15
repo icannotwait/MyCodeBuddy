@@ -71,6 +71,8 @@ thiserror = "2"
 dirs = "6"
 if-addrs = "0.13"
 walkdir = "2"
+# Same engine ripgrep uses: walk-time pruning via .gitignore / .ignore / .rgignore.
+ignore = "0.4"
 sacp = "11.0.0"
 sacp-tokio = "11.0.0"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "rt-multi-thread"] }

@@ -11,13 +11,13 @@ import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
-import { listAllConversations } from "@/lib/api"
+import { listAllConversations, searchWorkspaceFiles } from "@/lib/api"
 import type {
   AgentType,
   ConversationStatus,
   DbConversationSummary,
 } from "@/lib/types"
-import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
+import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import { AGENT_LABELS, compareAgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
@@ -67,39 +67,17 @@ export function SearchCommandDialog({
   const [agentFilter, setAgentFilter] = useState<AgentType | null>(null)
   const [results, setResults] = useState<DbConversationSummary[]>([])
   const [searching, setSearching] = useState(false)
+  const [filteredFiles, setFilteredFiles] = useState<FlatFileEntry[]>([])
+  const [filesLoading, setFilesLoading] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const fileSearchGenRef = useRef(0)
 
   const folderPath = folder?.path ?? ""
-
-  // File search via shared hook (lazy-loaded when files tab is active)
-  const {
-    allFiles,
-    loading: filesLoading,
-    reset: resetFileTree,
-  } = useFileTree({
-    folderPath: folderPath || undefined,
-    enabled: activeTab === "files",
-  })
 
   // Compute which agent types exist in current folder
   const availableAgents = Array.from(
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
-
-  // Filter files by query using pre-computed lowercase fields
-  const filteredFiles = useMemo(() => {
-    const trimmed = query.trim()
-    if (!trimmed) return allFiles.slice(0, 100)
-    const lower = trimmed.toLowerCase()
-    const matched: FlatFileEntry[] = []
-    for (const f of allFiles) {
-      if (f.lowerName.includes(lower) || f.lowerPath.includes(lower)) {
-        matched.push(f)
-        if (matched.length >= 100) break
-      }
-    }
-    return matched
-  }, [allFiles, query])
 
   const doSearch = useCallback(
     async (q: string, agent: AgentType | null) => {
@@ -137,16 +115,59 @@ export function SearchCommandDialog({
     }
   }, [query, agentFilter, doSearch, activeTab])
 
+  // On-demand workspace file search (ignore-aware, capped) — only while the
+  // files tab is open. Never pulls a full tree into the client.
+  useEffect(() => {
+    if (activeTab !== "files" || !folderPath) {
+      setFilteredFiles([])
+      setFilesLoading(false)
+      return
+    }
+    const gen = ++fileSearchGenRef.current
+    setFilesLoading(true)
+    const timer = window.setTimeout(() => {
+      void searchWorkspaceFiles(folderPath, query, 100)
+        .then((result) => {
+          if (fileSearchGenRef.current !== gen) return
+          setFilteredFiles(
+            result.files.map((hit) => {
+              const kind: "file" | "dir" =
+                hit.kind === "dir" ? "dir" : "file"
+              return {
+                name: hit.name,
+                relativePath: hit.path,
+                kind,
+                lowerPath: hit.path.toLowerCase(),
+                lowerName: hit.name.toLowerCase(),
+              }
+            })
+          )
+        })
+        .catch(() => {
+          if (fileSearchGenRef.current !== gen) return
+          setFilteredFiles([])
+        })
+        .finally(() => {
+          if (fileSearchGenRef.current !== gen) return
+          setFilesLoading(false)
+        })
+    }, 200)
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [activeTab, folderPath, query])
+
   // Reset state when dialog closes
   useEffect(() => {
     if (!open) {
       setQuery("")
       setAgentFilter(null)
       setResults([])
+      setFilteredFiles([])
       setActiveTab("conversations")
-      resetFileTree()
+      fileSearchGenRef.current += 1
     }
-  }, [open, resetFileTree])
+  }, [open])
 
   const handleSelectConversation = useCallback(
     (conv: DbConversationSummary) => {
