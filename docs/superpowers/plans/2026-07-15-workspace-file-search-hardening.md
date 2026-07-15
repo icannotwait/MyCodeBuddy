@@ -38,6 +38,9 @@
 - `src/lib/file-tree-display-prefs.test.ts`: default, persistence, and event synchronization tests.
 - `src/hooks/use-ignored-file-tree.ts`: one-shot ignored-tree overlay, sequence fallback, and refresh coalescing.
 - `src/hooks/use-ignored-file-tree.test.ts`: overlay lifecycle and error tests.
+- `src-tauri/src/workspace_state/mod.rs`: optional filesystem operation hint on live/replayed envelopes.
+- `src/lib/types.ts`: TypeScript mirror of the optional filesystem operation hint.
+- `src/hooks/use-workspace-state-store.ts`: forwards the operation hint to envelope subscribers.
 - `src/components/ui/context-menu.tsx`: native checkbox item wrapper.
 - `src/components/layout/aux-panel-file-tree-tab.tsx`: overlay rendering, lazy mode generation, checkbox wiring, and toasts.
 - `src/components/layout/aux-panel-file-tree-tab-source.test.ts`: minimal integration wiring assertions.
@@ -684,11 +687,15 @@ git commit -m "feat(files): persist ignored-file display preference"
 **Files:**
 - Create: `src/hooks/use-ignored-file-tree.ts`
 - Create: `src/hooks/use-ignored-file-tree.test.ts`
+- Modify: `src-tauri/src/workspace_state/mod.rs`
+- Modify: `src/lib/types.ts`
+- Modify: `src/hooks/use-workspace-state-store.ts`
 
 **Interfaces:**
 - Consumes: `getFileTree(rootPath, 2, true)`, `useShowIgnoredFiles()`, workspace `seq`, fallback tree, and `subscribeEnvelopes`
 - Produces: `{ tree, showIgnored, setShowIgnored, restored, loading, refresh, treeGeneration }`
-- Produces: `shouldRefreshIgnoredTree(kind, changedPaths)` pure helper
+- Produces: optional `fs_event_kind` on live and replayed workspace envelopes
+- Produces: `shouldRefreshIgnoredTree(fsEventKind, changedPaths)` pure helper
 
 - [ ] **Step 1: Write failing pure event-policy tests**
 
@@ -698,6 +705,7 @@ expect(shouldRefreshIgnoredTree("remove", ["src/old.ts"])).toBe(true)
 expect(shouldRefreshIgnoredTree("modify", ["src/main.ts"])).toBe(false)
 expect(shouldRefreshIgnoredTree("modify", [".gitignore"])).toBe(true)
 expect(shouldRefreshIgnoredTree("modify", [])).toBe(true)
+expect(shouldRefreshIgnoredTree(undefined, ["src/unknown.ts"])).toBe(true)
 ```
 
 - [ ] **Step 2: Write failing hook lifecycle tests**

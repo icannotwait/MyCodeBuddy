@@ -46,6 +46,8 @@ pub enum WorkspaceDelta {
 pub struct WorkspaceDeltaEnvelope {
     pub seq: u64,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_event_kind: Option<String>,
     pub payload: Vec<WorkspaceDelta>,
     pub requires_resync: bool,
     #[serde(default)]
@@ -58,6 +60,8 @@ pub struct WorkspaceStateEvent {
     pub seq: u64,
     pub version: u16,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_event_kind: Option<String>,
     pub payload: Vec<WorkspaceDelta>,
     pub requires_resync: bool,
     #[serde(default)]
@@ -114,6 +118,17 @@ impl WorkspaceStateCore {
         requires_resync: bool,
         changed_paths: Vec<String>,
     ) -> WorkspaceStateEvent {
+        self.append_event_with_fs_kind(kind, payload, requires_resync, changed_paths, None)
+    }
+
+    fn append_event_with_fs_kind(
+        &mut self,
+        kind: String,
+        payload: Vec<WorkspaceDelta>,
+        requires_resync: bool,
+        changed_paths: Vec<String>,
+        fs_event_kind: Option<String>,
+    ) -> WorkspaceStateEvent {
         self.seq += 1;
 
         if !requires_resync {
@@ -123,6 +138,7 @@ impl WorkspaceStateCore {
         let envelope = Arc::new(WorkspaceDeltaEnvelope {
             seq: self.seq,
             kind: kind.clone(),
+            fs_event_kind: fs_event_kind.clone(),
             payload: payload.clone(),
             requires_resync,
             changed_paths: changed_paths.clone(),
@@ -134,6 +150,7 @@ impl WorkspaceStateCore {
             seq: self.seq,
             version: WORKSPACE_STATE_PROTOCOL_VERSION,
             kind,
+            fs_event_kind,
             payload,
             requires_resync,
             changed_paths,
@@ -229,6 +246,7 @@ impl WorkspaceStateCore {
                 *slot = Arc::new(WorkspaceDeltaEnvelope {
                     seq: slot.seq,
                     kind: slot.kind.clone(),
+                    fs_event_kind: slot.fs_event_kind.clone(),
                     payload: remaining,
                     requires_resync: slot.requires_resync,
                     changed_paths: slot.changed_paths.clone(),
@@ -1047,7 +1065,13 @@ async fn flush_watch_batch(
             "meta".to_string()
         };
 
-        guard.append_event(kind, payload, git_presence_changed, changed_paths)
+        guard.append_event_with_fs_kind(
+            kind,
+            payload,
+            git_presence_changed,
+            changed_paths,
+            Some(event_kind_hint),
+        )
     };
 
     emit_event(emitter, "folder://workspace-state-event", event);
@@ -1726,6 +1750,7 @@ mod tests {
         assert_eq!(guard.seq, 1, "changed_paths envelope must still be issued");
         let event = guard.recent_events.back().expect("recent event");
         assert_eq!(event.kind, "meta");
+        assert_eq!(event.fs_event_kind.as_deref(), Some("modify"));
         assert_eq!(event.changed_paths, vec!["a.txt".to_string()]);
         assert!(matches!(
             event.payload.as_slice(),
@@ -1773,6 +1798,7 @@ mod tests {
             "full mode must refresh the tree snapshot"
         );
         let event = guard.recent_events.back().expect("recent event");
+        assert_eq!(event.fs_event_kind.as_deref(), Some("create"));
         assert_eq!(event.changed_paths, vec!["a.txt".to_string()]);
         assert!(event
             .payload
@@ -1944,7 +1970,7 @@ mod tests {
         let mut core =
             WorkspaceStateCore::new("/tmp/repo".to_string(), Vec::new(), Vec::new(), false);
 
-        let e1 = core.append_event(
+        let e1 = core.append_event_with_fs_kind(
             "git_delta".to_string(),
             vec![WorkspaceDelta::GitReplace {
                 entries: vec![WorkspaceGitEntry {
@@ -1956,6 +1982,7 @@ mod tests {
             }],
             false,
             vec!["a.txt".to_string()],
+            Some("create".to_string()),
         );
 
         let e2 = core.append_event(
@@ -1988,6 +2015,7 @@ mod tests {
             "older GitReplace payload should be dropped after compression"
         );
         assert_eq!(first.changed_paths, vec!["a.txt".to_string()]);
+        assert_eq!(first.fs_event_kind.as_deref(), Some("create"));
 
         let meta = snapshot
             .deltas

@@ -2167,6 +2167,7 @@ export type WorkspaceDelta =
 export interface WorkspaceDeltaEnvelope {
   seq: number
   kind: "fs_delta" | "git_delta" | "meta" | "resync_hint" | string
+  fs_event_kind?: "create" | "remove" | "modify" | string
   payload: WorkspaceDelta[]
   requires_resync: boolean
   changed_paths?: string[]
@@ -2177,6 +2178,7 @@ export interface WorkspaceStateEvent {
   seq: number
   version: number
   kind: "fs_delta" | "git_delta" | "meta" | "resync_hint" | string
+  fs_event_kind?: "create" | "remove" | "modify" | string
   payload: WorkspaceDelta[]
   requires_resync: boolean
   changed_paths?: string[]

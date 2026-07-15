@@ -74,10 +74,15 @@ tree source while the option remains enabled.
 The existing workspace stream continues to provide Git state, health, and
 filesystem event envelopes. Those envelopes already include ordinary paths
 matched by Git ignore files; only the existing hard watch exclusions are
-dropped. While show-ignored mode is active, a root-tree refresh is scheduled
-when an envelope represents create/remove activity, changes an ignore-control
-file, or carries an empty changed-path list that requires a conservative
-sweep. Ordinary file-content `modify` envelopes do not rebuild the root tree.
+dropped. Extend workspace events and replay envelopes with an optional
+`fs_event_kind` (`create`, `remove`, or `modify`) because the existing `kind`
+field describes payload shape (`fs_delta`, `git_delta`, or `meta`) and cannot
+distinguish structural filesystem activity. While show-ignored mode is active,
+a root-tree refresh is scheduled when `fs_event_kind` is create/remove, an
+ignore-control file changes, or an envelope carries an empty changed-path list
+that requires a conservative sweep. Ordinary file-content `modify` envelopes
+do not rebuild the root tree. Missing `fs_event_kind` from an older server is
+handled conservatively.
 
 Live seq-gap/overflow recovery can replace the workspace snapshot without
 forwarding a normal envelope. The hook therefore remembers the latest envelope
