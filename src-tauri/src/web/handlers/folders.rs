@@ -254,12 +254,18 @@ pub async fn list_directory_with_files(
 pub struct GetFileTreeParams {
     pub path: String,
     pub max_depth: Option<usize>,
+    pub include_ignored: Option<bool>,
 }
 
 pub async fn get_file_tree(
     Json(params): Json<GetFileTreeParams>,
 ) -> Result<Json<Vec<folder_commands::FileTreeNode>>, AppCommandError> {
-    let result = folder_commands::get_file_tree(params.path, params.max_depth).await?;
+    let result = folder_commands::get_file_tree(
+        params.path,
+        params.max_depth,
+        params.include_ignored,
+    )
+    .await?;
     Ok(Json(result))
 }
 

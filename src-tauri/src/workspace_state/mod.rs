@@ -946,7 +946,12 @@ async fn flush_watch_batch(
     // subdir, git is unreachable), because the frontend would re-fetch
     // the same stored resync_hint event on every watch tick.
     if should_refresh_tree {
-        match folders::get_file_tree(root_display.to_string(), Some(WORKSPACE_TREE_MAX_DEPTH)).await
+        match folders::get_file_tree(
+            root_display.to_string(),
+            Some(WORKSPACE_TREE_MAX_DEPTH),
+            None,
+        )
+        .await
         {
             Ok(tree) => refreshed_tree = Some(tree),
             Err(err) => tracing::error!(
@@ -1171,7 +1176,11 @@ async fn refresh_tree_git_snapshots(
     root_canonical: &Path,
 ) {
     let refreshed_tree =
-        match folders::get_file_tree(root_display.to_string(), Some(WORKSPACE_TREE_MAX_DEPTH))
+        match folders::get_file_tree(
+            root_display.to_string(),
+            Some(WORKSPACE_TREE_MAX_DEPTH),
+            None,
+        )
             .await
         {
             Ok(tree) => Some(tree),
@@ -1291,7 +1300,7 @@ pub async fn start_workspace_state_stream_core(
         Vec::new()
     };
     let initial_tree = if wants_tree_git {
-        folders::get_file_tree(root_path.clone(), Some(WORKSPACE_TREE_MAX_DEPTH))
+        folders::get_file_tree(root_path.clone(), Some(WORKSPACE_TREE_MAX_DEPTH), None)
             .await
             .unwrap_or_default()
     } else {
@@ -1595,7 +1604,11 @@ pub async fn get_workspace_snapshot_core(
     let is_git = wants_tree_git && is_git_repo(&root_canonical);
     let (refreshed_tree, refreshed_git) = if wants_tree_git {
         let tree_fut =
-            folders::get_file_tree(root_display.clone(), Some(WORKSPACE_TREE_MAX_DEPTH));
+            folders::get_file_tree(
+                root_display.clone(),
+                Some(WORKSPACE_TREE_MAX_DEPTH),
+                None,
+            );
         let git_fut = async {
             if is_git {
                 collect_git_snapshot(&root_display).await.ok()

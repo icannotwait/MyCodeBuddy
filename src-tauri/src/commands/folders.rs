@@ -2776,13 +2776,13 @@ const WORKSPACE_FILE_SEARCH_MAX_LIMIT: usize = 500;
 /// Default search limit when the caller omits one (matches `@` mention cap).
 const WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT: usize = 50;
 
-/// Shared walk options for file-tree builds and workspace file search: same
-/// ignore sources ripgrep honors by default (`.gitignore` / `.ignore` /
-/// `.rgignore` + git global/exclude), hard-skip of [FILE_TREE_IGNORED_DIRS]
-/// and `.DS_Store`, and visible dotfiles (e.g. `.env`).
-fn workspace_ignore_walk_builder(
+/// Shared walk options for file-tree builds and workspace file search.
+/// Hard exclusions and visible dotfiles apply in both modes; ignore sources
+/// can be disabled only for the auxiliary file-tree display.
+fn workspace_walk_builder(
     root: &Path,
     max_depth: Option<usize>,
+    respect_ignores: bool,
 ) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(root);
     if let Some(depth) = max_depth {
@@ -2792,15 +2792,12 @@ fn workspace_ignore_walk_builder(
         // Keep dotfiles like `.env` / `.eslintrc` visible; ignore rules still apply.
         .hidden(false)
         .follow_links(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_ignore(respect_ignores)
+        .git_global(respect_ignores)
+        .git_exclude(respect_ignores)
         // Plain `.ignore` files (gitignore syntax).
-        .ignore(true)
-        // `.rgignore` is not covered by `.ignore(true)` in the ignore crate —
-        // ripgrep registers it as a custom ignore filename; match that.
-        .add_custom_ignore_filename(".rgignore")
-        .parents(true)
+        .ignore(respect_ignores)
+        .parents(respect_ignores)
         // Apply `.gitignore` even when the folder is not a git worktree.
         .require_git(false)
         .filter_entry(|entry| {
@@ -2811,6 +2808,10 @@ fn workspace_ignore_walk_builder(
                 name != ".DS_Store"
             }
         });
+    if respect_ignores {
+        // `.rgignore` is not covered by `.ignore(true)` in the ignore crate.
+        builder.add_custom_ignore_filename(".rgignore");
+    }
     builder
 }
 
@@ -2849,7 +2850,7 @@ pub(crate) fn search_workspace_files_sync(
     let mut files: Vec<WorkspaceFileHit> = Vec::with_capacity(limit);
     let mut truncated = false;
 
-    let mut builder = workspace_ignore_walk_builder(&root, None);
+    let mut builder = workspace_walk_builder(&root, None, true);
     // Stable name order within each directory so empty-query results are
     // deterministic (same spirit as the nested tree builder).
     builder.sort_by_file_name(|a, b| a.cmp(b));
@@ -2904,8 +2905,8 @@ pub(crate) fn search_workspace_files_sync(
     Ok(WorkspaceFileSearchResult { files, truncated })
 }
 
-/// Build a nested file tree under `root`, pruning during the walk using the same
-/// ignore sources ripgrep honors by default:
+/// Build a nested file tree under `root`. Unless `include_ignored` is true, the
+/// walk prunes using the same ignore sources ripgrep honors by default:
 /// - `.gitignore` (always, even outside a git worktree — matches prior frontend
 ///   post-filter behavior used by `@` mentions / file search)
 /// - `.ignore`
@@ -2920,6 +2921,7 @@ pub(crate) fn search_workspace_files_sync(
 pub(crate) fn build_file_tree_sync(
     root: PathBuf,
     max_depth: usize,
+    include_ignored: bool,
 ) -> Result<Vec<FileTreeNode>, AppCommandError> {
     // Collect all entries, skipping ignored directories during the walk so large
     // trees (node_modules, target, dist, …) never enter the result payload.
@@ -2927,7 +2929,7 @@ pub(crate) fn build_file_tree_sync(
     let mut dir_order: Vec<PathBuf> = Vec::new();
     let mut dir_paths_by_rel: HashMap<String, PathBuf> = HashMap::new();
 
-    let mut builder = workspace_ignore_walk_builder(&root, Some(max_depth));
+    let mut builder = workspace_walk_builder(&root, Some(max_depth), !include_ignored);
     // Stable, case-sensitive name order (same spirit as the previous WalkDir
     // sort); final per-directory sort below is case-insensitive.
     builder.sort_by_file_name(|a, b| a.cmp(b));
@@ -3485,12 +3487,14 @@ pub async fn list_directory_with_files(
 pub async fn get_file_tree(
     path: String,
     max_depth: Option<usize>,
+    include_ignored: Option<bool>,
 ) -> Result<Vec<FileTreeNode>, AppCommandError> {
     let root = PathBuf::from(&path);
     let depth = max_depth.unwrap_or(usize::MAX);
+    let include_ignored = include_ignored.unwrap_or(false);
     // Walk + ignore matching is CPU/IO heavy on large repos; keep it off the
     // async runtime so concurrent IPC/WebSocket work stays responsive.
-    tokio::task::spawn_blocking(move || build_file_tree_sync(root, depth))
+    tokio::task::spawn_blocking(move || build_file_tree_sync(root, depth, include_ignored))
         .await
         .map_err(|e| {
             AppCommandError::io_error("File tree walk task failed").with_detail(e.to_string())
@@ -4957,7 +4961,7 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("dist/out.js"), "bundle\n");
         write_tree_fixture(&root.path().join("target/debug/foo"), "bin\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
             .expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
@@ -4993,7 +4997,7 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("app.rs"), "fn main(){}\n");
         write_tree_fixture(&root.path().join("vendor/lib.rs"), "// big\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
             .expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
@@ -5012,7 +5016,7 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
         write_tree_fixture(&root.path().join("src/main.rs"), "fn main(){}\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX)
+        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
             .expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
@@ -5027,6 +5031,39 @@ branch refs/heads/main";
         );
     }
 
+    #[test]
+    fn build_file_tree_can_include_ignored_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "dist/\n");
+        write_tree_fixture(&root.path().join("dist/bundle.js"), "bundle\n");
+        write_tree_fixture(&root.path().join("src/main.ts"), "main\n");
+        write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
+        write_tree_fixture(
+            &root.path().join("__pycache__/module.pyc"),
+            "cache\n",
+        );
+        write_tree_fixture(&root.path().join(".DS_Store"), "metadata\n");
+
+        let hidden = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
+            .expect("pruned tree");
+        let shown = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, true)
+            .expect("full tree");
+        let mut hidden_paths = Vec::new();
+        let mut shown_paths = Vec::new();
+        collect_tree_paths(&hidden, &mut hidden_paths);
+        collect_tree_paths(&shown, &mut shown_paths);
+
+        assert!(!hidden_paths.iter().any(|path| path.starts_with("dist")));
+        assert!(shown_paths.iter().any(|path| path == "dist/bundle.js"));
+        assert!(!shown_paths.iter().any(|path| {
+            path == ".git"
+                || path.starts_with(".git/")
+                || path == "__pycache__"
+                || path.starts_with("__pycache__/")
+                || path == ".DS_Store"
+        }));
+    }
+
     #[tokio::test]
     async fn get_file_tree_async_respects_ignore_files() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -5037,6 +5074,7 @@ branch refs/heads/main";
         let tree = get_file_tree(
             root.path().to_string_lossy().into_owned(),
             Some(10),
+            None,
         )
         .await
         .expect("async walk");
@@ -5047,6 +5085,24 @@ branch refs/heads/main";
             !paths.iter().any(|p| p.starts_with("heavy")),
             "heavy pruned via .rgignore, got {paths:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_file_tree_defaults_to_pruned_mode() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".ignore"), "generated/\n");
+        write_tree_fixture(&root.path().join("generated/out.txt"), "out\n");
+
+        let tree = get_file_tree(
+            root.path().to_string_lossy().into_owned(),
+            Some(10),
+            None,
+        )
+        .await
+        .expect("tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        assert!(!paths.iter().any(|path| path.starts_with("generated")));
     }
 
     #[test]
