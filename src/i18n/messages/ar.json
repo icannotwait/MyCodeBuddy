@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "إضافة إلى الجلسة",
       "compareWithBranch": "المقارنة مع الفرع...",
       "reloadFromDisk": "إعادة التحميل من القرص",
+      "showIgnoredFiles": "إظهار الملفات المتجاهلة",
       "new": "جديد",
       "newFile": "ملف",
       "newDirectory": "مجلد",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "فشل تنزيل {name}",
         "downloadSaved": "تم تنزيل {name}",
         "pathCopied": "تم نسخ المسار",
-        "copyPathFailed": "فشل نسخ المسار"
+        "copyPathFailed": "فشل نسخ المسار",
+        "loadIgnoredFilesFailed": "تعذر تحميل الملفات المتجاهلة"
       },
       "createDialog": {
         "newFile": "ملف جديد",

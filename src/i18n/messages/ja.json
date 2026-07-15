@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "セッションに追加",
       "compareWithBranch": "ブランチと比較...",
       "reloadFromDisk": "ディスクから再読み込み",
+      "showIgnoredFiles": "無視されたファイルを表示",
       "new": "新規作成",
       "newFile": "ファイル",
       "newDirectory": "ディレクトリ",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "{name} のダウンロードに失敗しました",
         "downloadSaved": "{name} をダウンロードしました",
         "pathCopied": "パスをコピーしました",
-        "copyPathFailed": "パスのコピーに失敗しました"
+        "copyPathFailed": "パスのコピーに失敗しました",
+        "loadIgnoredFilesFailed": "無視されたファイルを読み込めませんでした"
       },
       "createDialog": {
         "newFile": "新規ファイル",

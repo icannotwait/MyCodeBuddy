@@ -66,6 +66,16 @@ export function hasIgnoredAncestor(
   return false
 }
 
+export function finishLazyLoad(
+  inFlight: Map<string, number>,
+  path: string,
+  generation: number
+): void {
+  if (inFlight.get(path) === generation) {
+    inFlight.delete(path)
+  }
+}
+
 interface UseFileTreeOptions {
   folderPath: string | undefined
   enabled: boolean

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  finishLazyLoad,
   hasIgnoredAncestor,
   isIgnoreFileName,
   IGNORE_FILE_NAMES,
@@ -39,5 +40,17 @@ describe("hasIgnoredAncestor", () => {
     const ignored = new Set(["node_modules"])
     expect(hasIgnoredAncestor("src/index.ts", ignored)).toBe(false)
     expect(hasIgnoredAncestor("node_modules", ignored)).toBe(false)
+  })
+})
+
+describe("finishLazyLoad", () => {
+  it("only clears the in-flight marker owned by the finishing generation", () => {
+    const inFlight = new Map([["src", 2]])
+
+    finishLazyLoad(inFlight, "src", 1)
+    expect(inFlight.get("src")).toBe(2)
+
+    finishLazyLoad(inFlight, "src", 2)
+    expect(inFlight.has("src")).toBe(false)
   })
 })

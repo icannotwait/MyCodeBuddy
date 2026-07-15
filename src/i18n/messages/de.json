@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "Zur Sitzung hinzufügen",
       "compareWithBranch": "Mit Branch vergleichen...",
       "reloadFromDisk": "Von Datenträger neu laden",
+      "showIgnoredFiles": "Ignorierte Dateien anzeigen",
       "new": "Neu",
       "newFile": "Datei",
       "newDirectory": "Verzeichnis",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "Herunterladen von {name} fehlgeschlagen",
         "downloadSaved": "{name} heruntergeladen",
         "pathCopied": "Pfad kopiert",
-        "copyPathFailed": "Pfad konnte nicht kopiert werden"
+        "copyPathFailed": "Pfad konnte nicht kopiert werden",
+        "loadIgnoredFilesFailed": "Ignorierte Dateien konnten nicht geladen werden"
       },
       "createDialog": {
         "newFile": "Neue Datei",

@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "Ajouter à la session",
       "compareWithBranch": "Comparer avec la branche...",
       "reloadFromDisk": "Recharger depuis le disque",
+      "showIgnoredFiles": "Afficher les fichiers ignorés",
       "new": "Nouveau",
       "newFile": "Fichier",
       "newDirectory": "Répertoire",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "Échec du téléchargement de {name}",
         "downloadSaved": "{name} téléchargé",
         "pathCopied": "Chemin copié",
-        "copyPathFailed": "Échec de la copie du chemin"
+        "copyPathFailed": "Échec de la copie du chemin",
+        "loadIgnoredFilesFailed": "Impossible de charger les fichiers ignorés"
       },
       "createDialog": {
         "newFile": "Nouveau fichier",

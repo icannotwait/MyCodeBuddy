@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "세션에 추가",
       "compareWithBranch": "브랜치와 비교...",
       "reloadFromDisk": "디스크에서 다시 불러오기",
+      "showIgnoredFiles": "무시된 파일 표시",
       "new": "새로 만들기",
       "newFile": "파일",
       "newDirectory": "디렉터리",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "{name} 다운로드 실패",
         "downloadSaved": "{name} 다운로드 완료",
         "pathCopied": "경로가 복사되었습니다",
-        "copyPathFailed": "경로 복사에 실패했습니다"
+        "copyPathFailed": "경로 복사에 실패했습니다",
+        "loadIgnoredFilesFailed": "무시된 파일을 불러오지 못했습니다"
       },
       "createDialog": {
         "newFile": "새 파일",

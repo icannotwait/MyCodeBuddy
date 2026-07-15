@@ -1841,6 +1841,7 @@
       "attachToCurrentSession": "添加到会话",
       "compareWithBranch": "与分支比较...",
       "reloadFromDisk": "从磁盘重新加载",
+      "showIgnoredFiles": "显示忽略的文件",
       "new": "新建",
       "newFile": "文件",
       "newDirectory": "目录",
@@ -1882,7 +1883,8 @@
         "downloadFailed": "下载 {name} 失败",
         "downloadSaved": "已下载 {name}",
         "pathCopied": "已复制路径",
-        "copyPathFailed": "复制路径失败"
+        "copyPathFailed": "复制路径失败",
+        "loadIgnoredFilesFailed": "无法加载忽略的文件"
       },
       "createDialog": {
         "newFile": "新建文件",
