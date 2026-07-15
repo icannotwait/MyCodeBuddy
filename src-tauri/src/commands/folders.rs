@@ -4,13 +4,14 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
 use serde::Serialize;
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
@@ -2775,6 +2776,8 @@ const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".rgignore"];
 const WORKSPACE_FILE_SEARCH_MAX_LIMIT: usize = 500;
 /// Default search limit when the caller omits one (matches `@` mention cap).
 const WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT: usize = 50;
+const WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS: usize = 4;
+const WORKSPACE_FILE_SEARCH_ID_MAX_BYTES: usize = 128;
 
 /// Shared walk options for file-tree builds and workspace file search.
 /// Hard exclusions and visible dotfiles apply in both modes; ignore sources
@@ -2835,6 +2838,145 @@ pub struct WorkspaceFileSearchResult {
     pub truncated: bool,
 }
 
+impl WorkspaceFileSearchResult {
+    fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceSearchRegistration {
+    request_id: String,
+    token: Arc<CancellationToken>,
+}
+
+static WORKSPACE_SEARCH_REGISTRY: LazyLock<
+    Mutex<HashMap<String, WorkspaceSearchRegistration>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static WORKSPACE_SEARCH_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS,
+    ))
+});
+
+fn validate_workspace_search_identity(
+    search_session_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<Option<(String, String)>, AppCommandError> {
+    match (search_session_id, request_id) {
+        (None, None) => Ok(None),
+        (Some(session_id), Some(request_id)) => {
+            if session_id.trim().is_empty() || request_id.trim().is_empty() {
+                return Err(AppCommandError::invalid_input(
+                    "Workspace search identifiers cannot be empty",
+                ));
+            }
+            if session_id.len() > WORKSPACE_FILE_SEARCH_ID_MAX_BYTES
+                || request_id.len() > WORKSPACE_FILE_SEARCH_ID_MAX_BYTES
+            {
+                return Err(AppCommandError::invalid_input(
+                    "Workspace search identifiers are too long",
+                ));
+            }
+            Ok(Some((session_id.to_owned(), request_id.to_owned())))
+        }
+        _ => Err(AppCommandError::invalid_input(
+            "Workspace search requires both searchSessionId and requestId",
+        )),
+    }
+}
+
+struct WorkspaceSearchLease {
+    session_id: Option<String>,
+    request_id: Option<String>,
+    token: Arc<CancellationToken>,
+}
+
+impl WorkspaceSearchLease {
+    fn token(&self) -> Arc<CancellationToken> {
+        Arc::clone(&self.token)
+    }
+}
+
+impl Drop for WorkspaceSearchLease {
+    fn drop(&mut self) {
+        self.token.cancel();
+        let (Some(session_id), Some(request_id)) = (&self.session_id, &self.request_id) else {
+            return;
+        };
+        let Ok(mut registry) = WORKSPACE_SEARCH_REGISTRY.lock() else {
+            return;
+        };
+        let should_remove = registry.get(session_id).is_some_and(|current| {
+            current.request_id == *request_id && Arc::ptr_eq(&current.token, &self.token)
+        });
+        if should_remove {
+            registry.remove(session_id);
+        }
+    }
+}
+
+fn register_workspace_search(
+    search_session_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<WorkspaceSearchLease, AppCommandError> {
+    let identity = validate_workspace_search_identity(search_session_id, request_id)?;
+    let token = Arc::new(CancellationToken::new());
+    let (session_id, request_id, replaced) = match identity {
+        Some((session_id, request_id)) => {
+            let replaced = WORKSPACE_SEARCH_REGISTRY
+                .lock()
+                .map_err(|_| {
+                    AppCommandError::task_execution_failed(
+                        "Failed to lock workspace search registry",
+                    )
+                })?
+                .insert(
+                    session_id.clone(),
+                    WorkspaceSearchRegistration {
+                        request_id: request_id.clone(),
+                        token: Arc::clone(&token),
+                    },
+                );
+            (Some(session_id), Some(request_id), replaced)
+        }
+        None => (None, None, None),
+    };
+    if let Some(previous) = replaced {
+        previous.token.cancel();
+    }
+    Ok(WorkspaceSearchLease {
+        session_id,
+        request_id,
+        token,
+    })
+}
+
+fn cancel_workspace_search_registration(session_id: &str, request_id: &str) -> bool {
+    let registration = {
+        let Ok(mut registry) = WORKSPACE_SEARCH_REGISTRY.lock() else {
+            return false;
+        };
+        if registry
+            .get(session_id)
+            .is_some_and(|current| current.request_id == request_id)
+        {
+            registry.remove(session_id)
+        } else {
+            None
+        }
+    };
+    if let Some(registration) = registration {
+        registration.token.cancel();
+        true
+    } else {
+        false
+    }
+}
+
 /// Search workspace files/dirs under `root` without materializing the full tree.
 /// Applies the same ignore rules as [`build_file_tree_sync`], case-insensitive
 /// substring match on file name and relative path, and stops once `limit + 1`
@@ -2843,7 +2985,11 @@ pub(crate) fn search_workspace_files_sync(
     root: PathBuf,
     query: &str,
     limit: usize,
+    token: &CancellationToken,
 ) -> Result<WorkspaceFileSearchResult, AppCommandError> {
+    if token.is_cancelled() {
+        return Ok(WorkspaceFileSearchResult::empty());
+    }
     let limit = limit
         .clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
     let q = query.trim().to_lowercase();
@@ -2856,6 +3002,9 @@ pub(crate) fn search_workspace_files_sync(
     builder.sort_by_file_name(|a, b| a.cmp(b));
 
     for result in builder.build() {
+        if token.is_cancelled() {
+            return Ok(WorkspaceFileSearchResult::empty());
+        }
         let entry = result.map_err(|e| {
             AppCommandError::io_error("Failed to search workspace files").with_detail(e.to_string())
         })?;
@@ -2878,8 +3027,7 @@ pub(crate) fn search_workspace_files_sync(
         let matches = if q.is_empty() {
             true
         } else {
-            name.to_ascii_lowercase().contains(&q)
-                || rel_path.to_ascii_lowercase().contains(&q)
+            name.to_lowercase().contains(&q) || rel_path.to_lowercase().contains(&q)
         };
         if !matches {
             continue;
@@ -2902,7 +3050,41 @@ pub(crate) fn search_workspace_files_sync(
         });
     }
 
-    Ok(WorkspaceFileSearchResult { files, truncated })
+    if token.is_cancelled() {
+        Ok(WorkspaceFileSearchResult::empty())
+    } else {
+        Ok(WorkspaceFileSearchResult { files, truncated })
+    }
+}
+
+async fn run_workspace_search_task<F>(
+    semaphore: Arc<Semaphore>,
+    token: Arc<CancellationToken>,
+    task: F,
+) -> Result<WorkspaceFileSearchResult, AppCommandError>
+where
+    F: FnOnce(&CancellationToken) -> Result<WorkspaceFileSearchResult, AppCommandError>
+        + Send
+        + 'static,
+{
+    let permit = tokio::select! {
+        _ = token.cancelled() => return Ok(WorkspaceFileSearchResult::empty()),
+        permit = semaphore.acquire_owned() => permit.map_err(|error| {
+            AppCommandError::task_execution_failed(error.to_string())
+        })?,
+    };
+    if token.is_cancelled() {
+        return Ok(WorkspaceFileSearchResult::empty());
+    }
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task(&token)
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::io_error("Workspace file search task failed")
+            .with_detail(error.to_string())
+    })?
 }
 
 /// Build a nested file tree under `root`. Unless `include_ignored` is true, the
@@ -3508,16 +3690,42 @@ pub async fn search_workspace_files(
     path: String,
     query: Option<String>,
     limit: Option<usize>,
+    search_session_id: Option<String>,
+    request_id: Option<String>,
 ) -> Result<WorkspaceFileSearchResult, AppCommandError> {
     let root = PathBuf::from(&path);
     let q = query.unwrap_or_default();
     let lim = limit.unwrap_or(WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT);
-    tokio::task::spawn_blocking(move || search_workspace_files_sync(root, &q, lim))
-        .await
-        .map_err(|e| {
-            AppCommandError::io_error("Workspace file search task failed")
-                .with_detail(e.to_string())
-        })?
+    let lease = register_workspace_search(
+        search_session_id.as_deref(),
+        request_id.as_deref(),
+    )?;
+    let token = lease.token();
+    let result = run_workspace_search_task(
+        Arc::clone(&WORKSPACE_SEARCH_SEMAPHORE),
+        token,
+        move |token| search_workspace_files_sync(root, &q, lim, token),
+    )
+    .await;
+    drop(lease);
+    result
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn cancel_workspace_file_search(
+    search_session_id: String,
+    request_id: String,
+) -> Result<bool, AppCommandError> {
+    let Some((session_id, request_id)) = validate_workspace_search_identity(
+        Some(search_session_id.as_str()),
+        Some(request_id.as_str()),
+    )? else {
+        unreachable!("cancel always supplies both workspace search identifiers");
+    };
+    Ok(cancel_workspace_search_registration(
+        &session_id,
+        &request_id,
+    ))
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -4526,6 +4734,7 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::fresh_in_memory_db;
     use crate::models::agent::AgentType;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn emit_folder_upsert_broadcasts_on_folder_channel() {
@@ -5116,11 +5325,13 @@ branch refs/heads/main";
             &root.path().join("node_modules/pkg/index.js"),
             "skip\n",
         );
+        let token = CancellationToken::new();
 
         let by_name = search_workspace_files_sync(
             root.path().to_path_buf(),
             "foo",
             50,
+            &token,
         )
         .expect("search");
         let paths: Vec<_> = by_name.files.iter().map(|h| h.path.as_str()).collect();
@@ -5131,10 +5342,251 @@ branch refs/heads/main";
             "ignored paths must not appear, got {paths:?}"
         );
 
-        let capped = search_workspace_files_sync(root.path().to_path_buf(), "", 2)
-            .expect("capped empty query");
+        let capped = search_workspace_files_sync(
+            root.path().to_path_buf(),
+            "",
+            2,
+            &token,
+        )
+        .expect("capped empty query");
         assert_eq!(capped.files.len(), 2);
         assert!(capped.truncated, "more than 2 entries exist under the root");
+    }
+
+    #[test]
+    fn workspace_search_identity_requires_a_complete_valid_pair() {
+        assert!(validate_workspace_search_identity(None, None)
+            .expect("legacy request")
+            .is_none());
+        assert!(validate_workspace_search_identity(Some("session"), None).is_err());
+        assert!(validate_workspace_search_identity(None, Some("request")).is_err());
+        assert!(validate_workspace_search_identity(Some(""), Some("request")).is_err());
+        assert!(validate_workspace_search_identity(Some("   "), Some("request")).is_err());
+        let longest_valid = "x".repeat(128);
+        assert!(validate_workspace_search_identity(
+            Some(&longest_valid),
+            Some("request"),
+        )
+        .expect("128-byte id")
+        .is_some());
+        let too_long = "x".repeat(129);
+        assert!(validate_workspace_search_identity(Some(&too_long), Some("request")).is_err());
+    }
+
+    #[test]
+    fn workspace_search_replacement_and_delayed_cancel_are_request_scoped() {
+        let first = register_workspace_search(Some("replace-session"), Some("request-1"))
+            .expect("first registration");
+        let second = register_workspace_search(Some("replace-session"), Some("request-2"))
+            .expect("replacement registration");
+
+        assert!(first.token().is_cancelled());
+        assert!(!second.token().is_cancelled());
+        assert!(!cancel_workspace_search_registration(
+            "replace-session",
+            "request-1",
+        ));
+        assert!(!second.token().is_cancelled());
+
+        drop(first);
+        assert!(cancel_workspace_search_registration(
+            "replace-session",
+            "request-2",
+        ));
+        assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn workspace_search_pre_cancelled_walk_returns_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("src/main.rs"), "fn main() {}\n");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = search_workspace_files_sync(
+            root.path().to_path_buf(),
+            "",
+            10,
+            &token,
+        )
+        .expect("cancelled search");
+
+        assert!(result.files.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn workspace_search_matches_unicode_case() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("Ä.TXT"), "x\n");
+        let token = CancellationToken::new();
+
+        for query in ["ä", "Ä"] {
+            let result = search_workspace_files_sync(
+                root.path().to_path_buf(),
+                query,
+                10,
+                &token,
+            )
+            .expect("search");
+            assert_eq!(result.files.len(), 1, "query {query}");
+            assert_eq!(result.files[0].path, "Ä.TXT");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_search_gate_limits_walks_and_cancels_waiters() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let semaphore = Arc::new(Semaphore::new(4));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut tasks = Vec::new();
+
+        for _ in 0..5 {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(run_workspace_search_task(
+                Arc::clone(&semaphore),
+                Arc::new(CancellationToken::new()),
+                move |_| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    started.fetch_add(1, Ordering::SeqCst);
+
+                    let (lock, wake) = &*release;
+                    let mut released = lock.lock().expect("release lock");
+                    while !*released {
+                        released = wake.wait(released).expect("release wait");
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(WorkspaceFileSearchResult {
+                        files: Vec::new(),
+                        truncated: false,
+                    })
+                },
+            )));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("four searches should enter");
+        assert_eq!(active.load(Ordering::SeqCst), 4);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().expect("release lock") = true;
+            wake.notify_all();
+        }
+        for task in tasks {
+            task.await
+                .expect("search task join")
+                .expect("search task result");
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 5);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        let waiting_semaphore = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&waiting_semaphore)
+            .acquire_owned()
+            .await
+            .expect("held permit");
+        let waiting_token = Arc::new(CancellationToken::new());
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let waiting_task = tokio::spawn(run_workspace_search_task(
+            waiting_semaphore,
+            Arc::clone(&waiting_token),
+            move |_| {
+                ran_in_task.store(true, Ordering::SeqCst);
+                Ok(WorkspaceFileSearchResult {
+                    files: Vec::new(),
+                    truncated: false,
+                })
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!waiting_task.is_finished());
+
+        waiting_token.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), waiting_task)
+            .await
+            .expect("cancelled waiter should finish")
+            .expect("cancelled waiter join")
+            .expect("cancelled waiter result");
+        assert!(cancelled.files.is_empty());
+        assert!(!cancelled.truncated);
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(held_permit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_search_gate_holds_permit_after_caller_abort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_in_task = Arc::clone(&entered);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_in_task = Arc::clone(&release);
+        let task = tokio::spawn(run_workspace_search_task(
+            Arc::clone(&semaphore),
+            Arc::new(CancellationToken::new()),
+            move |_| {
+                entered_in_task.store(true, Ordering::SeqCst);
+                let (lock, wake) = &*release_in_task;
+                let mut released = lock.lock().expect("release lock");
+                while !*released {
+                    released = wake.wait(released).expect("release wait");
+                }
+                Ok(WorkspaceFileSearchResult {
+                    files: Vec::new(),
+                    truncated: false,
+                })
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking search should start");
+
+        task.abort();
+        assert!(task.await.expect_err("caller task should abort").is_cancelled());
+        let permits_while_detached = semaphore.available_permits();
+        let could_acquire_while_detached = semaphore.try_acquire().is_ok();
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().expect("release lock") = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while semaphore.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permit should return after blocking search exits");
+        assert_eq!(permits_while_detached, 0);
+        assert!(!could_acquire_while_detached);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -5145,6 +5597,8 @@ branch refs/heads/main";
             root.path().to_string_lossy().into_owned(),
             Some("util".into()),
             Some(10),
+            None,
+            None,
         )
         .await
         .expect("async search");

@@ -211,7 +211,7 @@ git commit -m "feat(files): add include-ignored tree mode"
 - Modify: `src-tauri/src/lib.rs:940-955`
 
 **Interfaces:**
-- Produces: `search_workspace_files(path: String, query: String, limit: Option<usize>, search_session_id: Option<String>, request_id: Option<String>)`
+- Produces: `search_workspace_files(path: String, query: Option<String>, limit: Option<usize>, search_session_id: Option<String>, request_id: Option<String>)`
 - Produces: `cancel_workspace_file_search(search_session_id: String, request_id: String) -> Result<bool, AppCommandError>`
 - Produces: a four-permit search gate whose owned permit lives inside the blocking closure
 

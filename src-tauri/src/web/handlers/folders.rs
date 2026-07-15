@@ -275,6 +275,8 @@ pub struct SearchWorkspaceFilesParams {
     pub path: String,
     pub query: Option<String>,
     pub limit: Option<usize>,
+    pub search_session_id: Option<String>,
+    pub request_id: Option<String>,
 }
 
 pub async fn search_workspace_files(
@@ -284,9 +286,30 @@ pub async fn search_workspace_files(
         params.path,
         params.query,
         params.limit,
+        params.search_session_id,
+        params.request_id,
     )
     .await?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelWorkspaceFileSearchParams {
+    pub search_session_id: String,
+    pub request_id: String,
+}
+
+pub async fn cancel_workspace_file_search(
+    Json(params): Json<CancelWorkspaceFileSearchParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    Ok(Json(
+        folder_commands::cancel_workspace_file_search(
+            params.search_session_id,
+            params.request_id,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
