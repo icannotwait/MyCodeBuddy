@@ -134,14 +134,28 @@ async fn create_inner(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     let now = Utc::now();
-    let (parent_id, parent_tool_use_id, delegation_call_id) = match delegation {
+    let (parent_id, parent_tool_use_id, delegation_call_id, task_fields) = match delegation {
         Some(link) => (
             Some(link.parent_conversation_id),
             Some(link.parent_tool_use_id),
             Some(link.delegation_call_id),
+            // Accepted boundary: linked delegate rows are born running. Normal
+            // root/chat rows keep all four task fields null.
+            (
+                Some(conversation::DelegationTaskStatus::Running),
+                None::<String>,
+                Some(now),
+                None,
+            ),
         ),
-        None => (None, None, None),
+        None => (None, None, None, (None, None, None, None)),
     };
+    let (
+        delegation_task_status,
+        delegation_error_code,
+        delegation_started_at,
+        delegation_finished_at,
+    ) = task_fields;
     let model = conversation::ActiveModel {
         id: NotSet,
         folder_id: Set(folder_id),
@@ -157,10 +171,10 @@ async fn create_inner(
         parent_tool_use_id: Set(parent_tool_use_id),
         delegation_call_id: Set(delegation_call_id),
         delegation_route_override: Set(route_policy_to_storage(delegation_route_override)),
-        delegation_task_status: Set(None),
-        delegation_error_code: Set(None),
-        delegation_started_at: Set(None),
-        delegation_finished_at: Set(None),
+        delegation_task_status: Set(delegation_task_status),
+        delegation_error_code: Set(delegation_error_code),
+        delegation_started_at: Set(delegation_started_at),
+        delegation_finished_at: Set(delegation_finished_at),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),

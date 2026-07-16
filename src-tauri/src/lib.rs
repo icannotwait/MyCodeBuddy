@@ -583,6 +583,13 @@ mod tauri_app {
                             &session_info_for_init,
                         )
                         .await;
+                        // After migrations + settings, before the listener accepts:
+                        // fail only orphaned running delegate rows as host_restarted.
+                        if let Err(e) = broker_for_init.reconcile_running_on_startup().await {
+                            tracing::error!(
+                                "[delegation] startup reconcile_running failed: {e}"
+                            );
+                        }
                     });
 
                     let listener_broker = broker.clone();

@@ -3090,23 +3090,23 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             let conns = self.manager.connections.lock().await;
             let conn = conns
                 .get(conn_id)
-                .ok_or_else(|| SpawnerError::Send(format!("child {conn_id} not found")))?;
+                .ok_or_else(|| SpawnerError::send(format!("child {conn_id} not found")))?;
             let s = conn.state.read().await;
             s.working_dir.clone()
         };
         let folder_path = working_dir_pathbuf
             .ok_or_else(|| {
-                SpawnerError::Send(
-                    "child connection has no working_dir; cannot derive folder_id".into(),
+                SpawnerError::send(
+                    "child connection has no working_dir; cannot derive folder_id",
                 )
             })?
             .to_string_lossy()
             .to_string();
         let folder = crate::db::service::folder_service::add_folder(&self.db.conn, &folder_path)
             .await
-            .map_err(|e| SpawnerError::Send(format!("add_folder: {e}")))?;
+            .map_err(|e| SpawnerError::send(format!("add_folder: {e}")))?;
 
-        let result = self
+        match self
             .manager
             .send_prompt_linked(
                 &self.db,
@@ -3117,12 +3117,27 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 Some(link),
             )
             .await
-            .map_err(|e| SpawnerError::Send(e.to_string()))?;
-        result.ok_or_else(|| {
-            SpawnerError::Send(
-                "send_prompt_linked succeeded but no conversation_id was bound".into(),
-            )
-        })
+        {
+            Ok(Some(cid)) => Ok(cid),
+            Ok(None) => Err(SpawnerError::send(
+                "send_prompt_linked succeeded but no conversation_id was bound",
+            )),
+            Err(e) => {
+                // Row may already exist (created before prompt enqueue). Preserve
+                // its id so the broker can settle failed/spawn_failed.
+                let child_conversation_id = {
+                    let conns = self.manager.connections.lock().await;
+                    match conns.get(conn_id) {
+                        Some(conn) => conn.state.read().await.conversation_id,
+                        None => None,
+                    }
+                };
+                Err(SpawnerError::Send {
+                    message: e.to_string(),
+                    child_conversation_id,
+                })
+            }
+        }
     }
 
     async fn cancel(

@@ -241,6 +241,31 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
+
+            // Delegate rows: durable task status + sidebar ConversationStatus are
+            // owned by the broker store CAS (`settle_task`). A generic
+            // ConversationStatus write here would race / obscure the terminal
+            // winner. Non-delegate chats keep the existing lifecycle write.
+            let is_delegate = conversation_service::get_by_id(db_conn, cid)
+                .await
+                .ok()
+                .and_then(|r| r.delegation_call_id)
+                .is_some();
+
+            if is_delegate {
+                if let Some(b) = broker {
+                    forward_turn_complete_to_broker(
+                        db_conn,
+                        b.as_ref(),
+                        cid,
+                        stop_reason.as_str(),
+                        last_text,
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+
             if let Some(ts) = target_status.clone() {
                 // DB write before emit so any downstream subscriber that observes
                 // the ConversationStatusChanged event can assume the row is
@@ -253,20 +278,6 @@ pub(crate) async fn handle_event(
                         conversation_id: cid,
                         status: ts,
                     },
-                )
-                .await;
-            }
-
-            // If this conversation was spawned by a delegation, resolve the
-            // pending broker call. The broker maps the outcome onto the
-            // parent's `tool_use_id` via the registered `call_id`.
-            if let Some(b) = broker {
-                forward_turn_complete_to_broker(
-                    db_conn,
-                    b.as_ref(),
-                    cid,
-                    stop_reason.as_str(),
-                    last_text,
                 )
                 .await;
             }
@@ -403,6 +414,17 @@ async fn handle_terminal_event(
         return Ok(());
     };
     let cid = entry.conversation_id;
+    // Delegate rows: terminal ConversationStatus is owned by the broker store
+    // CAS. Skipping the generic InProgress→Cancelled write prevents racing the
+    // durable winner (completed/failed/canceled).
+    let is_delegate = conversation_service::get_by_id(db_conn, cid)
+        .await
+        .ok()
+        .and_then(|r| r.delegation_call_id)
+        .is_some();
+    if is_delegate {
+        return Ok(());
+    }
     let changed = conversation_service::update_status_if(
         db_conn,
         cid,

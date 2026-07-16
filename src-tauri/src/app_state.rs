@@ -126,6 +126,7 @@ pub fn build_delegation_stack(
     use crate::acp::delegation::broker::{
         ChildStatusLookup, ConversationDepthLookup, DbChildStatusLookup, DbDepthLookup,
     };
+    use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
     use crate::acp::delegation::event_emitter::{
         ConnectionManagerEventEmitter, DelegationEventEmitter,
     };
@@ -152,7 +153,10 @@ pub fn build_delegation_stack(
     }) as Arc<dyn ConnectionSpawner>;
     let depth_lookup =
         Arc::new(DbDepthLookup { db: db_arc.clone() }) as Arc<dyn ConversationDepthLookup>;
-    let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
+    let task_store =
+        Arc::new(DbDelegationTaskStore::new(db_arc.clone())) as Arc<dyn DelegationTaskStore>;
+    let status_lookup =
+        Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
         manager: cm_arc.clone(),
     }) as Arc<dyn DelegationMetaWriter>;
@@ -163,6 +167,7 @@ pub fn build_delegation_stack(
         as Arc<dyn DelegationEventEmitter>;
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
+            .with_task_store(task_store)
             .with_status_lookup(status_lookup)
             .with_live_reply_lookup(live_reply_lookup),
     );

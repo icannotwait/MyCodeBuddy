@@ -333,6 +333,12 @@ async fn async_main() -> ExitCode {
     )
     .await;
 
+    // After migrations + settings, before the listener accepts: fail only
+    // orphaned running delegate rows as host_restarted.
+    if let Err(e) = delegation_broker.reconcile_running_on_startup().await {
+        tracing::error!("[delegation] startup reconcile_running failed: {e}");
+    }
+
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.
