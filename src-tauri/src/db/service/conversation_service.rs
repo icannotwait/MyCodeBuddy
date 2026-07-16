@@ -114,6 +114,7 @@ async fn create_inner(
         updated_at: Set(now),
         deleted_at: Set(None),
         pinned_at: Set(None),
+        awaiting_reply_token: Set(None),
     };
     Ok(model.insert(conn).await?)
 }
@@ -306,6 +307,7 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         title_locked: r.title_locked,
         agent_type: parse_agent_type(&r.agent_type),
         status,
+        awaiting_reply_token: r.awaiting_reply_token,
         kind: r.kind.clone(),
         model: r.model,
         git_branch: r.git_branch,

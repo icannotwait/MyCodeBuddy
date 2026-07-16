@@ -37,6 +37,7 @@ function child(
     title_locked: false,
     agent_type: "codex",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "delegate",
     model: null,
     git_branch: null,

@@ -1585,6 +1585,7 @@ mod tests {
             title_locked: false,
             agent_type: AgentType::Codex,
             status: status.into(),
+            awaiting_reply_token: None,
             kind: conversation::ConversationKind::Delegate,
             model: None,
             git_branch: None,

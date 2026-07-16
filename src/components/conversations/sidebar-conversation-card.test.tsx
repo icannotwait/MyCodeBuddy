@@ -42,6 +42,7 @@ function conv(id: number): DbConversationSummary {
     title_locked: false,
     agent_type: "claude_code",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,

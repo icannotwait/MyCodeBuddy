@@ -319,6 +319,7 @@ export interface DbConversationSummary {
   title_locked: boolean
   agent_type: AgentType
   status: string
+  awaiting_reply_token: string | null
   /** Mirrors `conversation.kind` — drives sidebar visibility and grouping. */
   kind: ConversationKind
   model: string | null
@@ -338,6 +339,13 @@ export interface DbConversationSummary {
   parent_id?: number | null
   parent_tool_use_id?: string | null
   delegation_call_id?: string | null
+}
+
+export interface ConversationStatePatch {
+  id: number
+  status: string
+  awaiting_reply_token: string | null
+  updated_at: string
 }
 
 /** Payload for the global `conversation://changed` side-channel that keeps

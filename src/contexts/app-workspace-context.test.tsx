@@ -91,6 +91,7 @@ function makeSummary(
     title_locked: false,
     agent_type: "claude_code",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
