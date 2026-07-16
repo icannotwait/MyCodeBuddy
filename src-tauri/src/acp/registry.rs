@@ -401,7 +401,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 package: "@xai-official/grok@0.2.98",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
-                // flags (`--no-auto-update` always, `--always-approve` only when
+                // flags (`--no-auto-update` always, `--disallowed-tools
+                // ask_user_question` always, and `--always-approve` only when
                 // the user picked that permission mode) MUST precede this
                 // subcommand — `grok agent stdio` itself rejects them (verified
                 // against 0.2.94; still applies on 0.2.98: it only accepts

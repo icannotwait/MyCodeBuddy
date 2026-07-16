@@ -401,6 +401,31 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
     })
 }
 
+fn append_npx_launch_args(
+    parts: &mut Vec<String>,
+    agent_type: AgentType,
+    args: &[&str],
+    grok_always_approve: bool,
+) {
+    if agent_type == AgentType::Grok {
+        // Grok's native ask_user_question waits outside Codeg's QuestionRequest
+        // flow. Remove it so structured questions use codeg-mcp instead.
+        for arg in [
+            "--no-auto-update",
+            "--disallowed-tools",
+            "ask_user_question",
+        ] {
+            parts.push(arg.into());
+        }
+        if grok_always_approve {
+            parts.push("--always-approve".into());
+        }
+    }
+    for arg in args {
+        parts.push((*arg).into());
+    }
+}
+
 async fn build_agent(
     agent_type: AgentType,
     runtime_env: &BTreeMap<String, String>,
@@ -463,18 +488,21 @@ async fn build_agent(
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
             //    CLI's background self-update (it would drift off the pin and can
             //    break the ACP contract). Config twin: `[cli].auto_update = false`.
+            //  - `--disallowed-tools ask_user_question`: Grok's built-in
+            //    `ask_user_question` collides with `codeg-mcp__ask_user_question`
+            //    and blocks outside Codeg's QuestionRequest flow. Disable the
+            //    native tool so structured questions route through codeg-mcp.
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
-            if agent_type == AgentType::Grok {
-                parts.push("--no-auto-update".into());
-                if crate::commands::acp::grok_launch_always_approve() {
-                    parts.push("--always-approve".into());
-                }
-            }
-            for a in args {
-                parts.push((*a).into());
-            }
+            let grok_always_approve = agent_type == AgentType::Grok
+                && crate::commands::acp::grok_launch_always_approve();
+            append_npx_launch_args(
+                &mut parts,
+                agent_type,
+                args,
+                grok_always_approve,
+            );
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -5984,6 +6012,60 @@ mod tests {
             d = d.old_text(o.to_string());
         }
         ToolCallContent::Diff(d)
+    }
+
+    #[test]
+    fn grok_npx_launch_args_disable_native_question_before_subcommand() {
+        let mut without_auto_approve = vec!["grok".to_string()];
+        append_npx_launch_args(
+            &mut without_auto_approve,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            false,
+        );
+        assert_eq!(
+            without_auto_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        let mut with_auto_approve = vec!["grok".to_string()];
+        append_npx_launch_args(
+            &mut with_auto_approve,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            true,
+        );
+        assert_eq!(
+            with_auto_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--always-approve",
+                "agent",
+                "stdio",
+            ]
+        );
+    }
+
+    #[test]
+    fn non_grok_npx_launch_args_remain_unchanged() {
+        let mut parts = vec!["codex-acp".to_string()];
+        append_npx_launch_args(
+            &mut parts,
+            AgentType::Codex,
+            &["serve"],
+            true,
+        );
+        assert_eq!(parts, vec!["codex-acp", "serve"]);
     }
 
     #[tokio::test]
