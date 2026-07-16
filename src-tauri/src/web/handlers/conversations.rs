@@ -183,6 +183,7 @@ pub struct CreateConversationParams {
     pub folder_id: i32,
     pub agent_type: AgentType,
     pub title: Option<String>,
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 }
 
 pub async fn create_conversation(
@@ -195,6 +196,7 @@ pub async fn create_conversation(
         params.folder_id,
         params.agent_type,
         params.title,
+        params.delegation_route_override,
     )
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &db.conn, result).await;
@@ -209,6 +211,7 @@ pub struct CreateChatConversationParams {
     /// Reuse an eagerly-created scratch dir (from `create_chat_dir`) instead of
     /// minting a new one, so the ACP cwd stays put across the first send.
     pub existing_dir: Option<String>,
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 }
 
 pub async fn create_chat_conversation(
@@ -221,11 +224,34 @@ pub async fn create_chat_conversation(
         params.agent_type,
         params.title,
         params.existing_dir.as_deref(),
+        params.delegation_route_override,
     )
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, result.conversation_id)
         .await;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConversationDelegationRouteParams {
+    pub conversation_id: i32,
+    pub route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+}
+
+pub async fn set_conversation_delegation_route(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SetConversationDelegationRouteParams>,
+) -> Result<Json<DbConversationSummary>, AppCommandError> {
+    let summary = conv_commands::set_conversation_delegation_route_core(
+        &state.db.conn,
+        params.conversation_id,
+        params.route_override,
+    )
+    .await?;
+    conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, params.conversation_id)
+        .await;
+    Ok(Json(summary))
 }
 
 /// Eagerly create a chat-mode scratch directory (no DB rows) and return its

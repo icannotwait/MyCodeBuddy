@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::AgentType;
 use super::message::{MessageTurn, TurnUsage};
-use crate::db::entities::conversation::ConversationKind;
+use crate::acp::delegation::route::DelegationRoutePolicy;
+use crate::db::entities::conversation::{ConversationKind, DelegationTaskStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
@@ -62,6 +63,14 @@ pub struct DbConversationSummary {
     pub parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_call_id: Option<String>,
+    /// Root-only managed-agent route override. Always serialized so cold-load
+    /// clients see `null` rather than an absent field.
+    pub delegation_route_override: Option<DelegationRoutePolicy>,
+    /// Durable Broker task status for delegate rows. Independent of `status`.
+    pub delegation_task_status: Option<DelegationTaskStatus>,
+    pub delegation_error_code: Option<String>,
+    pub delegation_started_at: Option<DateTime<Utc>>,
+    pub delegation_finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

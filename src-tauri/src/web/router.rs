@@ -140,6 +140,10 @@ pub fn build_router(
             post(handlers::conversations::create_chat_dir),
         )
         .route(
+            "/set_conversation_delegation_route",
+            post(handlers::conversations::set_conversation_delegation_route),
+        )
+        .route(
             "/update_conversation_status",
             post(handlers::conversations::update_conversation_status),
         )
@@ -1055,7 +1059,10 @@ pub fn build_router(
             "/automation_list",
             post(handlers::automation::automation_list),
         )
-        .route("/automation_get", post(handlers::automation::automation_get))
+        .route(
+            "/automation_get",
+            post(handlers::automation::automation_get),
+        )
         .route(
             "/automation_runs",
             post(handlers::automation::automation_runs),

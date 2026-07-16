@@ -434,7 +434,14 @@ impl AutomationEngine {
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
         let conversation_id =
-            match create_conversation_core(&self.db.conn, cwd.folder_id, agent_type, Some(title)).await
+            match create_conversation_core(
+                &self.db.conn,
+                cwd.folder_id,
+                agent_type,
+                Some(title),
+                None,
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {

@@ -4,6 +4,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
+use crate::acp::delegation::route::{is_managed_agent, DelegationRoutePolicy};
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
@@ -16,6 +17,26 @@ pub async fn create(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create`] but persists a root session route override in the same
+/// INSERT. Rejects a non-null override for unmanaged Agent types.
+pub async fn create_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
@@ -24,6 +45,7 @@ pub async fn create(
         git_branch,
         None,
         ConversationKind::Regular,
+        delegation_route_override,
     )
     .await
 }
@@ -39,6 +61,25 @@ pub async fn create_chat(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_chat_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create_chat`] but persists a route override in the same INSERT.
+pub async fn create_chat_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
@@ -47,6 +88,7 @@ pub async fn create_chat(
         git_branch,
         None,
         ConversationKind::Chat,
+        delegation_route_override,
     )
     .await
 }
@@ -56,7 +98,8 @@ pub async fn create_chat(
 /// `parent_id` / `parent_tool_use_id` / `delegation_call_id` so the lifecycle
 /// subscriber and frontend can rebuild the parent ↔ child binding without
 /// inspecting the live broker state. `kind` follows the invariant
-/// `delegate ⟺ parent_id set`.
+/// `delegate ⟺ parent_id set`. Broker children always store a null route
+/// override (connection origin forces Codeg later).
 pub async fn create_with_delegation(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -70,7 +113,10 @@ pub async fn create_with_delegation(
     } else {
         ConversationKind::Regular
     };
-    create_inner(conn, folder_id, agent_type, title, git_branch, delegation, kind).await
+    create_inner(
+        conn, folder_id, agent_type, title, git_branch, delegation, kind, None,
+    )
+    .await
 }
 
 async fn create_inner(
@@ -81,6 +127,7 @@ async fn create_inner(
     git_branch: Option<String>,
     delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
     kind: ConversationKind,
+    delegation_route_override: Option<DelegationRoutePolicy>,
 ) -> Result<conversation::Model, DbError> {
     let at_str = serde_json::to_value(agent_type)
         .ok()
@@ -109,6 +156,11 @@ async fn create_inner(
         parent_id: Set(parent_id),
         parent_tool_use_id: Set(parent_tool_use_id),
         delegation_call_id: Set(delegation_call_id),
+        delegation_route_override: Set(route_policy_to_storage(delegation_route_override)),
+        delegation_task_status: Set(None),
+        delegation_error_code: Set(None),
+        delegation_started_at: Set(None),
+        delegation_finished_at: Set(None),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
@@ -116,6 +168,29 @@ async fn create_inner(
         pinned_at: Set(None),
     };
     Ok(model.insert(conn).await?)
+}
+
+fn route_policy_to_storage(policy: Option<DelegationRoutePolicy>) -> Option<String> {
+    policy.map(|p| match p {
+        DelegationRoutePolicy::Codeg => "codeg".to_string(),
+        DelegationRoutePolicy::Native => "native".to_string(),
+    })
+}
+
+/// Map a stored route override string to the typed policy. Malformed legacy
+/// values log and become `None` — never panic.
+fn parse_route_override(raw: Option<String>) -> Option<DelegationRoutePolicy> {
+    match raw.as_deref() {
+        None => None,
+        Some("codeg") => Some(DelegationRoutePolicy::Codeg),
+        Some("native") => Some(DelegationRoutePolicy::Native),
+        Some(other) => {
+            tracing::warn!(
+                "[conversation_service] malformed delegation_route_override {other:?}, treating as None"
+            );
+            None
+        }
+    }
 }
 
 pub async fn update_status(
@@ -320,6 +395,11 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         parent_id: r.parent_id,
         parent_tool_use_id: r.parent_tool_use_id,
         delegation_call_id: r.delegation_call_id,
+        delegation_route_override: parse_route_override(r.delegation_route_override),
+        delegation_task_status: r.delegation_task_status,
+        delegation_error_code: r.delegation_error_code,
+        delegation_started_at: r.delegation_started_at,
+        delegation_finished_at: r.delegation_finished_at,
     }
 }
 
@@ -643,9 +723,15 @@ mod tests {
     async fn list_children_orders_newest_first() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-list-children-order").await;
-        let parent = create(&db.conn, folder, AgentType::ClaudeCode, Some("P".into()), None)
-            .await
-            .expect("parent");
+        let parent = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("P".into()),
+            None,
+        )
+        .await
+        .expect("parent");
         // Two children created oldest → newest under the same parent.
         let first = create_with_delegation(
             &db.conn,
@@ -744,7 +830,9 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-child-count-deleted").await;
         let (parent, child) = seed_parent_with_child(&db.conn, folder).await;
 
-        soft_delete(&db.conn, child).await.expect("soft delete child");
+        soft_delete(&db.conn, child)
+            .await
+            .expect("soft delete child");
 
         // A removed sub-session must not keep the parent's chevron alive: the
         // aggregate filters deleted_at IS NULL, matching list_children.
@@ -762,9 +850,15 @@ mod tests {
     async fn update_pin_sets_and_clears_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-update-pin").await;
-        let conv = create(&db.conn, folder, AgentType::ClaudeCode, Some("c".into()), None)
-            .await
-            .expect("create");
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
 
         // Freshly created rows are unpinned, and the summary projection carries
         // the field through (conv_to_summary mapping).
@@ -779,7 +873,10 @@ mod tests {
         // preference, not activity).
         update_pin(&db.conn, conv.id, true).await.expect("pin");
         let pinned = get_by_id(&db.conn, conv.id).await.expect("get pinned");
-        assert!(pinned.pinned_at.is_some(), "pinned_at must be set after pin");
+        assert!(
+            pinned.pinned_at.is_some(),
+            "pinned_at must be set after pin"
+        );
         assert_eq!(
             pinned.updated_at, updated_at_before,
             "pinning must not bump updated_at"
@@ -817,11 +914,20 @@ mod tests {
     async fn create_leaves_title_unlocked() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-title-unlocked").await;
-        let row = create(&db.conn, folder, AgentType::ClaudeCode, Some("hi".into()), None)
-            .await
-            .expect("create");
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("hi".into()),
+            None,
+        )
+        .await
+        .expect("create");
         let summary = get_by_id(&db.conn, row.id).await.expect("get");
-        assert!(!summary.title_locked, "new conversation must start unlocked");
+        assert!(
+            !summary.title_locked,
+            "new conversation must start unlocked"
+        );
     }
 
     #[tokio::test]
