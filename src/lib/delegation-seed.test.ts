@@ -59,4 +59,47 @@ describe("buildDelegationSeedEnvelopes", () => {
   it("returns an empty array for no delegations", () => {
     expect(buildDelegationSeedEnvelopes("p", [], 0)).toEqual([])
   })
+
+  it.each([
+    ["active", null],
+    ["waiting_input", null],
+    ["stalled", "2026-07-17T12:00:00Z"],
+  ] as const)(
+    "seeds observation=%s (and activity times) from active_delegations",
+    (observation, stalledSince) => {
+      const env = buildDelegationSeedEnvelopes(
+        "parent-conn",
+        [
+          dele({
+            parent_tool_use_id: "pt-1",
+            observation,
+            last_agent_activity_at: "2026-07-17T11:59:00Z",
+            stalled_since: stalledSince,
+          }),
+        ],
+        7
+      )
+      expect(env).toHaveLength(1)
+      expect(env[0]).toMatchObject({
+        type: "delegation_started",
+        observation,
+        last_agent_activity_at: "2026-07-17T11:59:00Z",
+        stalled_since: stalledSince,
+      })
+    }
+  )
+
+  it("defaults missing snapshot observation to active (not invented terminals)", () => {
+    const env = buildDelegationSeedEnvelopes(
+      "p",
+      [dele({ parent_tool_use_id: "pt-x" })],
+      1
+    )
+    expect(env[0]).toMatchObject({
+      type: "delegation_started",
+      observation: "active",
+      last_agent_activity_at: null,
+      stalled_since: null,
+    })
+  })
 })

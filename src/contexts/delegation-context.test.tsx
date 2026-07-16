@@ -39,6 +39,11 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
       <div data-testid="status">{binding.status}</div>
       <div data-testid="error-code">{binding.errorCode ?? "-"}</div>
       <div data-testid="agent">{binding.agentType}</div>
+      <div data-testid="observation">{binding.observation ?? "-"}</div>
+      <div data-testid="last-activity">
+        {binding.lastAgentActivityAt ?? "-"}
+      </div>
+      <div data-testid="stalled-since">{binding.stalledSince ?? "-"}</div>
     </div>
   )
 }
@@ -232,4 +237,122 @@ describe("DelegationProvider", () => {
     // Detach was canceled by the re-arriving start event.
     expect(mockDetach).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ["active", "2026-07-17T10:00:00Z", null],
+    ["waiting_input", "2026-07-17T10:01:00Z", null],
+    ["stalled", "2026-07-17T09:00:00Z", "2026-07-17T10:05:00Z"],
+  ] as const)(
+    "applies delegation_observation_changed to an existing running binding (%s) without terminal flip",
+    async (observation, lastAt, stalledSince) => {
+      renderProvider()
+      await awaitHandlerCaptured()
+      dispatch({
+        type: "delegation_started",
+        parent_connection_id: "p1",
+        parent_tool_use_id: "pt-1",
+        child_connection_id: "c1",
+        child_conversation_id: 99,
+        agent_type: "codex",
+      } as unknown as EventEnvelope)
+      expect(screen.getByTestId("status")).toHaveTextContent("running")
+      expect(screen.getByTestId("observation")).toHaveTextContent("active")
+
+      dispatch({
+        type: "delegation_observation_changed",
+        parent_tool_use_id: "pt-1",
+        task_id: "task-1",
+        observation,
+        last_agent_activity_at: lastAt,
+        stalled_since: stalledSince,
+      } as unknown as EventEnvelope)
+
+      // Lifecycle status stays running — observation is non-terminal health only.
+      expect(screen.getByTestId("status")).toHaveTextContent("running")
+      expect(screen.getByTestId("observation")).toHaveTextContent(observation)
+      expect(screen.getByTestId("last-activity")).toHaveTextContent(lastAt)
+      expect(screen.getByTestId("stalled-since")).toHaveTextContent(
+        stalledSince ?? "-"
+      )
+      // Never attaches a second child or synthesizes completion.
+      expect(mockAttach).toHaveBeenCalledTimes(1)
+      expect(mockDetach).not.toHaveBeenCalled()
+    }
+  )
+
+  it("does not synthesize a binding for observation on an unknown tool use", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch({
+      type: "delegation_observation_changed",
+      parent_tool_use_id: "pt-1",
+      task_id: "task-missing",
+      observation: "stalled",
+      last_agent_activity_at: "2026-07-17T10:00:00Z",
+      stalled_since: "2026-07-17T10:05:00Z",
+    } as unknown as EventEnvelope)
+    expect(screen.getByTestId("status")).toHaveTextContent("none")
+    expect(mockAttach).not.toHaveBeenCalled()
+  })
+
+  it("does not apply observation to a terminal binding", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch({
+      type: "delegation_started",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-1",
+      child_connection_id: "c1",
+      child_conversation_id: 99,
+      agent_type: "codex",
+    } as unknown as EventEnvelope)
+    dispatch({
+      type: "delegation_completed",
+      parent_connection_id: "p1",
+      parent_tool_use_id: "pt-1",
+      child_connection_id: "c1",
+      child_conversation_id: 99,
+      agent_type: "codex",
+      result: { kind: "ok", duration_ms: 10 },
+    } as unknown as EventEnvelope)
+    expect(screen.getByTestId("status")).toHaveTextContent("ok")
+
+    dispatch({
+      type: "delegation_observation_changed",
+      parent_tool_use_id: "pt-1",
+      task_id: "task-1",
+      observation: "stalled",
+      last_agent_activity_at: "2026-07-17T10:00:00Z",
+    } as unknown as EventEnvelope)
+    expect(screen.getByTestId("status")).toHaveTextContent("ok")
+    expect(screen.getByTestId("observation")).toHaveTextContent("-")
+  })
+
+  it.each([
+    ["waiting_input", "2026-07-17T11:00:00Z", null],
+    ["stalled", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"],
+  ] as const)(
+    "seeds snapshot recovery observation=%s on started without hardcoding active",
+    async (observation, lastAt, stalledSince) => {
+      renderProvider()
+      await awaitHandlerCaptured()
+      dispatch({
+        type: "delegation_started",
+        parent_connection_id: "p1",
+        parent_tool_use_id: "pt-1",
+        child_connection_id: "c1",
+        child_conversation_id: 99,
+        agent_type: "codex",
+        observation,
+        last_agent_activity_at: lastAt,
+        stalled_since: stalledSince,
+      } as unknown as EventEnvelope)
+      expect(screen.getByTestId("status")).toHaveTextContent("running")
+      expect(screen.getByTestId("observation")).toHaveTextContent(observation)
+      expect(screen.getByTestId("last-activity")).toHaveTextContent(lastAt)
+      expect(screen.getByTestId("stalled-since")).toHaveTextContent(
+        stalledSince ?? "-"
+      )
+    }
+  )
 })

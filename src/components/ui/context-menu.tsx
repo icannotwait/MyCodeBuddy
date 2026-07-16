@@ -198,7 +198,7 @@ function ContextMenuRadioItem({
       {...props}
     >
       <span
-        className="absolute right-2 flex items-center justify-center pointer-events-none"
+        className="absolute end-2 flex items-center justify-center pointer-events-none"
         data-slot="context-menu-radio-item-indicator"
       >
         <ContextMenuPrimitive.ItemIndicator>

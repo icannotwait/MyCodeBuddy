@@ -115,8 +115,13 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
           childConnectionId: envelope.child_connection_id,
           childConversationId: envelope.child_conversation_id,
           agentType: envelope.agent_type,
+          // Lifecycle stays running. Observation is non-terminal health only;
+          // live starts default to active; snapshot seeds may carry stalled /
+          // waiting_input from ActiveDelegationState.
           status: "running",
-          observation: "active",
+          observation: envelope.observation ?? "active",
+          lastAgentActivityAt: envelope.last_agent_activity_at ?? null,
+          stalledSince: envelope.stalled_since ?? null,
         }
         setByToolUseId((prev) => {
           const m = new Map(prev)

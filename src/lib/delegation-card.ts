@@ -21,13 +21,17 @@ import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
 /**
  * The full status a delegation card can render. Extends the wire-level
  * `DelegationStatus` ("running" | "ok" | "err") with UI-only "starting"
- * (binding not yet arrived) and "waiting" (child blocked on a permission
- * decision).
+ * (binding not yet arrived), "waiting" (child blocked on a permission
+ * decision), and soft-watchdog observations for a still-running binding
+ * (never terminal / never destructive).
  */
 export type DelegationCardStatus =
   | "starting"
   | "running"
+  | "active"
   | "waiting"
+  | "waiting_input"
+  | "stalled"
   | "ok"
   | "err"
 
@@ -544,7 +548,16 @@ export function resolveDelegationStatus({
   // A child awaiting a permission decision is blocked until the user acts;
   // surface it over the plain running state so the card cues opening "查看会话".
   if (childAwaitingPermission) return "waiting"
-  if (binding) return binding.status
+  if (binding) {
+    // Lifecycle status stays running/ok/err. Soft-watchdog observation only
+    // refines a still-running card — never terminal, never invents a binding.
+    if (binding.status === "running") {
+      if (binding.observation === "waiting_input") return "waiting_input"
+      if (binding.observation === "stalled") return "stalled"
+      if (binding.observation === "active") return "active"
+    }
+    return binding.status
+  }
   if (parsedMeta) return parsedMeta.status
   if (state === "output-error" || errorText) return "err"
   // Async: the parent output is a running ack while the child runs — keep

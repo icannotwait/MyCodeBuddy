@@ -141,4 +141,163 @@ describe("DelegationRouteMenu", () => {
     })
     expect(onDraftChange).toHaveBeenCalledWith("native")
   })
+
+  it("persisted radio calls setConversationDelegationRoute and applies returned upsert", async () => {
+    const onPersistedChange = vi.fn()
+    const summary = {
+      id: 12,
+      folder_id: 1,
+      title: "Root",
+      title_locked: false,
+      agent_type: "codex" as const,
+      status: "idle",
+      kind: "chat" as const,
+      model: null,
+      git_branch: null,
+      external_id: null,
+      message_count: 0,
+      child_count: 0,
+      created_at: "",
+      updated_at: "",
+      pinned_at: null,
+      delegation_route_override: "native" as const,
+    }
+    h.setConversationDelegationRoute.mockResolvedValueOnce(summary)
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ContextMenu>
+          <ContextMenuTrigger asChild>
+            <button type="button">open-menu</button>
+          </ContextMenuTrigger>
+          <ContextMenuContent>
+            <DelegationRouteMenu
+              agentType="codex"
+              conversationId={12}
+              parentId={null}
+              value={null}
+              onPersistedChange={onPersistedChange}
+            />
+          </ContextMenuContent>
+        </ContextMenu>
+      </NextIntlClientProvider>
+    )
+    fireEvent.contextMenu(screen.getByText("open-menu"))
+    await userEvent.click(await screen.findByText("Delegation route"))
+    await userEvent.click(await screen.findByText("Native"))
+    await waitFor(() => {
+      expect(h.setConversationDelegationRoute).toHaveBeenCalledWith(
+        12,
+        "native"
+      )
+    })
+    expect(h.applyConversationUpsert).toHaveBeenCalledWith(summary)
+    expect(onPersistedChange).toHaveBeenCalledWith("native")
+  })
+
+  it("does not upsert until the persisted route write resolves (busy in-flight)", async () => {
+    let resolveRoute!: (v: unknown) => void
+    h.setConversationDelegationRoute.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRoute = resolve
+        })
+    )
+    renderMenu({
+      agentType: "codex",
+      conversationId: 12,
+      parentId: null,
+      value: null,
+    })
+    await userEvent.click(await screen.findByText("Delegation route"))
+    await userEvent.click(await screen.findByText("Native"))
+    await waitFor(() => {
+      expect(h.setConversationDelegationRoute).toHaveBeenCalledWith(
+        12,
+        "native"
+      )
+    })
+    // In-flight: API called, store not yet updated.
+    expect(h.applyConversationUpsert).not.toHaveBeenCalled()
+    resolveRoute({
+      id: 12,
+      folder_id: 1,
+      title: null,
+      title_locked: false,
+      agent_type: "codex",
+      status: "idle",
+      kind: "chat",
+      model: null,
+      git_branch: null,
+      external_id: null,
+      message_count: 0,
+      child_count: 0,
+      created_at: "",
+      updated_at: "",
+      pinned_at: null,
+      delegation_route_override: "native",
+    })
+    await waitFor(() => {
+      expect(h.applyConversationUpsert).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it("toasts and does not upsert when setConversationDelegationRoute fails", async () => {
+    const { toast } = await import("sonner")
+    h.setConversationDelegationRoute.mockRejectedValueOnce(
+      new Error("route write failed")
+    )
+    renderMenu({
+      agentType: "codex",
+      conversationId: 12,
+      parentId: null,
+      value: null,
+    })
+    await userEvent.click(await screen.findByText("Delegation route"))
+    await userEvent.click(await screen.findByText("Native"))
+    await waitFor(() => {
+      expect(h.setConversationDelegationRoute).toHaveBeenCalledWith(
+        12,
+        "native"
+      )
+    })
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalled()
+    })
+    expect(h.applyConversationUpsert).not.toHaveBeenCalled()
+  })
+
+  it("ContextMenuRadioItem indicator uses logical end positioning (RTL-safe)", async () => {
+    // Open a real radio item and assert the indicator class is logical end-*.
+    renderMenu({
+      agentType: "codex",
+      conversationId: 12,
+      parentId: null,
+      value: "native",
+    })
+    await userEvent.click(await screen.findByText("Delegation route"))
+    const native = await screen.findByText("Native")
+    const item =
+      native.closest("[data-slot='context-menu-radio-item']") ??
+      native.closest("[role='menuitemradio']")
+    const indicator = item?.querySelector(
+      "[data-slot='context-menu-radio-item-indicator']"
+    )
+    expect(indicator).toBeTruthy()
+    expect(indicator?.className).toMatch(/\bend-2\b/)
+    expect(indicator?.className).not.toMatch(/\bright-2\b/)
+  })
+
+  it("persisted radio items wire disabled={busy} for in-flight writes", async () => {
+    const { readFileSync } = await import("node:fs")
+    const { resolve } = await import("node:path")
+    const src = readFileSync(
+      resolve(
+        process.cwd(),
+        "src/components/conversations/delegation-route-menu.tsx"
+      ),
+      "utf8"
+    )
+    // Three radios share the busy disable; guard against accidental removal.
+    expect(src.match(/disabled=\{busy\}/g)?.length).toBeGreaterThanOrEqual(3)
+  })
 })

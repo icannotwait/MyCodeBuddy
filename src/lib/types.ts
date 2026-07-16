@@ -1249,6 +1249,13 @@ export type AcpEvent =
       child_connection_id: string
       child_conversation_id: number
       agent_type: AgentType
+      /**
+       * Soft-watchdog health when re-seeding from snapshot `active_delegations`.
+       * Live broker starts omit this (frontend defaults to active).
+       */
+      observation?: TaskObservation | null
+      last_agent_activity_at?: string | null
+      stalled_since?: string | null
     }
   /**
    * The child sub-session has finished (or errored / timed out / been

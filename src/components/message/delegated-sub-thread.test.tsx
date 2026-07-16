@@ -137,6 +137,33 @@ describe("DelegatedSubThread", () => {
     expect(screen.getByText("running")).toBeInTheDocument()
   })
 
+  it.each([
+    ["active", "Active"],
+    ["waiting_input", "Waiting for input"],
+    ["stalled", "No recent agent activity"],
+  ] as const)(
+    "renders live binding running/%s with the same distinct badge as status reports",
+    (observation, label) => {
+      mockedHook.mockReturnValue({
+        binding: bindingOf({ status: "running", observation }),
+        detail: null,
+        loading: false,
+        error: null,
+      })
+      renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+      expect(screen.getByText(label)).toBeInTheDocument()
+      // Lifecycle stays non-terminal: open-conversation remains available.
+      expect(
+        screen.getByRole("button", { name: "Open conversation" })
+      ).toBeInTheDocument()
+      if (observation === "stalled") {
+        expect(screen.getByTestId("delegated-sub-thread")).not.toHaveClass(
+          "bg-destructive/5"
+        )
+      }
+    }
+  )
+
   it("renders the task line directly from input even without a binding", () => {
     const input = JSON.stringify({
       agent_type: "codex",

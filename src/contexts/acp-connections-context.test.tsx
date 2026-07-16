@@ -740,26 +740,57 @@ describe("AcpConnectionsProvider session load failures", () => {
 })
 
 describe("AcpConnectionsProvider route override + conflict", () => {
-  it("sends conversationId and route override to acpConnect", async () => {
+  it("sends conversationId and route override to acpConnect in exact parameter order", async () => {
     h.acpFindConnectionForConversation.mockResolvedValue(null)
     await mountProvider()
     await act(async () => {
-      await h.actions!.connect(
-        TAB,
-        "codex",
-        "/repo",
-        undefined,
-        undefined,
-        "native"
-      )
+      await h.actions!.connect(TAB, "codex", "/repo", undefined, 7, "native")
     })
+    // Exact order: agentType, workingDir, sessionId, preferredModeId,
+    // preferredConfigValues, conversationId, delegationRouteOverride.
     expect(h.acpConnect).toHaveBeenCalledWith(
       "codex",
       "/repo",
       undefined,
       undefined,
       {},
+      7,
+      "native"
+    )
+    const conn = h.store!.getConnection(TAB)
+    expect(conn?.conversationId).toBe(7)
+    expect(conn?.delegationRouteOverride).toBe("native")
+  })
+
+  it("reapplyConfig disconnects then reconnects with stored boundConversationId + boundRouteOverride", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "codex", "/repo", undefined, 42, "native")
+    })
+    const conn = h.store!.getConnection(TAB)
+    expect(conn?.conversationId).toBe(42)
+    expect(conn?.delegationRouteOverride).toBe("native")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    h.acpConnect.mockClear()
+    h.acpDisconnect.mockClear()
+
+    let reapplied = false
+    await act(async () => {
+      reapplied = await h.actions!.reapplyConfig(TAB)
+    })
+    expect(reapplied).toBe(true)
+    // Explicit disconnect of the live owner process first…
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    // …then reconnect reuses the stored conversation id + route override exactly
+    // (sessionId is whatever the connection last held — typically from snapshot).
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "codex",
+      "/repo",
+      conn?.sessionId ?? undefined,
       undefined,
+      {},
+      42,
       "native"
     )
   })
