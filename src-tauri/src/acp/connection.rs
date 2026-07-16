@@ -495,14 +495,9 @@ async fn build_agent(
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
-            let grok_always_approve = agent_type == AgentType::Grok
-                && crate::commands::acp::grok_launch_always_approve();
-            append_npx_launch_args(
-                &mut parts,
-                agent_type,
-                args,
-                grok_always_approve,
-            );
+            let grok_always_approve =
+                agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
+            append_npx_launch_args(&mut parts, agent_type, args, grok_always_approve);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -6059,12 +6054,7 @@ mod tests {
     #[test]
     fn non_grok_npx_launch_args_remain_unchanged() {
         let mut parts = vec!["codex-acp".to_string()];
-        append_npx_launch_args(
-            &mut parts,
-            AgentType::Codex,
-            &["serve"],
-            true,
-        );
+        append_npx_launch_args(&mut parts, AgentType::Codex, &["serve"], true);
         assert_eq!(parts, vec!["codex-acp", "serve"]);
     }
 
