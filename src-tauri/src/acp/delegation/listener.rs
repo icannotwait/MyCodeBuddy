@@ -345,6 +345,10 @@ impl DelegationListener {
     /// [`TokenRegistry`] before [`CompanionLeaseRegistry::mark_ready`]. Ack is
     /// written only after authentication; the socket stays open until peer EOF
     /// or the lease is revoked. Closed exactly once.
+    ///
+    /// Any failure after `mark_ready` and before a durable hold (including an
+    /// ack write failure) calls `mark_closed` so the host never observes a
+    /// false-ready with a dead companion.
     async fn serve_ready_lease<C>(&self, conn: &mut C, token: String) -> std::io::Result<()>
     where
         C: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -366,8 +370,13 @@ impl DelegationListener {
         if let Err(e) = self.leases.mark_ready(&token).await {
             return Err(std::io::Error::other(format!("mark_ready: {e}")));
         }
-        // Ack only after authentication + mark_ready.
-        write_frame(conn, &CompanionReadyAck { ready: true }).await?;
+        // Ack only after authentication + mark_ready. On write failure the host
+        // may already have observed ready via the watch; close so waiters flip
+        // unavailable and bootstrap does not treat the route as Connected.
+        if let Err(e) = write_frame(conn, &CompanionReadyAck { ready: true }).await {
+            self.leases.mark_closed(&token).await;
+            return Err(e);
+        }
 
         // Hold open: peer EOF or external revoke (availability → false).
         let mut probe = [0u8; 1];
@@ -2091,5 +2100,305 @@ mod tests {
         server_task.await.unwrap();
         assert_eq!(resp.outcome["declined"], true);
         assert!(questions.registered.lock().await.is_empty());
+    }
+
+    // ─── Task 7: ready-lease wire protocol (duplex / serve_one) ───────────
+
+    fn make_ready_lease_listener(
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            leases,
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        )
+    }
+
+    /// Valid token: Ready → ack → hold → peer EOF → closed exactly once.
+    #[tokio::test]
+    async fn ready_lease_wire_valid_token_acks_hold_then_closed_once_on_eof() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "ready-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("ready-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "ready-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter
+            .wait_ready(Duration::from_millis(200))
+            .await
+            .expect("host must observe ready after authenticated ack");
+        assert!(*waiter.availability().borrow());
+
+        // Peer EOF ends the hold; closed exactly once.
+        drop(client);
+        server_task.await.unwrap();
+        // Availability may already be false (mark_closed ran); if still true, wait once.
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
+        assert!(!*waiter.availability().borrow());
+        // Second close is a no-op (idempotent).
+        leases.mark_closed("ready-tok").await;
+        assert!(!*waiter.availability().borrow());
+    }
+
+    /// Valid token held, then revoke → closed once; host never sees re-ready.
+    #[tokio::test]
+    async fn ready_lease_wire_revoke_while_held_closes_once() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "revoke-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("revoke-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "revoke-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter.wait_ready(Duration::from_millis(200)).await.unwrap();
+
+        leases.revoke("revoke-tok").await;
+        server_task.await.unwrap();
+        assert!(!*waiter.availability().borrow());
+        // Keep client open until server exits so revoke path is exercised.
+        drop(client);
+    }
+
+    /// Invalid token never becomes ready on the registry watch.
+    #[tokio::test]
+    async fn ready_lease_wire_invalid_token_never_ready() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        // Register a different token so the lease slot exists for a good token only.
+        let mut good_waiter = leases.register("good-tok").await;
+        let mut bad_slot = leases.register("bad-tok").await;
+        // Only "good-tok" is in the token registry.
+        tokens
+            .register(
+                "good-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "bad-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let serve_result = server_task.await.unwrap();
+        assert!(serve_result.is_err(), "invalid token must fail serve_one");
+        // Neither slot becomes ready.
+        assert!(good_waiter
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(bad_slot
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(!*good_waiter.availability().borrow());
+        assert!(!*bad_slot.availability().borrow());
+        drop(client);
+    }
+
+    /// Write failure after mark_ready must mark_closed (no host false-ready).
+    /// Drives the real `serve_one` framing path with a scripted stream: a valid
+    /// Ready frame is readable, then the first write (ack) fails.
+    #[tokio::test]
+    async fn ready_lease_ack_write_failure_marks_closed() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::io::Cursor;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        /// Readable Ready frame, then fail the first write (ack).
+        struct ReadyThenFailAckWrite {
+            read_buf: Cursor<Vec<u8>>,
+            wrote: bool,
+        }
+
+        impl AsyncRead for ReadyThenFailAckWrite {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let mut tmp = vec![0u8; buf.remaining()];
+                match std::io::Read::read(&mut self.read_buf, &mut tmp) {
+                    Ok(0) => Poll::Ready(Ok(())),
+                    Ok(n) => {
+                        buf.put_slice(&tmp[..n]);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+        }
+
+        impl AsyncWrite for ReadyThenFailAckWrite {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if !self.wrote {
+                    self.wrote = true;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected ack write failure",
+                    )));
+                }
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "already failed",
+                )))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Encode a real Ready frame into the scripted stream's read buffer.
+        let mut encode = Vec::new();
+        {
+            use tokio::io::AsyncWriteExt;
+            // write_frame needs AsyncWrite — use a memory buffer via duplex half.
+            let (mut w, mut r) = duplex(4 * 1024);
+            write_frame(
+                &mut w,
+                &BrokerMessage::Ready(CompanionReadyRequest {
+                    token: "fail-ack".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            w.shutdown().await.unwrap();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut encode)
+                .await
+                .unwrap();
+        }
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "fail-ack".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("fail-ack").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let mut conn = ReadyThenFailAckWrite {
+            read_buf: Cursor::new(encode),
+            wrote: false,
+        };
+        let result = listener.serve_one(&mut conn).await;
+        assert!(result.is_err(), "ack write failure must surface via serve_one");
+
+        // Host may briefly observe ready via mark_ready; close must follow.
+        let _ = waiter
+            .wait_ready(std::time::Duration::from_millis(50))
+            .await;
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
+        assert!(
+            !*waiter.availability().borrow(),
+            "ack write failure must mark_closed (no durable false-ready)"
+        );
     }
 }

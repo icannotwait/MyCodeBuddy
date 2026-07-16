@@ -994,10 +994,7 @@ pub fn render_ask_result(outcome: &Value) -> Value {
             } else {
                 selected.join(", ")
             };
-            s.push_str(&format!(
-                "{}. [{header}] {question}\n   → {joined}\n",
-                i + 1
-            ));
+            s.push_str(&format!("{}. [{header}] {question}\n   → {joined}\n", i + 1));
         }
         s
     };
@@ -1140,14 +1137,8 @@ fn render_session_summary_text(o: &Value) -> String {
             .get("truncated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let suffix = if truncated {
-            ", older turns omitted"
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "\nRecent messages ({included}/{total}{suffix}):\n"
-        ));
+        let suffix = if truncated { ", older turns omitted" } else { "" };
+        out.push_str(&format!("\nRecent messages ({included}/{total}{suffix}):\n"));
         if let Some(items) = messages.get("items").and_then(|v| v.as_array()) {
             for item in items {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -2102,11 +2093,8 @@ mod tests {
         );
         assert!(!off.contains(&"ask_user_question".to_string()));
         let on = list_tool_names(
-            dispatch_with_features(
-                ASK_ONLY,
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            )
-            .await,
+            dispatch_with_features(ASK_ONLY, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+                .await,
         );
         assert_eq!(on, vec!["ask_user_question".to_string()]);
     }
@@ -2237,11 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_session_info_missing_or_bad_id_rejected_synchronously() {
-        for args in [
-            json!({}),
-            json!({ "session_id": "abc" }),
-            json!({ "session_id": true }),
-        ] {
+        for args in [json!({}), json!({ "session_id": "abc" }), json!({ "session_id": true })] {
             let line = json!({
                 "jsonrpc": "2.0", "id": 32, "method": "tools/call",
                 "params": { "name": "get_session_info", "arguments": args }
@@ -2297,7 +2281,10 @@ mod tests {
             parse_max_messages(&json!({ "max_messages": 4_294_967_296_u64 })),
             200
         );
-        assert_eq!(parse_max_messages(&json!({ "max_messages": 1e30 })), 200);
+        assert_eq!(
+            parse_max_messages(&json!({ "max_messages": 1e30 })),
+            200
+        );
         // Invalid / negative / fractional → default (optional knob, not an error).
         assert_eq!(parse_max_messages(&json!({ "max_messages": "abc" })), 20);
         assert_eq!(parse_max_messages(&json!({ "max_messages": -5 })), 20);
@@ -2430,12 +2417,8 @@ mod tests {
             let (mut c1, _) = listener.accept().await.unwrap();
             let _: BrokerResponse = match read_frame::<_, BrokerMessage>(&mut c1).await.unwrap() {
                 BrokerMessage::Feedback(_) => {
-                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"]))
-                        .await
-                        .unwrap();
-                    BrokerResponse {
-                        outcome: Value::Null,
-                    }
+                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"])).await.unwrap();
+                    BrokerResponse { outcome: Value::Null }
                 }
                 other => panic!("expected Feedback, got {other:?}"),
             };
@@ -2444,14 +2427,7 @@ mod tests {
             if let BrokerMessage::CommitFeedback(req) = read_frame(&mut c2).await.unwrap() {
                 committed2.lock().await.push(req.ids);
             }
-            write_frame(
-                &mut c2,
-                &BrokerResponse {
-                    outcome: Value::Null,
-                },
-            )
-            .await
-            .unwrap();
+            write_frame(&mut c2, &BrokerResponse { outcome: Value::Null }).await.unwrap();
         });
 
         let inflight = Arc::new(InflightCalls::new());
@@ -2460,9 +2436,7 @@ mod tests {
             Value::from(1),
             sock,
             "tok".into(),
-            BrokerFeedbackRequest {
-                token: "tok".into(),
-            },
+            BrokerFeedbackRequest { token: "tok".into() },
         )
         .await;
         let LineAction::Spawn(call) = action else {

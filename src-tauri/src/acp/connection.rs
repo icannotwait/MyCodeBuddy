@@ -11,9 +11,9 @@ use sacp::schema::{
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
     TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
     ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
@@ -38,6 +38,7 @@ use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
+use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
@@ -47,7 +48,6 @@ use crate::acp::types::{
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
-use crate::terminal::shell::ResolvedShellSpec;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
@@ -285,6 +285,10 @@ pub struct AgentConnection {
     pub status: ConnectionStatus,
     pub owner_window_label: String,
     pub cmd_tx: mpsc::Sender<ConnectionCommand>,
+    /// Abort handle for the connection background task. Used by
+    /// `teardown_unexposed_attempt` to terminate before `run_conversation_loop`
+    /// starts (where a queued `Disconnect` would never drain).
+    pub task_abort: Option<tokio::task::AbortHandle>,
     /// 后端权威的会话状态。所有 `emit_with_state` 写入此状态并自增 seq。
     /// 使用 `Arc<RwLock<_>>` 让 spawn 出的连接 task 与外部 snapshot 读取共享。
     pub state: Arc<RwLock<SessionState>>,
@@ -478,7 +482,10 @@ fn apply_route_argv(
                 .unwrap_or(argv.len());
             argv.insert(insert_at, "--no-subagents".into());
         }
-        (NativeSuppressionPlan::CodeBuddyDisallowedTools { tools }, AgentType::CodeBuddy) => {
+        (
+            NativeSuppressionPlan::CodeBuddyDisallowedTools { tools },
+            AgentType::CodeBuddy,
+        ) => {
             apply_codebuddy_disallowed_tools(argv, tools);
         }
         _ => {}
@@ -514,7 +521,10 @@ fn apply_codebuddy_disallowed_tools(argv: &mut Vec<String>, suppress_tools: &[St
     }
 
     // Prefer immediately before `--acp` when that flag is present.
-    let insert_at = argv.iter().position(|a| a == "--acp").unwrap_or(argv.len());
+    let insert_at = argv
+        .iter()
+        .position(|a| a == "--acp")
+        .unwrap_or(argv.len());
     let mut insert = Vec::with_capacity(1 + union.len());
     insert.push("--disallowedTools".to_string());
     insert.extend(union);
@@ -628,7 +638,10 @@ async fn build_agent(
                 agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
             append_npx_launch_args(&mut argv, agent_type, args, grok_always_approve);
             apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
-            let mut parts: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let mut parts: Vec<String> = env_map
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
             parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
@@ -665,8 +678,10 @@ async fn build_agent(
                             meta.name
                         ))
                     })?;
-            let merged_env =
-                apply_codex_cli_path_env(agent_type, merge_agent_env(env, runtime_env))?;
+            let merged_env = apply_codex_cli_path_env(
+                agent_type,
+                merge_agent_env(env, runtime_env),
+            )?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
             // Bundled: complete argv first, then one route application (env + argv).
             let mut argv: Vec<String> = Vec::new();
@@ -857,8 +872,7 @@ async fn build_agent(
                 // than provisioned through uvx.
                 tracing::warn!(
                     "[ACP][{}] uvx unavailable; falling back to system command {:?}",
-                    meta.name,
-                    sys_path
+                    meta.name, sys_path
                 );
                 // `system_cmd` is a complete launch recipe for the PATH binary;
                 // the uvx entry-script `args` don't necessarily apply to it
@@ -1022,11 +1036,12 @@ pub async fn spawn_agent_connection(
     connections.lock().await.insert(
         connection_id.clone(),
         AgentConnection {
-            id: connection_id,
+            id: connection_id.clone(),
             agent_type,
             status: ConnectionStatus::Connecting,
             owner_window_label,
             cmd_tx,
+            task_abort: None,
             state: Arc::clone(&session_state),
             emitter: emitter.clone(),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1040,7 +1055,7 @@ pub async fn spawn_agent_connection(
         },
     );
 
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         // RAII guard: runs on normal exit AND on panic unwinding, so a
         // panic inside `run_connection` can't leak a stale map entry.
         let _cleanup = ConnectionCleanupGuard {
@@ -1132,6 +1147,15 @@ pub async fn spawn_agent_connection(
         // `_cleanup` is dropped here — removes the connection entry from
         // the manager map. Same drop semantics apply on panic unwinding.
     });
+
+    // Install abort handle so unexposed teardown can terminate before the
+    // conversation loop (Disconnect would never drain there).
+    {
+        let mut map = connections.lock().await;
+        if let Some(conn) = map.get_mut(&connection_id) {
+            conn.task_abort = Some(join_handle.abort_handle());
+        }
+    }
 
     Ok(SpawnHandshake {
         session_started_rx,
@@ -2499,7 +2523,7 @@ async fn run_connection(
         Arc::clone(&prompt_ledger),
     );
 
-    Client
+    let connect_with_result = Client
         .builder()
         .name("codeg")
         .on_receive_request(
@@ -2790,7 +2814,7 @@ async fn run_connection(
                 // we fall through to the session/load block below, so the
                 // effective chain is resume → load → new.
                 if supports_resume {
-                    let resume_req = build_resume_session_request(
+                    let resume_req = match build_resume_session_request(
                         agent_type,
                         SessionId::new(sid.clone()),
                         &cwd,
@@ -2798,8 +2822,14 @@ async fn run_connection(
                         &terminal_shell.spec,
                         adapter_for(agent_type),
                         &route_plan,
-                    )
-                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(
+                                bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await
+                            );
+                        }
+                    };
                     match send_resume_session(&cx, resume_req).await {
                         Ok(resume_resp) => {
                             let initial_config_options = resume_resp.config_options.clone();
@@ -2919,7 +2949,7 @@ async fn run_connection(
                 }
 
                 // Load existing session via session/load
-                let load_req = build_load_session_request(
+                let load_req = match build_load_session_request(
                     agent_type,
                     SessionId::new(sid.clone()),
                     &cwd,
@@ -2927,8 +2957,12 @@ async fn run_connection(
                     &terminal_shell.spec,
                     adapter_for(agent_type),
                     &route_plan,
-                )
-                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Err(bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await);
+                    }
+                };
                 let load_result = cx.send_request_to(Agent, load_req).block_task().await;
 
                 match load_result {
@@ -3136,19 +3170,23 @@ async fn run_connection(
                             )
                             .await;
                         }
+                        let new_session_req = match build_new_session_request(
+                            agent_type,
+                            &cwd,
+                            mcp_servers.clone(),
+                            &terminal_shell.spec,
+                            adapter_for(agent_type),
+                            &route_plan,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Err(
+                                    bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await
+                                );
+                            }
+                        };
                         let new_resp = cx
-                            .send_request_to(
-                                Agent,
-                                build_new_session_request(
-                                    agent_type,
-                                    &cwd,
-                                    mcp_servers.clone(),
-                                    &terminal_shell.spec,
-                                    adapter_for(agent_type),
-                                    &route_plan,
-                                )
-                                .map_err(|e| sacp::util::internal_error(e.to_string()))?,
-                            )
+                            .send_request_to(Agent, new_session_req)
                             .block_task()
                             .await?;
                         let fallback_sid = new_resp.session_id.0.to_string();
@@ -3237,19 +3275,21 @@ async fn run_connection(
                 }
             } else {
                 // Create new session
+                let new_session_req = match build_new_session_request(
+                    agent_type,
+                    &cwd,
+                    mcp_servers.clone(),
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                    &route_plan,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Err(bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await);
+                    }
+                };
                 let new_resp = cx
-                    .send_request_to(
-                        Agent,
-                        build_new_session_request(
-                            agent_type,
-                            &cwd,
-                            mcp_servers.clone(),
-                            &terminal_shell.spec,
-                            adapter_for(agent_type),
-                            &route_plan,
-                        )
-                        .map_err(|e| sacp::util::internal_error(e.to_string()))?,
-                    )
+                    .send_request_to(Agent, new_session_req)
                     .block_task()
                     .await?;
                 let sid = new_resp.session_id.0.to_string();
@@ -3334,81 +3374,85 @@ async fn run_connection(
                 .await
             }
         }})
-        .await
-        .map_err({
-            let route_bootstrap_tx = Arc::clone(&route_bootstrap_tx);
-            move |e| {
-            let raw = e.to_string();
-            let acp_err = classify_connect_error_for_bootstrap(&raw);
-            // If bootstrap wasn't completed (Ready), report Fatal/RouteSpecific.
-            // Only suppression validation + authenticated ready-lease failures
-            // construct RouteSpecific (root may fall back once); everything else
-            // is Fatal and preserves typed errors where possible.
-            if let Ok(mut guard) = route_bootstrap_tx.try_lock() {
-                if let Some(tx) = guard.take() {
-                    use crate::acp::delegation::route::RouteDegradedReason;
-                    let outcome = match &acp_err {
-                        AcpError::RouteUnavailable { reason }
-                            if matches!(
-                                reason,
-                                RouteDegradedReason::NativeSuppressionInvalid
-                                    | RouteDegradedReason::CompanionInitializationFailed
-                            ) =>
-                        {
-                            RouteBootstrapOutcome::RouteSpecific(*reason)
-                        }
-                        other => RouteBootstrapOutcome::Fatal(match other {
-                            AcpError::InitializeTimeout => AcpError::InitializeTimeout,
-                            AcpError::SdkNotInstalled(m) => AcpError::SdkNotInstalled(m.clone()),
-                            AcpError::RouteUnavailable { reason } => {
-                                AcpError::RouteUnavailable { reason: *reason }
-                            }
-                            _ => AcpError::protocol(other.to_string()),
-                        }),
-                    };
-                    let _ = tx.send(outcome);
-                }
+        .await;
+        match connect_with_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let acp_err = classify_connect_error_residual(&e.to_string());
+                // Deterministic awaited send: never try_lock-suppress the outcome.
+                // If a typed path already took the sender (suppression preflight /
+                // finish_route_ready), this is a no-op.
+                send_bootstrap_outcome_once(
+                    &route_bootstrap_tx,
+                    bootstrap_outcome_from_acp_error(&acp_err),
+                )
+                .await;
+                Err(acp_err)
             }
-            acp_err
-        }})
+        }
 }
 
-/// Map sacp connect errors back into typed [`AcpError`] for bootstrap routing.
-///
-/// `merge_claude_route_meta` / ready-lease failures cross the sacp boundary as
-/// display strings; recover only the two RouteSpecific reasons so fatal SDK /
-/// protocol / timeout failures never look like typed route bootstrap failures.
-fn classify_connect_error_for_bootstrap(raw: &str) -> AcpError {
+/// Typed mapping from [`AcpError`] to bootstrap outcome. **No string parsing.**
+/// Only `NativeSuppressionInvalid` and `CompanionInitializationFailed` yield
+/// [`RouteBootstrapOutcome::RouteSpecific`]; auth/provider/SDK/process/generic
+/// ACP errors (and any other `RouteUnavailable` reason) are `Fatal`.
+fn bootstrap_outcome_from_acp_error(err: &AcpError) -> RouteBootstrapOutcome {
     use crate::acp::delegation::route::RouteDegradedReason;
+    match err {
+        AcpError::RouteUnavailable { reason }
+            if matches!(
+                reason,
+                RouteDegradedReason::NativeSuppressionInvalid
+                    | RouteDegradedReason::CompanionInitializationFailed
+            ) =>
+        {
+            RouteBootstrapOutcome::RouteSpecific(*reason)
+        }
+        AcpError::InitializeTimeout => {
+            RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout)
+        }
+        AcpError::SdkNotInstalled(m) => {
+            RouteBootstrapOutcome::Fatal(AcpError::SdkNotInstalled(m.clone()))
+        }
+        AcpError::RouteUnavailable { reason } => {
+            RouteBootstrapOutcome::Fatal(AcpError::RouteUnavailable { reason: *reason })
+        }
+        other => RouteBootstrapOutcome::Fatal(AcpError::protocol(other.to_string())),
+    }
+}
 
+/// Send bootstrap outcome exactly once (first caller wins). Uses awaited lock.
+async fn send_bootstrap_outcome_once(
+    route_bootstrap_tx: &Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
+    >,
+    outcome: RouteBootstrapOutcome,
+) {
+    let mut guard = route_bootstrap_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(outcome);
+    }
+}
+
+/// Bridge a typed [`AcpError`] across the sacp boundary: publish the typed
+/// bootstrap outcome first, then convert to a display-only sacp error.
+async fn bridge_acp_err_for_bootstrap(
+    e: AcpError,
+    route_bootstrap_tx: &Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
+    >,
+) -> sacp::Error {
+    send_bootstrap_outcome_once(route_bootstrap_tx, bootstrap_outcome_from_acp_error(&e)).await;
+    sacp::util::internal_error(e.to_string())
+}
+
+/// Residual sacp-string classification for errors that never had a typed
+/// [`AcpError`] side channel. Recovers **only** the initialize-timeout
+/// sentinel. Deliberately does **not** parse `RouteUnavailable` / ready-lease
+/// display strings — those must arrive via typed bootstrap side channels.
+fn classify_connect_error_residual(raw: &str) -> AcpError {
     if raw.contains(INIT_TIMEOUT_SENTINEL) {
         return AcpError::InitializeTimeout;
-    }
-    if raw.contains("codeg delegation ready lease") {
-        return AcpError::RouteUnavailable {
-            reason: RouteDegradedReason::CompanionInitializationFailed,
-        };
-    }
-    // Display of `AcpError::RouteUnavailable` is
-    // "delegation route unavailable: {reason:?}" — recover suppression invalid
-    // (the only RouteUnavailable constructed on the session-meta path).
-    const PREFIX: &str = "delegation route unavailable: ";
-    if let Some(idx) = raw.find(PREFIX) {
-        let rest = raw[idx + PREFIX.len()..].trim();
-        let token = rest
-            .split(|c: char| c == ')' || c == ',' || c.is_whitespace())
-            .next()
-            .unwrap_or(rest);
-        if token == "NativeSuppressionInvalid" {
-            return AcpError::RouteUnavailable {
-                reason: RouteDegradedReason::NativeSuppressionInvalid,
-            };
-        }
-        if token == "CompanionInitializationFailed" {
-            return AcpError::RouteUnavailable {
-                reason: RouteDegradedReason::CompanionInitializationFailed,
-            };
-        }
     }
     AcpError::protocol(raw)
 }
@@ -6868,6 +6912,110 @@ mod tests {
                 reason: RouteDegradedReason::NativeSuppressionInvalid
             }
         ));
+    }
+
+    /// Typed side channel only: display-string recovery must not mint RouteSpecific.
+    #[test]
+    fn bootstrap_outcome_typed_only_no_substring_fallback() {
+        use crate::acp::delegation::route::RouteDegradedReason;
+
+        // Exact typed mapping for the two allowed RouteSpecific reasons.
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            }),
+            RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::NativeSuppressionInvalid
+            )
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::CompanionInitializationFailed,
+            }),
+            RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed
+            )
+        ));
+
+        // Auth/provider/SDK/process/generic stay Fatal.
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::SdkNotInstalled("missing".into())),
+            RouteBootstrapOutcome::Fatal(AcpError::SdkNotInstalled(_))
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::InitializeTimeout),
+            RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout)
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::ProcessExited),
+            RouteBootstrapOutcome::Fatal(AcpError::Protocol(_))
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::protocol("auth failed")),
+            RouteBootstrapOutcome::Fatal(AcpError::Protocol(_))
+        ));
+
+        // Residual classifier: init-timeout sentinel only — never parse
+        // "delegation route unavailable: NativeSuppressionInvalid" display text.
+        assert!(matches!(
+            classify_connect_error_residual(INIT_TIMEOUT_SENTINEL),
+            AcpError::InitializeTimeout
+        ));
+        let spoof = "delegation route unavailable: NativeSuppressionInvalid";
+        assert!(
+            matches!(
+                classify_connect_error_residual(spoof),
+                AcpError::Protocol(_)
+            ),
+            "substring fallback must not recover NativeSuppressionInvalid"
+        );
+        let spoof2 = "codeg delegation ready lease failed";
+        assert!(
+            matches!(
+                classify_connect_error_residual(spoof2),
+                AcpError::Protocol(_)
+            ),
+            "substring fallback must not recover CompanionInitializationFailed"
+        );
+        // Spoofed residual → Fatal, not RouteSpecific.
+        let residual = classify_connect_error_residual(spoof);
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&residual),
+            RouteBootstrapOutcome::Fatal(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_acp_err_sends_typed_native_suppression_once() {
+        use crate::acp::delegation::route::RouteDegradedReason;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let sacp_err = bridge_acp_err_for_bootstrap(
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            },
+            &slot,
+        )
+        .await;
+        // Display may still include the error text (sacp boundary), but bootstrap
+        // outcome is typed and already consumed.
+        assert!(!sacp_err.to_string().is_empty());
+        assert!(slot.lock().await.is_none(), "sender must be taken");
+        match rx.await.unwrap() {
+            RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::NativeSuppressionInvalid,
+            ) => {}
+            other => panic!("expected typed RouteSpecific, got {other:?}"),
+        }
+        // Second bridge does not panic / double-send.
+        let _ = bridge_acp_err_for_bootstrap(
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            },
+            &slot,
+        )
+        .await;
     }
 
     #[test]

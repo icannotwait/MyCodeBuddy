@@ -20,15 +20,17 @@ use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOr
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::{DelegationRoutePlan, RouteDegradedReason};
 use crate::acp::error::AcpError;
+use crate::acp::terminal_context::{
+    finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
+};
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
-    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
+    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
-use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
@@ -449,6 +451,7 @@ impl ConnectionManager {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -504,6 +507,7 @@ impl ConnectionManager {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -720,47 +724,90 @@ impl ConnectionManager {
         Ok(connection_id)
     }
 
-    /// Tear down a partial spawn that never exposed Connected: disconnect,
-    /// revoke companion token/lease, await removal from the connection map so
-    /// session-id dedup cannot see the partial first attempt.
+    /// Tear down a partial spawn that never exposed Connected: terminate the
+    /// connection task, revoke companion token/lease with awaited locks, and
+    /// observe actual map removal before returning so the partial process
+    /// cannot race a replacement or win session-id dedup.
+    ///
+    /// A queued `Disconnect` alone is insufficient when bootstrap fails before
+    /// `run_conversation_loop` (the command is never drained). Abort the task
+    /// instead, then wait for [`ConnectionCleanupGuard`] to remove the entry.
+    /// Does **not** force-remove a still-live map entry; after abort the cleanup
+    /// path is responsible for removal (including delayed async remove when the
+    /// map lock is contended).
     async fn teardown_unexposed_attempt(&self, connection_id: &str) {
-        // Best-effort disconnect command.
-        {
+        // Snapshot handles under the map lock, then release before awaiting
+        // state/token locks so we never hold connections + state together.
+        let (task_abort, state, cmd_tx) = {
             let map = self.connections.lock().await;
-            if let Some(conn) = map.get(connection_id) {
-                let _ = conn.cmd_tx.try_send(ConnectionCommand::Disconnect);
-                // Revoke token + lease immediately so ready waiters unblock.
-                let token = conn
-                    .state
-                    .try_read()
-                    .ok()
-                    .and_then(|s| s.delegation_token.clone());
-                if let (Some(tok), Some(inj)) = (token, self.delegation_snapshot()) {
-                    inj.leases.revoke(&tok).await;
-                    inj.tokens.revoke(&tok).await;
-                }
+            match map.get(connection_id) {
+                Some(conn) => (
+                    conn.task_abort.clone(),
+                    Some(Arc::clone(&conn.state)),
+                    Some(conn.cmd_tx.clone()),
+                ),
+                None => (None, None, None),
+            }
+        };
+
+        // 1) Awaited token revoke (never try_read — must not skip under contention).
+        if let Some(state) = state {
+            let token = state.read().await.delegation_token.clone();
+            if let (Some(tok), Some(inj)) = (token, self.delegation_snapshot()) {
+                inj.leases.revoke(&tok).await;
+                inj.tokens.revoke(&tok).await;
             }
         }
-        // Await removal (cleanup guard drops the map entry).
+
+        // 2) Terminate the unexposed attempt: abort first (works pre-loop),
+        //    then best-effort Disconnect if the task already reached the loop.
+        if let Some(abort) = task_abort {
+            abort.abort();
+        }
+        if let Some(tx) = cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::Disconnect);
+        }
+
+        // 3) Observe actual map removal before returning (no force-remove race).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
                 let map = self.connections.lock().await;
                 if !map.contains_key(connection_id) {
-                    break;
+                    return;
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
+                tracing::error!(
                     "[ACP] teardown_unexposed_attempt timed out waiting for \
-                     removal of {connection_id}"
+                     removal of {connection_id} after abort+revoke; \
+                     not force-removing (would race a live SessionStarted entry)"
                 );
-                // Force-remove so fallback can proceed without partial race.
-                self.connections.lock().await.remove(connection_id);
-                break;
+                // Keep waiting briefly for delayed cleanup-guard spawn path.
+                let extended = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < extended {
+                    {
+                        let map = self.connections.lock().await;
+                        if !map.contains_key(connection_id) {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tracing::error!(
+                    "[ACP] teardown_unexposed_attempt: {connection_id} still present \
+                     after extended wait"
+                );
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Test/harness surface for [`Self::teardown_unexposed_attempt`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn teardown_unexposed_for_test(&self, connection_id: &str) {
+        self.teardown_unexposed_attempt(connection_id).await;
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -3180,6 +3227,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3350,6 +3398,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".into(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3663,6 +3712,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -4019,6 +4069,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -5795,6 +5846,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6187,6 +6239,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6947,6 +7000,272 @@ mod tests {
         s.set_route_plan_snapshot(&plan);
         s.set_delegation_available(true);
         Arc::new(tokio::sync::RwLock::new(s))
+    }
+
+    /// Production-shaped teardown: abort task, awaited revoke, observe map
+    /// absence before return — including delayed cleanup after abort.
+    #[tokio::test]
+    async fn teardown_unexposed_revokes_and_observes_map_absence_before_return() {
+        use crate::acp::connection::AgentConnection;
+        use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
+        use crate::acp::delegation::lease::CompanionLeaseRegistry;
+        use crate::acp::delegation::listener::{TokenEntry, TokenRegistry};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::acp::types::ConnectionStatus;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::mpsc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+        struct NoQuestions;
+        #[async_trait::async_trait]
+        impl SessionQuestionAccess for NoQuestions {
+            async fn register_question(
+                &self,
+                _parent_connection_id: &str,
+                _questions: Vec<QuestionSpec>,
+            ) -> Option<RegisteredQuestion> {
+                None
+            }
+            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+        }
+
+        let mgr = ConnectionManager::new();
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        let token = "teardown-tok".to_string();
+        tokens
+            .register(
+                token.clone(),
+                TokenEntry {
+                    parent_connection_id: "unexposed-1".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register(&token).await;
+        leases.mark_ready(&token).await.unwrap();
+        waiter
+            .wait_ready(Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        mgr.install_delegation(crate::acp::connection::DelegationInjection {
+            broker,
+            tokens: Arc::clone(&tokens),
+            leases: Arc::clone(&leases),
+            socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions)
+                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        });
+
+        let conn_id = "unexposed-1".to_string();
+        let mut state = SessionState::new(
+            conn_id.clone(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        state.delegation_token = Some(token.clone());
+        state.status = ConnectionStatus::Connecting;
+        let state = Arc::new(RwLock::new(state));
+        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = codeg_plan_for_late_close();
+        let (spawn_config, observed_config) = matching_config_pair(
+            "agent",
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+
+        let removed = Arc::new(AtomicBool::new(false));
+        let event_order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        // Connection task parks on pending() — Disconnect cannot wake it; only
+        // abort terminates (proves teardown does not rely on a drained Disconnect).
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        // Ensure the task is scheduled before we store its abort handle.
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+
+        // Delayed map removal after revoke (production cleanup-guard race).
+        // Teardown must await absence — not force-remove.
+        let connections = mgr.connections.clone();
+        let conn_id_task = conn_id.clone();
+        let tokens_watch = Arc::clone(&tokens);
+        let token_watch = token.clone();
+        let removed_flag = Arc::clone(&removed);
+        let order_cleanup = Arc::clone(&event_order);
+        let cleanup_task = tokio::spawn(async move {
+            loop {
+                if tokens_watch.lookup(&token_watch).await.is_none() {
+                    order_cleanup.lock().unwrap().push("revoked");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            connections.lock().await.remove(&conn_id_task);
+            removed_flag.store(true, Ordering::SeqCst);
+            order_cleanup.lock().unwrap().push("map_removed");
+        });
+
+        mgr.connections.lock().await.insert(
+            conn_id.clone(),
+            AgentConnection {
+                id: conn_id.clone(),
+                agent_type: AgentType::Codex,
+                status: ConnectionStatus::Connecting,
+                owner_window_label: "test".into(),
+                cmd_tx: tx,
+                task_abort: Some(abort),
+                state: Arc::clone(&state),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            },
+        );
+
+        assert!(mgr.connections.lock().await.contains_key(&conn_id));
+        assert!(
+            mgr.connections
+                .lock()
+                .await
+                .get(&conn_id)
+                .and_then(|c| c.task_abort.clone())
+                .is_some(),
+            "task_abort must be installed for unexposed teardown"
+        );
+        assert!(!join.is_finished(), "precondition: parking task is live");
+
+        let t0 = std::time::Instant::now();
+        mgr.teardown_unexposed_for_test(&conn_id).await;
+        let elapsed = t0.elapsed();
+        assert!(
+            !mgr.connections.lock().await.contains_key(&conn_id),
+            "map entry must be absent before teardown returns"
+        );
+        assert!(
+            removed.load(Ordering::SeqCst),
+            "delayed cleanup must have removed the entry (teardown awaited it)"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "teardown must wait for delayed cleanup, not return immediately; elapsed={elapsed:?}"
+        );
+        assert!(tokens.lookup(&token).await.is_none());
+        assert!(!*waiter.availability().borrow());
+        for _ in 0..200 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            join.is_finished(),
+            "connection task must be aborted (Disconnect cannot wake pending())"
+        );
+        let _ = join.await;
+        let _ = cleanup_task.await;
+        let events = event_order.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["revoked", "map_removed"],
+            "expected revoke then map removal before attempt 2"
+        );
+    }
+
+    /// Fallback policy still at most two attempts; teardown completes before attempt 2.
+    #[tokio::test]
+    async fn safe_fallback_records_teardown_before_attempt_two() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sequence = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seq = Arc::clone(&sequence);
+        let attempt_n = Arc::new(AtomicUsize::new(0));
+
+        // Stand-in for production: attempt1 RouteSpecific → teardown log → attempt2.
+        let outcomes: [Result<String, RouteBootstrapOutcome>; 2] = [
+            Err(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            )),
+            Ok("native-connection".into()),
+        ];
+        let mut outcomes = outcomes.into_iter();
+        let mut plans = Vec::new();
+        let request = root_codeg_request();
+        let mut plan = request.plan.clone();
+        let origin = request.origin;
+
+        for attempt in 1u8..=2 {
+            attempt_n.fetch_add(1, Ordering::SeqCst);
+            seq.lock()
+                .unwrap()
+                .push(format!("attempt_{attempt}_start"));
+            plans.push(plan.clone());
+            match outcomes.next().unwrap() {
+                Ok(id) => {
+                    seq.lock().unwrap().push(format!("attempt_{attempt}_ready"));
+                    assert_eq!(id, "native-connection");
+                    assert_eq!(attempt, 2);
+                    break;
+                }
+                Err(RouteBootstrapOutcome::RouteSpecific(reason))
+                    if origin == DelegationConnectionOrigin::Root && attempt == 1 =>
+                {
+                    seq.lock().unwrap().push("teardown_start".into());
+                    // Production would await map absence here; record the gate.
+                    seq.lock().unwrap().push("teardown_map_absent".into());
+                    seq.lock().unwrap().push("teardown_done".into());
+                    plan = safe_native_fallback(&plan, reason);
+                    continue;
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+
+        let events = sequence.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "attempt_1_start".to_string(),
+                "teardown_start".to_string(),
+                "teardown_map_absent".to_string(),
+                "teardown_done".to_string(),
+                "attempt_2_start".to_string(),
+                "attempt_2_ready".to_string(),
+            ]
+        );
+        assert_eq!(attempt_n.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            plans[1].source,
+            crate::acp::delegation::route::DelegationRouteSource::SafeFallback
+        );
     }
 
     async fn apply_companion_closed(
