@@ -231,6 +231,14 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Soft-watchdog health for this still-running card. Absent until the
+    /// supervisor publishes; cleared only when the card is removed on complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::acp::delegation::types::TaskObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_activity_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
 /// The in-flight user prompt for the current turn. Captured from
@@ -909,8 +917,26 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        observation: None,
+                        last_agent_activity_at: None,
+                        stalled_since: None,
                     },
                 );
+            }
+            AcpEvent::DelegationObservationChanged {
+                parent_tool_use_id,
+                observation,
+                last_agent_activity_at,
+                stalled_since,
+                ..
+            } => {
+                // Observe-only: update an existing card. Never insert, remove,
+                // or synthesize Completion from a health transition.
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    card.observation = Some(*observation);
+                    card.last_agent_activity_at = Some(*last_agent_activity_at);
+                    card.stalled_since = *stalled_since;
+                }
             }
             AcpEvent::DelegationCompleted {
                 parent_tool_use_id, ..
@@ -1473,6 +1499,103 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    fn codeg_plan(agent_type: AgentType) -> crate::acp::delegation::route::DelegationRoutePlan {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let _ = agent_type;
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "task10-route".into(),
+        }
+    }
+
+    fn state_with_route(
+        plan: crate::acp::delegation::route::DelegationRoutePlan,
+    ) -> SessionState {
+        let mut s = fresh_state();
+        s.agent_type = AgentType::Codex;
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        s
+    }
+
+    #[test]
+    fn snapshot_keeps_route_immutable_while_availability_changes() {
+        let mut state = state_with_route(codeg_plan(AgentType::Codex));
+        let original = state.to_snapshot().delegation_route;
+        state.apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+        let changed = state.to_snapshot().delegation_route;
+        assert_eq!(original.requested, changed.requested);
+        assert_eq!(original.effective, changed.effective);
+        assert_eq!(original.source, changed.source);
+        assert!(!changed.delegation_available);
+    }
+
+    #[test]
+    fn observation_changed_updates_active_card_without_completing() {
+        let mut s = fresh_state();
+        s.apply_event(&delegation_started("pt-1", 99));
+        assert!(s.active_delegations.contains_key("pt-1"));
+        let at = Utc::now();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "pt-1".into(),
+            task_id: "task-1".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Stalled,
+            last_agent_activity_at: at,
+            stalled_since: Some(at + chrono::Duration::seconds(300)),
+        });
+        let card = s.active_delegations.get("pt-1").expect("card remains");
+        assert_eq!(
+            card.observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        assert_eq!(card.last_agent_activity_at, Some(at));
+        assert!(card.stalled_since.is_some());
+        // Snapshot recovers observation + route availability bit together.
+        let snap = s.to_snapshot();
+        assert_eq!(snap.active_delegations.len(), 1);
+        assert_eq!(
+            snap.active_delegations[0].observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        // Never synthesizes completion.
+        assert!(s.active_delegations.contains_key("pt-1"));
+    }
+
+    #[test]
+    fn observation_changed_unknown_tool_use_does_not_create_card() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "ghost".into(),
+            task_id: "t".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Active,
+            last_agent_activity_at: Utc::now(),
+            stalled_since: None,
+        });
+        assert!(s.active_delegations.is_empty());
+    }
+
+    #[test]
+    fn delegation_route_snapshot_round_trips_on_live_snapshot() {
+        let mut s = state_with_route(codeg_plan(AgentType::Codex));
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert!(snap.delegation_route.delegation_available);
+        let json = serde_json::to_value(&snap).unwrap();
+        let back: LiveSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.delegation_route, snap.delegation_route);
     }
 
     #[test]

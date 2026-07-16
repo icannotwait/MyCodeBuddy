@@ -369,6 +369,10 @@ pub enum TaskStatus {
 /// Fields are all optional except `status` so one type can describe a running
 /// ack (ids + `Running`), a completed result (`text` + `duration_ms`), a
 /// failure (`error_code` + `message`), and a setup failure (`task_id: None`).
+///
+/// Soft-watchdog fields (`observation`, `last_agent_activity_at`,
+/// `stalled_since`) appear **only** on `Running` reports when the supervisor
+/// has published a snapshot; terminal and unknown reports omit them on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationTaskReport {
     /// Broker `call_id` (UUID) identifying the task. `None` only when setup
@@ -394,6 +398,15 @@ pub struct DelegationTaskReport {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Soft-watchdog health. Present only on `Running` when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<TaskObservation>,
+    /// Last child agent activity timestamp from the observation cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_activity_at: Option<DateTime<Utc>>,
+    /// Stall start (`last_agent_activity_at + threshold`); only when stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
 impl DelegationOutcome {

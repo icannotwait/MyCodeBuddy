@@ -114,6 +114,9 @@ impl PersistedTask {
             error_code: self.error_code.clone(),
             message,
             duration_ms: None,
+            observation: None,
+            last_agent_activity_at: None,
+            stalled_since: None,
         }
     }
 }
@@ -342,6 +345,9 @@ fn report_from_terminal(
         error_code: terminal.error_code.clone(),
         message: None,
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 

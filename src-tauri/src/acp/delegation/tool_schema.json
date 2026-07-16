@@ -43,7 +43,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot; set it to wait. wait_ms=0 waits without timeout. A wait returns when ANY requested task is terminal, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.",
+    "description": "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -57,7 +57,7 @@
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
-          "description": "Omit for a snapshot. A positive value waits up to that many ms (max 60000); 0 waits without timeout. Multi-task waits return when ANY task is terminal."
+          "description": "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout."
         }
       }
     }

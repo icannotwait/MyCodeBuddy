@@ -337,6 +337,17 @@ pub enum AcpEvent {
     /// available. Does **not** change route plan, suppression, fingerprint,
     /// process lifetime, or Broker tasks — only the mutable availability bit.
     DelegationAvailabilityChanged { available: bool },
+    /// Soft-supervisor observation transition for a still-running Broker task.
+    /// Updates the existing active-delegation card only — never creates,
+    /// removes, or completes a task.
+    DelegationObservationChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        observation: crate::acp::delegation::types::TaskObservation,
+        last_agent_activity_at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_since: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,

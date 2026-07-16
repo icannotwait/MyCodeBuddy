@@ -423,13 +423,17 @@ impl DelegationListener {
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
             .await;
-        // Map the wire `wait_ms` to a wait mode: omitted → immediate poll, an
-        // explicit `0` → block with no timeout (long-running children), any
-        // positive value → bounded long-poll clamped to the hard ceiling.
+        // Map the wire `wait_ms` to a wait mode: omitted → snapshot (never park),
+        // explicit `0` → terminal-only (no timeout), positive → supervised with
+        // hard ceiling.
         let wait = match req.wait_ms {
-            None => StatusWait::Immediate,
-            Some(0) => StatusWait::Infinite,
-            Some(ms) => StatusWait::Bounded(ms.min(STATUS_WAIT_MAX_MS)),
+            None => StatusWait::Snapshot,
+            Some(0) => StatusWait::Terminal,
+            Some(ms) => {
+                StatusWait::Supervised(std::time::Duration::from_millis(
+                    ms.min(STATUS_WAIT_MAX_MS),
+                ))
+            }
         };
         self.broker
             .get_tasks_status(
@@ -697,6 +701,9 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
         error_code: Some("canceled".into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -711,6 +718,9 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
         error_code: Some(error_code.into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -726,6 +736,9 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some("unknown task id".into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -739,6 +752,9 @@ fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some(crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
