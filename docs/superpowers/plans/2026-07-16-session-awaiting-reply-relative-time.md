@@ -16,11 +16,13 @@
 - Generate each eligible completion token with `uuid::Uuid::new_v4().to_string()`; no new dependency is required because `uuid` v4 is already enabled.
 - The first qualifying view on any client clears the token globally for every client sharing SQLite. Per-client read receipts remain out of scope.
 - A prompt must carry an explicit per-turn `mark_awaiting_reply` value. UI root turns use `true`; automation, chat-channel, and delegation turns use `false`.
+- Changing attention eligibility must not change mandatory profile-route registration; chat-channel prompts keep their current route behavior while passing `mark_awaiting_reply=false`.
 - Only an eligible root `end_turn` that wins `InProgress -> PendingReview` may create a token.
 - Status, token, and backend `updated_at` change atomically. Manual status writes, prompt start, failures, Completed, and Cancelled clear the token.
 - Clear accepts the observed token and never changes status or `updated_at`. A stale token is a successful no-op that returns current backend state.
 - `get_folder_conversation` and every other read endpoint remain free of awaiting-reply clear side effects.
 - `conversation://changed` is the only app-workspace/sidebar state stream. Per-connection status events must not also patch the workspace store.
+- Root and child `conversation://changed` consumers use the same `state` patch shape; child seed buffering preserves status, token, and backend `updated_at` together.
 - In tile mode only the active tile counts as viewed. Automations route, hidden/unfocused documents, and a maximized file pane do not count.
 - Awaiting reply is gated defensively on `status === "pending_review"`; running and cancelled presentation always wins.
 - Add `statusAwaitingReplyBadge` to all ten locale files: `ar`, `de`, `en`, `es`, `fr`, `ja`, `ko`, `pt`, `zh-CN`, and `zh-TW`.
@@ -37,6 +39,7 @@
 - `src-tauri/src/web/event_bridge.rs`, `src-tauri/src/commands/conversations.rs`: authoritative global state event.
 - `src-tauri/src/web/handlers/conversations.rs`, `src-tauri/src/web/router.rs`, `src-tauri/src/lib.rs`: shared clear operation exposed through Axum and Tauri.
 - `src/stores/app-workspace-store.ts`, `src/contexts/app-workspace-context.tsx`: exact state-patch application with stable stats.
+- `src/stores/tab-store.ts`, `src/hooks/use-subsession-sync.ts`: exact child state-patch application, including in-flight seed buffering.
 - `src/components/conversations/conversation-awaiting-reply-clearer.tsx`: qualifying-view observer and expected-token acknowledgement.
 - `src/components/conversations/sidebar-conversation-grouping.ts`, `sidebar-conversation-list.tsx`, `sidebar-conversation-card.tsx`: time source/format and visual state.
 - `src/i18n/messages/*.json`: required accessible awaiting-reply label.
@@ -724,11 +727,11 @@ pub async fn send_prompt_background(
 ) -> Result<(), AcpError> {
     let prompt_lock = self.clone_prompt_lock(conn_id).await?;
     let _guard = prompt_lock.lock_owned().await;
-    self.send_prompt_inner(conn_id, blocks, None, false, false).await
+    self.send_prompt_inner(conn_id, blocks, None, true, false).await
 }
 ```
 
-The existing `send_prompt` calls `send_prompt_inner(..., true, true)`. Introduce one private linked implementation accepting the policy, keep UI `send_prompt_linked_with_message_id` passing `delegation.is_none()`, and expose:
+The existing `send_prompt` calls `send_prompt_inner(..., true, true)`. The first boolean remains mandatory profile-route registration, so the chat-channel background wrapper deliberately keeps it `true` and changes only attention eligibility. Introduce one private linked implementation accepting the policy, keep UI `send_prompt_linked_with_message_id` passing `delegation.is_none()`, and expose:
 
 ```rust
 pub async fn send_prompt_linked_background(
@@ -741,7 +744,7 @@ pub async fn send_prompt_linked_background(
 ) -> Result<Option<i32>, AcpError>
 ```
 
-It delegates to the private linked implementation with no delegation, no client message id, and `mark_awaiting_reply=false`.
+It delegates to the private linked implementation with no delegation, no client message id, the existing root mandatory-route behavior, and `mark_awaiting_reply=false`.
 
 - [ ] **Step 5: Mark non-UI production callers explicitly**
 
@@ -749,6 +752,7 @@ It delegates to the private linked implementation with no delegation, no client 
 - Change all three chat-channel `send_prompt(...)` calls in `session_commands.rs` and `session_event_subscriber.rs` to `send_prompt_background(...)`.
 - Keep UI Tauri/Axum send handlers on `send_prompt_linked_with_message_id`.
 - Keep delegation calls false through their non-null delegation argument.
+- Do not change mandatory profile-route registration for chat-channel or automation prompts while changing their attention policy.
 
 Run this audit after editing:
 
@@ -1085,13 +1089,19 @@ git commit -m "feat(conversations): expose awaiting reply acknowledgement"
 - Modify: `src/lib/types.ts`
 - Modify: `src/stores/app-workspace-store.ts`
 - Modify: `src/stores/app-workspace-store.test.ts`
+- Modify: `src/stores/tab-store.ts`
+- Modify: `src/hooks/use-subsession-sync.ts`
+- Modify: `src/hooks/use-subsession-sync.test.ts`
 - Modify: `src/contexts/app-workspace-context.tsx`
 - Modify: `src/contexts/app-workspace-context.test.tsx`
+- Modify: `src/contexts/tab-context.test.tsx`
 - Modify: `src/app/workspace/layout.tsx`
 
 **Interfaces:**
 - Extends `ConversationChange` with `{ kind: "state"; patch: ConversationStatePatch }` and removes `kind: "status"`.
 - Produces store action `applyConversationStatePatch(patch): void`.
+- Migrates both child-session consumers from `status` to `state`; child summaries merge `status`, `awaiting_reply_token`, and backend `updated_at` atomically.
+- Buffers a full child state patch while a child seed fetch is in flight, so the live patch wins over the fetched snapshot.
 - Removes `ConversationStatusEventBridge` as an app-workspace mutation source.
 - Preserves stats object identity because state patches cannot change count, Agent type, or message count.
 
@@ -1140,13 +1150,15 @@ it("ignores a state patch for an unknown conversation", () => {
 
 Add an `AppWorkspaceProvider` test that emits `{kind:"state", patch}` and observes all three fields update. Delete bridge-only test scaffolding and imports together with `ConversationStatusEventBridge`; the Task 4 backend no-duplicate test and Task 9 source audit prove ACP status is no longer a workspace path.
 
+Update the existing child event tests in `use-subsession-sync.test.ts` and `tab-context.test.tsx` to emit `{ kind: "state", patch }`. Assert that a loaded child receives `status`, `awaiting_reply_token`, and exact backend `updated_at`, unknown child ids remain identity-preserving no-ops, and a state patch buffered during an in-flight child seed wins over all three older fetched fields.
+
 - [ ] **Step 2: Run focused frontend tests and verify RED**
 
 ```powershell
-pnpm exec vitest run src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.test.tsx
+pnpm exec vitest run src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.test.tsx src/hooks/use-subsession-sync.test.ts src/contexts/tab-context.test.tsx
 ```
 
-Expected: tests fail because the state type/action do not exist and the ACP bridge still patches status.
+Expected: tests fail because the state type/action do not exist, the ACP bridge still patches status, and child consumers still expect the removed status-only shape.
 
 - [ ] **Step 3: Implement the exact store action**
 
@@ -1190,20 +1202,22 @@ if (change.kind === "upsert") {
 
 Delete `ConversationStatusEventBridge`, remove its `useAcpEvent` import, remove its layout import/render, and adjust the context test mock comment. Keep ACP status handling inside the connection runtime untouched.
 
+Update `tab-store.handleChildConversationChange` and `use-subsession-sync` to branch on `kind === "state"` and merge `change.patch.status`, `change.patch.awaiting_reply_token`, and `change.patch.updated_at` into a known child summary. In `tab-store`, replace the seed buffer's status string with a full `ConversationStatePatch`; apply that patch after the buffered/full summary choice so the newest state wins during an in-flight fetch. Preserve deleted-event terminal precedence and unknown-id no-op behavior.
+
 - [ ] **Step 5: Run focused tests, typecheck, and lint**
 
 ```powershell
-pnpm exec vitest run src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.test.tsx src/contexts/tab-context.test.tsx
+pnpm exec vitest run src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.test.tsx src/hooks/use-subsession-sync.test.ts src/contexts/tab-context.test.tsx
 pnpm exec tsc --noEmit
-pnpm eslint src/lib/types.ts src/stores/app-workspace-store.ts src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/app/workspace/layout.tsx
+pnpm eslint src/lib/types.ts src/stores/app-workspace-store.ts src/stores/app-workspace-store.test.ts src/stores/tab-store.ts src/hooks/use-subsession-sync.ts src/hooks/use-subsession-sync.test.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/contexts/tab-context.test.tsx src/app/workspace/layout.tsx
 ```
 
-Expected: global state events update tabs/sidebar through the store, stats references remain stable, and ACP events no longer duplicate the mutation.
+Expected: global state events update root and child tabs/sidebar with exact backend state, buffered child patches win over seed fetches, stats references remain stable, and ACP events no longer duplicate the mutation.
 
 - [ ] **Step 6: Commit the frontend state authority**
 
 ```powershell
-git add -p -- src/lib/types.ts src/stores/app-workspace-store.ts src/stores/app-workspace-store.test.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/app/workspace/layout.tsx
+git add -p -- src/lib/types.ts src/stores/app-workspace-store.ts src/stores/app-workspace-store.test.ts src/stores/tab-store.ts src/hooks/use-subsession-sync.ts src/hooks/use-subsession-sync.test.ts src/contexts/app-workspace-context.tsx src/contexts/app-workspace-context.test.tsx src/contexts/tab-context.test.tsx src/app/workspace/layout.tsx
 git commit -m "feat(conversations): apply authoritative state patches"
 ```
 
@@ -1242,14 +1256,24 @@ it("clears the active token once while the conversation is genuinely visible", a
 })
 
 it.each([
-  ["automations route", { isConversations: false, filesMaximized: false, focused: true }],
-  ["maximized files", { isConversations: true, filesMaximized: true, focused: true }],
-  ["unfocused document", { isConversations: true, filesMaximized: false, focused: false }],
+  ["automations route", { isConversations: false, filesMaximized: false, visible: true, focused: true }],
+  ["maximized files", { isConversations: true, filesMaximized: true, visible: true, focused: true }],
+  ["hidden document", { isConversations: true, filesMaximized: false, visible: false, focused: true }],
+  ["unfocused document", { isConversations: true, filesMaximized: false, visible: true, focused: false }],
 ])("does not clear while %s", async (_label, state) => {
   seedActiveConversation({ id: 8, awaiting_reply_token: "generation-8" })
   routeMock.isConversations = state.isConversations
   workspaceMock.filesMaximized = state.filesMaximized
+  setDocumentVisibility(state.visible ? "visible" : "hidden")
   documentHasFocus.mockReturnValue(state.focused)
+  render(<ConversationAwaitingReplyClearer />)
+  await Promise.resolve()
+  expect(clearAwaitingReply).not.toHaveBeenCalled()
+})
+
+it("does not clear a token owned by an inactive tile", async () => {
+  seedTiledConversations({ activeId: 8, inactiveId: 9, inactiveToken: "generation-9" })
+  documentHasFocus.mockReturnValue(true)
   render(<ConversationAwaitingReplyClearer />)
   await Promise.resolve()
   expect(clearAwaitingReply).not.toHaveBeenCalled()
@@ -1280,7 +1304,7 @@ it("acknowledges a newer token with its own CAS after a stale clear loses", asyn
 })
 ```
 
-The test helper sets `tabsHydrated=true`, inserts one active tab with `conversationId`, inserts its summary, stubs `document.visibilityState` to `visible`, and makes the clear mock return a null-token patch by default.
+The test helper sets `tabsHydrated=true`, inserts one active tab with `conversationId`, inserts its summary, stubs `document.visibilityState` to `visible`, and makes the clear mock return a null-token patch by default. `seedTiledConversations` enables tile mode, makes only `activeId` the active tab, and gives only the visible inactive tab a token.
 
 - [ ] **Step 2: Run the new test and verify RED**
 
@@ -1707,7 +1731,8 @@ Expected: server and companion configurations compile and lint without warnings;
 rg -n "\.status\s*=\s*Set\(|update_status\(|update_status_if\(" src-tauri/src --glob '!vendor/**'
 rg -n "send_prompt\(|send_prompt_linked_with_message_id\(" src-tauri/src/automation src-tauri/src/chat_channel
 rg -n "formatRelative\(.*created_at|sortMode ===.*created_at" src/components/conversations
-rg -n "ConversationStatusEventBridge|kind: \"status\"" src
+rg -n "ConversationStatusEventBridge|\| \{ kind: \"status\"; id: number; status: string \}" src/lib/types.ts src/contexts src/hooks src/stores
+rg -n "change\.kind === \"status\"" src/contexts src/hooks src/stores
 ```
 
 Expected:
@@ -1715,7 +1740,7 @@ Expected:
 - no unowned production status write bypasses token clearing/event convergence;
 - automation/chat use only background prompt wrappers;
 - no sidebar label reads `created_at`;
-- no duplicate workspace ACP status bridge or legacy global status variant remains.
+- no duplicate workspace ACP status bridge or legacy `ConversationChange` status variant/consumer remains; unrelated domain types such as delegation action `kind: "status"` are outside this audit.
 
 - [ ] **Step 5: Perform the manual multi-client smoke matrix**
 
