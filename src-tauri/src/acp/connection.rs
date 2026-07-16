@@ -418,8 +418,11 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
     })
 }
 
-/// Apply process-scoped route suppression for Codex env and Grok/CodeBuddy argv.
-/// Consumes `plan.native_suppression` only — never resolves policy.
+/// Single application point for process-scoped route suppression (Codex env,
+/// Grok/CodeBuddy argv). Call with the **complete** env and agent argv after
+/// base flags/subcommand/registry args are assembled, and before
+/// `AcpAgent::from_args`. Consumes `plan.native_suppression` only — never
+/// resolves policy. Idempotent.
 fn apply_process_route(
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
     agent_type: AgentType,
@@ -453,7 +456,9 @@ fn apply_route_environment(
 }
 
 /// Route-scoped argv tokens for Grok (`--no-subagents`) and CodeBuddy
-/// (`--disallowedTools` union). No-ops for other agents / native plans.
+/// (`--disallowedTools` union). Operates on the **complete** agent argv
+/// (command + base flags + registry/subcommand args). Idempotent; never drops
+/// or reorders unrelated tokens. No-ops for other agents / native plans.
 fn apply_route_argv(
     agent_type: AgentType,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -463,10 +468,15 @@ fn apply_route_argv(
 
     match (&plan.native_suppression, agent_type) {
         (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
-            // Caller places this among root flags, before `agent stdio`.
-            if !argv.iter().any(|a| a == "--no-subagents") {
-                argv.push("--no-subagents".into());
+            // Structured insert: after root flags, before `agent stdio`.
+            if argv.iter().any(|a| a == "--no-subagents") {
+                return;
             }
+            let insert_at = argv
+                .windows(2)
+                .position(|w| w[0] == "agent" && w[1] == "stdio")
+                .unwrap_or(argv.len());
+            argv.insert(insert_at, "--no-subagents".into());
         }
         (
             NativeSuppressionPlan::CodeBuddyDisallowedTools { tools },
@@ -519,12 +529,14 @@ fn apply_codebuddy_disallowed_tools(argv: &mut Vec<String>, suppress_tools: &[St
     }
 }
 
+/// Base Npx launch args only (route-independent). Grok root flags and
+/// registry/subcommand tokens; **no** route suppression. Callers must build
+/// the complete argv then apply route once via [`apply_process_route`].
 fn append_npx_launch_args(
     parts: &mut Vec<String>,
     agent_type: AgentType,
     args: &[&str],
     grok_always_approve: bool,
-    plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) {
     if agent_type == AgentType::Grok {
         // Grok's native ask_user_question waits outside Codeg's QuestionRequest
@@ -540,22 +552,9 @@ fn append_npx_launch_args(
         if grok_always_approve {
             parts.push("--always-approve".into());
         }
-        // Codeg route: --no-subagents after root flags, before agent stdio.
-        apply_route_argv(agent_type, plan, parts);
-    } else if agent_type == AgentType::CodeBuddy {
-        // Registry args are typically just `--acp`; build the deny union into
-        // `parts` first, then append args so `--disallowedTools` lands before
-        // `--acp` (apply_codebuddy also repositions if `--acp` is already in
-        // parts).
-        apply_route_argv(agent_type, plan, parts);
     }
     for arg in args {
         parts.push((*arg).into());
-    }
-    // When `--acp` arrives via `args` after a CodeBuddy deny list was pushed
-    // onto `parts`, re-run so the union sits immediately before `--acp`.
-    if agent_type == AgentType::CodeBuddy {
-        apply_route_argv(agent_type, plan, parts);
     }
 }
 
@@ -604,15 +603,10 @@ async fn build_agent(
             // fails with SdkNotInstalled if host Codex is missing.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
-            // Immutable route plan: Codex multi-agent env suppression only.
-            // Argv suppressions for Grok/CodeBuddy are applied in
-            // `append_npx_launch_args` (must interleave with root flags / `--acp`).
-            apply_process_route(plan, agent_type, &mut env_map, &mut Vec::new())?;
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in &env_map {
-                parts.push(format!("{k}={v}"));
-            }
-            parts.push(
+            // Build complete agent argv first (command + base flags + registry
+            // args), then apply route exactly once over real env + argv.
+            let mut argv: Vec<String> = Vec::new();
+            argv.push(
                 crate::commands::acp::resolve_npx_command(cmd)
                     .await
                     .map(|p| p.to_string_lossy().to_string())
@@ -634,13 +628,17 @@ async fn build_agent(
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
-            //  - `--no-subagents` (Codeg route only): after root flags, before
-            //    `agent stdio`. Native plans omit it.
-            // CodeBuddy Codeg route injects a stable `--disallowedTools` union
-            // before `--acp`.
+            // Route tokens (`--no-subagents`, CodeBuddy `--disallowedTools`) are
+            // applied once by `apply_process_route` on this complete argv.
             let grok_always_approve =
                 agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
-            append_npx_launch_args(&mut parts, agent_type, args, grok_always_approve, plan);
+            append_npx_launch_args(&mut argv, agent_type, args, grok_always_approve);
+            apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
+            let mut parts: Vec<String> = env_map
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -681,14 +679,16 @@ async fn build_agent(
                 merge_agent_env(env, runtime_env),
             )?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
-            // Bundled Codex (Windows) receives the same env contract as npx.
-            apply_process_route(plan, agent_type, &mut env_map, &mut Vec::new())?;
+            // Bundled: complete argv first, then one route application (env + argv).
+            let mut argv: Vec<String> = Vec::new();
+            argv.push(binary_path.to_string_lossy().to_string());
+            argv.extend(args.iter().map(|arg| (*arg).to_string()));
+            apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
             let mut parts: Vec<String> = env_map
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
-            parts.push(binary_path.to_string_lossy().to_string());
-            parts.extend(args.iter().map(|arg| (*arg).to_string()));
+            parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
             let agent_name = meta.name.to_string();
             tracing::info!(
@@ -2727,6 +2727,7 @@ async fn run_connection(
                                 &cwd_string,
                                 supports_fork,
                                 &terminal_shell.spec,
+                                &route_plan,
                                 &prompt_ledger,
                                 &terminal_prompt_context,
                                 delegation_injection.as_ref(),
@@ -2751,6 +2752,7 @@ async fn run_connection(
                                 &cwd,
                                 &cwd_string,
                                 &terminal_shell.spec,
+                                &route_plan,
                                 &prompt_ledger,
                                 &terminal_prompt_context,
                                 delegation_injection.as_ref(),
@@ -2897,6 +2899,7 @@ async fn run_connection(
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -2917,6 +2920,7 @@ async fn run_connection(
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -3047,6 +3051,7 @@ async fn run_connection(
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -3069,6 +3074,7 @@ async fn run_connection(
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -3138,6 +3144,7 @@ async fn run_connection(
                     &cwd_string,
                     supports_fork,
                     &terminal_shell.spec,
+                    &route_plan,
                     &prompt_ledger,
                     &terminal_prompt_context,
                     delegation_injection.as_ref(),
@@ -3158,6 +3165,7 @@ async fn run_connection(
                     &cwd,
                     &cwd_string,
                     &terminal_shell.spec,
+                    &route_plan,
                     &prompt_ledger,
                     &terminal_prompt_context,
                     delegation_injection.as_ref(),
@@ -4078,6 +4086,8 @@ async fn handle_fork_or_exit(
     cwd_string: &str,
     // Immutable connection shell snapshot — never re-read from settings.
     shell_spec: &ResolvedShellSpec,
+    // Same immutable launch route plan as the original session loop.
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
@@ -4165,6 +4175,7 @@ async fn handle_fork_or_exit(
         cwd_string,
         true, // fork already succeeded on this process
         shell_spec,
+        route_plan,
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
@@ -4187,6 +4198,7 @@ async fn handle_fork_or_exit(
         _cwd,
         cwd_string,
         shell_spec,
+        route_plan,
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
@@ -4339,6 +4351,9 @@ async fn run_conversation_loop<'a>(
     supports_fork: bool,
     // Immutable connection shell snapshot for `session/fork` metadata.
     shell_spec: &ResolvedShellSpec,
+    // Immutable launch route plan — fork reuses the same Claude deny merge as
+    // new/load/resume; never re-resolves policy.
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
@@ -5005,10 +5020,12 @@ async fn run_conversation_loop<'a>(
                     "[ACP] Sending session/fork for session_id={} cwd={}",
                     sid.0, cwd
                 );
-                // Build from the connection snapshot only — never re-read
-                // global terminal settings during fork.
-                let terminal_meta = match terminal_metadata(
-                    Meta::default(),
+                // Same immutable route plan + shell snapshot as new/load/resume
+                // (Codeg Claude re-asserts Agent/Task deny; native unchanged).
+                // Never re-read global terminal settings during fork.
+                let terminal_meta = match session_request_meta(
+                    agent_type,
+                    route_plan,
                     shell_spec,
                     adapter_for(agent_type),
                 ) {
@@ -6294,16 +6311,28 @@ mod tests {
         }
     }
 
+    /// Build base Npx argv then apply the immutable route plan once — mirrors
+    /// production `build_agent` for Npx agents.
+    fn apply_base_npx_then_route(
+        parts: &mut Vec<String>,
+        agent_type: AgentType,
+        args: &[&str],
+        grok_always_approve: bool,
+        plan: &DelegationRoutePlan,
+    ) {
+        append_npx_launch_args(parts, agent_type, args, grok_always_approve);
+        apply_process_route(plan, agent_type, &mut BTreeMap::new(), parts).unwrap();
+    }
+
     #[test]
     fn grok_npx_launch_args_disable_native_question_before_subcommand() {
-        // Native plan: question deny remains; --no-subagents is omitted.
+        // Base args only (append_npx is route-independent): question deny remains.
         let mut without_auto_approve = vec!["grok".to_string()];
         append_npx_launch_args(
             &mut without_auto_approve,
             AgentType::Grok,
             &["agent", "stdio"],
             false,
-            &native_plan(AgentType::Grok),
         );
         assert_eq!(
             without_auto_approve,
@@ -6323,7 +6352,6 @@ mod tests {
             AgentType::Grok,
             &["agent", "stdio"],
             true,
-            &native_plan(AgentType::Grok),
         );
         assert_eq!(
             with_auto_approve,
@@ -6342,13 +6370,7 @@ mod tests {
     #[test]
     fn non_grok_npx_launch_args_remain_unchanged() {
         let mut parts = vec!["codex-acp".to_string()];
-        append_npx_launch_args(
-            &mut parts,
-            AgentType::Codex,
-            &["serve"],
-            true,
-            &native_plan(AgentType::Codex),
-        );
+        append_npx_launch_args(&mut parts, AgentType::Codex, &["serve"], true);
         assert_eq!(parts, vec!["codex-acp", "serve"]);
     }
 
@@ -6356,7 +6378,7 @@ mod tests {
     fn managed_process_adapters_suppress_only_on_codeg_route() {
         let codeg_grok = codeg_plan(AgentType::Grok);
         let mut grok = vec!["grok".to_string()];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut grok,
             AgentType::Grok,
             &["agent", "stdio"],
@@ -6378,7 +6400,7 @@ mod tests {
 
         // always-approve stays between question deny and --no-subagents.
         let mut grok_approve = vec!["grok".to_string()];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut grok_approve,
             AgentType::Grok,
             &["agent", "stdio"],
@@ -6400,7 +6422,7 @@ mod tests {
         );
 
         let mut codebuddy = vec!["codebuddy".to_string()];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut codebuddy,
             AgentType::CodeBuddy,
             &["--acp"],
@@ -6422,7 +6444,7 @@ mod tests {
             "Task".to_string(),
             "TaskStop".to_string(),
         ];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut codebuddy_union,
             AgentType::CodeBuddy,
             &["--acp"],
@@ -6444,7 +6466,7 @@ mod tests {
         );
 
         let mut native_grok = vec!["grok".to_string()];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut native_grok,
             AgentType::Grok,
             &["agent", "stdio"],
@@ -6456,7 +6478,7 @@ mod tests {
         assert!(native_grok.contains(&"ask_user_question".to_string()));
 
         let mut native_cb = vec!["codebuddy".to_string()];
-        append_npx_launch_args(
+        apply_base_npx_then_route(
             &mut native_cb,
             AgentType::CodeBuddy,
             &["--acp"],
@@ -6695,6 +6717,266 @@ mod tests {
                 "{label} terminal meta"
             );
         }
+    }
+
+    /// Complete base argv (as production builds before `AcpAgent::from_args`)
+    /// must receive structured route insertion via `apply_process_route` only:
+    /// Grok `--no-subagents` before `agent stdio`, CodeBuddy deny union before
+    /// `--acp`. Second application is a no-op (idempotent).
+    #[test]
+    fn apply_process_route_on_complete_argv_is_ordered_and_idempotent() {
+        // Grok: base root flags + subcommand already present (single application point).
+        let mut grok_argv = vec![
+            "grok".to_string(),
+            "--no-auto-update".to_string(),
+            "--disallowed-tools".to_string(),
+            "ask_user_question".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ];
+        let mut env = BTreeMap::new();
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut env,
+            &mut grok_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_argv,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+        let grok_once = grok_argv.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut env,
+            &mut grok_argv,
+        )
+        .unwrap();
+        assert_eq!(grok_argv, grok_once, "Grok apply_process_route is idempotent");
+
+        // always-approve stays between question deny and --no-subagents.
+        let mut grok_approve = vec![
+            "grok".to_string(),
+            "--no-auto-update".to_string(),
+            "--disallowed-tools".to_string(),
+            "ask_user_question".to_string(),
+            "--always-approve".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ];
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut BTreeMap::new(),
+            &mut grok_approve,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--always-approve",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        // CodeBuddy: complete argv already includes --acp; union before it.
+        let mut cb_argv = vec!["codebuddy".to_string(), "--acp".to_string()];
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            cb_argv,
+            vec!["codebuddy", "--disallowedTools", "Agent", "Task", "--acp"]
+        );
+        let cb_once = cb_argv.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_argv,
+        )
+        .unwrap();
+        assert_eq!(cb_argv, cb_once, "CodeBuddy apply_process_route is idempotent");
+
+        // Pre-existing denies union without reordering unrelated tokens.
+        let mut cb_union = vec![
+            "codebuddy".to_string(),
+            "--disallowedTools".to_string(),
+            "Bash".to_string(),
+            "TaskOutput".to_string(),
+            "Task".to_string(),
+            "TaskStop".to_string(),
+            "--acp".to_string(),
+        ];
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_union,
+        )
+        .unwrap();
+        assert_eq!(
+            cb_union,
+            vec![
+                "codebuddy",
+                "--disallowedTools",
+                "Bash",
+                "TaskOutput",
+                "Task",
+                "TaskStop",
+                "Agent",
+                "--acp",
+            ]
+        );
+        let cb_union_once = cb_union.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_union,
+        )
+        .unwrap();
+        assert_eq!(cb_union, cb_union_once);
+    }
+
+    /// Native CodeBuddy must be a strict no-op on the complete argv, including
+    /// pre-seeded `--disallowedTools` in any supported position.
+    #[test]
+    fn native_codebuddy_preserves_preseeded_disallowed_tools() {
+        let cases = [
+            vec![
+                "codebuddy".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+                "--acp".to_string(),
+            ],
+            vec![
+                "codebuddy".to_string(),
+                "--acp".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+            ],
+            vec![
+                "codebuddy".to_string(),
+                "--some-other-flag".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+                "--acp".to_string(),
+            ],
+        ];
+        for original in cases {
+            let mut argv = original.clone();
+            apply_process_route(
+                &native_plan(AgentType::CodeBuddy),
+                AgentType::CodeBuddy,
+                &mut BTreeMap::new(),
+                &mut argv,
+            )
+            .unwrap();
+            assert_eq!(
+                argv, original,
+                "native CodeBuddy must not mutate preseeded denies"
+            );
+        }
+    }
+
+    /// Fork must re-assert the same Claude Codeg Agent/Task deny list as
+    /// new/load/resume (via `session_request_meta` / deep merge). Native is
+    /// unchanged (no Codeg deny injection).
+    #[test]
+    fn claude_fork_meta_reasserts_codeg_agent_task_deny() {
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::ClaudeCode);
+
+        let codeg_meta = session_request_meta(
+            AgentType::ClaudeCode,
+            &codeg_plan(AgentType::ClaudeCode),
+            &spec,
+            adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            codeg_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .cloned()
+                .expect("Codeg fork meta must include disallowedTools"),
+            serde_json::json!(["Agent", "Task"])
+        );
+        assert_eq!(
+            codeg_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("emitRawSDKMessages"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            codeg_meta.contains_key("codeg.dev/terminal"),
+            "fork meta preserves terminal snapshot"
+        );
+        // Adapter keys from terminal_metadata path stay intact (no clobber).
+        let fork_req = crate::acp::fork::build_fork_session_request(
+            SessionId::new("s-fork-route"),
+            "/tmp/codeg",
+            codeg_meta.clone(),
+        );
+        let fork_val = serde_json::to_value(fork_req).unwrap();
+        assert_eq!(
+            fork_val["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Agent", "Task"])
+        );
+        assert!(fork_val["_meta"].get("codeg.dev/terminal").is_some());
+
+        let native_meta = session_request_meta(
+            AgentType::ClaudeCode,
+            &native_plan(AgentType::ClaudeCode),
+            &spec,
+            adapter,
+        )
+        .unwrap();
+        assert!(
+            native_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .is_none(),
+            "native Claude fork meta must not inject Codeg denies"
+        );
+        assert_eq!(
+            native_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("emitRawSDKMessages"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(native_meta.contains_key("codeg.dev/terminal"));
     }
 
     #[tokio::test]
