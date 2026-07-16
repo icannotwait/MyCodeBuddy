@@ -2,9 +2,10 @@
 
 ## Status
 
-Approved in conversation. This document covers automatic local-file links in
-completed assistant prose and the Windows `file://` compatibility fix required
-for those links to survive Streamdown's sanitization pipeline.
+Approved in conversation and corrected during implementation-plan review. This
+document covers automatic local-file links in completed assistant prose and
+the Windows `file://` compatibility fix required for those links to survive
+Streamdown's sanitization pipeline.
 
 ## Problem
 
@@ -60,6 +61,12 @@ handler remain the only presentation and navigation path.
 - Home-relative (`~/...`), UNC, explicitly relative (`./...`, `../...`), or
   bare relative (`src/app.ts`) paths.
 - Paths embedded in inline code, fenced code, or raw HTML.
+- Paths whose Markdown source is not a one-to-one text-node slice, including
+  Windows separators consumed as CommonMark escapes before punctuation such as
+  `\[`, `\#`, or `\_`.
+- Paths containing `$`; this fails closed when the existing math-delimiter
+  normalizer changed `\(...\)` or `\[...\]` inside a path before Markdown
+  parsing.
 - Filesystem existence checks during rendering.
 - Autolinking tool output, reasoning, plans, system messages, or user text.
 - Making `file://` images renderable.
@@ -131,14 +138,27 @@ outside the link node.
 
 A remark transform that visits eligible mdast `text` nodes, calls the pure
 scanner, and replaces each matched node with alternating text and link nodes.
-It performs no path parsing of its own.
+It performs no path parsing of its own. When the parser changed a text node
+relative to its original source slice, the transform skips that node rather
+than constructing a link to a path with consumed Markdown escapes.
 
 ### `src/components/ai-elements/remark-file-uri-links.ts`
 
 The existing transform continues to handle explicit Markdown links. For local
-Windows-drive and POSIX `file://` destinations, it uses the same safe href
-normalization rules as the autolinker. Images remain untouched. The existing
-UNC behavior is outside this design and is not claimed as v1 support.
+Windows-drive and POSIX `file://` destinations, it preserves the URL parser's
+already-encoded pathname in the same harden-safe root-relative shape used by
+the autolinker. Images remain untouched. The existing UNC behavior is outside
+this design and is not claimed as v1 support.
+
+### `src/components/ai-elements/link-safety.tsx`
+
+The click parser separates raw `:line[:column]`, query, and fragment syntax
+before percent-decoding filesystem data. It removes the leading slash from a
+Windows drive target only when the raw href itself begins with a literal
+`/D:/`-style prefix. This distinction preserves valid POSIX paths such as
+`/C:/repo/a.ts`, whose safe href contains an encoded drive-like colon
+(`/C%3A/repo/a.ts`), and preserves encoded terminal names such as
+`report%3A12` as filename data rather than line metadata.
 
 ### `src/components/ai-elements/message.tsx`
 
@@ -157,14 +177,22 @@ The `MessageResponse` memo comparator must include the new prop.
 ### Completed assistant text activation
 
 `HistoricalMessageGroup` already knows whether its turn is persisted through
-`isResponseComplete`. It passes that state to `ContentPartsRenderer`, which
-enables the prop only when the part is top-level, the message role is
-`assistant`, and the response is complete. Recursive rendering inside
-structured goal/tool containers does not inherit the opt-in.
+`isResponseComplete`. Before display-role normalization, the message-list
+adapter records the object identities of top-level text parts whose source
+role is exactly `assistant`. Consecutive-turn merging unions those identity
+sets, so a source `tool` turn that is displayed as assistant content cannot
+inherit eligibility from a neighboring assistant turn.
+
+`HistoricalMessageGroup` passes the eligible set to `ContentPartsRenderer`
+only when the response is complete. The renderer enables the prop only when a
+part is top-level, its object identity is in that set, and the display role is
+`assistant`. Recursive rendering inside structured goal/tool containers does
+not inherit the opt-in.
 
 The direct history path passes the prop to `MessageResponse`. The completed
 streaming-partition handoff passes it through `StreamingMarkdownDocument` and
-`SealedBlock`. Their prop types and memo comparators must include the flag.
+`SealedBlock`. Both prop types carry the flag, and the `SealedBlock` memo
+comparator includes it.
 
 Live transcript components never set the flag. The legacy compatibility path,
 which renders a streaming phase through `HistoricalMessageGroup` when
@@ -196,8 +224,8 @@ The following location suffixes are part of the link label and destination:
 #L12-20
 ```
 
-The existing file opener uses the first line in a line/column or line-range
-suffix. Column and range-end values remain display information only.
+The click parser uses the first line in a line/column or line-range suffix.
+Column and range-end values remain display information only.
 
 ### POSIX confidence rule
 
@@ -211,23 +239,42 @@ file paths. A `//host/path` candidate is never treated as a local POSIX path.
 
 ### Boundaries
 
-An unquoted candidate ends at whitespace or a Markdown delimiter. Common
-sentence punctuation is removed from its tail. A closing bracket is retained
-when it balances an opening bracket inside the candidate; otherwise it remains
-outside the link.
+An unquoted candidate uses conservative token boundaries. Common sentence
+punctuation stays outside the link, while balanced filename brackets can stay
+inside it.
 
 A path may contain spaces only when enclosed by matching ASCII single or double
 quotes. The quotes remain ordinary prose around the badge. Escaped or nested
 quotes are not supported in v1.
 
+The unquoted scanner treats whitespace, ASCII quotes/backticks/angle brackets,
+asterisk and table-pipe delimiters, ASCII comma/semicolon/exclamation, and
+common CJK sentence punctuation as hard boundaries. ASCII `.`, `:`, and `?`
+are scanned so drive letters, location suffixes, extensions, and literal
+internal filename characters remain possible; when they occur only as
+trailing sentence punctuation they stay outside the match.
+
+Bracket pairs are tracked while scanning. A closing bracket is included only
+when it closes the current innermost opening bracket; the first unmatched or
+mismatched closer ends the candidate and remains prose.
+
 The scanner rejects a candidate that begins inside an HTTP(S) URL, a
-protocol-relative URL, a slash command, or another path token.
+protocol-relative URL, a slash command, an import alias such as `@/src/app`,
+or another path/token-like sequence. An escaped opening quote, an escaped
+quote inside a quoted candidate, or a nested quote leaves that quoted
+candidate unchanged. A candidate containing `$` is also rejected so a path
+changed by math-delimiter normalization cannot become a different target.
 
 ### Markdown exclusions
 
 The remark transform only changes `text` nodes. It does not descend into an
 existing `link` or `linkReference`. `inlineCode`, `code`, HTML, image, and
 definition nodes are not candidates.
+
+When the VFile source is available, a text node is eligible only if its
+position maps to an identical source slice. A missing position or a differing
+slice fails closed. This prevents CommonMark escape processing from turning a
+raw Windows separator into a different clickable path.
 
 Replacement walks the original child list once and does not revisit newly
 created link children. Running the transform twice is therefore idempotent.
@@ -241,6 +288,7 @@ The displayed label and the href have different responsibilities:
 | `D:\repo\src\a.ts` | `D:\repo\src\a.ts` | `/D:/repo/src/a.ts` |
 | `D:/repo/src/a.ts` | `D:/repo/src/a.ts` | `/D:/repo/src/a.ts` |
 | `/Users/me/repo/a.ts` | `/Users/me/repo/a.ts` | `/Users/me/repo/a.ts` |
+| `/C:/repo/a.ts` | `/C:/repo/a.ts` | `/C%3A/repo/a.ts` |
 | `"D:\My Project\a.ts"` | `D:\My Project\a.ts` | `/D:/My%20Project/a.ts` |
 
 The quotes in the final table row are surrounding prose, not part of the href.
@@ -259,8 +307,10 @@ path, not as an already encoded URI. A literal `%20` in bare prose therefore
 means a filename containing those three characters. Explicit `file://` links
 continue to be parsed as URIs before normalization.
 
-On click, the existing `parseLocalFileTarget` logic decodes the href and
-`stripLeadingSlashOnWindows` converts `/D:/...` back to `D:/...`.
+On click, `parseLocalFileTarget` separates raw location syntax first, then
+decodes path data. `stripLeadingSlashOnWindows` converts a literal raw
+`/D:/...` back to `D:/...`, while an encoded POSIX `/D%3A/...` remains rooted
+as `/D:/...`.
 
 ## Streaming and Rendering Lifecycle
 
@@ -327,11 +377,14 @@ Examples:
 file:///D:/repo/a.ts       -> /D:/repo/a.ts
 file:///D:/My%20Repo/a.ts -> /D:/My%20Repo/a.ts
 file:///Users/me/a.ts     -> /Users/me/a.ts
+file:///C%3A/repo/a.ts    -> /C%3A/repo/a.ts
 ```
 
 Fragments and queries that encode path characters remain encoded. Recognized
 line fragments such as `#L12` remain location metadata. `file://` image nodes
 are still skipped so Streamdown's blocked-image placeholder remains intact.
+Encoded terminal colons remain filename data; only a raw `:line[:column]`
+suffix becomes location metadata.
 
 ## Testing
 
@@ -345,10 +398,11 @@ Cover:
 - Unicode path segments;
 - every supported location suffix;
 - trailing ASCII and CJK punctuation;
-- balanced and unbalanced closing brackets;
+- nested balanced brackets plus unmatched and mismatched closing brackets;
 - literal `%`, `#`, and `?` path characters;
 - adjacent text and multiple matches;
-- HTTP(S), `//host`, slash command, `~/`, UNC, relative, and bare-relative
+- HTTP(S), `//host`, slash command, import alias, embedded-token,
+  math-normalized, escaped-quote, `~/`, UNC, relative, and bare-relative
   negatives; and
 - a large input regression that validates complete output without relying on a
   timing threshold.
@@ -360,6 +414,7 @@ Verify:
 - a text node becomes the expected `text/link/text` sequence;
 - outer quotes remain text;
 - visible text is unchanged;
+- a text node changed by CommonMark backslash escaping is left unchanged;
 - existing links and link references are not nested;
 - inline code, fenced code, HTML, image, and definition nodes are unchanged;
   and
@@ -376,6 +431,7 @@ Verify:
 - rendered text does not contain `[blocked]`;
 - an explicit Windows `file:///D:/...` Markdown link survives;
 - clicking passes the decoded path and starting line to `openFilePreview`;
+- encoded POSIX drive-like prefixes and terminal colons remain path data;
 - no click opens a browser; and
 - unsupported candidates remain ordinary text.
 
@@ -388,10 +444,13 @@ Verify:
   rendering is disabled;
 - the same canonical text renders a badge after history handoff;
 - completed-partition and full fallback rendering agree;
+- source `tool` text stays opted out even when consecutive-turn merging gives
+  its group the assistant display role;
 - user, system, reasoning, tool, plan, and permission content do not opt in;
 - nested structured content does not inherit the top-level assistant opt-in;
-- `MessageResponse`, `StreamingMarkdownDocument`, and `SealedBlock` memo
-  comparisons react to the flag; and
+- `MessageResponse` and `SealedBlock` memo comparisons react to the flag, and
+  `StreamingMarkdownDocument` propagates it through completed blocks and its
+  invalid-document fallback; and
 - existing Markdown and explicit web links remain unchanged.
 
 After focused tests, run:
