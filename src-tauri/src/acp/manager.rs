@@ -48,6 +48,11 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
+/// Production primary wait for map absence after unexposed teardown.
+const TEARDOWN_MAP_WAIT_PRIMARY: Duration = Duration::from_secs(5);
+/// Production extended wait after primary timeout before fail-closed.
+const TEARDOWN_MAP_WAIT_EXTENDED: Duration = Duration::from_secs(2);
+
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
 /// never land here: it would collide with a persisted transcript turn id and let
@@ -698,22 +703,23 @@ impl ConnectionManager {
                         "[ACP] route bootstrap RouteSpecific ({reason:?}); \
                          tearing down unexposed attempt and safe-native fallback"
                     );
-                    self.teardown_unexposed_attempt(&connection_id).await;
+                    // Attempt 2 only after teardown observes map absence.
+                    self.teardown_unexposed_attempt(&connection_id).await?;
                     attempt_plan = safe_native_fallback(&attempt_plan, reason);
                     // Second attempt cannot recurse/retry again (attempt==2).
                     continue;
                 }
                 Ok(RouteBootstrapOutcome::RouteSpecific(reason)) => {
-                    self.teardown_unexposed_attempt(&connection_id).await;
+                    self.teardown_unexposed_attempt(&connection_id).await?;
                     return Err(AcpError::RouteUnavailable { reason });
                 }
                 Ok(RouteBootstrapOutcome::Fatal(error)) => {
-                    self.teardown_unexposed_attempt(&connection_id).await;
+                    self.teardown_unexposed_attempt(&connection_id).await?;
                     return Err(error);
                 }
                 Err(_) => {
                     // Connection task dropped without bootstrap (process died).
-                    self.teardown_unexposed_attempt(&connection_id).await;
+                    self.teardown_unexposed_attempt(&connection_id).await?;
                     return Err(AcpError::ProcessExited);
                 }
             }
@@ -732,10 +738,25 @@ impl ConnectionManager {
     /// A queued `Disconnect` alone is insufficient when bootstrap fails before
     /// `run_conversation_loop` (the command is never drained). Abort the task
     /// instead, then wait for [`ConnectionCleanupGuard`] to remove the entry.
-    /// Does **not** force-remove a still-live map entry; after abort the cleanup
-    /// path is responsible for removal (including delayed async remove when the
-    /// map lock is contended).
-    async fn teardown_unexposed_attempt(&self, connection_id: &str) {
+    /// Does **not** force-remove a still-live map entry. Success requires
+    /// observed map absence after revoke + terminate request; timeout is
+    /// fail-closed ([`AcpError::ProcessExited`]) so root fallback never starts
+    /// attempt 2 against a still-mapped partial connection.
+    async fn teardown_unexposed_attempt(&self, connection_id: &str) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt_with_waits(
+            connection_id,
+            TEARDOWN_MAP_WAIT_PRIMARY,
+            TEARDOWN_MAP_WAIT_EXTENDED,
+        )
+        .await
+    }
+
+    async fn teardown_unexposed_attempt_with_waits(
+        &self,
+        connection_id: &str,
+        primary: Duration,
+        extended: Duration,
+    ) -> Result<(), AcpError> {
         // Snapshot handles under the map lock, then release before awaiting
         // state/token locks so we never hold connections + state together.
         let (task_abort, state, cmd_tx) = {
@@ -749,6 +770,11 @@ impl ConnectionManager {
                 None => (None, None, None),
             }
         };
+
+        // Already absent: nothing to clean up (success).
+        if task_abort.is_none() && state.is_none() {
+            return Ok(());
+        }
 
         // 1) Awaited token revoke (never try_read — must not skip under contention).
         if let Some(state) = state {
@@ -768,13 +794,13 @@ impl ConnectionManager {
             let _ = tx.try_send(ConnectionCommand::Disconnect);
         }
 
-        // 3) Observe actual map removal before returning (no force-remove race).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // 3) Observe actual map removal before Ok (no force-remove race).
+        let deadline = tokio::time::Instant::now() + primary;
         loop {
             {
                 let map = self.connections.lock().await;
                 if !map.contains_key(connection_id) {
-                    return;
+                    return Ok(());
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -784,21 +810,21 @@ impl ConnectionManager {
                      not force-removing (would race a live SessionStarted entry)"
                 );
                 // Keep waiting briefly for delayed cleanup-guard spawn path.
-                let extended = tokio::time::Instant::now() + Duration::from_secs(2);
-                while tokio::time::Instant::now() < extended {
+                let extended_deadline = tokio::time::Instant::now() + extended;
+                while tokio::time::Instant::now() < extended_deadline {
                     {
                         let map = self.connections.lock().await;
                         if !map.contains_key(connection_id) {
-                            return;
+                            return Ok(());
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 tracing::error!(
                     "[ACP] teardown_unexposed_attempt: {connection_id} still present \
-                     after extended wait"
+                     after extended wait; fail closed (no native fallback)"
                 );
-                return;
+                return Err(AcpError::ProcessExited);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -806,8 +832,24 @@ impl ConnectionManager {
 
     /// Test/harness surface for [`Self::teardown_unexposed_attempt`].
     #[cfg(any(test, feature = "test-utils"))]
-    pub async fn teardown_unexposed_for_test(&self, connection_id: &str) {
-        self.teardown_unexposed_attempt(connection_id).await;
+    pub async fn teardown_unexposed_for_test(
+        &self,
+        connection_id: &str,
+    ) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt(connection_id).await
+    }
+
+    /// Like [`Self::teardown_unexposed_for_test`] with explicit wait bounds
+    /// (deterministic stuck-cleanup tests; no global timeout override).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn teardown_unexposed_for_test_with_waits(
+        &self,
+        connection_id: &str,
+        primary: Duration,
+        extended: Duration,
+    ) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt_with_waits(connection_id, primary, extended)
+            .await
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -7163,7 +7205,9 @@ mod tests {
         assert!(!join.is_finished(), "precondition: parking task is live");
 
         let t0 = std::time::Instant::now();
-        mgr.teardown_unexposed_for_test(&conn_id).await;
+        mgr.teardown_unexposed_for_test(&conn_id)
+            .await
+            .expect("delayed cleanup must yield Ok after map absence");
         let elapsed = t0.elapsed();
         assert!(
             !mgr.connections.lock().await.contains_key(&conn_id),
@@ -7198,6 +7242,182 @@ mod tests {
             vec!["revoked", "map_removed"],
             "expected revoke then map removal before attempt 2"
         );
+    }
+
+    /// Stuck cleanup: short teardown timeout fails closed; attempt 2 never starts.
+    /// Does not force-remove the map entry.
+    #[tokio::test]
+    async fn teardown_unexposed_stuck_cleanup_fails_closed_no_attempt_two() {
+        use crate::acp::connection::AgentConnection;
+        use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
+        use crate::acp::delegation::lease::CompanionLeaseRegistry;
+        use crate::acp::delegation::listener::{TokenEntry, TokenRegistry};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::acp::types::ConnectionStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+        struct NoQuestions;
+        #[async_trait::async_trait]
+        impl SessionQuestionAccess for NoQuestions {
+            async fn register_question(
+                &self,
+                _parent_connection_id: &str,
+                _questions: Vec<QuestionSpec>,
+            ) -> Option<RegisteredQuestion> {
+                None
+            }
+            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+        }
+
+        let mgr = ConnectionManager::new();
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        let token = "stuck-teardown-tok".to_string();
+        tokens
+            .register(
+                token.clone(),
+                TokenEntry {
+                    parent_connection_id: "stuck-1".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let _waiter = leases.register(&token).await;
+
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        mgr.install_delegation(crate::acp::connection::DelegationInjection {
+            broker,
+            tokens: Arc::clone(&tokens),
+            leases: Arc::clone(&leases),
+            socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions)
+                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        });
+
+        let conn_id = "stuck-1".to_string();
+        let mut state = SessionState::new(
+            conn_id.clone(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        state.delegation_token = Some(token.clone());
+        state.status = ConnectionStatus::Connecting;
+        let state = Arc::new(RwLock::new(state));
+        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = codeg_plan_for_late_close();
+        let (spawn_config, observed_config) = matching_config_pair(
+            "agent",
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+
+        // No cleanup task: map entry stays forever (stuck cleanup).
+        mgr.connections.lock().await.insert(
+            conn_id.clone(),
+            AgentConnection {
+                id: conn_id.clone(),
+                agent_type: AgentType::Codex,
+                status: ConnectionStatus::Connecting,
+                owner_window_label: "test".into(),
+                cmd_tx: tx,
+                task_abort: Some(abort),
+                state: Arc::clone(&state),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            },
+        );
+
+        // Production root RouteSpecific branch: teardown must succeed before attempt 2.
+        // Short per-call waits keep the test deterministic without global overrides.
+        let attempt_two_starts = Arc::new(AtomicUsize::new(0));
+        let attempt_n = Arc::clone(&attempt_two_starts);
+        let mut attempt = 1u8;
+        let bootstrap = RouteBootstrapOutcome::RouteSpecific(
+            RouteDegradedReason::CompanionInitializationFailed,
+        );
+        let outcome = match bootstrap {
+            RouteBootstrapOutcome::RouteSpecific(reason) if attempt == 1 => {
+                match mgr
+                    .teardown_unexposed_for_test_with_waits(
+                        &conn_id,
+                        Duration::from_millis(40),
+                        Duration::from_millis(20),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        // Would start attempt 2 only after success.
+                        attempt = 2;
+                        attempt_n.fetch_add(1, Ordering::SeqCst);
+                        let _ = reason;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => panic!("expected RouteSpecific"),
+        };
+
+        assert!(
+            matches!(outcome, Err(AcpError::ProcessExited)),
+            "stuck cleanup must fail closed with ProcessExited; got {outcome:?}"
+        );
+        assert_eq!(
+            attempt_two_starts.load(Ordering::SeqCst),
+            0,
+            "attempt 2 must never start when teardown fails"
+        );
+        assert_eq!(attempt, 1, "attempt counter must stay at 1");
+        assert!(
+            mgr.connections.lock().await.contains_key(&conn_id),
+            "must not force-remove a stuck map entry"
+        );
+        // Token/lease revoke and task abort still ran.
+        assert!(tokens.lookup(&token).await.is_none());
+        for _ in 0..200 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(join.is_finished(), "task abort must still be requested");
+
+        let _ = join.await;
+        mgr.connections.lock().await.remove(&conn_id);
     }
 
     /// Fallback policy still at most two attempts; teardown completes before attempt 2.

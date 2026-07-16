@@ -341,25 +341,29 @@ impl DelegationListener {
         Ok(())
     }
 
-    /// Authenticated two-frame ready lease. Token is validated against
-    /// [`TokenRegistry`] before [`CompanionLeaseRegistry::mark_ready`]. Ack is
-    /// written only after authentication; the socket stays open until peer EOF
-    /// or the lease is revoked. Closed exactly once.
+    /// Authenticated two-frame ready lease.
     ///
-    /// Any failure after `mark_ready` and before a durable hold (including an
-    /// ack write failure) calls `mark_closed` so the host never observes a
-    /// false-ready with a dead companion.
+    /// Order: validate/reserve token → write `{"ready":true}` ack → publish
+    /// host readiness via [`CompanionLeaseRegistry::mark_ready`]. Readiness is
+    /// never published until the ack write succeeds, so a dead companion cannot
+    /// make the host `wait_ready` / Connected / `RouteBootstrapOutcome::Ready`.
+    ///
+    /// On ack write failure the lease is revoked so the waiter fails closed
+    /// immediately (not merely availability=false after a false ready). If
+    /// revoke races between ack and mark_ready, mark_ready fails and the hold
+    /// is not entered.
     async fn serve_ready_lease<C>(&self, conn: &mut C, token: String) -> std::io::Result<()>
     where
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        // Authenticate first — never mark_ready for an unknown/revoked token.
+        // 1) Authenticate first — never publish ready for an unknown/revoked token.
         if self.tokens.lookup(&token).await.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "invalid ready-lease token",
             ));
         }
+        // 2) Reserve: host must have registered the lease before companion Ready.
         let mut availability = self
             .leases
             .subscribe_availability(&token)
@@ -367,15 +371,20 @@ impl DelegationListener {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "ready lease not registered")
             })?;
-        if let Err(e) = self.leases.mark_ready(&token).await {
-            return Err(std::io::Error::other(format!("mark_ready: {e}")));
-        }
-        // Ack only after authentication + mark_ready. On write failure the host
-        // may already have observed ready via the watch; close so waiters flip
-        // unavailable and bootstrap does not treat the route as Connected.
+
+        // 3) Write ack only after authentication/reserve. Host readiness is
+        //    published only after this write succeeds.
         if let Err(e) = write_frame(conn, &CompanionReadyAck { ready: true }).await {
-            self.leases.mark_closed(&token).await;
+            // Fail closed: never mark_ready; drop the lease so wait_ready sees
+            // Closed immediately (ready_tx dropped) and cannot return Ready.
+            self.leases.revoke(&token).await;
             return Err(e);
+        }
+
+        // 4) Publish host ready only after durable ack. Revoke race → fail closed.
+        if let Err(e) = self.leases.mark_ready(&token).await {
+            self.leases.mark_closed(&token).await;
+            return Err(std::io::Error::other(format!("mark_ready: {e}")));
         }
 
         // Hold open: peer EOF or external revoke (availability → false).
@@ -2277,11 +2286,10 @@ mod tests {
         drop(client);
     }
 
-    /// Write failure after mark_ready must mark_closed (no host false-ready).
-    /// Drives the real `serve_one` framing path with a scripted stream: a valid
-    /// Ready frame is readable, then the first write (ack) fails.
+    /// Scripted ack write failure must leave the host waiter unable to become
+    /// Ready (not only availability=false). Valid path covered separately.
     #[tokio::test]
-    async fn ready_lease_ack_write_failure_marks_closed() {
+    async fn ready_lease_ack_write_failure_never_ready() {
         use crate::acp::delegation::transport::{
             write_frame, BrokerMessage, CompanionReadyRequest,
         };
@@ -2352,7 +2360,6 @@ mod tests {
         let mut encode = Vec::new();
         {
             use tokio::io::AsyncWriteExt;
-            // write_frame needs AsyncWrite — use a memory buffer via duplex half.
             let (mut w, mut r) = duplex(4 * 1024);
             write_frame(
                 &mut w,
@@ -2389,16 +2396,23 @@ mod tests {
         let result = listener.serve_one(&mut conn).await;
         assert!(result.is_err(), "ack write failure must surface via serve_one");
 
-        // Host may briefly observe ready via mark_ready; close must follow.
-        let _ = waiter
-            .wait_ready(std::time::Duration::from_millis(50))
+        // Host bootstrap must not observe Ready (Connected / RouteBootstrap Ready
+        // depend on wait_ready succeeding). Fail closed — not merely availability.
+        let wait = waiter
+            .wait_ready(std::time::Duration::from_millis(80))
             .await;
-        if *waiter.availability().borrow() {
-            waiter.availability().changed().await.unwrap();
-        }
+        assert!(
+            wait.is_err(),
+            "ack write failure must not make wait_ready Ready; got {wait:?}"
+        );
         assert!(
             !*waiter.availability().borrow(),
-            "ack write failure must mark_closed (no durable false-ready)"
+            "ack write failure must leave availability false"
+        );
+        // A later mark_ready must not resurrect a failed handshake slot if revoked.
+        assert!(
+            leases.mark_ready("fail-ack").await.is_err(),
+            "failed ack path should revoke/forget lease so host cannot mark ready later"
         );
     }
 }
