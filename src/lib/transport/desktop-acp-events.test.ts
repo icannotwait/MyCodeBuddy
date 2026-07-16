@@ -63,6 +63,26 @@ describe("subscribeDesktopAcpEvents", () => {
     )
   })
 
+  it("rolls back partial batched registration when failure listen fails", async () => {
+    const transport = fakeTransport()
+    const unsubFns: Array<ReturnType<typeof vi.fn>> = []
+    let calls = 0
+    transport.subscribe.mockImplementation(async () => {
+      calls += 1
+      if (calls === 2) {
+        throw new Error("failure channel unavailable")
+      }
+      const unsub = vi.fn()
+      unsubFns.push(unsub)
+      return unsub
+    })
+    await expect(
+      subscribeDesktopAcpEvents(capabilities("batched"), handlers, transport)
+    ).rejects.toThrow("failure channel unavailable")
+    expect(unsubFns).toHaveLength(1)
+    expect(unsubFns[0]).toHaveBeenCalledTimes(1)
+  })
+
   it("wraps legacy envelopes as one-event batches with monotonic ids", async () => {
     const transport = fakeTransport()
     type Handler = (payload: unknown) => void

@@ -3423,10 +3423,31 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       if (!sinks.transcript) return
       if (connectionFrame) {
-        // Frame path: always publish so turn_complete (and other non-content
-        // events) can mark completing even when liveMessage is unchanged.
-        // Canonical sink above still only runs on live change.
-        sinks.transcript.publish(connectionFrame, nextConn.liveMessage)
+        // Match the canonical out-of-turn guard: only project streaming content
+        // when this connection was or is prompting for the frame. Otherwise
+        // background wire updates would graft onto the previous live reply.
+        const previousStatus = previous.get(key)?.status
+        const allowStreamingContent =
+          previousStatus === "prompting" || nextConn.status === "prompting"
+        const publishFrame = allowStreamingContent
+          ? connectionFrame
+          : {
+              ...connectionFrame,
+              applyEvents: connectionFrame.applyEvents.filter(
+                (event) =>
+                  event.type === "turn_complete" ||
+                  event.type === "status_changed"
+              ),
+            }
+        // Always publish (even filtered) so turn_complete can mark completing
+        // when liveMessage is unchanged.
+        if (
+          allowStreamingContent ||
+          publishFrame.applyEvents.length > 0 ||
+          liveChanged
+        ) {
+          sinks.transcript.publish(publishFrame, nextConn.liveMessage)
+        }
       } else if (liveChanged) {
         // Snapshot hydrate / non-frame dispatches: full rebuild at cursor.
         sinks.transcript.rebuild(nextConn.liveMessage, nextConn.lastAppliedSeq)
@@ -3459,6 +3480,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         prepared.changedConnections.length,
         next !== previous
       )
+      if (streamingPerfRecorder.isActive()) {
+        // Count raw accepted envelopes (pre-compaction) so integrity matches
+        // fixture event counts, not compacted applyEvents.
+        let accepted = 0
+        let firstSeq = 0
+        let lastSeq = 0
+        for (const connFrame of frame.connections) {
+          accepted += connFrame.rawEvents.length
+          for (const event of connFrame.rawEvents) {
+            if (event.type === "content_delta" && event.text) {
+              streamingPerfRecorder.appendFrontendText(event.text)
+            }
+            if (firstSeq === 0 || event.seq < firstSeq) firstSeq = event.seq
+            if (event.seq > lastSeq) lastSeq = event.seq
+          }
+        }
+        if (accepted > 0) {
+          streamingPerfRecorder.markFrontendEventsAccepted(accepted)
+          if (lastSeq > 0) {
+            streamingPerfRecorder.noteFrontendSeqRange(firstSeq, lastSeq)
+          }
+        }
+      }
 
       // Map contextKey → accepted connection frame for transcript.publish.
       const framesByKey = new Map<string, AcceptedConnectionFrame>()
@@ -3685,6 +3729,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const handleSequenceGap = useCallback(
     (gap: SequenceGap) => {
+      if (streamingPerfRecorder.isActive()) {
+        streamingPerfRecorder.markFrontendSequenceGap()
+      }
       const ingestor = eventIngestorRef.current
       ingestor?.pauseConnection(gap.connectionId)
       void (async () => {
@@ -3734,7 +3781,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const handleDesktopDeliveryFailure = useCallback(
     (failure: DesktopDeliveryFailure) => {
       desktopDeliveryFailedRef.current = true
+      listenerReadyRef.current = false
       const ingestor = eventIngestorRef.current
+      // Commit any contiguous pending work before tearing the ingestor down so
+      // a successfully emitted but unflushed batch is not silently discarded.
+      try {
+        ingestor?.flushNow()
+      } catch (err) {
+        console.warn(
+          "[acp-context] flush before delivery-failure dispose failed",
+          err
+        )
+      }
       ingestor?.dispose()
       eventIngestorRef.current = null
 
@@ -3756,6 +3814,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               patch.activeDelegations,
               patch.eventSeq
             )
+            // Surface terminal delivery failure on the connection so the UI
+            // cannot treat the session as still streamable.
+            dispatch({
+              type: "ERROR",
+              contextKey,
+              message:
+                "Desktop event delivery failed. Reload the conversation to continue.",
+            })
           } catch (err) {
             console.warn(
               "[acp-context] delivery-failure snapshot recovery failed",
@@ -3771,7 +3837,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       pushAlertRef.current(
         "error",
         t("eventErrorTitle"),
-        t("backendErrors.processExited", { agent: "ACP" })
+        "Desktop event delivery failed. Reload the conversation to continue."
       )
     },
     [dispatch, t]
@@ -3958,8 +4024,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     const start = async () => {
       if (desktopDeliveryFailedRef.current) {
         // Terminal failure: do not re-subscribe (no hot-switch / no legacy).
-        listenerReadyRef.current = true
-        resolveListenerReadyWaiters()
+        // Stay not-ready so waiters and prompts cannot treat delivery as live.
+        listenerReadyRef.current = false
         return
       }
 
@@ -3981,24 +4047,52 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       // Desktop firehose path.
+      // Never invent a delivery mode: if capability query fails we stay not-ready
+      // rather than assume legacy while the backend may be emitting batches.
       listenerReadyRef.current = false
-      let capabilities: DesktopDeliveryCapabilities =
-        LEGACY_DISABLED_CAPABILITIES
-      try {
-        if (getTransport().isDesktop()) {
-          capabilities = await acpGetDesktopDeliveryCapabilities()
+      if (desktopDeliveryFailedRef.current) {
+        // Terminal delivery failure for this process — do not re-subscribe.
+        return
+      }
+
+      let capabilities: DesktopDeliveryCapabilities | null = null
+      if (getTransport().isDesktop()) {
+        const maxAttempts = 3
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            capabilities = await acpGetDesktopDeliveryCapabilities()
+            break
+          } catch (err) {
+            console.warn(
+              `[acp-context] desktop delivery capabilities failed (attempt ${attempt}/${maxAttempts})`,
+              err
+            )
+            if (attempt < maxAttempts) {
+              await new Promise((r) => setTimeout(r, 50 * attempt))
+            }
+          }
         }
-      } catch (err) {
-        console.warn(
-          "[acp-context] desktop delivery capabilities failed; using legacy",
-          err
-        )
+        if (!capabilities) {
+          console.error(
+            "[acp-context] desktop delivery capabilities unavailable; leaving listener not-ready"
+          )
+          pushAlertRef.current(
+            "error",
+            t("eventErrorTitle"),
+            "Could not negotiate desktop event delivery. Restart the app."
+          )
+          return
+        }
+      } else {
+        capabilities = LEGACY_DISABLED_CAPABILITIES
       }
       if (cancelled) return
       try {
         capabilities = initializeStreamingPerformanceConfig(capabilities)
       } catch {
-        // Already initialized.
+        // Already initialized with the same snapshot.
+        capabilities =
+          getStreamingPerformanceConfig() ?? LEGACY_DISABLED_CAPABILITIES
       }
       if (cancelled) return
 
@@ -4026,6 +4120,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })
       } catch (err) {
         console.error("[acp-context] desktop ACP subscribe failed", err)
+        eventIngestorRef.current?.dispose()
+        eventIngestorRef.current = null
+        pushAlertRef.current(
+          "error",
+          t("eventErrorTitle"),
+          "Failed to subscribe to desktop ACP events. Restart the app."
+        )
+        // Stay not-ready — never mark ready without an active subscription.
+        return
       }
 
       if (cancelled) {
@@ -4789,6 +4892,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clientMessageId?: string | null
       }
     ) => {
+      if (desktopDeliveryFailedRef.current) {
+        throw new Error(
+          "Desktop ACP delivery failed; reload the conversation before sending"
+        )
+      }
+      if (
+        getTransport().isDesktop() &&
+        getEventStream() === null &&
+        !listenerReadyRef.current
+      ) {
+        throw new Error(
+          "Desktop ACP event listener is not ready; cannot send prompt"
+        )
+      }
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) return
       lastActivityRef.current.set(contextKey, Date.now())
@@ -5176,29 +5293,30 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             await waitTwoRafs()
 
             const metricsAfter = await acpGetEventMetrics()
-            const appliedEvents = Math.max(
-              0,
-              metricsAfter.desktop_legacy_emit_count +
-                metricsAfter.desktop_batch_event_count -
-                (metricsBefore.desktop_legacy_emit_count +
-                  metricsBefore.desktop_batch_event_count)
-            )
+            // Frontend-committed counts and text digest only — never trust
+            // backend emit counters or the fixture's self-reported checksum.
+            const appliedEvents =
+              streamingPerfRecorder.getFrontendAcceptedEvents()
+            const finalTextSha256 =
+              await streamingPerfRecorder.computeFrontendTextSha256()
             const integrityOk =
-              result.event_count === GROK_RICH_V1_EXPECTED_EVENTS &&
-              result.final_text_sha256 === GROK_RICH_V1_EXPECTED_TEXT_SHA256
+              appliedEvents === GROK_RICH_V1_EXPECTED_EVENTS &&
+              finalTextSha256 === GROK_RICH_V1_EXPECTED_TEXT_SHA256 &&
+              result.event_count === GROK_RICH_V1_EXPECTED_EVENTS
 
             streamingPerfRecorder.setDeliverySnapshot(metricsAfter)
             streamingPerfRecorder.setIntegrity({
               expectedEvents: GROK_RICH_V1_EXPECTED_EVENTS,
-              appliedEvents:
-                appliedEvents > 0 ? appliedEvents : result.event_count,
-              firstSeq: 1,
+              appliedEvents,
+              firstSeq: appliedEvents > 0 ? 1 : 0,
               lastSeq: result.final_event_seq,
-              duplicateCount: 0,
-              gapCount: 0,
-              finalTextSha256: result.final_text_sha256,
+              // gap/duplicate come from recorder marks during the run
+              finalTextSha256,
               ok: integrityOk,
             })
+
+            // Silence unused metricsBefore (kept for delivery delta diagnostics).
+            void metricsBefore
 
             const report = streamingPerfRecorder.buildReport({
               delivery: metricsAfter,

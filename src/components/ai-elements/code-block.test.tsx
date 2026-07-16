@@ -8,6 +8,7 @@ import type {
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   CodeBlockContent,
+  clearHighlightCaches,
   highlightCode,
   type TokenizedCode,
   __getHighlightCacheStatsForTest,
@@ -88,6 +89,49 @@ describe("highlightCode", () => {
     expect(__getHighlightCacheStatsForTest().bytes).toBeLessThanOrEqual(
       8 * 1024 * 1024
     )
+  })
+
+  it("does not let a pre-reset inflight job repopulate the cache", async () => {
+    const staleEngine =
+      deferred<HighlighterGeneric<BundledLanguage, BundledTheme>>()
+    const freshEngine =
+      deferred<HighlighterGeneric<BundledLanguage, BundledTheme>>()
+    let factoryCalls = 0
+    __setHighlighterFactoryForTest(() => {
+      factoryCalls += 1
+      return factoryCalls === 1 ? staleEngine.promise : freshEngine.promise
+    })
+    const staleCallback = vi.fn()
+    expect(highlightCode("stale-source", "ts", staleCallback)).toBeNull()
+
+    // Generation bump without clearing the test factory override.
+    clearHighlightCaches()
+    expect(__getHighlightCacheStatsForTest().entries).toBe(0)
+
+    const freshCallback = vi.fn()
+    // Same source key after reset must start a new-generation job.
+    expect(highlightCode("stale-source", "ts", freshCallback)).toBeNull()
+    expect(factoryCalls).toBe(2)
+
+    // Resolve the stale job first — it must not repopulate completedTokens.
+    await act(async () => {
+      staleEngine.resolve(
+        fakeHighlighter((code) => shikiResult(`${code}-STALE`))
+      )
+    })
+    await Promise.resolve()
+    expect(staleCallback).not.toHaveBeenCalled()
+    expect(highlightCode("stale-source", "ts")).toBeNull()
+
+    await act(async () => {
+      freshEngine.resolve(
+        fakeHighlighter((code) => shikiResult(`${code}-token`))
+      )
+    })
+    await vi.waitFor(() => expect(freshCallback).toHaveBeenCalledTimes(1))
+    expect(staleCallback).not.toHaveBeenCalled()
+    expect(highlightCode("stale-source", "ts")).not.toBeNull()
+    expect(__getHighlightCacheStatsForTest().entries).toBe(1)
   })
 })
 

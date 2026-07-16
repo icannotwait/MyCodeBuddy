@@ -20,6 +20,8 @@ This document owns the **observation release** after Tasks 1–16. Flags and the
 
 Release defaults (after Task 15): all three **true**, with downward normalization (incremental/deferred require batching). Env false still disables.
 
+**Known validation limits (merge caveats):** absolute gates and fixture integrity are **Windows-only** in this branch. macOS WKWebView / Linux WebKitGTK smoke were not executed in-session. Frontend integrity now counts **accepted envelopes + SHA-256 of committed content_delta text** (not backend emit counters). Prefer env opt-out (`=0`) if a platform shows delivery/integrity incidents before those smokes land.
+
 ## Metric fields (content-free)
 
 Use reports from `window.__codegStreamingPerf` / desktop metrics snapshot only:
@@ -38,8 +40,10 @@ Use reports from `window.__codegStreamingPerf` / desktop metrics snapshot only:
 
 | Signal | Meaning | First response |
 | --- | --- | --- |
-| `integrity.ok === false` or gap/duplicate &gt; 0 | Delivery / apply integrity break | Disable `CODEG_DESKTOP_ACP_EVENT_BATCHING=0` (forces legacy + dependents off) |
-| `desktop_startup_fallback_count` / runtime failure counters rising | Batcher start or emit path failing | Confirm legacy path; file incident; keep flag false until root cause |
+| `integrity.ok === false` or gap/duplicate &gt; 0 | Frontend apply integrity break (accepted count / text hash / gap / dup) | Disable `CODEG_DESKTOP_ACP_EVENT_BATCHING=0` (forces legacy + dependents off) |
+| Capability query fails / listener stays not-ready | FE cannot invent delivery mode; no subscribe | Restart app; check `acp_get_desktop_delivery_capabilities`; do **not** hot-switch |
+| Runtime delivery failure alert / prompts blocked | Batch emit terminal; stream fail-closed | Reload conversation; inspect `desktop_runtime_failure_count` |
+| `desktop_startup_fallback_count` rising (backend) | Batcher start failed server-side | Confirm backend legacy emit + FE capability mode still match; file incident |
 | Projector rebuild storms / parity test fail | Live transcript projection drift | Disable `CODEG_INCREMENTAL_LIVE_TRANSCRIPT=0` |
 | Rich engine / Shiki / Mermaid fallback error rate spike | Deferred rich path unhealthy | Disable `CODEG_DEFERRED_STREAMING_RICH_CONTENT=0` |
 | Content leakage in reports | Privacy blocker | Stop publishing reports; scrub pipeline |

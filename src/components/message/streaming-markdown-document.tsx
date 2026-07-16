@@ -13,20 +13,27 @@ import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
 interface Props {
   document: IncrementalStreamBlocks
   onBlockRender?: (blockId: string) => void
+  /**
+   * `sealed-streaming` while live (no Mermaid); `complete` after handoff so
+   * history can upgrade math/Mermaid/code engines.
+   */
+  richContentState?: "sealed-streaming" | "complete"
 }
 
 const SealedBlock = memo(
   function SealedBlock({
     block,
     onRender,
+    richContentState,
   }: {
     block: SealedMarkdownBlock
     onRender?: (blockId: string) => void
+    richContentState: "sealed-streaming" | "complete"
   }) {
     streamingPerfRecorder.countRender("markdownBlock")
     onRender?.(block.id)
     return (
-      <MessageResponse mode="static" richContentState="sealed-streaming">
+      <MessageResponse mode="static" richContentState={richContentState}>
         {block.markdown}
       </MessageResponse>
     )
@@ -34,7 +41,8 @@ const SealedBlock = memo(
   (previous, next) =>
     previous.block.id === next.block.id &&
     previous.block.markdown === next.block.markdown &&
-    previous.onRender === next.onRender
+    previous.onRender === next.onRender &&
+    previous.richContentState === next.richContentState
 )
 
 function getOpenFenceTail(document: IncrementalStreamBlocks): {
@@ -51,10 +59,19 @@ function getOpenFenceTail(document: IncrementalStreamBlocks): {
   }
 }
 
-export function StreamingMarkdownDocument({ document, onBlockRender }: Props) {
+export function StreamingMarkdownDocument({
+  document,
+  onBlockRender,
+  richContentState = "sealed-streaming",
+}: Props) {
   if (!document.valid) {
     return (
-      <MessageResponse mode="streaming">
+      <MessageResponse
+        mode={richContentState === "complete" ? "static" : "streaming"}
+        richContentState={
+          richContentState === "complete" ? "complete" : undefined
+        }
+      >
         {joinStreamingMarkdown(document)}
       </MessageResponse>
     )
@@ -63,7 +80,12 @@ export function StreamingMarkdownDocument({ document, onBlockRender }: Props) {
   return (
     <div className="space-y-4">
       {document.sealed.map((block) => (
-        <SealedBlock key={block.id} block={block} onRender={onBlockRender} />
+        <SealedBlock
+          key={block.id}
+          block={block}
+          onRender={onBlockRender}
+          richContentState={richContentState}
+        />
       ))}
       {openFence ? (
         <>

@@ -196,7 +196,7 @@ describe("live-transcript-store", () => {
           raw_output_append: true,
           locations: null,
           meta: null,
-          images: null,
+          images: undefined,
         },
         {
           connection_id: "c1",
@@ -211,7 +211,7 @@ describe("live-transcript-store", () => {
           raw_output_append: true,
           locations: null,
           meta: null,
-          images: null,
+          images: undefined,
         },
       ]),
       {
@@ -292,7 +292,7 @@ describe("live-transcript-store", () => {
           raw_output_append: false,
           locations: null,
           meta: null,
-          images: null,
+          images: undefined,
         },
       ]),
       {
@@ -316,6 +316,93 @@ describe("live-transcript-store", () => {
     const updated = store.getToolGroup(9, store.getToolGroupIds(9)[0])!
     expect(updated.runningCount).toBe(1)
     expect(updated.errorCount).toBe(0)
+  })
+
+  it("reuses unchanged tool-group summary refs so sibling groups stay cold", () => {
+    const store = createLiveTranscriptStore()
+    const makeTool = (
+      id: string,
+      status: ToolCallInfo["status"]
+    ): ToolCallInfo => ({
+      tool_call_id: id,
+      title: "Read",
+      kind: "read",
+      status,
+      content: null,
+      raw_input: JSON.stringify({ file_path: `${id}.ts` }),
+      raw_output_chunks: [],
+      raw_output_total_bytes: 0,
+      locations: null,
+      meta: null,
+      images: [],
+    })
+    // Two tool groups separated by a text segment.
+    const msg: LiveMessage = {
+      id: "m-g2",
+      role: "assistant",
+      content: [
+        { type: "tool_call", info: makeTool("g1a", "in_progress") },
+        { type: "text", text: "mid" },
+        { type: "tool_call", info: makeTool("g2a", "in_progress") },
+      ],
+      startedAt: 1,
+    }
+    store.rebuild(11, "c2", msg, 1)
+    const groupIds = store.getToolGroupIds(11)
+    expect(groupIds.length).toBe(2)
+    const [groupAId, groupBId] = groupIds
+    const groupABefore = store.getToolGroup(11, groupAId)!
+    const groupBBefore = store.getToolGroup(11, groupBId)!
+
+    const listenerA = vi.fn()
+    const listenerB = vi.fn()
+    store.subscribeToolGroup(11, groupAId, listenerA)
+    store.subscribeToolGroup(11, groupBId, listenerB)
+
+    // Only group B's tool completes — group A summary values are unchanged.
+    store.publish(
+      11,
+      frame([
+        {
+          connection_id: "c2",
+          seq: 2,
+          type: "tool_call_update",
+          tool_call_id: "g2a",
+          title: null,
+          status: "completed",
+          content: "ok",
+          raw_input: null,
+          raw_output: "ok",
+          raw_output_append: false,
+          locations: null,
+          meta: null,
+          images: undefined,
+        },
+      ]),
+      {
+        ...msg,
+        content: [
+          { type: "tool_call", info: makeTool("g1a", "in_progress") },
+          { type: "text", text: "mid" },
+          {
+            type: "tool_call",
+            info: {
+              ...makeTool("g2a", "completed"),
+              content: "ok",
+              raw_output_chunks: ["ok"],
+              raw_output_total_bytes: 2,
+            },
+          },
+        ],
+      }
+    )
+
+    expect(listenerA).not.toHaveBeenCalled()
+    expect(listenerB).toHaveBeenCalledTimes(1)
+    // Unchanged group keeps the same summary object reference.
+    expect(store.getToolGroup(11, groupAId)).toBe(groupABefore)
+    expect(store.getToolGroup(11, groupBId)).not.toBe(groupBBefore)
+    expect(store.getToolGroup(11, groupBId)?.runningCount).toBe(0)
   })
 
   it("100 sequential completed conversations leave no live-store entries after removal", () => {

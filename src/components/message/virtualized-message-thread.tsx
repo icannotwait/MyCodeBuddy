@@ -1,6 +1,13 @@
 "use client"
 
-import { memo, useCallback, useEffect, useMemo, useRef } from "react"
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+} from "react"
 import type { CSSProperties, ReactNode, RefObject } from "react"
 import { Virtualizer, type VirtualizerHandle } from "virtua"
 import { useStickToBottomContext } from "use-stick-to-bottom"
@@ -106,8 +113,10 @@ function VirtualizedMessageThreadImpl<T>({
     []
   )
 
-  // Create the coordinator eagerly while the footer is present so child layout
-  // effects can scheduleFollow on the same commit (useEffect would be too late).
+  // Create during render only (idempotent ref assign) so child layout effects
+  // on the same commit can scheduleFollow. Never dispose during render —
+  // concurrent renders that drop the footer would tear down the committed
+  // coordinator while old listeners still hold it.
   if (hasFooter && !coordinatorRef.current) {
     const el = scrollRef.current
     const initiallyFollowing =
@@ -125,10 +134,16 @@ function VirtualizedMessageThreadImpl<T>({
       },
       initiallyFollowing,
     })
-  } else if (!hasFooter && coordinatorRef.current) {
-    coordinatorRef.current.dispose()
-    coordinatorRef.current = null
   }
+
+  // Dispose only after commit when the footer is gone (or on unmount).
+  useLayoutEffect(() => {
+    if (hasFooter) return
+    if (coordinatorRef.current) {
+      coordinatorRef.current.dispose()
+      coordinatorRef.current = null
+    }
+  }, [hasFooter])
 
   // Escape / re-entry listeners on the scroll viewport.
   useEffect(() => {

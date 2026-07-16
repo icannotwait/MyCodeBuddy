@@ -934,9 +934,7 @@ function deriveToolTitle(
     }
     const direct = getField("command") ?? getField("cmd") ?? getField("script")
     // Prefer field/regex extraction; only full-parse when command is nested.
-    const parsedCommand = direct
-      ? null
-      : commandFromUnknownValue(getParsed())
+    const parsedCommand = direct ? null : commandFromUnknownValue(getParsed())
     const fallback = extractCommandFromUnknownInput(titleSource)
     const command = direct ?? parsedCommand ?? fallback
     if (command) {
@@ -2119,7 +2117,11 @@ const TextPart = memo(function TextPart({
   ) {
     return (
       <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-        <StreamingMarkdownDocument document={partition} />
+        {/* History handoff uses complete so Mermaid/math can upgrade. */}
+        <StreamingMarkdownDocument
+          document={partition}
+          richContentState="complete"
+        />
       </div>
     )
   }

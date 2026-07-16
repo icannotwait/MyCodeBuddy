@@ -182,6 +182,22 @@ export function buildLiveToolGroupSummaries(
   return groups
 }
 
+function toolGroupSummaryEqual(
+  a: LiveToolGroupSummary,
+  b: LiveToolGroupSummary
+): boolean {
+  if (a.runningCount !== b.runningCount) return false
+  if (a.errorCount !== b.errorCount) return false
+  if (a.toolCallIds.length !== b.toolCallIds.length) return false
+  for (let i = 0; i < a.toolCallIds.length; i++) {
+    if (a.toolCallIds[i] !== b.toolCallIds[i]) return false
+  }
+  for (const kind of TOOL_KIND_ORDER) {
+    if (a.counts[kind] !== b.counts[kind]) return false
+  }
+  return true
+}
+
 function groupsEqual(
   a: Map<string, LiveToolGroupSummary>,
   b: Map<string, LiveToolGroupSummary>
@@ -190,17 +206,33 @@ function groupsEqual(
   for (const [id, ga] of a) {
     const gb = b.get(id)
     if (!gb) return false
-    if (ga.runningCount !== gb.runningCount) return false
-    if (ga.errorCount !== gb.errorCount) return false
-    if (ga.toolCallIds.length !== gb.toolCallIds.length) return false
-    for (let i = 0; i < ga.toolCallIds.length; i++) {
-      if (ga.toolCallIds[i] !== gb.toolCallIds[i]) return false
-    }
-    for (const kind of TOOL_KIND_ORDER) {
-      if (ga.counts[kind] !== gb.counts[kind]) return false
-    }
+    if (!toolGroupSummaryEqual(ga, gb)) return false
   }
   return true
+}
+
+/**
+ * Rebuild group summaries while reusing previous summary object refs (and
+ * toolCallIds arrays) when values are unchanged, so per-group subscribers
+ * only wake when their group actually changed.
+ */
+function reuseToolGroupSummaries(
+  prev: Map<string, LiveToolGroupSummary> | null,
+  computed: Map<string, LiveToolGroupSummary>
+): Map<string, LiveToolGroupSummary> {
+  if (!prev || prev.size === 0) return computed
+  let reusedAny = false
+  const next = new Map<string, LiveToolGroupSummary>()
+  for (const [id, summary] of computed) {
+    const prior = prev.get(id)
+    if (prior && toolGroupSummaryEqual(prior, summary)) {
+      next.set(id, prior)
+      reusedAny = true
+    } else {
+      next.set(id, summary)
+    }
+  }
+  return reusedAny ? next : computed
 }
 
 /** Frame sink registered on a connection context key. */
@@ -360,17 +392,29 @@ export function createLiveTranscriptStore(
       // Keep previous map ref when nothing changed so subscribers stay cold.
       return
     }
-    toolGroupsByConversation.set(conversationId, computed)
-    toolGroupIdsByConversation.set(
-      conversationId,
-      computed.size === 0
-        ? STABLE_EMPTY_IDS
-        : Object.freeze([...computed.keys()])
-    )
-    const allIds = new Set([...(prevGroups?.keys() ?? []), ...computed.keys()])
+    // Per-group value reuse: unchanged groups keep the same summary ref so
+    // `a !== b` only notifies groups that actually changed.
+    const reused = reuseToolGroupSummaries(prevGroups, computed)
+    toolGroupsByConversation.set(conversationId, reused)
+
+    const prevIds = toolGroupIdsByConversation.get(conversationId)
+    let nextIds: readonly string[]
+    if (reused.size === 0) {
+      nextIds = STABLE_EMPTY_IDS
+    } else {
+      const keys = [...reused.keys()]
+      const sameIds =
+        prevIds != null &&
+        prevIds.length === keys.length &&
+        prevIds.every((id, i) => id === keys[i])
+      nextIds = sameIds ? prevIds : Object.freeze(keys)
+    }
+    toolGroupIdsByConversation.set(conversationId, nextIds)
+
+    const allIds = new Set([...(prevGroups?.keys() ?? []), ...reused.keys()])
     for (const id of allIds) {
       const a = prevGroups?.get(id)
-      const b = computed.get(id)
+      const b = reused.get(id)
       if (a !== b) notifyToolGroup(conversationId, id)
     }
   }

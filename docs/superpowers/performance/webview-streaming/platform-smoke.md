@@ -64,6 +64,10 @@ When a macOS host is available, record: 1,223 events + checksum; no capability c
 
 Same recording checklist as macOS when a host becomes available.
 
+### Cross-platform default caveat
+
+Flags default **on** after Windows absolute gates. Until macOS/Linux smoke rows above are filled, treat other platforms as **best-effort** and keep env opt-out ready. Integrity sampling was corrected to frontend-accepted events + text hash (see failure matrix); re-run fixture medians after that fix before citing new evidence.
+
 ---
 
 ## Failure / recovery matrix (test-build evidence)
@@ -72,8 +76,10 @@ Exercised via focused unit/integration suites on Task 16 HEAD (not live GUI inje
 
 | Failure mode | Coverage | Recovery result |
 | --- | --- | --- |
-| Startup batcher failure → legacy emit | `desktop_event_batcher` / streaming_performance Rust tests; capability path | Falls back to legacy `acp://event`; counters content-free |
-| Runtime emit failure | batcher failure / outstanding envelope tests | Failure signaled; metrics incremented without payload logs |
+| Startup capability query failure | `acp-connections-context` desktop start path | **No false legacy invent** — retries then stays not-ready; prompts blocked; user alerted to restart |
+| Partial desktop subscribe failure | `desktop-acp-events.test.ts` rollback | Atomic register: first listener unsubscribed; provider stays not-ready |
+| Runtime emit / delivery failure | batcher failure + FE `handleDesktopDeliveryFailure` | Flush pending → dispose ingestor → snapshot + ERROR; prompts blocked; no hot-switch to legacy |
+| Integrity sampling | `streaming-perf-recorder` frontend accepted + text SHA-256 | `integrity.ok` requires frontend applied count, non-empty hash match, gap=0 **and** duplicate=0 (never backend emit fallback) |
 | Sequence gap (pause/resume) | `event-ingestor.test.ts` | Gap detected; ordered apply preserved after resume; content-free logs |
 | Projector throw | `live-transcript-store.test.ts` | Rebuilds from canonical without false cursor advance |
 | Invalid Markdown partition | `incremental-stream-blocks.test.ts` | Safe partition / no throw of full stream |

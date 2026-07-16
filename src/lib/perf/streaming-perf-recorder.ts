@@ -105,6 +105,10 @@ interface ActiveRun {
   paintFlushIds: number[]
   paintRafHandle: number | null
   integrity: StreamingPerfReport["integrity"]
+  /** Events accepted by the frontend frame commit path (not backend emit counts). */
+  frontendAcceptedEvents: number
+  /** Canonical assistant text observed via committed content_delta frames. */
+  frontendText: string
   deliverySnapshot: EventBusMetricsSnapshot | null
   environment: StreamingPerfReport["environment"] | null
 }
@@ -317,10 +321,11 @@ export class StreamingPerfRecorder {
         lastSeq: 0,
         duplicateCount: 0,
         gapCount: 0,
-        finalTextSha256:
-          metadata.expectedTextSha256 ?? GROK_RICH_V1_EXPECTED_TEXT_SHA256,
+        finalTextSha256: "",
         ok: false,
       },
+      frontendAcceptedEvents: 0,
+      frontendText: "",
       deliverySnapshot: null,
       environment: null,
     }
@@ -631,6 +636,61 @@ export class StreamingPerfRecorder {
     active.renderCounts[kind] += 1
   }
 
+  /**
+   * Count envelopes the frontend actually committed (frame applyEvents).
+   * Integrity must use this — never backend emit counters alone.
+   */
+  markFrontendEventsAccepted(count: number): void {
+    const active = this.active
+    if (!active || count <= 0) return
+    active.frontendAcceptedEvents += count
+    active.integrity.appliedEvents = active.frontendAcceptedEvents
+  }
+
+  /** Append committed assistant text for frontend checksum integrity. */
+  appendFrontendText(delta: string): void {
+    const active = this.active
+    if (!active || !delta) return
+    active.frontendText += delta
+  }
+
+  markFrontendSequenceGap(): void {
+    const active = this.active
+    if (!active) return
+    active.integrity.gapCount += 1
+  }
+
+  markFrontendDuplicate(): void {
+    const active = this.active
+    if (!active) return
+    active.integrity.duplicateCount += 1
+  }
+
+  noteFrontendSeqRange(firstSeq: number, lastSeq: number): void {
+    const active = this.active
+    if (!active) return
+    if (
+      active.integrity.firstSeq === 0 ||
+      firstSeq < active.integrity.firstSeq
+    ) {
+      active.integrity.firstSeq = firstSeq
+    }
+    if (lastSeq > active.integrity.lastSeq) {
+      active.integrity.lastSeq = lastSeq
+    }
+  }
+
+  /** SHA-256 hex of the frontend-observed assistant text (empty when inactive). */
+  async computeFrontendTextSha256(): Promise<string> {
+    const active = this.active
+    if (!active) return ""
+    return sha256Hex(active.frontendText)
+  }
+
+  getFrontendAcceptedEvents(): number {
+    return this.active?.frontendAcceptedEvents ?? 0
+  }
+
   setIntegrity(partial: Partial<StreamingPerfReport["integrity"]>): void {
     const active = this.active
     if (!active) return
@@ -750,10 +810,13 @@ export class StreamingPerfRecorder {
       ...overrides.integrity,
     }
     // Always recompute integrity.ok from factual fields (do not sticky-or).
+    // Requires frontend-accepted count, text digest, and zero gaps/duplicates.
     integrity.ok =
       integrity.appliedEvents === integrity.expectedEvents &&
+      integrity.finalTextSha256.length > 0 &&
       integrity.finalTextSha256 === active.metadata.expectedTextSha256 &&
-      integrity.gapCount === 0
+      integrity.gapCount === 0 &&
+      integrity.duplicateCount === 0
 
     const updatesPerSecond =
       active.cadenceQueuedDurationMs > 0
@@ -888,6 +951,23 @@ export class StreamingPerfRecorder {
 }
 
 export const streamingPerfRecorder = new StreamingPerfRecorder()
+
+/** SHA-256 hex digest of UTF-8 text (Web Crypto). */
+export async function sha256Hex(text: string): Promise<string> {
+  if (typeof crypto !== "undefined" && crypto.subtle) {
+    const data = new TextEncoder().encode(text)
+    const digest = await crypto.subtle.digest("SHA-256", data)
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+  }
+  // Test / non-browser fallback: not cryptographic, only for empty-env smoke.
+  let h = 0
+  for (let i = 0; i < text.length; i++) {
+    h = (Math.imul(31, h) + text.charCodeAt(i)) | 0
+  }
+  return `fallback-${(h >>> 0).toString(16)}`
+}
 
 /**
  * Non-mutating input-latency probe: MessageChannel microtask → next paint.

@@ -155,6 +155,12 @@ const inflightTokens = new Map<string, Promise<TokenizedCode>>()
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>()
 
+/**
+ * Bumped on every cache reset so in-flight jobs from a previous generation
+ * cannot repopulate completedTokens or delete a newer job's inflight entry.
+ */
+let highlightCacheGeneration = 0
+
 function getTokensCacheKey(code: string, language: BundledLanguage): string {
   // Full source — length/prefix/suffix keys collide when only the middle changes.
   return `github-light+github-dark\0${language}\0${code}`
@@ -209,9 +215,11 @@ function startHighlight(
   language: BundledLanguage,
   tokensCacheKey: string
 ): Promise<TokenizedCode | undefined> {
+  const generation = highlightCacheGeneration
   const promise = getHighlighter(language)
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
+      if (generation !== highlightCacheGeneration) return undefined
       const availableLangs = highlighter.getLoadedLanguages()
       const langToUse = availableLangs.includes(language) ? language : "text"
 
@@ -231,6 +239,9 @@ function startHighlight(
     })
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((tokenized) => {
+      if (tokenized == null || generation !== highlightCacheGeneration) {
+        return undefined
+      }
       completedTokens.set(tokensCacheKey, tokenized)
       const subs = subscribers.get(tokensCacheKey)
       if (subs) {
@@ -245,12 +256,17 @@ function startHighlight(
     .catch((error: unknown) => {
       console.error("Failed to highlight code:", error)
       // Drop subscribers so no stale callback fires; raw tokens stay visible.
-      subscribers.delete(tokensCacheKey)
+      if (generation === highlightCacheGeneration) {
+        subscribers.delete(tokensCacheKey)
+      }
       return undefined
     })
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .finally(() => {
-      inflightTokens.delete(tokensCacheKey)
+      // Only clear our own inflight slot — never a post-reset replacement job.
+      if (inflightTokens.get(tokensCacheKey) === promise) {
+        inflightTokens.delete(tokensCacheKey)
+      }
     })
 
   inflightTokens.set(tokensCacheKey, promise as Promise<TokenizedCode>)
@@ -291,6 +307,8 @@ export const highlightCode = (
 
 /** Clear completed/in-flight highlight caches (backend reset / tests). */
 export function clearHighlightCaches(): void {
+  // Invalidate in-flight jobs so they cannot repopulate maps after reset.
+  highlightCacheGeneration += 1
   completedTokens.clear()
   inflightTokens.clear()
   subscribers.clear()
