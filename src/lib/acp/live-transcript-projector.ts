@@ -858,7 +858,10 @@ export function projectNativeActivitiesFromTranscript(
       output,
       status: info.status ?? null,
       at,
+      meta: info.meta ?? null,
     }
   })
+  // Tool-call projection + explicit Claude marker / CodeBuddy subAgent envelopes
+  // (deriveNativeActivitiesFromToolCalls merges both; original tools unchanged).
   return deriveNativeActivitiesFromToolCalls(tools, platform)
 }

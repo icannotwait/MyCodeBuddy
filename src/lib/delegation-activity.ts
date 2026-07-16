@@ -10,6 +10,9 @@
  *
  * Conservative parsing only: known four-platform tools, documented id fields,
  * and explicit terminal status when the platform emits it.
+ *
+ * Explicit non-tool-call signals (CodeBuddy background / Claude SDK task) enter
+ * via structured producers — never fabricated tool calls or rendered-text parse.
  */
 
 import type {
@@ -18,7 +21,10 @@ import type {
   DelegationActivityView,
   DelegationObservedStatus,
 } from "@/lib/types"
-import { normalizeToolName } from "@/lib/tool-call-normalization"
+import {
+  parseBackgroundTaskMarker,
+  type BackgroundTaskLifecycle,
+} from "@/lib/background-agent"
 
 export type {
   DelegationActivityOperation,
@@ -162,9 +168,15 @@ function parseObject(
 }
 
 /**
- * Canonical key for known-tool matching. Uses normalizeToolName only as a
- * secondary probe — Codex aliases would collapse `spawn_agent`→`agent`, so the
- * primary key preserves the bare tool identity.
+ * Canonical keys for known-tool matching.
+ *
+ * Uses bare lower/underscored identity only (exact platform table semantics).
+ * Secondary `normalizeToolName` is intentionally NOT applied: its alias table
+ * remaps foreign tools (`wait_agent`→`task`, `spawn_agent`→`agent`) and would
+ * re-label under a wrong session hint.
+ *
+ * Host-prefixed MCP / dotted names are reduced by stripping the prefix only
+ * (no cross-platform alias remap).
  */
 function toolMatchKeys(toolName: string): string[] {
   const raw = toolName.trim()
@@ -175,12 +187,13 @@ function toolMatchKeys(toolName: string): string[] {
     .replace(/[\s-]+/g, "_")
     .replace(/_+/g, "_")
   const keys = new Set<string>([lower, underscored])
-  // Secondary: normalized form (useful for host-prefixed MCP-style names).
-  try {
-    const normalized = normalizeToolName(raw).toLowerCase()
-    if (normalized && normalized !== "tool") keys.add(normalized)
-  } catch {
-    // normalizeToolName is pure and should not throw; ignore defensively.
+  // MCP-style: mcp__server__tool_name → tool_name
+  const mcp = underscored.match(/^mcp__(?:.+?)__(.+)$/)
+  if (mcp?.[1]) keys.add(mcp[1])
+  // Dotted host prefix: functions.spawn_agent → spawn_agent
+  if (underscored.includes(".")) {
+    const leaf = underscored.split(".").pop()
+    if (leaf) keys.add(leaf)
   }
   return [...keys]
 }
@@ -321,7 +334,7 @@ function mergeWithPrevious(
   const updated_at = view.updated_at ?? previous.updated_at
   let observed_status = view.observed_status
   // Prefer explicit new status; if new is unknown and previous was known, keep
-  // previous unless the operation is wait-timeout (already unknown on view).
+  // previous unless the operation is wait (timeout stays unknown).
   if (
     view.observed_status === "unknown" &&
     previous.observed_status !== "unknown" &&
@@ -329,18 +342,21 @@ function mergeWithPrevious(
   ) {
     observed_status = previous.observed_status
   }
-  const finished_at =
-    view.finished_at ??
-    (isTerminal(observed_status)
-      ? (previous.finished_at ?? view.updated_at)
-      : previous.finished_at)
+  // Wait timeout / non-terminal: do not retain an incompatible terminal stamp.
+  let finished_at: string | undefined
+  if (isTerminal(observed_status)) {
+    finished_at =
+      view.finished_at ?? previous.finished_at ?? view.updated_at ?? undefined
+  } else {
+    finished_at = undefined
+  }
   return {
     ...view,
     task_id,
     observed_status,
     started_at,
     updated_at,
-    finished_at,
+    ...(finished_at ? { finished_at } : {}),
   }
 }
 
@@ -461,7 +477,8 @@ export function projectNativeDelegationActivity(
 export function projectCodegDelegationActivity(
   event: CodegDelegationActivityEvent
 ): DelegationActivityView {
-  const at = event.at ?? new Date().toISOString()
+  // Prefer caller-supplied clock; fall back only when omitted (tests / sparse events).
+  const at = event.at ?? "1970-01-01T00:00:00.000Z"
   if (event.type === "delegation_started") {
     return {
       origin: "codeg",
@@ -526,24 +543,276 @@ export function inferNativePlatformFromToolName(
   return null
 }
 
+// ─── Explicit signal producers (production-shaped sources) ───────────────
+
+/**
+ * Claude production envelope: parser rewrites async-launch acks into
+ * `[[codeg-background-task]]{task_id,status,summary,result}` after folding the
+ * latest `<task-notification>` (see `background-agent.ts` / claude.rs).
+ * Builds a `claude_sdk_task` signal — never a fabricated tool call.
+ */
+export function signalFromClaudeBackgroundLifecycle(
+  lifecycle: BackgroundTaskLifecycle,
+  at: string,
+  operation?: DelegationActivityOperation
+): ClaudeSdkTaskSignal {
+  return {
+    kind: "claude_sdk_task",
+    platform: "claude_code",
+    taskId: lifecycle.taskId,
+    ...(lifecycle.status ? { status: lifecycle.status } : {}),
+    at,
+    operation:
+      operation ??
+      (lifecycle.status == null
+        ? "spawn"
+        : lifecycle.status === "completed"
+          ? "status"
+          : "status"),
+  }
+}
+
+/**
+ * CodeBuddy nearest explicit metadata boundary for background/sub-agent
+ * lifecycle when a separate notification envelope is not emitted by the
+ * current platform version:
+ * - structured `providerData.toolResult.subAgent.sessionId` in tool output JSON
+ * - live ACP meta `codebuddy.ai/parentToolCallId` (child tools of an Agent)
+ * - documented task/agent id fields on Agent tool bodies
+ */
+export function signalFromCodeBuddyBackgroundBoundary(args: {
+  taskId?: string | null
+  status?: string | null
+  at: string
+  operation?: DelegationActivityOperation
+}): CodeBuddyBackgroundSignal | null {
+  const taskId =
+    typeof args.taskId === "string" && args.taskId.trim().length > 0
+      ? args.taskId.trim()
+      : undefined
+  if (!taskId) return null
+  return {
+    kind: "codebuddy_background",
+    platform: "code_buddy",
+    taskId,
+    ...(args.status ? { status: args.status } : {}),
+    at: args.at,
+    operation: args.operation ?? "spawn",
+  }
+}
+
+/** Extract CodeBuddy subAgent.sessionId from structured tool output JSON. */
+export function extractCodeBuddySubAgentSessionId(
+  output: string | null | undefined
+): string | null {
+  const obj = parseObject(output)
+  if (!obj) return null
+  const direct = obj.subAgent
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) {
+    const sid = (direct as Record<string, unknown>).sessionId
+    if (typeof sid === "string" && sid.trim()) return sid.trim()
+  }
+  const pd = obj.providerData
+  if (pd && typeof pd === "object" && !Array.isArray(pd)) {
+    const tr = (pd as Record<string, unknown>).toolResult
+    if (tr && typeof tr === "object" && !Array.isArray(tr)) {
+      const sa = (tr as Record<string, unknown>).subAgent
+      if (sa && typeof sa === "object" && !Array.isArray(sa)) {
+        const sid = (sa as Record<string, unknown>).sessionId
+        if (typeof sid === "string" && sid.trim()) return sid.trim()
+      }
+    }
+  }
+  return null
+}
+
+export type ToolFieldForActivity = {
+  toolCallId: string
+  toolName: string
+  input?: string | null
+  output?: string | null
+  status?: string | null
+  at?: string
+  meta?: Record<string, unknown> | null
+}
+
+/**
+ * Collect explicit non-tool-call signals from structured tool fields.
+ * Does not fabricate tool calls; only recognizes documented envelopes/meta.
+ */
+export function collectExplicitNativeSignalsFromToolFields(
+  tools: ReadonlyArray<ToolFieldForActivity>
+): NativeDelegationSignal[] {
+  const signals: NativeDelegationSignal[] = []
+  const seenTaskIds = new Set<string>()
+
+  for (const tool of tools) {
+    const at = tool.at ?? new Date(0).toISOString()
+
+    // Claude: structured background-task marker (parser-folded task-notification).
+    const lifecycle = parseBackgroundTaskMarker(tool.output)
+    if (lifecycle) {
+      if (!seenTaskIds.has(lifecycle.taskId)) {
+        seenTaskIds.add(lifecycle.taskId)
+        signals.push(signalFromClaudeBackgroundLifecycle(lifecycle, at))
+      }
+      continue
+    }
+
+    // CodeBuddy: structured subAgent.sessionId in tool output JSON.
+    const subSession = extractCodeBuddySubAgentSessionId(tool.output)
+    if (subSession) {
+      if (!seenTaskIds.has(subSession)) {
+        seenTaskIds.add(subSession)
+        const status =
+          typeof parseObject(tool.output)?.status === "string"
+            ? (parseObject(tool.output)!.status as string)
+            : (tool.status ?? null)
+        const sig = signalFromCodeBuddyBackgroundBoundary({
+          taskId: subSession,
+          status,
+          at,
+          operation: "spawn",
+        })
+        if (sig) signals.push(sig)
+      }
+      continue
+    }
+
+    // CodeBuddy live boundary: Agent/Task spawn with parent meta is on children;
+    // when the Agent tool itself carries a documented id in body, still emit
+    // via tool-call path. Parent-tool meta on child tools is not a background
+    // notification for the parent — skip inventing a signal from child meta alone.
+  }
+
+  return signals
+}
+
+/**
+ * Merge explicit + tool-call projections, deduping by task_id (then order).
+ * Explicit signals win merge order after tool-calls so notification status
+ * updates a prior spawn without dropping the original tool-derived row identity.
+ */
+export function mergeActivityViews(
+  views: ReadonlyArray<DelegationActivityView | null | undefined>
+): DelegationActivityView[] {
+  const activities: DelegationActivityView[] = []
+  const indexByTaskId = new Map<string, number>()
+
+  for (const view of views) {
+    if (!view) continue
+    if (view.task_id && indexByTaskId.has(view.task_id)) {
+      const idx = indexByTaskId.get(view.task_id)!
+      const prev = activities[idx]
+      // Re-project via mergeWithPrevious by synthesizing a minimal update path:
+      // keep later operation/status when both native and same platform.
+      if (
+        prev.origin === view.origin &&
+        prev.platform === view.platform &&
+        view.origin === "native"
+      ) {
+        activities[idx] = {
+          ...view,
+          task_id: view.task_id ?? prev.task_id,
+          started_at: prev.started_at ?? view.started_at,
+          updated_at: view.updated_at ?? prev.updated_at,
+          observed_status:
+            view.observed_status !== "unknown"
+              ? view.observed_status
+              : prev.observed_status,
+          finished_at: isTerminal(
+            view.observed_status !== "unknown"
+              ? view.observed_status
+              : prev.observed_status
+          )
+            ? (view.finished_at ?? prev.finished_at ?? view.updated_at)
+            : undefined,
+          operation:
+            view.operation !== "unknown" ? view.operation : prev.operation,
+        }
+      }
+    } else {
+      if (view.task_id) {
+        indexByTaskId.set(view.task_id, activities.length)
+      }
+      activities.push(view)
+    }
+  }
+
+  return activities
+}
+
+function activityDedupeKey(view: DelegationActivityView): string {
+  if (view.task_id) return `task:${view.platform}:${view.task_id}`
+  return `op:${view.origin}:${view.platform}:${view.operation}:${view.started_at ?? ""}:${view.updated_at ?? ""}`
+}
+
+/**
+ * Deterministic dedupe for overlay consumers combining store + live sources.
+ * Prefer authoritative Codeg, then later-updated native rows for the same task.
+ */
+export function dedupeDelegationActivities(
+  primary: ReadonlyArray<DelegationActivityView>,
+  secondary: ReadonlyArray<DelegationActivityView> = []
+): DelegationActivityView[] {
+  const byKey = new Map<string, DelegationActivityView>()
+  const order: string[] = []
+
+  const consider = (view: DelegationActivityView) => {
+    const key = activityDedupeKey(view)
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, view)
+      order.push(key)
+      return
+    }
+    // Prefer authoritative; else prefer more recent updated_at.
+    if (view.authoritative && !existing.authoritative) {
+      byKey.set(key, view)
+      return
+    }
+    if (existing.authoritative && !view.authoritative) return
+    const a = Date.parse(view.updated_at ?? view.started_at ?? "") || 0
+    const b = Date.parse(existing.updated_at ?? existing.started_at ?? "") || 0
+    if (a >= b) byKey.set(key, view)
+  }
+
+  for (const v of primary) consider(v)
+  for (const v of secondary) consider(v)
+  return order.map((k) => byKey.get(k)!)
+}
+
 /**
  * Derive native activity views from live/persisted tool-call fields without
  * mutating the source blocks. Pass the session agent type when known so
  * Agent/Task tools resolve to the correct platform.
+ *
+ * Also collects explicit CodeBuddy/Claude envelope signals from structured
+ * tool outputs and merges them with tool-call projections.
  */
 export function deriveNativeActivitiesFromToolCalls(
-  tools: ReadonlyArray<{
-    toolCallId: string
-    toolName: string
-    input?: string | null
-    output?: string | null
-    status?: string | null
-    at?: string
-  }>,
+  tools: ReadonlyArray<ToolFieldForActivity>,
   platformHint?: AgentType | null
 ): DelegationActivityView[] {
   const activities: DelegationActivityView[] = []
   const indexByTaskId = new Map<string, number>()
+
+  const pushOrMerge = (
+    provisional: DelegationActivityView,
+    signal: NativeDelegationSignal
+  ) => {
+    if (provisional.task_id && indexByTaskId.has(provisional.task_id)) {
+      const idx = indexByTaskId.get(provisional.task_id)!
+      const merged =
+        projectNativeDelegationActivity(signal, activities[idx]) ?? provisional
+      activities[idx] = merged
+    } else {
+      if (provisional.task_id) {
+        indexByTaskId.set(provisional.task_id, activities.length)
+      }
+      activities.push(provisional)
+    }
+  }
 
   for (const tool of tools) {
     let platform: ManagedNativePlatform | null = null
@@ -567,11 +836,6 @@ export function deriveNativeActivitiesFromToolCalls(
         toolCallStatus = undefined
     }
 
-    const prior =
-      // Merge against earlier view with the same toolCallId is not tracked here;
-      // task_id merge covers multi-tool lifecycle for one native agent.
-      undefined as DelegationActivityView | undefined
-
     const signal: NativeToolCallSignal = {
       platform,
       toolName: tool.toolName,
@@ -582,24 +846,20 @@ export function deriveNativeActivitiesFromToolCalls(
       toolCallStatus,
     }
 
-    // If we already have a view for this task id, pass it as previous.
-    const provisional = projectNativeDelegationActivity(signal, prior)
+    const provisional = projectNativeDelegationActivity(signal)
     if (!provisional) continue
+    pushOrMerge(provisional, signal)
+  }
 
-    if (provisional.task_id && indexByTaskId.has(provisional.task_id)) {
-      const idx = indexByTaskId.get(provisional.task_id)!
-      const merged =
-        projectNativeDelegationActivity(signal, activities[idx]) ?? provisional
-      activities[idx] = merged
-    } else {
-      if (provisional.task_id) {
-        indexByTaskId.set(provisional.task_id, activities.length)
-      }
-      activities.push(provisional)
-    }
+  // Explicit structured envelopes (Claude marker / CodeBuddy subAgent JSON).
+  const explicit = collectExplicitNativeSignalsFromToolFields(tools)
+  for (const signal of explicit) {
+    const provisional = projectNativeDelegationActivity(signal)
+    if (!provisional) continue
+    pushOrMerge(provisional, signal)
   }
 
   return activities
 }
 
-export { isManagedNativePlatform }
+export { isManagedNativePlatform, parseObject, mapExplicitStatus }

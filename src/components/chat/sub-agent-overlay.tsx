@@ -64,7 +64,7 @@ function formatActivityTime(iso?: string): string | null {
 
 function observedToBadgeStatus(
   status: DelegationActivityView["observed_status"]
-): "starting" | "running" | "ok" | "err" | "checked" {
+): "starting" | "running" | "ok" | "err" | "checked" | "waiting" {
   switch (status) {
     case "running":
       return "running"
@@ -73,7 +73,8 @@ function observedToBadgeStatus(
     case "failed":
       return "err"
     case "canceled":
-      return "err"
+      // Informational only — not a Broker failure; avoid destructive "err" chrome.
+      return "waiting"
     default:
       return "checked"
   }

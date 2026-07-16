@@ -251,17 +251,16 @@ describe("SubAgentOverlay", () => {
       />
     )
     expect(screen.getByTestId("sub-agent-origin-native")).toBeInTheDocument()
-    expect(screen.getByTestId("sub-agent-row")).toHaveAttribute(
-      "data-origin",
-      "native"
-    )
-    expect(screen.getByTestId("sub-agent-row")).toHaveAttribute(
-      "data-authoritative",
-      "false"
-    )
+    const row = screen.getByTestId("sub-agent-row")
+    expect(row).toHaveAttribute("data-origin", "native")
+    expect(row).toHaveAttribute("data-authoritative", "false")
+    // Native row is an informational div, not a button / dialog trigger.
+    expect(row.tagName.toLowerCase()).toBe("div")
+    expect(row.closest("button")).toBeNull()
     expect(
       screen.queryByRole("button", { name: /cancel/i })
     ).not.toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
   })
 
   it("groups Codeg and native activity with origin labels", () => {
