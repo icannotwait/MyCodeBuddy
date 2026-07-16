@@ -258,6 +258,7 @@ async fn async_main() -> ExitCode {
     let (
         delegation_broker,
         delegation_tokens,
+        delegation_leases,
         delegation_socket_path,
         feedback_config,
         question_config,
@@ -285,6 +286,7 @@ async fn async_main() -> ExitCode {
         delegation_broker: delegation_broker.clone(),
         delegation_runtime_settings: delegation_runtime_settings.clone(),
         delegation_tokens: delegation_tokens.clone(),
+        delegation_leases: delegation_leases.clone(),
         delegation_socket_path: delegation_socket_path.clone(),
         feedback_config: feedback_config.clone(),
         question_config: question_config.clone(),
@@ -338,6 +340,7 @@ async fn async_main() -> ExitCode {
         let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
             delegation_broker,
             delegation_tokens,
+            delegation_leases,
             Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
                 manager: Arc::new(state.connection_manager.clone_ref()),
             }),

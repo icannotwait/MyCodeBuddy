@@ -13,20 +13,22 @@ use sea_orm::{
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::connection::matching_config_pair;
 use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand,
+    spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
+    SpawnHandshake,
 };
+use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::delegation::route::{DelegationRoutePlan, RouteDegradedReason};
 use crate::acp::error::AcpError;
-use crate::acp::terminal_context::{
-    finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
-};
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
-    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
+    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
+use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
@@ -87,6 +89,92 @@ fn route_reuse_decision(
     } else {
         RouteReuseDecision::Conflict {
             existing_connection_id: existing_connection_id.to_string(),
+        }
+    }
+}
+
+/// Pure spawn-policy inputs for unit-testing the max-two-attempt fallback
+/// without real Agent binaries. Production `spawn_agent` inlines the same
+/// match arms against live `spawn_agent_connection` outcomes.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub struct SpawnAttemptRequest {
+    pub origin: DelegationConnectionOrigin,
+    pub plan: DelegationRoutePlan,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct SpawnAttemptResult {
+    pub connection_id: String,
+    pub plan: DelegationRoutePlan,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub struct SpawnAttemptHarness {
+    outcomes: std::sync::Mutex<std::vec::IntoIter<Result<String, RouteBootstrapOutcome>>>,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SpawnAttemptHarness {
+    pub fn new(outcomes: impl IntoIterator<Item = Result<String, RouteBootstrapOutcome>>) -> Self {
+        Self {
+            outcomes: std::sync::Mutex::new(outcomes.into_iter().collect::<Vec<_>>().into_iter()),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn attempt_count(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn spawn_once(
+        &self,
+        _plan: &DelegationRoutePlan,
+    ) -> Result<String, RouteBootstrapOutcome> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcomes
+            .lock()
+            .unwrap()
+            .next()
+            .unwrap_or(Err(RouteBootstrapOutcome::Fatal(AcpError::ProcessExited)))
+    }
+}
+
+/// Explicit max-two-attempt policy: root may retry once on RouteSpecific;
+/// child never falls back; Fatal never retries. Second attempt cannot recurse.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn spawn_with_safe_fallback(
+    request: SpawnAttemptRequest,
+    harness: &SpawnAttemptHarness,
+) -> Result<SpawnAttemptResult, AcpError> {
+    let requested_plan = request.plan;
+    match harness.spawn_once(&requested_plan).await {
+        Ok(connection_id) => Ok(SpawnAttemptResult {
+            connection_id,
+            plan: requested_plan,
+        }),
+        Err(RouteBootstrapOutcome::RouteSpecific(reason))
+            if request.origin == DelegationConnectionOrigin::Root =>
+        {
+            // teardown_unexposed_attempt is a no-op in the harness (no process).
+            let fallback = safe_native_fallback(&requested_plan, reason);
+            match harness.spawn_once(&fallback).await {
+                Ok(id) => Ok(SpawnAttemptResult {
+                    connection_id: id,
+                    plan: fallback,
+                }),
+                Err(outcome) => Err(outcome.into_acp_error()),
+            }
+        }
+        Err(RouteBootstrapOutcome::RouteSpecific(reason)) => {
+            Err(AcpError::RouteUnavailable { reason })
+        }
+        Err(RouteBootstrapOutcome::Fatal(error)) => Err(error),
+        Err(RouteBootstrapOutcome::Ready) => {
+            Err(AcpError::Protocol("unexpected Ready as spawn error".into()))
         }
     }
 }
@@ -370,7 +458,8 @@ impl ConnectionManager {
             route_plan,
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -424,7 +513,8 @@ impl ConnectionManager {
             route_plan,
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -530,61 +620,147 @@ impl ConnectionManager {
             route_capability,
         } = finalize_acp_launch_config(launch_inputs, agent_type)?;
 
-        let connection_id = uuid::Uuid::new_v4().to_string();
-        tracing::info!(
-            "[ACP] spawning connection id={} owner_window={} agent={:?}",
-            connection_id, owner_window_label, agent_type
-        );
-
-        // `spawn_agent_connection` inserts the entry into `self.connections`,
-        // installs the SessionStarted dedup signal on the state, registers
-        // a cleanup hook, and returns the rx half of the signal. Any spawn
-        // failure short-circuits before we touch the rx wait.
-        let session_started_rx = spawn_agent_connection(
-            connection_id.clone(),
-            agent_type,
-            working_dir,
-            session_id,
-            runtime_env,
-            terminal_shell,
-            route_plan,
-            origin,
-            route_preference,
-            route_capability,
-            owner_window_label,
-            emitter,
-            self.connections.clone(),
-            preferred_mode_id,
-            preferred_config_values,
-            self.delegation_snapshot(),
-        )
-        .await?;
-
-        // When dedup is active, hold the lock until the agent's
-        // SessionStarted has applied (so external_id is populated for the
-        // next waiter), aborted (connection died), or the timeout fires.
-        // Logged on every wait so production can audit real-world handshake
-        // latencies and tune `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`.
-        if dedup_lock.is_some() {
-            let timeout = self.spawn_handshake_timeout;
-            let (outcome, elapsed) = wait_for_session_started(session_started_rx, timeout).await;
+        // Explicit max-two-attempt root state machine: Codeg request, then one
+        // safe-native fallback only for typed RouteSpecific bootstrap failures.
+        // Child and Fatal never retry.
+        let mut attempt_plan = route_plan;
+        let mut attempt = 0u8;
+        let connection_id = loop {
+            attempt += 1;
+            let connection_id = uuid::Uuid::new_v4().to_string();
             tracing::info!(
-                "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
-                 elapsed_ms={} timeout_ms={}",
+                "[ACP] spawning connection id={} owner_window={} agent={:?} \
+                 attempt={} effective={:?}",
                 connection_id,
-                session_id_for_log.as_deref().unwrap_or(""),
-                outcome.as_str(),
-                elapsed.as_millis(),
-                timeout.as_millis(),
+                owner_window_label,
+                agent_type,
+                attempt,
+                attempt_plan.effective
             );
-        }
-        // session_started_rx (in the no-dedup branch) is dropped here. tx
-        // staying inside SessionState gets dropped naturally when the
-        // connection terminates, no leak.
+
+            let SpawnHandshake {
+                session_started_rx,
+                route_bootstrap_rx,
+            } = match spawn_agent_connection(
+                connection_id.clone(),
+                agent_type,
+                working_dir.clone(),
+                session_id.clone(),
+                runtime_env.clone(),
+                terminal_shell.clone(),
+                attempt_plan.clone(),
+                origin,
+                route_preference,
+                route_capability.clone(),
+                owner_window_label.clone(),
+                emitter.clone(),
+                self.connections.clone(),
+                preferred_mode_id.clone(),
+                preferred_config_values.clone(),
+                self.delegation_snapshot(),
+            )
+            .await
+            {
+                Ok(hs) => hs,
+                Err(e) => {
+                    // Spawn-time failures (SDK missing, shell, etc.) are Fatal —
+                    // never route-specific fallback.
+                    return Err(e);
+                }
+            };
+
+            // When dedup is active, hold the lock until SessionStarted applies.
+            if dedup_lock.is_some() {
+                let timeout = self.spawn_handshake_timeout;
+                let (outcome, elapsed) =
+                    wait_for_session_started(session_started_rx, timeout).await;
+                tracing::info!(
+                    "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
+                     elapsed_ms={} timeout_ms={}",
+                    connection_id,
+                    session_id_for_log.as_deref().unwrap_or(""),
+                    outcome.as_str(),
+                    elapsed.as_millis(),
+                    timeout.as_millis(),
+                );
+            }
+
+            match route_bootstrap_rx.await {
+                Ok(RouteBootstrapOutcome::Ready) => break connection_id,
+                Ok(RouteBootstrapOutcome::RouteSpecific(reason))
+                    if origin == DelegationConnectionOrigin::Root && attempt == 1 =>
+                {
+                    tracing::warn!(
+                        "[ACP] route bootstrap RouteSpecific ({reason:?}); \
+                         tearing down unexposed attempt and safe-native fallback"
+                    );
+                    self.teardown_unexposed_attempt(&connection_id).await;
+                    attempt_plan = safe_native_fallback(&attempt_plan, reason);
+                    // Second attempt cannot recurse/retry again (attempt==2).
+                    continue;
+                }
+                Ok(RouteBootstrapOutcome::RouteSpecific(reason)) => {
+                    self.teardown_unexposed_attempt(&connection_id).await;
+                    return Err(AcpError::RouteUnavailable { reason });
+                }
+                Ok(RouteBootstrapOutcome::Fatal(error)) => {
+                    self.teardown_unexposed_attempt(&connection_id).await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    // Connection task dropped without bootstrap (process died).
+                    self.teardown_unexposed_attempt(&connection_id).await;
+                    return Err(AcpError::ProcessExited);
+                }
+            }
+        };
 
         drop(dedup_lock);
 
         Ok(connection_id)
+    }
+
+    /// Tear down a partial spawn that never exposed Connected: disconnect,
+    /// revoke companion token/lease, await removal from the connection map so
+    /// session-id dedup cannot see the partial first attempt.
+    async fn teardown_unexposed_attempt(&self, connection_id: &str) {
+        // Best-effort disconnect command.
+        {
+            let map = self.connections.lock().await;
+            if let Some(conn) = map.get(connection_id) {
+                let _ = conn.cmd_tx.try_send(ConnectionCommand::Disconnect);
+                // Revoke token + lease immediately so ready waiters unblock.
+                let token = conn
+                    .state
+                    .try_read()
+                    .ok()
+                    .and_then(|s| s.delegation_token.clone());
+                if let (Some(tok), Some(inj)) = (token, self.delegation_snapshot()) {
+                    inj.leases.revoke(&tok).await;
+                    inj.tokens.revoke(&tok).await;
+                }
+            }
+        }
+        // Await removal (cleanup guard drops the map entry).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let map = self.connections.lock().await;
+                if !map.contains_key(connection_id) {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "[ACP] teardown_unexposed_attempt timed out waiting for \
+                     removal of {connection_id}"
+                );
+                // Force-remove so fallback can proceed without partial race.
+                self.connections.lock().await.remove(connection_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -724,7 +900,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -773,7 +954,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -786,12 +972,8 @@ impl ConnectionManager {
         global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
         delegation_enabled: bool,
     ) -> usize {
-        self.refresh_delegation_route_staleness_filtered(
-            global_policy,
-            delegation_enabled,
-            None,
-        )
-        .await
+        self.refresh_delegation_route_staleness_filtered(global_policy, delegation_enabled, None)
+            .await
     }
 
     /// Like [`Self::refresh_delegation_route_staleness`] but only connections
@@ -862,8 +1044,7 @@ impl ConnectionManager {
                     prev_route != conn.observed_config.fingerprint.delegation_route;
                 if observed_changed || prev_effective != new_effective {
                     let stale = new_effective.is_some();
-                    let emit_kind =
-                        new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
+                    let emit_kind = new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
                     targets.push((
                         Arc::clone(&conn.state),
                         conn.emitter.clone(),
@@ -874,7 +1055,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -934,8 +1120,7 @@ impl ConnectionManager {
             );
 
             let new_effective = effective_stale_kind(conn);
-            let observed_changed =
-                prev_route != conn.observed_config.fingerprint.delegation_route;
+            let observed_changed = prev_route != conn.observed_config.fingerprint.delegation_route;
             if observed_changed || prev_effective != new_effective {
                 let stale = new_effective.is_some();
                 let emit_kind = new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
@@ -948,7 +1133,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         Ok(())
     }
@@ -1041,9 +1231,7 @@ impl ConnectionManager {
                     joined.push_str(text);
                 }
             }
-            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(
-                &joined,
-            ))
+            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(&joined))
         } else {
             None
         };
@@ -1086,9 +1274,7 @@ impl ConnectionManager {
         // register_mandatory_routes=false and skip this.
         if let Some(ids) = pending_mandatory_ids {
             if let Some(injection) = self.delegation_snapshot() {
-                injection
-                    .broker
-                    .set_mandatory_profile_routes(conn_id, ids);
+                injection.broker.set_mandatory_profile_routes(conn_id, ids);
             }
         }
         permit.send(ConnectionCommand::Prompt {
@@ -1798,7 +1984,9 @@ impl ConnectionManager {
             // Surface failures even when the caller is gone (the detached task's
             // Result would otherwise be dropped silently).
             if let Err(ref e) = outcome {
-                tracing::error!("[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}");
+                tracing::error!(
+                    "[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}"
+                );
             }
             outcome
         });
@@ -2180,7 +2368,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
-            owner_window_label, disconnected
+            owner_window_label,
+            disconnected
         );
         disconnected
     }
@@ -2222,8 +2411,7 @@ impl ConnectionManager {
         let mut out = Vec::new();
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            let (Some(conversation_id), Some(folder_id)) =
-                (state.conversation_id, state.folder_id)
+            let (Some(conversation_id), Some(folder_id)) = (state.conversation_id, state.folder_id)
             else {
                 continue;
             };
@@ -2322,11 +2510,8 @@ impl ConnectionManager {
         if !state.read().await.feedback_tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
-        let item = FeedbackItem::new_pending(
-            uuid::Uuid::new_v4().to_string(),
-            text,
-            chrono::Utc::now(),
-        );
+        let item =
+            FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
         // gated emit): a `TurnComplete` (flips the flag) or `UserMessage`
         // (clears `feedback`) can't slip between the gate and the append+seq, so
@@ -2508,7 +2693,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_questions.lock().await.contains_key(question_id) {
+        if self
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(question_id)
+        {
             return false;
         }
         emit_with_state(
@@ -2546,7 +2736,9 @@ impl ConnectionManager {
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
         let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2571,7 +2763,9 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2894,10 +3088,7 @@ pub struct ConnectionManagerFeedbackLookup {
 
 #[async_trait::async_trait]
 impl SessionFeedbackAccess for ConnectionManagerFeedbackLookup {
-    async fn read_pending_feedback(
-        &self,
-        parent_connection_id: &str,
-    ) -> Vec<PendingFeedback> {
+    async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
         self.manager
             .read_pending_feedback(parent_connection_id)
             .await
@@ -2996,17 +3187,20 @@ mod tests {
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).0,
+            )
+            .0,
             observed_config: matching_config_pair(
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).1,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -3100,7 +3294,10 @@ mod tests {
         let state = mgr.get_state("c1").await.unwrap();
         let state = state.read().await;
         assert!(state.config_stale);
-        assert_eq!(state.config_stale_kind, Some(ConfigStaleKind::TerminalShell));
+        assert_eq!(
+            state.config_stale_kind,
+            Some(ConfigStaleKind::TerminalShell)
+        );
     }
 
     #[tokio::test]
@@ -3124,9 +3321,11 @@ mod tests {
         let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
         let mut receiver = subscribe_conn_stream(&mgr, "c1").await;
         assert_eq!(mgr.refresh_terminal_shell_staleness("shell-v1").await, 0);
-        assert!(tokio::time::timeout(Duration::from_millis(50), receiver.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     fn synthetic_connection_with_fingerprints(
@@ -3160,7 +3359,8 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -3177,8 +3377,7 @@ mod tests {
             }
         );
 
-        let mut conn =
-            synthetic_connection_with_fingerprints("agent-v1", "shell-v1", "route-v1");
+        let mut conn = synthetic_connection_with_fingerprints("agent-v1", "shell-v1", "route-v1");
         conn.observed_config.fingerprint.agent_config = "agent-v2".into();
         assert_eq!(
             effective_stale_kind(&conn),
@@ -3340,13 +3539,7 @@ mod tests {
             &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         );
         let mgr = ConnectionManager::new();
-        seed_route_root(
-            &mgr,
-            "draft",
-            Some(DelegationRoutePolicy::Codeg),
-            &codeg_fp,
-        )
-        .await;
+        seed_route_root(&mgr, "draft", Some(DelegationRoutePolicy::Codeg), &codeg_fp).await;
         let before = {
             let map = mgr.connections.lock().await;
             map.get("draft").unwrap().route_plan.clone()
@@ -3477,17 +3670,20 @@ mod tests {
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).0,
+            )
+            .0,
             observed_config: matching_config_pair(
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).1,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         mgr.connections
             .lock()
@@ -3550,9 +3746,7 @@ mod tests {
         // Wire-only `<codeg_terminal_context>` is appended in the connection
         // loop after this payload is captured for broadcast.
         assert!(
-            um.1
-                .iter()
-                .all(|t| !t.contains("codeg_terminal_context")),
+            um.1.iter().all(|t| !t.contains("codeg_terminal_context")),
             "user_message must never leak terminal context block, got {um:?}"
         );
     }
@@ -3832,17 +4026,20 @@ mod tests {
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).0,
+            )
+            .0,
             observed_config: matching_config_pair(
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).1,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -4178,10 +4375,10 @@ mod tests {
         // Empty / whitespace / image-only prompts seed no title (stays NULL,
         // backfilled on first detail load as before).
         assert!(delegation_child_title_seed(&[]).is_none());
-        assert!(
-            delegation_child_title_seed(&[PromptInputBlock::Text { text: "  \n ".into() }])
-                .is_none()
-        );
+        assert!(delegation_child_title_seed(&[PromptInputBlock::Text {
+            text: "  \n ".into()
+        }])
+        .is_none());
         let img = vec![PromptInputBlock::Image {
             data: "x".into(),
             mime_type: "image/png".into(),
@@ -5002,9 +5199,7 @@ mod tests {
 
     #[tokio::test]
     async fn changing_settings_does_not_mutate_running_snapshot() {
-        use crate::acp::terminal_context::{
-            finalize_acp_launch_config, AcpLaunchInputs,
-        };
+        use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchInputs};
         use crate::models::SystemTerminalSettings;
         use crate::terminal::shell::ResolvedShellSnapshot;
 
@@ -5032,22 +5227,22 @@ mod tests {
 
         let snap_a: ResolvedShellSnapshot = finalize_acp_launch_config(
             AcpLaunchInputs::with_placeholder_route(
-            BTreeMap::new(),
-            SystemTerminalSettings {
+                BTreeMap::new(),
+                SystemTerminalSettings {
                     default_shell: Some(path_a.to_string_lossy().into_owned()),
                 },
-        ),
+            ),
             AgentType::ClaudeCode,
         )
         .expect("shell a")
         .terminal_shell;
         let snap_b: ResolvedShellSnapshot = finalize_acp_launch_config(
             AcpLaunchInputs::with_placeholder_route(
-            BTreeMap::new(),
-            SystemTerminalSettings {
+                BTreeMap::new(),
+                SystemTerminalSettings {
                     default_shell: Some(path_b.to_string_lossy().into_owned()),
                 },
-        ),
+            ),
             AgentType::ClaudeCode,
         )
         .expect("shell b")
@@ -5082,11 +5277,11 @@ mod tests {
                 Some(working_dir.to_string_lossy().into_owned()),
                 Some("ext-snap".into()),
                 AcpLaunchInputs::with_placeholder_route(
-            BTreeMap::new(),
-            SystemTerminalSettings {
+                    BTreeMap::new(),
+                    SystemTerminalSettings {
                         default_shell: Some(path_b.to_string_lossy().into_owned()),
                     },
-        ),
+                ),
                 "test-window".into(),
                 EventEmitter::Noop,
                 None,
@@ -5607,17 +5802,20 @@ mod tests {
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).0,
+            )
+            .0,
             observed_config: matching_config_pair(
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).1,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5712,7 +5910,10 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-restack", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-restack", None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -5993,17 +6194,20 @@ mod tests {
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).0,
+            )
+            .0,
             observed_config: matching_config_pair(
                 String::new(),
                 "system",
                 crate::acp::delegation::route::test_empty_route_plan().fingerprint,
-            ).1,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         {
@@ -6337,7 +6541,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- ask_user_question: register / answer / cancel -------------------
@@ -6548,7 +6756,12 @@ mod tests {
         // The first is still the pending one and still answerable.
         let state = mgr.get_state("cc2").await.unwrap();
         assert_eq!(
-            state.read().await.pending_question.as_ref().map(|p| p.question_id.clone()),
+            state
+                .read()
+                .await
+                .pending_question
+                .as_ref()
+                .map(|p| p.question_id.clone()),
             Some(first.question_id.clone())
         );
         mgr.answer_question(
@@ -6584,12 +6797,7 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         // A second read still returns them — read is non-destructive, so an
         // abandoned (peer-closed) call leaves the notes retryable.
-        assert_eq!(
-            mgr.read_pending_feedback("c1")
-                .await
-                .len(),
-            2
-        );
+        assert_eq!(mgr.read_pending_feedback("c1").await.len(), 2);
         {
             let state = mgr.get_state("c1").await.unwrap();
             assert!(state
@@ -6604,10 +6812,7 @@ mod tests {
         mgr.commit_feedback_delivered("c1", vec![a.id.clone(), b.id.clone()])
             .await;
         // Now READ returns nothing (delivered notes are filtered out).
-        assert!(mgr
-            .read_pending_feedback("c1")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
         let state = mgr.get_state("c1").await.unwrap();
         assert!(state
             .read()
@@ -6623,12 +6828,136 @@ mod tests {
     #[tokio::test]
     async fn read_pending_missing_connection_returns_empty() {
         let mgr = ConnectionManager::new();
-        assert!(mgr
-            .read_pending_feedback("nope")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("nope").await.is_empty());
         // Commit on a missing connection is a safe no-op.
-        mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+        mgr.commit_feedback_delivered("nope", vec!["x".into()])
+            .await;
     }
 
+    // ─── Task 7: root safe fallback + child never fallback + late close ──
+
+    fn root_codeg_request() -> SpawnAttemptRequest {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
+            ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        SpawnAttemptRequest {
+            origin: DelegationConnectionOrigin::Root,
+            plan: DelegationRoutePlan {
+                managed: true,
+                requested: DelegationRoutePolicy::Codeg,
+                effective: DelegationRoutePolicy::Codeg,
+                source: DelegationRouteSource::GlobalDefault,
+                native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+                expose_codeg_delegation: true,
+                degraded_reason: None,
+                adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+                fingerprint: "test-root-codeg".into(),
+            },
+        }
+    }
+
+    fn codeg_child_request() -> SpawnAttemptRequest {
+        let mut req = root_codeg_request();
+        req.origin = DelegationConnectionOrigin::CodegChild;
+        req.plan.source = crate::acp::delegation::route::DelegationRouteSource::ForcedChild;
+        req
+    }
+
+    #[tokio::test]
+    async fn root_safe_fallback_retries_once_only_for_typed_route_bootstrap_failure() {
+        let harness = SpawnAttemptHarness::new([
+            Err(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            )),
+            Ok("native-connection".into()),
+        ]);
+        let result = spawn_with_safe_fallback(root_codeg_request(), &harness)
+            .await
+            .unwrap();
+        assert_eq!(result.connection_id, "native-connection");
+        assert_eq!(
+            result.plan.source,
+            crate::acp::delegation::route::DelegationRouteSource::SafeFallback
+        );
+        assert_eq!(harness.attempt_count(), 2);
+
+        let fatal = SpawnAttemptHarness::new([Err(RouteBootstrapOutcome::Fatal(
+            AcpError::SdkNotInstalled("missing SDK".into()),
+        ))]);
+        assert!(matches!(
+            spawn_with_safe_fallback(root_codeg_request(), &fatal).await,
+            Err(AcpError::SdkNotInstalled(_))
+        ));
+        assert_eq!(fatal.attempt_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_child_never_falls_back_and_late_close_never_switches_route() {
+        let harness = SpawnAttemptHarness::new([Err(RouteBootstrapOutcome::RouteSpecific(
+            RouteDegradedReason::CompanionInitializationFailed,
+        ))]);
+        assert_eq!(
+            spawn_with_safe_fallback(codeg_child_request(), &harness)
+                .await
+                .unwrap_err()
+                .code(),
+            Some("route_unavailable")
+        );
+        assert_eq!(harness.attempt_count(), 1);
+
+        let state = state_with_route(codeg_plan_for_late_close());
+        apply_companion_closed(&state).await;
+        let snapshot = state.read().await.to_snapshot();
+        assert_eq!(
+            snapshot.delegation_route.effective,
+            crate::acp::delegation::route::DelegationRoutePolicy::Codeg
+        );
+        assert!(!snapshot.delegation_route.delegation_available);
+    }
+
+    fn codeg_plan_for_late_close() -> DelegationRoutePlan {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
+            ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "late-close".into(),
+        }
+    }
+
+    fn state_with_route(
+        plan: DelegationRoutePlan,
+    ) -> Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>> {
+        let mut s = crate::acp::session_state::SessionState::new(
+            "late-close".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        Arc::new(tokio::sync::RwLock::new(s))
+    }
+
+    async fn apply_companion_closed(
+        state: &Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    ) {
+        // Mirror post-ready lease close: only availability flips.
+        state.write().await.set_delegation_available(false);
+        // Apply the event path too so snapshot consumers see the same bit.
+        state
+            .write()
+            .await
+            .apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+    }
 }

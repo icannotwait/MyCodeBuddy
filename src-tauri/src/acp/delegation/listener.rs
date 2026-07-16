@@ -16,10 +16,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    CompanionReadyAck,
 };
 use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
@@ -33,7 +35,6 @@ use serde_json::Value;
 /// keeps running past this; the LLM simply re-issues the wait. An explicit
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
-
 
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
@@ -73,16 +74,27 @@ impl TokenRegistry {
     }
 
     /// Drop every token whose `parent_connection_id` matches. Used on parent
-    /// connection teardown so a leaked token can't be reused.
-    pub async fn revoke_by_parent(&self, parent_connection_id: &str) {
+    /// connection teardown so a leaked token can't be reused. Returns the
+    /// revoked token strings so callers can also revoke ready leases.
+    pub async fn revoke_by_parent(&self, parent_connection_id: &str) -> Vec<String> {
         let mut map = self.inner.write().await;
-        map.retain(|_, entry| entry.parent_connection_id != parent_connection_id);
+        let mut revoked = Vec::new();
+        map.retain(|token, entry| {
+            if entry.parent_connection_id == parent_connection_id {
+                revoked.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        revoked
     }
 }
 
 pub struct DelegationListener {
     pub broker: Arc<DelegationBroker>,
     pub tokens: Arc<TokenRegistry>,
+    pub leases: Arc<CompanionLeaseRegistry>,
     pub parent_lookup: Arc<dyn ParentSessionLookup>,
     /// Pulls pending live-feedback notes for the `check_user_feedback` tool.
     /// Shares the same `tokens` registry and parent-connection scoping as the
@@ -102,6 +114,7 @@ impl DelegationListener {
     pub fn new(
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
         parent_lookup: Arc<dyn ParentSessionLookup>,
         feedback: Arc<dyn SessionFeedbackAccess>,
         questions: Arc<dyn SessionQuestionAccess>,
@@ -110,6 +123,7 @@ impl DelegationListener {
         Arc::new(Self {
             broker,
             tokens,
+            leases,
             parent_lookup,
             feedback,
             questions,
@@ -189,7 +203,13 @@ impl DelegationListener {
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let msg: BrokerMessage = read_frame(conn).await?;
+        // Ready lease is a long-lived hold: authenticate → mark ready → ack →
+        // select peer-EOF vs revoke, then mark closed exactly once.
+        if let BrokerMessage::Ready(req) = msg {
+            return self.serve_ready_lease(conn, req.token).await;
+        }
         let resp = match msg {
+            BrokerMessage::Ready(_) => unreachable!("handled above"),
             BrokerMessage::Call(req) => report_response(self.process(req).await)?,
             BrokerMessage::Status(req) => {
                 // A status long-poll — especially `wait_ms = 0` (block until
@@ -224,10 +244,7 @@ impl DelegationListener {
                         write_frame(conn, &feedback_response(&[])?).await?;
                     }
                     Some(parent_conn_id) => {
-                        let pending = self
-                            .feedback
-                            .read_pending_feedback(&parent_conn_id)
-                            .await;
+                        let pending = self.feedback.read_pending_feedback(&parent_conn_id).await;
                         // Read-only: the response carries the note ids
                         // (`_commit_ids`); delivery is committed LATER, by the
                         // companion's `CommitFeedback` once it actually returns
@@ -321,6 +338,54 @@ impl DelegationListener {
             }
         };
         write_frame(conn, &resp).await?;
+        Ok(())
+    }
+
+    /// Authenticated two-frame ready lease. Token is validated against
+    /// [`TokenRegistry`] before [`CompanionLeaseRegistry::mark_ready`]. Ack is
+    /// written only after authentication; the socket stays open until peer EOF
+    /// or the lease is revoked. Closed exactly once.
+    async fn serve_ready_lease<C>(&self, conn: &mut C, token: String) -> std::io::Result<()>
+    where
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
+        // Authenticate first — never mark_ready for an unknown/revoked token.
+        if self.tokens.lookup(&token).await.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid ready-lease token",
+            ));
+        }
+        let mut availability = self
+            .leases
+            .subscribe_availability(&token)
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "ready lease not registered")
+            })?;
+        if let Err(e) = self.leases.mark_ready(&token).await {
+            return Err(std::io::Error::other(format!("mark_ready: {e}")));
+        }
+        // Ack only after authentication + mark_ready.
+        write_frame(conn, &CompanionReadyAck { ready: true }).await?;
+
+        // Hold open: peer EOF or external revoke (availability → false).
+        let mut probe = [0u8; 1];
+        tokio::select! {
+            biased;
+            _ = conn.read(&mut probe) => {}
+            _ = async {
+                loop {
+                    if !*availability.borrow() {
+                        break;
+                    }
+                    if availability.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        self.leases.mark_closed(&token).await;
         Ok(())
     }
 
@@ -731,10 +796,7 @@ mod tests {
     }
     #[async_trait]
     impl SessionFeedbackAccess for StubFeedback {
-        async fn read_pending_feedback(
-            &self,
-            parent_connection_id: &str,
-        ) -> Vec<PendingFeedback> {
+        async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
             *self.read_conn.lock().await = Some(parent_connection_id.to_string());
             self.items.lock().await.clone()
         }
@@ -754,9 +816,7 @@ mod tests {
     #[derive(Default)]
     struct StubQuestion {
         pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
-        registered: tokio::sync::Mutex<
-            Vec<(String, Vec<crate::acp::question::QuestionSpec>)>,
-        >,
+        registered: tokio::sync::Mutex<Vec<(String, Vec<crate::acp::question::QuestionSpec>)>>,
         canceled: tokio::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
@@ -849,6 +909,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(parent_conversation)),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -869,6 +930,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             feedback,
             Arc::new(StubQuestion::default()),
@@ -890,6 +952,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             questions,
@@ -910,6 +973,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -1682,7 +1746,10 @@ mod tests {
         let commit_ids = resp.outcome["_commit_ids"].as_array().unwrap();
         assert_eq!(commit_ids, &vec!["f1", "f2"]);
         // Read was scoped to the token's parent connection id.
-        assert_eq!(feedback.read_conn.lock().await.as_deref(), Some("parent-conn"));
+        assert_eq!(
+            feedback.read_conn.lock().await.as_deref(),
+            Some("parent-conn")
+        );
         // The Feedback arm is READ-ONLY — it does NOT commit (delivery is
         // committed later, by the companion's CommitFeedback).
         assert!(feedback.committed.lock().await.is_empty());
@@ -2000,7 +2067,10 @@ mod tests {
             .await
             .expect("serve_one must return after peer close");
         result.unwrap().unwrap();
-        assert_eq!(questions.canceled.lock().await.as_slice(), &["q-1".to_string()]);
+        assert_eq!(
+            questions.canceled.lock().await.as_slice(),
+            &["q-1".to_string()]
+        );
     }
 
     /// An invalid token never registers a question and returns a `declined`
@@ -2008,7 +2078,8 @@ mod tests {
     #[tokio::test]
     async fn ask_invalid_token_declined() {
         let questions = Arc::new(StubQuestion::default());
-        let listener = make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
+        let listener =
+            make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
         let (mut client, mut server) = duplex(8 * 1024);
         let server_task = tokio::spawn(async move {
             listener.serve_one(&mut server).await.unwrap();
@@ -2021,5 +2092,4 @@ mod tests {
         assert_eq!(resp.outcome["declined"], true);
         assert!(questions.registered.lock().await.is_empty());
     }
-
 }

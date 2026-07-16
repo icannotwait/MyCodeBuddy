@@ -813,6 +813,10 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::acp::delegation::listener::TokenRegistry>>()
             .inner()
             .clone(),
+        delegation_leases: app
+            .state::<Arc<crate::acp::delegation::lease::CompanionLeaseRegistry>>()
+            .inner()
+            .clone(),
         delegation_socket_path: app
             .state::<crate::commands::delegation::DelegationSocketPath>()
             .0

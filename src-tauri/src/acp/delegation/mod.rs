@@ -34,6 +34,7 @@ pub mod broker;
 pub mod companion;
 pub mod depth;
 pub mod event_emitter;
+pub mod lease;
 pub mod listener;
 pub mod live_reply;
 pub mod meta_writer;

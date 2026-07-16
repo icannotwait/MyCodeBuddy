@@ -332,10 +332,11 @@ pub enum AcpEvent {
     /// clear its "restart to apply" banner. Carried into `SessionState` so a
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
-    SessionConfigStale {
-        stale: bool,
-        kind: ConfigStaleKind,
-    },
+    SessionConfigStale { stale: bool, kind: ConfigStaleKind },
+    /// Post-ready companion lease closed: Codeg delegation is no longer
+    /// available. Does **not** change route plan, suppression, fingerprint,
+    /// process lifetime, or Broker tasks — only the mutable availability bit.
+    DelegationAvailabilityChanged { available: bool },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,

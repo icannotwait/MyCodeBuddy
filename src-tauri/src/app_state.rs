@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::acp::delegation::broker::DelegationBroker;
+use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
@@ -46,6 +47,10 @@ pub struct AppState {
     /// Registered when `load_mcp_servers_for_agent` injects the
     /// `codeg-mcp` MCP entry, revoked on parent teardown.
     pub delegation_tokens: Arc<TokenRegistry>,
+    /// Authenticated companion ready-lease registry. Shared with the
+    /// listener and MCP injection so Codeg routes wait for ready before
+    /// emitting Connected.
+    pub delegation_leases: Arc<CompanionLeaseRegistry>,
     /// Absolute path of the UDS / named pipe the companion connects to.
     /// PID-scoped so multiple codeg processes on the same host don't fight.
     pub delegation_socket_path: PathBuf,
@@ -110,6 +115,7 @@ pub fn build_delegation_stack(
 ) -> (
     Arc<DelegationBroker>,
     Arc<TokenRegistry>,
+    Arc<CompanionLeaseRegistry>,
     PathBuf,
     crate::acp::feedback::FeedbackRuntimeConfig,
     crate::acp::question::QuestionRuntimeConfig,
@@ -161,6 +167,7 @@ pub fn build_delegation_stack(
             .with_live_reply_lookup(live_reply_lookup),
     );
     let tokens = Arc::new(TokenRegistry::default());
+    let leases = Arc::new(CompanionLeaseRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());
     let feedback = crate::acp::feedback::FeedbackRuntimeConfig::new();
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
@@ -171,6 +178,7 @@ pub fn build_delegation_stack(
     connection_manager.install_delegation(DelegationInjection {
         broker: broker.clone(),
         tokens: tokens.clone(),
+        leases: leases.clone(),
         socket_path: socket_path.clone(),
         feedback: feedback.clone(),
         ask: ask.clone(),
@@ -185,6 +193,7 @@ pub fn build_delegation_stack(
     (
         broker,
         tokens,
+        leases,
         socket_path,
         feedback,
         ask,
@@ -214,6 +223,7 @@ impl AppState {
         let (
             delegation_broker,
             delegation_tokens,
+            delegation_leases,
             delegation_socket_path,
             feedback_config,
             question_config,
@@ -240,6 +250,7 @@ impl AppState {
             delegation_broker,
             delegation_runtime_settings,
             delegation_tokens,
+            delegation_leases,
             delegation_socket_path,
             feedback_config,
             question_config,

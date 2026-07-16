@@ -8,6 +8,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::route::{
+    DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
+};
 use crate::acp::event_stream::{ConnectionEventStream, RecentEventsBuffer};
 use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::question::PendingQuestionState;
@@ -17,6 +20,46 @@ use crate::acp::types::{
 };
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
+
+/// Immutable route plan plus the one mutable post-ready availability bit.
+/// Carried on live snapshots so attach payloads have one stable shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRouteSnapshot {
+    pub requested: DelegationRoutePolicy,
+    pub effective: DelegationRoutePolicy,
+    pub source: DelegationRouteSource,
+    pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<RouteDegradedReason>,
+    pub delegation_available: bool,
+}
+
+impl DelegationRouteSnapshot {
+    /// Build from an immutable launch plan. Availability starts false until
+    /// the authenticated ready lease succeeds (Codeg) or stays false (native).
+    pub fn from_plan(plan: &DelegationRoutePlan, delegation_available: bool) -> Self {
+        Self {
+            requested: plan.requested,
+            effective: plan.effective,
+            source: plan.source,
+            managed: plan.managed,
+            degraded_reason: plan.degraded_reason,
+            delegation_available,
+        }
+    }
+}
+
+/// Serde default for mixed-version clients: unmanaged native, unavailable.
+pub fn legacy_unmanaged_route_snapshot() -> DelegationRouteSnapshot {
+    DelegationRouteSnapshot {
+        requested: DelegationRoutePolicy::Native,
+        effective: DelegationRoutePolicy::Native,
+        source: DelegationRouteSource::FeatureDisabled,
+        managed: false,
+        degraded_reason: None,
+        delegation_available: false,
+    }
+}
 
 /// 当前 streaming 中的 turn 的累积内容。turn 完成后清空。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +433,11 @@ pub struct SessionState {
     /// Which settings surface drifted, for the banner's wording. `Some` iff
     /// `config_stale`; reset to `None` when staleness clears.
     pub config_stale_kind: Option<ConfigStaleKind>,
+
+    /// Managed route snapshot: immutable plan fields + mutable
+    /// `delegation_available`. New sessions always supply a real plan-derived
+    /// value; wire default for legacy payloads is unmanaged native unavailable.
+    pub delegation_route: DelegationRouteSnapshot,
 }
 
 impl SessionState {
@@ -440,7 +488,21 @@ impl SessionState {
             turn_in_flight: false,
             config_stale: false,
             config_stale_kind: None,
+            // Placeholder until spawn installs the real plan snapshot; tests
+            // that never set a plan still deserialize/serialize as legacy default.
+            delegation_route: legacy_unmanaged_route_snapshot(),
         }
+    }
+
+    /// Install the plan-derived route snapshot (availability still false until
+    /// ready lease / native path marks connected without delegation).
+    pub fn set_route_plan_snapshot(&mut self, plan: &DelegationRoutePlan) {
+        self.delegation_route = DelegationRouteSnapshot::from_plan(plan, false);
+    }
+
+    /// Post-ready availability flip only — never mutates plan fields.
+    pub fn set_delegation_available(&mut self, available: bool) {
+        self.delegation_route.delegation_available = available;
     }
 
     /// Clone the broadcaster handle so attach handlers and subscriber tasks
@@ -527,6 +589,9 @@ impl SessionState {
             AcpEvent::SessionConfigStale { stale, kind } => {
                 self.config_stale = *stale;
                 self.config_stale_kind = if *stale { Some(*kind) } else { None };
+            }
+            AcpEvent::DelegationAvailabilityChanged { available } => {
+                self.delegation_route.delegation_available = *available;
             }
             AcpEvent::PromptCapabilities {
                 prompt_capabilities,
@@ -1172,6 +1237,7 @@ impl SessionState {
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
+            delegation_route: self.delegation_route.clone(),
             event_seq: self.event_seq,
         }
     }
@@ -1263,6 +1329,10 @@ pub struct LiveSessionSnapshot {
     /// byte-identical with the pre-feature wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_stale_kind: Option<ConfigStaleKind>,
+    /// Managed route + availability (see [`DelegationRouteSnapshot`]).
+    /// Default preserves mixed-version clients and Rust deserialization tests.
+    #[serde(default = "legacy_unmanaged_route_snapshot")]
+    pub delegation_route: DelegationRouteSnapshot,
     pub event_seq: u64,
 }
 
@@ -3100,5 +3170,73 @@ mod tests {
             !empty.contains("\"feedback\":"),
             "no-feedback snapshot must omit the notes array"
         );
+    }
+
+    #[test]
+    fn live_session_snapshot_legacy_default_is_unmanaged_native_unavailable() {
+        // Missing delegation_route field deserializes to legacy default.
+        let json = r#"{
+            "connection_id": "c1",
+            "conversation_id": null,
+            "folder_id": null,
+            "status": "connecting",
+            "external_id": null,
+            "live_message": null,
+            "active_tool_calls": [],
+            "pending_permission": null,
+            "modes": null,
+            "current_mode": null,
+            "config_options": null,
+            "prompt_capabilities": null,
+            "usage": null,
+            "fork_supported": false,
+            "available_commands": [],
+            "selectors_ready": false,
+            "event_seq": 0
+        }"#;
+        let snap: LiveSessionSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snap.delegation_route, legacy_unmanaged_route_snapshot());
+        assert!(!snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            crate::acp::delegation::route::DelegationRoutePolicy::Native
+        );
+        assert!(!snap.delegation_route.delegation_available);
+    }
+
+    #[test]
+    fn new_session_state_supplies_real_plan_snapshot_not_only_legacy_default() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "snap-test".into(),
+        };
+        let mut s = fresh_state();
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            DelegationRoutePolicy::Codeg
+        );
+        assert!(snap.delegation_route.delegation_available);
+        // Wire uses snake_case; no secret token fields.
+        let json = serde_json::to_value(&snap).unwrap();
+        let route = &json["delegation_route"];
+        assert_eq!(route["effective"], "codeg");
+        assert_eq!(route["requested"], "codeg");
+        assert_eq!(route["source"], "global_default");
+        assert!(route.get("token").is_none());
     }
 }

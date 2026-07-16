@@ -210,12 +210,27 @@ pub struct BrokerSessionRequest {
     pub max_messages: Option<u32>,
 }
 
+/// Companion → listener ready-lease request. First frame of the two-frame
+/// ready handshake: listener authenticates `token`, acks, then both keep the
+/// socket open until peer EOF or revoke.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionReadyRequest {
+    pub token: String,
+}
+
+/// Ready-lease acknowledgement body written after authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionReadyAck {
+    pub ready: bool,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrokerMessage {
+    Ready(CompanionReadyRequest),
     Call(BrokerRequest),
     Cancel(BrokerCancelRequest),
     Status(BrokerStatusRequest),
@@ -299,6 +314,81 @@ async fn message_round_trip(socket_path: &str, msg: &BrokerMessage) -> io::Resul
         .map_err(|e| io::Error::other(format!("open pipe: {e}")))?;
     write_frame(&mut stream, msg).await?;
     read_frame(&mut stream).await
+}
+
+/// Establish the authenticated ready lease and hold the socket open until
+/// the returned [`ReadyLeaseHold`] is dropped (or the peer closes).
+///
+/// Connects, writes [`BrokerMessage::Ready`], reads [`CompanionReadyAck`],
+/// and returns a hold that owns the open stream. Used by the companion before
+/// exposing tools when delegation is enabled.
+#[cfg(unix)]
+pub async fn client_establish_ready_lease(
+    socket_path: &str,
+    token: &str,
+) -> io::Result<ReadyLeaseHold> {
+    use tokio::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path).await?;
+    let msg = BrokerMessage::Ready(CompanionReadyRequest {
+        token: token.to_string(),
+    });
+    write_frame(&mut stream, &msg).await?;
+    let ack: CompanionReadyAck = read_frame(&mut stream).await?;
+    if !ack.ready {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ready lease rejected",
+        ));
+    }
+    Ok(ReadyLeaseHold::Unix(stream))
+}
+
+#[cfg(windows)]
+pub async fn client_establish_ready_lease(
+    socket_path: &str,
+    token: &str,
+) -> io::Result<ReadyLeaseHold> {
+    let mut stream = open_named_pipe_with_retry(socket_path)
+        .await
+        .map_err(|e| io::Error::other(format!("open pipe: {e}")))?;
+    let msg = BrokerMessage::Ready(CompanionReadyRequest {
+        token: token.to_string(),
+    });
+    write_frame(&mut stream, &msg).await?;
+    let ack: CompanionReadyAck = read_frame(&mut stream).await?;
+    if !ack.ready {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ready lease rejected",
+        ));
+    }
+    Ok(ReadyLeaseHold::Windows(stream))
+}
+
+/// Owns the open ready-lease stream so peer-close is observed by the listener.
+pub enum ReadyLeaseHold {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    Windows(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+impl ReadyLeaseHold {
+    /// Park until the peer closes the socket (or an error occurs).
+    pub async fn wait_until_closed(self) {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(mut stream) => {
+                let mut buf = [0u8; 1];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            }
+            #[cfg(windows)]
+            Self::Windows(mut stream) => {
+                let mut buf = [0u8; 1];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            }
+        }
+    }
 }
 
 /// Dispatch a `delegate_to_agent` call and read back the broker's

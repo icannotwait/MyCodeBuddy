@@ -530,6 +530,7 @@ mod tauri_app {
                     let (
                         broker,
                         tokens,
+                        leases,
                         socket_path,
                         feedback_config,
                         question_config,
@@ -542,6 +543,7 @@ mod tauri_app {
                     );
                     app.manage(broker.clone());
                     app.manage(tokens.clone());
+                    app.manage(leases.clone());
                     app.manage(feedback_config.clone());
                     app.manage(question_config.clone());
                     app.manage(session_info_config.clone());
@@ -587,6 +589,7 @@ mod tauri_app {
                     let listener = crate::acp::delegation::listener::DelegationListener::new(
                         listener_broker,
                         tokens,
+                        leases,
                         std::sync::Arc::new(
                             crate::acp::manager::ConnectionManagerParentLookup {
                                 manager: std::sync::Arc::new(cm_state.clone_ref()),
