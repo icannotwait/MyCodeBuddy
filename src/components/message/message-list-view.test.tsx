@@ -1,4 +1,4 @@
-import { act, render, screen, cleanup } from "@testing-library/react"
+import { act, fireEvent, render, screen, cleanup } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ReactNode } from "react"
@@ -193,6 +193,25 @@ vi.mock("@/lib/perf/streaming-perf-recorder", () => ({
     },
     markReactCommit: vi.fn(),
     isActive: () => false,
+  },
+}))
+
+const initialScrollControllerSpy = vi.fn()
+vi.mock("./initial-history-scroll-controller", () => ({
+  InitialHistoryScrollController: (props: {
+    pending: boolean
+    historyReady: boolean
+    hasHistoryRows: boolean
+    onFinish: () => void
+  }) => {
+    initialScrollControllerSpy(props)
+    return props.pending ? (
+      <button
+        type="button"
+        data-testid="finish-initial-history-scroll"
+        onClick={props.onFinish}
+      />
+    ) : null
   },
 }))
 
@@ -407,6 +426,80 @@ describe("extractTextFromParts", () => {
         },
       ])
     ).toBe("nested hidden thought")
+  })
+})
+
+describe("MessageListView initial history scroll latch", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    initialScrollControllerSpy.mockClear()
+    listScrollToBottom.mockClear()
+    seedHistory()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  const ui = (isActive: boolean, detailLoading: boolean) => (
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <MessageListView
+        conversationId={CID}
+        agentType="codex"
+        connStatus="connected"
+        isActive={isActive}
+        detailLoading={detailLoading}
+        initialHistoryScrollEligible
+        historyLoadComplete
+        showMessageNav={false}
+      />
+    </NextIntlClientProvider>
+  )
+
+  it("uses instant resize once and does not reset for cache switches or reloads", () => {
+    const view = render(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "instant"
+    )
+    expect(
+      screen.getByTestId("finish-initial-history-scroll")
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("finish-initial-history-scroll"))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "smooth"
+    )
+    expect(
+      screen.queryByTestId("finish-initial-history-scroll")
+    ).not.toBeInTheDocument()
+
+    view.rerender(ui(false, false))
+    view.rerender(ui(true, true))
+    view.rerender(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "smooth"
+    )
+    expect(
+      screen.queryByTestId("finish-initial-history-scroll")
+    ).not.toBeInTheDocument()
+
+    view.unmount()
+    render(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "instant"
+    )
+    expect(
+      screen.getByTestId("finish-initial-history-scroll")
+    ).toBeInTheDocument()
   })
 })
 

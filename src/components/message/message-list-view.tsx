@@ -93,6 +93,7 @@ import {
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
+import { InitialHistoryScrollController } from "./initial-history-scroll-controller"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
@@ -124,6 +125,10 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
+  /** Immutable mount-time eligibility supplied by the owning conversation view. */
+  initialHistoryScrollEligible?: boolean
+  /** True only after a persisted detail payload has loaded successfully. */
+  historyLoadComplete?: boolean
 }
 
 export function canReloadSessionLoadError(
@@ -758,6 +763,8 @@ export function MessageListView({
   onReload,
   onNewSession,
   showMessageNav = true,
+  initialHistoryScrollEligible = false,
+  historyLoadComplete = false,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -765,6 +772,14 @@ export function MessageListView({
     "incremental_live_transcript"
   )
   const showThinking = useAgentThinkingVisibility(agentType)
+
+  // One-shot latch: initialized once from mount-time eligibility; only the
+  // controller clears it. Later prop changes never re-arm this state.
+  const [initialHistoryScrollPending, setInitialHistoryScrollPending] =
+    useState(() => initialHistoryScrollEligible)
+  const finishInitialHistoryScroll = useCallback(() => {
+    setInitialHistoryScrollPending(false)
+  }, [])
 
   // When incremental live is on: historical timeline only (reference-stable
   // across live content updates) + narrow syncState. Compatibility path keeps
@@ -1126,6 +1141,10 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
+  const hasPersistedHistoryRows = threadItems.some(
+    (item) => item.kind === "turn" && item.phase === "persisted"
+  )
+
   const hasRenderableContent =
     threadItems.length > 0 ||
     Boolean(liveMessage) ||
@@ -1206,8 +1225,18 @@ export function MessageListView({
     <div className="relative flex h-full min-h-0 flex-col">
       <MessageThread
         className="flex-1 min-h-0"
-        resize={hasLiveTranscript ? "instant" : "smooth"}
+        resize={
+          hasLiveTranscript || initialHistoryScrollPending
+            ? "instant"
+            : "smooth"
+        }
       >
+        <InitialHistoryScrollController
+          pending={initialHistoryScrollPending}
+          historyReady={historyLoadComplete}
+          hasHistoryRows={hasPersistedHistoryRows}
+          onFinish={finishInitialHistoryScroll}
+        />
         <AutoScrollOnSend signal={sendSignal} />
         <VirtualizedMessageThread
           items={threadItems}
