@@ -280,6 +280,7 @@ function folder(
     path: `/p/${id}`,
     color: "blue",
     default_agent_type: null,
+    last_agent_type: null,
     parent_id: parentId,
   } as unknown as FolderDetail
 }
