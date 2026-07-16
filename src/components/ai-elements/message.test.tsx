@@ -15,11 +15,17 @@ vi.mock("streamdown", () => ({
   Streamdown: ({
     children,
     className,
+    remarkPlugins,
   }: {
     children: ReactNode
     className?: string
+    remarkPlugins?: unknown[]
   }) => (
-    <div className={className} data-testid="streamdown-root">
+    <div
+      className={className}
+      data-testid="streamdown-root"
+      data-remark-plugin-count={remarkPlugins?.length ?? 0}
+    >
       {children}
     </div>
   ),
@@ -153,5 +159,21 @@ describe("MessageResponse", () => {
       vi.advanceTimersByTime(1_000)
     })
     expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(0)
+  })
+
+  it("reselects the remark pipeline when local-path autolinking changes", () => {
+    const { rerender } = render(
+      <MessageResponse autolinkLocalPaths={false}>plain</MessageResponse>
+    )
+    expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
+      "data-remark-plugin-count",
+      "1"
+    )
+
+    rerender(<MessageResponse autolinkLocalPaths>plain</MessageResponse>)
+    expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
+      "data-remark-plugin-count",
+      "2"
+    )
   })
 })

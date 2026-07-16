@@ -37,6 +37,7 @@ import {
 } from "streamdown"
 import { markdownLinkComponents } from "./markdown-link"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
+import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
 import {
   detectHeavyPlugins,
@@ -346,6 +347,7 @@ export const MessageBranchPage = ({
 export type { RichContentState }
 export type MessageResponseProps = ComponentProps<typeof Streamdown> & {
   richContentState?: RichContentState
+  autolinkLocalPaths?: boolean
 }
 
 // remark-math only supports `$` delimiters. Convert LaTeX-style
@@ -372,6 +374,12 @@ export function normalizeMathDelimiters(text: string): string {
 
 const remarkPlugins = [
   ...Object.values(defaultRemarkPlugins),
+  remarkRewriteFileUriLinks,
+]
+
+const remarkPluginsWithLocalPaths = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkAutolinkLocalPaths,
   remarkRewriteFileUriLinks,
 ]
 
@@ -420,6 +428,7 @@ function MessageResponseImpl({
   className,
   children,
   richContentState = "complete",
+  autolinkLocalPaths = false,
   ...props
 }: MessageResponseProps) {
   const normalized = useMemo(
@@ -446,7 +455,9 @@ function MessageResponseImpl({
           className
         )}
         plugins={plugins}
-        remarkPlugins={remarkPlugins}
+        remarkPlugins={
+          autolinkLocalPaths ? remarkPluginsWithLocalPaths : remarkPlugins
+        }
         rehypePlugins={rehypePlugins}
         {...props}
         // Merge after spreading props so a caller can still override other
@@ -463,7 +474,8 @@ export const MessageResponse = memo(
   MessageResponseImpl,
   (prevProps, nextProps) =>
     prevProps.children === nextProps.children &&
-    prevProps.richContentState === nextProps.richContentState
+    prevProps.richContentState === nextProps.richContentState &&
+    prevProps.autolinkLocalPaths === nextProps.autolinkLocalPaths
 )
 
 MessageResponse.displayName = "MessageResponse"
