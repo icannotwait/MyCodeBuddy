@@ -217,8 +217,13 @@ pub trait DelegationTaskStore: Send + Sync {
     async fn has_retry_record(&self, task_id: &str) -> bool;
 }
 
-/// Default store for broker unit tests that do not exercise durability.
-/// Every settle wins with a synthetic report derived from the write.
+/// Default store for broker unit tests that do **not** exercise durability.
+///
+/// **Always returns `Settlement::Won`** with a synthetic report derived from
+/// the write — never `Existing`, never a real row. Suitable only for race /
+/// setup / routing unit tests that ignore store semantics. Durability,
+/// CAS-loser, and cold-load tests must use [`mock::MockTaskStore`] or
+/// [`DbDelegationTaskStore`].
 #[derive(Default)]
 pub struct NoopTaskStore {
     retries: Mutex<HashMap<String, PendingTerminalRetry>>,
@@ -473,7 +478,18 @@ pub mod mock {
         fail_remaining: Mutex<Option<u32>>,
         retries: Mutex<HashMap<String, PendingTerminalRetry>>,
         default_child_id: AtomicI32,
+        /// When true, `load` seeds a missing id as running (for send-fail tests
+        /// where the call id is only known after start_delegation mints it).
+        seed_on_load: std::sync::atomic::AtomicBool,
+        /// Optional gate: each `settle` waits on a oneshot after signaling entry.
+        settle_gate: Mutex<Option<SettleGate>>,
         pub settle_count: AtomicUsize,
+    }
+
+    /// Deterministic settle delay for mid-settle observation tests.
+    struct SettleGate {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
 
     impl MockTaskStore {
@@ -485,11 +501,14 @@ pub mod mock {
                 fail_remaining: Mutex::new(None),
                 retries: Mutex::new(HashMap::new()),
                 default_child_id: AtomicI32::new(0),
+                seed_on_load: std::sync::atomic::AtomicBool::new(false),
+                settle_gate: Mutex::new(None),
                 settle_count: AtomicUsize::new(0),
             }
         }
 
-        /// Auto-seed any missing task as running with the given child id.
+        /// Auto-seed any missing task as running with the given child id
+        /// (on settle only, unless [`Self::with_seed_on_load`]).
         pub fn accept_any_running(child_conversation_id: i32) -> Self {
             let s = Self::new();
             s.default_child_id
@@ -497,35 +516,60 @@ pub mod mock {
             s
         }
 
+        /// Like [`Self::accept_any_running`] but also seeds on `load` so send
+        /// failure can discover the row by call id before settle.
+        pub fn accept_any_running_loadable(child_conversation_id: i32) -> Self {
+            let s = Self::accept_any_running(child_conversation_id);
+            s.seed_on_load.store(true, Ordering::SeqCst);
+            s
+        }
+
         pub fn with_running(task_id: &str, child_conversation_id: i32) -> Self {
             let s = Self::new();
             s.default_child_id
                 .store(child_conversation_id, Ordering::SeqCst);
-            if let Ok(mut map) = s.tasks.try_lock() {
-                map.insert(
-                    task_id.to_string(),
-                    PersistedTask {
-                        task_id: task_id.to_string(),
-                        child_conversation_id,
-                        parent_id: Some(1),
-                        agent_type: AgentType::ClaudeCode,
-                        status: TaskStatus::Running,
-                        error_code: None,
-                        started_at: Some(Utc::now()),
-                        finished_at: None,
-                    },
-                );
-            }
+            // Constructor is exclusive — try_lock must succeed (never silent skip).
+            let mut map = s
+                .tasks
+                .try_lock()
+                .expect("MockTaskStore::with_running: tasks mutex busy at construction");
+            map.insert(
+                task_id.to_string(),
+                PersistedTask {
+                    task_id: task_id.to_string(),
+                    child_conversation_id,
+                    parent_id: Some(1),
+                    agent_type: AgentType::ClaudeCode,
+                    status: TaskStatus::Running,
+                    error_code: None,
+                    started_at: Some(Utc::now()),
+                    finished_at: None,
+                },
+            );
+            drop(map);
             s
         }
 
         /// Fail the next `n` settle attempts with a transient error, then CAS.
         pub fn fail_settle_times(n: u32) -> Self {
             let s = Self::with_running("task-1", 42);
-            if let Ok(mut fr) = s.fail_remaining.try_lock() {
-                *fr = Some(n);
-            }
+            *s.fail_remaining
+                .try_lock()
+                .expect("MockTaskStore::fail_settle_times: fail_remaining busy") = Some(n);
             s
+        }
+
+        /// Install a one-shot settle gate: next `settle` signals `entered` then
+        /// waits on `release` before applying CAS. Used for mid-settle tests.
+        pub async fn install_settle_gate(
+            &self,
+            entered: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        ) {
+            *self.settle_gate.lock().await = Some(SettleGate {
+                entered: Some(entered),
+                release: Some(release),
+            });
         }
 
         pub async fn seed_running(
@@ -599,7 +643,12 @@ pub mod mock {
     #[async_trait]
     impl DelegationTaskStore for MockTaskStore {
         async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError> {
-            Ok(self.tasks.lock().await.get(task_id).cloned())
+            let mut map = self.tasks.lock().await;
+            if self.seed_on_load.load(Ordering::SeqCst) {
+                let child_id = self.default_child_id.load(Ordering::SeqCst);
+                Self::seed_if_missing(&mut map, task_id, child_id);
+            }
+            Ok(map.get(task_id).cloned())
         }
 
         async fn settle(
@@ -612,6 +661,17 @@ pub mod mock {
                 .lock()
                 .await
                 .push((task_id.to_string(), terminal.clone()));
+
+            // Optional mid-settle gate (deterministic; no multi-second sleeps).
+            let gate = self.settle_gate.lock().await.take();
+            if let Some(mut gate) = gate {
+                if let Some(tx) = gate.entered.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = gate.release.take() {
+                    let _ = rx.await;
+                }
+            }
 
             if let Some(remaining) = self.fail_remaining.lock().await.as_mut() {
                 if *remaining > 0 {

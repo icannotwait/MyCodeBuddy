@@ -246,24 +246,42 @@ pub(crate) async fn handle_event(
             // owned by the broker store CAS (`settle_task`). A generic
             // ConversationStatus write here would race / obscure the terminal
             // winner. Non-delegate chats keep the existing lifecycle write.
-            let is_delegate = conversation_service::get_by_id(db_conn, cid)
-                .await
-                .ok()
-                .and_then(|r| r.delegation_call_id)
-                .is_some();
-
-            if is_delegate {
-                if let Some(b) = broker {
-                    forward_turn_complete_to_broker(
-                        db_conn,
-                        b.as_ref(),
-                        cid,
-                        stop_reason.as_str(),
-                        last_text,
-                    )
-                    .await;
+            // DB probe is fail-closed: on error never fall through to generic
+            // ConversationStatus mutation (may still route to broker).
+            match conversation_is_delegate(db_conn, cid).await {
+                Ok(true) => {
+                    if let Some(b) = broker {
+                        forward_turn_complete_to_broker(
+                            db_conn,
+                            b.as_ref(),
+                            cid,
+                            stop_reason.as_str(),
+                            last_text,
+                        )
+                        .await;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        conversation_id = cid,
+                        error = %e,
+                        "[lifecycle] is_delegate probe failed; skipping generic \
+                         ConversationStatus write (fail-closed)"
+                    );
+                    if let Some(b) = broker {
+                        forward_turn_complete_to_broker(
+                            db_conn,
+                            b.as_ref(),
+                            cid,
+                            stop_reason.as_str(),
+                            last_text,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
             }
 
             if let Some(ts) = target_status.clone() {
@@ -287,6 +305,17 @@ pub(crate) async fn handle_event(
         // this dispatcher with new arms as the lifecycle scope grows.
         _ => Ok(()),
     }
+}
+
+/// Whether a conversation row is a Codeg delegation child (has
+/// `delegation_call_id`). Returns `Err` on DB failure so callers can fail
+/// closed instead of treating the probe as "not a delegate".
+async fn conversation_is_delegate(
+    db_conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let row = conversation_service::get_by_id(db_conn, conversation_id).await?;
+    Ok(row.delegation_call_id.is_some())
 }
 
 /// On TurnComplete for a delegation child, resolve the pending broker call
@@ -416,14 +445,19 @@ async fn handle_terminal_event(
     let cid = entry.conversation_id;
     // Delegate rows: terminal ConversationStatus is owned by the broker store
     // CAS. Skipping the generic InProgress→Cancelled write prevents racing the
-    // durable winner (completed/failed/canceled).
-    let is_delegate = conversation_service::get_by_id(db_conn, cid)
-        .await
-        .ok()
-        .and_then(|r| r.delegation_call_id)
-        .is_some();
-    if is_delegate {
-        return Ok(());
+    // durable winner (completed/failed/canceled). Fail-closed on probe error.
+    match conversation_is_delegate(db_conn, cid).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(
+                conversation_id = cid,
+                error = %e,
+                "[lifecycle] is_delegate probe failed on terminal event; \
+                 skipping generic ConversationStatus write (fail-closed)"
+            );
+            return Ok(());
+        }
     }
     let changed = conversation_service::update_status_if(
         db_conn,
@@ -2996,5 +3030,178 @@ mod tests {
 
         drop(bus);
         let _ = dispatcher.await;
+    }
+
+    // ── Task 8 review fix: is_delegate fail-closed ───────────────────────
+
+    #[tokio::test]
+    async fn conversation_is_delegate_false_for_regular_chat() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-regular").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert!(!conversation_is_delegate(&db.conn, conv.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn conversation_is_delegate_true_for_linked_child() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-child").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-1".into(),
+                delegation_call_id: "call-delegate-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(conversation_is_delegate(&db.conn, child.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn turn_complete_nondelegate_writes_pending_review() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/tc-nondelegate").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_complete_delegate_skips_generic_status_write() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/tc-delegate").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-1".into(),
+                delegation_call_id: "call-tc-del".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Delegate rows start InProgress; store CAS owns terminal ConversationStatus.
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::InProgress
+        );
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c-child".to_string(),
+                fake_connection_with_state("c-child", Some(child.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-child".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::InProgress,
+            "delegate TurnComplete must not write generic PendingReview"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_delegate_probe_db_error_skips_generic_status_write() {
+        // Soft-deleted rows are filtered by get_by_id → Err, which must fail
+        // closed (no generic ConversationStatus mutation) rather than treating
+        // the probe as "not a delegate".
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-err").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::soft_delete(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert!(
+            conversation_is_delegate(&db.conn, conv.id).await.is_err(),
+            "soft-deleted row must surface as probe error"
+        );
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+            },
+        };
+        // Must not error out of handle_event, and must not resurrect status.
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        // Raw entity still InProgress (soft-deleted; no status flip).
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(row.status, ConversationStatus::InProgress);
     }
 }

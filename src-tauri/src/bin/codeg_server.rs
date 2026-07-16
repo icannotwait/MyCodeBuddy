@@ -334,9 +334,13 @@ async fn async_main() -> ExitCode {
     .await;
 
     // After migrations + settings, before the listener accepts: fail only
-    // orphaned running delegate rows as host_restarted.
-    if let Err(e) = delegation_broker.reconcile_running_on_startup().await {
-        tracing::error!("[delegation] startup reconcile_running failed: {e}");
+    // orphaned running delegate rows as host_restarted. Fail-closed: do not
+    // start the listener (or continue accepting work) when reconcile fails.
+    if let Err(e) = codeg_lib::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
+        delegation_broker.reconcile_running_on_startup().await,
+    ) {
+        tracing::error!("[delegation][FATAL] {e}; aborting startup.");
+        return ExitCode::from(2);
     }
 
     // Spawn the delegation listener so companion processes can round-trip

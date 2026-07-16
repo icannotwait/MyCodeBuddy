@@ -561,7 +561,7 @@ mod tauri_app {
                     let feedback_for_init = feedback_config.clone();
                     let question_for_init = question_config.clone();
                     let session_info_for_init = session_info_config.clone();
-                    tauri::async_runtime::block_on(async move {
+                    let reconcile_result = tauri::async_runtime::block_on(async move {
                         delegation_commands::apply_persisted_config(
                             &db_for_init,
                             &broker_for_init,
@@ -585,12 +585,15 @@ mod tauri_app {
                         .await;
                         // After migrations + settings, before the listener accepts:
                         // fail only orphaned running delegate rows as host_restarted.
-                        if let Err(e) = broker_for_init.reconcile_running_on_startup().await {
-                            tracing::error!(
-                                "[delegation] startup reconcile_running failed: {e}"
-                            );
-                        }
+                        // Fail-closed: do not start the listener on reconcile error.
+                        crate::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
+                            broker_for_init.reconcile_running_on_startup().await,
+                        )
                     });
+                    if let Err(e) = reconcile_result {
+                        tracing::error!("[delegation] {e}");
+                        return Err(e.into());
+                    }
 
                     let listener_broker = broker.clone();
                     let listener = crate::acp::delegation::listener::DelegationListener::new(
