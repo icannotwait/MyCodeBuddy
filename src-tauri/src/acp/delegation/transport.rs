@@ -109,13 +109,13 @@ pub struct BrokerStatusRequest {
     /// `task_ids` array into this list (trimmed, de-duplicated, order-preserving).
     /// The listener returns one report per id, in this order.
     pub task_ids: Vec<String>,
-    /// How long the listener may block waiting for a task to reach a terminal
-    /// state before returning the current (possibly still-running) snapshot.
-    /// `None` (omitted) returns an immediate snapshot; an explicit `0` blocks
-    /// with no timeout until a task finishes (long-running children); any
-    /// positive value is a long-poll the listener clamps to a hard ceiling so a
-    /// single bounded call can't hang unbounded. For a batch the wait resolves as
-    /// soon as ANY requested task reaches a terminal state.
+    /// Wait mode for `get_delegation_status` (mapped by the listener):
+    /// - `None` (omitted) → immediate snapshot (never parks).
+    /// - `Some(0)` → terminal-only wait with no timeout (observation ignored).
+    /// - `Some(ms > 0)` → supervised wait, clamped to **60000** ms; returns on
+    ///   terminal, stalled, waiting_input, a requested observation transition,
+    ///   or the deadline (a still-running snapshot at deadline is success).
+    /// Batch waits resolve when ANY requested id meets the mode condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
 }

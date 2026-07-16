@@ -874,9 +874,12 @@ pub enum StatusWait {
     /// Return the current snapshot right away — never parks. Wire: omit `wait_ms`.
     Snapshot,
     /// Bounded supervised wait: returns on terminal/Unknown, stalled,
-    /// waiting_input, any observation snapshot transition, or deadline.
-    /// Parks only while every requested item is `Running` + `Active` with no
-    /// version change. Wire: positive `wait_ms` (ceiling applied by listener).
+    /// waiting_input, any **requested** observation snapshot transition
+    /// (including Active→Active timestamp bumps and observation clear), or
+    /// deadline. Parks only while every requested id is live in-memory
+    /// [`StatusClass::Running`] (running ∪ settling) and not yet actionable —
+    /// pre-first-publish `observation: None` continues parking. Wire: positive
+    /// `wait_ms` (ceiling applied by listener).
     Supervised(Duration),
     /// Wait only for a non-Running status (terminal or Unknown). Ignores
     /// observation transitions. No timeout. Wire: `wait_ms = 0`.
@@ -884,7 +887,8 @@ pub enum StatusWait {
 }
 
 /// Supervised wait exits when any report is non-Running or has an actionable
-/// observation (`Stalled` / `WaitingInput`). `Active` alone continues parking.
+/// observation (`Stalled` / `WaitingInput`). `Active` or pre-publish `None`
+/// alone continues parking (until a requested observation transition).
 fn supervised_should_return(reports: &[DelegationTaskReport]) -> bool {
     reports.iter().any(|r| {
         if r.status != TaskStatus::Running {
@@ -895,6 +899,36 @@ fn supervised_should_return(reports: &[DelegationTaskReport]) -> bool {
             Some(TaskObservation::Stalled) | Some(TaskObservation::WaitingInput)
         )
     })
+}
+
+/// Comparable observation fields for a single requested report. Used so a
+/// Supervised wait returns only when a **requested** id's observation snapshot
+/// changes — not when an unrelated task bumps the global status version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedObservationView {
+    observation: Option<TaskObservation>,
+    last_agent_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+    stalled_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn requested_observation_views(reports: &[DelegationTaskReport]) -> Vec<RequestedObservationView> {
+    reports
+        .iter()
+        .map(|r| RequestedObservationView {
+            observation: r.observation,
+            last_agent_activity_at: r.last_agent_activity_at,
+            stalled_since: r.stalled_since,
+        })
+        .collect()
+}
+
+/// Park membership: only live in-memory `StatusClass::Running` (pending.running
+/// or pending.settling). `NotInMemory` / `Settled` never park — this process has
+/// no terminal notifier producer for cold ids.
+fn all_live_running(classes: &[StatusClass]) -> bool {
+    classes
+        .iter()
+        .all(|c| matches!(c, StatusClass::Running { .. }))
 }
 
 /// Status report for a still-running task.
@@ -998,11 +1032,13 @@ enum StatusClass {
         child_connection_id: String,
     },
     /// Neither running, settling, nor completed in memory — resolve via the DB
-    /// fallback in `assemble_reports`. A not-in-memory id is, for wait purposes,
-    /// already settled: it can never transition back to running, so a batch
-    /// wait need not park on it (and must not hit the DB on every wake).
-    /// Mid-settle tasks live in `settling` and are classified `Running`, not
-    /// this variant.
+    /// fallback in `assemble_reports`. For **park** purposes this is always
+    /// non-parkable: every wait mode returns the assembled snapshot immediately
+    /// when any requested id is `NotInMemory`, even if the DB/lookup still
+    /// reports `TaskStatus::Running`, because this process has no live terminal
+    /// notifier producer for it. Report truth still reflects the lookup (Running
+    /// snapshot for re-poll is fine; hang is not). Mid-settle tasks live in
+    /// `settling` and are classified `Running`, not this variant.
     NotInMemory,
 }
 
@@ -1465,13 +1501,15 @@ impl DelegationBroker {
     }
 
     /// Drop a cached observation when the task leaves logical Running
-    /// (neither `running` nor `settling` — true terminal).
+    /// (neither `running` nor `settling` — true terminal) or on a supervisor
+    /// stale clear. Treats clear as an observation transition: bumps version
+    /// and wakes waiters. Supervised re-evaluates **requested** ids only, so an
+    /// unrelated clear is a harmless wake (re-park).
     pub async fn clear_observation(&self, task_id: &str) {
         let removed = self.observation_cache.lock().await.remove(task_id).is_some();
         if removed {
-            // Terminal path already notifies via settle; version bump is
-            // redundant for Terminal wait but keeps supervised consistent.
             self.bump_status_version();
+            self.result_notify.notify_waiters();
         }
     }
 
@@ -1482,10 +1520,6 @@ impl DelegationBroker {
 
     fn bump_status_version(&self) {
         self.status_version.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn status_version(&self) -> u64 {
-        self.status_version.load(Ordering::SeqCst)
     }
 
     /// Emit observation change on the parent stream (synthetic tool-use ids skip).
@@ -3539,11 +3573,17 @@ impl DelegationBroker {
     ///
     /// Blocking obeys [`StatusWait`]:
     /// - [`Snapshot`] — first assemble, never parks.
-    /// - [`Supervised`] — returns when ANY item is non-Running, Stalled,
-    ///   WaitingInput, or after an observation version change while parked, or
-    ///   at the deadline. Parks only while ALL items are Running+Active.
+    /// - [`Supervised`] — returns when ANY requested item is non-Running,
+    ///   Stalled, WaitingInput, any **requested** observation snapshot
+    ///   transition after park (Active→Active timestamps included), or the
+    ///   deadline. Parks only while ALL requested ids are live
+    ///   [`StatusClass::Running`] and not yet actionable (pre-first-publish
+    ///   `observation: None` continues parking). Unrelated tasks' version
+    ///   bumps re-evaluate but do not end the wait by themselves.
     /// - [`Terminal`] — returns when ANY item is non-Running (Unknown is
-    ///   immediate). Observation transitions are ignored for the exit condition.
+    ///   immediate) **or** any requested id is [`StatusClass::NotInMemory`]
+    ///   (even if DB says Running — no live notifier). Observation transitions
+    ///   are ignored for the exit condition.
     ///
     /// Batch returns as soon as ANY requested item meets the mode condition —
     /// a terminal sibling is never held hostage to a long-running peer.
@@ -3561,9 +3601,9 @@ impl DelegationBroker {
             StatusWait::Supervised(d) => Some(Instant::now() + d),
             StatusWait::Snapshot | StatusWait::Terminal => None,
         };
-        // Version observed when we last parked (Supervised only). A bump after
-        // parking is an observation/terminal transition and ends Supervised.
-        let mut version_at_park: Option<u64> = None;
+        // Observation views captured when we last parked (Supervised only). A
+        // change on **requested** ids ends Supervised; unrelated wakes re-park.
+        let mut obs_at_park: Option<Vec<RequestedObservationView>> = None;
         loop {
             // Arm the notify BEFORE the snapshot so a completion/observation
             // landing between the snapshot and the await isn't lost.
@@ -3571,7 +3611,6 @@ impl DelegationBroker {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let version_now = self.status_version();
             let classes: Vec<StatusClass> = {
                 let inner = self.pending.inner.lock().await;
                 task_ids
@@ -3579,6 +3618,10 @@ impl DelegationBroker {
                     .map(|id| classify_locked(&inner, parent_connection_id, id))
                     .collect()
             };
+            // Park only on live in-memory Running (running ∪ settling). Any
+            // NotInMemory/Settled id forces an immediate return of the assemble
+            // for every mode (cold DB Running has no terminal notify producer).
+            let can_park = all_live_running(&classes);
             let reports = self
                 .assemble_reports(parent_conversation_id, task_ids, classes)
                 .await;
@@ -3586,20 +3629,24 @@ impl DelegationBroker {
             match wait {
                 StatusWait::Snapshot => return reports,
                 StatusWait::Terminal => {
-                    // Unknown and every terminal status are non-Running.
-                    if reports.iter().any(|r| r.status != TaskStatus::Running) {
+                    // Unknown/terminal are non-Running; NotInMemory never parks
+                    // even when the assembled report status is still Running.
+                    if !can_park || reports.iter().any(|r| r.status != TaskStatus::Running) {
                         return reports;
                     }
                     // Observation-only wakes re-evaluate and re-park.
                 }
                 StatusWait::Supervised(_) => {
-                    if supervised_should_return(&reports) {
+                    if !can_park || supervised_should_return(&reports) {
                         return reports;
                     }
-                    // After parking, any version bump (observation transition
-                    // or sibling terminal that didn't hit our id set) ends the
-                    // wait with the current snapshot.
-                    if version_at_park.is_some_and(|v| version_now > v) {
+                    // After parking, return only when a **requested** observation
+                    // snapshot changed (including clear and Active timestamp).
+                    let views = requested_observation_views(&reports);
+                    if obs_at_park
+                        .as_ref()
+                        .is_some_and(|prev| prev.as_slice() != views.as_slice())
+                    {
                         return reports;
                     }
                     let now = Instant::now();
@@ -3609,12 +3656,15 @@ impl DelegationBroker {
                 }
             }
 
-            // All requested items still Running (+ Active for Supervised).
+            // All requested items still live Running (+ not actionable for
+            // Supervised). Snapshot already returned above.
             let now = Instant::now();
             if deadline.is_some_and(|d| now >= d) {
                 return reports;
             }
-            version_at_park = Some(version_now);
+            if matches!(wait, StatusWait::Supervised(_)) {
+                obs_at_park = Some(requested_observation_views(&reports));
+            }
             match deadline {
                 Some(d) => {
                     let remaining = d - now;
@@ -10002,5 +10052,157 @@ mod tests {
         assert_eq!(reports[2].status, TaskStatus::Unknown);
         assert_eq!(reports[0].status, TaskStatus::Running);
         assert_eq!(reports[1].status, TaskStatus::Running);
+    }
+
+    /// I1: NotInMemory + durable/lookup Running must not park Terminal
+    /// (no live notifier producer for that id in this process).
+    #[tokio::test]
+    async fn terminal_wait_not_in_memory_db_running_returns_immediately() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let mock = Arc::new(MockSpawner::new());
+        let store = Arc::new(MockTaskStore::with_running("cold-running", 42));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+            )
+            .with_task_store(store as Arc<dyn DelegationTaskStore>),
+        );
+        enable_delegation(&broker).await;
+
+        let reports = tokio::time::timeout(
+            Duration::from_millis(100),
+            broker.get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &["cold-running".into()],
+                StatusWait::Terminal,
+            ),
+        )
+        .await
+        .expect("NotInMemory+DB Running must not hang under Terminal wait");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].task_id.as_deref(), Some("cold-running"));
+    }
+
+    /// M2: global status-version wake from an unrelated task must not end
+    /// Supervised; only requested-id observation / terminal / deadline does.
+    #[tokio::test]
+    async fn supervised_wait_ignores_unrelated_task_version_bump() {
+        let fixture = running_wait_fixture(&["a", "b"]).await;
+        let a = fixture.resolve("a");
+        fixture.publish("a", TaskObservation::Active).await;
+        fixture.publish("b", TaskObservation::Active).await;
+
+        let mut wait = Box::pin(fixture.broker.status_many(
+            &fixture.parent_id,
+            vec![a],
+            StatusWait::Supervised(Duration::from_secs(60)),
+        ));
+
+        // Sibling stall bumps global version + notifies; requested a unchanged.
+        fixture.publish("b", TaskObservation::Stalled).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut wait)
+                .await
+                .is_err(),
+            "unrelated observation must not end supervised wait"
+        );
+
+        // Requested actionable transition still wakes.
+        fixture.publish("a", TaskObservation::Stalled).await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested stall must wake supervised");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Stalled));
+    }
+
+    /// M3: clear_observation is an observation transition and must notify;
+    /// Supervised returns when a **requested** id clears.
+    #[tokio::test]
+    async fn supervised_wait_wakes_on_requested_observation_clear() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        fixture.publish("a", TaskObservation::Active).await;
+
+        let broker = fixture.broker.clone();
+        let parent_id = fixture.parent_id.clone();
+        let a_wait = a.clone();
+        let wait = tokio::spawn(async move {
+            broker
+                .status_many(
+                    &parent_id,
+                    vec![a_wait],
+                    StatusWait::Supervised(Duration::from_secs(60)),
+                )
+                .await
+        });
+        // Let the wait arm notify and park with Active before clearing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fixture.broker.clear_observation(&a).await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested observation clear must wake supervised")
+            .expect("status_many join");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, None);
+        assert_eq!(reports[0].last_agent_activity_at, None);
+    }
+
+    /// Active→Active timestamp change on a requested id is a full observation
+    /// snapshot transition and still ends Supervised.
+    #[tokio::test]
+    async fn supervised_wait_wakes_on_requested_active_timestamp_change() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        let t1 = Utc::now();
+        fixture
+            .broker
+            .cache_observation(
+                &a,
+                ObservationSnapshot {
+                    observation: TaskObservation::Active,
+                    last_agent_activity_at: t1,
+                    stalled_since: None,
+                },
+            )
+            .await;
+
+        let broker = fixture.broker.clone();
+        let parent_id = fixture.parent_id.clone();
+        let a_wait = a.clone();
+        let wait = tokio::spawn(async move {
+            broker
+                .status_many(
+                    &parent_id,
+                    vec![a_wait],
+                    StatusWait::Supervised(Duration::from_secs(60)),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t2 = t1 + chrono::Duration::seconds(5);
+        fixture
+            .broker
+            .cache_observation(
+                &a,
+                ObservationSnapshot {
+                    observation: TaskObservation::Active,
+                    last_agent_activity_at: t2,
+                    stalled_since: None,
+                },
+            )
+            .await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested Active timestamp change must wake supervised")
+            .expect("status_many join");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Active));
+        assert_eq!(reports[0].last_agent_activity_at, Some(t2));
     }
 }
