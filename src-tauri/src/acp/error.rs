@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::acp::delegation::route::RouteDegradedReason;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::terminal::shell::ShellResolveError;
 
@@ -23,6 +24,12 @@ pub enum AcpError {
         display_name: String,
         executable: String,
     },
+    /// Managed Codeg route could not be established (child never falls back).
+    #[error("delegation route unavailable: {reason:?}")]
+    RouteUnavailable { reason: RouteDegradedReason },
+    /// Session-id reuse found an existing connection with an incompatible route.
+    #[error("session route conflict with connection {existing_connection_id}")]
+    SessionRouteConflict { existing_connection_id: String },
     #[error("agent process exited unexpectedly")]
     ProcessExited,
     /// A prompt arrived while this connection already had a turn in flight.
@@ -100,6 +107,8 @@ impl AcpError {
             Self::ConnectionNotFound(_) => Some("connection_not_found"),
             Self::TerminalShellUnavailable { .. } => Some("terminal_shell_unavailable"),
             Self::TerminalShellUnsupported { .. } => Some("terminal_shell_unsupported"),
+            Self::RouteUnavailable { .. } => Some("route_unavailable"),
+            Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::Protocol(_) => None,
         }
     }
