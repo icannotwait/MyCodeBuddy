@@ -213,9 +213,7 @@ async fn async_main() -> ExitCode {
         // bearer credential and must never enter the durable log files or the
         // in-app log viewer. `eprintln!` bypasses the tracing sinks (file +
         // ring buffer); only the local terminal / Docker stderr sees it.
-        eprintln!(
-            "[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}"
-        );
+        eprintln!("[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}");
         eprintln!("[SERVER] Pin your own by setting the CODEG_TOKEN environment variable.");
     }
 
@@ -264,6 +262,7 @@ async fn async_main() -> ExitCode {
         feedback_config,
         question_config,
         session_info_config,
+        delegation_runtime_settings,
     ) = codeg_lib::app_state::build_delegation_stack(
         &connection_manager,
         db.conn.clone(),
@@ -284,6 +283,7 @@ async fn async_main() -> ExitCode {
         ),
         pet_state: pet_state_handle.clone(),
         delegation_broker: delegation_broker.clone(),
+        delegation_runtime_settings: delegation_runtime_settings.clone(),
         delegation_tokens: delegation_tokens.clone(),
         delegation_socket_path: delegation_socket_path.clone(),
         feedback_config: feedback_config.clone(),
@@ -299,13 +299,18 @@ async fn async_main() -> ExitCode {
         hub.set_emitter(state.emitter.clone());
     }
 
-    // Apply persisted delegation settings (depth, enabled) before
-    // the listener starts accepting so even the first companion request
-    // sees the operator's configured behavior. Cancellation is handled
+    // Apply persisted delegation settings (depth, enabled, route, watchdog)
+    // before the listener starts accepting so even the first companion request
+    // sees the operator's configured behavior. Broker config and the runtime
+    // watch snapshot come from one clamped load. Cancellation is handled
     // out-of-band via MCP `notifications/cancelled` — no broker-side
     // timeout to apply here.
-    codeg_lib::commands::delegation::apply_persisted_config(&state.db.conn, &delegation_broker)
-        .await;
+    codeg_lib::commands::delegation::apply_persisted_config(
+        &state.db.conn,
+        &delegation_broker,
+        &delegation_runtime_settings,
+    )
+    .await;
     // Same for the live-feedback enable flag, so the first companion launch
     // sees the operator's configured behavior.
     codeg_lib::commands::feedback::apply_persisted_feedback_config(
@@ -507,9 +512,11 @@ async fn async_main() -> ExitCode {
     // Publish runtime state so the settings page (served by us) shows
     // the truth — running on `actual_port` with this token — instead of
     // the placeholder "stopped" that triggers the stale-port banner.
-    state
-        .web_server_state
-        .mark_externally_running(advertised_host.clone(), actual_port, token.clone());
+    state.web_server_state.mark_externally_running(
+        advertised_host.clone(),
+        actual_port,
+        token.clone(),
+    );
     let addresses = addresses_for_bind(&advertised_host, actual_port);
 
     // Token on stderr ONLY (bearer credential — keep it out of the log files

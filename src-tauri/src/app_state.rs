@@ -6,6 +6,7 @@ use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
 use crate::chat_channel::manager::ChatChannelManager;
+use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
 use crate::pet_state_mapper::PetStateHandle;
 use crate::terminal::manager::TerminalManager;
@@ -37,6 +38,10 @@ pub struct AppState {
     /// requests here. v1 uses the default `DelegationConfig`; settings UI
     /// hot-swaps via `delegation_broker.set_config`.
     pub delegation_broker: Arc<DelegationBroker>,
+    /// Live route_policy / stalled_after_seconds / enabled snapshot shared by
+    /// route resolution and the soft-watchdog supervisor. Updated only after
+    /// a successful settings transaction (or one clamped load at startup).
+    pub delegation_runtime_settings: DelegationRuntimeSettings,
     /// Per-launch ephemeral tokens identifying parent ACP connections.
     /// Registered when `load_mcp_servers_for_agent` injects the
     /// `codeg-mcp` MCP entry, revoked on parent teardown.
@@ -109,6 +114,7 @@ pub fn build_delegation_stack(
     crate::acp::feedback::FeedbackRuntimeConfig,
     crate::acp::question::QuestionRuntimeConfig,
     crate::acp::session_info::SessionInfoRuntimeConfig,
+    DelegationRuntimeSettings,
 ) {
     use crate::acp::connection::DelegationInjection;
     use crate::acp::delegation::broker::{
@@ -155,6 +161,7 @@ pub fn build_delegation_stack(
     let feedback = crate::acp::feedback::FeedbackRuntimeConfig::new();
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
+    let runtime_settings = DelegationRuntimeSettings::default();
 
     // Install the injection on the manager so spawn_agent picks it up
     // without an extra parameter at every call site.
@@ -172,7 +179,15 @@ pub fn build_delegation_stack(
         }) as Arc<dyn crate::acp::question::SessionQuestionAccess>,
     });
 
-    (broker, tokens, socket_path, feedback, ask, sessions)
+    (
+        broker,
+        tokens,
+        socket_path,
+        feedback,
+        ask,
+        sessions,
+        runtime_settings,
+    )
 }
 
 impl AppState {
@@ -200,6 +215,7 @@ impl AppState {
             feedback_config,
             question_config,
             session_info_config,
+            delegation_runtime_settings,
         ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
         Self {
@@ -219,6 +235,7 @@ impl AppState {
             ),
             pet_state: crate::pet_state_mapper::new_pet_state_handle(),
             delegation_broker,
+            delegation_runtime_settings,
             delegation_tokens,
             delegation_socket_path,
             feedback_config,
