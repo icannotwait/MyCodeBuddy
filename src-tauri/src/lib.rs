@@ -595,6 +595,14 @@ mod tauri_app {
                         return Err(e.into());
                     }
 
+                    // Soft supervisor: after reconcile (fail-closed preserved),
+                    // before/with listener. Observe-only.
+                    crate::app_state::spawn_delegation_supervisor(
+                        broker.clone(),
+                        cm_state.clone_ref(),
+                        &runtime_settings,
+                    );
+
                     let listener_broker = broker.clone();
                     let listener = crate::acp::delegation::listener::DelegationListener::new(
                         listener_broker,

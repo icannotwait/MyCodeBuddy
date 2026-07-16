@@ -178,6 +178,14 @@ pub fn build_delegation_stack(
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
 
+    // Soft-supervisor wake channel: tx side is shared via SupervisorWake on
+    // injection + broker; rx is taken once at desktop/server startup after
+    // reconcile (see spawn_delegation_supervisor).
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(64);
+    let supervisor_wake =
+        crate::acp::delegation::supervisor::SupervisorWake::new(wake_tx);
+    broker.set_supervisor_wake(supervisor_wake.clone());
+
     // Install the injection on the manager so spawn_agent picks it up
     // without an extra parameter at every call site.
     connection_manager.install_delegation(DelegationInjection {
@@ -193,7 +201,11 @@ pub fn build_delegation_stack(
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {
             manager: Arc::new(connection_manager.clone_ref()),
         }) as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        supervisor_wake,
     });
+
+    // Park the wake receiver on the broker until startup takes it.
+    broker.park_supervisor_wake_rx(wake_rx);
 
     (
         broker,
@@ -205,6 +217,68 @@ pub fn build_delegation_stack(
         sessions,
         runtime_settings,
     )
+}
+
+/// Spawn the soft supervisor after Task 8 reconcile and with/before the
+/// delegation listener. Observe-only: no cancel/settle/route capability.
+pub fn spawn_delegation_supervisor(
+    broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+    connection_manager: crate::acp::manager::ConnectionManager,
+    runtime: &DelegationRuntimeSettings,
+) {
+    use crate::acp::delegation::broker::{BrokerObservationSink, BrokerObservationSource};
+    use crate::acp::delegation::supervisor::{DelegationSupervisor, SystemClock};
+
+    let Some(wake_rx) = broker.take_supervisor_wake_rx() else {
+        tracing::warn!(
+            "[delegation] supervisor wake rx already taken; skipping soft supervisor"
+        );
+        return;
+    };
+
+    let threshold_rx = {
+        let (tx, rx) = tokio::sync::watch::channel(runtime.snapshot().stalled_after_seconds);
+        let mut settings_rx = runtime.subscribe();
+        let bridge = async move {
+            loop {
+                if settings_rx.changed().await.is_err() {
+                    break;
+                }
+                let secs = settings_rx.borrow().stalled_after_seconds;
+                if tx.send(secs).is_err() {
+                    break;
+                }
+            }
+        };
+        #[cfg(feature = "tauri-runtime")]
+        tauri::async_runtime::spawn(bridge);
+        #[cfg(not(feature = "tauri-runtime"))]
+        tokio::spawn(bridge);
+        rx
+    };
+
+    let source = Arc::new(BrokerObservationSource {
+        broker: broker.clone(),
+        manager: Arc::new(connection_manager.clone_ref()),
+    });
+    let sink = Arc::new(BrokerObservationSink {
+        broker: broker.clone(),
+    });
+    let supervisor = DelegationSupervisor::new(
+        source,
+        sink,
+        Arc::new(SystemClock),
+        threshold_rx,
+        wake_rx,
+    );
+    let run = async move {
+        supervisor.run().await;
+        tracing::info!("[delegation] soft supervisor exited");
+    };
+    #[cfg(feature = "tauri-runtime")]
+    tauri::async_runtime::spawn(run);
+    #[cfg(not(feature = "tauri-runtime"))]
+    tokio::spawn(run);
 }
 
 impl AppState {

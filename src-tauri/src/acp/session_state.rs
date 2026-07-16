@@ -355,7 +355,19 @@ pub struct SessionState {
 
     // 事件锚点
     pub event_seq: u64,
+    /// Idle-sweep / general liveness timestamp. Bumped on every emit and
+    /// frontend keepalive. **Not** the soft-watchdog agent activity clock.
     pub last_activity_at: DateTime<Utc>,
+
+    /// Soft-watchdog agent activity clock. Advanced only by normalized Agent
+    /// transcript/thinking, tool start/update/progress, and plan activity (or
+    /// first successful child prompt enqueue). Independent of `last_activity_at`.
+    pub last_agent_activity_at: DateTime<Utc>,
+
+    /// Optional wake handle for the soft supervisor. Default is noop so unit
+    /// tests that never install a wake stay silent. Not serialized / not on
+    /// wire snapshots.
+    pub(crate) supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
 
     /// Per-connection event broadcaster used by the WS attach protocol.
     /// New subscribers register receivers here while holding the SessionState
@@ -478,6 +490,8 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_agent_activity_at: Utc::now(),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
@@ -492,6 +506,13 @@ impl SessionState {
             // that never set a plan still deserialize/serialize as legacy default.
             delegation_route: legacy_unmanaged_route_snapshot(),
         }
+    }
+
+    /// Mark real agent-side progress for the soft watchdog. Does **not** touch
+    /// `last_activity_at` (idle sweep). Wakes the supervisor when a handle is set.
+    pub fn mark_agent_activity(&mut self, at: DateTime<Utc>) {
+        self.last_agent_activity_at = at;
+        self.supervisor_wake.notify();
     }
 
     /// Install the plan-derived route snapshot (availability still false until
@@ -693,6 +714,8 @@ impl SessionState {
                     options: options.clone(),
                     created_at: Utc::now(),
                 });
+                // Waiting-input observation changes — wake soft supervisor.
+                self.supervisor_wake.notify();
             }
             AcpEvent::PermissionResolved { request_id } => {
                 // Drop the snapshot's pending_permission iff the resolved
@@ -705,6 +728,7 @@ impl SessionState {
                     Some(p) if p.request_id == *request_id,
                 ) {
                     self.pending_permission = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::QuestionRequest {
@@ -716,6 +740,7 @@ impl SessionState {
                     questions: questions.clone(),
                     created_at: Utc::now(),
                 });
+                self.supervisor_wake.notify();
             }
             AcpEvent::QuestionResolved { question_id } => {
                 // Mirror `PermissionResolved`: only clear when the resolved id
@@ -726,6 +751,7 @@ impl SessionState {
                     Some(p) if p.question_id == *question_id,
                 ) {
                     self.pending_question = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::TurnComplete { .. } => {
@@ -779,12 +805,17 @@ impl SessionState {
                 // turn completes; clearing it would drop the running binding from
                 // the snapshot the instant the parent turn ends (the original
                 // web-only bug). It's removed per-entry by `DelegationCompleted`.
+                let had_waiting =
+                    self.pending_permission.is_some() || self.pending_question.is_some();
                 self.pending_permission = None;
                 // A blocked `ask_user_question` can't outlive its turn: if the
                 // turn ends (cancel / stop) the card is moot. The backend's
                 // answer one-shot is cleaned via the listener's peer-close race;
                 // this just keeps the snapshot honest.
                 self.pending_question = None;
+                if had_waiting {
+                    self.supervisor_wake.notify();
+                }
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
@@ -806,7 +837,10 @@ impl SessionState {
                 // window before this next prompt arrives.
                 self.feedback.clear();
                 // A new user turn supersedes any stale pending question.
-                self.pending_question = None;
+                if self.pending_question.is_some() {
+                    self.pending_question = None;
+                    self.supervisor_wake.notify();
+                }
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -1439,6 +1473,24 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    #[test]
+    fn mark_agent_activity_does_not_advance_idle_sweep_timestamp() {
+        let mut s = fresh_state();
+        let idle_before = s.last_activity_at;
+        let agent_before = s.last_agent_activity_at;
+        // Ensure a distinct later instant for agent activity.
+        let later = agent_before + chrono::Duration::seconds(42);
+        s.mark_agent_activity(later);
+        assert_eq!(
+            s.last_agent_activity_at, later,
+            "agent activity clock advances"
+        );
+        assert_eq!(
+            s.last_activity_at, idle_before,
+            "idle-sweep last_activity_at must stay unchanged"
+        );
     }
 
     #[test]

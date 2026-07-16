@@ -961,6 +961,10 @@ pub async fn spawn_agent_connection(
     );
     // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
     initial_state.set_route_plan_snapshot(&route_plan);
+    // Soft-supervisor wake (noop when injection lacks a handle).
+    if let Some(inj) = delegation_injection.as_ref() {
+        initial_state.supervisor_wake = inj.supervisor_wake.clone();
+    }
 
     // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
     // first event (StatusChanged{Connecting} below) doesn't race with the
@@ -2020,6 +2024,10 @@ pub struct DelegationInjection {
     /// the delegation `broker.cancel_by_parent` cleanup. Shares the same backing
     /// `ConnectionManager` as the listener's question lookup.
     pub questions: Arc<dyn crate::acp::question::SessionQuestionAccess>,
+    /// Soft-supervisor wake handle. Cloned onto each `SessionState` at spawn so
+    /// agent activity and permission/question changes can nudge the supervisor.
+    /// Default `noop` until bootstrap installs a live channel.
+    pub supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
 }
 
 /// Typed bootstrap outcome from the connection task to the manager.
@@ -3023,7 +3031,12 @@ async fn run_connection(
                                     })
                                     .await
                                     .otherwise(async |dispatch| {
-                                        maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                        // Historical replay: never counts as
+                                        // agent activity for the soft watchdog.
+                                        let _ = maybe_emit_claude_sdk_ext_notification(
+                                            &st, &h, dispatch,
+                                        )
+                                        .await;
                                         Ok(())
                                     })
                                     .await;
@@ -4556,6 +4569,22 @@ fn is_agent_output_update(update: &SessionUpdate) -> bool {
     )
 }
 
+/// Soft-watchdog activity classifier. True only for Agent transcript /
+/// thinking chunks, tool start/update/progress, and plan activity.
+/// User/frontend keepalive, commands, usage, status, and session-info noise
+/// do **not** count. Distinct from [`is_agent_output_update`] (which excludes
+/// `Plan` for silent-EndTurn detection).
+pub(crate) fn advances_agent_activity(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
+    )
+}
+
 /// Build an `AcpEvent::Error` for a non-success stop reason so the user gets a
 /// toast instead of a silent transition to `PendingReview`. Returns `None` for
 /// `end_turn` (success) and `cancelled` (already user-driven).
@@ -4664,13 +4693,25 @@ async fn run_conversation_loop<'a>(
                             let _ = MatchDispatch::new(dispatch)
                                 .if_notification(
                                     async |notif: SessionNotification| {
+                                        // Soft-watchdog: mark agent activity at
+                                        // the inbound boundary, before conversion.
+                                        if advances_agent_activity(&notif.update) {
+                                            st.write().await.mark_agent_activity(chrono::Utc::now());
+                                        }
                                         emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
                                         Ok(())
                                     },
                                 )
                                 .await
                                 .otherwise(async |dispatch| {
-                                    maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                    if maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch)
+                                        .await
+                                    {
+                                        // Only when a normalizer advanced
+                                        // transcript/tool state (currently never
+                                        // for api_retry-only envelopes).
+                                        st.write().await.mark_agent_activity(chrono::Utc::now());
+                                    }
                                     Ok(())
                                 })
                                 .await;
@@ -4818,6 +4859,13 @@ async fn run_conversation_loop<'a>(
                                                 if is_agent_output_update(&notif.update) {
                                                     turn_had_agent_output = true;
                                                 }
+                                                // Soft-watchdog: mark at inbound
+                                                // boundary before event conversion.
+                                                if advances_agent_activity(&notif.update) {
+                                                    st.write()
+                                                        .await
+                                                        .mark_agent_activity(chrono::Utc::now());
+                                                }
                                                 emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
                                                 if should_poll_now {
                                                     poll_tracked_terminal_tool_calls(
@@ -4834,7 +4882,15 @@ async fn run_conversation_loop<'a>(
                                         )
                                         .await
                                         .otherwise(async |dispatch| {
-                                            maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                            if maybe_emit_claude_sdk_ext_notification(
+                                                &st, &h, dispatch,
+                                            )
+                                            .await
+                                            {
+                                                st.write()
+                                                    .await
+                                                    .mark_agent_activity(chrono::Utc::now());
+                                            }
                                             Ok(())
                                         })
                                         .await
@@ -6063,18 +6119,25 @@ fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpE
     })
 }
 
+/// Emit adapter-specific raw SDK notifications. Returns `true` only when a
+/// normalizer advanced the same live transcript / tool state that the soft
+/// watchdog treats as agent activity. Claude `api_retry` system messages are
+/// UI status only and return `false`.
 async fn maybe_emit_claude_sdk_ext_notification(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     dispatch: Dispatch,
-) {
+) -> bool {
     let Dispatch::Notification(notification) = dispatch else {
-        return;
+        return false;
     };
 
     if let Some(event) = map_claude_sdk_ext_notification(&notification) {
+        // api_retry → ClaudeSdkMessage does not advance transcript/tool state.
         emit_with_state(state, emitter, event).await;
+        return false;
     }
+    false
 }
 
 /// Fix null fields in `usage_update` notifications that would otherwise fail deserialization.
@@ -6532,6 +6595,91 @@ mod tests {
     };
     use sacp::schema::Diff;
     use std::sync::Arc;
+
+    fn agent_text_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("agent_message_chunk")
+    }
+
+    fn agent_thought_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("agent_thought_chunk")
+    }
+
+    fn tool_start_update(tool_id: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_id,
+            "title": "run",
+            "kind": "execute",
+            "status": "pending"
+        }))
+        .expect("tool_call")
+    }
+
+    fn tool_progress_update(tool_id: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_id,
+            "status": "in_progress"
+        }))
+        .expect("tool_call_update")
+    }
+
+    fn plan_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [{
+                "content": "step",
+                "priority": "medium",
+                "status": "pending"
+            }]
+        }))
+        .expect("plan")
+    }
+
+    fn available_commands_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": []
+        }))
+        .expect("available_commands_update")
+    }
+
+    fn usage_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "used": 1,
+            "size": 100
+        }))
+        .expect("usage_update")
+    }
+
+    fn user_message_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("user_message_chunk")
+    }
+
+    #[test]
+    fn agent_activity_classifier_excludes_ui_and_status_noise() {
+        assert!(advances_agent_activity(&agent_text_update("x")));
+        assert!(advances_agent_activity(&agent_thought_update("x")));
+        assert!(advances_agent_activity(&tool_start_update("tool-1")));
+        assert!(advances_agent_activity(&tool_progress_update("tool-1")));
+        assert!(advances_agent_activity(&plan_update()));
+        assert!(!advances_agent_activity(&available_commands_update()));
+        assert!(!advances_agent_activity(&usage_update()));
+        assert!(!advances_agent_activity(&user_message_update("keepalive")));
+    }
 
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {
         let mut d = Diff::new(path, new);
@@ -9489,6 +9637,7 @@ mod tests {
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
         };
 
         let mut servers: Vec<McpServer> = Vec::new();

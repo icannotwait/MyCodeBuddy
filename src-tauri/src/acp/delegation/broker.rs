@@ -66,9 +66,10 @@ use crate::acp::delegation::store::{
     DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy,
     Settlement, TerminalTaskWrite,
 };
+use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationRequest, DelegationTaskReport, TaskStatus,
+    DelegationRequest, DelegationTaskReport, ObservationSnapshot, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::db::entities::conversation::ConversationStatus;
@@ -1274,6 +1275,15 @@ pub struct DelegationBroker {
     /// Woken after every terminal `record_completed` so a `get_delegation_status`
     /// long-poll wakes the instant its task finishes instead of busy-polling.
     result_notify: Arc<Notify>,
+    /// Soft-supervisor observation cache (running tasks only). Sink updates;
+    /// Task 10 status/wait may read. Never a terminal lifecycle write.
+    observation_cache: Arc<Mutex<HashMap<String, ObservationSnapshot>>>,
+    /// Wake handle for the soft supervisor (accepted/terminal transitions).
+    /// Mutex so production can install a live channel after `with_writers`.
+    supervisor_wake: Arc<std::sync::Mutex<SupervisorWake>>,
+    /// Soft-supervisor wake receiver, parked until desktop/server startup
+    /// takes it after reconcile. Tests leave this `None` (noop wake).
+    supervisor_wake_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
     /// Count of persistence-retry workers actually spawned (single-flight
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1338,9 +1348,75 @@ impl DelegationBroker {
             config: Arc::new(Mutex::new(DelegationConfig::default())),
             mandatory_profile_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             result_notify: Arc::new(Notify::new()),
+            observation_cache: Arc::new(Mutex::new(HashMap::new())),
+            supervisor_wake: Arc::new(std::sync::Mutex::new(SupervisorWake::noop())),
+            supervisor_wake_rx: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Install the soft-supervisor wake handle (production bootstrap). Tests
+    /// leave the default noop.
+    pub fn set_supervisor_wake(&self, wake: SupervisorWake) {
+        *self
+            .supervisor_wake
+            .lock()
+            .expect("supervisor_wake lock") = wake;
+    }
+
+    /// Park the wake receiver until startup takes it after reconcile.
+    pub fn park_supervisor_wake_rx(&self, rx: tokio::sync::mpsc::Receiver<()>) {
+        *self
+            .supervisor_wake_rx
+            .lock()
+            .expect("supervisor_wake_rx lock") = Some(rx);
+    }
+
+    /// Take the parked wake receiver exactly once (desktop/server startup).
+    pub fn take_supervisor_wake_rx(&self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        self.supervisor_wake_rx
+            .lock()
+            .expect("supervisor_wake_rx lock")
+            .take()
+    }
+
+    /// Nudge the soft supervisor (non-blocking; coalesces when channel is full).
+    pub fn notify_supervisor(&self) {
+        self.supervisor_wake
+            .lock()
+            .expect("supervisor_wake lock")
+            .notify();
+    }
+
+    /// Running Broker tasks as `(task_id, child_connection_id)` for the
+    /// observation source. Settling tasks are still lifecycle-running for
+    /// status, but observation only covers `running` (not mid-settle).
+    pub async fn running_task_child_ids(&self) -> Vec<(String, String)> {
+        let inner = self.pending.inner.lock().await;
+        inner
+            .running
+            .iter()
+            .map(|(id, t)| (id.clone(), t.child_connection_id.clone()))
+            .collect()
+    }
+
+    /// Cache a soft-supervisor observation (observe-only; never mutates status).
+    pub async fn cache_observation(&self, task_id: &str, snap: ObservationSnapshot) {
+        self.observation_cache
+            .lock()
+            .await
+            .insert(task_id.to_string(), snap);
+    }
+
+    /// Drop a cached observation when the task leaves `running`.
+    pub async fn clear_observation(&self, task_id: &str) {
+        self.observation_cache.lock().await.remove(task_id);
+    }
+
+    /// Read a cached observation (for future status/wait enrichment).
+    pub async fn cached_observation(&self, task_id: &str) -> Option<ObservationSnapshot> {
+        self.observation_cache.lock().await.get(task_id).cloned()
     }
 
     /// Replace the DB status fallback used by `get_delegation_status` /
@@ -2641,6 +2717,10 @@ impl DelegationBroker {
                 }
             }
         };
+        // Accepted → running: soft supervisor should re-scan.
+        if matches!(disposition, Disposition::Running) {
+            self.notify_supervisor();
+        }
 
         match disposition {
             // A child terminal beat registration — durable settle then return.
@@ -2788,6 +2868,9 @@ impl DelegationBroker {
                     );
                 }
                 self.result_notify.notify_waiters();
+                // Terminal: drop observation cache entry and wake supervisor.
+                self.clear_observation(task_id).await;
+                self.notify_supervisor();
                 if won {
                     // Live sidebar coherence: one ConversationStatusChanged
                     // matching the durable CAS write (Existing/loser skips).
@@ -2880,6 +2963,8 @@ impl DelegationBroker {
                     );
                 }
                 self.result_notify.notify_waiters();
+                self.clear_observation(task_id).await;
+                self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 let retry_terminal = TerminalTaskWrite::failed(
                     "persistence_error",
@@ -3742,6 +3827,58 @@ impl ChildStatusLookup for DbChildStatusLookup {
             parent_id: summary.parent_id,
             error_code: summary.delegation_error_code.clone(),
         })
+    }
+}
+
+// ── Soft-supervisor production adapters (observe-only) ─────────────────────
+
+use crate::acp::delegation::supervisor::{
+    DelegationObservationSink, DelegationObservationSource, RunningTaskHealth,
+};
+use crate::acp::manager::ConnectionManager;
+
+/// Joins Broker running-task ids to child `SessionState` snapshots (read-only).
+pub struct BrokerObservationSource {
+    pub broker: Arc<DelegationBroker>,
+    pub manager: Arc<ConnectionManager>,
+}
+
+#[async_trait]
+impl DelegationObservationSource for BrokerObservationSource {
+    async fn running_task_health(&self) -> Vec<RunningTaskHealth> {
+        let pairs = self.broker.running_task_child_ids().await;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (task_id, child_connection_id) in pairs {
+            let Some(state) = self.manager.get_state(&child_connection_id).await else {
+                continue;
+            };
+            let guard = state.read().await;
+            let waiting_input =
+                guard.pending_permission.is_some() || guard.pending_question.is_some();
+            out.push(RunningTaskHealth {
+                task_id,
+                child_connection_id,
+                last_agent_activity_at: guard.last_agent_activity_at,
+                waiting_input,
+            });
+        }
+        out
+    }
+}
+
+/// Observation cache sink — never mutates task status or connections.
+pub struct BrokerObservationSink {
+    pub broker: Arc<DelegationBroker>,
+}
+
+#[async_trait]
+impl DelegationObservationSink for BrokerObservationSink {
+    async fn publish_observation(&self, task_id: &str, observation: ObservationSnapshot) {
+        self.broker.cache_observation(task_id, observation).await;
+    }
+
+    async fn clear_observation(&self, task_id: &str) {
+        self.broker.clear_observation(task_id).await;
     }
 }
 

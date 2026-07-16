@@ -3118,7 +3118,19 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             )
             .await
         {
-            Ok(Some(cid)) => Ok(cid),
+            Ok(Some(cid)) => {
+                // Soft-watchdog: first successful child prompt enqueue resets
+                // agent activity so a newly accepted silent child gets a full
+                // threshold window. Does not touch idle-sweep last_activity_at
+                // beyond whatever send_prompt already did for general liveness.
+                if let Some(state) = self.manager.get_state(conn_id).await {
+                    state
+                        .write()
+                        .await
+                        .mark_agent_activity(chrono::Utc::now());
+                }
+                Ok(cid)
+            }
             Ok(None) => Err(SpawnerError::send(
                 "send_prompt_linked succeeded but no conversation_id was bound",
             )),
@@ -7128,6 +7140,7 @@ mod tests {
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
         });
 
         let conn_id = "unexposed-1".to_string();
@@ -7323,6 +7336,7 @@ mod tests {
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
         });
 
         let conn_id = "stuck-1".to_string();

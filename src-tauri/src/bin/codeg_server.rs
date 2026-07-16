@@ -343,6 +343,14 @@ async fn async_main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Soft supervisor: after reconcile (fail-closed preserved), before/with
+    // the listener. Observe-only — no cancel/settle/route capability.
+    codeg_lib::app_state::spawn_delegation_supervisor(
+        delegation_broker.clone(),
+        state.connection_manager.clone_ref(),
+        &delegation_runtime_settings,
+    );
+
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.

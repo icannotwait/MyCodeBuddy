@@ -12,9 +12,30 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::AgentType;
+
+/// Soft-watchdog health for a **running** Broker task only. Terminal tasks
+/// have no observation. Observe-only — never a lifecycle / terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskObservation {
+    Active,
+    Stalled,
+    WaitingInput,
+}
+
+/// Snapshot published by the soft supervisor when observation or timestamps
+/// change. `stalled_since` is `last_agent_activity_at + threshold` (not scan time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationSnapshot {
+    pub observation: TaskObservation,
+    pub last_agent_activity_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
+}
 
 /// Per-agent defaults applied when codeg-mcp spawns a subagent on behalf of a
 /// `delegate_to_agent` call. Mirrors the two knobs `ConnectionManager::spawn_agent`
