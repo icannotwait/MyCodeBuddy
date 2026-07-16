@@ -43,9 +43,7 @@ describe("remarkAutolinkLocalPaths", () => {
       {
         type: "link",
         url: "/D:/repo/src/app.ts",
-        children: [
-          { type: "text", value: String.raw`D:\repo\src\app.ts` },
-        ],
+        children: [{ type: "text", value: String.raw`D:\repo\src\app.ts` }],
       },
       { type: "text", value: " now" },
     ])
@@ -60,18 +58,14 @@ describe("remarkAutolinkLocalPaths", () => {
       {
         type: "link",
         url: "/D:/My%20Project/app.ts",
-        children: [
-          { type: "text", value: String.raw`D:\My Project\app.ts` },
-        ],
+        children: [{ type: "text", value: String.raw`D:\My Project\app.ts` }],
       },
       { type: "text", value: '" now' },
     ])
   })
 
   it("creates multiple non-overlapping links", () => {
-    const tree = paragraph(
-      String.raw`D:\repo\a.ts and /Users/me/repo/b.ts#L4`
-    )
+    const tree = paragraph(String.raw`D:\repo\a.ts and /Users/me/repo/b.ts#L4`)
     remarkAutolinkLocalPaths()(tree)
     const links = tree.children?.[0].children?.filter(
       (child) => child.type === "link"

@@ -81,30 +81,30 @@ describe("MessageResponse local-path autolinking", () => {
     ["#L12", String.raw`see "D:\My Project\src\app.ts#L12" now`],
     ["#L12-L20", String.raw`see "D:\My Project\src\app.ts#L12-L20" now`],
     ["#L12-20", String.raw`see "D:\My Project\src\app.ts#L12-20" now`],
-  ])("opens a quoted Windows path with %s at its starting line", async (
-    _suffix,
-    source
-  ) => {
-    const { container } = render(
-      <MessageResponse autolinkLocalPaths>{source}</MessageResponse>
-    )
-    const button = await waitFor(() => {
-      const found = container.querySelector<HTMLButtonElement>(
-        "button[data-resource-kind='file']"
+  ])(
+    "opens a quoted Windows path with %s at its starting line",
+    async (_suffix, source) => {
+      const { container } = render(
+        <MessageResponse autolinkLocalPaths>{source}</MessageResponse>
       )
-      expect(found).not.toBeNull()
-      return found!
-    })
-    fireEvent.click(button)
-    await waitFor(() => {
-      expect(mocks.openFilePreview).toHaveBeenCalledWith(
-        "D:/My Project/src/app.ts",
-        { line: 12 }
-      )
-    })
-    expect(mocks.openUrl).not.toHaveBeenCalled()
-    expect(window.open).not.toHaveBeenCalled()
-  })
+      const button = await waitFor(() => {
+        const found = container.querySelector<HTMLButtonElement>(
+          "button[data-resource-kind='file']"
+        )
+        expect(found).not.toBeNull()
+        return found!
+      })
+      fireEvent.click(button)
+      await waitFor(() => {
+        expect(mocks.openFilePreview).toHaveBeenCalledWith(
+          "D:/My Project/src/app.ts",
+          { line: 12 }
+        )
+      })
+      expect(mocks.openUrl).not.toHaveBeenCalled()
+      expect(window.open).not.toHaveBeenCalled()
+    }
+  )
 
   it("does not autolink inline code or slash commands", () => {
     const { container } = render(

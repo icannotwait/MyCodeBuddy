@@ -183,10 +183,9 @@ describe("link safety direct opening", () => {
     fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
 
     await waitFor(() => {
-      expect(mocks.openFilePreview).toHaveBeenCalledWith(
-        "C:/repo/src/app.ts",
-        { line: 12 }
-      )
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("C:/repo/src/app.ts", {
+        line: 12,
+      })
     })
   })
 
@@ -221,10 +220,9 @@ describe("link safety direct opening", () => {
     fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
 
     await waitFor(() => {
-      expect(mocks.openFilePreview).toHaveBeenCalledWith(
-        "/C:/repo/report:12",
-        { line: undefined }
-      )
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("/C:/repo/report:12", {
+        line: undefined,
+      })
     })
   })
 

@@ -56,10 +56,7 @@ vi.mock("@/components/diff/unified-diff-preview", () => ({
   ),
 }))
 
-import {
-  ContentPartsRenderer,
-  ToolCallPart,
-} from "./content-parts-renderer"
+import { ContentPartsRenderer, ToolCallPart } from "./content-parts-renderer"
 
 function wrap(ui: React.ReactElement) {
   return render(

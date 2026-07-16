@@ -157,9 +157,7 @@ export function findAbsoluteLocalPathRanges(text: string): LocalPathMatch[] {
       const close = findQuotedClose(text, index + 1, current)
       if (!close) break
       const label = text.slice(index + 1, close.end)
-      const containsNestedQuote = label.includes(
-        current === '"' ? "'" : '"'
-      )
+      const containsNestedQuote = label.includes(current === '"' ? "'" : '"')
       if (!close.containsEscapedQuote && !containsNestedQuote) {
         const match = parseCandidate(label, index + 1, close.end)
         if (match) matches.push(match)

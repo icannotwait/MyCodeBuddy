@@ -168,9 +168,7 @@ function topLevelAssistantTextParts(
   const parts = message.content.filter(
     (part): part is AutolinkableTextPart => part.type === "text"
   )
-  return parts.length > 0
-    ? new Set(parts)
-    : EMPTY_AUTOLINKABLE_TEXT_PARTS
+  return parts.length > 0 ? new Set(parts) : EMPTY_AUTOLINKABLE_TEXT_PARTS
 }
 
 type ThreadRenderItem =
