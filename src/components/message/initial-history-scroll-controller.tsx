@@ -29,6 +29,8 @@ export function InitialHistoryScrollController({
   const scrollToBottomRef = useRef(scrollToBottom)
   const stopScrollRef = useRef(stopScroll)
   const onFinishRef = useRef(onFinish)
+  /** One-shot guard: survives StrictMode effect replay; not set before readiness. */
+  const finishedRef = useRef(false)
 
   useLayoutEffect(() => {
     scrollToBottomRef.current = scrollToBottom
@@ -39,20 +41,22 @@ export function InitialHistoryScrollController({
   useLayoutEffect(() => {
     if (!pending || !historyReady) return
     if (!hasHistoryRows) {
+      if (finishedRef.current) return
+      finishedRef.current = true
       onFinishRef.current()
       return
     }
 
-    const viewport = scrollRef.current
-    if (!viewport) return
-
     let disposed = false
+    let started = false
     let frameId: number | null = null
     let previousContentHeight: number | null = null
     let previousScrollHeight: number | null = null
     let stableFrames = 0
+    let viewport: HTMLElement | null = null
 
     const removeListeners = () => {
+      if (!viewport) return
       viewport.removeEventListener("wheel", cancelForUser)
       viewport.removeEventListener("touchstart", cancelForUser)
       viewport.removeEventListener("pointerdown", onPointerDown)
@@ -60,8 +64,9 @@ export function InitialHistoryScrollController({
     }
 
     const finish = (cancelledByUser: boolean) => {
-      if (disposed) return
+      if (disposed || finishedRef.current) return
       disposed = true
+      finishedRef.current = true
       if (frameId != null) {
         cancelAnimationFrame(frameId)
         frameId = null
@@ -78,8 +83,14 @@ export function InitialHistoryScrollController({
     function onPointerDown(event: PointerEvent) {
       // Treat missing button as primary (jsdom/fireEvent often omits it).
       if ((event.button ?? 0) !== 0 || event.ctrlKey) return
-      const target = event.target as Element | null
-      if (target?.closest(SCROLL_FOLLOW_INTERACTIVE_SELECTOR)) return
+      const target = event.target
+      if (
+        target instanceof Element &&
+        target.closest(SCROLL_FOLLOW_INTERACTIVE_SELECTOR)
+      ) {
+        return
+      }
+      // Non-Element targets (e.g. Text) cancel normally.
       cancelForUser()
     }
 
@@ -124,13 +135,31 @@ export function InitialHistoryScrollController({
       frameId = requestAnimationFrame(measure)
     }
 
-    viewport.addEventListener("wheel", cancelForUser, { passive: true })
-    viewport.addEventListener("touchstart", cancelForUser, { passive: true })
-    viewport.addEventListener("pointerdown", onPointerDown)
-    viewport.addEventListener("keydown", onKeyDown)
+    const beginWithViewport = (el: HTMLElement) => {
+      viewport = el
+      viewport.addEventListener("wheel", cancelForUser, { passive: true })
+      viewport.addEventListener("touchstart", cancelForUser, { passive: true })
+      viewport.addEventListener("pointerdown", onPointerDown)
+      viewport.addEventListener("keydown", onKeyDown)
 
-    void scrollToBottomRef.current({ animation: "instant" })
-    frameId = requestAnimationFrame(measure)
+      void scrollToBottomRef.current({ animation: "instant" })
+      frameId = requestAnimationFrame(measure)
+    }
+
+    /** Sync when viewport exists; otherwise cancelable RAF until it attaches. */
+    const start = () => {
+      frameId = null
+      if (disposed || finishedRef.current || started) return
+      const el = scrollRef.current
+      if (!el) {
+        frameId = requestAnimationFrame(start)
+        return
+      }
+      started = true
+      beginWithViewport(el)
+    }
+
+    start()
 
     return () => {
       if (disposed) return

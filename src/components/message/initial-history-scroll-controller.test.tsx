@@ -5,11 +5,17 @@ import {
   render,
   renderHook,
 } from "@testing-library/react"
+import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   scrollToBottom: vi.fn(),
   stopScroll: vi.fn(),
+}))
+
+const stickRefs = vi.hoisted(() => ({
+  scrollRef: { current: null as HTMLDivElement | null },
+  contentRef: { current: null as HTMLDivElement | null },
 }))
 
 let scrollElement: HTMLDivElement
@@ -19,8 +25,8 @@ let contentHeight = 0
 
 vi.mock("use-stick-to-bottom", () => ({
   useStickToBottomContext: () => ({
-    scrollRef: { current: scrollElement },
-    contentRef: { current: contentElement },
+    scrollRef: stickRefs.scrollRef,
+    contentRef: stickRefs.contentRef,
     scrollToBottom: mocks.scrollToBottom,
     stopScroll: mocks.stopScroll,
   }),
@@ -43,9 +49,38 @@ function flushNextFrame(): void {
   act(() => entry[1](0))
 }
 
+function flushStableFinish(): void {
+  // baseline sample, stable #1, stable #2 → final scroll + finish
+  flushNextFrame()
+  flushNextFrame()
+  flushNextFrame()
+}
+
+/** jsdom lacks PointerEvent; MouseEvent carries button/ctrlKey for our handlers. */
+function dispatchPointerDown(
+  target: EventTarget,
+  init: { button?: number; ctrlKey?: boolean; eventTarget?: EventTarget } = {}
+): void {
+  const event = new MouseEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    button: init.button ?? 0,
+    ctrlKey: init.ctrlKey ?? false,
+  })
+  if (init.eventTarget != null) {
+    Object.defineProperty(event, "target", {
+      configurable: true,
+      get: () => init.eventTarget,
+    })
+  }
+  target.dispatchEvent(event)
+}
+
 beforeEach(() => {
   scrollElement = document.createElement("div")
   contentElement = document.createElement("div")
+  stickRefs.scrollRef.current = scrollElement
+  stickRefs.contentRef.current = contentElement
   scrollHeight = 500
   contentHeight = 100
   Object.defineProperty(scrollElement, "scrollHeight", {
@@ -182,6 +217,99 @@ describe("InitialHistoryScrollController", () => {
     expect(onFinish).toHaveBeenCalledTimes(1)
   })
 
+  it("finishes empty successful history only once under StrictMode", () => {
+    const onFinish = vi.fn()
+    render(
+      <StrictMode>
+        <InitialHistoryScrollController
+          pending
+          historyReady
+          hasHistoryRows={false}
+          onFinish={onFinish}
+        />
+      </StrictMode>
+    )
+    expect(mocks.scrollToBottom).not.toHaveBeenCalled()
+    expect(onFinish).toHaveBeenCalledTimes(1)
+  })
+
+  it("still finishes after a failed load then empty successful history", () => {
+    const onFinish = vi.fn()
+    const view = render(
+      <InitialHistoryScrollController
+        pending
+        historyReady={false}
+        hasHistoryRows={false}
+        onFinish={onFinish}
+      />
+    )
+    expect(onFinish).not.toHaveBeenCalled()
+
+    view.rerender(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows={false}
+        onFinish={onFinish}
+      />
+    )
+    expect(mocks.scrollToBottom).not.toHaveBeenCalled()
+    expect(onFinish).toHaveBeenCalledTimes(1)
+  })
+
+  it("retries start via RAF when viewport attaches after ready without rerender", () => {
+    const onFinish = vi.fn()
+    stickRefs.scrollRef.current = null
+
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+
+    expect(mocks.scrollToBottom).not.toHaveBeenCalled()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(frames.size).toBe(1)
+
+    // Attach viewport without React re-render (ref.current change alone).
+    stickRefs.scrollRef.current = scrollElement
+
+    flushNextFrame()
+    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(1)
+    expect(mocks.scrollToBottom).toHaveBeenLastCalledWith({
+      animation: "instant",
+    })
+    expect(frames.size).toBe(1)
+
+    flushStableFinish()
+    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(2)
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    expect(frames.size).toBe(0)
+  })
+
+  it("cancels pre-start RAF retry on unmount without finishing", () => {
+    const onFinish = vi.fn()
+    stickRefs.scrollRef.current = null
+
+    const view = render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+    expect(frames.size).toBe(1)
+
+    view.unmount()
+    expect(frames.size).toBe(0)
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(mocks.scrollToBottom).not.toHaveBeenCalled()
+  })
+
   it.each(["wheel", "touchstart", "pointerdown", "PageUp", "Home", "ArrowUp"])(
     "cancels initialization on %s user input",
     (input) => {
@@ -211,6 +339,95 @@ describe("InitialHistoryScrollController", () => {
     }
   )
 
+  it("ignores non-primary pointer and leaves RAF pending", () => {
+    const onFinish = vi.fn()
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+    expect(frames.size).toBe(1)
+
+    dispatchPointerDown(scrollElement, { button: 1 })
+
+    expect(mocks.stopScroll).not.toHaveBeenCalled()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(frames.size).toBe(1)
+  })
+
+  it("ignores ctrl+primary pointer and leaves RAF pending", () => {
+    const onFinish = vi.fn()
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+    expect(frames.size).toBe(1)
+
+    dispatchPointerDown(scrollElement, { button: 0, ctrlKey: true })
+
+    expect(mocks.stopScroll).not.toHaveBeenCalled()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(frames.size).toBe(1)
+  })
+
+  it("ignores pointer on interactive control matching SCROLL_FOLLOW_INTERACTIVE_SELECTOR", () => {
+    const onFinish = vi.fn()
+    const button = document.createElement("button")
+    button.type = "button"
+    button.textContent = "action"
+    scrollElement.appendChild(button)
+
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+    expect(frames.size).toBe(1)
+
+    // Dispatch on the button so event.target.closest(selector) is exercised.
+    dispatchPointerDown(button, { button: 0 })
+
+    expect(mocks.stopScroll).not.toHaveBeenCalled()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(frames.size).toBe(1)
+  })
+
+  it("cancels on pointerdown when target is a non-Element Text node", () => {
+    const onFinish = vi.fn()
+    const textNode = document.createTextNode("transcript text")
+    scrollElement.appendChild(textNode)
+
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(1)
+    expect(frames.size).toBe(1)
+
+    dispatchPointerDown(scrollElement, {
+      button: 0,
+      eventTarget: textNode,
+    })
+
+    expect(mocks.stopScroll).toHaveBeenCalledTimes(1)
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    expect(frames.size).toBe(0)
+  })
+
   it("cancels its pending frame on unmount without completing", () => {
     const onFinish = vi.fn()
     const view = render(
@@ -224,6 +441,13 @@ describe("InitialHistoryScrollController", () => {
     expect(frames.size).toBe(1)
     view.unmount()
     expect(frames.size).toBe(0)
+    expect(onFinish).not.toHaveBeenCalled()
+
+    // Former viewport events must no-op after unmount cleanup.
+    fireEvent.wheel(scrollElement)
+    fireEvent.pointerDown(scrollElement, { button: 0 })
+    fireEvent.keyDown(scrollElement, { key: "PageUp" })
+    expect(mocks.stopScroll).not.toHaveBeenCalled()
     expect(onFinish).not.toHaveBeenCalled()
   })
 })
