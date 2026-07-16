@@ -62,13 +62,20 @@ initial-scroll lifecycle for the uncached conversation behavior.
 Do not store these values in local storage, native agent config JSON, or the
 existing `folder.default_agent_type` field.
 
+The three user-visible changes are independently testable and will use three
+implementation plans: agent thinking visibility, project last-agent recall,
+and uncached-conversation initial scroll. Each plan must leave the repository in
+a working state without depending on a later plan.
+
 ## Data Model
 
-Add migrations for:
+Add independent migrations so either persisted feature can land on its own:
 
 ```text
-agent_setting.show_thinking BOOLEAN NOT NULL DEFAULT FALSE
-folder.last_agent_type TEXT NULL
+m20260716_000001_agent_show_thinking
+  agent_setting.show_thinking BOOLEAN NOT NULL DEFAULT FALSE
+m20260716_000002_folder_last_agent
+  folder.last_agent_type TEXT NULL
 ```
 
 Adding `show_thinking` with a database default of `FALSE` intentionally makes
@@ -100,8 +107,10 @@ value and shows an error toast.
 Add a dedicated command and matching web handler:
 `acp_update_agent_display_preferences(agent_type, show_thinking)`. It updates
 only `agent_setting.show_thinking` and emits the existing
-`app://acp-agents-updated` event so every settings/chat window refreshes through
-the shared `useAcpAgents` subscription.
+`app://acp-agents-updated` event. Chat consumers refresh through the shared
+`useAcpAgents` subscription. The originating settings panel owns a separate
+local `agents` array, so it updates that row optimistically and rolls it back on
+failure instead of waiting for the shared hook.
 
 This command must not call the agent environment/config update functions, alter
 the session configuration fingerprint, mark running connections stale, or show
@@ -123,6 +132,15 @@ When the setting is false:
 - `LiveTurnStats` continues to inspect canonical live content, so thinking vs.
   streaming activity, elapsed time, tool counts, and edit statistics remain
   available.
+
+Historical rendering passes `showThinking` through `HistoricalMessageGroup` to
+`ContentPartsRenderer`; the renderer skips reasoning in its recursive
+`renderPart` function, including reasoning nested in a goal run. Live rendering
+filters thinking segment IDs while building `LiveFooterItem[]`, before mounting
+`LiveTranscriptSegmentView`, so a hidden thinking segment has no per-delta view
+subscription or Markdown work. If all current live footer items are hidden
+thinking, `LiveTranscriptRow` returns no message body while the separate live
+activity row continues to render.
 
 Agent settings load asynchronously. Until a matching persisted record is
 available, the view must fail closed and hide thinking to avoid a content flash.
@@ -147,9 +165,12 @@ point, failure of the auxiliary recency write must be logged as a warning and
 must not turn the create request into an error; otherwise a frontend retry could
 create a duplicate conversation.
 
-After a successful create, the frontend refreshes or patches that folder in the
-workspace store so another new-conversation action immediately sees the new
-recency. Concurrent clients use last successful database write wins semantics.
+After the shared core returns, both the Tauri command wrapper and Axum handler
+emit the existing `folder://changed` upsert with the fresh `FolderDetail`.
+`AppWorkspaceProvider` applies that event to `folders` and `allFolders`, so all
+open clients immediately see the new recency without a new frontend-only patch
+path. A dropped event reconciles on the existing refresh/reconnect paths.
+Concurrent clients use last successful database write wins semantics.
 
 Do not update recency for:
 
@@ -181,6 +202,11 @@ unavailable, skip it without deleting the persisted value and continue to the
 ordered fallback. During cold hydration, a recency-derived draft remains
 provisional until the fresh enabled/available list can validate it.
 
+Concretely, a non-null recent agent is returned as provisional while `fresh` is
+false. Once `fresh` is true, use it only when `sortedTypes` contains it;
+otherwise continue to `sortedTypes[0]`. Explicit folder defaults and requested
+inheritance keep their existing confirmation/fallback semantics.
+
 ## Initial Uncached Conversation Scroll
 
 ### Existing Keep-Alive Boundary
@@ -192,15 +218,18 @@ or persisted scroll metadata is required.
 
 ### First-History Lifecycle
 
-Each mounted message list begins with an `initialHistoryScrollPending` latch.
-For a persisted conversation:
+Only a tab whose `ConversationTabView` was already bound to a persisted
+conversation when it mounted begins with an `initialHistoryScrollPending`
+latch. A new draft starts with the latch cleared, and binding that still-mounted
+draft after its first send does not enable it. For an eligible persisted
+conversation:
 
 1. Keep `MessageThread.resize` set to `instant` while detail history is loading,
    the first historical projection is committed, and Virtua performs its first
    measurements.
 2. Once historical rows exist, issue an explicit instant `scrollToBottom`.
-3. Observe the shared content/scroll dimensions until they are unchanged for two
-   consecutive animation frames.
+3. Compare the shared content height and viewport `scrollHeight` on animation
+   frames until both are unchanged for two consecutive frames.
 4. Issue one final instant correction and clear the latch.
 5. Restore the existing behavior after initialization: history-only resize uses
    `smooth`; a live transcript continues using `instant`.
@@ -241,6 +270,8 @@ uncached view and correctly performs the first-open behavior again.
 - Agent listing returns the persisted display preference.
 - Normal root conversation creation records `last_agent_type` only after a
   successful insert.
+- The Tauri and Axum create wrappers emit a fresh `folder://changed` upsert
+  after recency persistence, and the frontend applies it to both folder lists.
 - Chat-mode creation, delegation children, imports, and failed creates do not
   change a regular project's recency.
 - Desktop and web handlers exercise the same core behavior.
@@ -256,6 +287,8 @@ uncached view and correctly performs the first-open behavior again.
   remains.
 - Live transcript tests prove thinking disappears while live activity and tool
   statistics remain.
+- A hidden live thinking segment never mounts `LiveTranscriptSegmentView`, and
+  a thinking-only footer leaves no empty message body.
 - Copy/export tests prove hidden reasoning is still included in complete output.
 - Message-thread tests prove loading/measurement uses instant resize and
   performs a final instant correction after two stable frames.
@@ -284,3 +317,5 @@ commands and file-level test targets.
 8. Tauri and server deployments share the same persisted behavior.
 9. `en` and `zh-CN` contain authored setting copy; the other locale catalogs use
    the English values until full localization, without missing-key failures.
+10. A successful project create broadcasts the updated folder so every open
+    client uses the same recent agent for its next normal new conversation.
