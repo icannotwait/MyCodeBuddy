@@ -324,13 +324,23 @@ pub fn resolve_route(
 }
 
 /// Build a fresh native plan from a prior Codeg-oriented plan (root-only path).
+///
+/// Transforms only a **managed**, **effective-Codeg** plan whose suppression is
+/// a typed non-`None` managed variant (from which agent identity is recovered
+/// for the fingerprint). Unmanaged, already-native, feature-disabled,
+/// already-fallback, or `None`-suppression inputs return `plan` unchanged so
+/// misuse is idempotent and never invents an `AgentType`.
 pub fn safe_native_fallback(
     plan: &DelegationRoutePlan,
     reason: RouteDegradedReason,
 ) -> DelegationRoutePlan {
-    // Agent type is not stored on the plan; recover it from the Codeg
-    // suppression variant when present so the fingerprint stays agent-scoped.
-    let agent_type = agent_type_from_suppression(&plan.native_suppression);
+    let Some(agent_type) = agent_type_from_suppression(&plan.native_suppression) else {
+        return plan.clone();
+    };
+    if !plan.managed || plan.effective != DelegationRoutePolicy::Codeg {
+        return plan.clone();
+    }
+
     finish_plan(
         agent_type,
         DelegationRoutePlan {
@@ -415,16 +425,16 @@ fn codeg_suppression_plan(agent_type: AgentType) -> NativeSuppressionPlan {
     }
 }
 
-fn agent_type_from_suppression(plan: &NativeSuppressionPlan) -> AgentType {
+/// Recover the managed Agent type from a typed Codeg suppression variant.
+/// Returns `None` for `NativeSuppressionPlan::None` — callers must not invent
+/// a stand-in agent identity.
+fn agent_type_from_suppression(plan: &NativeSuppressionPlan) -> Option<AgentType> {
     match plan {
-        NativeSuppressionPlan::CodexMultiAgentFalse => AgentType::Codex,
-        NativeSuppressionPlan::GrokNoSubagents => AgentType::Grok,
-        NativeSuppressionPlan::CodeBuddyDisallowedTools { .. } => AgentType::CodeBuddy,
-        NativeSuppressionPlan::ClaudeDisallowedTools { .. } => AgentType::ClaudeCode,
-        // Native/None plans do not encode the agent. Prefer a stable managed
-        // stand-in; production fallbacks are built from Codeg plans that still
-        // carry a typed suppression variant (see `safe_native_fallback` tests).
-        NativeSuppressionPlan::None => AgentType::Codex,
+        NativeSuppressionPlan::CodexMultiAgentFalse => Some(AgentType::Codex),
+        NativeSuppressionPlan::GrokNoSubagents => Some(AgentType::Grok),
+        NativeSuppressionPlan::CodeBuddyDisallowedTools { .. } => Some(AgentType::CodeBuddy),
+        NativeSuppressionPlan::ClaudeDisallowedTools { .. } => Some(AgentType::ClaudeCode),
+        NativeSuppressionPlan::None => None,
     }
 }
 
@@ -606,5 +616,62 @@ mod tests {
                 "route_unavailable"
             );
         }
+    }
+
+    #[test]
+    fn safe_native_fallback_noops_non_codeg_and_transforms_managed_codeg_once() {
+        let reason = RouteDegradedReason::CompanionBinaryUnavailable;
+
+        // Already-native managed plan: must remain exactly unchanged.
+        let mut native_input = input(AgentType::Grok);
+        native_input.global_policy = DelegationRoutePolicy::Native;
+        let native = resolve_route(native_input).expect("native plan");
+        assert_eq!(native.effective, DelegationRoutePolicy::Native);
+        assert_eq!(native.native_suppression, NativeSuppressionPlan::None);
+        let after_native = safe_native_fallback(&native, reason);
+        assert_eq!(
+            after_native, native,
+            "already-native plan must not be mutated or re-fingerprinted"
+        );
+
+        // Feature-disabled (native effective, None suppression).
+        let mut disabled_input = input(AgentType::Grok);
+        disabled_input.delegation_enabled = false;
+        let disabled = resolve_route(disabled_input).expect("feature-disabled plan");
+        assert_eq!(disabled.source, DelegationRouteSource::FeatureDisabled);
+        let after_disabled = safe_native_fallback(&disabled, reason);
+        assert_eq!(after_disabled, disabled);
+
+        // Unmanaged / None-suppression plan.
+        let unmanaged = resolve_route(input(AgentType::OpenCode)).expect("unmanaged");
+        assert!(!unmanaged.managed);
+        assert_eq!(unmanaged.native_suppression, NativeSuppressionPlan::None);
+        let after_unmanaged = safe_native_fallback(&unmanaged, reason);
+        assert_eq!(
+            after_unmanaged, unmanaged,
+            "unmanaged None-suppression plan must not invent an agent fingerprint"
+        );
+
+        // Valid managed Codeg plan still transforms exactly once.
+        let codeg = resolve_route(input(AgentType::Grok)).expect("codeg plan");
+        assert_eq!(codeg.effective, DelegationRoutePolicy::Codeg);
+        assert!(codeg.native_suppression.suppresses_creation());
+        let once = safe_native_fallback(&codeg, reason);
+        assert_eq!(once.managed, true);
+        assert_eq!(once.requested, DelegationRoutePolicy::Codeg);
+        assert_eq!(once.effective, DelegationRoutePolicy::Native);
+        assert_eq!(once.source, DelegationRouteSource::SafeFallback);
+        assert_eq!(once.degraded_reason, Some(reason));
+        assert!(!once.native_suppression.suppresses_creation());
+        assert!(!once.expose_codeg_delegation);
+        assert_ne!(once.fingerprint, codeg.fingerprint);
+        assert_ne!(once, codeg);
+
+        // Already-fallback: second call is a pure no-op (idempotent).
+        let twice = safe_native_fallback(&once, RouteDegradedReason::AgentMcpUnsupported);
+        assert_eq!(
+            twice, once,
+            "already-fallback plan must stay unchanged (no second fallback)"
+        );
     }
 }
