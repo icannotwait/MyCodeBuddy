@@ -354,7 +354,7 @@ export interface ConversationStatePatch {
 export type ConversationChange =
   | { kind: "upsert"; summary: DbConversationSummary }
   | { kind: "deleted"; id: number }
-  | { kind: "status"; id: number; status: string }
+  | { kind: "state"; patch: ConversationStatePatch }
 
 export const CONVERSATION_CHANGED_EVENT = "conversation://changed"
 

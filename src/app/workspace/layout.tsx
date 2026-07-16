@@ -13,10 +13,7 @@ import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { Sidebar } from "@/components/layout/sidebar"
 import { StatusBar } from "@/components/layout/status-bar"
-import {
-  AppWorkspaceProvider,
-  ConversationStatusEventBridge,
-} from "@/contexts/app-workspace-context"
+import { AppWorkspaceProvider } from "@/contexts/app-workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { TaskProvider } from "@/contexts/task-context"
 import { AlertProvider } from "@/contexts/alert-context"
@@ -937,7 +934,6 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
           <TaskProvider>
             <AcpConnectionsProvider>
               <DelegationProvider>
-                <ConversationStatusEventBridge />
                 <ConversationRuntimeProvider>
                   <WorkspaceProvider>
                     <TabProvider>
