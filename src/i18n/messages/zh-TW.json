@@ -963,7 +963,8 @@
       "piBinaryInstallFailed": "pi 安裝失敗",
       "piBinaryUninstalled": "pi 已解除安裝",
       "piBinaryUninstallFailed": "pi 解除安裝失敗",
-      "savePiTrustFailed": "儲存工作區信任失敗"
+      "savePiTrustFailed": "儲存工作區信任失敗",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "版本狀態",
@@ -1052,7 +1053,8 @@
       "trustDescription": "codeg 連線 pi 到某個目錄時，將該目錄標記為信任，使 pi 無需另行確認即可載入該專案的本機設定與技能。",
       "trustHint": "僅信任你在此開啟的目錄，絕不涉及整台機器；且只影響設定載入，不影響 pi 能執行什麼。",
       "configDirSkillsNote": "設定自訂組態目錄後，設定頁中管理的技能、專家與辦公工具將不會套用至該 pi；請直接在該目錄中管理其技能。"
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "載入 Agent 設定中...",

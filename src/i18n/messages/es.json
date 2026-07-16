@@ -963,7 +963,8 @@
       "piBinaryInstallFailed": "Error al instalar pi",
       "piBinaryUninstalled": "pi desinstalado",
       "piBinaryUninstallFailed": "Error al desinstalar pi",
-      "savePiTrustFailed": "Error al guardar la confianza del espacio de trabajo"
+      "savePiTrustFailed": "Error al guardar la confianza del espacio de trabajo",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "Estado de versión",
@@ -1052,7 +1053,8 @@
       "trustDescription": "Cuando codeg conecta pi a una carpeta, marca esa carpeta como de confianza para que pi cargue la configuración y las habilidades locales del proyecto sin una confirmación aparte.",
       "trustHint": "Solo se confía en las carpetas que abres aquí, nunca en todo tu equipo, y esto afecta únicamente a la carga de configuración, no a lo que pi puede ejecutar.",
       "configDirSkillsNote": "Con un directorio de configuración personalizado, las habilidades, los expertos y las herramientas de oficina gestionados en Ajustes no se aplican a este pi; gestiona sus habilidades directamente en esa carpeta."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "Cargando configuración de agentes...",

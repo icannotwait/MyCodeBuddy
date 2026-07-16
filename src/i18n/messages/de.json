@@ -963,7 +963,8 @@
       "piBinaryInstallFailed": "pi-Installation fehlgeschlagen",
       "piBinaryUninstalled": "pi deinstalliert",
       "piBinaryUninstallFailed": "pi-Deinstallation fehlgeschlagen",
-      "savePiTrustFailed": "Speichern des Arbeitsbereich-Vertrauens fehlgeschlagen"
+      "savePiTrustFailed": "Speichern des Arbeitsbereich-Vertrauens fehlgeschlagen",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "Versionsstatus",
@@ -1052,7 +1053,8 @@
       "trustDescription": "Wenn codeg pi mit einem Ordner verbindet, wird dieser Ordner als vertrauenswürdig markiert, sodass pi die lokale Konfiguration und Skills des Projekts ohne separate Abfrage lädt.",
       "trustHint": "Nur hier geöffnete Ordner werden als vertrauenswürdig eingestuft, niemals der gesamte Rechner – und dies betrifft nur das Laden der Konfiguration, nicht das, was pi ausführen darf.",
       "configDirSkillsNote": "Mit einem benutzerdefinierten Konfigurationsverzeichnis gelten die in den Einstellungen verwalteten Skills, Experten und Office-Tools nicht für dieses pi — verwalte seine Skills direkt in diesem Ordner."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "Agent-Einstellungen werden geladen...",
