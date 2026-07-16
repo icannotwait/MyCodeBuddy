@@ -116,6 +116,7 @@ import type {
   OfficecliInfo,
   OfficecliSkill,
   SkillSyncReport,
+  ConversationStatePatch,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -1982,6 +1983,16 @@ export async function createChatConversation(
  */
 export async function createChatDir(): Promise<CreateChatDirResult> {
   return getTransport().call("create_chat_dir", {})
+}
+
+export async function clearAwaitingReply(
+  conversationId: number,
+  expectedToken: string
+): Promise<ConversationStatePatch> {
+  return getTransport().call("clear_awaiting_reply", {
+    conversationId,
+    expectedToken,
+  })
 }
 
 export async function updateConversationStatus(

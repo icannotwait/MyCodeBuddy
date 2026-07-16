@@ -61,6 +61,7 @@ import {
   PetFocusBridge,
 } from "@/components/workspace/deep-link-bootstrap"
 import { WorkspaceOpenFolderListener } from "@/components/workspace/workspace-open-folder-listener"
+import { ConversationAwaitingReplyClearer } from "@/components/conversations/conversation-awaiting-reply-clearer"
 import { HeavyPluginsWarmup } from "@/components/ai-elements/heavy-plugins-warmup"
 import {
   ResizableHandle,
@@ -953,6 +954,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                 <AutomationsViewProvider>
                                   <WorkbenchRouteProvider>
                                     <WorkbenchRouteConversationSync />
+                                    <ConversationAwaitingReplyClearer />
                                     {/* Inside WorkbenchRouteProvider: the
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
