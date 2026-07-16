@@ -497,14 +497,12 @@ impl AutomationEngine {
 
         match self
             .manager
-            .send_prompt_linked_with_message_id(
+            .send_prompt_linked_background(
                 &self.db,
                 &conn_id,
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
-                None,
-                None,
             )
             .await
         {

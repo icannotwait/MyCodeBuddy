@@ -185,6 +185,10 @@ pub enum ConnectionCommand {
         /// prompt actually being processed. `None` for delegation children,
         /// empty prompts, unbound conversations, and non-linked senders.
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        /// Per-turn awaiting-reply eligibility. Copied onto every real
+        /// `AcpEvent::TurnComplete` emitted for this prompt so the lifecycle
+        /// CAS can decide whether to mint a generation token.
+        mark_awaiting_reply: bool,
     },
     SetMode {
         mode_id: String,
@@ -4161,6 +4165,7 @@ async fn run_conversation_loop<'a>(
             Some(ConnectionCommand::Prompt {
                 blocks,
                 user_message,
+                mark_awaiting_reply,
             }) => {
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
@@ -4347,6 +4352,7 @@ async fn run_conversation_loop<'a>(
                                             session_id: sid.0.to_string(),
                                             stop_reason: reason_str.into(),
                                             agent_type: agent_type.to_string(),
+                                            mark_awaiting_reply,
                                         },
                                     )
                                     .await;
@@ -4418,6 +4424,7 @@ async fn run_conversation_loop<'a>(
                                     session_id: sid.0.to_string(),
                                     stop_reason: reason_str.into(),
                                     agent_type: agent_type.to_string(),
+                                    mark_awaiting_reply,
                                 },
                             )
                             .await;
@@ -4559,6 +4566,7 @@ async fn run_conversation_loop<'a>(
                                             session_id: sid.0.to_string(),
                                             stop_reason: "cancelled".into(),
                                             agent_type: agent_type.to_string(),
+                                            mark_awaiting_reply,
                                         },
                                     )
                                     .await;

@@ -709,6 +709,7 @@ describe("AcpConnectionsProvider permission request details", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "cancelled",
+      mark_awaiting_reply: false,
     })
 
     expect(h.store!.getConnection(TAB)!.pendingPermission).toBeNull()
@@ -1455,6 +1456,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             type: "turn_complete",
             session_id: "sess-1",
             stop_reason: "end_turn",
+            mark_awaiting_reply: false,
           },
         ])
       )
@@ -1786,6 +1788,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             type: "turn_complete",
             session_id: "sess-1",
             stop_reason: "end_turn",
+            mark_awaiting_reply: false,
           },
         ])
       )

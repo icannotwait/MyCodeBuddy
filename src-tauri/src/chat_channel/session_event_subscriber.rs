@@ -120,7 +120,7 @@ async fn handle_acp_envelope(
                     let blocks = vec![PromptInputBlock::Text {
                         text: prompt_text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
                         // A turn is already in flight on this shared connection
                         // (another client raced this kickoff between
                         // SessionStarted and here). Transient, not a failure —
@@ -485,7 +485,7 @@ async fn handle_acp_envelope(
                     let blocks = vec![PromptInputBlock::Text {
                         text: prompt_text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
                             let mut g = bridge.lock().await;
                             if let Some(s) = g.get_mut(connection_id) {
@@ -496,7 +496,9 @@ async fn handle_acp_envelope(
                                  next TurnComplete"
                             );
                         } else {
-                            tracing::error!("[SessionEventSub] failed to send deferred kickoff: {e}");
+                            tracing::error!(
+                                "[SessionEventSub] failed to send deferred kickoff: {e}"
+                            );
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_channel(channel_id, &msg).await;
                         }
@@ -919,9 +921,7 @@ mod delegation_relay_tests {
         assert!(is_delegation_title("delegate_to_agent"));
         assert!(is_delegation_title("Delegate To Agent"));
         assert!(is_delegation_title("delegate-to-agent"));
-        assert!(is_delegation_title(
-            "mcp__codeg-mcp__delegate_to_agent"
-        ));
+        assert!(is_delegation_title("mcp__codeg-mcp__delegate_to_agent"));
         assert!(is_delegation_title("Run mcp__codeg__delegate_to_agent"));
         assert!(!is_delegation_title("agent"));
         assert!(!is_delegation_title("write"));
@@ -1398,6 +1398,7 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude".into(),
+                mark_awaiting_reply: false,
             },
         };
         handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn).await;

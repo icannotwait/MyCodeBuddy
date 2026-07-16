@@ -742,7 +742,11 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         text: req.text.to_string(),
     }];
 
-    if let Err(e) = req.conn_mgr.send_prompt(&connection_id, blocks).await {
+    if let Err(e) = req
+        .conn_mgr
+        .send_prompt_background(&connection_id, blocks)
+        .await
+    {
         // A turn is already in flight on this (shared) connection — another
         // client, or a previous prompt still running. This is transient: the
         // connection is alive, so do NOT tear down the bridge/session. Tell the

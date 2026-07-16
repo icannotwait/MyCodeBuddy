@@ -196,7 +196,11 @@ pub(crate) async fn handle_event(
             }
             Ok(())
         }
-        AcpEvent::TurnComplete { stop_reason, .. } => {
+        AcpEvent::TurnComplete {
+            stop_reason,
+            mark_awaiting_reply,
+            ..
+        } => {
             // Centralized status transition: when the agent reports the turn
             // is done, flip the conversation row and re-broadcast the change
             // as `ConversationStatusChanged`. This lives in the lifecycle
@@ -206,26 +210,14 @@ pub(crate) async fn handle_event(
             // mid-turn — the row gets the correct status even if no
             // browser is connected to react to TurnComplete itself.
             //
-            // The target status depends on the stop reason: `end_turn` is the
-            // only success case and goes to `PendingReview`. `refusal`,
-            // `max_tokens`, `max_turn_requests`, `unknown`, and `empty`
-            // indicate the turn failed (often a backend/gateway error
-            // masquerading as `Refusal` per the ACP spec gap, or — common
-            // with OpenCode — a silent EndTurn that produced no output), so
-            // we flip to `Cancelled` and pair the transition with an
-            // `AcpEvent::Error` toast emitted upstream by `connection.rs`.
-            // `cancelled` is already written by `manager.cancel()` (eager
-            // CAS InProgress → Cancelled at the user-cancel entry point), so
-            // we leave it alone here. `completed` transitions remain
-            // frontend-driven.
-            let target_status = match stop_reason.as_str() {
-                "end_turn" => Some(ConversationStatus::PendingReview),
-                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
-                    Some(ConversationStatus::Cancelled)
-                }
-                // `cancelled` and any future reason: don't write here.
-                _ => None,
-            };
+            // CAS helpers from conversation_service own the write:
+            // `end_turn` → finish_end_turn_if_in_progress (PendingReview +
+            // optional token). Failure reasons → update_status_if_with_patch
+            // (InProgress → Cancelled, clears token). Emit the existing
+            // per-connection status event only when the CAS wins (`Some`).
+            // `cancelled` is already written by `manager.cancel()`; leave
+            // it alone. `completed` transitions remain frontend-driven.
+            // Global conversation state emission is Task 4 — not here.
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -241,11 +233,28 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
-            if let Some(ts) = target_status.clone() {
-                // DB write before emit so any downstream subscriber that observes
-                // the ConversationStatusChanged event can assume the row is
-                // already at the target status.
-                conversation_service::update_status(db_conn, cid, ts.clone()).await?;
+            let cas_status = match stop_reason.as_str() {
+                "end_turn" => conversation_service::finish_end_turn_if_in_progress(
+                    db_conn,
+                    cid,
+                    *mark_awaiting_reply,
+                )
+                .await?
+                .map(|_| ConversationStatus::PendingReview),
+                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+                    conversation_service::update_status_if_with_patch(
+                        db_conn,
+                        cid,
+                        ConversationStatus::InProgress,
+                        ConversationStatus::Cancelled,
+                    )
+                    .await?
+                    .map(|_| ConversationStatus::Cancelled)
+                }
+                // `cancelled` and any future reason: don't write here.
+                _ => None,
+            };
+            if let Some(ts) = cas_status {
                 emit_with_state(
                     &state_arc,
                     &emitter,
@@ -257,9 +266,9 @@ pub(crate) async fn handle_event(
                 .await;
             }
 
-            // If this conversation was spawned by a delegation, resolve the
-            // pending broker call. The broker maps the outcome onto the
-            // parent's `tool_use_id` via the registered `call_id`.
+            // Broker forwarding stays outside the CAS branch so delegation
+            // completion settlement remains unchanged even when status CAS
+            // loses (e.g. row already Completed / Cancelled).
             if let Some(b) = broker {
                 forward_turn_complete_to_broker(
                     db_conn,
@@ -1765,6 +1774,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1772,6 +1782,192 @@ mod tests {
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview
         );
+    }
+
+    async fn read_row_awaiting_reply_token(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+    ) -> Option<String> {
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("conversation row exists")
+            .awaiting_reply_token
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_marks_awaiting_reply() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-await").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::InProgress
+        );
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, conv.id).await.is_some(),
+            "eligible root end_turn must mint awaiting_reply_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_background_no_token() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-bg").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, conv.id).await.is_none(),
+            "background root end_turn must not mint a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_child_no_token() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-child").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-1".into(),
+                delegation_call_id: "call-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(child.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "codex".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, child.id).await.is_none(),
+            "child end_turn never receives a generation even if mark is true"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_respects_completed_cas() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-completed").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::update_status(&db.conn, conv.id, ConversationStatus::Completed)
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::Completed,
+            "Completed row must win over delayed end_turn CAS"
+        );
+        assert!(read_row_awaiting_reply_token(&db, conv.id).await.is_none());
     }
 
     #[tokio::test]
@@ -1811,6 +2007,7 @@ mod tests {
                     session_id: "ext-1".into(),
                     stop_reason: stop_reason.into(),
                     agent_type: "open_code".into(),
+                    mark_awaiting_reply: false,
                 },
             };
             handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1849,6 +2046,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "cancelled".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1883,6 +2081,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2163,6 +2362,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,
@@ -2265,6 +2465,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         }));
     }
 
@@ -2416,6 +2617,7 @@ mod tests {
                 session_id: "ext-final".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         }));
 
@@ -2496,6 +2698,7 @@ mod tests {
                 session_id: "ext-200".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         }));
 

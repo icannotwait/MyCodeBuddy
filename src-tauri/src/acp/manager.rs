@@ -12,21 +12,17 @@ use sea_orm::{
 
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::connection::matching_config_pair;
-use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand,
-};
+use crate::acp::connection::{spawn_agent_connection, AgentConnection, ConnectionCommand};
 use crate::acp::error::AcpError;
-use crate::acp::terminal_context::{
-    finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
-};
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
-    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
+    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
+use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
@@ -461,7 +457,9 @@ impl ConnectionManager {
         let connection_id = uuid::Uuid::new_v4().to_string();
         tracing::info!(
             "[ACP] spawning connection id={} owner_window={} agent={:?}",
-            connection_id, owner_window_label, agent_type
+            connection_id,
+            owner_window_label,
+            agent_type
         );
 
         // `spawn_agent_connection` inserts the entry into `self.connections`,
@@ -648,7 +646,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -697,7 +700,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -765,6 +773,10 @@ impl ConnectionManager {
         // for broker-generated child/delegation tasks so nested task text
         // cannot install routes on the child connection.
         register_mandatory_routes: bool,
+        // Per-turn awaiting-reply eligibility carried onto TurnComplete.
+        // Independent of route registration: chat-channel keeps routes on
+        // while setting this false.
+        mark_awaiting_reply: bool,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -790,9 +802,7 @@ impl ConnectionManager {
                     joined.push_str(text);
                 }
             }
-            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(
-                &joined,
-            ))
+            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(&joined))
         } else {
             None
         };
@@ -835,14 +845,13 @@ impl ConnectionManager {
         // register_mandatory_routes=false and skip this.
         if let Some(ids) = pending_mandatory_ids {
             if let Some(injection) = self.delegation_snapshot() {
-                injection
-                    .broker
-                    .set_mandatory_profile_routes(conn_id, ids);
+                injection.broker.set_mandatory_profile_routes(conn_id, ids);
             }
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            mark_awaiting_reply,
         });
         Ok(())
     }
@@ -868,8 +877,22 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        // Non-linked sends are always user-facing root prompts.
-        self.send_prompt_inner(conn_id, blocks, None, true).await
+        // Non-linked UI sends: register mandatory routes + mark attention.
+        self.send_prompt_inner(conn_id, blocks, None, true, true)
+            .await
+    }
+
+    /// Background (non-UI) prompt: keeps mandatory profile-route registration
+    /// but does not mark the turn as awaiting-reply eligible.
+    pub async fn send_prompt_background(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), AcpError> {
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        self.send_prompt_inner(conn_id, blocks, None, true, false)
+            .await
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -919,6 +942,10 @@ impl ConnectionManager {
     /// than a heuristic — and an unrelated optimistic turn on another client
     /// never suppresses a different sender's prompt. `None` falls back to a
     /// connection-scoped id for non-UI senders.
+    ///
+    /// Awaiting-reply eligibility is `delegation.is_none()` (UI root true;
+    /// delegation children false). Background automation uses
+    /// [`send_prompt_linked_background`] instead.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_prompt_linked_with_message_id(
         &self,
@@ -929,6 +956,57 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+    ) -> Result<Option<i32>, AcpError> {
+        let mark_awaiting_reply = delegation.is_none();
+        self.send_prompt_linked_impl(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            delegation,
+            client_message_id,
+            mark_awaiting_reply,
+        )
+        .await
+    }
+
+    /// Linked prompt for automation / non-UI producers: root mandatory-route
+    /// registration is preserved, but the turn is not awaiting-reply eligible.
+    pub async fn send_prompt_linked_background(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+    ) -> Result<Option<i32>, AcpError> {
+        self.send_prompt_linked_impl(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Shared linked-prompt implementation. `mark_awaiting_reply` is independent
+    /// of mandatory profile-route registration (`delegation.is_none()`).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_prompt_linked_impl(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        client_message_id: Option<String>,
+        mark_awaiting_reply: bool,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1214,8 +1292,15 @@ impl ConnectionManager {
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         // Only root (non-delegation) prompts install mandatory profile routes.
         // Child tasks go through the same helper but must not scan task text.
+        // Awaiting-reply eligibility is a separate policy bit.
         match self
-            .send_prompt_inner(conn_id, blocks, user_message, delegation.is_none())
+            .send_prompt_inner(
+                conn_id,
+                blocks,
+                user_message,
+                delegation.is_none(),
+                mark_awaiting_reply,
+            )
             .await
         {
             Ok(()) => {
@@ -1547,7 +1632,9 @@ impl ConnectionManager {
             // Surface failures even when the caller is gone (the detached task's
             // Result would otherwise be dropped silently).
             if let Err(ref e) = outcome {
-                tracing::error!("[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}");
+                tracing::error!(
+                    "[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}"
+                );
             }
             outcome
         });
@@ -1925,7 +2012,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
-            owner_window_label, disconnected
+            owner_window_label,
+            disconnected
         );
         disconnected
     }
@@ -1967,8 +2055,7 @@ impl ConnectionManager {
         let mut out = Vec::new();
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            let (Some(conversation_id), Some(folder_id)) =
-                (state.conversation_id, state.folder_id)
+            let (Some(conversation_id), Some(folder_id)) = (state.conversation_id, state.folder_id)
             else {
                 continue;
             };
@@ -2067,11 +2154,8 @@ impl ConnectionManager {
         if !state.read().await.feedback_tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
-        let item = FeedbackItem::new_pending(
-            uuid::Uuid::new_v4().to_string(),
-            text,
-            chrono::Utc::now(),
-        );
+        let item =
+            FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
         // gated emit): a `TurnComplete` (flips the flag) or `UserMessage`
         // (clears `feedback`) can't slip between the gate and the append+seq, so
@@ -2253,7 +2337,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_questions.lock().await.contains_key(question_id) {
+        if self
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(question_id)
+        {
             return false;
         }
         emit_with_state(
@@ -2291,7 +2380,9 @@ impl ConnectionManager {
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
         let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2316,7 +2407,9 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2634,10 +2727,7 @@ pub struct ConnectionManagerFeedbackLookup {
 
 #[async_trait::async_trait]
 impl SessionFeedbackAccess for ConnectionManagerFeedbackLookup {
-    async fn read_pending_feedback(
-        &self,
-        parent_connection_id: &str,
-    ) -> Vec<PendingFeedback> {
+    async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
         self.manager
             .read_pending_feedback(parent_connection_id)
             .await
@@ -2828,7 +2918,10 @@ mod tests {
         let state = mgr.get_state("c1").await.unwrap();
         let state = state.read().await;
         assert!(state.config_stale);
-        assert_eq!(state.config_stale_kind, Some(ConfigStaleKind::TerminalShell));
+        assert_eq!(
+            state.config_stale_kind,
+            Some(ConfigStaleKind::TerminalShell)
+        );
     }
 
     #[tokio::test]
@@ -2852,9 +2945,11 @@ mod tests {
         let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
         let mut receiver = subscribe_conn_stream(&mgr, "c1").await;
         assert_eq!(mgr.refresh_terminal_shell_staleness("shell-v1").await, 0);
-        assert!(tokio::time::timeout(Duration::from_millis(50), receiver.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     /// Subscribe directly to the per-connection event stream. Phase 4b
@@ -2926,6 +3021,42 @@ mod tests {
         vec![PromptInputBlock::Text {
             text: "test prompt".into(),
         }]
+    }
+
+    #[tokio::test]
+    async fn prompt_wrappers_encode_user_facing_and_background_attention() {
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live("policy-conn", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+
+        mgr.send_prompt("policy-conn", one_text_block())
+            .await
+            .expect("UI prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected prompt command");
+        };
+        assert!(mark_awaiting_reply);
+
+        {
+            let state = mgr.get_state("policy-conn").await.unwrap();
+            state.write().await.turn_in_flight = false;
+        }
+        mgr.send_prompt_background("policy-conn", one_text_block())
+            .await
+            .expect("background prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected background prompt command");
+        };
+        assert!(!mark_awaiting_reply);
     }
 
     /// Insert a connection with a LIVE command receiver so `send_prompt_inner`'s
@@ -3023,9 +3154,7 @@ mod tests {
         // Wire-only `<codeg_terminal_context>` is appended in the connection
         // loop after this payload is captured for broadcast.
         assert!(
-            um.1
-                .iter()
-                .all(|t| !t.contains("codeg_terminal_context")),
+            um.1.iter().all(|t| !t.contains("codeg_terminal_context")),
             "user_message must never leak terminal context block, got {um:?}"
         );
     }
@@ -3402,6 +3531,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                mark_awaiting_reply: false,
             })
             .await
             .unwrap();
@@ -3414,6 +3544,7 @@ mod tests {
                 text: "blocked".into(),
             }],
             None,
+            true,
             true,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
@@ -3639,10 +3770,10 @@ mod tests {
         // Empty / whitespace / image-only prompts seed no title (stays NULL,
         // backfilled on first detail load as before).
         assert!(delegation_child_title_seed(&[]).is_none());
-        assert!(
-            delegation_child_title_seed(&[PromptInputBlock::Text { text: "  \n ".into() }])
-                .is_none()
-        );
+        assert!(delegation_child_title_seed(&[PromptInputBlock::Text {
+            text: "  \n ".into()
+        }])
+        .is_none());
         let img = vec![PromptInputBlock::Image {
             data: "x".into(),
             mime_type: "image/png".into(),
@@ -4463,9 +4594,7 @@ mod tests {
 
     #[tokio::test]
     async fn changing_settings_does_not_mutate_running_snapshot() {
-        use crate::acp::terminal_context::{
-            finalize_acp_launch_config, AcpLaunchInputs,
-        };
+        use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchInputs};
         use crate::models::SystemTerminalSettings;
         use crate::terminal::shell::ResolvedShellSnapshot;
 
@@ -5161,7 +5290,10 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-restack", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-restack", None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -5774,7 +5906,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- ask_user_question: register / answer / cancel -------------------
@@ -5985,7 +6121,12 @@ mod tests {
         // The first is still the pending one and still answerable.
         let state = mgr.get_state("cc2").await.unwrap();
         assert_eq!(
-            state.read().await.pending_question.as_ref().map(|p| p.question_id.clone()),
+            state
+                .read()
+                .await
+                .pending_question
+                .as_ref()
+                .map(|p| p.question_id.clone()),
             Some(first.question_id.clone())
         );
         mgr.answer_question(
@@ -6021,12 +6162,7 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         // A second read still returns them — read is non-destructive, so an
         // abandoned (peer-closed) call leaves the notes retryable.
-        assert_eq!(
-            mgr.read_pending_feedback("c1")
-                .await
-                .len(),
-            2
-        );
+        assert_eq!(mgr.read_pending_feedback("c1").await.len(), 2);
         {
             let state = mgr.get_state("c1").await.unwrap();
             assert!(state
@@ -6041,10 +6177,7 @@ mod tests {
         mgr.commit_feedback_delivered("c1", vec![a.id.clone(), b.id.clone()])
             .await;
         // Now READ returns nothing (delivered notes are filtered out).
-        assert!(mgr
-            .read_pending_feedback("c1")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
         let state = mgr.get_state("c1").await.unwrap();
         assert!(state
             .read()
@@ -6060,12 +6193,9 @@ mod tests {
     #[tokio::test]
     async fn read_pending_missing_connection_returns_empty() {
         let mgr = ConnectionManager::new();
-        assert!(mgr
-            .read_pending_feedback("nope")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("nope").await.is_empty());
         // Commit on a missing connection is a safe no-op.
-        mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+        mgr.commit_feedback_delivered("nope", vec!["x".into()])
+            .await;
     }
-
 }
