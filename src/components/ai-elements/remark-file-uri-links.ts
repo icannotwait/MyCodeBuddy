@@ -32,10 +32,10 @@ function fileUriToLocalPath(uri: string): string | null {
     const body = `${parsed.host}${parsed.pathname}`.replace(/\//g, "\\")
     return `\\\\${body}${parsed.search}${parsed.hash}`
   }
-  let path = parsed.pathname
-  if (/^\/[a-zA-Z]:[\\/]/.test(path)) path = path.slice(1)
-  // Keep URL-encoded form so `%23` / `%3F` don't collide with fragment/query
-  // boundaries when the click handler later splits on `#` / `?`.
+  // Keep the leading slash on Windows drive paths. `/C:/x` survives harden as a
+  // root-relative href, and parseLocalFileTarget strips that slash on click.
+  // The URL parser already preserves encoded path characters in pathname.
+  const path = parsed.pathname
   return `${path}${parsed.search}${parsed.hash}`
 }
 

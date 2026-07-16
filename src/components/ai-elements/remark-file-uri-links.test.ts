@@ -42,8 +42,41 @@ describe("remarkRewriteFileUriLinks", () => {
     expect(rewrite("file:///Users/a/b.ts")).toBe("/Users/a/b.ts")
   })
 
-  it("strips the leading slash before a Windows drive letter", () => {
-    expect(rewrite("file:///C:/x/y.ts")).toBe("C:/x/y.ts")
+  it("keeps the harden-safe leading slash before a Windows drive", () => {
+    expect(rewrite("file:///C:/x/y.ts")).toBe("/C:/x/y.ts")
+  })
+
+  it("preserves encoded path data, query text, and line fragments", () => {
+    expect(rewrite("file:///C:/My%20Repo/a%23b.ts?raw=1#L12")).toBe(
+      "/C:/My%20Repo/a%23b.ts?raw=1#L12"
+    )
+  })
+
+  it("keeps an encoded POSIX drive-like segment encoded", () => {
+    expect(rewrite("file:///C%3A/repo/app.ts")).toBe("/C%3A/repo/app.ts")
+  })
+
+  it("leaves file images and their reference definitions unchanged", () => {
+    const tree: Node = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [
+            { type: "image", url: "file:///C:/image.png" },
+            { type: "imageReference", identifier: "img" },
+          ],
+        },
+        {
+          type: "definition",
+          identifier: "img",
+          url: "file:///C:/image.png",
+        },
+      ],
+    }
+    const before = structuredClone(tree)
+    remarkRewriteFileUriLinks()(tree)
+    expect(tree).toEqual(before)
   })
 
   it("emits a UNC file:// URI as a backslash UNC path (unambiguously local)", () => {
