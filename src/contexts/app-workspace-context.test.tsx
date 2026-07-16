@@ -357,6 +357,22 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(screen.getByTestId("all-folder-ids")).toHaveTextContent("12")
   })
 
+  it("updates recent agent in both folder lists from a folder upsert", async () => {
+    await mountProvider()
+    emitFolder({
+      kind: "upsert",
+      folder: makeFolder({ id: 12, last_agent_type: "gemini" }),
+    })
+
+    const state = useAppWorkspaceStore.getState()
+    expect(
+      state.folders.find((folder) => folder.id === 12)?.last_agent_type
+    ).toBe("gemini")
+    expect(
+      state.allFolders.find((folder) => folder.id === 12)?.last_agent_type
+    ).toBe("gemini")
+  })
+
   it("replaces an existing folder in place on a repeat upsert", async () => {
     await mountProvider()
     emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
