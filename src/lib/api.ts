@@ -343,6 +343,16 @@ export async function acpListAgents(): Promise<AcpAgentInfo[]> {
   return getTransport().call("acp_list_agents")
 }
 
+export async function acpUpdateAgentDisplayPreferences(
+  agentType: AgentType,
+  showThinking: boolean
+): Promise<void> {
+  return getTransport().call("acp_update_agent_display_preferences", {
+    agentType,
+    showThinking,
+  })
+}
+
 export async function acpGetAgentStatus(
   agentType: AgentType
 ): Promise<AcpAgentStatus> {

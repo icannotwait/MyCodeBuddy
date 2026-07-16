@@ -639,6 +639,10 @@ pub fn build_router(
             post(handlers::acp::acp_update_agent_preferences),
         )
         .route(
+            "/acp_update_agent_display_preferences",
+            post(handlers::acp::acp_update_agent_display_preferences),
+        )
+        .route(
             "/acp_update_agent_env",
             post(handlers::acp::acp_update_agent_env),
         )

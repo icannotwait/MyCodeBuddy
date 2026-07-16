@@ -1711,6 +1711,7 @@ export interface AcpAgentInfo {
   /** Backend distribution: npx, binary, uvx, or bundled. */
   distribution_type: string
   enabled: boolean
+  show_thinking: boolean
   sort_order: number
   installed_version: string | null
   env: Record<string, string>
