@@ -156,16 +156,20 @@ The `MessageResponse` memo comparator must include the new prop.
 
 ### Completed assistant text activation
 
-`ContentPartsRenderer` enables the prop only for a top-level `text` part whose
-message role is `assistant`. Recursive rendering inside structured goal/tool
-containers does not inherit the opt-in.
+`HistoricalMessageGroup` already knows whether its turn is persisted through
+`isResponseComplete`. It passes that state to `ContentPartsRenderer`, which
+enables the prop only when the part is top-level, the message role is
+`assistant`, and the response is complete. Recursive rendering inside
+structured goal/tool containers does not inherit the opt-in.
 
 The direct history path passes the prop to `MessageResponse`. The completed
 streaming-partition handoff passes it through `StreamingMarkdownDocument` and
 `SealedBlock`. Their prop types and memo comparators must include the flag.
 
-Live transcript components never set the flag, regardless of whether deferred
-streaming rich content is enabled.
+Live transcript components never set the flag. The legacy compatibility path,
+which renders a streaming phase through `HistoricalMessageGroup` when
+`incremental_live_transcript` is disabled, explicitly passes
+`isResponseComplete=false` and therefore also remains opted out.
 
 ## Detection Rules
 
@@ -263,6 +267,12 @@ On click, the existing `parseLocalFileTarget` logic decodes the href and
 No live component opts into the plugin. Sealed live blocks and the growing tail
 therefore render exactly as they do today, and paths remain plain text for the
 entire active turn.
+
+When `incremental_live_transcript` is disabled, the compatibility renderer
+keeps the active turn in the virtualized timeline instead of using the live
+footer. Its existing phase-derived `isResponseComplete` value is the authority:
+the streaming row remains opted out until that turn is promoted to persisted
+history.
 
 When the turn completes, the runtime completes and caches any incremental
 Markdown partition before the live projection is retired. The historical
@@ -374,6 +384,8 @@ Verify:
 Verify:
 
 - live text does not invoke the scanner and contains no automatic file badge;
+- the compatibility streaming row also stays opted out when incremental live
+  rendering is disabled;
 - the same canonical text renders a badge after history handoff;
 - completed-partition and full fallback rendering agree;
 - user, system, reasoning, tool, plan, and permission content do not opt in;
