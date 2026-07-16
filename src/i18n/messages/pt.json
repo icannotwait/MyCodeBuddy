@@ -2280,7 +2280,10 @@
       "subAgentOverlay": {
         "title": "Subagentes",
         "collapsedSummary": "Subagentes {count}",
-        "collapseAria": "Recolher subagentes"
+        "collapseAria": "Recolher subagentes",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "Plano do agente",

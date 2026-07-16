@@ -53,6 +53,9 @@ import {
 } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
+import { deriveNativeActivitiesFromToolCalls } from "@/lib/delegation-activity"
+import type { DelegationActivityView } from "@/lib/types"
+import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
   MessageThread,
   MessageThreadScrollButton,
@@ -680,6 +683,8 @@ function extractLiveDelegationSources(
   return liveSources
 }
 
+const EMPTY_ACTIVITIES: DelegationActivityView[] = []
+
 /** Narrow-subscription live stats — parent list does not re-render per token. */
 const LiveTurnStatsFromTranscript = memo(function LiveTurnStatsFromTranscript({
   conversationId,
@@ -728,17 +733,22 @@ const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
 
 /**
  * Sub-agent overlay: prefers live-transcript delegations while streaming so
- * historical row adaptation is not required.
+ * historical row adaptation is not required. Native activity is derived
+ * alongside and never replaces original tool rendering.
  */
 const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   conversationId,
+  agentType,
   isStreaming,
   historicalDelegations,
+  historicalActivities,
   historicalKey,
 }: {
   conversationId: number
+  agentType: AgentType
   isStreaming: boolean
   historicalDelegations: DelegationCardSource[]
+  historicalActivities: DelegationActivityView[]
   historicalKey: string
 }) {
   const snap = useLiveTranscriptConversation(
@@ -748,16 +758,23 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     if (!snap || !isStreaming) return EMPTY_DELEGATIONS
     return extractLiveDelegationSources(liveSnapshotToLiveMessage(snap))
   }, [snap, isStreaming])
+  const liveActivities = useMemo(() => {
+    if (!snap || !isStreaming) return EMPTY_ACTIVITIES
+    return projectNativeActivitiesFromTranscript(snap, agentType)
+  }, [snap, isStreaming, agentType])
   const delegations =
     liveDelegations.length > 0 ? liveDelegations : historicalDelegations
+  const activities =
+    liveActivities.length > 0 ? liveActivities : historicalActivities
   const overlayKey =
-    liveDelegations.length > 0
+    liveDelegations.length > 0 || liveActivities.length > 0
       ? `subagents-live-${snap?.messageId ?? conversationId}`
       : historicalKey
   return (
     <SubAgentOverlay
       key={overlayKey}
       delegations={delegations}
+      activities={activities}
       overlayKey={overlayKey}
     />
   )
@@ -1108,6 +1125,40 @@ export function MessageListView({
         : EMPTY_DELEGATIONS,
     [lastAssistantGroup]
   )
+  const lastAssistantActivities = useMemo(() => {
+    if (!lastAssistantGroup) return EMPTY_ACTIVITIES
+    const tools: Array<{
+      toolCallId: string
+      toolName: string
+      input?: string | null
+      output?: string | null
+      status?: string | null
+    }> = []
+    const walk = (parts: AdaptedContentPart[]) => {
+      for (const part of parts) {
+        if (part.type === "tool-call" && part.toolCallId) {
+          tools.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            input: part.input ?? null,
+            output: part.output ?? part.errorText ?? null,
+            status:
+              part.state === "output-error"
+                ? "failed"
+                : part.state === "output-available"
+                  ? "completed"
+                  : "in_progress",
+          })
+        } else if (part.type === "tool-group") {
+          walk(part.items)
+        } else if (part.type === "goal-run") {
+          walk(part.items)
+        }
+      }
+    }
+    walk(lastAssistantGroup.parts)
+    return deriveNativeActivitiesFromToolCalls(tools, agentType)
+  }, [lastAssistantGroup, agentType])
   const subAgentOverlayKey = lastAssistantGroup
     ? `subagents-${lastAssistantGroup.id}`
     : `subagents-history-${conversationId}`
@@ -1325,14 +1376,17 @@ export function MessageListView({
         {useIncrementalLive ? (
           <LiveAwareSubAgentOverlay
             conversationId={conversationId}
+            agentType={agentType}
             isStreaming={connStatus === "prompting"}
             historicalDelegations={lastAssistantDelegations}
+            historicalActivities={lastAssistantActivities}
             historicalKey={subAgentOverlayKey}
           />
         ) : (
           <SubAgentOverlay
             key={subAgentOverlayKey}
             delegations={lastAssistantDelegations}
+            activities={lastAssistantActivities}
             overlayKey={subAgentOverlayKey}
           />
         )}

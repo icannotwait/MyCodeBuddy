@@ -2280,7 +2280,10 @@
       "subAgentOverlay": {
         "title": "서브 에이전트",
         "collapsedSummary": "서브 에이전트 {count}",
-        "collapseAria": "서브 에이전트 접기"
+        "collapseAria": "서브 에이전트 접기",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "에이전트 계획",

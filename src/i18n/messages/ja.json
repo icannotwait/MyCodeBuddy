@@ -2280,7 +2280,10 @@
       "subAgentOverlay": {
         "title": "サブエージェント",
         "collapsedSummary": "サブエージェント {count}",
-        "collapseAria": "サブエージェントを折りたたむ"
+        "collapseAria": "サブエージェントを折りたたむ",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "エージェントプラン",

@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest"
-import type { LiveMessage } from "@/contexts/acp-connections-context"
+import type {
+  LiveContentBlock,
+  LiveMessage,
+  ToolCallInfo,
+} from "@/contexts/acp-connections-context"
 import type {
   DbConversationDetail,
   MessageTurn,
@@ -7,6 +11,7 @@ import type {
 } from "@/lib/types"
 import type { BackgroundOverlayEntry } from "@/stores/conversation-runtime-store"
 import {
+  buildStreamingTurnsFromLiveMessage,
   resetConversationRuntimeStore,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
@@ -580,5 +585,60 @@ describe("selectTimelineTurns compatibility", () => {
     )
     expect(historical.every((e) => e.phase !== "streaming")).toBe(true)
     expect(historical.map((e) => e.turn.id)).toContain(`live-${CID}-lm-dup`)
+  })
+})
+
+function codexSpawnToolBlock(): LiveContentBlock {
+  const info: ToolCallInfo = {
+    tool_call_id: "spawn-call-1",
+    title: "spawn_agent",
+    kind: "other",
+    status: "completed",
+    content: null,
+    raw_input: JSON.stringify({
+      agent_type: "worker",
+      message: "investigate flaky test",
+    }),
+    raw_output_chunks: [JSON.stringify({ agent_id: "agent-native-1" })],
+    raw_output_total_bytes: 0,
+    locations: null,
+    meta: null,
+    images: [],
+  }
+  info.raw_output_total_bytes = info.raw_output_chunks.join("").length
+  return { type: "tool_call", info }
+}
+
+function buildRuntimeFromBlocks(blocks: LiveContentBlock[]) {
+  const live: LiveMessage = {
+    id: "msg-native",
+    role: "assistant",
+    content: blocks,
+    startedAt: Date.parse("2026-07-16T10:00:00Z"),
+  }
+  return buildStreamingTurnsFromLiveMessage(CID, live, { agentType: "codex" })
+}
+
+describe("buildStreamingTurnsFromLiveMessage — native activity projection", () => {
+  it("keeps the original native tool call while adding one activity view", () => {
+    const result = buildRuntimeFromBlocks([codexSpawnToolBlock()])
+    // Runtime MessageTurn blocks use ContentBlock shape (`tool_use`).
+    // Activity is derived alongside — the source tool block is never removed.
+    const toolBlocks = result.turns.flatMap((turn) =>
+      turn.blocks.filter((b) => b.type === "tool_use")
+    )
+    expect(toolBlocks).toHaveLength(1)
+    expect(toolBlocks[0]).toMatchObject({
+      type: "tool_use",
+      tool_name: expect.stringMatching(/spawn_agent|agent|collab/i),
+    })
+    expect(result.delegationActivities).toHaveLength(1)
+    expect(result.delegationActivities[0]).toMatchObject({
+      origin: "native",
+      authoritative: false,
+      platform: "codex",
+      operation: "spawn",
+      task_id: "agent-native-1",
+    })
   })
 })

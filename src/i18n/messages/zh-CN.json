@@ -2280,7 +2280,10 @@
       "subAgentOverlay": {
         "title": "子智能体",
         "collapsedSummary": "子智能体 {count}",
-        "collapseAria": "折叠子智能体"
+        "collapseAria": "折叠子智能体",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "计划任务",

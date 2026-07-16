@@ -2280,7 +2280,10 @@
       "subAgentOverlay": {
         "title": "الوكلاء الفرعيون",
         "collapsedSummary": "الوكلاء الفرعيون {count}",
-        "collapseAria": "طي الوكلاء الفرعيين"
+        "collapseAria": "طي الوكلاء الفرعيين",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "خطة الوكيل",

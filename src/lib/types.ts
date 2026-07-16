@@ -10,6 +10,37 @@ export type AgentType =
   | "pi"
   | "grok"
 
+/**
+ * Read-only sub-agent activity projection.
+ * Native views are informational only (`authoritative: false`); they never enter
+ * DelegationBroker and never expose Broker cancel actions.
+ */
+export type DelegationActivityOperation =
+  | "spawn"
+  | "status"
+  | "wait"
+  | "cancel"
+  | "unknown"
+
+export type DelegationObservedStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "unknown"
+
+export interface DelegationActivityView {
+  origin: "codeg" | "native"
+  authoritative: boolean
+  platform: AgentType
+  task_id?: string
+  operation: DelegationActivityOperation
+  observed_status: DelegationObservedStatus
+  started_at?: string
+  updated_at?: string
+  finished_at?: string
+}
+
 export type AppErrorCode =
   | "invalid_input"
   | "configuration_missing"

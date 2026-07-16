@@ -15,7 +15,9 @@ import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-r
 import { liveTranscriptStore } from "@/stores/live-transcript-store"
 import type {
   AgentExecutionStats,
+  AgentType,
   DbConversationDetail,
+  DelegationActivityView,
   MessageTurn,
   PlanEntryInfo,
   SessionStats,
@@ -30,6 +32,7 @@ import { COLLAB_AGENT_TOOL_NAME, mergeCollabOp } from "@/lib/collab-tool"
 import { collapseLiveCollabBlocks } from "@/lib/collab-collapse"
 import { kimiTodoWriteEntries } from "@/lib/plan-parse"
 import { toErrorMessage } from "@/lib/app-error"
+import { deriveNativeActivitiesFromToolCalls } from "@/lib/delegation-activity"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -437,6 +440,11 @@ function createEmptySession(
 interface BuiltStreamingTurns {
   turns: MessageTurn[]
   inProgressToolCallIds: Set<string>
+  /**
+   * Read-only native/Codeg activity projection derived alongside tool blocks.
+   * Never replaces or filters the original `tool_call` content.
+   */
+  delegationActivities: DelegationActivityView[]
 }
 
 // Cache joined chunk output keyed by chunks-array identity. The ACP reducer
@@ -651,7 +659,8 @@ function resolveLiveToolInput(
 
 export function buildStreamingTurnsFromLiveMessage(
   conversationId: number,
-  liveMessage: LiveMessage
+  liveMessage: LiveMessage,
+  options?: { agentType?: AgentType | null }
 ): BuiltStreamingTurns {
   // Consolidate codex collab capsules first (spawn execution + per-wait result,
   // close folded in) so live matches the history reconstruction. No-op when the
@@ -1001,7 +1010,48 @@ export function buildStreamingTurnsFromLiveMessage(
       timestamp,
     }))
 
-  return { turns, inProgressToolCallIds }
+  // Derive native activity alongside tool blocks — never filter/replace them.
+  // Use the pre-collapse tool stream so Codex collab ops keep their native
+  // names (`spawn_agent` / `wait_agent` / …) rather than the collapsed
+  // collab capsule title. Source tool blocks in `turns` remain unchanged.
+  const activityToolInputs: Array<{
+    toolCallId: string
+    toolName: string
+    input?: string | null
+    output?: string | null
+    status?: string | null
+    at?: string
+  }> = []
+  for (const block of liveMessage.content) {
+    if (block.type !== "tool_call") continue
+    const resolvedOutput =
+      block.info.raw_output_chunks.length > 0
+        ? getJoinedChunks(block.info.raw_output_chunks)
+        : (block.info.content ?? null)
+    // Prefer ACP title (spawn_agent / TaskOutput / …) so native mapping
+    // sees the platform tool identity before freeform name collapse.
+    const title = block.info.title?.trim() || ""
+    const inferred = inferLiveToolName({
+      title: block.info.title,
+      kind: block.info.kind,
+      rawInput: block.info.raw_input,
+      meta: block.info.meta,
+    })
+    activityToolInputs.push({
+      toolCallId: block.info.tool_call_id,
+      toolName: title || inferred,
+      input: block.info.raw_input ?? null,
+      output: resolvedOutput,
+      status: block.info.status ?? null,
+      at: timestamp,
+    })
+  }
+  const delegationActivities = deriveNativeActivitiesFromToolCalls(
+    activityToolInputs,
+    options?.agentType ?? null
+  )
+
+  return { turns, inProgressToolCallIds, delegationActivities }
 }
 
 function upsertExternalIdIndex(
