@@ -536,6 +536,7 @@ mod tauri_app {
                         question_config,
                         session_info_config,
                         runtime_settings,
+                        delegation_metrics,
                     ) = crate::app_state::build_delegation_stack(
                         &cm_state,
                         db_conn.clone(),
@@ -548,6 +549,7 @@ mod tauri_app {
                     app.manage(question_config.clone());
                     app.manage(session_info_config.clone());
                     app.manage(runtime_settings.clone());
+                    app.manage(delegation_metrics.clone());
                     app.manage(crate::commands::delegation::DelegationSocketPath(
                         socket_path.clone(),
                     ));

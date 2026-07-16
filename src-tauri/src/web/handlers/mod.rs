@@ -5,6 +5,7 @@ pub mod backup;
 pub mod chat_channel;
 pub mod conversations;
 pub mod delegation;
+pub mod delegation_metrics;
 mod error;
 pub mod event_metrics;
 pub mod experts;

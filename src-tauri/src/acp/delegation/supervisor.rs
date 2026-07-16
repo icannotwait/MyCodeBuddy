@@ -128,6 +128,7 @@ pub struct DelegationSupervisor {
     threshold_rx: watch::Receiver<u32>,
     wake_rx: mpsc::Receiver<()>,
     last_emitted: Mutex<HashMap<String, ObservationSnapshot>>,
+    metrics: Arc<super::metrics::DelegationMetrics>,
 }
 
 impl DelegationSupervisor {
@@ -139,6 +140,25 @@ impl DelegationSupervisor {
         threshold_rx: watch::Receiver<u32>,
         wake_rx: mpsc::Receiver<()>,
     ) -> Self {
+        Self::with_metrics(
+            source,
+            sink,
+            clock,
+            threshold_rx,
+            wake_rx,
+            Arc::new(super::metrics::DelegationMetrics::default()),
+        )
+    }
+
+    /// Production constructor with shared reliability metrics.
+    pub fn with_metrics(
+        source: Arc<dyn DelegationObservationSource>,
+        sink: Arc<dyn DelegationObservationSink>,
+        clock: Arc<dyn SupervisorClock>,
+        threshold_rx: watch::Receiver<u32>,
+        wake_rx: mpsc::Receiver<()>,
+        metrics: Arc<super::metrics::DelegationMetrics>,
+    ) -> Self {
         Self {
             source,
             sink,
@@ -146,6 +166,7 @@ impl DelegationSupervisor {
             threshold_rx,
             wake_rx,
             last_emitted: Mutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -181,14 +202,32 @@ impl DelegationSupervisor {
                 h.waiting_input,
                 threshold,
             );
-            let should_emit = {
+            let prev_snap = {
                 let last = self.last_emitted.lock().expect("last_emitted lock");
-                match last.get(&h.task_id) {
-                    Some(prev) => prev != &snap,
-                    None => true,
-                }
+                last.get(&h.task_id).cloned()
+            };
+            let should_emit = match &prev_snap {
+                Some(prev) => prev != &snap,
+                None => true,
             };
             if should_emit {
+                // Metrics only on actual supervisor-emitted observation-enum
+                // transitions (not first publish; timestamp-only changes still
+                // emit events but do not bump stalled episode counters).
+                if let Some(prev) = &prev_snap {
+                    if prev.observation != snap.observation {
+                        self.metrics.record_observation_transition(
+                            prev.observation,
+                            snap.observation,
+                        );
+                        super::metrics::DelegationAuditRecord::observation(
+                            &h.task_id,
+                            prev.observation,
+                            snap.observation,
+                        )
+                        .emit_observation();
+                    }
+                }
                 self.sink.publish_observation(&h.task_id, snap.clone()).await;
                 self.last_emitted
                     .lock()

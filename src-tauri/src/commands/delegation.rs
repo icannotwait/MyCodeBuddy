@@ -662,6 +662,14 @@ pub async fn set_delegation_bundle(
     }
 }
 
+/// Snapshot process-local delegation reliability metrics (debug / operator use).
+/// Shared by the authenticated HTTP debug handler; no product UI consumer.
+pub fn get_delegation_metrics_core(
+    metrics: &crate::acp::delegation::metrics::DelegationMetrics,
+) -> crate::acp::delegation::metrics::DelegationMetricsSnapshot {
+    metrics.snapshot()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

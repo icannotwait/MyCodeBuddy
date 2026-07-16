@@ -107,6 +107,8 @@ pub struct DelegationListener {
     /// other arms this is NOT parent-scoped — it looks any non-deleted session up
     /// by its codeg conversation id (still token-gated against an invalid caller).
     pub session_info: Arc<dyn SessionInfoAccess>,
+    /// Process-local reliability metrics (wait peer-close, cancel classes).
+    pub metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
 }
 
 impl DelegationListener {
@@ -120,6 +122,7 @@ impl DelegationListener {
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
     ) -> Arc<Self> {
+        let metrics = broker.metrics();
         Arc::new(Self {
             broker,
             tokens,
@@ -128,6 +131,7 @@ impl DelegationListener {
             feedback,
             questions,
             session_info,
+            metrics,
         })
     }
 
@@ -221,13 +225,40 @@ impl DelegationListener {
                 // abandoning the wait is safe and there's nothing to cancel
                 // broker-side. The companion never writes a second frame on
                 // this socket, so the probe read only resolves on EOF/error.
+                use crate::acp::delegation::metrics::{
+                    DelegationAuditRecord, WaitModeLabel, WaitReturnReason,
+                };
+                let wait_mode = match req.wait_ms {
+                    None => WaitModeLabel::Snapshot,
+                    Some(0) => WaitModeLabel::Terminal,
+                    Some(_) => WaitModeLabel::Supervised,
+                };
+                let requested_wait_ms = req.wait_ms.map(|ms| ms.min(STATUS_WAIT_MAX_MS));
+                let wait_started = std::time::Instant::now();
                 let status_fut = self.process_status(req);
                 tokio::pin!(status_fut);
                 let mut probe = [0u8; 1];
                 let reports = tokio::select! {
                     biased;
                     reports = &mut status_fut => reports,
-                    _ = conn.read(&mut probe) => return Ok(()),
+                    _ = conn.read(&mut probe) => {
+                        // Peer closed before broker returned: record once,
+                        // no task mutation, abandon wait.
+                        let wall = wait_started.elapsed();
+                        self.metrics.record_wait(
+                            wait_mode,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        );
+                        DelegationAuditRecord::wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        )
+                        .emit_wait();
+                        return Ok(());
+                    },
                 };
                 reports_response(reports)?
             }
@@ -455,6 +486,14 @@ impl DelegationListener {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             return unknown_report(&req.task_id);
         };
+        // Explicit task cancel (distinct from MCP request cancel).
+        self.metrics.record_explicit_cancel(req.reason);
+        crate::acp::delegation::metrics::DelegationAuditRecord::cancel(
+            &entry.parent_connection_id,
+            &req.task_id,
+            req.reason,
+        )
+        .emit_cancel();
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
@@ -504,6 +543,8 @@ impl DelegationListener {
         let Some(_entry) = self.tokens.lookup(&cancel.token).await else {
             return;
         };
+        // MCP tools/call cancellation — not an explicit cancel_delegation.
+        self.metrics.record_mcp_request_cancel();
         let reason = cancel
             .reason
             .unwrap_or_else(|| "mcp client canceled".into());

@@ -152,7 +152,8 @@ impl RouteResolutionError {
     pub fn stable_code(&self) -> &'static str {
         match self {
             Self::RouteUnavailable { .. } => "route_unavailable",
-            Self::MixedCreationSurfaces => "mixed_route_invariant",
+            // Wire taxonomy: invalid suppression / mixed creation surfaces.
+            Self::MixedCreationSurfaces => "native_suppression_invalid",
         }
     }
 }

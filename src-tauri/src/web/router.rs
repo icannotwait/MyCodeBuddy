@@ -40,6 +40,10 @@ pub fn build_router(
             "/debug/event_metrics",
             get(handlers::event_metrics::get_event_metrics),
         )
+        .route(
+            "/debug/delegation_metrics",
+            get(handlers::delegation_metrics::get_delegation_metrics),
+        )
         // ─── Conversations ───
         .route(
             "/list_conversations",

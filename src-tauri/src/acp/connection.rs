@@ -438,6 +438,18 @@ fn apply_process_route(
     Ok(())
 }
 
+/// Classify suppression application for audit (no env values / secrets).
+pub(crate) fn suppression_application_for_plan(
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+) -> crate::acp::delegation::metrics::SuppressionApplication {
+    use crate::acp::delegation::metrics::SuppressionApplication;
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+    match &plan.native_suppression {
+        NativeSuppressionPlan::None => SuppressionApplication::NotApplicable,
+        _ => SuppressionApplication::Applied,
+    }
+}
+
 /// Codex Codeg only: set/override `CODEX_ACP_MULTI_AGENT=0`.
 /// Native, unmanaged, and non-Codex plans leave the key byte-for-byte untouched
 /// (including user values `0`/`1` and absence).
@@ -2028,6 +2040,8 @@ pub struct DelegationInjection {
     /// agent activity and permission/question changes can nudge the supervisor.
     /// Default `noop` until bootstrap installs a live channel.
     pub supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
+    /// Process-local reliability metrics (route validation at launch).
+    pub metrics: std::sync::Arc<crate::acp::delegation::metrics::DelegationMetrics>,
 }
 
 /// Typed bootstrap outcome from the connection task to the manager.
@@ -9638,6 +9652,7 @@ mod tests {
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
         };
 
         let mut servers: Vec<McpServer> = Vec::new();

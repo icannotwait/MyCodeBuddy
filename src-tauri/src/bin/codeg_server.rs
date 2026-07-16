@@ -264,6 +264,7 @@ async fn async_main() -> ExitCode {
         question_config,
         session_info_config,
         delegation_runtime_settings,
+        delegation_metrics,
     ) = codeg_lib::app_state::build_delegation_stack(
         &connection_manager,
         db.conn.clone(),
@@ -284,6 +285,7 @@ async fn async_main() -> ExitCode {
         ),
         pet_state: pet_state_handle.clone(),
         delegation_broker: delegation_broker.clone(),
+        delegation_metrics: delegation_metrics.clone(),
         delegation_runtime_settings: delegation_runtime_settings.clone(),
         delegation_tokens: delegation_tokens.clone(),
         delegation_leases: delegation_leases.clone(),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::acp::delegation::broker::DelegationBroker;
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
+use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
 use crate::chat_channel::manager::ChatChannelManager;
@@ -39,6 +40,9 @@ pub struct AppState {
     /// requests here. v1 uses the default `DelegationConfig`; settings UI
     /// hot-swaps via `delegation_broker.set_config`.
     pub delegation_broker: Arc<DelegationBroker>,
+    /// Process-local delegation reliability metrics (route/accepted/terminal/
+    /// wait/cancel). Shared with broker, supervisor, listener, and route launch.
+    pub delegation_metrics: Arc<DelegationMetrics>,
     /// Live route_policy / stalled_after_seconds / enabled snapshot shared by
     /// route resolution and the soft-watchdog supervisor. Updated only after
     /// a successful settings transaction (or one clamped load at startup).
@@ -121,6 +125,7 @@ pub fn build_delegation_stack(
     crate::acp::question::QuestionRuntimeConfig,
     crate::acp::session_info::SessionInfoRuntimeConfig,
     DelegationRuntimeSettings,
+    Arc<DelegationMetrics>,
 ) {
     use crate::acp::connection::DelegationInjection;
     use crate::acp::delegation::broker::{
@@ -165,11 +170,13 @@ pub fn build_delegation_stack(
     }) as Arc<dyn ChildLiveReplyLookup>;
     let event_emitter = Arc::new(ConnectionManagerEventEmitter { manager: cm_arc })
         as Arc<dyn DelegationEventEmitter>;
+    let delegation_metrics = Arc::new(DelegationMetrics::default());
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
             .with_task_store(task_store)
             .with_status_lookup(status_lookup)
-            .with_live_reply_lookup(live_reply_lookup),
+            .with_live_reply_lookup(live_reply_lookup)
+            .with_metrics(delegation_metrics.clone()),
     );
     let tokens = Arc::new(TokenRegistry::default());
     let leases = Arc::new(CompanionLeaseRegistry::default());
@@ -202,6 +209,7 @@ pub fn build_delegation_stack(
             manager: Arc::new(connection_manager.clone_ref()),
         }) as Arc<dyn crate::acp::question::SessionQuestionAccess>,
         supervisor_wake,
+        metrics: delegation_metrics.clone(),
     });
 
     // Park the wake receiver on the broker until startup takes it.
@@ -216,6 +224,7 @@ pub fn build_delegation_stack(
         ask,
         sessions,
         runtime_settings,
+        delegation_metrics,
     )
 }
 
@@ -264,12 +273,13 @@ pub fn spawn_delegation_supervisor(
     let sink = Arc::new(BrokerObservationSink {
         broker: broker.clone(),
     });
-    let supervisor = DelegationSupervisor::new(
+    let supervisor = DelegationSupervisor::with_metrics(
         source,
         sink,
         Arc::new(SystemClock),
         threshold_rx,
         wake_rx,
+        broker.metrics(),
     );
     let run = async move {
         supervisor.run().await;
@@ -308,6 +318,7 @@ impl AppState {
             question_config,
             session_info_config,
             delegation_runtime_settings,
+            delegation_metrics,
         ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
         Self {
@@ -327,6 +338,7 @@ impl AppState {
             ),
             pet_state: crate::pet_state_mapper::new_pet_state_handle(),
             delegation_broker,
+            delegation_metrics,
             delegation_runtime_settings,
             delegation_tokens,
             delegation_leases,

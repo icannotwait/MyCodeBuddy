@@ -633,6 +633,32 @@ impl ConnectionManager {
         // safe-native fallback only for typed RouteSpecific bootstrap failures.
         // Child and Fatal never retry.
         let mut attempt_plan = route_plan;
+        // Authoritative route record after exclusivity validation (Task 13).
+        if let Some(inj) = self.delegation_snapshot() {
+            if let Err(e) = inj
+                .metrics
+                .validate_and_record_route(agent_type, &attempt_plan)
+            {
+                return Err(AcpError::protocol(format!(
+                    "managed plan violates exclusive route surfaces: {}",
+                    e.stable_code()
+                )));
+            }
+            let suppression = crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+            crate::acp::delegation::metrics::DelegationAuditRecord::route(
+                "pending-spawn",
+                None,
+                agent_type,
+                &attempt_plan,
+                suppression,
+            )
+            .emit_route_resolved();
+        } else {
+            // Tests without injection still enforce exclusivity.
+            attempt_plan
+                .assert_exclusive()
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
+        }
         let mut attempt = 0u8;
         let connection_id = loop {
             attempt += 1;
@@ -706,6 +732,20 @@ impl ConnectionManager {
                     // Attempt 2 only after teardown observes map absence.
                     self.teardown_unexposed_attempt(&connection_id).await?;
                     attempt_plan = safe_native_fallback(&attempt_plan, reason);
+                    // Count safe fallback once at the actual decision boundary.
+                    if let Some(inj) = self.delegation_snapshot() {
+                        inj.metrics.record_route(agent_type, &attempt_plan);
+                        let suppression =
+                            crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+                        crate::acp::delegation::metrics::DelegationAuditRecord::route(
+                            &connection_id,
+                            None,
+                            agent_type,
+                            &attempt_plan,
+                            suppression,
+                        )
+                        .emit_route_resolved();
+                    }
                     // Second attempt cannot recurse/retry again (attempt==2).
                     continue;
                 }
@@ -7141,6 +7181,7 @@ mod tests {
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
         });
 
         let conn_id = "unexposed-1".to_string();
@@ -7337,6 +7378,7 @@ mod tests {
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
         });
 
         let conn_id = "stuck-1".to_string();

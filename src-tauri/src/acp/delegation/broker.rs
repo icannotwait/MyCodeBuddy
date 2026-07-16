@@ -1355,6 +1355,9 @@ pub struct DelegationBroker {
     /// Soft-supervisor wake receiver, parked until desktop/server startup
     /// takes it after reconcile. Tests leave this `None` (noop wake).
     supervisor_wake_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
+    /// Process-local reliability metrics (accepted/terminal/wait). Shared with
+    /// AppState; tests default to a private Arc.
+    metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
     /// Count of persistence-retry workers actually spawned (single-flight
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1423,9 +1426,43 @@ impl DelegationBroker {
             observation_cache: Arc::new(Mutex::new(HashMap::new())),
             supervisor_wake: Arc::new(std::sync::Mutex::new(SupervisorWake::noop())),
             supervisor_wake_rx: Arc::new(std::sync::Mutex::new(None)),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Wire process-local reliability metrics (production: shared AppState Arc).
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Shared metrics handle for supervisor / listener / tests.
+    pub fn metrics(&self) -> Arc<crate::acp::delegation::metrics::DelegationMetrics> {
+        self.metrics.clone()
+    }
+
+    /// Record one status-wait outcome (exact-once per request return path).
+    fn record_status_wait(
+        &self,
+        mode: crate::acp::delegation::metrics::WaitModeLabel,
+        requested_wait_ms: Option<u64>,
+        started: Instant,
+        reason: crate::acp::delegation::metrics::WaitReturnReason,
+    ) {
+        let wall = started.elapsed();
+        self.metrics.record_wait(mode, wall, reason);
+        crate::acp::delegation::metrics::DelegationAuditRecord::wait(
+            mode,
+            requested_wait_ms,
+            wall,
+            reason,
+        )
+        .emit_wait();
     }
 
     /// Install the soft-supervisor wake handle (production bootstrap). Tests
@@ -2949,6 +2986,20 @@ impl DelegationBroker {
 
         // Registered and running in the background — return the ack. The child
         // resolves later via the lifecycle → `complete_call` (or a cancel path).
+        // Durable accepted boundary (Task 8): count only after running insert.
+        self.metrics.record_accepted(req.agent_type);
+        let accepted = crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+            &req.parent_connection_id,
+            Some(req.parent_conversation_id),
+            req.agent_type,
+            &call_id,
+            Some(child_conversation_id),
+            TaskStatus::Running,
+            None,
+            None,
+            None,
+        );
+        accepted.emit_task_transition();
         running_ack(call_id, child_conversation_id, req.agent_type)
     }
 
@@ -3006,6 +3057,37 @@ impl DelegationBroker {
                 self.clear_observation(task_id).await;
                 self.notify_supervisor();
                 if won {
+                    // Reliability metrics: terminal only for the CAS winner.
+                    self.metrics.record_terminal(
+                        report.status,
+                        std::time::Duration::from_millis(ctx.duration_ms),
+                    );
+                    let terminal_audit =
+                        crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                            &ctx.parent_connection_id,
+                            None,
+                            ctx.agent_type,
+                            task_id,
+                            Some(ctx.child_conversation_id),
+                            report.status,
+                            report
+                                .error_code
+                                .as_deref()
+                                .and_then(|c| {
+                                    // Only intern stable static codes we own.
+                                    match c {
+                                        "spawn_failed" => Some("spawn_failed"),
+                                        "persistence_error" => Some("persistence_error"),
+                                        "host_restarted" => Some("host_restarted"),
+                                        "depth_limit_exceeded" => Some("depth_limit_exceeded"),
+                                        "canceled" => Some("canceled"),
+                                        _ => None,
+                                    }
+                                }),
+                            Some(ctx.duration_ms),
+                            Some(true),
+                        );
+                    terminal_audit.emit_task_transition();
                     // Live sidebar coherence: one ConversationStatusChanged
                     // matching the durable CAS write (Existing/loser skips).
                     self.emit_conversation_status_if_real(
@@ -3597,6 +3679,20 @@ impl DelegationBroker {
         if task_ids.is_empty() {
             return Vec::new();
         }
+        use crate::acp::delegation::metrics::{WaitModeLabel, WaitReturnReason};
+        let wait_started = Instant::now();
+        let wait_mode = match wait {
+            StatusWait::Snapshot => WaitModeLabel::Snapshot,
+            StatusWait::Terminal => WaitModeLabel::Terminal,
+            StatusWait::Supervised(_) => WaitModeLabel::Supervised,
+        };
+        let requested_wait_ms: Option<u64> = match wait {
+            StatusWait::Snapshot => None,
+            StatusWait::Terminal => Some(0),
+            StatusWait::Supervised(d) => {
+                Some(crate::acp::delegation::metrics::DelegationMetrics::duration_ms_saturating(d))
+            }
+        };
         let deadline = match wait {
             StatusWait::Supervised(d) => Some(Instant::now() + d),
             StatusWait::Snapshot | StatusWait::Terminal => None,
@@ -3627,17 +3723,47 @@ impl DelegationBroker {
                 .await;
 
             match wait {
-                StatusWait::Snapshot => return reports,
+                StatusWait::Snapshot => {
+                    self.record_status_wait(
+                        wait_mode,
+                        requested_wait_ms,
+                        wait_started,
+                        WaitReturnReason::Snapshot,
+                    );
+                    return reports;
+                }
                 StatusWait::Terminal => {
                     // Unknown/terminal are non-Running; NotInMemory never parks
                     // even when the assembled report status is still Running.
                     if !can_park || reports.iter().any(|r| r.status != TaskStatus::Running) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Terminal,
+                        );
                         return reports;
                     }
                     // Observation-only wakes re-evaluate and re-park.
                 }
                 StatusWait::Supervised(_) => {
-                    if !can_park || supervised_should_return(&reports) {
+                    if !can_park || reports.iter().any(|r| r.status != TaskStatus::Running) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Terminal,
+                        );
+                        return reports;
+                    }
+                    if supervised_should_return(&reports) {
+                        // Still Running but stalled / waiting_input.
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Observation,
+                        );
                         return reports;
                     }
                     // After parking, return only when a **requested** observation
@@ -3647,10 +3773,22 @@ impl DelegationBroker {
                         .as_ref()
                         .is_some_and(|prev| prev.as_slice() != views.as_slice())
                     {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Observation,
+                        );
                         return reports;
                     }
                     let now = Instant::now();
                     if deadline.is_some_and(|d| now >= d) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Deadline,
+                        );
                         return reports;
                     }
                 }
@@ -3660,6 +3798,12 @@ impl DelegationBroker {
             // Supervised). Snapshot already returned above.
             let now = Instant::now();
             if deadline.is_some_and(|d| now >= d) {
+                self.record_status_wait(
+                    wait_mode,
+                    requested_wait_ms,
+                    wait_started,
+                    WaitReturnReason::Deadline,
+                );
                 return reports;
             }
             if matches!(wait, StatusWait::Supervised(_)) {
