@@ -455,11 +455,13 @@ function MessageResponseImpl({
           className
         )}
         plugins={plugins}
+        rehypePlugins={rehypePlugins}
+        {...props}
+        // App-selected remark plugins are authoritative so a caller's
+        // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
         remarkPlugins={
           autolinkLocalPaths ? remarkPluginsWithLocalPaths : remarkPlugins
         }
-        rehypePlugins={rehypePlugins}
-        {...props}
         // Merge after spreading props so a caller can still override other
         // elements, but the link icon + safety routing on `a` always wins.
         components={{ ...props.components, ...markdownLinkComponents }}

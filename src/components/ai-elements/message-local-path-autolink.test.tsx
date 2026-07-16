@@ -49,14 +49,19 @@ describe("MessageResponse local-path autolinking", () => {
     vi.restoreAllMocks()
   })
 
-  it("leaves a bare path as text by default", () => {
+  it("leaves a bare path as text by default", async () => {
+    const path = String.raw`D:\repo\src\app.ts`
     const { container } = render(
-      <MessageResponse>{String.raw`changed D:\repo\src\app.ts`}</MessageResponse>
+      <MessageResponse>{String.raw`changed ${path}`}</MessageResponse>
     )
+    await waitFor(() => {
+      expect(container.textContent).toContain(path)
+      expect(container.querySelector("p")).not.toBeNull()
+    })
     expect(
       container.querySelector("[data-reference-badge][data-ref-type='file']")
     ).toBeNull()
-    expect(container.textContent).toContain(String.raw`D:\repo\src\app.ts`)
+    expect(container.textContent).toContain(path)
   })
 
   it("renders supported Windows and POSIX paths only when enabled", async () => {
@@ -73,6 +78,19 @@ describe("MessageResponse local-path autolinking", () => {
       ).toHaveLength(2)
     })
     expect(container.textContent).not.toContain("[blocked]")
+  })
+
+  it("keeps autolink when caller provides remarkPlugins", async () => {
+    const { container } = render(
+      <MessageResponse autolinkLocalPaths remarkPlugins={[]}>
+        {String.raw`D:\repo\src\app.ts`}
+      </MessageResponse>
+    )
+    await waitFor(() => {
+      expect(
+        container.querySelector("[data-reference-badge][data-ref-type='file']")
+      ).not.toBeNull()
+    })
   })
 
   it.each([
@@ -106,24 +124,33 @@ describe("MessageResponse local-path autolinking", () => {
     }
   )
 
-  it("does not autolink inline code or slash commands", () => {
+  it("does not autolink inline code or slash commands", async () => {
     const { container } = render(
       <MessageResponse autolinkLocalPaths>
         {"`D:\\repo\\src\\app.ts` and /review"}
       </MessageResponse>
     )
-    expect(container.querySelector("code")).not.toBeNull()
+    await waitFor(() => {
+      expect(container.querySelector("code")).not.toBeNull()
+      expect(container.querySelector("code")?.textContent).toContain(
+        String.raw`D:\repo\src\app.ts`
+      )
+    })
     expect(
       container.querySelector("[data-reference-badge][data-ref-type='file']")
     ).toBeNull()
   })
 
-  it("fails closed after CommonMark consumes a Windows separator", () => {
+  it("fails closed after CommonMark consumes a Windows separator", async () => {
     const { container } = render(
       <MessageResponse autolinkLocalPaths>
         {String.raw`D:\repo\[draft]\app.ts`}
       </MessageResponse>
     )
+    await waitFor(() => {
+      // After CommonMark link/ref parsing, some visible path text remains.
+      expect(container.textContent).toMatch(/D:\\repo|app\.ts/)
+    })
     expect(
       container.querySelector("[data-reference-badge][data-ref-type='file']")
     ).toBeNull()
