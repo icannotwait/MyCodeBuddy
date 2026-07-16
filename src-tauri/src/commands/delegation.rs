@@ -127,8 +127,10 @@ impl DelegationRuntimeSettings {
     }
 
     pub fn set(&self, snapshot: DelegationRuntimeSnapshot) {
-        // Receivers may not exist yet (startup before subscribers attach).
-        let _ = self.tx.send(snapshot);
+        // `send` returns Err and drops the value when the channel has zero
+        // receivers. `send_replace` always retains the latest snapshot so
+        // startup `apply_persisted_config` works before any subscriber attaches.
+        self.tx.send_replace(snapshot);
     }
 }
 
@@ -930,6 +932,18 @@ mod tests {
         assert_eq!(defaults.route_policy, DelegationRoutePolicy::Codeg);
         assert_eq!(defaults.stalled_after_seconds, 300);
 
+        // Non-numeric watchdog values keep the product default (300) before any
+        // numeric under/over clamp cases below.
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_DELEGATION_STALLED_AFTER_SECONDS,
+            "not-a-number",
+        )
+        .await
+        .unwrap();
+        let non_numeric = load_delegation_settings(&db.conn).await;
+        assert_eq!(non_numeric.stalled_after_seconds, 300);
+
         app_metadata_service::upsert_value(&db.conn, KEY_DELEGATION_ROUTE_POLICY, "broken")
             .await
             .unwrap();
@@ -949,6 +963,26 @@ mod tests {
         let persisted = load_delegation_settings(&db.conn).await;
         assert_eq!(persisted.route_policy, DelegationRoutePolicy::Native);
         assert_eq!(persisted.stalled_after_seconds, 3600);
+    }
+
+    /// Startup applies persisted settings via `set` before any consumer has
+    /// called `subscribe`. With zero receivers, `Sender::send` drops the value
+    /// and later subscribers would still see the channel default.
+    #[test]
+    fn runtime_settings_retain_value_with_zero_subscribers() {
+        let runtime = DelegationRuntimeSettings::default();
+        // No subscribe() yet — mirrors AppState construction before watchdog /
+        // route resolvers attach.
+        let desired = DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy: DelegationRoutePolicy::Native,
+            stalled_after_seconds: 120,
+        };
+        runtime.set(desired.clone());
+
+        assert_eq!(runtime.snapshot(), desired);
+        let rx = runtime.subscribe();
+        assert_eq!(*rx.borrow(), desired);
     }
 
     #[tokio::test]
