@@ -1,7 +1,10 @@
 import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
+import type {
+  AdaptedContentPart,
+  AdaptedToolCallPart,
+} from "@/lib/adapters/ai-elements-adapter"
 import enMessages from "@/i18n/messages/en.json"
 import * as tryParseJsonMod from "@/lib/try-parse-json"
 import * as unifiedDiff from "@/lib/unified-diff-generator"
@@ -10,6 +13,7 @@ vi.mock("@/components/ai-elements/message", () => ({
   MessageResponse: ({ children }: { children?: React.ReactNode }) => (
     <div data-testid="markdown-response">{children}</div>
   ),
+  normalizeMathDelimiters: (children: React.ReactNode) => children,
 }))
 
 vi.mock("@/components/ai-elements/terminal", () => ({
@@ -32,10 +36,7 @@ vi.mock("@/components/diff/unified-diff-preview", () => ({
   ),
 }))
 
-import {
-  ContentPartsRenderer,
-  ToolCallPart,
-} from "./content-parts-renderer"
+import { ContentPartsRenderer, ToolCallPart } from "./content-parts-renderer"
 
 function wrap(ui: React.ReactElement) {
   return render(
@@ -202,5 +203,45 @@ describe("ContentPartsRenderer lazy tools", () => {
       )
     })
     expect(screen.getByText(/line-3/)).toBeInTheDocument()
+  })
+})
+
+describe("ContentPartsRenderer thinking visibility", () => {
+  it("omits reasoning when showThinking is false", () => {
+    const reasoning: AdaptedContentPart = {
+      type: "reasoning",
+      content: "private chain",
+      isStreaming: false,
+    }
+    wrap(<ContentPartsRenderer parts={[reasoning]} showThinking={false} />)
+    expect(screen.queryByText("private chain")).not.toBeInTheDocument()
+  })
+
+  it("omits reasoning nested in a goal run", () => {
+    const start: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "goal-1",
+      toolName: "update_goal",
+      input: null,
+      state: "input-available",
+    }
+    const goalRun: AdaptedContentPart = {
+      type: "goal-run",
+      start,
+      end: null,
+      items: [
+        {
+          type: "reasoning",
+          content: "nested private chain",
+          isStreaming: false,
+        },
+        { type: "text", text: "visible result" },
+      ],
+      isRunning: false,
+    }
+    wrap(<ContentPartsRenderer parts={[goalRun]} showThinking={false} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.queryByText("nested private chain")).not.toBeInTheDocument()
+    expect(screen.getByText("visible result")).toBeInTheDocument()
   })
 })

@@ -2805,11 +2805,14 @@ const ToolGroupPart = memo(function ToolGroupPart({
 interface ContentPartsRendererProps {
   parts: AdaptedContentPart[]
   role?: MessageRole
+  /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
+  showThinking?: boolean
 }
 
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
+  showThinking = true,
 }: ContentPartsRendererProps) {
   const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
     if (part.type === "text") {
@@ -2857,7 +2860,9 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     if (part.type === "reasoning") {
-      return <ReasoningPart key={`reasoning-${keyId}`} part={part} />
+      return showThinking ? (
+        <ReasoningPart key={`reasoning-${keyId}`} part={part} />
+      ) : null
     }
 
     if (part.type === "plan") {

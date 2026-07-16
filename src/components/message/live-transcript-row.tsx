@@ -61,6 +61,8 @@ import {
 export interface LiveTranscriptRowProps {
   conversationId: number
   agentType: AgentType
+  /** When false, thinking segments are skipped before segment views mount. */
+  showThinking: boolean
   /** Test / perf hook: called once per LiveToolCard render with toolCallId. */
   onToolRender?: (toolCallId: string) => void
 }
@@ -466,7 +468,8 @@ type LiveFooterItem =
 function buildLiveFooterItems(
   conversationId: number,
   segmentIds: readonly string[],
-  groupIds: readonly string[]
+  groupIds: readonly string[],
+  showThinking: boolean
 ): LiveFooterItem[] {
   // Only multi-tool runs collapse into a summary chip. Lone tools keep a
   // dedicated LiveToolCard so running command tails stay visible mid-stream.
@@ -485,6 +488,7 @@ function buildLiveFooterItems(
   const items: LiveFooterItem[] = []
   for (const segmentId of segmentIds) {
     const segment = liveTranscriptStore.getSegment(conversationId, segmentId)
+    if (segment?.type === "thinking" && !showThinking) continue
     if (segment?.type === "tool") {
       const groupId = toolToGroup.get(segment.toolCallId)
       if (groupId) {
@@ -507,6 +511,7 @@ function buildLiveFooterItems(
 export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   conversationId,
   agentType,
+  showThinking,
   onToolRender,
 }: LiveTranscriptRowProps) {
   const segmentIds = useLiveTranscriptSegmentIds(conversationId)
@@ -527,13 +532,16 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   }, [publicationVersion, messageScroll])
 
   const items = useMemo(
-    () => buildLiveFooterItems(conversationId, segmentIds, groupIds),
-    [conversationId, segmentIds, groupIds]
+    () =>
+      buildLiveFooterItems(conversationId, segmentIds, groupIds, showThinking),
+    [conversationId, segmentIds, groupIds, showThinking]
   )
 
   if (segmentIds.length === 0) {
     return <PendingTypingIndicator />
   }
+
+  if (items.length === 0) return null
 
   return (
     <Message from="assistant" data-testid="live-transcript-row">
