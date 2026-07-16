@@ -30,7 +30,9 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
-use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
+use crate::acp::file_system_runtime::{
+    mode_allows_outside_workspace, FileSystemRuntime, FileSystemRuntimeError,
+};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
@@ -1420,8 +1422,12 @@ async fn apply_and_emit_session_config_options(
     preferred_mode_id: Option<&str>,
     preferred_config_values: &BTreeMap<String, String>,
     initial_config_options: Vec<SessionConfigOption>,
+    file_system_runtime: &FileSystemRuntime,
 ) {
     if agent_type == AgentType::Grok {
+        // Grok has no session mode selector; full-access follows
+        // `~/.grok/config.toml` `[ui].permission_mode = always-approve`.
+        sync_file_system_outside_access(file_system_runtime, agent_type, None);
         if let Some(mut opts) = synthesize_grok_config_options(grok_meta) {
             let session_id = session.session_id().clone();
             apply_grok_preferred_model(cx, &session_id, &mut opts, preferred_config_values).await;
@@ -1439,6 +1445,8 @@ async fn apply_and_emit_session_config_options(
         preferred_mode_id,
         preferred_config_values,
         initial_config_options,
+        file_system_runtime,
+        agent_type,
     )
     .await;
     emit_session_config_options_values(state, emitter, agent_type, updated).await;
@@ -1476,6 +1484,44 @@ fn resolve_working_dir(working_dir: Option<&str>) -> PathBuf {
         None => std::env::current_dir()
             .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))),
     }
+}
+
+/// Initial client-side FS sandbox policy before the agent reports its mode.
+///
+/// Grok's "always-approve" permission mode (from `~/.grok/config.toml`) is the
+/// full-access equivalent for that agent. Other agents use session mode /
+/// config-option ids recognized by [`mode_allows_outside_workspace`].
+fn initial_allow_outside_workspace(
+    agent_type: AgentType,
+    preferred_mode_id: Option<&str>,
+    preferred_config_values: &BTreeMap<String, String>,
+) -> bool {
+    if agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve() {
+        return true;
+    }
+    if preferred_mode_id.is_some_and(mode_allows_outside_workspace) {
+        return true;
+    }
+    preferred_config_values
+        .get("mode")
+        .is_some_and(|v| mode_allows_outside_workspace(v))
+}
+
+/// Keep `fs/read_text_file` / `fs/write_text_file` workspace sandbox in sync
+/// with the agent's current full-access mode (and Grok always-approve).
+fn sync_file_system_outside_access(
+    file_system_runtime: &FileSystemRuntime,
+    agent_type: AgentType,
+    mode_id: Option<&str>,
+) {
+    let allow = if agent_type == AgentType::Grok
+        && crate::commands::acp::grok_launch_always_approve()
+    {
+        true
+    } else {
+        mode_id.is_some_and(mode_allows_outside_workspace)
+    };
+    file_system_runtime.set_allow_outside_workspace(allow);
 }
 
 fn claude_raw_sdk_session_meta(
@@ -2022,7 +2068,15 @@ async fn run_connection(
         .with_default_cwd(Some(cwd.clone())),
     );
     let cwd_string = cwd.to_string_lossy().to_string();
-    let file_system_runtime = Arc::new(FileSystemRuntime::new(cwd.clone()));
+    let file_system_runtime = Arc::new(
+        FileSystemRuntime::new(cwd.clone()).with_allow_outside_workspace(
+            initial_allow_outside_workspace(
+                agent_type,
+                preferred_mode_id.as_deref(),
+                &preferred_config_values,
+            ),
+        ),
+    );
 
     let conn_id = connection_id.clone();
     let emitter_clone = emitter.clone();
@@ -2395,6 +2449,7 @@ async fn run_connection(
                                 preferred_mode_id.as_deref(),
                                 &preferred_config_values,
                                 initial_config_options.unwrap_or_default(),
+                                file_system_runtime.as_ref(),
                             )
                             .await;
                             emit_selectors_ready(&state, &emitter_clone).await;
@@ -2408,6 +2463,7 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 terminal_runtime.clone(),
+                                file_system_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
                                 &terminal_shell.spec,
@@ -2431,6 +2487,7 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 terminal_runtime.clone(),
+                                file_system_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
                                 &terminal_shell.spec,
@@ -2561,6 +2618,7 @@ async fn run_connection(
                             preferred_mode_id.as_deref(),
                             &preferred_config_values,
                             initial_config_options.unwrap_or_default(),
+                            file_system_runtime.as_ref(),
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
@@ -2574,6 +2632,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            file_system_runtime.clone(),
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
@@ -2593,6 +2652,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            file_system_runtime.clone(),
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
@@ -2707,6 +2767,7 @@ async fn run_connection(
                             preferred_mode_id.as_deref(),
                             &preferred_config_values,
                             initial_config_options.unwrap_or_default(),
+                            file_system_runtime.as_ref(),
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
@@ -2720,6 +2781,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            file_system_runtime.clone(),
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
@@ -2741,6 +2803,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            file_system_runtime.clone(),
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
@@ -2794,6 +2857,7 @@ async fn run_connection(
                     preferred_mode_id.as_deref(),
                     &preferred_config_values,
                     initial_config_options.unwrap_or_default(),
+                    file_system_runtime.as_ref(),
                 )
                 .await;
                 emit_selectors_ready(&state, &emitter_clone).await;
@@ -2807,6 +2871,7 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     terminal_runtime.clone(),
+                    file_system_runtime.clone(),
                     &cwd_string,
                     supports_fork,
                     &terminal_shell.spec,
@@ -2826,6 +2891,7 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     terminal_runtime.clone(),
+                    file_system_runtime.clone(),
                     &cwd,
                     &cwd_string,
                     &terminal_shell.spec,
@@ -2976,6 +3042,8 @@ async fn set_session_mode(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     mode_id: String,
+    file_system_runtime: &FileSystemRuntime,
+    agent_type: AgentType,
 ) -> Result<(), sacp::Error> {
     let req = SetSessionModeRequest::new(session.session_id().clone(), mode_id.clone());
     session
@@ -2984,6 +3052,7 @@ async fn set_session_mode(
         .block_task()
         .await?;
 
+    sync_file_system_outside_access(file_system_runtime, agent_type, Some(&mode_id));
     emit_with_state(state, emitter, AcpEvent::ModeChanged { mode_id }).await;
 
     Ok(())
@@ -3057,6 +3126,8 @@ async fn apply_preferred_session_options(
     preferred_mode_id: Option<&str>,
     preferred_config_values: &BTreeMap<String, String>,
     initial_config_options: Vec<SessionConfigOption>,
+    file_system_runtime: &FileSystemRuntime,
+    agent_type: AgentType,
 ) -> Vec<SessionConfigOption> {
     if let Some(pref_mode) = preferred_mode_id {
         let needs_apply = session
@@ -3065,10 +3136,28 @@ async fn apply_preferred_session_options(
             .map(|m| m.current_mode_id.to_string() != pref_mode)
             .unwrap_or(false);
         if needs_apply {
-            if let Err(e) = set_session_mode(session, state, emitter, pref_mode.to_string()).await {
+            if let Err(e) = set_session_mode(
+                session,
+                state,
+                emitter,
+                pref_mode.to_string(),
+                file_system_runtime,
+                agent_type,
+            )
+            .await
+            {
                 tracing::error!("[ACP] failed to apply preferred mode '{pref_mode}' on connect: {e}");
             }
+        } else {
+            // Preferred mode already active — still align the client FS sandbox.
+            sync_file_system_outside_access(file_system_runtime, agent_type, Some(pref_mode));
         }
+    } else if let Some(current) = session
+        .modes()
+        .as_ref()
+        .map(|m| m.current_mode_id.to_string())
+    {
+        sync_file_system_outside_access(file_system_runtime, agent_type, Some(&current));
     }
 
     if preferred_config_values.is_empty() {
@@ -3092,12 +3181,28 @@ async fn apply_preferred_session_options(
                 )
         });
         if already_matches {
+            if config_id == "mode" {
+                sync_file_system_outside_access(
+                    file_system_runtime,
+                    agent_type,
+                    Some(value_id.as_str()),
+                );
+            }
             continue;
         }
         match set_session_config_option_inner(cx, &session_id, config_id.clone(), value_id.clone())
             .await
         {
-            Ok(updated) => options = updated,
+            Ok(updated) => {
+                if config_id == "mode" {
+                    sync_file_system_outside_access(
+                        file_system_runtime,
+                        agent_type,
+                        Some(value_id.as_str()),
+                    );
+                }
+                options = updated;
+            }
             Err(e) => tracing::error!(
                 "[ACP] failed to apply preferred config '{config_id}'='{value_id}' \
                  on connect: {e}"
@@ -3705,6 +3810,7 @@ async fn handle_fork_or_exit(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     terminal_runtime: Arc<TerminalRuntime>,
+    file_system_runtime: Arc<FileSystemRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
     // Immutable connection shell snapshot — never re-read from settings.
@@ -3778,6 +3884,7 @@ async fn handle_fork_or_exit(
         None,
         &BTreeMap::new(),
         initial_config_options.unwrap_or_default(),
+        file_system_runtime.as_ref(),
     )
     .await;
     emit_selectors_ready(state, emitter).await;
@@ -3791,6 +3898,7 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         terminal_runtime.clone(),
+        file_system_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
         shell_spec,
@@ -3812,6 +3920,7 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         terminal_runtime,
+        file_system_runtime,
         _cwd,
         cwd_string,
         shell_spec,
@@ -3962,6 +4071,7 @@ async fn run_conversation_loop<'a>(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     terminal_runtime: Arc<TerminalRuntime>,
+    file_system_runtime: Arc<FileSystemRuntime>,
     cwd: &str,
     supports_fork: bool,
     // Immutable connection shell snapshot for `session/fork` metadata.
@@ -4337,6 +4447,11 @@ async fn run_conversation_loop<'a>(
                                     let req = SetSessionModeRequest::new(sid.clone(), mode_id.clone());
                                     match cx.send_request_to(Agent, req).block_task().await {
                                         Ok(_) => {
+                                            sync_file_system_outside_access(
+                                                file_system_runtime.as_ref(),
+                                                agent_type,
+                                                Some(&mode_id),
+                                            );
                                             emit_with_state(
                                                 state,
                                                 emitter,
@@ -4370,11 +4485,21 @@ async fn run_conversation_loop<'a>(
                                         )
                                         .await
                                     } else {
-                                        set_session_config_option(
+                                        let is_mode = config_id == "mode";
+                                        let mode_value = value_id.clone();
+                                        let result = set_session_config_option(
                                             &cx, &sid, state, emitter, agent_type, config_id,
                                             value_id,
                                         )
-                                        .await
+                                        .await;
+                                        if result.is_ok() && is_mode {
+                                            sync_file_system_outside_access(
+                                                file_system_runtime.as_ref(),
+                                                agent_type,
+                                                Some(&mode_value),
+                                            );
+                                        }
+                                        result
                                     };
                                     if let Err(e) = set_result {
                                         emit_with_state(
@@ -4513,7 +4638,16 @@ async fn run_conversation_loop<'a>(
                 }
             }
             Some(ConnectionCommand::SetMode { mode_id }) => {
-                if let Err(e) = set_session_mode(session, state, emitter, mode_id).await {
+                if let Err(e) = set_session_mode(
+                    session,
+                    state,
+                    emitter,
+                    mode_id,
+                    file_system_runtime.as_ref(),
+                    agent_type,
+                )
+                .await
+                {
                     emit_with_state(
                         state,
                         emitter,
@@ -4539,10 +4673,20 @@ async fn run_conversation_loop<'a>(
                 let set_result = if agent_type == AgentType::Grok {
                     set_grok_config_option(&cx, &sid, state, emitter, config_id, value_id).await
                 } else {
-                    set_session_config_option(
+                    let is_mode = config_id == "mode";
+                    let mode_value = value_id.clone();
+                    let result = set_session_config_option(
                         &cx, &sid, state, emitter, agent_type, config_id, value_id,
                     )
-                    .await
+                    .await;
+                    if result.is_ok() && is_mode {
+                        sync_file_system_outside_access(
+                            file_system_runtime.as_ref(),
+                            agent_type,
+                            Some(&mode_value),
+                        );
+                    }
+                    result
                 };
                 if let Err(e) = set_result {
                     emit_with_state(

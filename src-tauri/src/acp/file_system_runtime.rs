@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,11 +32,29 @@ impl FileSystemRuntimeError {
     }
 }
 
+/// Whether an ACP session mode / approval preset should lift the client-side
+/// workspace path sandbox for `fs/read_text_file` and `fs/write_text_file`.
+///
+/// Kept in sync with agent vocabularies:
+/// - Codex: `agent-full-access` (and legacy `full-access` / `danger-full-access`)
+/// - Claude Code: `bypassPermissions`
+pub fn mode_allows_outside_workspace(mode_id: &str) -> bool {
+    matches!(
+        mode_id,
+        "agent-full-access"
+            | "full-access"
+            | "danger-full-access"
+            | "bypassPermissions"
+    )
+}
+
 #[derive(Clone)]
 pub struct FileSystemRuntime {
     workspace_root: PathBuf,
     workspace_root_canonical: Option<PathBuf>,
     io_semaphore: Arc<Semaphore>,
+    /// When true, skip the workspace-root containment check (full-access mode).
+    allow_outside_workspace: Arc<AtomicBool>,
 }
 
 impl FileSystemRuntime {
@@ -53,7 +72,23 @@ impl FileSystemRuntime {
             workspace_root,
             workspace_root_canonical,
             io_semaphore: Arc::new(Semaphore::new(FS_MAX_CONCURRENT_OPS)),
+            allow_outside_workspace: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_allow_outside_workspace(self, allow: bool) -> Self {
+        self.allow_outside_workspace
+            .store(allow, Ordering::Relaxed);
+        self
+    }
+
+    pub fn set_allow_outside_workspace(&self, allow: bool) {
+        self.allow_outside_workspace
+            .store(allow, Ordering::Relaxed);
+    }
+
+    pub fn allow_outside_workspace(&self) -> bool {
+        self.allow_outside_workspace.load(Ordering::Relaxed)
     }
 
     pub async fn read_text_file(
@@ -82,6 +117,7 @@ impl FileSystemRuntime {
 
         let workspace_root = self.workspace_root.clone();
         let workspace_root_canonical = self.workspace_root_canonical.clone();
+        let allow_outside = self.allow_outside_workspace();
         let path = request.path;
         let line = request.line;
         let limit = request.limit;
@@ -95,6 +131,7 @@ impl FileSystemRuntime {
                 limit,
                 &workspace_root,
                 workspace_root_canonical.as_deref(),
+                allow_outside,
             )
             .map(ReadTextFileResponse::new)
         })
@@ -132,6 +169,7 @@ impl FileSystemRuntime {
 
         let workspace_root = self.workspace_root.clone();
         let workspace_root_canonical = self.workspace_root_canonical.clone();
+        let allow_outside = self.allow_outside_workspace();
         let path = request.path;
         let content = request.content;
         let started_at = Instant::now();
@@ -143,6 +181,7 @@ impl FileSystemRuntime {
                 &workspace_root,
                 workspace_root_canonical.as_deref(),
                 true,
+                allow_outside,
             )?;
             atomic_write_text(&path, content.as_bytes())?;
             Ok(WriteTextFileResponse::new())
@@ -185,8 +224,15 @@ fn read_text_file_impl(
     limit: Option<u32>,
     workspace_root: &Path,
     workspace_root_canonical: Option<&Path>,
+    allow_outside_workspace: bool,
 ) -> Result<String, FileSystemRuntimeError> {
-    ensure_path_in_workspace(path, workspace_root, workspace_root_canonical, false)?;
+    ensure_path_in_workspace(
+        path,
+        workspace_root,
+        workspace_root_canonical,
+        false,
+        allow_outside_workspace,
+    )?;
 
     let metadata = std::fs::metadata(path).map_err(|err| map_io_error("read", path, err))?;
     if metadata.len() > FS_MAX_FILE_SIZE_BYTES {
@@ -367,7 +413,12 @@ fn ensure_path_in_workspace(
     workspace_root: &Path,
     workspace_root_canonical: Option<&Path>,
     for_write: bool,
+    allow_outside_workspace: bool,
 ) -> Result<(), FileSystemRuntimeError> {
+    if allow_outside_workspace {
+        return Ok(());
+    }
+
     let root = canonical_workspace_root(workspace_root, workspace_root_canonical);
     let target = canonical_target_path(path, for_write)?;
 
@@ -479,6 +530,47 @@ mod tests {
 
         let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_access_allows_path_outside_workspace() {
+        let workspace = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("outside-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&outside, "outside-ok\n").expect("write outside file");
+
+        let runtime = FileSystemRuntime::new(workspace.clone()).with_allow_outside_workspace(true);
+        let response = runtime
+            .read_text_file(ReadTextFileRequest::new("sid", &outside))
+            .await
+            .expect("full access should allow outside path");
+        assert_eq!(response.content, "outside-ok\n");
+
+        runtime.set_allow_outside_workspace(false);
+        let error = runtime
+            .read_text_file(ReadTextFileRequest::new("sid", &outside))
+            .await
+            .expect_err("sandbox should re-engage when full access is off");
+        match error {
+            FileSystemRuntimeError::InvalidParams(message) => {
+                assert!(message.contains("outside workspace"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn mode_allows_outside_workspace_recognizes_known_full_access_ids() {
+        assert!(mode_allows_outside_workspace("agent-full-access"));
+        assert!(mode_allows_outside_workspace("full-access"));
+        assert!(mode_allows_outside_workspace("danger-full-access"));
+        assert!(mode_allows_outside_workspace("bypassPermissions"));
+        assert!(!mode_allows_outside_workspace("agent"));
+        assert!(!mode_allows_outside_workspace("read-only"));
+        assert!(!mode_allows_outside_workspace("default"));
+        assert!(!mode_allows_outside_workspace("always-approve"));
     }
 
     #[tokio::test(flavor = "current_thread")]
