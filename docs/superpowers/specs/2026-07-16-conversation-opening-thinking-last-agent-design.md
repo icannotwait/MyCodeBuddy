@@ -145,11 +145,14 @@ activity row continues to render.
 Agent settings load asynchronously. Until a matching persisted record is
 available, the view must fail closed and hide thinking to avoid a content flash.
 
-The preference is presentation-only. Adapters, transcript stores, historical
-turns, copy helpers, and export helpers retain the complete reasoning data.
-Turning the switch back on reveals already-loaded thinking without a transcript
-reload. Copying a message or exporting a conversation keeps the current complete
-data behavior even while thinking is hidden on screen.
+The preference is presentation-only. Adapters, transcript stores, and
+historical turns retain the complete reasoning data. The current
+`extractTextFromParts` helper copies only text, so extend it to include
+`reasoning.content` recursively through goal runs; message copy must include
+reasoning whether or not it is visible. Markdown, HTML, and image export already
+read canonical `ContentBlock` values and handle `thinking`, so those paths stay
+unchanged apart from regression coverage. Turning the switch back on reveals
+already-loaded thinking without a transcript reload.
 
 ## Project Last-Agent Recall
 
@@ -158,19 +161,24 @@ data behavior even while thinking is hidden on screen.
 After a normal project root conversation row has been created successfully,
 record its agent in that regular folder's `last_agent_type`.
 
-The standard desktop and server create paths share `create_conversation_core`,
-so the recency update belongs in the shared backend flow. It runs only after the
-conversation insert succeeds. Because the conversation already exists at that
-point, failure of the auxiliary recency write must be logged as a warning and
-must not turn the create request into an error; otherwise a frontend retry could
-create a duplicate conversation.
+Keep the existing `create_conversation_core` as the generic conversation-create
+primitive used by automation and tests. Add a shared
+`create_project_conversation_core` above it, and route only the standard desktop
+and server project-create wrappers through that new core. The project core calls
+the generic primitive first, then records recency only after the conversation
+insert succeeds. Because the conversation already exists at that point, failure
+of the auxiliary recency write must be logged as a warning and must not turn the
+create request into an error; otherwise a frontend retry could create a
+duplicate conversation.
 
-After the shared core returns, both the Tauri command wrapper and Axum handler
-emit the existing `folder://changed` upsert with the fresh `FolderDetail`.
-`AppWorkspaceProvider` applies that event to `folders` and `allFolders`, so all
-open clients immediately see the new recency without a new frontend-only patch
-path. A dropped event reconciles on the existing refresh/reconnect paths.
-Concurrent clients use last successful database write wins semantics.
+The project core returns the fresh `FolderDetail` produced by the successful
+recency update. After it returns, both the Tauri command wrapper and Axum handler
+call the same post-create emitter helper, which emits the existing conversation
+upsert and a `folder://changed` upsert for that fresh folder. `AppWorkspaceProvider`
+applies the folder event to `folders` and `allFolders`, so all open clients
+immediately see the new recency without a new frontend-only patch path. A
+dropped event reconciles on the existing refresh/reconnect paths. Concurrent
+clients use last successful database write wins semantics.
 
 Do not update recency for:
 
@@ -218,11 +226,13 @@ or persisted scroll metadata is required.
 
 ### First-History Lifecycle
 
-Only a tab whose `ConversationTabView` was already bound to a persisted
-conversation when it mounted begins with an `initialHistoryScrollPending`
-latch. A new draft starts with the latch cleared, and binding that still-mounted
-draft after its first send does not enable it. For an eligible persisted
-conversation:
+`ConversationTabView` captures whether it was already bound to a persisted
+conversation at mount and passes that immutable eligibility into
+`MessageListView`. `MessageListView` owns the
+`initialHistoryScrollPending` latch, while a focused child controller owns the
+DOM listeners and animation-frame stabilization. A new draft starts with the
+latch cleared, and binding that still-mounted draft after its first send does
+not enable it. For an eligible persisted conversation:
 
 1. Keep `MessageThread.resize` set to `instant` while detail history is loading,
    the first historical projection is committed, and Virtua performs its first
@@ -237,6 +247,11 @@ conversation:
 The initialization controller is one-shot for that mounted tab. It is not reset
 by active/inactive changes, a manual detail reload, or a draft becoming bound to
 its newly created conversation.
+
+The delegated sub-agent session dialog is also an uncached conversation view:
+its body unmounts when the dialog closes. It opts into the same controller on
+each body mount, so reopening the dialog performs a fresh first-open placement
+without introducing a separate scroll implementation.
 
 If the initial history load fails, leave the latch pending. A later successful
 retry performs the first instant placement. If the user starts wheel, touch,
@@ -289,7 +304,8 @@ uncached view and correctly performs the first-open behavior again.
   statistics remain.
 - A hidden live thinking segment never mounts `LiveTranscriptSegmentView`, and
   a thinking-only footer leaves no empty message body.
-- Copy/export tests prove hidden reasoning is still included in complete output.
+- Message-copy tests prove `extractTextFromParts` includes hidden reasoning, and
+  export regression tests prove every format still receives canonical thinking.
 - Message-thread tests prove loading/measurement uses instant resize and
   performs a final instant correction after two stable frames.
 - Keep-alive tests prove switching away/back and manual reload do not re-run the
