@@ -16,7 +16,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { WeightedLruCache } from "@/lib/cache/weighted-lru"
 import { cn, copyTextToClipboard } from "@/lib/utils"
+import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import {
   createContext,
@@ -102,7 +104,7 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   showLineNumbers?: boolean
 }
 
-interface TokenizedCode {
+export interface TokenizedCode {
   tokens: ThemedToken[][]
   fg: string
   bg: string
@@ -117,23 +119,59 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
 })
 
+type HighlighterFactory = (
+  language: BundledLanguage
+) => Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
+
 // Highlighter cache (singleton per language)
 const highlighterCache = new Map<
   string,
   Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
 >()
 
-// Token cache
-const tokensCache = new Map<string, TokenizedCode>()
+let highlighterFactoryOverride: HighlighterFactory | null = null
+
+const tokenCacheUtf8Encoder = new TextEncoder()
+
+function tokenCacheUtf8Bytes(value: string): number {
+  return tokenCacheUtf8Encoder.encode(value).byteLength
+}
+
+function estimateTokenizedCodeBytes(value: TokenizedCode): number {
+  return tokenCacheUtf8Bytes(JSON.stringify(value))
+}
+
+/** 128-entry / 8 MiB completed highlight token cache. */
+const completedTokens = new WeightedLruCache<string, TokenizedCode>({
+  maxEntries: 128,
+  maxWeight: 8 * 1024 * 1024,
+  weightOf: (value, key) =>
+    tokenCacheUtf8Bytes(key) + estimateTokenizedCodeBytes(value),
+})
+
+/** One in-flight highlight job per full-source cache key. */
+const inflightTokens = new Map<string, Promise<TokenizedCode>>()
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>()
 
-const getTokensCacheKey = (code: string, language: BundledLanguage) => {
-  const start = code.slice(0, 100)
-  const end = code.length > 100 ? code.slice(-100) : ""
-  return `${language}:${code.length}:${start}:${end}`
+function getTokensCacheKey(code: string, language: BundledLanguage): string {
+  // Full source — length/prefix/suffix keys collide when only the middle changes.
+  return `github-light+github-dark\0${language}\0${code}`
 }
+
+const defaultHighlighterFactory: HighlighterFactory = (language) =>
+  // Load Shiki's engine lazily: a static `import` would pull it (and its
+  // textmate machinery) into the first-paint bundle for every message list,
+  // even a text-only conversation. Highlighting is already async with an
+  // immediate raw-token fallback (see `createRawTokens`), so deferring the
+  // engine import only extends that existing pre-highlight window slightly.
+  import("shiki").then(({ createHighlighter }) =>
+    createHighlighter({
+      langs: [language],
+      themes: ["github-light", "github-dark"],
+    })
+  )
 
 const getHighlighter = (
   language: BundledLanguage
@@ -143,17 +181,8 @@ const getHighlighter = (
     return cached
   }
 
-  // Load Shiki's engine lazily: a static `import` would pull it (and its
-  // textmate machinery) into the first-paint bundle for every message list,
-  // even a text-only conversation. Highlighting is already async with an
-  // immediate raw-token fallback (see `createRawTokens`), so deferring the
-  // engine import only extends that existing pre-highlight window slightly.
-  const highlighterPromise = import("shiki").then(({ createHighlighter }) =>
-    createHighlighter({
-      langs: [language],
-      themes: ["github-light", "github-dark"],
-    })
-  )
+  const factory = highlighterFactoryOverride ?? defaultHighlighterFactory
+  const highlighterPromise = factory(language)
 
   highlighterCache.set(language, highlighterPromise)
   return highlighterPromise
@@ -175,31 +204,12 @@ const createRawTokens = (code: string): TokenizedCode => ({
   ),
 })
 
-// Synchronous highlight with callback for async results
-export const highlightCode = (
+function startHighlight(
   code: string,
   language: BundledLanguage,
-  // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-callbacks)
-  callback?: (result: TokenizedCode) => void
-): TokenizedCode | null => {
-  const tokensCacheKey = getTokensCacheKey(code, language)
-
-  // Return cached result if available
-  const cached = tokensCache.get(tokensCacheKey)
-  if (cached) {
-    return cached
-  }
-
-  // Subscribe callback if provided
-  if (callback) {
-    if (!subscribers.has(tokensCacheKey)) {
-      subscribers.set(tokensCacheKey, new Set())
-    }
-    subscribers.get(tokensCacheKey)?.add(callback)
-  }
-
-  // Start highlighting in background - fire-and-forget async pattern
-  getHighlighter(language)
+  tokensCacheKey: string
+): Promise<TokenizedCode | undefined> {
+  const promise = getHighlighter(language)
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
       const availableLangs = highlighter.getLoadedLanguages()
@@ -213,16 +223,15 @@ export const highlightCode = (
         },
       })
 
-      const tokenized: TokenizedCode = {
+      return {
         bg: result.bg ?? "transparent",
         fg: result.fg ?? "inherit",
         tokens: result.tokens,
-      }
-
-      // Cache the result
-      tokensCache.set(tokensCacheKey, tokenized)
-
-      // Notify all subscribers
+      } satisfies TokenizedCode
+    })
+    // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
+    .then((tokenized) => {
+      completedTokens.set(tokensCacheKey, tokenized)
       const subs = subscribers.get(tokensCacheKey)
       if (subs) {
         for (const sub of subs) {
@@ -230,14 +239,108 @@ export const highlightCode = (
         }
         subscribers.delete(tokensCacheKey)
       }
+      return tokenized
     })
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then), eslint-plugin-promise(prefer-await-to-callbacks)
-    .catch((error) => {
+    .catch((error: unknown) => {
       console.error("Failed to highlight code:", error)
+      // Drop subscribers so no stale callback fires; raw tokens stay visible.
       subscribers.delete(tokensCacheKey)
+      return undefined
+    })
+    // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
+    .finally(() => {
+      inflightTokens.delete(tokensCacheKey)
     })
 
+  inflightTokens.set(tokensCacheKey, promise as Promise<TokenizedCode>)
+  return promise
+}
+
+// Synchronous highlight with callback for async results
+export const highlightCode = (
+  code: string,
+  language: BundledLanguage,
+  // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-callbacks)
+  callback?: (result: TokenizedCode) => void
+): TokenizedCode | null => {
+  const tokensCacheKey = getTokensCacheKey(code, language)
+
+  // Return cached result if available
+  const cached = completedTokens.get(tokensCacheKey)
+  if (cached) {
+    return cached
+  }
+
+  // Subscribe callback if provided
+  if (callback) {
+    if (!subscribers.has(tokensCacheKey)) {
+      subscribers.set(tokensCacheKey, new Set())
+    }
+    subscribers.get(tokensCacheKey)?.add(callback)
+  }
+
+  // Share one in-flight job per full-source key
+  if (!inflightTokens.has(tokensCacheKey)) {
+    // Fire-and-forget; settle handlers above notify subscribers / clear state.
+    void startHighlight(code, language, tokensCacheKey)
+  }
+
   return null
+}
+
+/** Clear completed/in-flight highlight caches (backend reset / tests). */
+export function clearHighlightCaches(): void {
+  completedTokens.clear()
+  inflightTokens.clear()
+  subscribers.clear()
+  highlighterCache.clear()
+}
+
+/** Alias used by streaming-performance cache ownership. */
+export const resetHighlightCaches = clearHighlightCaches
+
+registerBackendScopedStoreReset(clearHighlightCaches)
+
+/** Test-only: override the Shiki highlighter factory. */
+export function __setHighlighterFactoryForTest(
+  factory: HighlighterFactory | null
+): void {
+  highlighterFactoryOverride = factory
+  highlighterCache.clear()
+}
+
+/** Test-only: insert a completed token entry under an arbitrary key. */
+export function __putHighlightCacheForTest(
+  key: string,
+  value: TokenizedCode
+): void {
+  completedTokens.set(key, value)
+}
+
+/** Content-free highlight cache stats (soak / memory assertions). */
+export function getHighlightCacheStats(): {
+  entries: number
+  bytes: number
+} {
+  return {
+    entries: completedTokens.size,
+    bytes: completedTokens.totalWeight,
+  }
+}
+
+/** Test-only alias for highlight cache stats. */
+export function __getHighlightCacheStatsForTest(): {
+  entries: number
+  bytes: number
+} {
+  return getHighlightCacheStats()
+}
+
+/** Test-only: reset overrides, caches, and in-flight state. */
+export function __resetHighlightCachesForTest(): void {
+  highlighterFactoryOverride = null
+  clearHighlightCaches()
 }
 
 // Line number styles using CSS counters
@@ -398,29 +501,27 @@ export const CodeBlockContent = ({
     [code, language, rawTokens]
   )
 
-  // Async highlighted result, tagged with its source code/language
+  // Async highlighted result, tagged with its source code/language.
+  // An incrementing request version rejects stale callbacks after props change.
   const [asyncState, setAsyncState] = useState<{
     code: string
     language: string
     tokenized: TokenizedCode
   } | null>(null)
+  const requestVersionRef = useRef(0)
 
   useEffect(() => {
-    let cancelled = false
+    const requestVersion = ++requestVersionRef.current
 
     // Subscribe to async highlighting result
     highlightCode(code, language, (result) => {
-      if (!cancelled) {
-        setAsyncState({ code, language, tokenized: result })
-      }
+      if (requestVersion !== requestVersionRef.current) return
+      setAsyncState({ code, language, tokenized: result })
     })
-
-    return () => {
-      cancelled = true
-    }
   }, [code, language])
 
-  // Use async result only if it matches current code/language
+  // Use async result only if it matches current code/language (stale
+  // versions never write asyncState, so code/language is sufficient here).
   const tokenized =
     asyncState?.code === code && asyncState?.language === language
       ? asyncState.tokenized

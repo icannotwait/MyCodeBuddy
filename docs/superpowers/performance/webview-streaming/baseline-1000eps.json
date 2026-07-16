@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "runId": "run-mrmjh3l6-12a4d1",
+  "fixture": {
+    "id": "grok_rich_v1",
+    "version": "grok-rich-v1",
+    "seed": 49374,
+    "rateProfile": "eps_1000",
+    "expectedEvents": 1223,
+    "expectedTextChars": 30000,
+    "expectedTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039"
+  },
+  "environment": {
+    "platform": "Win32",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+    "webviewVersion": "150.0.0.0",
+    "buildMode": "production",
+    "hardwareAcceleration": "enabled",
+    "deliveryMode": "legacy",
+    "flags": {
+      "desktop_acp_event_batching": false,
+      "incremental_live_transcript": false,
+      "deferred_streaming_rich_content": false
+    }
+  },
+  "delivery": {
+    "emitted_count": 18364,
+    "lagged_count": 0,
+    "ring_buffer_evict_count": 18108,
+    "replay_count": 0,
+    "replay_event_total": 0,
+    "snapshot_fallback_count": 0,
+    "snapshot_cold_count": 0,
+    "forwarder_lagged_count": 0,
+    "worker_queue_full_count": 0,
+    "desktop_raw_envelope_count": 18364,
+    "desktop_raw_bytes": 2714557,
+    "desktop_emit_attempt_count": 18364,
+    "desktop_serialization_failure_count": 0,
+    "desktop_emit_failure_count": 0,
+    "desktop_legacy_emit_count": 18364,
+    "desktop_batch_count": 0,
+    "desktop_batch_event_count": 0,
+    "desktop_batch_bytes": 0,
+    "desktop_batch_max_events": 0,
+    "desktop_batch_max_bytes": 0,
+    "desktop_batch_latency_total_us": 0,
+    "desktop_batch_latency_max_us": 0,
+    "desktop_queue_full_count": 0,
+    "desktop_startup_fallback_count": 0,
+    "desktop_runtime_failure_count": 0
+  },
+  "pipelineCounts": {
+    "deliveryCallbacks": 1223,
+    "ingestorFrames": 0,
+    "connectionMapPublications": 0,
+    "connectionTransactions": 1223,
+    "livePublications": 64,
+    "reactCommits": 64,
+    "paints": 15
+  },
+  "timings": {
+    "receiptToTransaction": {
+      "count": 1223,
+      "p50": 0,
+      "p95": 0.20000000298023224,
+      "max": 0.7000000029802322
+    },
+    "transactionToLivePublication": {
+      "count": 64,
+      "p50": 0,
+      "p95": 0,
+      "max": 0.10000000894069672
+    },
+    "batchToCommit": {
+      "count": 64,
+      "p50": 7.700000002980232,
+      "p95": 14.5,
+      "max": 16
+    },
+    "batchToPaint": {
+      "count": 64,
+      "p50": 56.29999999701977,
+      "p95": 113.59999999403954,
+      "max": 171
+    },
+    "inputToPaint": {
+      "count": 7,
+      "p50": 145.6000000089407,
+      "p95": 433.30000001192093,
+      "max": 433.30000001192093
+    },
+    "longTasks": {
+      "count": 2,
+      "p50": 70,
+      "p95": 92,
+      "max": 92
+    },
+    "frameGaps": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "eventLoopDrift": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "renders": {
+    "conversationPanel": 0,
+    "historicalThread": 133,
+    "historicalRow": 2,
+    "liveRow": 125,
+    "markdownBlock": 0,
+    "toolCard": 0
+  },
+  "integrity": {
+    "expectedEvents": 1223,
+    "appliedEvents": 1223,
+    "firstSeq": 1,
+    "lastSeq": 17131,
+    "duplicateCount": 0,
+    "gapCount": 0,
+    "finalTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039",
+    "ok": true
+  },
+  "cadence": {
+    "queuedDurationMs": 1461.2999999970198,
+    "paintCount": 12,
+    "updatesPerSecond": 8.211866146598558
+  },
+  "resources": {
+    "markdownCacheEntries": null,
+    "markdownCacheBytes": null,
+    "highlightCacheEntries": null,
+    "highlightCacheBytes": null,
+    "liveConversations": null,
+    "liveSegments": null,
+    "liveTools": null,
+    "usedHeapBytes": 120527134,
+    "heapMeasurement": "supported"
+  },
+  "acceptance": {
+    "batchToPaint": false,
+    "inputToPaint": false,
+    "longTask": true,
+    "visualCadence": false,
+    "eventIntegrity": true,
+    "passed": false
+  }
+}

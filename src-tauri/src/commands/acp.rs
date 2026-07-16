@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "tauri-runtime")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,9 @@ use tauri::{Manager, State};
 use crate::acp::binary_cache;
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
+use crate::acp::{EventBusMetrics, EventBusMetricsSnapshot};
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::InternalEventBus;
 use crate::acp::opencode_plugins::{self, PluginCheckSummary};
 use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
@@ -6090,6 +6095,45 @@ pub async fn acp_list_connections(
     manager: State<'_, ConnectionManager>,
 ) -> Result<Vec<ConnectionInfo>, AcpError> {
     Ok(manager.list_connections().await)
+}
+
+pub(crate) fn acp_get_event_metrics_core(metrics: &EventBusMetrics) -> EventBusMetricsSnapshot {
+    metrics.snapshot()
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub fn acp_get_event_metrics(
+    bus: tauri::State<'_, Arc<InternalEventBus>>,
+) -> EventBusMetricsSnapshot {
+    acp_get_event_metrics_core(bus.metrics())
+}
+
+/// Startup-selected desktop ACP delivery mode and performance flags.
+/// Mode is fixed for the process lifetime (never hot-switched).
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub fn acp_get_desktop_delivery_capabilities(
+    delivery: tauri::State<'_, Arc<crate::acp::DesktopAcpDelivery>>,
+) -> crate::acp::DesktopDeliveryCapabilities {
+    delivery.capabilities()
+}
+
+/// Test-utils-only: replay a deterministic ACP streaming fixture through the
+/// normal `emit_with_state` path for the given connection. Absent from release
+/// desktop registration and from server builds.
+#[cfg(all(feature = "test-utils", feature = "tauri-runtime"))]
+#[tauri::command]
+pub async fn acp_replay_streaming_perf_fixture(
+    connection_id: String,
+    request: crate::acp::perf_fixture::PerfReplayRequest,
+    manager: tauri::State<'_, ConnectionManager>,
+) -> Result<crate::acp::perf_fixture::PerfReplayResult, AcpError> {
+    let (state, emitter) = manager
+        .get_state_and_emitter(&connection_id)
+        .await
+        .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.clone()))?;
+    crate::acp::perf_fixture::replay_perf_fixture(&state, &emitter, request).await
 }
 
 pub(crate) async fn acp_get_session_snapshot_core(

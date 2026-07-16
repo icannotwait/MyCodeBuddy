@@ -4,7 +4,15 @@ import type {
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
 import { getFolderConversation } from "@/lib/api"
+import {
+  cacheCompletedStreamingPartition,
+  clearCompletedStreamingPartitions,
+  completeStreamingMarkdown,
+  joinStreamingMarkdown,
+} from "@/lib/markdown/incremental-stream-blocks"
+import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
+import { liveTranscriptStore } from "@/stores/live-transcript-store"
 import type {
   AgentExecutionStats,
   DbConversationDetail,
@@ -163,6 +171,92 @@ const initialState: ConversationRuntimeState = {
 // memoizing on the returned array (MessageListView's `threadItems`) don't see
 // a fresh array on every render for conversations that don't exist yet.
 const EMPTY_TIMELINE: ConversationTimelineTurn[] = []
+
+/**
+ * Cache key for the historical (non-streaming) timeline. Intentionally excludes
+ * live message *content* so content-only `SET_LIVE_MESSAGE` appends reuse the
+ * same historical array + entry references. Live identity (`id` / `startedAt`)
+ * still invalidates once at turn start and once at handoff.
+ */
+interface HistoricalTimelineCacheKey {
+  detail: DbConversationDetail | null
+  localTurns: MessageTurn[]
+  backgroundTurns: BackgroundOverlayEntry[]
+  optimisticTurns: MessageTurn[]
+  liveOwnsActiveTurn: boolean
+  delegationKickoffText: string | null
+  liveMessageId: string | null
+  liveStartedAt: number | null
+}
+
+interface HistoricalTimelineCacheEntry {
+  key: HistoricalTimelineCacheKey
+  value: ConversationTimelineTurn[]
+}
+
+/** Per-conversation historical timeline cache (session-keyed via conversationId). */
+const historicalTimelineCache = new Map<number, HistoricalTimelineCacheEntry>()
+
+function sameHistoricalKey(
+  left: HistoricalTimelineCacheKey,
+  right: HistoricalTimelineCacheKey
+): boolean {
+  return (
+    left.detail === right.detail &&
+    left.localTurns === right.localTurns &&
+    left.backgroundTurns === right.backgroundTurns &&
+    left.optimisticTurns === right.optimisticTurns &&
+    left.liveOwnsActiveTurn === right.liveOwnsActiveTurn &&
+    left.delegationKickoffText === right.delegationKickoffText &&
+    left.liveMessageId === right.liveMessageId &&
+    left.liveStartedAt === right.liveStartedAt
+  )
+}
+
+function buildHistoricalKey(
+  session: ConversationRuntimeSession
+): HistoricalTimelineCacheKey {
+  return {
+    detail: session.detail,
+    localTurns: session.localTurns,
+    backgroundTurns: session.backgroundTurns,
+    optimisticTurns: session.optimisticTurns,
+    liveOwnsActiveTurn: session.liveOwnsActiveTurn,
+    delegationKickoffText: session.delegationKickoffText,
+    liveMessageId: session.liveMessage?.id ?? null,
+    liveStartedAt: session.liveMessage?.startedAt ?? null,
+  }
+}
+
+function dedupeTimelineByRoleAwareId(
+  result: ConversationTimelineTurn[]
+): ConversationTimelineTurn[] {
+  // Retain rule is role-aware (all entries sharing an id are the same
+  // underlying turn, so the role is unambiguous):
+  //   - ASSISTANT (and any non-user): keep the LAST occurrence.
+  //   - USER: keep the FIRST occurrence.
+  // The key includes the role, not just the id, so the merge only ever
+  // collapses entries that are genuinely the same turn (same id AND role).
+  // Runs for every timeline entry on every streaming token, so avoid
+  // `JSON.stringify`. `role` is a fixed enum with no spaces, so the first space
+  // unambiguously splits role from id — a collision-free, far cheaper key.
+  const retainKey = (turn: MessageTurn) => `${turn.role} ${turn.id}`
+  const retainIndexByKey = new Map<string, number>()
+  result.forEach((entry, i) => {
+    const key = retainKey(entry.turn)
+    const existing = retainIndexByKey.get(key)
+    // First sighting always records; later sightings overwrite only for
+    // non-user turns (keep-last). User turns keep their first index.
+    if (existing === undefined || entry.turn.role !== "user") {
+      retainIndexByKey.set(key, i)
+    }
+  })
+  return retainIndexByKey.size === result.length
+    ? result
+    : result.filter(
+        (entry, i) => retainIndexByKey.get(retainKey(entry.turn)) === i
+      )
+}
 
 type Action =
   | {
@@ -1466,6 +1560,11 @@ function reducer(
         nextExternalIndex.set(merged.externalId, action.toConversationId)
       }
 
+      // Drop both ids so the next select recomputes under the new conversation
+      // id (keys rewrite with the new id). Never copy cache entries across.
+      historicalTimelineCache.delete(action.fromConversationId)
+      historicalTimelineCache.delete(action.toConversationId)
+
       return {
         byConversationId: nextByConversationId,
         conversationIdByExternalId: nextExternalIndex,
@@ -1597,6 +1696,9 @@ function reducer(
       if (current.externalId) {
         nextExternalIndex.delete(current.externalId)
       }
+      // Drop the historical cache entry so session transcript isn't retained
+      // after the conversation is removed from the store map.
+      historicalTimelineCache.delete(action.conversationId)
       return {
         byConversationId: nextByConversationId,
         conversationIdByExternalId: nextExternalIndex,
@@ -1604,6 +1706,7 @@ function reducer(
     }
 
     case "RESET":
+      historicalTimelineCache.clear()
       return initialState
   }
 }
@@ -1641,7 +1744,9 @@ export interface RuntimeActions {
   setLiveMessage: (
     conversationId: number,
     liveMessage: LiveMessage | null,
-    isLive?: boolean
+    isLive?: boolean,
+    /** Optional ACP delivery IDs for streaming-perf attribution (P0). */
+    deliveryIds?: readonly number[]
   ) => void
   setExternalId: (conversationId: number, externalId: string | null) => void
   setDbConversationId: (
@@ -1678,21 +1783,6 @@ export interface ConversationRuntimeContextValue extends RuntimeActions {
   getTimelineTurns: (conversationId: number) => ConversationTimelineTurn[]
 }
 
-// Timeline cache keyed by the session OBJECT (not the id). Each reducer step
-// allocates a fresh session object only for the conversation it touches and
-// preserves the reference for every other conversation, so an unrelated
-// dispatch (another tab's streaming token) leaves this conversation's session
-// ref — and therefore its cached timeline array — untouched. A WeakMap lets an
-// entry be collected once its session object is dropped from state (replaced on
-// update, or removed on REMOVE_CONVERSATION / RESET / migration), so the
-// transitively-retained transcript (detail.turns, live message, images, diffs)
-// never leaks in a long-lived desktop session. Keying by session is sound
-// because each session object belongs to exactly one conversation id.
-let timelineCache = new WeakMap<
-  ConversationRuntimeSession,
-  ConversationTimelineTurn[]
->()
-
 // Per-conversation fetch-generation counter. Each fetchDetail / refetchDetail /
 // removeConversation bumps the counter for that conversationId; an outstanding
 // fetch captures the value it was issued with and refuses to dispatch its
@@ -1714,13 +1804,6 @@ function isLatestGeneration(
   return fetchGeneration.get(conversationId) === generation
 }
 
-/**
- * Build the render timeline for a conversation from its runtime session,
- * memoized per session object via `timelineCache`. Verbatim port of the former
- * `getTimelineTurns` context callback; reads `state` explicitly so it can be
- * used both as a `useConversationRuntimeStore` selector body
- * (`selectTimelineTurns`) and via `getState()` in callbacks (`getTimelineTurns`).
- */
 /**
  * Stable two-list merge by turn timestamp (both inputs are already in
  * chronological order within themselves). Ties keep the LEFT list's entry
@@ -1758,15 +1841,23 @@ function mergeTimelineByTimestamp(
   return merged
 }
 
-function computeTimeline(
+/**
+ * Historical (non-streaming) timeline: phases 1–3 only. Cached per conversation
+ * with a key that excludes live content so streaming token appends keep the
+ * same historical array and entry references.
+ */
+function computeHistoricalTimeline(
   state: ConversationRuntimeState,
   conversationId: number
 ): ConversationTimelineTurn[] {
   const session = state.byConversationId.get(conversationId)
   if (!session) return EMPTY_TIMELINE
 
-  const cached = timelineCache.get(session)
-  if (cached) return cached
+  const key = buildHistoricalKey(session)
+  const cached = historicalTimelineCache.get(conversationId)
+  if (cached && sameHistoricalKey(cached.key, key)) {
+    return cached.value
+  }
 
   // Phase 1: DB historical turns.
   // When liveOwnsActiveTurn is set (sub-agent dialog), the live/local reply
@@ -1781,10 +1872,16 @@ function computeTimeline(
   // first assistant turn onward removes exactly the persisted copy of that
   // one reply. (A hypothetical multi-turn child would have earlier replies
   // hidden during the live/grace window — not a case the viewer supports.)
+  //
+  // Identity-only live fields (`liveMessageId` / `liveStartedAt`) gate the
+  // same branches that previously checked `session.liveMessage !== null`, so
+  // content-only live updates do not recompute this path.
+  const liveMessageId = key.liveMessageId
+  const liveStartedAt = key.liveStartedAt
   const rawPersistedTurns = session.detail?.turns ?? []
   const hasLiveOrLocalReply =
     session.liveOwnsActiveTurn &&
-    (session.liveMessage !== null || session.localTurns.length > 0)
+    (liveMessageId !== null || session.localTurns.length > 0)
   const firstAssistantIdx = hasLiveOrLocalReply
     ? rawPersistedTurns.findIndex((t) => t.role === "assistant")
     : -1
@@ -1817,9 +1914,7 @@ function computeTimeline(
   // id, so an earlier completed round's reply is never mistaken for a partial.
   const inFlightPromptId = session.detail?.in_flight_user_turn_id ?? null
   const inFlightPromptIdx =
-    !hasLiveOrLocalReply &&
-    session.liveMessage !== null &&
-    inFlightPromptId !== null
+    !hasLiveOrLocalReply && liveMessageId !== null && inFlightPromptId !== null
       ? persistedTurns.findIndex(
           (t) => t.role === "user" && t.id === inFlightPromptId
         )
@@ -1866,9 +1961,7 @@ function computeTimeline(
         // common case.
         timestamp:
           session.detail?.summary.created_at ??
-          (session.liveMessage
-            ? new Date(session.liveMessage.startedAt).toISOString()
-            : ""),
+          (liveStartedAt !== null ? new Date(liveStartedAt).toISOString() : ""),
       },
       phase: "persisted",
     })
@@ -1912,82 +2005,56 @@ function computeTimeline(
     })
   )
 
-  // Phase 4: Streaming turns (live agent response, split into rounds)
-  const streamingMessage = session.liveMessage
-  const built = streamingMessage
-    ? buildStreamingTurnsFromLiveMessage(conversationId, streamingMessage)
-    : null
-
+  // Invariant: the historical timeline never contains two turns with the same
+  // id+role. Streaming-phase dedup against historical runs in
+  // `appendCanonicalStreamingTurns` so this cache stays free of live content.
   const result = [...persisted, ...localAndBackground, ...optimistic]
+  const deduped = dedupeTimelineByRoleAwareId(result)
 
-  if (built) {
-    for (const [i, turn] of built.turns.entries()) {
-      result.push({
-        key: `streaming-${conversationId}-${streamingMessage?.id ?? "unknown"}-${i}`,
-        turn,
-        phase: "streaming",
-        inProgressToolCallIds: built.inProgressToolCallIds,
-      })
-    }
-  }
-
-  // Invariant: the timeline never contains two turns with the same id. A
-  // premature/duplicate COMPLETE_TURN (e.g. the background `turn_complete`
-  // listener in ConversationDetailPanel racing the panel's own promotion)
-  // can leave the in-flight turn in BOTH `localTurns` (a promoted snapshot)
-  // and the still-streaming `liveMessage`, or — after a final re-promotion
-  // once the same liveMessage was re-bridged — twice in `localTurns`. All
-  // copies are built by `buildStreamingTurnsFromLiveMessage` from that one
-  // liveMessage, so they share `live-<cid>-<liveMessageId>[-i]` ids.
-  // Rendering both duplicates the whole assistant turn (visible doubling +
-  // React duplicate-key warnings once `mergeConsecutiveAssistantTurns`
-  // flat-maps their parts).
-  //
-  // Retain rule is role-aware (all entries sharing an id are the same
-  // underlying turn, so the role is unambiguous):
-  //   - ASSISTANT (and any non-user): keep the LAST occurrence. The live
-  //     streaming copy (appended last) wins over an earlier promoted
-  //     snapshot, and a re-promoted local turn wins over its stale copy.
-  //   - USER: keep the FIRST occurrence. When the detail endpoint stamps the
-  //     persisted in-flight user turn with the broadcast id, that persisted
-  //     copy is emitted first, in its correct position before any partial
-  //     assistant reply; a same-id optimistic/synthesized copy is appended
-  //     later (and, for the sender, survives a mid-turn `awaiting_persist`
-  //     refetch). Keeping the persisted copy preserves ordering — otherwise
-  //     the prompt would render after its own streaming reply.
-  // Real turns always have distinct ids (liveMessage.id is minted fresh per
-  // prompt cycle, DB turn ids are unique), so a normal multi-turn timeline
-  // has no collisions and is returned untouched.
-  //
-  // The key includes the role, not just the id, so the merge only ever
-  // collapses entries that are genuinely the same turn (same id AND role).
-  // Should two DIFFERENT-role turns ever share an id — only reachable via a
-  // client id that collided into another namespace — they are kept separately
-  // (a recoverable visible duplicate) instead of one silently overwriting the
-  // other, which could hide a user prompt.
-  // Runs for every timeline entry on every streaming token, so avoid
-  // `JSON.stringify`. `role` is a fixed enum with no spaces, so the first space
-  // unambiguously splits role from id — a collision-free, far cheaper key.
-  const retainKey = (turn: MessageTurn) => `${turn.role} ${turn.id}`
-  const retainIndexByKey = new Map<string, number>()
-  result.forEach((entry, i) => {
-    const key = retainKey(entry.turn)
-    const existing = retainIndexByKey.get(key)
-    // First sighting always records; later sightings overwrite only for
-    // non-user turns (keep-last). User turns keep their first index.
-    if (existing === undefined || entry.turn.role !== "user") {
-      retainIndexByKey.set(key, i)
-    }
-  })
-  const deduped =
-    retainIndexByKey.size === result.length
-      ? result
-      : result.filter(
-          (entry, i) => retainIndexByKey.get(retainKey(entry.turn)) === i
-        )
-
-  timelineCache.set(session, deduped)
+  historicalTimelineCache.set(conversationId, { key, value: deduped })
   return deduped
+}
+
+/**
+ * Append canonical live streaming turns onto a historical timeline without
+ * mutating the cached historical array. Dedup is role-aware so a promoted
+ * local snapshot yields to the still-streaming copy of the same live id.
+ */
+function appendCanonicalStreamingTurns(
+  historical: ConversationTimelineTurn[],
+  conversationId: number,
+  liveMessage: LiveMessage
+): ConversationTimelineTurn[] {
+  const built = buildStreamingTurnsFromLiveMessage(conversationId, liveMessage)
+  const result = historical.slice()
+  for (const [index, turn] of built.turns.entries()) {
+    result.push({
+      key: `streaming-${conversationId}-${liveMessage.id}-${index}`,
+      turn,
+      phase: "streaming",
+      inProgressToolCallIds: built.inProgressToolCallIds,
+    })
+  }
+  return dedupeTimelineByRoleAwareId(result)
+}
+
+/**
+ * Full render timeline: stable historical rows + (when live) canonical
+ * streaming turns. Streaming appends produce a new array each call; historical
+ * entries remain reference-stable across content-only live updates.
+ */
+function computeTimeline(
+  state: ConversationRuntimeState,
+  conversationId: number
+): ConversationTimelineTurn[] {
+  const historical = computeHistoricalTimeline(state, conversationId)
+  const session = state.byConversationId.get(conversationId)
+  if (!session?.liveMessage) return historical
+  return appendCanonicalStreamingTurns(
+    historical,
+    conversationId,
+    session.liveMessage
+  )
 }
 
 export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
@@ -2255,13 +2322,26 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         turns,
         watermark,
       }),
-    setLiveMessage: (conversationId, liveMessage, isLive) =>
+    setLiveMessage: (conversationId, liveMessage, isLive, deliveryIds) => {
       dispatch({
         type: "SET_LIVE_MESSAGE",
         conversationId,
         liveMessage,
         isLive,
-      }),
+      })
+      // Queue after the Zustand update; the desktop listener flushes after
+      // markTransactionComplete so stage order stays receipt→tx→live→paint.
+      // Prefer explicit IDs, else the process-local in-flight delivery binding.
+      // Skip entirely when inactive so the hot path stays a single boolean check.
+      if (!streamingPerfRecorder.isActive()) return
+      const ids =
+        deliveryIds && deliveryIds.length > 0
+          ? deliveryIds
+          : streamingPerfRecorder.getCurrentDeliveryIds()
+      if (ids && ids.length > 0) {
+        streamingPerfRecorder.queueLivePublication(ids)
+      }
+    },
     setExternalId: (conversationId, externalId) =>
       dispatch({ type: "SET_EXTERNAL_ID", conversationId, externalId }),
     setDbConversationId: (conversationId, dbConversationId) =>
@@ -2272,12 +2352,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }),
     setSyncState: (conversationId, syncState) =>
       dispatch({ type: "SET_SYNC_STATE", conversationId, syncState }),
-    migrateConversation: (fromConversationId, toConversationId) =>
+    migrateConversation: (fromConversationId, toConversationId) => {
       dispatch({
         type: "MIGRATE_CONVERSATION",
         fromConversationId,
         toConversationId,
-      }),
+      })
+      liveTranscriptStore.migrate(fromConversationId, toConversationId)
+    },
     setPendingCleanup: (conversationId, pendingCleanup) =>
       dispatch({ type: "SET_PENDING_CLEANUP", conversationId, pendingCleanup }),
     setAcpLoadError: (conversationId, error) =>
@@ -2295,8 +2377,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
+      liveTranscriptStore.remove(conversationId)
     },
-    reset: () => dispatch({ type: "RESET" }),
+    reset: () => {
+      dispatch({ type: "RESET" })
+      liveTranscriptStore.reset()
+    },
   }
 
   return {
@@ -2340,10 +2426,23 @@ export function getTimelineTurns(
 }
 
 /**
- * State-taking timeline selector for `useConversationRuntimeStore(...)`. Returns
- * a reference-stable array across unrelated dispatches (memoized per session
- * object), so a subscribing component re-renders only when its own conversation
- * changes.
+ * Historical timeline only (no streaming phase). Cached with a key that
+ * excludes live content so content-only live appends return the exact same
+ * array and entry references.
+ */
+export function selectHistoricalTimelineTurns(
+  state: ConversationRuntimeState,
+  conversationId: number
+): ConversationTimelineTurn[] {
+  return computeHistoricalTimeline(state, conversationId)
+}
+
+/**
+ * State-taking timeline selector for `useConversationRuntimeStore(...)`.
+ * Compatibility path: stable historical rows plus canonical live streaming
+ * turns for consumers not yet migrated to the historical/live split.
+ * Historical entries stay reference-stable across content-only live updates;
+ * the returned outer array changes when streaming content is present.
  */
 export function selectTimelineTurns(
   state: ConversationRuntimeState,
@@ -2356,6 +2455,40 @@ export function selectTimelineTurns(
  *  state slices, never `actions`), so consumers re-render zero times. */
 export function useConversationRuntimeActions(): RuntimeActions {
   return useConversationRuntimeStore((s) => s.actions)
+}
+
+/**
+ * One call-stack live→local handoff: mark live completing → promote the
+ * canonical turn via `completeTurn` → drop the matching live projection.
+ * React external-store notifications issued in this stack produce one
+ * committed tree (no blank/duplicate assistant frame). Existing COMPLETE_TURN
+ * idempotency guards are preserved.
+ */
+export function completeLiveTranscriptTurn(
+  conversationId: number,
+  liveMessage?: LiveMessage | null
+): void {
+  const live = liveTranscriptStore.getConversation(conversationId)
+  if (live) {
+    liveTranscriptStore.markCompleting(conversationId, live.messageId)
+    // Complete each text partition and cache by exact canonical text for
+    // one-shot historical TextPart handoff before the live projection is dropped.
+    for (const id of live.segmentIds) {
+      const segment = live.segments.get(id)
+      if (segment?.type !== "text") continue
+      const completed = completeStreamingMarkdown(segment.document)
+      if (!completed.valid) continue
+      const joined = joinStreamingMarkdown(completed)
+      if (joined !== segment.text) continue
+      cacheCompletedStreamingPartition(segment.text, completed)
+    }
+  }
+  useConversationRuntimeStore
+    .getState()
+    .actions.completeTurn(conversationId, liveMessage)
+  if (live) {
+    liveTranscriptStore.removeIfMessage(conversationId, live.messageId)
+  }
 }
 
 /**
@@ -2372,7 +2505,8 @@ export function resetConversationRuntimeStore(): void {
   // have no concurrent fetches — but a real in-place backend switch would need a
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
-  timelineCache = new WeakMap()
+  historicalTimelineCache.clear()
+  clearCompletedStreamingPartitions()
   useConversationRuntimeStore.setState({
     byConversationId: new Map(),
     conversationIdByExternalId: new Map(),

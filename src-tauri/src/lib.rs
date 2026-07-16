@@ -223,6 +223,30 @@ mod tauri_app {
             // same download progress; lets the upgrade UI survive navigation.
             .manage(crate::update::new_update_state_handle())
             .setup(|app| {
+                // Desktop ACP delivery owner — selected once at startup from
+                // normalized streaming-performance flags. Managed before any
+                // manager / background task that can emit ACP events so the
+                // Tauri leg always resolves a stable mode (legacy or batched).
+                {
+                    use tauri::Manager;
+                    let metrics = app
+                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .metrics()
+                        .clone();
+                    let flags = crate::acp::StreamingPerformanceFlags::from_env();
+                    let delivery = crate::acp::DesktopAcpDelivery::start(
+                        app.handle().clone(),
+                        metrics,
+                        flags,
+                    );
+                    tracing::info!(
+                        "[ACP] desktop delivery mode={:?} batching={}",
+                        delivery.mode(),
+                        delivery.capabilities().flags.desktop_acp_event_batching
+                    );
+                    app.manage(delivery);
+                }
+
                 let app_data_dir = app.path().app_data_dir()?;
 
                 // Unify the data root across every consumer:
@@ -676,6 +700,10 @@ mod tauri_app {
                         .title("Codeg")
                         .inner_size(1260.0, 860.0)
                         .min_inner_size(400.0, 600.0);
+                    // Perf harness / reference builds only — ordinary release
+                    // binaries must not expose DevTools on the main window.
+                    #[cfg(feature = "test-utils")]
+                    let builder = builder.devtools(true);
                     if let Ok(w) = windows::apply_platform_window_style(builder).build() {
                         windows::post_window_setup(&w);
                     }
@@ -1073,6 +1101,10 @@ mod tauri_app {
                 acp_commands::acp_disconnect,
                 acp_commands::acp_touch_connection,
                 acp_commands::acp_list_connections,
+                acp_commands::acp_get_event_metrics,
+                acp_commands::acp_get_desktop_delivery_capabilities,
+                #[cfg(all(feature = "test-utils", feature = "tauri-runtime"))]
+                acp_commands::acp_replay_streaming_perf_fixture,
                 acp_commands::acp_get_session_snapshot,
                 acp_commands::acp_get_session_snapshot_by_conversation,
                 acp_commands::acp_find_connection_for_conversation,
@@ -1235,7 +1267,18 @@ mod tauri_app {
                     }
                     crate::office_watch::stop_all_office_watches();
                     if let Some(cm) = app.try_state::<ConnectionManager>() {
+                        // Disconnect first so terminal ACP events enter the
+                        // desktop queue before we drain the batcher.
                         tauri::async_runtime::block_on(cm.disconnect_all());
+                    }
+                    if let Some(delivery) =
+                        app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>()
+                    {
+                        if let Err(error) =
+                            tauri::async_runtime::block_on(delivery.shutdown())
+                        {
+                            tracing::error!("[ACP] desktop delivery shutdown failed: {error}");
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]

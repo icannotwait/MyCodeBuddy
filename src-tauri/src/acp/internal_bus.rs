@@ -21,6 +21,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
@@ -118,9 +119,69 @@ pub struct EventBusMetrics {
     /// stall their worker (typically a SQLite contention pattern). Distinct
     /// from `lagged_count` (bus-level event loss).
     pub worker_queue_full_count: AtomicU64,
+
+    // --- Desktop ACP delivery observability (Tauri webview leg only) ---
+    /// Envelopes offered to the desktop delivery path (legacy emit or batcher).
+    pub desktop_raw_envelope_count: AtomicU64,
+    /// Estimated serialized bytes of envelopes offered to desktop delivery.
+    pub desktop_raw_bytes: AtomicU64,
+    /// Desktop emit attempts (legacy single-event or batch flush).
+    pub desktop_emit_attempt_count: AtomicU64,
+    /// Failures while estimating payload size (serde); payload contents never logged.
+    pub desktop_serialization_failure_count: AtomicU64,
+    /// Desktop emit failures (`app.emit` / batch emit errors).
+    pub desktop_emit_failure_count: AtomicU64,
+    /// Successful single-event legacy `app.emit("acp://event", …)` counts.
+    pub desktop_legacy_emit_count: AtomicU64,
+    /// Batches flushed to the webview (P1+; remains zero under P0 legacy).
+    pub desktop_batch_count: AtomicU64,
+    /// Sum of event counts across all flushed batches.
+    pub desktop_batch_event_count: AtomicU64,
+    /// Sum of estimated bytes across all flushed batches.
+    pub desktop_batch_bytes: AtomicU64,
+    /// Max events observed in a single batch (`fetch_max`).
+    pub desktop_batch_max_events: AtomicU64,
+    /// Max estimated bytes observed in a single batch (`fetch_max`).
+    pub desktop_batch_max_bytes: AtomicU64,
+    /// Sum of batch flush latencies in microseconds.
+    pub desktop_batch_latency_total_us: AtomicU64,
+    /// Max batch flush latency in microseconds (`fetch_max`).
+    pub desktop_batch_latency_max_us: AtomicU64,
+    /// Desktop batcher queue full / backpressure observations.
+    pub desktop_queue_full_count: AtomicU64,
+    /// Startup fell back from batched to legacy delivery.
+    pub desktop_startup_fallback_count: AtomicU64,
+    /// Runtime delivery failures that forced fallback / failure events.
+    pub desktop_runtime_failure_count: AtomicU64,
 }
 
 impl EventBusMetrics {
+    /// Record one envelope offered to the desktop delivery path.
+    pub fn record_desktop_offer(&self, estimated_bytes: usize) {
+        self.desktop_raw_envelope_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.desktop_raw_bytes
+            .fetch_add(estimated_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record one flushed desktop batch (event count, bytes, flush latency).
+    pub fn record_desktop_batch(&self, events: usize, bytes: usize, latency: Duration) {
+        self.desktop_batch_count.fetch_add(1, Ordering::Relaxed);
+        self.desktop_batch_event_count
+            .fetch_add(events as u64, Ordering::Relaxed);
+        self.desktop_batch_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.desktop_batch_max_events
+            .fetch_max(events as u64, Ordering::Relaxed);
+        self.desktop_batch_max_bytes
+            .fetch_max(bytes as u64, Ordering::Relaxed);
+        let latency_us = latency.as_micros().min(u64::MAX as u128) as u64;
+        self.desktop_batch_latency_total_us
+            .fetch_add(latency_us, Ordering::Relaxed);
+        self.desktop_batch_latency_max_us
+            .fetch_max(latency_us, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> EventBusMetricsSnapshot {
         EventBusMetricsSnapshot {
             emitted_count: self.emitted_count.load(Ordering::Relaxed),
@@ -132,6 +193,38 @@ impl EventBusMetrics {
             snapshot_cold_count: self.snapshot_cold_count.load(Ordering::Relaxed),
             forwarder_lagged_count: self.forwarder_lagged_count.load(Ordering::Relaxed),
             worker_queue_full_count: self.worker_queue_full_count.load(Ordering::Relaxed),
+            desktop_raw_envelope_count: self
+                .desktop_raw_envelope_count
+                .load(Ordering::Relaxed),
+            desktop_raw_bytes: self.desktop_raw_bytes.load(Ordering::Relaxed),
+            desktop_emit_attempt_count: self
+                .desktop_emit_attempt_count
+                .load(Ordering::Relaxed),
+            desktop_serialization_failure_count: self
+                .desktop_serialization_failure_count
+                .load(Ordering::Relaxed),
+            desktop_emit_failure_count: self
+                .desktop_emit_failure_count
+                .load(Ordering::Relaxed),
+            desktop_legacy_emit_count: self.desktop_legacy_emit_count.load(Ordering::Relaxed),
+            desktop_batch_count: self.desktop_batch_count.load(Ordering::Relaxed),
+            desktop_batch_event_count: self.desktop_batch_event_count.load(Ordering::Relaxed),
+            desktop_batch_bytes: self.desktop_batch_bytes.load(Ordering::Relaxed),
+            desktop_batch_max_events: self.desktop_batch_max_events.load(Ordering::Relaxed),
+            desktop_batch_max_bytes: self.desktop_batch_max_bytes.load(Ordering::Relaxed),
+            desktop_batch_latency_total_us: self
+                .desktop_batch_latency_total_us
+                .load(Ordering::Relaxed),
+            desktop_batch_latency_max_us: self
+                .desktop_batch_latency_max_us
+                .load(Ordering::Relaxed),
+            desktop_queue_full_count: self.desktop_queue_full_count.load(Ordering::Relaxed),
+            desktop_startup_fallback_count: self
+                .desktop_startup_fallback_count
+                .load(Ordering::Relaxed),
+            desktop_runtime_failure_count: self
+                .desktop_runtime_failure_count
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -150,6 +243,22 @@ pub struct EventBusMetricsSnapshot {
     pub snapshot_cold_count: u64,
     pub forwarder_lagged_count: u64,
     pub worker_queue_full_count: u64,
+    pub desktop_raw_envelope_count: u64,
+    pub desktop_raw_bytes: u64,
+    pub desktop_emit_attempt_count: u64,
+    pub desktop_serialization_failure_count: u64,
+    pub desktop_emit_failure_count: u64,
+    pub desktop_legacy_emit_count: u64,
+    pub desktop_batch_count: u64,
+    pub desktop_batch_event_count: u64,
+    pub desktop_batch_bytes: u64,
+    pub desktop_batch_max_events: u64,
+    pub desktop_batch_max_bytes: u64,
+    pub desktop_batch_latency_total_us: u64,
+    pub desktop_batch_latency_max_us: u64,
+    pub desktop_queue_full_count: u64,
+    pub desktop_startup_fallback_count: u64,
+    pub desktop_runtime_failure_count: u64,
 }
 
 #[cfg(test)]
@@ -203,5 +312,20 @@ mod tests {
         assert_eq!(snap.emitted_count, 42);
         assert_eq!(snap.lagged_count, 3);
         assert_eq!(snap.snapshot_fallback_count, 1);
+    }
+
+    #[test]
+    fn metrics_snapshot_includes_desktop_delivery_counters() {
+        let metrics = EventBusMetrics::default();
+        metrics.desktop_raw_envelope_count.store(9, Ordering::Relaxed);
+        metrics.desktop_raw_bytes.store(4_096, Ordering::Relaxed);
+        metrics.desktop_emit_failure_count.store(2, Ordering::Relaxed);
+        metrics.desktop_batch_max_events.store(17, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.desktop_raw_envelope_count, 9);
+        assert_eq!(snapshot.desktop_raw_bytes, 4_096);
+        assert_eq!(snapshot.desktop_emit_failure_count, 2);
+        assert_eq!(snapshot.desktop_batch_max_events, 17);
     }
 }

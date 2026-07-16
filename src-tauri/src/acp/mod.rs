@@ -16,11 +16,16 @@ pub mod lifecycle;
 pub mod manager;
 pub mod opencode_catalog;
 pub mod opencode_plugins;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod perf_fixture;
 pub mod preflight;
 pub mod question;
 pub mod registry;
 pub mod session_info;
 pub mod session_state;
+pub mod streaming_performance;
+#[cfg(feature = "tauri-runtime")]
+pub mod desktop_event_batcher;
 pub mod terminal_adapter;
 pub mod terminal_context;
 pub mod terminal_runtime;
@@ -28,6 +33,14 @@ pub mod types;
 
 pub use idle_sweep::{idle_sweep_task, idle_timeout_from_env, SWEEP_INTERVAL_SECS};
 pub use internal_bus::{EventBusMetrics, EventBusMetricsSnapshot, InternalEventBus};
+pub use streaming_performance::{
+    DesktopDeliveryCapabilities, DesktopDeliveryMode, StreamingPerformanceFlags,
+};
+#[cfg(feature = "tauri-runtime")]
+pub use desktop_event_batcher::{
+    DesktopAcpDelivery, DesktopAcpEventBatch, DesktopConnectionSeqRange, DesktopDeliveryError,
+    DesktopDeliveryFailure,
+};
 pub use lifecycle::lifecycle_subscriber_task;
 pub use session_state::{LiveSessionSnapshot, SessionState};
 // Re-export the inner types of LiveSessionSnapshot for downstream consumers; not all are

@@ -1612,18 +1612,13 @@ mod tests {
         // waiter yielded from child.wait() while retaining the mutex. The
         // refresh path never yields while it owns this lock.
         let wall_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match terminal.child.try_lock() {
-                Ok(guard) => {
-                    drop(guard);
-                    assert!(
-                        std::time::Instant::now() < wall_deadline,
-                        "waiter never acquired the child mutex"
-                    );
-                    tokio::task::yield_now().await;
-                }
-                Err(_) => break,
-            }
+        while let Ok(guard) = terminal.child.try_lock() {
+            drop(guard);
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "waiter never acquired the child mutex"
+            );
+            tokio::task::yield_now().await;
         }
 
         let release_runtime = Arc::clone(&runtime);

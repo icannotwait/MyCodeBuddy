@@ -571,6 +571,7 @@ impl SessionState {
                     content.as_deref(),
                     raw_input.as_deref(),
                     raw_output.as_deref(),
+                    false,
                     locations.as_ref(),
                     meta.as_ref(),
                     images.as_deref(),
@@ -590,10 +591,10 @@ impl SessionState {
                 content,
                 raw_input,
                 raw_output,
+                raw_output_append,
                 locations,
                 meta,
                 images,
-                ..
             } => {
                 self.upsert_tool_call(
                     tool_call_id,
@@ -603,6 +604,7 @@ impl SessionState {
                     content.as_deref(),
                     raw_input.as_deref(),
                     raw_output.as_deref(),
+                    *raw_output_append == Some(true),
                     locations.as_ref(),
                     meta.as_ref(),
                     images.as_deref(),
@@ -1046,6 +1048,10 @@ impl SessionState {
     /// when present. Partial-update preservation: a `None` value passed in
     /// from a `ToolCallUpdate` (which typically carries only the fields that
     /// changed) must NOT clobber a previously-set value on the entry.
+    ///
+    /// When `raw_output_append` is true and both the prior and incoming
+    /// outputs are text, the strings are concatenated (mirrors the frontend
+    /// reducer and agent delta emission with `raw_output_append=true`).
     #[allow(clippy::too_many_arguments)]
     fn upsert_tool_call(
         &mut self,
@@ -1056,6 +1062,7 @@ impl SessionState {
         content: Option<&str>,
         raw_input: Option<&str>,
         raw_output: Option<&str>,
+        raw_output_append: bool,
         locations: Option<&serde_json::Value>,
         meta: Option<&serde_json::Value>,
         images: Option<&[ToolCallImageInfo]>,
@@ -1101,7 +1108,27 @@ impl SessionState {
             }
         }
         if let Some(text) = raw_output {
-            entry.output = Some(parse_tool_call_output_text(text));
+            let next = parse_tool_call_output_text(text);
+            if raw_output_append {
+                match (&mut entry.output, next) {
+                    (
+                        Some(ToolCallOutput::Text { content }),
+                        ToolCallOutput::Text { content: add },
+                    ) => {
+                        content.push_str(&add);
+                    }
+                    (None, next) => {
+                        entry.output = Some(next);
+                    }
+                    (_, next) => {
+                        // Type change under append: fall back to replace so
+                        // structured/error outputs still land.
+                        entry.output = Some(next);
+                    }
+                }
+            } else {
+                entry.output = Some(next);
+            }
         }
         if let Some(loc) = locations {
             entry.locations = Some(loc.clone());

@@ -10,7 +10,16 @@ import {
   type ReactNode,
 } from "react"
 import { useTranslations } from "next-intl"
-import { subscribe, getEventStream } from "@/lib/platform"
+import { getEventStream } from "@/lib/platform"
+import { getTransport } from "@/lib/transport"
+import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
+import { EventIngestor } from "@/lib/acp/event-ingestor"
+import {
+  getStreamingPerformanceConfig,
+  initializeStreamingPerformanceConfig,
+  __resetStreamingPerformanceConfigForTests,
+} from "@/lib/acp/streaming-performance-config"
+import type { LiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import type {
   AttachHandlers,
   EventStreamSubscription,
@@ -30,7 +39,23 @@ import {
   acpTouchConnection,
   acpGetSessionSnapshot,
   acpFindConnectionForConversation,
+  acpGetDesktopDeliveryCapabilities,
+  acpGetEventMetrics,
+  acpReplayStreamingPerfFixture,
+  getSystemRenderingSettings,
 } from "@/lib/api"
+import {
+  streamingPerfRecorder,
+  type PerfRateProfile,
+} from "@/lib/perf/streaming-perf-recorder"
+import {
+  downloadStreamingPerfReport,
+  extractWebviewVersion,
+  GROK_RICH_V1_EXPECTED_EVENTS,
+  GROK_RICH_V1_EXPECTED_TEXT_SHA256,
+  legacyStreamingPerformanceFlags,
+  type StreamingPerfReport,
+} from "@/lib/perf/streaming-perf-report"
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import {
@@ -59,6 +84,12 @@ import type {
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
   PromptCapabilitiesInfo,
+  AcceptedConnectionFrame,
+  AcceptedEventFrame,
+  DesktopAcpEventBatch,
+  DesktopDeliveryCapabilities,
+  DesktopDeliveryFailure,
+  SequenceGap,
   PromptInputBlock,
   ToolCallImageWire,
   UserMessageBlock,
@@ -549,12 +580,71 @@ type Action =
       type: "DELEGATION_CHILD_DETACH"
       contextKey: string
     }
+  | {
+      type: "APPLY_EVENT_FRAME"
+      frames: readonly PreparedConnectionFrame[]
+    }
 
 type StreamingAction =
   | { type: "CONTENT_DELTA"; contextKey: string; text: string }
   | { type: "THINKING"; contextKey: string; text: string }
 
+type MapLevelAction = Extract<
+  Action,
+  {
+    type:
+      | "CONNECTION_CREATED"
+      | "CONNECTION_REMOVED"
+      | "REMOVE_ALL"
+      | "REKEY_CONNECTION"
+      | "DELEGATION_CHILD_ATTACH"
+      | "DELEGATION_CHILD_DETACH"
+  }
+>
+
+type FrameAction = Exclude<
+  Action,
+  MapLevelAction | { type: "APPLY_EVENT_FRAME" }
+>
+
+interface PreparedConnectionFrame {
+  contextKey: string
+  deliveryIds: readonly number[]
+  actions: readonly FrameAction[]
+  highestSeq: number
+}
+
 type ConnectionsMap = Map<string, ConnectionState>
+
+/** Test-only: counts outer-map clones from writableConnections. */
+let writableConnectionsCloneCount = 0
+
+function writableConnections(
+  state: ConnectionsMap,
+  mutateUnpublished: boolean
+): ConnectionsMap {
+  if (mutateUnpublished) return state
+  if (process.env.NODE_ENV === "test") {
+    writableConnectionsCloneCount += 1
+  }
+  return new Map(state)
+}
+
+/** @internal */
+export function __getWritableConnectionsCloneCount(): number {
+  return writableConnectionsCloneCount
+}
+
+/** @internal */
+export function __resetWritableConnectionsCloneCount(): void {
+  if (process.env.NODE_ENV !== "test") return
+  writableConnectionsCloneCount = 0
+}
+
+/** @internal */
+export function __resetStreamingConfigForProviderTests(): void {
+  __resetStreamingPerformanceConfigForTests()
+}
 const MAX_LIVE_TOOL_RAW_OUTPUT_CHARS = 200_000
 const MAX_BUFFERED_UNMAPPED_EVENTS_PER_CONNECTION = 64
 const MAX_BUFFERED_UNMAPPED_CONNECTIONS = 128
@@ -1113,13 +1203,14 @@ function recordOutOfTurnToolCall(
   return next
 }
 
-function connectionsReducer(
+function reduceSingleAction(
   state: ConnectionsMap,
-  action: Action
+  action: Exclude<Action, { type: "APPLY_EVENT_FRAME" }>,
+  mutateUnpublished = false
 ): ConnectionsMap {
   switch (action.type) {
     case "CONNECTION_CREATED": {
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         connectionId: action.connectionId,
         contextKey: action.contextKey,
@@ -1173,7 +1264,7 @@ function connectionsReducer(
       if (existing && existing.connectionId === action.connectionId) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         connectionId: action.connectionId,
         contextKey: action.contextKey,
@@ -1222,7 +1313,7 @@ function connectionsReducer(
     case "DELEGATION_CHILD_DETACH": {
       const existing = state.get(action.contextKey)
       if (!existing || !existing.isDelegationChild) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.delete(action.contextKey)
       return next
     }
@@ -1277,7 +1368,7 @@ function connectionsReducer(
         ) {
           return state
         }
-        const next = new Map(state)
+        const next = writableConnections(state, mutateUnpublished)
         next.set(action.contextKey, {
           ...current,
           modes: mergedModes,
@@ -1295,7 +1386,7 @@ function connectionsReducer(
         action.patch.pendingPermission,
         hydratedLiveMessage ?? current.liveMessage
       )
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...current,
         status: action.patch.status,
@@ -1330,7 +1421,7 @@ function connectionsReducer(
       if (!current) return state
       // Idempotent: only advances if the new seq is strictly higher.
       if (action.seq <= current.lastAppliedSeq) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...current,
         lastAppliedSeq: action.seq,
@@ -1339,7 +1430,7 @@ function connectionsReducer(
     }
 
     case "CONNECTION_REMOVED": {
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.delete(action.contextKey)
       return next
     }
@@ -1352,7 +1443,7 @@ function connectionsReducer(
       if (!conn) return state
       // Defensive: if toKey already has an entry, do not clobber it.
       if (state.has(action.toKey)) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.delete(action.fromKey)
       next.set(action.toKey, { ...conn, contextKey: action.toKey })
       return next
@@ -1361,7 +1452,7 @@ function connectionsReducer(
     case "STATUS_CHANGED": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       const updated = { ...conn, status: action.status }
       if (action.status === "prompting") {
         updated.liveMessage = {
@@ -1408,7 +1499,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         backgroundOutstanding: action.outstanding,
@@ -1423,7 +1514,7 @@ function connectionsReducer(
       if (!conn) return state
       const updated = applyStreamingAction(conn, action)
       if (!updated) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, updated)
       return next
     }
@@ -1458,7 +1549,7 @@ function connectionsReducer(
         if (!hasChange) continue
 
         if (!next) {
-          next = new Map(state)
+          next = writableConnections(state, mutateUnpublished)
         }
         next.set(contextKey, updatedConn)
       }
@@ -1474,7 +1565,7 @@ function connectionsReducer(
       // the garbled-timeline bug), but its context is still recorded so a
       // background permission request can render command/diff details.
       if (conn.status !== "prompting") {
-        const next = new Map(state)
+        const next = writableConnections(state, mutateUnpublished)
         next.set(action.contextKey, {
           ...conn,
           outOfTurnToolCalls: recordOutOfTurnToolCall(conn.outOfTurnToolCalls, {
@@ -1555,7 +1646,7 @@ function connectionsReducer(
       }
       const nextLiveMessage = { ...prev, content: newContent }
       const nextInfo = findLiveToolCallInfo(newContent, action.tool_call_id)
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage: nextLiveMessage,
@@ -1602,7 +1693,7 @@ function connectionsReducer(
               meta: action.meta,
               images: action.images ?? [],
             }
-        const next = new Map(state)
+        const next = writableConnections(state, mutateUnpublished)
         next.set(action.contextKey, {
           ...conn,
           outOfTurnToolCalls: recordOutOfTurnToolCall(
@@ -1712,7 +1803,7 @@ function connectionsReducer(
 
       const nextLiveMessage = { ...prev, content: newContent }
       const nextInfo = findLiveToolCallInfo(newContent, action.tool_call_id)
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage: nextLiveMessage,
@@ -1728,10 +1819,14 @@ function connectionsReducer(
     case "BATCH_TOOL_CALL_UPDATES": {
       let current = state
       for (const sub of action.actions) {
-        current = connectionsReducer(current, {
-          type: "TOOL_CALL_UPDATE",
-          ...sub,
-        })
+        current = reduceSingleAction(
+          current,
+          {
+            type: "TOOL_CALL_UPDATE",
+            ...sub,
+          },
+          mutateUnpublished
+        )
       }
       return current
     }
@@ -1818,7 +1913,7 @@ function connectionsReducer(
           }
         }
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage: updatedLiveMessage,
@@ -1840,7 +1935,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingPermission: null,
@@ -1851,7 +1946,7 @@ function connectionsReducer(
     case "SET_PENDING_QUESTION": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingQuestion: action.pendingQuestion,
@@ -1862,7 +1957,7 @@ function connectionsReducer(
     case "CLEAR_PENDING_QUESTION": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingQuestion: null,
@@ -1873,7 +1968,7 @@ function connectionsReducer(
     case "SET_ASK_QUESTION": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingAskQuestion: action.pendingAskQuestion,
@@ -1890,7 +1985,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         pendingAskQuestion: null,
@@ -1901,7 +1996,7 @@ function connectionsReducer(
     case "SESSION_STARTED": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         sessionId: action.sessionId,
@@ -1913,7 +2008,7 @@ function connectionsReducer(
       const conn = state.get(action.contextKey)
       if (!conn) return state
       if (sameModes(conn.modes, action.modes)) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         modes: action.modes,
@@ -1927,7 +2022,7 @@ function connectionsReducer(
       if (sameConfigOptions(conn.configOptions, action.configOptions)) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         configOptions: action.configOptions,
@@ -1949,7 +2044,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         configStale: action.stale,
@@ -1962,7 +2057,7 @@ function connectionsReducer(
     case "DISMISS_CONFIG_STALE": {
       const conn = state.get(action.contextKey)
       if (!conn || conn.configStaleDismissed) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         configStaleDismissed: true,
@@ -1973,7 +2068,7 @@ function connectionsReducer(
     case "SELECTORS_READY": {
       const conn = state.get(action.contextKey)
       if (!conn || conn.selectorsReady) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         selectorsReady: true,
@@ -1992,7 +2087,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         promptCapabilities: action.promptCapabilities,
@@ -2004,7 +2099,7 @@ function connectionsReducer(
       const conn = state.get(action.contextKey)
       if (!conn) return state
       if (conn.supportsFork === action.supported) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         supportsFork: action.supported,
@@ -2016,7 +2111,7 @@ function connectionsReducer(
       const conn = state.get(action.contextKey)
       if (!conn?.modes) return state
       if (conn.modes.current_mode_id === action.modeId) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         modes: {
@@ -2049,7 +2144,7 @@ function connectionsReducer(
         ...opt,
         kind: { ...opt.kind, current_value: action.valueId },
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...conn, configOptions: updated })
       return next
     }
@@ -2093,7 +2188,7 @@ function connectionsReducer(
               { type: "plan" as const, entries: action.entries },
             ]
 
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage: { ...prev, content: newContent },
@@ -2105,7 +2200,7 @@ function connectionsReducer(
     case "CLAUDE_API_RETRY": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         claudeApiRetry: action.retry,
@@ -2116,7 +2211,7 @@ function connectionsReducer(
     case "ERROR": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         claudeApiRetry: null,
@@ -2128,7 +2223,7 @@ function connectionsReducer(
     case "ACP_LOAD_ERROR": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         loadError: action.message,
@@ -2140,7 +2235,7 @@ function connectionsReducer(
     case "CLEAR_ACP_LOAD_ERROR": {
       const conn = state.get(action.contextKey)
       if (!conn || conn.loadError === null) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         loadError: null,
@@ -2154,7 +2249,7 @@ function connectionsReducer(
       if (!conn) return state
       const commands = dedupeCommandsByName(action.commands)
       if (sameCommands(conn.availableCommands, commands)) return state
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         availableCommands: commands,
@@ -2177,7 +2272,7 @@ function connectionsReducer(
       ) {
         return state
       }
-      const next = new Map(state)
+      const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         usage: action.usage,
@@ -2188,6 +2283,679 @@ function connectionsReducer(
     default:
       return state
   }
+}
+
+function connectionsReducer(
+  state: ConnectionsMap,
+  action: Action
+): ConnectionsMap {
+  if (action.type === "APPLY_EVENT_FRAME") {
+    const next = writableConnections(state, false)
+    let changed = false
+    for (const frame of action.frames) {
+      const beforeConn = next.get(frame.contextKey)
+      if (!beforeConn) continue
+      for (const item of frame.actions) {
+        reduceSingleAction(next, item, true)
+      }
+      const reduced = next.get(frame.contextKey)
+      if (reduced && frame.highestSeq > reduced.lastAppliedSeq) {
+        next.set(frame.contextKey, {
+          ...reduced,
+          lastAppliedSeq: frame.highestSeq,
+        })
+      }
+      if (next.get(frame.contextKey) !== beforeConn) changed = true
+    }
+    return changed ? next : state
+  }
+  return reduceSingleAction(state, action, false)
+}
+
+/** @internal — for frame-action parity tests. */
+export function __connectionsReducerForTests(
+  state: ConnectionsMap,
+  action: Action
+): ConnectionsMap {
+  return connectionsReducer(state, action)
+}
+
+/** @internal */
+export type __FrameActionForTests = FrameAction
+
+// --- prepareMappedEnvelope + frame helpers (inserted before provider) ---
+
+interface PreparedEnvelope {
+  actions: FrameAction[]
+  afterCommit: Array<() => void>
+}
+
+interface PrepareEnv {
+  t: (key: string, params?: Record<string, string | number>) => string
+  tChat: (key: string, params?: Record<string, string | number>) => string
+  folderName: string | undefined
+  pushAlert: (
+    kind: "error" | "warning",
+    title: string,
+    message: string,
+    actions?: AlertAction[]
+  ) => void
+}
+
+function prepareMappedEnvelope(
+  contextKey: string,
+  envelope: EventEnvelope,
+  snapshot: ConnectionState,
+  env: PrepareEnv
+): PreparedEnvelope {
+  const actions: FrameAction[] = []
+  const afterCommit: Array<() => void> = []
+  const e = envelope
+
+  switch (e.type) {
+    case "status_changed":
+      actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
+      break
+    case "content_delta":
+      actions.push({ type: "CONTENT_DELTA", contextKey, text: e.text })
+      break
+    case "thinking":
+      actions.push({ type: "THINKING", contextKey, text: e.text })
+      break
+    case "claude_sdk_message":
+      actions.push({
+        type: "CLAUDE_API_RETRY",
+        contextKey,
+        retry: parseClaudeApiRetryEvent(e),
+      })
+      break
+    case "tool_call":
+      actions.push({
+        type: "TOOL_CALL",
+        contextKey,
+        tool_call_id: e.tool_call_id,
+        title: e.title,
+        kind: e.kind,
+        status: e.status,
+        content: e.content,
+        raw_input: e.raw_input,
+        raw_output: e.raw_output,
+        locations: e.locations ?? null,
+        meta: (e.meta as ToolCallMeta) ?? null,
+        images: e.images ?? null,
+      })
+      break
+    case "tool_call_update":
+      actions.push({
+        type: "TOOL_CALL_UPDATE",
+        contextKey,
+        tool_call_id: e.tool_call_id,
+        title: e.title,
+        fallback_title: env.t("toolFallbackTitle"),
+        fallback_kind: "tool",
+        status: e.status,
+        content: e.content,
+        raw_input: e.raw_input,
+        raw_output: e.raw_output,
+        raw_output_append: e.raw_output_append,
+        locations: e.locations ?? null,
+        meta: (e.meta as ToolCallMeta) ?? null,
+        images: e.images ?? null,
+      })
+      break
+    case "permission_resolved":
+      actions.push({
+        type: "PERMISSION_CLEARED",
+        contextKey,
+        requestId: e.request_id,
+      })
+      break
+    case "question_request":
+      actions.push({
+        type: "SET_ASK_QUESTION",
+        contextKey,
+        pendingAskQuestion: {
+          question_id: e.question_id,
+          questions: e.questions,
+          created_at: new Date().toISOString(),
+        },
+      })
+      break
+    case "question_resolved":
+      actions.push({
+        type: "CLEAR_ASK_QUESTION",
+        contextKey,
+        questionId: e.question_id,
+      })
+      break
+    case "background_activity": {
+      actions.push({
+        type: "SET_BACKGROUND_OUTSTANDING",
+        contextKey,
+        outstanding: e.outstanding,
+        settledCount: e.settled?.length ?? 0,
+        turnsCount: e.turns?.length ?? 0,
+      })
+      const sessionId = e.session_id
+      const turns = e.turns
+      const watermark = e.watermark
+      const settled = e.settled
+      const agentType = snapshot.agentType
+      const statusAtPrepare = snapshot.status
+      afterCommit.push(() => {
+        if (turns && turns.length > 0) {
+          const conversationId =
+            getConversationIdByExternalIdFromStore(sessionId)
+          if (conversationId != null) {
+            const runtime = useConversationRuntimeStore.getState()
+            runtime.actions.applyBackgroundActivity(
+              conversationId,
+              turns,
+              watermark
+            )
+            const session = useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(conversationId)
+            const now = Date.now()
+            const lastAt = overlayFoldRefetchAt.get(conversationId) ?? 0
+            if (
+              session &&
+              session.backgroundTurns.length > OVERLAY_FOLD_THRESHOLD &&
+              !session.detailLoading &&
+              now - lastAt > OVERLAY_FOLD_MIN_INTERVAL_MS
+            ) {
+              overlayFoldRefetchAt.set(conversationId, now)
+              runtime.actions.refetchDetail(conversationId, {
+                preserveLive: statusAtPrepare === "prompting",
+              })
+            }
+          }
+        }
+        if (settled && settled.length > 0) {
+          const agentLabel = AGENT_LABELS[agentType]
+          const fn = env.folderName
+          const title = fn ? `${fn} - MyCodeBuddy` : "MyCodeBuddy"
+          for (const item of settled) {
+            const body =
+              item.summary ??
+              env.tChat("backgroundTasks.settledFallback", {
+                status: item.status,
+              })
+            sendSystemNotification(title, `${agentLabel}: ${body}`).catch(
+              () => {}
+            )
+          }
+          const conversationId =
+            getConversationIdByExternalIdFromStore(sessionId)
+          if (conversationId != null) {
+            useConversationRuntimeStore
+              .getState()
+              .actions.refetchDetail(conversationId, {
+                preserveLive: statusAtPrepare === "prompting",
+              })
+          }
+        }
+      })
+      break
+    }
+    case "permission_request": {
+      actions.push({
+        type: "PERMISSION_REQUEST",
+        contextKey,
+        request_id: e.request_id,
+        tool_call: e.tool_call,
+        fallback_title: env.t("toolFallbackTitle"),
+        fallback_kind: "tool",
+        options: e.options,
+      })
+      const agentLabel = AGENT_LABELS[snapshot.agentType]
+      const fn = env.folderName
+      afterCommit.push(() => {
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        sendSystemNotification(
+          title,
+          `${agentLabel}: ${env.tChat("permissionDialog.subtitle")}`
+        ).catch(() => {})
+      })
+      break
+    }
+    case "session_started":
+      actions.push({
+        type: "SESSION_STARTED",
+        contextKey,
+        sessionId: e.session_id,
+      })
+      break
+    case "conversation_linked": {
+      const payload = {
+        contextKey,
+        connectionId: e.connection_id,
+        conversationId: e.conversation_id,
+        folderId: e.folder_id,
+      }
+      afterCommit.push(() => {
+        console.log("[acp-context] conversation_linked", payload)
+      })
+      break
+    }
+    case "session_modes": {
+      actions.push({
+        type: "SESSION_MODES",
+        contextKey,
+        modes: e.modes,
+      })
+      const agentType = snapshot.agentType
+      const modes = e.modes
+      afterCommit.push(() => {
+        const entry = selectorsCache.get(agentType) ?? {
+          modes: null,
+          configOptions: null,
+        }
+        entry.modes = modes
+        selectorsCache.set(agentType, entry)
+      })
+      break
+    }
+    case "session_config_options": {
+      actions.push({
+        type: "SESSION_CONFIG_OPTIONS",
+        contextKey,
+        configOptions: e.config_options,
+      })
+      const agentType = snapshot.agentType
+      const configOptions = e.config_options
+      afterCommit.push(() => {
+        const entry = selectorsCache.get(agentType) ?? {
+          modes: null,
+          configOptions: null,
+        }
+        entry.configOptions = configOptions
+        selectorsCache.set(agentType, entry)
+      })
+      break
+    }
+    case "session_config_stale":
+      actions.push({
+        type: "CONFIG_STALE_CHANGED",
+        contextKey,
+        stale: e.stale,
+        kind: e.kind,
+      })
+      break
+    case "selectors_ready": {
+      actions.push({ type: "SELECTORS_READY", contextKey })
+      const agentType = snapshot.agentType
+      const modes = snapshot.modes
+      const configOptions = snapshot.configOptions
+      afterCommit.push(() => {
+        if (!selectorsCache.has(agentType)) {
+          selectorsCache.set(agentType, { modes, configOptions })
+        }
+      })
+      break
+    }
+    case "prompt_capabilities":
+      actions.push({
+        type: "PROMPT_CAPABILITIES",
+        contextKey,
+        promptCapabilities: e.prompt_capabilities,
+      })
+      break
+    case "fork_supported":
+      actions.push({
+        type: "FORK_SUPPORTED",
+        contextKey,
+        supported: e.supported,
+      })
+      break
+    case "mode_changed":
+      actions.push({
+        type: "MODE_CHANGED",
+        contextKey,
+        modeId: e.mode_id,
+      })
+      break
+    case "plan_update":
+      actions.push({
+        type: "PLAN_UPDATE",
+        contextKey,
+        entries: e.entries,
+      })
+      break
+    case "turn_complete": {
+      actions.push({ type: "PERMISSION_CLEARED", contextKey })
+      actions.push({
+        type: "STATUS_CHANGED",
+        contextKey,
+        status: "connected",
+      })
+      if (snapshot.liveMessage) {
+        const blocks = snapshot.liveMessage.content
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          const block = blocks[i]
+          if (block.type !== "tool_call") continue
+          const normalized = inferLiveToolName({
+            title: block.info.title,
+            kind: block.info.kind,
+            rawInput: block.info.raw_input,
+            meta: block.info.meta,
+          })
+          if (normalized === "question") {
+            const questionText = extractQuestionText(block.info.raw_input)
+            if (questionText) {
+              actions.push({
+                type: "SET_PENDING_QUESTION",
+                contextKey,
+                pendingQuestion: {
+                  tool_call_id: block.info.tool_call_id,
+                  question: questionText,
+                },
+              })
+            }
+            break
+          }
+        }
+      }
+      const agentLabel = AGENT_LABELS[snapshot.agentType]
+      const fn = env.folderName
+      afterCommit.push(() => {
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        sendSystemNotification(
+          title,
+          env.t("notificationTurnComplete", { agent: agentLabel })
+        ).catch(() => {})
+      })
+      break
+    }
+    case "error": {
+      const agentLabel =
+        AGENT_LABELS[snapshot.agentType] || (e.agent_type as string)
+      const localizedMessage = (() => {
+        switch (e.code) {
+          case "initialize_timeout":
+            return env.t("backendErrors.initializeTimeout", {
+              agent: agentLabel,
+            })
+          case "sdk_not_installed":
+            return env.t("blocked.sdkMissing", { agent: agentLabel })
+          case "platform_not_supported":
+            return env.t("blocked.unavailable", { agent: agentLabel })
+          case "process_exited":
+            return env.t("backendErrors.processExited", { agent: agentLabel })
+          case "spawn_failed":
+            return env.t("backendErrors.spawnFailed", {
+              agent: agentLabel,
+              message: e.message,
+            })
+          case "download_failed":
+            return env.t("backendErrors.downloadFailed", {
+              agent: agentLabel,
+              message: e.message,
+            })
+          case "turn_failed_refusal":
+            return env.t("backendErrors.turnFailedRefusal", {
+              agent: agentLabel,
+            })
+          case "turn_failed_max_tokens":
+            return env.t("backendErrors.turnFailedMaxTokens", {
+              agent: agentLabel,
+            })
+          case "turn_failed_max_turn_requests":
+            return env.t("backendErrors.turnFailedMaxTurnRequests", {
+              agent: agentLabel,
+            })
+          case "turn_failed_unknown":
+            return env.t("backendErrors.turnFailedUnknown", {
+              agent: agentLabel,
+            })
+          case "turn_failed_empty":
+            return env.t("backendErrors.turnFailedEmpty", { agent: agentLabel })
+          case "grok_model_switch_incompatible_agent":
+            return env.t("backendErrors.grokModelSwitchIncompatibleAgent", {
+              agent: agentLabel,
+            })
+          default:
+            return e.message
+        }
+      })()
+      actions.push({ type: "ERROR", contextKey, message: localizedMessage })
+      afterCommit.push(() => {
+        env.pushAlert("error", env.t("eventErrorTitle"), localizedMessage)
+        const fn = env.folderName
+        const title = fn ? `${fn} - Codeg` : "Codeg"
+        sendSystemNotification(
+          title,
+          env.t("notificationError", {
+            agent: agentLabel,
+            message: localizedMessage,
+          })
+        ).catch(() => {})
+      })
+      break
+    }
+    case "session_load_failed": {
+      const agentLabel = AGENT_LABELS[snapshot.agentType] || ""
+      const localizedMessage = (() => {
+        switch (e.code) {
+          case "resource_not_found":
+            return env.t("backendErrors.sessionLoadResourceNotFound", {
+              agent: agentLabel,
+            })
+          case "session_unavailable":
+            return env.t("backendErrors.sessionLoadUnavailable", {
+              agent: agentLabel,
+            })
+          case "legacy_cli_session":
+            return env.t("backendErrors.sessionLoadLegacyCliSession", {
+              agent: agentLabel,
+            })
+          default:
+            return e.message
+        }
+      })()
+      actions.push({
+        type: "ACP_LOAD_ERROR",
+        contextKey,
+        message: localizedMessage,
+        code: e.code,
+      })
+      break
+    }
+    case "available_commands":
+      actions.push({
+        type: "AVAILABLE_COMMANDS",
+        contextKey,
+        commands: e.commands,
+      })
+      break
+    case "usage_update":
+      actions.push({
+        type: "USAGE_UPDATE",
+        contextKey,
+        usage: { used: e.used, size: e.size },
+      })
+      break
+    case "user_message":
+    case "user_prompt_sent":
+    case "conversation_status_changed":
+    case "delegation_started":
+    case "delegation_completed":
+    case "feedback_submitted":
+    case "feedback_consumed":
+      // No store mutations; raw subscribers (e.g. DelegationProvider) still run.
+      break
+    default: {
+      const unknown = envelope as EventEnvelope & { type: string }
+      console.warn("[acp-context] unknown ACP event type", {
+        type: unknown.type,
+      })
+      break
+    }
+  }
+
+  return { actions, afterCommit }
+}
+
+interface PreparedEventFrame {
+  connections: PreparedConnectionFrame[]
+  afterCommit: Array<() => void>
+  changedConnections: Array<{
+    contextKey: string
+    deliveryIds: readonly number[]
+  }>
+  renderChangedConnections: Array<{ contextKey: string }>
+}
+
+function resolveContextKeyForConnection(
+  connectionId: string,
+  fallbackKey: string,
+  reverseMap: Map<string, string>,
+  connections: ConnectionsMap
+): string {
+  const fromReverse = reverseMap.get(connectionId)
+  if (fromReverse) return fromReverse
+  for (const [key, conn] of connections) {
+    if (conn.connectionId === connectionId) return key
+  }
+  return fallbackKey
+}
+
+function onlyCursorChanged(
+  before: ConnectionState | undefined,
+  after: ConnectionState | undefined
+): boolean {
+  if (!before || !after) return false
+  if (before === after) return true
+  if (before.lastAppliedSeq === after.lastAppliedSeq) return false
+  return (
+    before.connectionId === after.connectionId &&
+    before.status === after.status &&
+    before.liveMessage === after.liveMessage &&
+    before.pendingPermission === after.pendingPermission &&
+    before.pendingQuestion === after.pendingQuestion &&
+    before.pendingAskQuestion === after.pendingAskQuestion &&
+    before.pendingUserMessage === after.pendingUserMessage &&
+    before.sessionId === after.sessionId &&
+    before.modes === after.modes &&
+    before.configOptions === after.configOptions &&
+    before.availableCommands === after.availableCommands &&
+    before.usage === after.usage &&
+    before.error === after.error &&
+    before.loadError === after.loadError &&
+    before.loadErrorCode === after.loadErrorCode &&
+    before.selectorsReady === after.selectorsReady &&
+    before.supportsFork === after.supportsFork &&
+    before.promptCapabilities === after.promptCapabilities &&
+    before.claudeApiRetry === after.claudeApiRetry &&
+    before.configStale === after.configStale &&
+    before.configStaleKind === after.configStaleKind &&
+    before.configStaleDismissed === after.configStaleDismissed &&
+    before.backgroundOutstanding === after.backgroundOutstanding &&
+    before.backgroundSettleSyncingSince ===
+      after.backgroundSettleSyncingSince &&
+    before.outOfTurnToolCalls === after.outOfTurnToolCalls &&
+    before.isViewer === after.isViewer &&
+    before.isDelegationChild === after.isDelegationChild
+  )
+}
+
+function prepareEventFrame(
+  frame: AcceptedEventFrame,
+  connections: ConnectionsMap,
+  reverseMap: Map<string, string>,
+  env: PrepareEnv
+): PreparedEventFrame {
+  // Progressive draft so later envelopes in the same frame see prior effects.
+  let draft = new Map(connections)
+  const preparedConnections: PreparedConnectionFrame[] = []
+  const afterCommit: Array<() => void> = []
+  const changedConnections: PreparedEventFrame["changedConnections"] = []
+  const renderChangedConnections: PreparedEventFrame["renderChangedConnections"] =
+    []
+
+  for (const connFrame of frame.connections) {
+    const contextKey = resolveContextKeyForConnection(
+      connFrame.connectionId,
+      connFrame.contextKey,
+      reverseMap,
+      draft
+    )
+    let snapshot = draft.get(contextKey)
+    if (!snapshot) continue
+
+    const before = connections.get(contextKey) ?? snapshot
+    const actions: FrameAction[] = []
+    for (const event of connFrame.applyEvents) {
+      const prepared = prepareMappedEnvelope(contextKey, event, snapshot, env)
+      actions.push(...prepared.actions)
+      afterCommit.push(...prepared.afterCommit)
+      for (const item of prepared.actions) {
+        draft = reduceSingleAction(draft, item, false)
+      }
+      const nextSnap = draft.get(contextKey)
+      if (nextSnap) snapshot = nextSnap
+    }
+
+    // Cursor advance (mirrors APPLY_EVENT_FRAME)
+    if (snapshot && connFrame.highestSeq > snapshot.lastAppliedSeq) {
+      const advanced: ConnectionState = {
+        ...snapshot,
+        lastAppliedSeq: connFrame.highestSeq,
+      }
+      draft.set(contextKey, advanced)
+      snapshot = advanced
+    }
+
+    preparedConnections.push({
+      contextKey,
+      deliveryIds: connFrame.deliveryIds,
+      actions,
+      highestSeq: connFrame.highestSeq,
+    })
+
+    const after = draft.get(contextKey)
+    if (after && after !== before) {
+      changedConnections.push({
+        contextKey,
+        deliveryIds: connFrame.deliveryIds,
+      })
+      if (!onlyCursorChanged(before, after)) {
+        renderChangedConnections.push({ contextKey })
+      }
+    }
+  }
+
+  return {
+    connections: preparedConnections,
+    afterCommit,
+    changedConnections,
+    renderChangedConnections,
+  }
+}
+
+/** Test-only publication counter for outer connection-map swaps. */
+let publishedConnectionMapsCount = 0
+
+/** @internal */
+export function __getPublishedConnectionMapsCount(): number {
+  return publishedConnectionMapsCount
+}
+
+/** @internal */
+export function __resetPublishedConnectionMapsCount(): void {
+  if (process.env.NODE_ENV !== "test") return
+  publishedConnectionMapsCount = 0
+}
+
+const LEGACY_DISABLED_CAPABILITIES: DesktopDeliveryCapabilities = {
+  mode: "legacy",
+  flags: {
+    desktop_acp_event_batching: false,
+    incremental_live_transcript: false,
+    deferred_streaming_rich_content: false,
+  },
+  perf_replay_available: false,
+  failure_event: "acp://delivery-failed",
 }
 
 // ── Ref-based store (replaces useReducer + Context) ──
@@ -2234,8 +3002,25 @@ export function useConnectionStore(): ConnectionStoreApi {
  */
 export type LiveMessageSink = (
   liveMessage: LiveMessage,
-  isLive: boolean
+  isLive: boolean,
+  /** Optional ACP delivery IDs for streaming-perf live-publication marks. */
+  deliveryIds?: readonly number[]
 ) => void
+
+/**
+ * Per-connection live sinks: canonical runtime mirror + optional UI transcript
+ * projection. Frame commit calls `canonical` once, then `transcript.publish`
+ * once with the accepted connection frame. Registration and snapshot hydrate
+ * call `transcript.rebuild` with the current canonical message.
+ */
+export interface ConnectionLiveSinks {
+  canonical(
+    liveMessage: LiveMessage,
+    isLive: boolean,
+    deliveryIds?: readonly number[]
+  ): void
+  transcript?: LiveTranscriptFrameSink
+}
 
 export interface AcpActionsValue {
   connect(
@@ -2277,11 +3062,15 @@ export interface AcpActionsValue {
   touchActivity(contextKey: string): void
   registerOpenTabKeys(keys: Set<string>): void
   /**
-   * Register a sink that mirrors this contextKey's `liveMessage` into the
-   * conversation-runtime store from `dispatch` (outside React), replacing the
-   * panel's per-token mirror effect. Returns an unregister fn (idempotent —
-   * only removes the entry if it still points at this sink). See
-   * `LiveMessageSink`.
+   * Register live sinks for this contextKey (canonical runtime mirror + optional
+   * transcript projection). Returns an unregister fn (idempotent — only removes
+   * the entry if it still points at these sinks). Immediately replays the
+   * current canonical message through `canonical` and `transcript.rebuild`.
+   */
+  registerLiveSinks(contextKey: string, sinks: ConnectionLiveSinks): () => void
+  /**
+   * Backward-compatible wrapper around `registerLiveSinks` with only a
+   * canonical sink. Prefer `registerLiveSinks` for new call sites.
    */
   registerLiveMessageSink(contextKey: string, sink: LiveMessageSink): () => void
   /**
@@ -2404,6 +3193,8 @@ export function useAcpEvent(handler: EventSubscriberHandler): void {
 function getAffectedKey(action: Action): string | null {
   if (action.type === "REMOVE_ALL") return null // special: all keys
   if (action.type === "STREAM_BATCH") return null
+  if (action.type === "APPLY_EVENT_FRAME") return null
+  if (action.type === "BATCH_TOOL_CALL_UPDATES") return null
   if ("contextKey" in action) return action.contextKey
   return null
 }
@@ -2533,22 +3324,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [t]
   )
 
-  // Per-contextKey liveMessage sinks. Fired synchronously from `dispatch` when a
-  // connection's liveMessage reference changes, mirroring it into the runtime
-  // store outside React (see `LiveMessageSink`). A ref → no re-renders.
-  const liveMessageSinksRef = useRef(new Map<string, LiveMessageSink>())
+  // Per-contextKey live sinks (canonical runtime mirror + optional transcript).
+  // Fired synchronously from frame commit / dispatch when liveMessage changes.
+  // A ref → no re-renders.
+  const liveSinksRef = useRef(new Map<string, ConnectionLiveSinks>())
 
   // Activity tracking (no re-renders)
   const lastActivityRef = useRef(new Map<string, number>())
-  const streamingQueueRef = useRef<StreamingAction[]>([])
-  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingUnmappedEventsRef = useRef(new Map<string, EventEnvelope[]>())
   const listenerReadyRef = useRef(false)
   const listenerReadyWaitersRef = useRef<Array<() => void>>([])
+  const eventIngestorRef = useRef<EventIngestor | null>(null)
+  const desktopDeliveryFailedRef = useRef(false)
   // Set of refs (not callbacks) so unmount cleanup matches the original
   // registration even when caller-side handler identity changes per render.
-  // Populated by the `useAcpEvent` hook; read by the primary `acp://event`
-  // listener and the buffered-events replay loop.
+  // Populated by the `useAcpEvent` hook; read by the primary event path
+  // and the buffered-events replay loop.
   const eventSubscribersRef = useRef<Set<EventSubscriberRef>>(new Set())
 
   // ── Notify helpers ──
@@ -2570,34 +3361,158 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     for (const cb of storeRef.current.activeKeyListeners) cb()
   }, [])
 
+  const notifyRawSubscribers = useCallback((envelope: EventEnvelope) => {
+    for (const ref of eventSubscribersRef.current) {
+      try {
+        ref.current(envelope)
+      } catch (err) {
+        console.error("[acp-context] subscriber threw:", err)
+      }
+    }
+  }, [])
+
+  const getPrepareEnv = useCallback((): PrepareEnv => {
+    return {
+      t: (key, params) =>
+        // next-intl keys are typed; prepare path uses dynamic keys.
+        (t as (k: string, p?: Record<string, string | number>) => string)(
+          key,
+          params
+        ),
+      tChat: (key, params) =>
+        (tChat as (k: string, p?: Record<string, string | number>) => string)(
+          key,
+          params
+        ),
+      folderName: folderNameRef.current,
+      pushAlert: (kind, title, message, actions) => {
+        pushAlertRef.current(kind, title, message, actions)
+      },
+    }
+  }, [t, tChat])
+
+  const mirrorLiveMessageOnce = useCallback(
+    (
+      key: string,
+      previous: ConnectionsMap,
+      next: ConnectionsMap,
+      deliveryIds: readonly number[],
+      connectionFrame?: AcceptedConnectionFrame
+    ) => {
+      const sinks = liveSinksRef.current.get(key)
+      if (!sinks) return
+      const nextConn = next.get(key)
+      if (!nextConn || nextConn.liveMessage == null) return
+      const liveChanged =
+        nextConn.liveMessage !== previous.get(key)?.liveMessage
+      if (!liveChanged && !connectionFrame) return
+
+      if (liveChanged) {
+        streamingPerfRecorder.setCurrentDeliveryIds(deliveryIds)
+        try {
+          sinks.canonical(
+            nextConn.liveMessage,
+            nextConn.status === "prompting",
+            deliveryIds
+          )
+          streamingPerfRecorder.flushQueuedLivePublication()
+        } finally {
+          streamingPerfRecorder.setCurrentDeliveryIds(null)
+        }
+      }
+
+      if (!sinks.transcript) return
+      if (connectionFrame) {
+        // Frame path: always publish so turn_complete (and other non-content
+        // events) can mark completing even when liveMessage is unchanged.
+        // Canonical sink above still only runs on live change.
+        sinks.transcript.publish(connectionFrame, nextConn.liveMessage)
+      } else if (liveChanged) {
+        // Snapshot hydrate / non-frame dispatches: full rebuild at cursor.
+        sinks.transcript.rebuild(nextConn.liveMessage, nextConn.lastAppliedSeq)
+      }
+    },
+    []
+  )
+
+  const commitEventFrame = useCallback(
+    (frame: AcceptedEventFrame): void => {
+      const prepared = prepareEventFrame(
+        frame,
+        storeRef.current.connections,
+        reverseMapRef.current,
+        getPrepareEnv()
+      )
+      const previous = storeRef.current.connections
+      const next = connectionsReducer(previous, {
+        type: "APPLY_EVENT_FRAME",
+        frames: prepared.connections,
+      })
+      if (next !== previous) {
+        storeRef.current.connections = next
+        if (process.env.NODE_ENV === "test") {
+          publishedConnectionMapsCount += 1
+        }
+      }
+      streamingPerfRecorder.markConnectionFrameCommitted(
+        frame.deliveryIds,
+        prepared.changedConnections.length,
+        next !== previous
+      )
+
+      // Map contextKey → accepted connection frame for transcript.publish.
+      const framesByKey = new Map<string, AcceptedConnectionFrame>()
+      for (const connFrame of frame.connections) {
+        const key =
+          reverseMapRef.current.get(connFrame.connectionId) ??
+          connFrame.contextKey
+        framesByKey.set(key, connFrame)
+      }
+
+      for (const connection of prepared.changedConnections) {
+        mirrorLiveMessageOnce(
+          connection.contextKey,
+          previous,
+          next,
+          connection.deliveryIds,
+          framesByKey.get(connection.contextKey)
+        )
+      }
+      for (const effect of prepared.afterCommit) effect()
+      for (const connection of prepared.renderChangedConnections) {
+        notifyKeyListeners(connection.contextKey)
+      }
+      for (const event of frame.rawEventsInDeliveryOrder) {
+        notifyRawSubscribers(event)
+      }
+    },
+    [
+      getPrepareEnv,
+      mirrorLiveMessageOnce,
+      notifyKeyListeners,
+      notifyRawSubscribers,
+    ]
+  )
+
   // ── Dispatch (replaces useReducer dispatch) ──
 
   const dispatch = useCallback(
     (action: Action) => {
+      if (action.type === "APPLY_EVENT_FRAME") {
+        // Frame commits go through commitEventFrame (publish order).
+        return
+      }
       const prev = storeRef.current.connections
       const next = connectionsReducer(prev, action)
       if (next === prev) return // no change
 
       storeRef.current.connections = next
+      if (process.env.NODE_ENV === "test") {
+        publishedConnectionMapsCount += 1
+      }
 
-      // Mirror a changed liveMessage into the runtime store OUTSIDE React, so
-      // the keep-alive conversation panel no longer has to re-render per
-      // streaming token just to run a mirror effect. Fires only when the
-      // reference actually changed and a sink is registered for the key; writes
-      // non-null values (turn-end clearing is owned by COMPLETE_TURN, unmount by
-      // removeConversation). `isLive = status === "prompting"`.
-      //
-      // Ordering: mirror BEFORE notifying the connection's key listeners, so the
-      // runtime store is updated before React observes the connection change —
-      // the panel and the runtime-store-driven message list then re-render off a
-      // consistent snapshot (not relying on React batching to reconcile the two).
       const mirrorLiveMessage = (key: string) => {
-        const sink = liveMessageSinksRef.current.get(key)
-        if (!sink) return
-        const nextConn = next.get(key)
-        if (!nextConn || nextConn.liveMessage == null) return
-        if (nextConn.liveMessage === prev.get(key)?.liveMessage) return
-        sink(nextConn.liveMessage, nextConn.status === "prompting")
+        mirrorLiveMessageOnce(key, prev, next, [])
       }
 
       if (action.type === "REMOVE_ALL") {
@@ -2615,8 +3530,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           notifyKeyListeners(key)
         }
       } else if (action.type === "REKEY_CONNECTION") {
-        // The connection (with its in-flight liveMessage) moved to toKey; sync
-        // it BEFORE notifying so a close+reopen mid-turn doesn't drop the stream.
+        // Move sink registration with the context key; projection IDs unchanged.
+        const sinks = liveSinksRef.current.get(action.fromKey)
+        if (sinks) {
+          liveSinksRef.current.delete(action.fromKey)
+          liveSinksRef.current.set(action.toKey, sinks)
+        }
         mirrorLiveMessage(action.toKey)
         notifyKeyListeners(action.fromKey)
         notifyKeyListeners(action.toKey)
@@ -2628,7 +3547,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [notifyKeyListeners, notifyAllKeyListeners]
+    [mirrorLiveMessageOnce, notifyKeyListeners, notifyAllKeyListeners]
   )
 
   // ── setActiveKey ──
@@ -2682,29 +3601,28 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     openTabKeysRef.current = keys
   }, [])
 
-  const registerLiveMessageSink = useCallback(
-    (contextKey: string, sink: LiveMessageSink) => {
-      liveMessageSinksRef.current.set(contextKey, sink)
-      // Replay the CURRENT liveMessage immediately, matching the removed mirror
-      // effect's setup write. A panel can mount/remount over a connection that
-      // already holds a non-null liveMessage — connection reuse, a viewer
-      // attaching mid-turn, or close+reopen mid-turn — and if the stream is
-      // paused (e.g. blocked on a permission/question) no further delta would
-      // arrive to trigger the sink. Without this replay the runtime store, and
-      // thus the message list, would stay blank/stale until the next change.
+  const registerLiveSinks = useCallback(
+    (contextKey: string, sinks: ConnectionLiveSinks) => {
+      liveSinksRef.current.set(contextKey, sinks)
       const conn = storeRef.current.connections.get(contextKey)
       if (conn?.liveMessage != null) {
-        sink(conn.liveMessage, conn.status === "prompting")
+        sinks.canonical(conn.liveMessage, conn.status === "prompting")
+        sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
       }
       return () => {
-        // Idempotent: only drop the entry if it still points at this sink (a
-        // remount may have already replaced it).
-        if (liveMessageSinksRef.current.get(contextKey) === sink) {
-          liveMessageSinksRef.current.delete(contextKey)
+        if (liveSinksRef.current.get(contextKey) === sinks) {
+          liveSinksRef.current.delete(contextKey)
         }
       }
     },
     []
+  )
+
+  const registerLiveMessageSink = useCallback(
+    (contextKey: string, sink: LiveMessageSink) => {
+      return registerLiveSinks(contextKey, { canonical: sink })
+    },
+    [registerLiveSinks]
   )
 
   const clearAcpLoadError = useCallback(
@@ -2712,51 +3630,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "CLEAR_ACP_LOAD_ERROR", contextKey })
     },
     [dispatch]
-  )
-
-  const flushStreamingQueue = useCallback(() => {
-    flushTimerRef.current = null
-    const queued = streamingQueueRef.current
-    if (queued.length === 0) return
-    streamingQueueRef.current = []
-
-    // Merge adjacent deltas by connection key (per-key order preserved),
-    // reducing reducer work and string copies under high-frequency streams.
-    const grouped = new Map<string, StreamingAction[]>()
-    for (const action of queued) {
-      const list = grouped.get(action.contextKey)
-      if (!list) {
-        grouped.set(action.contextKey, [{ ...action }])
-        continue
-      }
-      const last = list[list.length - 1]
-      if (last && last.type === action.type) {
-        last.text += action.text
-      } else {
-        list.push({ ...action })
-      }
-    }
-
-    const compacted = Array.from(grouped.values()).flat()
-    dispatch({ type: "STREAM_BATCH", actions: compacted })
-  }, [dispatch])
-
-  const enqueueStreamingAction = useCallback(
-    (action: StreamingAction) => {
-      streamingQueueRef.current.push(action)
-      if (streamingQueueRef.current.length >= 256) {
-        if (flushTimerRef.current !== null) {
-          clearTimeout(flushTimerRef.current)
-          flushTimerRef.current = null
-        }
-        flushStreamingQueue()
-        return
-      }
-      if (flushTimerRef.current === null) {
-        flushTimerRef.current = setTimeout(flushStreamingQueue, 16)
-      }
-    },
-    [flushStreamingQueue]
   )
 
   const resolveListenerReadyWaiters = useCallback(() => {
@@ -2802,608 +3675,136 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     []
   )
 
-  // ── RAF batching for tool_call_update events ──
-  const pendingToolCallUpdates = useRef<
-    Array<{
-      contextKey: string
-      tool_call_id: string
-      title: string | null
-      fallback_title: string
-      fallback_kind: string
-      status: string | null
-      content: string | null
-      raw_input: string | null
-      raw_output: string | null
-      raw_output_append?: boolean
-      locations: unknown
-      meta: ToolCallMeta
-      images: ToolCallImage[] | null
-    }>
-  >([])
-  const toolCallUpdateRafId = useRef<number | null>(null)
+  const seedDelegationsFromSnapshotRef = useRef<
+    (
+      connectionId: string,
+      activeDelegations: ActiveDelegationState[],
+      eventSeq: number
+    ) => void
+  >(() => {})
 
-  const flushPendingToolCallUpdates = useCallback(() => {
-    if (pendingToolCallUpdates.current.length === 0) return
-    if (toolCallUpdateRafId.current !== null) {
-      cancelAnimationFrame(toolCallUpdateRafId.current)
-      toolCallUpdateRafId.current = null
-    }
-    const batch = pendingToolCallUpdates.current
-    pendingToolCallUpdates.current = []
-    dispatch({ type: "BATCH_TOOL_CALL_UPDATES", actions: batch })
-  }, [dispatch])
-
-  const scheduleToolCallUpdateFlush = useCallback(() => {
-    if (toolCallUpdateRafId.current !== null) return
-    toolCallUpdateRafId.current = requestAnimationFrame(() => {
-      toolCallUpdateRafId.current = null
-      flushPendingToolCallUpdates()
-    })
-  }, [flushPendingToolCallUpdates])
-
-  useEffect(() => {
-    return () => {
-      if (toolCallUpdateRafId.current !== null) {
-        cancelAnimationFrame(toolCallUpdateRafId.current)
-      }
-    }
-  }, [])
-
-  const handleMappedEvent = useCallback(
-    (contextKey: string, e: EventEnvelope) => {
-      switch (e.type) {
-        case "status_changed":
-          flushStreamingQueue()
-          dispatch({ type: "STATUS_CHANGED", contextKey, status: e.status })
-          break
-        case "content_delta":
-          enqueueStreamingAction({
-            type: "CONTENT_DELTA",
-            contextKey,
-            text: e.text,
-          })
-          break
-        case "thinking":
-          enqueueStreamingAction({ type: "THINKING", contextKey, text: e.text })
-          break
-        case "claude_sdk_message":
-          flushStreamingQueue()
-          dispatch({
-            type: "CLAUDE_API_RETRY",
-            contextKey,
-            retry: parseClaudeApiRetryEvent(e),
-          })
-          break
-        case "tool_call":
-          flushStreamingQueue()
-          dispatch({
-            type: "TOOL_CALL",
-            contextKey,
-            tool_call_id: e.tool_call_id,
-            title: e.title,
-            kind: e.kind,
-            status: e.status,
-            content: e.content,
-            raw_input: e.raw_input,
-            raw_output: e.raw_output,
-            locations: e.locations ?? null,
-            meta: (e.meta as ToolCallMeta) ?? null,
-            images: e.images ?? null,
-          })
-          break
-        case "tool_call_update":
-          flushStreamingQueue()
-          pendingToolCallUpdates.current.push({
-            contextKey,
-            tool_call_id: e.tool_call_id,
-            title: e.title,
-            fallback_title: t("toolFallbackTitle"),
-            fallback_kind: "tool",
-            status: e.status,
-            content: e.content,
-            raw_input: e.raw_input,
-            raw_output: e.raw_output,
-            raw_output_append: e.raw_output_append,
-            locations: e.locations ?? null,
-            meta: (e.meta as ToolCallMeta) ?? null,
-            images: e.images ?? null,
-          })
-          scheduleToolCallUpdateFlush()
-          break
-        case "permission_resolved":
-          // Backend signals a permission was answered (this window's local
-          // respondPermission, a sibling window, a server-mode peer, or
-          // chat-channel auto-approve). The local-respond path already
-          // dispatched PERMISSION_CLEARED synchronously, so this is a no-op
-          // there; the other three paths rely on this branch to retire the
-          // dialog without waiting for TurnComplete. Matched by request_id so
-          // a stale event can't wipe a fresh permission.
-          dispatch({
-            type: "PERMISSION_CLEARED",
-            contextKey,
-            requestId: e.request_id,
-          })
-          break
-        case "question_request":
-          // Agent called the blocking `ask_user_question` MCP tool. Flush any
-          // queued streaming so the card renders against current content, then
-          // raise the interactive multiple-choice card above the input box.
-          flushStreamingQueue()
-          dispatch({
-            type: "SET_ASK_QUESTION",
-            contextKey,
-            pendingAskQuestion: {
-              question_id: e.question_id,
-              questions: e.questions,
-              created_at: new Date().toISOString(),
-            },
-          })
-          break
-        case "question_resolved":
-          // The question was answered (this or another window) or canceled.
-          // Matched by question_id so a stale event can't wipe a fresh one.
-          dispatch({
-            type: "CLEAR_ASK_QUESTION",
-            contextKey,
-            questionId: e.question_id,
-          })
-          break
-        case "background_activity": {
-          // Out-of-turn transcript activity from the backend watcher: async
-          // task completions, the agent's continued work after them, cron//
-          // loop turns. Three consumers:
-          // 1. the outstanding mirror (idle-sweep exemption + chip) plus the
-          //    settle-syncing bridge inputs;
-          dispatch({
-            type: "SET_BACKGROUND_OUTSTANDING",
-            contextKey,
-            outstanding: e.outstanding,
-            settledCount: e.settled?.length ?? 0,
-            turnsCount: e.turns?.length ?? 0,
-          })
-          // 2. overlay turns → the conversation runtime store (resolved via
-          //    the external-id index; unresolved = this conversation was never
-          //    opened in this client, and its cold detail fetch covers it);
-          if (e.turns && e.turns.length > 0) {
-            const conversationId = getConversationIdByExternalIdFromStore(
-              e.session_id
-            )
-            if (conversationId != null) {
-              const runtime = useConversationRuntimeStore.getState()
-              runtime.actions.applyBackgroundActivity(
-                conversationId,
-                e.turns,
-                e.watermark
-              )
-              // Self-healing bound: cron//loop turns never settle, so nothing
-              // else would ever refetch — the overlay would grow for as long
-              // as the tab stays open. Past the threshold, fold what's
-              // accumulated into persisted turns (the watermark rule retires
-              // covered entries). Guarded by the in-flight flag and a
-              // per-conversation interval so a failing backend can't turn
-              // this into a 1Hz fetch loop.
-              const session = useConversationRuntimeStore
-                .getState()
-                .byConversationId.get(conversationId)
-              const now = Date.now()
-              const lastAt = overlayFoldRefetchAt.get(conversationId) ?? 0
-              if (
-                session &&
-                session.backgroundTurns.length > OVERLAY_FOLD_THRESHOLD &&
-                !session.detailLoading &&
-                now - lastAt > OVERLAY_FOLD_MIN_INTERVAL_MS
-              ) {
-                overlayFoldRefetchAt.set(conversationId, now)
-                const oc = storeRef.current.connections.get(contextKey)
-                runtime.actions.refetchDetail(conversationId, {
-                  preserveLive: oc?.status === "prompting",
-                })
-              }
-            }
-          }
-          // 3. one OS notification per settled task (matches the permission
-          //    notification's shape; `document.hidden` gating lives inside
-          //    sendSystemNotification).
-          if (e.settled && e.settled.length > 0) {
-            const nc = storeRef.current.connections.get(contextKey)
-            const agentLabel = nc ? AGENT_LABELS[nc.agentType] : "Agent"
-            const fn = folderNameRef.current
-            const title = fn ? `${fn} - MyCodeBuddy` : "MyCodeBuddy"
-            for (const settled of e.settled) {
-              const body =
-                settled.summary ??
-                tChat("backgroundTasks.settledFallback", {
-                  status: settled.status,
-                })
-              sendSystemNotification(title, `${agentLabel}: ${body}`).catch(
-                () => {}
-              )
-            }
-            // 4. fold the settlement into persisted turns: a refetch flips
-            //    the launching card from "result pending" to its terminal
-            //    state (the parser joins the ack with the notification) and
-            //    retires covered overlay turns via the watermark rule. Rare
-            //    (once per task settling), so a full detail parse is fine.
-            //    preserveLive while a foreground turn is in flight so the
-            //    refetch can't clobber the streaming buffers it races.
-            const conversationId = getConversationIdByExternalIdFromStore(
-              e.session_id
-            )
-            if (conversationId != null) {
-              useConversationRuntimeStore
-                .getState()
-                .actions.refetchDetail(conversationId, {
-                  preserveLive: nc?.status === "prompting",
-                })
-            }
-          }
-          break
-        }
-        case "permission_request":
-          flushStreamingQueue()
-          flushPendingToolCallUpdates()
-          dispatch({
-            type: "PERMISSION_REQUEST",
-            contextKey,
-            request_id: e.request_id,
-            tool_call: e.tool_call,
-            fallback_title: t("toolFallbackTitle"),
-            fallback_kind: "tool",
-            options: e.options,
-          })
-          // Send OS notification when permission approval is needed
-          {
-            const nc = storeRef.current.connections.get(contextKey)
-            if (nc) {
-              const agentLabel = AGENT_LABELS[nc.agentType]
-              const fn = folderNameRef.current
-              const title = fn ? `${fn} - Codeg` : "Codeg"
-              sendSystemNotification(
-                title,
-                `${agentLabel}: ${tChat("permissionDialog.subtitle")}`
-              ).catch(() => {})
-            }
-          }
-          break
-        case "session_started":
-          flushStreamingQueue()
-          dispatch({
-            type: "SESSION_STARTED",
-            contextKey,
-            sessionId: e.session_id,
-          })
-          break
-        case "conversation_linked":
-          // Backend just bound (or reaffirmed) the connection's DB conversation
-          // row. Phase 3a frontend pre-creates rows for new-tab sends so this
-          // event is mostly a confirmation; we log it for visibility. Phase 3b
-          // will use this to drive UI mapping when the frontend stops creating
-          // rows itself.
-          console.log("[acp-context] conversation_linked", {
-            contextKey,
-            connectionId: e.connection_id,
-            conversationId: e.conversation_id,
-            folderId: e.folder_id,
-          })
-          break
-        case "session_modes": {
-          flushStreamingQueue()
-          // Preferences are applied on the backend during connect (see
-          // `getSavedPrefsForConnect` + `acp_connect`), so `e.modes` already
-          // carries the user's preferred `current_mode_id` — no client-side
-          // override or sync-back needed.
-          dispatch({
-            type: "SESSION_MODES",
-            contextKey,
-            modes: e.modes,
-          })
-          const modeConn = storeRef.current.connections.get(contextKey)
-          if (modeConn) {
-            const entry = selectorsCache.get(modeConn.agentType) ?? {
-              modes: null,
-              configOptions: null,
-            }
-            entry.modes = e.modes
-            selectorsCache.set(modeConn.agentType, entry)
-          }
-          break
-        }
-        case "session_config_options": {
-          flushStreamingQueue()
-          // Same as `session_modes`: backend already merged saved prefs
-          // into `current_value` before emitting.
-          dispatch({
-            type: "SESSION_CONFIG_OPTIONS",
-            contextKey,
-            configOptions: e.config_options,
-          })
-          const cfgConn = storeRef.current.connections.get(contextKey)
-          if (cfgConn) {
-            const entry = selectorsCache.get(cfgConn.agentType) ?? {
-              modes: null,
-              configOptions: null,
-            }
-            entry.configOptions = e.config_options
-            selectorsCache.set(cfgConn.agentType, entry)
-          }
-          break
-        }
-        case "session_config_stale": {
-          flushStreamingQueue()
-          dispatch({
-            type: "CONFIG_STALE_CHANGED",
-            contextKey,
-            stale: e.stale,
-            kind: e.kind,
-          })
-          break
-        }
-        case "selectors_ready": {
-          flushStreamingQueue()
-          dispatch({
-            type: "SELECTORS_READY",
-            contextKey,
-          })
-          // Cache for agent types that may not emit session_modes /
-          // session_config_options at all (no selectors).
-          const rdyConn = storeRef.current.connections.get(contextKey)
-          if (rdyConn && !selectorsCache.has(rdyConn.agentType)) {
-            selectorsCache.set(rdyConn.agentType, {
-              modes: rdyConn.modes,
-              configOptions: rdyConn.configOptions,
+  const handleSequenceGap = useCallback(
+    (gap: SequenceGap) => {
+      const ingestor = eventIngestorRef.current
+      ingestor?.pauseConnection(gap.connectionId)
+      void (async () => {
+        try {
+          const snapshot = await acpGetSessionSnapshot(gap.connectionId)
+          if (!snapshot) {
+            reverseMapRef.current.delete(gap.connectionId)
+            dispatch({
+              type: "CONNECTION_REMOVED",
+              contextKey: gap.contextKey,
             })
+            ingestor?.resumeConnection(
+              gap.connectionId,
+              Number.MAX_SAFE_INTEGER
+            )
+            return
           }
-          break
+          const patch = denormalizeSnapshot(snapshot)
+          // Re-resolve key in case of rekey during await.
+          const contextKey =
+            reverseMapRef.current.get(gap.connectionId) ?? gap.contextKey
+          dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          seedDelegationsFromSnapshotRef.current(
+            patch.connectionId,
+            patch.activeDelegations,
+            patch.eventSeq
+          )
+          ingestor?.resumeConnection(gap.connectionId, patch.eventSeq)
+        } catch (err) {
+          console.warn(
+            "[acp-context] sequence gap recovery failed",
+            gap.connectionId,
+            err
+          )
+          reverseMapRef.current.delete(gap.connectionId)
+          dispatch({
+            type: "CONNECTION_REMOVED",
+            contextKey: gap.contextKey,
+          })
+          ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
         }
-        case "prompt_capabilities":
-          flushStreamingQueue()
-          dispatch({
-            type: "PROMPT_CAPABILITIES",
-            contextKey,
-            promptCapabilities: e.prompt_capabilities,
-          })
-          break
-        case "fork_supported":
-          flushStreamingQueue()
-          dispatch({
-            type: "FORK_SUPPORTED",
-            contextKey,
-            supported: e.supported,
-          })
-          break
-        case "mode_changed":
-          flushStreamingQueue()
-          dispatch({
-            type: "MODE_CHANGED",
-            contextKey,
-            modeId: e.mode_id,
-          })
-          break
-        case "plan_update":
-          flushStreamingQueue()
-          dispatch({
-            type: "PLAN_UPDATE",
-            contextKey,
-            entries: e.entries,
-          })
-          break
-        case "turn_complete": {
-          flushStreamingQueue()
-          flushPendingToolCallUpdates()
-          dispatch({
-            type: "PERMISSION_CLEARED",
-            contextKey,
-          })
-          dispatch({
-            type: "STATUS_CHANGED",
-            contextKey,
-            status: "connected",
-          })
-          // Detect pending question from tool calls in the completed turn
-          const turnConn = storeRef.current.connections.get(contextKey)
-          if (turnConn?.liveMessage) {
-            const blocks = turnConn.liveMessage.content
-            for (let i = blocks.length - 1; i >= 0; i--) {
-              const block = blocks[i]
-              if (block.type !== "tool_call") continue
-              const normalized = inferLiveToolName({
-                title: block.info.title,
-                kind: block.info.kind,
-                rawInput: block.info.raw_input,
-                meta: block.info.meta,
-              })
-              if (normalized === "question") {
-                const questionText = extractQuestionText(block.info.raw_input)
-                if (questionText) {
-                  dispatch({
-                    type: "SET_PENDING_QUESTION",
-                    contextKey,
-                    pendingQuestion: {
-                      tool_call_id: block.info.tool_call_id,
-                      question: questionText,
-                    },
-                  })
-                }
-                break
-              }
-            }
-          }
-          // Send OS notification when window is not focused
-          {
-            const nc = storeRef.current.connections.get(contextKey)
-            if (nc) {
-              const agentLabel = AGENT_LABELS[nc.agentType]
-              const fn = folderNameRef.current
-              const title = fn ? `${fn} - Codeg` : "Codeg"
-              sendSystemNotification(
-                title,
-                t("notificationTurnComplete", { agent: agentLabel })
-              ).catch(() => {})
-            }
-          }
-          break
-        }
-        case "error": {
-          flushStreamingQueue()
-          const nc = storeRef.current.connections.get(contextKey)
-          const agentLabel = nc
-            ? AGENT_LABELS[nc.agentType]
-            : (e.agent_type as string)
-
-          // Localize backend errors via their stable `code` identifier.
-          // Unknown codes fall back to the raw English message so we
-          // never swallow a useful stack trace.
-          const localizedMessage = (() => {
-            switch (e.code) {
-              case "initialize_timeout":
-                return t("backendErrors.initializeTimeout", {
-                  agent: agentLabel,
-                })
-              case "sdk_not_installed":
-                return t("blocked.sdkMissing", { agent: agentLabel })
-              case "platform_not_supported":
-                return t("blocked.unavailable", { agent: agentLabel })
-              case "process_exited":
-                return t("backendErrors.processExited", { agent: agentLabel })
-              case "spawn_failed":
-                return t("backendErrors.spawnFailed", {
-                  agent: agentLabel,
-                  message: e.message,
-                })
-              case "download_failed":
-                return t("backendErrors.downloadFailed", {
-                  agent: agentLabel,
-                  message: e.message,
-                })
-              case "turn_failed_refusal":
-                return t("backendErrors.turnFailedRefusal", {
-                  agent: agentLabel,
-                })
-              case "turn_failed_max_tokens":
-                return t("backendErrors.turnFailedMaxTokens", {
-                  agent: agentLabel,
-                })
-              case "turn_failed_max_turn_requests":
-                return t("backendErrors.turnFailedMaxTurnRequests", {
-                  agent: agentLabel,
-                })
-              case "turn_failed_unknown":
-                return t("backendErrors.turnFailedUnknown", {
-                  agent: agentLabel,
-                })
-              case "turn_failed_empty":
-                return t("backendErrors.turnFailedEmpty", {
-                  agent: agentLabel,
-                })
-              case "grok_model_switch_incompatible_agent":
-                return t("backendErrors.grokModelSwitchIncompatibleAgent", {
-                  agent: agentLabel,
-                })
-              default:
-                return e.message
-            }
-          })()
-
-          dispatch({ type: "ERROR", contextKey, message: localizedMessage })
-          pushAlertRef.current("error", t("eventErrorTitle"), localizedMessage)
-          // Send OS notification for agent errors
-          if (nc) {
-            const fn = folderNameRef.current
-            const title = fn ? `${fn} - Codeg` : "Codeg"
-            sendSystemNotification(
-              title,
-              t("notificationError", {
-                agent: agentLabel,
-                message: localizedMessage,
-              })
-            ).catch(() => {})
-          }
-          break
-        }
-        case "session_load_failed": {
-          flushStreamingQueue()
-          // Localize via the stable `code` field. Fall back to the raw agent
-          // message so an unknown future code still surfaces something useful.
-          const nc = storeRef.current.connections.get(contextKey)
-          const agentLabel = nc ? AGENT_LABELS[nc.agentType] : ""
-          const localizedMessage = (() => {
-            switch (e.code) {
-              case "resource_not_found":
-                return t("backendErrors.sessionLoadResourceNotFound", {
-                  agent: agentLabel,
-                })
-              case "session_unavailable":
-                return t("backendErrors.sessionLoadUnavailable", {
-                  agent: agentLabel,
-                })
-              case "legacy_cli_session":
-                return t("backendErrors.sessionLoadLegacyCliSession", {
-                  agent: agentLabel,
-                })
-              default:
-                return e.message
-            }
-          })()
-          dispatch({
-            type: "ACP_LOAD_ERROR",
-            contextKey,
-            message: localizedMessage,
-            code: e.code,
-          })
-          break
-        }
-        case "available_commands":
-          flushStreamingQueue()
-          dispatch({
-            type: "AVAILABLE_COMMANDS",
-            contextKey,
-            commands: e.commands,
-          })
-          break
-        case "usage_update":
-          flushStreamingQueue()
-          dispatch({
-            type: "USAGE_UPDATE",
-            contextKey,
-            usage: {
-              used: e.used,
-              size: e.size,
-            },
-          })
-          break
-      }
+      })()
     },
-    [
-      dispatch,
-      enqueueStreamingAction,
-      flushPendingToolCallUpdates,
-      flushStreamingQueue,
-      scheduleToolCallUpdateFlush,
-      t,
-      tChat,
-    ]
+    [dispatch]
   )
 
-  // Apply a single envelope to the store. Shared by the legacy global
-  // listener and the attach-protocol per-subscription handlers so dedup +
-  // dispatch ordering + JS subscriber fan-out stays identical between
-  // the two paths.
+  const handleDesktopDeliveryFailure = useCallback(
+    (failure: DesktopDeliveryFailure) => {
+      desktopDeliveryFailedRef.current = true
+      const ingestor = eventIngestorRef.current
+      ingestor?.dispose()
+      eventIngestorRef.current = null
+
+      for (const range of failure.affected) {
+        const contextKey = reverseMapRef.current.get(range.connection_id)
+        if (!contextKey) continue
+        void (async () => {
+          try {
+            const snapshot = await acpGetSessionSnapshot(range.connection_id)
+            if (!snapshot) {
+              reverseMapRef.current.delete(range.connection_id)
+              dispatch({ type: "CONNECTION_REMOVED", contextKey })
+              return
+            }
+            const patch = denormalizeSnapshot(snapshot)
+            dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+            seedDelegationsFromSnapshotRef.current(
+              patch.connectionId,
+              patch.activeDelegations,
+              patch.eventSeq
+            )
+          } catch (err) {
+            console.warn(
+              "[acp-context] delivery-failure snapshot recovery failed",
+              range.connection_id,
+              err
+            )
+            reverseMapRef.current.delete(range.connection_id)
+            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          }
+        })()
+      }
+
+      pushAlertRef.current(
+        "error",
+        t("eventErrorTitle"),
+        t("backendErrors.processExited", { agent: "ACP" })
+      )
+    },
+    [dispatch, t]
+  )
+
+  // Push envelopes into the frame ingestor. Optional flush for connect-time
+  // buffered drains that must apply before the next tick.
+  const pushMappedEvents = useCallback(
+    (contextKey: string, events: readonly EventEnvelope[], flush = false) => {
+      if (events.length === 0) return
+      lastActivityRef.current.set(contextKey, Date.now())
+      const ingestor = eventIngestorRef.current
+      if (!ingestor) {
+        console.warn(
+          "[acp-context] event ingestor not ready; dropping mapped events",
+          { contextKey, count: events.length }
+        )
+        return
+      }
+      ingestor.pushMapped(contextKey, events)
+      if (flush) ingestor.flushNow()
+    },
+    []
+  )
+
+  // Apply a single envelope through the ingestor (attach / buffered drain).
   const applyMappedEnvelope = useCallback(
-    (contextKey: string, envelope: EventEnvelope) => {
+    (contextKey: string, envelope: EventEnvelope, flush = true) => {
       const conn = storeRef.current.connections.get(contextKey)
       if (conn && envelope.seq <= conn.lastAppliedSeq) return
-      lastActivityRef.current.set(contextKey, Date.now())
-      handleMappedEvent(contextKey, envelope)
-      dispatch({ type: "EVENT_APPLIED", contextKey, seq: envelope.seq })
-      for (const ref of eventSubscribersRef.current) {
-        try {
-          ref.current(envelope)
-        } catch (err) {
-          console.error("[acp-context] subscriber threw:", err)
-        }
-      }
+      pushMappedEvents(contextKey, [envelope], flush)
     },
-    [dispatch, handleMappedEvent]
+    [pushMappedEvents]
   )
 
   // Re-seed `DelegationProvider` bindings from a snapshot's active_delegations.
@@ -3431,20 +3832,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         eventSeq
       )
       for (const envelope of envelopes) {
-        for (const ref of eventSubscribersRef.current) {
-          try {
-            ref.current(envelope)
-          } catch (err) {
-            console.error(
-              "[acp-context] delegation seed subscriber threw:",
-              err
-            )
-          }
-        }
+        notifyRawSubscribers(envelope)
       }
     },
-    []
+    [notifyRawSubscribers]
   )
+  seedDelegationsFromSnapshotRef.current = seedDelegationsFromSnapshot
 
   // Open a Subscribe-with-Snapshot stream for `connectionId` and route its
   // frames into the store under `contextKey`. Returns the subscription
@@ -3473,30 +3866,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           lastActivityRef.current.set(contextKey, Date.now())
-          // Recover delegation bindings the snapshot carries but the transient
-          // events don't (the load-bearing fix for the web-only "running shows
-          // completed / no 查看会话" bug). Uses the snapshot's own connection_id
-          // as the parent id.
           seedDelegationsFromSnapshot(
             patch.connectionId,
             patch.activeDelegations,
             patch.eventSeq
           )
+          // Feed cursor back so a queued batch drops old events.
+          eventIngestorRef.current?.resumeConnection(
+            connectionId,
+            patch.eventSeq
+          )
         },
         onReplay: (events) => {
-          for (const envelope of events) {
-            applyMappedEnvelope(contextKey, envelope)
-          }
+          pushMappedEvents(contextKey, events, true)
         },
         onEvent: (envelope) => {
-          applyMappedEnvelope(contextKey, envelope)
+          applyMappedEnvelope(contextKey, envelope, true)
         },
         onDetached: (reason) => {
           if (reason === "lagged" || reason === "server_shutdown") {
-            // Transient: re-attach with the latest cursor so we either
-            // replay the gap (small) or hydrate fresh (large). For
-            // server_shutdown the WS is closed, so the new attach frame
-            // queues until reconnect; for lagged the WS is still open.
             const conn = storeRef.current.connections.get(contextKey)
             const newSinceSeq = conn?.lastAppliedSeq
             const newSub = stream.attach(
@@ -3508,9 +3896,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             attachSubscriptionsRef.current.set(contextKey, newSub)
             return
           }
-          // connection_gone: backend GC'd the connection. Mirror to UI
-          // so the user sees the conversation tab go away rather than
-          // staring at stale state forever.
           attachSubscriptionsRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         },
@@ -3520,7 +3905,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       attachSubscriptionsRef.current.set(contextKey, activeSub)
       return activeSub
     },
-    [applyMappedEnvelope, dispatch, seedDelegationsFromSnapshot]
+    [
+      applyMappedEnvelope,
+      dispatch,
+      pushMappedEvents,
+      seedDelegationsFromSnapshot,
+    ]
   )
 
   // Tear down an attach subscription: detach the WS subscription so the
@@ -3540,98 +3930,128 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Single global event listener
+  // One EventIngestor for desktop + attach. Desktop also subscribes via
+  // subscribeDesktopAcpEvents (never hot-switches after failure).
   useEffect(() => {
     let cancelled = false
-    let unlisten: (() => void) | null = null
+    let unsubDesktop: (() => void) | null = null
 
-    // Web / remote-desktop transports: the backend no longer fans ACP
-    // events through the WS firehose (Phase 5 dropped the `acp://event`
-    // channel; per-connection attach streams are the sole delivery path).
-    // Skip the legacy listener entirely — keeping it would register a
-    // dead WebSocket subscription and waste a slot on every reconnect.
-    // `waitForListenerReady` becomes an immediate no-op since the path
-    // it was guarding (Tauri's app.emit handshake) doesn't exist here.
-    if (getEventStream() !== null) {
-      listenerReadyRef.current = true
-      resolveListenerReadyWaiters()
-      return
-    }
-
-    listenerReadyRef.current = false
-
-    subscribe<EventEnvelope>("acp://event", (envelope) => {
-      // Tauri webview path: the desktop frontend receives ACP events here
-      // via `app.emit("acp://event", ...)`. Web / remote-desktop transports
-      // skipped this useEffect above and route ACP events solely via the
-      // per-connection attach streams.
-      const contextKey = reverseMapRef.current.get(envelope.connection_id)
-      if (!contextKey) {
-        bufferUnmappedEvent(envelope)
-        return
-      }
-
-      // Seq dedup: skip envelopes already accounted for by a snapshot or a
-      // prior delivery. snapshot.event_seq sets the lower bound; subsequent
-      // envelopes with seq <= lastAppliedSeq are no-op duplicates.
-      const conn = storeRef.current.connections.get(contextKey)
-      if (conn && envelope.seq <= conn.lastAppliedSeq) {
-        return
-      }
-
-      // Touch activity on every incoming event
-      lastActivityRef.current.set(contextKey, Date.now())
-      handleMappedEvent(contextKey, envelope)
-
-      // Advance lastAppliedSeq after the event's effects have dispatched.
-      // EVENT_APPLIED is idempotent (only advances if higher).
-      dispatch({
-        type: "EVENT_APPLIED",
-        contextKey,
-        seq: envelope.seq,
+    const buildIngestor = () =>
+      new EventIngestor({
+        resolveContextKey: (connectionId) =>
+          reverseMapRef.current.get(connectionId) ?? null,
+        readCursor: (contextKey) =>
+          storeRef.current.connections.get(contextKey)?.lastAppliedSeq ?? 0,
+        commit: (frame) => {
+          commitEventFrame(frame)
+        },
+        onGap: (gap) => {
+          handleSequenceGap(gap)
+        },
+        onUnmapped: (event) => {
+          bufferUnmappedEvent(event)
+        },
+        scheduleFrame: (cb) => requestAnimationFrame(cb),
+        cancelFrame: (handle) => cancelAnimationFrame(handle),
       })
 
-      // Fan out to JS-level subscribers (e.g. ConversationDetailPanel's
-      // background turn_complete handler). Runs AFTER the reducer dispatches
-      // and AFTER seq dedup, so subscribers see a consistent, deduped stream.
-      // Unmapped events return early above and never reach here. One bad
-      // subscriber must not kill the others — wrap each call in try/catch.
-      for (const ref of eventSubscribersRef.current) {
-        try {
-          ref.current(envelope)
-        } catch (err) {
-          console.error("[acp-context] subscriber threw:", err)
-        }
-      }
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn()
-        } else {
-          unlisten = fn
-          listenerReadyRef.current = true
-          resolveListenerReadyWaiters()
-        }
-      })
-      .catch(() => {
+    const start = async () => {
+      if (desktopDeliveryFailedRef.current) {
+        // Terminal failure: do not re-subscribe (no hot-switch / no legacy).
         listenerReadyRef.current = true
         resolveListenerReadyWaiters()
-      })
+        return
+      }
+
+      const hasAttachStream = getEventStream() !== null
+
+      if (hasAttachStream) {
+        // Web / remote: no Tauri capability command; explicit legacy snapshot.
+        try {
+          initializeStreamingPerformanceConfig(LEGACY_DISABLED_CAPABILITIES)
+        } catch {
+          // Already initialized in this process (HMR / remount).
+        }
+        if (cancelled) return
+        const ingestor = buildIngestor()
+        eventIngestorRef.current = ingestor
+        listenerReadyRef.current = true
+        resolveListenerReadyWaiters()
+        return
+      }
+
+      // Desktop firehose path.
+      listenerReadyRef.current = false
+      let capabilities: DesktopDeliveryCapabilities =
+        LEGACY_DISABLED_CAPABILITIES
+      try {
+        if (getTransport().isDesktop()) {
+          capabilities = await acpGetDesktopDeliveryCapabilities()
+        }
+      } catch (err) {
+        console.warn(
+          "[acp-context] desktop delivery capabilities failed; using legacy",
+          err
+        )
+      }
+      if (cancelled) return
+      try {
+        capabilities = initializeStreamingPerformanceConfig(capabilities)
+      } catch {
+        // Already initialized.
+      }
+      if (cancelled) return
+
+      const ingestor = buildIngestor()
+      eventIngestorRef.current = ingestor
+
+      try {
+        unsubDesktop = await subscribeDesktopAcpEvents(capabilities, {
+          onBatch: (batch: DesktopAcpEventBatch) => {
+            if (streamingPerfRecorder.isActive()) {
+              streamingPerfRecorder.markBatchReceived(
+                batch.batch_id,
+                batch.events.length
+              )
+            }
+            for (const event of batch.events) {
+              const key = reverseMapRef.current.get(event.connection_id)
+              if (key) lastActivityRef.current.set(key, Date.now())
+            }
+            eventIngestorRef.current?.pushBatch(batch)
+          },
+          onFailure: (failure) => {
+            handleDesktopDeliveryFailure(failure)
+          },
+        })
+      } catch (err) {
+        console.error("[acp-context] desktop ACP subscribe failed", err)
+      }
+
+      if (cancelled) {
+        unsubDesktop?.()
+        ingestor.dispose()
+        return
+      }
+      listenerReadyRef.current = true
+      resolveListenerReadyWaiters()
+    }
+
+    void start()
 
     return () => {
       cancelled = true
       listenerReadyRef.current = false
       resolveListenerReadyWaiters()
-      if (flushTimerRef.current !== null) {
-        clearTimeout(flushTimerRef.current)
-        flushTimerRef.current = null
-      }
-      unlisten?.()
+      unsubDesktop?.()
+      eventIngestorRef.current?.dispose()
+      eventIngestorRef.current = null
     }
   }, [
     bufferUnmappedEvent,
-    dispatch,
-    handleMappedEvent,
+    commitEventFrame,
+    handleDesktopDeliveryFailure,
+    handleSequenceGap,
     resolveListenerReadyWaiters,
   ])
 
@@ -4556,6 +4976,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setActiveKey,
       touchActivity,
       registerOpenTabKeys,
+      registerLiveSinks,
       registerLiveMessageSink,
       clearAcpLoadError,
       attachDelegationChild,
@@ -4576,6 +4997,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setActiveKey,
       touchActivity,
       registerOpenTabKeys,
+      registerLiveSinks,
       registerLiveMessageSink,
       clearAcpLoadError,
       attachDelegationChild,
@@ -4589,6 +5011,236 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     () => ({ subscribers: eventSubscribersRef.current }),
     []
   )
+
+  // Install `window.__codegStreamingPerf` only when the test-utils replay
+  // command is available. Removed on provider unmount; never persists content.
+  useEffect(() => {
+    let cancelled = false
+
+    const waitTwoRafs = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => resolve())
+        })
+      })
+
+    const buildEnvironment = async (): Promise<
+      StreamingPerfReport["environment"]
+    > => {
+      let hardwareAcceleration: "enabled" | "disabled" | "unknown" = "unknown"
+      try {
+        const settings = await getSystemRenderingSettings()
+        hardwareAcceleration = settings.disable_hardware_acceleration
+          ? "disabled"
+          : "enabled"
+      } catch {
+        hardwareAcceleration = "unknown"
+      }
+      const userAgent =
+        typeof navigator !== "undefined" ? navigator.userAgent : "unknown"
+      const caps = getStreamingPerformanceConfig()
+      const deliveryMode: "legacy" | "batched" =
+        caps?.mode === "batched" ? "batched" : "legacy"
+      const flags = caps?.flags ?? legacyStreamingPerformanceFlags()
+      return {
+        platform:
+          typeof navigator !== "undefined" ? navigator.platform : "unknown",
+        userAgent,
+        webviewVersion: extractWebviewVersion(userAgent),
+        buildMode:
+          process.env.NODE_ENV === "production" ? "production" : "development",
+        hardwareAcceleration,
+        deliveryMode,
+        flags: {
+          desktop_acp_event_batching: flags.desktop_acp_event_batching,
+          incremental_live_transcript: flags.incremental_live_transcript,
+          deferred_streaming_rich_content:
+            flags.deferred_streaming_rich_content,
+        },
+      }
+    }
+
+    const isReplayCommandMissing = (error: unknown): boolean => {
+      const msg = error instanceof Error ? error.message : String(error)
+      // Domain errors from the registered command (e.g. empty connectionId →
+      // "connection not found") must NOT be treated as a missing command; the
+      // probe intentionally uses an empty id so a domain error means "present".
+      if (/connection not found/i.test(msg)) {
+        return false
+      }
+      return /not found|unknown command|does not exist|not available|no such command|Command.*not found/i.test(
+        msg
+      )
+    }
+
+    const installHarness = () => {
+      if (cancelled || typeof window === "undefined") return
+
+      window.__codegStreamingPerf = {
+        debugState() {
+          return {
+            activeKey: storeRef.current.activeKey,
+            connections: Array.from(storeRef.current.connections.entries()).map(
+              ([key, value]) => ({
+                key,
+                connectionId: value.connectionId,
+                status: value.status,
+                agentType: value.agentType,
+              })
+            ),
+          }
+        },
+        async ensureConnected(options?: {
+          agentType?: string
+          workingDir?: string
+          conversationId?: number
+          contextKey?: string
+        }) {
+          const agentType = (options?.agentType ??
+            "grok") as import("@/lib/types").AgentType
+          const workingDir = options?.workingDir ?? "D:\\MyCodeBuddy"
+          const contextKey =
+            options?.contextKey ??
+            `perf-${agentType}-${options?.conversationId ?? "chat"}`
+          const existing = storeRef.current.connections.get(contextKey)
+          if (
+            existing?.connectionId &&
+            existing.status !== "error" &&
+            existing.status !== "disconnected"
+          ) {
+            setActiveKey(contextKey)
+            return {
+              contextKey,
+              connectionId: existing.connectionId,
+              status: existing.status,
+            }
+          }
+          await connect(
+            contextKey,
+            agentType,
+            workingDir,
+            undefined,
+            options?.conversationId
+          )
+          setActiveKey(contextKey)
+          const conn = storeRef.current.connections.get(contextKey)
+          if (!conn?.connectionId) {
+            throw new Error(
+              `streaming perf: ensureConnected failed for ${contextKey}`
+            )
+          }
+          return {
+            contextKey,
+            connectionId: conn.connectionId,
+            status: conn.status,
+          }
+        },
+        async run(options) {
+          const rateProfile = options.rateProfile as PerfRateProfile
+          const seed = options.seed ?? 0xc0de
+          const activeKey = storeRef.current.activeKey
+          if (!activeKey) {
+            throw new Error(
+              "streaming perf: no active connection (setActiveKey first)"
+            )
+          }
+          const conn = storeRef.current.connections.get(activeKey)
+          if (!conn?.connectionId) {
+            throw new Error(
+              "streaming perf: active connection has no connectionId"
+            )
+          }
+
+          const metricsBefore = await acpGetEventMetrics()
+          const environment = await buildEnvironment()
+
+          streamingPerfRecorder.start({
+            seed,
+            rateProfile,
+            expectedEvents: GROK_RICH_V1_EXPECTED_EVENTS,
+            expectedTextSha256: GROK_RICH_V1_EXPECTED_TEXT_SHA256,
+          })
+          streamingPerfRecorder.setEnvironment(environment)
+
+          try {
+            const result = await acpReplayStreamingPerfFixture(
+              conn.connectionId,
+              {
+                fixture_id: "grok_rich_v1",
+                seed,
+                rate_profile: rateProfile,
+              }
+            )
+
+            await streamingPerfRecorder.waitForQuiet()
+            await waitTwoRafs()
+
+            const metricsAfter = await acpGetEventMetrics()
+            const appliedEvents = Math.max(
+              0,
+              metricsAfter.desktop_legacy_emit_count +
+                metricsAfter.desktop_batch_event_count -
+                (metricsBefore.desktop_legacy_emit_count +
+                  metricsBefore.desktop_batch_event_count)
+            )
+            const integrityOk =
+              result.event_count === GROK_RICH_V1_EXPECTED_EVENTS &&
+              result.final_text_sha256 === GROK_RICH_V1_EXPECTED_TEXT_SHA256
+
+            streamingPerfRecorder.setDeliverySnapshot(metricsAfter)
+            streamingPerfRecorder.setIntegrity({
+              expectedEvents: GROK_RICH_V1_EXPECTED_EVENTS,
+              appliedEvents:
+                appliedEvents > 0 ? appliedEvents : result.event_count,
+              firstSeq: 1,
+              lastSeq: result.final_event_seq,
+              duplicateCount: 0,
+              gapCount: 0,
+              finalTextSha256: result.final_text_sha256,
+              ok: integrityOk,
+            })
+
+            const report = streamingPerfRecorder.buildReport({
+              delivery: metricsAfter,
+              environment,
+            })
+
+            if (options.download) {
+              downloadStreamingPerfReport(report)
+            }
+            return report
+          } finally {
+            streamingPerfRecorder.stop()
+          }
+        },
+      }
+    }
+
+    void (async () => {
+      try {
+        // Probe: empty connectionId. If the command is registered we get a
+        // domain error; if it is absent we get a missing-command error.
+        await acpReplayStreamingPerfFixture("", {
+          fixture_id: "grok_rich_v1",
+          seed: 0,
+          rate_profile: "eps_100",
+        })
+        if (!cancelled) installHarness()
+      } catch (error) {
+        if (cancelled) return
+        if (!isReplayCommandMissing(error)) {
+          installHarness()
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      if (typeof window !== "undefined") {
+        delete window.__codegStreamingPerf
+      }
+    }
+  }, [])
 
   return (
     <AcpActionsContext.Provider value={actions}>

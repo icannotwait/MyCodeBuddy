@@ -38,7 +38,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
-import { useConversationRuntimeActions } from "@/stores/conversation-runtime-store"
+import {
+  completeLiveTranscriptTurn,
+  useConversationRuntimeActions,
+} from "@/stores/conversation-runtime-store"
+import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import {
   useAcpActions,
   useConnectionStore,
@@ -118,11 +122,14 @@ function useChildLiveBridge(
   childConversationId: number,
   childConnState: ConnectionState | undefined
 ) {
-  const { setLiveMessage, completeTurn, syncTurnMetadata, removeConversation } =
+  const { setLiveMessage, syncTurnMetadata, removeConversation } =
     useConversationRuntimeActions()
+  const acpActions = useAcpActions()
 
   const connStatus = childConnState?.status ?? null
   const liveMessage = childConnState?.liveMessage ?? null
+  const connectionId = childConnState?.connectionId ?? null
+  const contextKey = childConnState?.contextKey ?? connectionId
 
   // Backfill token usage / duration / model into the promoted reply once the
   // child's persisted transcript catches up. `completeTurn` lands the streamed
@@ -140,19 +147,10 @@ function useChildLiveBridge(
     syncCancelRef.current = syncTurnMetadata(childConversationId)
   }, [childConversationId, syncTurnMetadata])
 
-  const connStatusRef = useRef(connStatus)
-  useEffect(() => {
-    connStatusRef.current = connStatus
-  }, [connStatus])
-
   // When connStatus transitions away from "prompting", completeTurn snapshots
-  // and promotes the live reply. This stays correct across the transition
-  // because the mirror-live effect's cleanup gates on `connStatusRef` (which
-  // still reads "prompting" at cleanup time, since React updates it only in a
-  // later setup pass) rather than on effect declaration order. We also latch
-  // whether we ever observed streaming this mount, so the adopt-settled-reply
-  // effect below can tell a fresh "reopened after the child already finished"
-  // mount from a normal streaming→settled handoff.
+  // and promotes the live reply. Latch whether we ever observed streaming this
+  // mount so the adopt-settled-reply effect can tell a fresh "reopened after the
+  // child already finished" mount from a normal streaming→settled handoff.
   const prevStatusRef = useRef(connStatus)
   const everPromptingRef = useRef(connStatus === "prompting")
   useEffect(() => {
@@ -160,45 +158,44 @@ function useChildLiveBridge(
     prevStatusRef.current = connStatus
     if (connStatus === "prompting") everPromptingRef.current = true
     if (!wasPrompting || connStatus === "prompting") return
-    completeTurn(childConversationId, liveMessage)
+    completeLiveTranscriptTurn(childConversationId, liveMessage)
     startMetadataSync()
-  }, [
-    connStatus,
-    liveMessage,
-    childConversationId,
-    completeTurn,
-    startMetadataSync,
-  ])
+  }, [connStatus, liveMessage, childConversationId, startMetadataSync])
 
+  // Canonical + transcript sinks (outside React), matching the main panel.
+  // Registration immediately replays the current liveMessage when present.
   useEffect(() => {
-    if (liveMessage != null) {
-      setLiveMessage(
+    if (!contextKey || !connectionId) return
+    return acpActions.registerLiveSinks(contextKey, {
+      canonical: (lm, isLive, deliveryIds) => {
+        if (deliveryIds && deliveryIds.length > 0) {
+          setLiveMessage(childConversationId, lm, isLive, deliveryIds)
+        } else {
+          setLiveMessage(childConversationId, lm, isLive)
+        }
+      },
+      transcript: createLiveTranscriptFrameSink(
         childConversationId,
-        liveMessage,
-        connStatus === "prompting"
-      )
-    }
-    return () => {
-      if (connStatusRef.current !== "prompting") {
-        setLiveMessage(childConversationId, null)
-      }
-    }
-  }, [liveMessage, connStatus, childConversationId, setLiveMessage])
+        connectionId
+      ),
+    })
+  }, [
+    acpActions,
+    contextKey,
+    connectionId,
+    childConversationId,
+    setLiveMessage,
+  ])
 
   // Adopt-settled-reply: handle reopening the dialog onto a child that ALREADY
   // finished but whose connection still carries its final liveMessage (kept for
   // CHILD_DETACH_GRACE_MS after completion to bridge DB lag). For such a mount
   // the streaming→settled completeTurn edge never fires (we never saw
-  // "prompting"), and the non-live mirror above is rejected by the
-  // SET_LIVE_MESSAGE guard while the mount fetch is loading — so without this
-  // the final reply would vanish whenever the persisted transcript still lags
-  // (empty / user-only / partial detail). Adopt the retained reply directly:
-  // bridge it as live (a one-shot child's liveMessage is unambiguously its own
-  // reply, never a stale reconnect replay) then promote it to a COMPLETED local
-  // turn (no streaming affordance), where the `liveOwnsActiveTurn` projection
-  // keeps it and dedupes the persisted copy once the DB catches up. Runs at most
-  // once, and never when streaming was observed (that path promotes via the
-  // settled edge).
+  // "prompting"), and the sink registration above mirrors with isLive=false,
+  // which the SET_LIVE_MESSAGE guard rejects while the mount fetch is loading.
+  // Adopt the retained reply directly as live (a one-shot child's liveMessage is
+  // unambiguously its own reply) then promote it. Runs at most once, and never
+  // when streaming was observed (that path promotes via the settled edge).
   const adoptedRef = useRef(false)
   useEffect(() => {
     if (adoptedRef.current || everPromptingRef.current) return
@@ -206,14 +203,13 @@ function useChildLiveBridge(
     if (liveMessage == null) return
     adoptedRef.current = true
     setLiveMessage(childConversationId, liveMessage, true)
-    completeTurn(childConversationId, liveMessage)
+    completeLiveTranscriptTurn(childConversationId, liveMessage)
     startMetadataSync()
   }, [
     connStatus,
     liveMessage,
     childConversationId,
     setLiveMessage,
-    completeTurn,
     startMetadataSync,
   ])
 

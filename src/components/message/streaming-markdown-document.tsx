@@ -1,0 +1,94 @@
+"use client"
+
+import { memo } from "react"
+import { MessageResponse } from "@/components/ai-elements/message"
+import { CodeBlockContainer } from "@/components/ai-elements/code-block"
+import {
+  joinStreamingMarkdown,
+  type IncrementalStreamBlocks,
+  type SealedMarkdownBlock,
+} from "@/lib/markdown/incremental-stream-blocks"
+import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
+
+interface Props {
+  document: IncrementalStreamBlocks
+  onBlockRender?: (blockId: string) => void
+}
+
+const SealedBlock = memo(
+  function SealedBlock({
+    block,
+    onRender,
+  }: {
+    block: SealedMarkdownBlock
+    onRender?: (blockId: string) => void
+  }) {
+    streamingPerfRecorder.countRender("markdownBlock")
+    onRender?.(block.id)
+    return (
+      <MessageResponse mode="static" richContentState="sealed-streaming">
+        {block.markdown}
+      </MessageResponse>
+    )
+  },
+  (previous, next) =>
+    previous.block.id === next.block.id &&
+    previous.block.markdown === next.block.markdown &&
+    previous.onRender === next.onRender
+)
+
+function getOpenFenceTail(document: IncrementalStreamBlocks): {
+  language: string
+  prefix: string
+  code: string
+} | null {
+  const fence = document.scanner.fence
+  if (!fence) return null
+  return {
+    language: fence.language || "text",
+    prefix: document.tail.slice(0, fence.openingOffset),
+    code: document.tail.slice(fence.bodyOffset),
+  }
+}
+
+export function StreamingMarkdownDocument({ document, onBlockRender }: Props) {
+  if (!document.valid) {
+    return (
+      <MessageResponse mode="streaming">
+        {joinStreamingMarkdown(document)}
+      </MessageResponse>
+    )
+  }
+  const openFence = getOpenFenceTail(document)
+  return (
+    <div className="space-y-4">
+      {document.sealed.map((block) => (
+        <SealedBlock key={block.id} block={block} onRender={onBlockRender} />
+      ))}
+      {openFence ? (
+        <>
+          {openFence.prefix ? (
+            <div className="whitespace-pre-wrap break-words text-sm select-text">
+              {openFence.prefix}
+            </div>
+          ) : null}
+          <CodeBlockContainer language={openFence.language}>
+            <pre
+              data-testid="streaming-code-tail"
+              className="m-0 whitespace-pre-wrap break-words p-4 font-mono text-sm select-text"
+            >
+              <code>{openFence.code}</code>
+            </pre>
+          </CodeBlockContainer>
+        </>
+      ) : document.tail ? (
+        <div
+          data-testid="streaming-markdown-tail"
+          className="whitespace-pre-wrap break-words text-sm select-text"
+        >
+          {document.tail}
+        </div>
+      ) : null}
+    </div>
+  )
+}

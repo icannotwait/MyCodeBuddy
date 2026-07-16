@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect } from "react"
+import { scheduleIdleWork } from "@/lib/scheduling/idle-work"
 import { prefetchHeavyPlugins } from "./streamdown-plugins"
 
 /**
@@ -18,7 +19,7 @@ import { prefetchHeavyPlugins } from "./streamdown-plugins"
  *      resolution would cause.
  *   2. Idle fallback — for the rarer read-without-interacting case.
  *      requestIdleCallback is absent in WKWebView (macOS Tauri), so fall back to
- *      a short timeout there.
+ *      a short timeout there via `scheduleIdleWork`.
  *
  * Only `code` is prefetched: it's by far the most common heavy engine in
  * coding-agent output. katex (`math`) and mermaid stay purely on-demand — they're
@@ -49,21 +50,8 @@ export function HeavyPluginsWarmup() {
     window.addEventListener("pointerdown", warm, true)
     window.addEventListener("keydown", warm, true)
 
-    // (2) Idle baseline.
-    let cancelIdle: () => void
-    if (typeof window.requestIdleCallback === "function") {
-      const handle = window.requestIdleCallback(warm, { timeout: 3000 })
-      cancelIdle = () => {
-        // Guard cancelIdleCallback independently — defensive against a partial
-        // polyfill that shims requestIdleCallback but not its canceller.
-        if (typeof window.cancelIdleCallback === "function") {
-          window.cancelIdleCallback(handle)
-        }
-      }
-    } else {
-      const timer = setTimeout(warm, 1500)
-      cancelIdle = () => clearTimeout(timer)
-    }
+    // (2) Idle baseline — 1.5s hard timeout / WKWebView setTimeout fallback.
+    const cancelIdle = scheduleIdleWork(warm, { timeoutMs: 1_500 })
 
     return () => {
       window.removeEventListener("pointerdown", warm, true)

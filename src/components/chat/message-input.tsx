@@ -2,6 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { isDesktop } from "@/lib/platform"
+import {
+  probeInputToPaint,
+  streamingPerfRecorder,
+} from "@/lib/perf/streaming-perf-recorder"
 import Image from "next/image"
 import { useLocale, useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
@@ -622,6 +626,29 @@ export function MessageInput({
       })
     }
   }, [isActive, disabled, isPrompting])
+
+  // Non-mutating input-latency probe while a streaming-perf replay is active.
+  // Uses MessageChannel → rAF; never synthesizes InputEvents against Tiptap.
+  useEffect(() => {
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    const sync = (active: boolean) => {
+      if (active) {
+        if (intervalId == null) {
+          intervalId = setInterval(() => {
+            probeInputToPaint(streamingPerfRecorder)
+          }, 100)
+        }
+      } else if (intervalId != null) {
+        clearInterval(intervalId)
+        intervalId = null
+      }
+    }
+    const unsubscribe = streamingPerfRecorder.subscribeActive(sync)
+    return () => {
+      unsubscribe()
+      if (intervalId != null) clearInterval(intervalId)
+    }
+  }, [])
 
   useEffect(() => {
     disabledRef.current = disabled

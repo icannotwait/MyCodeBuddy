@@ -29,6 +29,13 @@ vi.mock("@/stores/conversation-runtime-store", async () => {
   >("@/stores/conversation-runtime-store")
   return {
     ...actual,
+    // Atomic live handoff coordinator used by the child bridge.
+    completeLiveTranscriptTurn: (
+      conversationId: number,
+      liveMessage?: unknown
+    ) => {
+      mockCompleteTurn(conversationId, liveMessage)
+    },
     // Bridge + body pull mutators from the stable actions bundle.
     useConversationRuntimeActions: () => ({
       setLiveMessage: mockSetLiveMessage,
@@ -59,6 +66,7 @@ vi.mock("@/stores/conversation-runtime-store", async () => {
         conversationIdByExternalId: { get: () => undefined },
       }),
     selectTimelineTurns: () => mockGetTimelineTurns(),
+    selectHistoricalTimelineTurns: () => mockGetTimelineTurns(),
   }
 })
 
@@ -91,6 +99,43 @@ vi.mock("@/contexts/acp-connections-context", async () => {
     useAcpActions: () => ({
       respondPermission: mockRespondPermission,
       answerQuestion: mockAnswerQuestion,
+      // Mirror real registerLiveSinks: immediate replay of current liveMessage.
+      registerLiveSinks: (
+        _key: string,
+        sinks: {
+          canonical: (
+            lm: NonNullable<ConnectionState["liveMessage"]>,
+            isLive: boolean,
+            deliveryIds?: readonly number[]
+          ) => void
+          transcript?: {
+            rebuild: (
+              lm: NonNullable<ConnectionState["liveMessage"]>,
+              seq: number
+            ) => void
+          }
+        }
+      ) => {
+        const conn = mockChildConnection
+        if (conn?.liveMessage != null) {
+          sinks.canonical(conn.liveMessage, conn.status === "prompting")
+          sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
+        }
+        return () => {}
+      },
+      registerLiveMessageSink: (
+        key: string,
+        sink: (
+          lm: NonNullable<ConnectionState["liveMessage"]>,
+          isLive: boolean
+        ) => void
+      ) => {
+        const conn = mockChildConnection
+        if (conn?.liveMessage != null) {
+          sink(conn.liveMessage, conn.status === "prompting")
+        }
+        return () => {}
+      },
     }),
   }
 })

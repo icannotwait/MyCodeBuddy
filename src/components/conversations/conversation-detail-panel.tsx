@@ -61,11 +61,13 @@ import {
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
 import {
+  completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
@@ -238,7 +240,6 @@ const ConversationTabView = memo(function ConversationTabView({
     appendOptimisticTurn,
     removeOptimisticTurn,
     appendViewerUserTurn,
-    completeTurn,
     refetchDetail,
     syncTurnMetadata,
     removeConversation,
@@ -591,14 +592,12 @@ const ConversationTabView = memo(function ConversationTabView({
     prevConnStatusRef.current = connStatus
     if (!wasPrompting || connStatus === "prompting") return
 
-    // Turn completed — promote liveMessage + optimisticTurns to localTurns.
-    // Don't pass conn.liveMessage: this panel no longer subscribes to it (the
-    // connection snapshot is stable across streaming tokens — see useConnection),
-    // so reading it here would be stale. COMPLETE_TURN falls back to
-    // session.liveMessage, which the connection dispatch's sink wrote
-    // synchronously as the final chunk landed (turn_complete flushes the stream
-    // queue BEFORE the status change), so it already holds the final message.
-    completeTurn(effectiveConversationId)
+    // Turn completed — promote liveMessage + optimisticTurns to localTurns,
+    // and drop the live transcript projection in the same call stack (no
+    // blank/duplicate assistant frame). Don't pass conn.liveMessage: this
+    // panel no longer subscribes to it (see useConnection); COMPLETE_TURN
+    // falls back to session.liveMessage written by the sink before status change.
+    completeLiveTranscriptTurn(effectiveConversationId)
 
     // Cancel previous metadata sync (handles rapid consecutive turns)
     syncCancelRef.current?.()
@@ -611,7 +610,7 @@ const ConversationTabView = memo(function ConversationTabView({
         effectiveConversationId
       )
     }
-  }, [completeTurn, connStatus, effectiveConversationId, syncTurnMetadata])
+  }, [connStatus, effectiveConversationId, syncTurnMetadata])
 
   // Auto-send queued messages when agent finishes responding.
   // Refs are synced via useEffect; the auto-send effect is declared
@@ -682,23 +681,39 @@ const ConversationTabView = memo(function ConversationTabView({
     workingDirForConnection,
   ])
 
-  // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
-  // The connection dispatch invokes this sink synchronously whenever liveMessage
+  // Mirror the connection's liveMessage into the runtime session OUTSIDE React,
+  // and publish incremental live-transcript projection for the UI footer (Task 11).
+  // The connection dispatch invokes these sinks synchronously whenever liveMessage
   // changes (streaming deltas, tool updates, the prompt-start reset), so the
-  // streaming content flows straight to the runtime store — which the message
-  // list renders — WITHOUT this keep-alive panel re-rendering per token (the old
-  // mirror effect required a per-token render just to run). The sink writes
-  // non-null values with isLive = (status === "prompting"), which tells the
-  // runtime reducer to bypass its stale-reconnect-replay guard (matters for the
-  // rekey path: close+reopen mid-turn, where detail.turns may already hold user
-  // turns that would otherwise drop the live assistant stream). Turn-end clearing
-  // is owned by COMPLETE_TURN (nulls liveMessage); unmount clearing by
-  // removeConversation. `tabId` is the connection contextKey.
+  // streaming content flows straight to the runtime / transcript stores WITHOUT
+  // this keep-alive panel re-rendering per token. Canonical writes non-null values
+  // with isLive = (status === "prompting"), which tells the runtime reducer to
+  // bypass its stale-reconnect-replay guard. Turn-end clearing is owned by
+  // COMPLETE_TURN; unmount clearing by removeConversation. `tabId` is the
+  // connection contextKey.
+  const connectionIdForSink = conn.connectionId
   useEffect(() => {
-    return acpActions.registerLiveMessageSink(tabId, (liveMessage, isLive) =>
-      setLiveMessage(effectiveConversationId, liveMessage, isLive)
-    )
-  }, [acpActions, tabId, effectiveConversationId, setLiveMessage])
+    const conversationId = effectiveConversationId
+    return acpActions.registerLiveSinks(tabId, {
+      canonical: (liveMessage, isLive, deliveryIds) => {
+        if (deliveryIds && deliveryIds.length > 0) {
+          setLiveMessage(conversationId, liveMessage, isLive, deliveryIds)
+        } else {
+          setLiveMessage(conversationId, liveMessage, isLive)
+        }
+      },
+      transcript: createLiveTranscriptFrameSink(
+        conversationId,
+        connectionIdForSink || "pending"
+      ),
+    })
+  }, [
+    acpActions,
+    tabId,
+    effectiveConversationId,
+    connectionIdForSink,
+    setLiveMessage,
+  ])
 
   // Cross-client VIEWER (Bug 2): mirror the connection's in-flight user prompt
   // (from a snapshot's `pending_user_message`, captured when we attach
@@ -1599,10 +1614,8 @@ export function ConversationDetailPanel() {
   const tStatus = useTranslations("Folder.statusLabels")
   const tExport = useTranslations("Folder.conversation.exportLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
-  const {
-    completeTurn: runtimeCompleteTurn,
-    removeConversation: runtimeRemoveConversation,
-  } = useConversationRuntimeActions()
+  const { removeConversation: runtimeRemoveConversation } =
+    useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
   const conversations = useAppWorkspaceStore((s) => s.conversations)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
@@ -1706,8 +1719,9 @@ export function ConversationDetailPanel() {
         )
         if (isOpenInTabs) return
 
-        // Promote liveMessage + optimisticTurns to localTurns immediately
-        runtimeCompleteTurn(matchedConversationId)
+        // Promote liveMessage + optimisticTurns to localTurns immediately,
+        // coordinating the live-transcript footer handoff in the same stack.
+        completeLiveTranscriptTurn(matchedConversationId)
 
         // If tab was closed while agent was responding, clean up now.
         // Event-time read: fresh via getState(), no reactive subscription.
@@ -1716,7 +1730,7 @@ export function ConversationDetailPanel() {
           runtimeRemoveConversation(matchedConversationId)
         }
       },
-      [tabs, runtimeCompleteTurn, runtimeRemoveConversation]
+      [tabs, runtimeRemoveConversation]
     )
   )
 

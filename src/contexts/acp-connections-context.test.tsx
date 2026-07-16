@@ -5,7 +5,17 @@ import {
   AcpConnectionsProvider,
   useAcpActions,
   useConnectionStore,
+  __getPublishedConnectionMapsCount,
+  __resetPublishedConnectionMapsCount,
+  __resetStreamingConfigForProviderTests,
+  __connectionsReducerForTests,
+  __resetWritableConnectionsCloneCount,
+  __getWritableConnectionsCloneCount,
 } from "@/contexts/acp-connections-context"
+import type {
+  DesktopAcpEventBatch,
+  DesktopDeliveryFailure,
+} from "@/lib/types"
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
 import type { AttachHandlers } from "@/lib/transport/types"
@@ -24,6 +34,11 @@ import type {
 const h = vi.hoisted(() => {
   const attach = vi.fn(() => ({ detach: vi.fn() }))
   const stream = { attach }
+  const rafQueue: FrameRequestCallback[] = []
+  const state: {
+    onBatch: ((batch: DesktopAcpEventBatch) => void) | null
+    onFailure: ((failure: DesktopDeliveryFailure) => void) | null
+  } = { onBatch: null, onFailure: null }
   return {
     attach,
     stream,
@@ -38,9 +53,39 @@ const h = vi.hoisted(() => {
     acpConnect: vi.fn(),
     acpDisconnect: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
+    acpGetDesktopDeliveryCapabilities: vi.fn(),
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
     pushAlert: vi.fn(),
+    isDesktop: true,
+    rafQueue,
+    desktopBatchHandler: null as ((batch: DesktopAcpEventBatch) => void) | null,
+    desktopFailureHandler:
+      null as ((failure: DesktopDeliveryFailure) => void) | null,
+    setDesktopHandlers(
+      onBatch: (batch: DesktopAcpEventBatch) => void,
+      onFailure: (failure: DesktopDeliveryFailure) => void
+    ) {
+      state.onBatch = onBatch
+      state.onFailure = onFailure
+    },
+    emitDesktopBatch(batch: DesktopAcpEventBatch) {
+      state.onBatch?.(batch)
+    },
+    emitDesktopFailure(failure: DesktopDeliveryFailure) {
+      state.onFailure?.(failure)
+    },
+    runAnimationFrame() {
+      const queued = rafQueue.splice(0, rafQueue.length)
+      for (const cb of queued) cb(16)
+    },
+    publishedConnectionMaps: () => __getPublishedConnectionMapsCount(),
+    subscribeRaw(handler: (event: EventEnvelope) => void) {
+      // Registered via useAcpEvent after mount — tests call actions path.
+      // Provider exposes subscribers only through the hook; for raw tests we
+      // use a lightweight wrapper registered in the describe block.
+      void handler
+    },
   }
 })
 
@@ -97,6 +142,7 @@ vi.mock("@/lib/api", () => ({
   acpConnect: h.acpConnect,
   acpDisconnect: h.acpDisconnect,
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
+  acpGetDesktopDeliveryCapabilities: h.acpGetDesktopDeliveryCapabilities,
   acpPrompt: vi.fn(),
   acpSetMode: vi.fn(),
   acpSetConfigOption: vi.fn(),
@@ -110,6 +156,34 @@ vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(async () => {
     throw new Error("detail not seeded in this suite")
   }),
+}))
+
+vi.mock("@/lib/transport", () => ({
+  getTransport: () => ({
+    isDesktop: () => h.isDesktop,
+    subscribe: vi.fn(async () => () => {}),
+    call: vi.fn(),
+  }),
+}))
+
+vi.mock("@/lib/transport/desktop-acp-events", () => ({
+  subscribeDesktopAcpEvents: vi.fn(
+    async (
+      _caps: unknown,
+      handlers: {
+        onBatch: (batch: DesktopAcpEventBatch) => void
+        onFailure: (failure: DesktopDeliveryFailure) => void
+      }
+    ) => {
+      h.setDesktopHandlers(handlers.onBatch, handlers.onFailure)
+      return () => {
+        h.setDesktopHandlers(
+          () => {},
+          () => {}
+        )
+      }
+    }
+  ),
 }))
 
 function Probe() {
@@ -140,14 +214,29 @@ beforeEach(() => {
   h.attach.mockClear()
   h.store = null
   h.eventStreamValue = h.stream
+  h.isDesktop = true
+  h.rafQueue.length = 0
   h.buildDelegationSeedEnvelopes.mockClear()
   h.acpGetAgentStatus.mockReset()
   h.acpFindConnectionForConversation.mockReset()
   h.acpConnect.mockReset()
   h.acpDisconnect.mockReset()
   h.acpGetSessionSnapshot.mockReset()
+  h.acpGetDesktopDeliveryCapabilities.mockReset()
   h.denormalizeSnapshot.mockReset()
   h.pushAlert.mockReset()
+  __resetStreamingConfigForProviderTests()
+  __resetPublishedConnectionMapsCount()
+  __resetWritableConnectionsCloneCount()
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+    h.rafQueue.push(cb)
+    return h.rafQueue.length
+  })
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+    if (id > 0 && id <= h.rafQueue.length) {
+      h.rafQueue[id - 1] = () => {}
+    }
+  })
   h.denormalizeSnapshot.mockReturnValue({
     connectionId: "owner-conn",
     eventSeq: 0,
@@ -163,6 +252,16 @@ beforeEach(() => {
   h.acpConnect.mockResolvedValue("spawned-conn")
   h.acpDisconnect.mockResolvedValue(undefined)
   h.acpGetSessionSnapshot.mockResolvedValue(null)
+  h.acpGetDesktopDeliveryCapabilities.mockResolvedValue({
+    mode: "batched",
+    flags: {
+      desktop_acp_event_batching: true,
+      incremental_live_transcript: false,
+      deferred_streaming_rich_content: false,
+    },
+    perf_replay_available: true,
+    failure_event: "acp://delivery-failed",
+  })
 })
 
 function latestAttachHandlers(): AttachHandlers {
@@ -1183,4 +1282,1428 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
     // choice), so a fresh session lands on Composer where the switch succeeds.
     expect(saveConfigPreference).toHaveBeenCalledTimes(1)
   })
+})
+
+
+// ── Task 7: one store transaction per browser frame ──
+
+function batch(
+  batch_id: number,
+  events: EventEnvelope[]
+): DesktopAcpEventBatch {
+  return { batch_id, events }
+}
+
+function content(
+  connectionId: string,
+  seq: number,
+  text: string
+): EventEnvelope {
+  return {
+    connection_id: connectionId,
+    seq,
+    type: "content_delta",
+    text,
+  }
+}
+
+function thinking(
+  connectionId: string,
+  seq: number,
+  text: string
+): EventEnvelope {
+  return {
+    connection_id: connectionId,
+    seq,
+    type: "thinking",
+    text,
+  }
+}
+
+describe("AcpConnectionsProvider frame transactions (raw order)", () => {
+  it("publishes one store transaction and one live sink for a 200-event frame", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    const sink = vi.fn()
+    h.actions!.registerLiveMessageSink(TAB, sink)
+    sink.mockClear()
+    const notify = vi.fn()
+    const unsubscribe = h.store!.subscribeKey(TAB, notify)
+    __resetPublishedConnectionMapsCount()
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(
+          2,
+          Array.from({ length: 200 }, (_, index) =>
+            content("owner-conn", index + 2, "x")
+          )
+        )
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.publishedConnectionMaps()).toBe(1)
+    expect(sink).toHaveBeenCalledTimes(1)
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(201)
+    expect(h.store!.getConnection(TAB)?.liveMessage?.content[0]).toMatchObject({
+      type: "text",
+      text: "x".repeat(200),
+    })
+    unsubscribe()
+  })
+
+  it("publishes turn_complete-only frames and marks transcript completing", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+
+    const {
+      createLiveTranscriptStore,
+      createLiveTranscriptFrameSink,
+    } = await import("@/stores/live-transcript-store")
+    const transcriptStore = createLiveTranscriptStore()
+    const baseSink = createLiveTranscriptFrameSink(
+      42,
+      "owner-conn",
+      transcriptStore
+    )
+    const publish = vi.fn(
+      (
+        frame: Parameters<typeof baseSink.publish>[0],
+        canonical: Parameters<typeof baseSink.publish>[1]
+      ) => baseSink.publish(frame, canonical)
+    )
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    h.actions!.registerLiveSinks(TAB, {
+      canonical: vi.fn(),
+      transcript: {
+        rebuild: baseSink.rebuild,
+        publish,
+        markCompleting: baseSink.markCompleting,
+        clear: baseSink.clear,
+      },
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          content("owner-conn", 2, "hello"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    const liveMessage = h.store!.getConnection(TAB)?.liveMessage
+    expect(liveMessage).toBeTruthy()
+    publish.mockClear()
+
+    // turn_complete alone leaves liveMessage reference unchanged; transcript
+    // publish must still run so status can flip to completing.
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "turn_complete",
+            session_id: "sess-1",
+            stop_reason: "end_turn",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    const publishedFrame = publish.mock.calls[0]![0]
+    expect(publishedFrame.applyEvents.map((e: { type: string }) => e.type)).toEqual([
+      "turn_complete",
+    ])
+    expect(h.store!.getConnection(TAB)?.liveMessage).toBe(liveMessage)
+    expect(transcriptStore.getConversation(42)?.status).toBe("completing")
+  })
+
+  it("raw subscribers run after commit in original envelope order", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+
+    const seen: Array<{ seq: number; cursor: number }> = []
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+
+    function RawProbe() {
+      useAcpEvent((event) => {
+        const conn = h.store?.getConnection(TAB)
+        seen.push({
+          seq: event.seq,
+          cursor: conn?.lastAppliedSeq ?? -1,
+        })
+      })
+      return null
+    }
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    seen.length = 0
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(9, [content("owner-conn", 2, "a"), thinking("owner-conn", 3, "b")])
+      )
+      h.runAnimationFrame()
+    })
+
+    // After commit, cursor is highest applied seq (3); both raw callbacks see it.
+    expect(seen).toEqual([
+      { seq: 2, cursor: 3 },
+      { seq: 3, cursor: 3 },
+    ])
+  })
+
+  it("unknown event advances cursor, reaches raw subscribers, logs only type", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    const seen: number[] = []
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+    function RawProbe() {
+      useAcpEvent((event) => {
+        seen.push(event.seq)
+      })
+      return null
+    }
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            // @ts-expect-error intentional unknown wire type
+            type: "future_extension_event",
+            secret_payload: "must-not-log",
+          } as EventEnvelope,
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(1)
+    expect(seen).toEqual([1])
+    expect(warn).toHaveBeenCalledWith(
+      "[acp-context] unknown ACP event type",
+      { type: "future_extension_event" }
+    )
+    const logged = JSON.stringify(warn.mock.calls)
+    expect(logged).not.toContain("secret_payload")
+    expect(logged).not.toContain("must-not-log")
+    warn.mockRestore()
+  })
+
+  it("one raw subscriber throwing does not stop later subscribers", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    const second = vi.fn()
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    function RawProbes() {
+      useAcpEvent(() => {
+        throw new Error("boom")
+      })
+      useAcpEvent(second)
+      return null
+    }
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbes />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "connected",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(second).toHaveBeenCalled()
+    errSpy.mockRestore()
+  })
+
+  it("runtime failure never starts the legacy listener", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    const { subscribeDesktopAcpEvents } = await import(
+      "@/lib/transport/desktop-acp-events"
+    )
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    const callsBefore = vi.mocked(subscribeDesktopAcpEvents).mock.calls.length
+
+    act(() => {
+      h.emitDesktopFailure({
+        generation: 1,
+        reason: "batch_emit_failed",
+        affected: [
+          { connection_id: "owner-conn", first_seq: 1, last_seq: 3 },
+        ],
+      })
+    })
+
+    // Failure must not re-subscribe (no hot-switch / no legacy acp://event).
+    expect(vi.mocked(subscribeDesktopAcpEvents).mock.calls.length).toBe(
+      callsBefore
+    )
+    expect(h.pushAlert).toHaveBeenCalled()
+  })
+
+  async function mountDesktopOwner(
+    connectionId = "owner-conn",
+    contextKey = TAB,
+    sessionId = "sess-1"
+  ) {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue(connectionId)
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        contextKey,
+        "claude_code",
+        "/tmp/x",
+        sessionId
+      )
+    })
+  }
+
+  it("applies control-event order in one batch after one RAF", async () => {
+    const seenTypes: string[] = []
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+
+    function RawProbe() {
+      useAcpEvent((event) => {
+        seenTypes.push(event.type)
+      })
+      return null
+    }
+
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "permission_request",
+            request_id: "req-1",
+            tool_call: {
+              kind: "execute",
+              status: "pending",
+              toolCallId: "call-1",
+            },
+            options: [],
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "permission_resolved",
+            request_id: "req-1",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "question_request",
+            question_id: "q-1",
+            questions: [
+              {
+                id: "q1",
+                question: "Pick one?",
+                header: "Q",
+                multi_select: false,
+                options: [{ label: "A", description: "" }],
+              },
+            ],
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 4,
+            type: "question_resolved",
+            question_id: "q-1",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 5,
+            type: "error",
+            message: "turn blew up",
+            agent_type: "claude_code",
+            code: null,
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 6,
+            type: "status_changed",
+            status: "prompting",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 7,
+            type: "turn_complete",
+            session_id: "sess-1",
+            stop_reason: "end_turn",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(seenTypes).toEqual([
+      "permission_request",
+      "permission_resolved",
+      "question_request",
+      "question_resolved",
+      "error",
+      "status_changed",
+      "turn_complete",
+    ])
+    const conn = h.store!.getConnection(TAB)!
+    // Final transitions after ordered apply in one frame:
+    // request→resolved cleared permission/question; status_changed(prompting)
+    // clears the error set by the prior error event; turn_complete → connected.
+    expect(conn.pendingPermission).toBeNull()
+    expect(conn.pendingAskQuestion).toBeNull()
+    expect(conn.error).toBeNull()
+    expect(conn.status).toBe("connected")
+    expect(conn.lastAppliedSeq).toBe(7)
+    // Error afterCommit still fired (before status cleared the field).
+    expect(h.pushAlert).toHaveBeenCalled()
+    expect(h.pushAlert.mock.calls[0]?.slice(0, 3)).toEqual([
+      "error",
+      "§eventErrorTitle",
+      "turn blew up",
+    ])
+  })
+
+  it("concatenates raw_output_append chunks in order after one frame", async () => {
+    await mountDesktopOwner()
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "tool_call",
+            tool_call_id: "tool-1",
+            title: "Bash",
+            kind: "execute",
+            status: "in_progress",
+            content: null,
+            raw_input: null,
+            raw_output: null,
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "tool_call_update",
+            tool_call_id: "tool-1",
+            title: null,
+            status: null,
+            content: null,
+            raw_input: null,
+            raw_output: "hello ",
+            raw_output_append: true,
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 4,
+            type: "tool_call_update",
+            tool_call_id: "tool-1",
+            title: null,
+            status: null,
+            content: null,
+            raw_input: null,
+            raw_output: "world",
+            raw_output_append: true,
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 5,
+            type: "tool_call_update",
+            tool_call_id: "tool-1",
+            title: null,
+            status: "completed",
+            content: null,
+            raw_input: null,
+            raw_output: "!",
+            raw_output_append: true,
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    const tool = h.store!.getConnection(TAB)!.liveMessage?.content.find(
+      (b) => b.type === "tool_call"
+    )
+    expect(tool?.type).toBe("tool_call")
+    if (tool?.type !== "tool_call") throw new Error("expected tool_call")
+    expect(tool.info.raw_output_chunks).toEqual(["hello ", "world", "!"])
+    expect(tool.info.raw_output_total_bytes).toBe("hello world!".length)
+    expect(tool.info.status).toBe("completed")
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(5)
+  })
+
+  it("rekeys between receipt and commit and applies once under the new key", async () => {
+    const ORPHAN = "new-orphan-tab"
+    await mountDesktopOwner("owner-conn", ORPHAN, "sess-shared")
+
+    // Orphan rescue matches on sessionId — seed it before the rekey race.
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "session_started",
+            session_id: "sess-shared",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(ORPHAN)?.sessionId).toBe("sess-shared")
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [content("owner-conn", 3, "a"), content("owner-conn", 4, "b")])
+      )
+    })
+    // Frame is scheduled but not run — rekey via orphan rescue first.
+    expect(h.rafQueue.length).toBeGreaterThan(0)
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared")
+    })
+
+    expect(h.store!.getConnection(ORPHAN)).toBeUndefined()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-conn")
+
+    act(() => {
+      h.runAnimationFrame()
+    })
+
+    expect(h.store!.getConnection(ORPHAN)).toBeUndefined()
+    const conn = h.store!.getConnection(TAB)!
+    expect(conn.lastAppliedSeq).toBe(4)
+    expect(conn.liveMessage?.content[0]).toMatchObject({
+      type: "text",
+      text: "ab",
+    })
+  })
+
+  it("buffers unmapped events, hydrates, then drains without duplicates", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    let resolveSnapshot: (value: unknown) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSnapshot = resolve
+        })
+    )
+    h.denormalizeSnapshot.mockImplementation((snap: { connection_id: string; event_seq: number }) => ({
+      connectionId: snap.connection_id,
+      eventSeq: snap.event_seq,
+      activeDelegations: [],
+      status: "prompting",
+      sessionId: "sess-1",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: {
+        id: "snap-lm",
+        role: "assistant",
+        content: [{ type: "text", text: "from-snapshot" }],
+        startedAt: 1,
+      },
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      backgroundOutstanding: 0,
+    }))
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    let connectPromise: Promise<void> | undefined
+    await act(async () => {
+      connectPromise = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sess-1"
+      )
+    })
+    // Wait until CONNECTION_CREATED (acpConnect resolved) but reverseMap is
+    // still unset while snapshot is in flight.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-conn")
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          content("owner-conn", 1, "dup-a"),
+          content("owner-conn", 2, "dup-b"),
+          content("owner-conn", 3, "only-live"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    // Unmapped: cursor must not advance from the firehose yet.
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(0)
+
+    await act(async () => {
+      resolveSnapshot({ connection_id: "owner-conn", event_seq: 2 })
+      await connectPromise
+    })
+    // Drain may flush immediately; run any residual frame.
+    act(() => {
+      h.runAnimationFrame()
+    })
+
+    const conn = h.store!.getConnection(TAB)!
+    expect(conn.lastAppliedSeq).toBe(3)
+    // Snapshot text + only the post-cursor live delta (no duplicate 1/2).
+    const texts = (conn.liveMessage?.content ?? [])
+      .filter((b): b is { type: "text"; text: string } => b.type === "text")
+      .map((b) => b.text)
+    expect(texts.join("")).toContain("from-snapshot")
+    expect(texts.join("")).toContain("only-live")
+    expect(texts.join("")).not.toContain("dup-a")
+    expect(texts.join("")).not.toContain("dup-b")
+  })
+
+  it("snapshot race mid-queue drops old seq and applies contiguous suffix", async () => {
+    await mountDesktopOwner()
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          content("owner-conn", 2, "w"),
+          content("owner-conn", 3, "x"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(3)
+
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "owner-conn",
+      eventSeq: 5,
+      activeDelegations: [],
+      status: "prompting",
+      sessionId: "sess-1",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: {
+        id: "lm-race",
+        role: "assistant",
+        content: [{ type: "text", text: "snap-5" }],
+        startedAt: 1,
+      },
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      backgroundOutstanding: 0,
+    })
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "owner-conn",
+      event_seq: 5,
+    })
+
+    // Gap at 5 (missing 4) pauses the connection; 5-7 stay buffered.
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [
+          content("owner-conn", 5, "old"),
+          content("owner-conn", 6, "g"),
+          content("owner-conn", 7, "h"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(3)
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    act(() => {
+      h.runAnimationFrame()
+    })
+
+    const conn = h.store!.getConnection(TAB)!
+    // Hydrate cursor 5 drops seq 5; contiguous 6-7 apply.
+    expect(conn.lastAppliedSeq).toBe(7)
+    const text = (conn.liveMessage?.content ?? [])
+      .filter((b): b is { type: "text"; text: string } => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+    expect(text).toContain("snap-5")
+    expect(text).toContain("g")
+    expect(text).toContain("h")
+    expect(text).not.toContain("old")
+  })
+
+  it("multi-connection gap on A does not block B in the same batch", async () => {
+    const TAB_A = "tab-a-claude"
+    const TAB_B = "tab-b-claude"
+    h.eventStreamValue = null
+    let connectN = 0
+    h.acpConnect.mockImplementation(async () => {
+      connectN += 1
+      return connectN === 1 ? "conn-a" : "conn-b"
+    })
+    // Connect path: no snapshot. Gap recovery: hydrate A to seq 5.
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+    h.denormalizeSnapshot.mockImplementation(
+      (snap: { connection_id: string; event_seq: number }) => ({
+        connectionId: snap.connection_id,
+        eventSeq: snap.event_seq,
+        activeDelegations: [],
+        status: "prompting",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: {
+          id: "lm",
+          role: "assistant",
+          content: [],
+          startedAt: 1,
+        },
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        backgroundOutstanding: 0,
+      })
+    )
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB_A, "claude_code", "/tmp/x", "sess-a")
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB_B, "claude_code", "/tmp/x", "sess-b")
+    })
+
+    // Seed A cursor to 3 so a jump to 5 is a gap (missing 4).
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "conn-a",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          content("conn-a", 2, "a"),
+          content("conn-a", 3, "b"),
+          {
+            connection_id: "conn-b",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(TAB_A)?.lastAppliedSeq).toBe(3)
+    expect(h.store!.getConnection(TAB_B)?.lastAppliedSeq).toBe(1)
+
+    // From here, gap recovery for A returns a snapshot at seq 5.
+    h.acpGetSessionSnapshot.mockImplementation(async (id: string) => {
+      if (id === "conn-a") {
+        return { connection_id: "conn-a", event_seq: 5 }
+      }
+      return null
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [
+          content("conn-a", 5, "gap"), // missing 4
+          content("conn-b", 2, "x"),
+          content("conn-b", 3, "y"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    // B commits contiguous work immediately; A stays at 3 pending recovery.
+    expect(h.store!.getConnection(TAB_B)?.lastAppliedSeq).toBe(3)
+    expect(h.store!.getConnection(TAB_B)?.liveMessage?.content[0]).toMatchObject(
+      {
+        type: "text",
+        text: "xy",
+      }
+    )
+    expect(h.store!.getConnection(TAB_A)?.lastAppliedSeq).toBe(3)
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    act(() => {
+      h.runAnimationFrame()
+    })
+
+    // A recovered via snapshot to event_seq 5 (gap event dropped as duplicate).
+    expect(h.store!.getConnection(TAB_A)?.lastAppliedSeq).toBe(5)
+    // B remains healthy and was never starved.
+    expect(h.store!.getConnection(TAB_B)?.lastAppliedSeq).toBe(3)
+  })
+
+  it("cursor-only frame skips live sink and key notify", async () => {
+    await mountDesktopOwner()
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    const sink = vi.fn()
+    h.actions!.registerLiveMessageSink(TAB, sink)
+    sink.mockClear()
+    const notify = vi.fn()
+    const unsubscribe = h.store!.subscribeKey(TAB, notify)
+    const liveBefore = h.store!.getConnection(TAB)?.liveMessage
+
+    act(() => {
+      // user_message produces no FrameAction store mutations — cursor only.
+      h.emitDesktopBatch(
+        batch(2, [
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "user_message",
+            message_id: "m1",
+            blocks: [{ type: "text", text: "hi" }],
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(2)
+    expect(h.store!.getConnection(TAB)?.liveMessage).toBe(liveBefore)
+    expect(sink).not.toHaveBeenCalled()
+    expect(notify).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+})
+
+describe("APPLY_EVENT_FRAME reducer parity", () => {
+  /**
+   * Closed set of FrameAction types produced by `prepareMappedEnvelope` on the
+   * frame commit path. Map-level actions and direct-dispatch-only actions
+   * (HYDRATE_FROM_SNAPSHOT, STREAM_BATCH, BATCH_TOOL_CALL_UPDATES,
+   * DISMISS_CONFIG_STALE, CONFIG_OPTION_CHANGED, CLEAR_ACP_LOAD_ERROR,
+   * EVENT_APPLIED, CLEAR_PENDING_QUESTION) are intentionally excluded — they
+   * are never listed in PreparedConnectionFrame.actions.
+   */
+  function baseConn(
+    overrides: Partial<
+      import("@/contexts/acp-connections-context").ConnectionState
+    > = {}
+  ): import("@/contexts/acp-connections-context").ConnectionState {
+    return {
+      connectionId: "c1",
+      contextKey: "k1",
+      agentType: "claude_code",
+      workingDir: "/tmp",
+      status: "prompting",
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: "s1",
+      modes: {
+        current_mode_id: "default",
+        available_modes: [{ id: "default", name: "Default", description: null }],
+      },
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: {
+        id: "lm",
+        role: "assistant",
+        content: [],
+        startedAt: 1,
+      },
+      pendingPermission: {
+        request_id: "req-0",
+        tool_call: { toolCallId: "t0" },
+        options: [],
+      },
+      pendingUserMessage: null,
+      pendingQuestion: {
+        tool_call_id: "tq",
+        question: "old?",
+      },
+      pendingAskQuestion: {
+        question_id: "ask-0",
+        questions: [],
+        created_at: "2020-01-01T00:00:00.000Z",
+      },
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      ...overrides,
+    }
+  }
+
+  const framePathFixtures: Array<{
+    name: string
+    action: import("@/contexts/acp-connections-context").__FrameActionForTests
+    conn?: Partial<
+      import("@/contexts/acp-connections-context").ConnectionState
+    >
+  }> = [
+    {
+      name: "CONTENT_DELTA",
+      action: { type: "CONTENT_DELTA", contextKey: "k1", text: "hi" },
+    },
+    {
+      name: "THINKING",
+      action: { type: "THINKING", contextKey: "k1", text: "hmm" },
+    },
+    {
+      name: "STATUS_CHANGED",
+      action: {
+        type: "STATUS_CHANGED",
+        contextKey: "k1",
+        status: "connected",
+      },
+    },
+    {
+      name: "ERROR",
+      action: { type: "ERROR", contextKey: "k1", message: "boom" },
+    },
+    {
+      name: "USAGE_UPDATE",
+      action: {
+        type: "USAGE_UPDATE",
+        contextKey: "k1",
+        usage: { used: 1, size: 10 },
+      },
+    },
+    {
+      name: "SESSION_STARTED",
+      action: {
+        type: "SESSION_STARTED",
+        contextKey: "k1",
+        sessionId: "new-sess",
+      },
+    },
+    {
+      name: "SESSION_MODES",
+      action: {
+        type: "SESSION_MODES",
+        contextKey: "k1",
+        modes: {
+          current_mode_id: "plan",
+          available_modes: [{ id: "plan", name: "Plan", description: null }],
+        },
+      },
+    },
+    {
+      name: "SESSION_CONFIG_OPTIONS",
+      action: {
+        type: "SESSION_CONFIG_OPTIONS",
+        contextKey: "k1",
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            description: null,
+            category: null,
+            kind: {
+              type: "select",
+              current_value: "m1",
+              options: [{ value: "m1", name: "M1" }],
+              groups: [],
+            },
+          },
+        ],
+      },
+    },
+    {
+      name: "CONFIG_STALE_CHANGED",
+      action: {
+        type: "CONFIG_STALE_CHANGED",
+        contextKey: "k1",
+        stale: true,
+        kind: "agent_config",
+      },
+    },
+    {
+      name: "SELECTORS_READY",
+      action: { type: "SELECTORS_READY", contextKey: "k1" },
+    },
+    {
+      name: "PROMPT_CAPABILITIES",
+      action: {
+        type: "PROMPT_CAPABILITIES",
+        contextKey: "k1",
+        promptCapabilities: {
+          image: true,
+          audio: false,
+          embedded_context: true,
+        },
+      },
+    },
+    {
+      name: "FORK_SUPPORTED",
+      action: {
+        type: "FORK_SUPPORTED",
+        contextKey: "k1",
+        supported: true,
+      },
+    },
+    {
+      name: "MODE_CHANGED",
+      action: {
+        type: "MODE_CHANGED",
+        contextKey: "k1",
+        modeId: "plan",
+      },
+      conn: {
+        modes: {
+          current_mode_id: "default",
+          available_modes: [
+            { id: "default", name: "Default", description: null },
+            { id: "plan", name: "Plan", description: null },
+          ],
+        },
+      },
+    },
+    {
+      name: "PLAN_UPDATE",
+      action: {
+        type: "PLAN_UPDATE",
+        contextKey: "k1",
+        entries: [{ content: "a", status: "pending", priority: "medium" }],
+      },
+    },
+    {
+      name: "CLAUDE_API_RETRY",
+      action: {
+        type: "CLAUDE_API_RETRY",
+        contextKey: "k1",
+        retry: {
+          sessionId: "s1",
+          attempt: 1,
+          maxRetries: 3,
+          error: "rate limit",
+          errorStatus: 429,
+          retryDelayMs: 1000,
+        },
+      },
+    },
+    {
+      name: "TOOL_CALL",
+      action: {
+        type: "TOOL_CALL",
+        contextKey: "k1",
+        tool_call_id: "t1",
+        title: "Bash",
+        kind: "execute",
+        status: "pending",
+        content: null,
+        raw_input: "{}",
+        raw_output: null,
+        locations: null,
+        meta: null,
+        images: null,
+      },
+    },
+    {
+      name: "TOOL_CALL_UPDATE",
+      action: {
+        type: "TOOL_CALL_UPDATE",
+        contextKey: "k1",
+        tool_call_id: "t1",
+        title: "Bash",
+        fallback_title: "tool",
+        fallback_kind: "tool",
+        status: "in_progress",
+        content: null,
+        raw_input: null,
+        raw_output: "out",
+        raw_output_append: true,
+        locations: null,
+        meta: null,
+        images: null,
+      },
+    },
+    {
+      name: "PERMISSION_REQUEST",
+      action: {
+        type: "PERMISSION_REQUEST",
+        contextKey: "k1",
+        request_id: "req-1",
+        tool_call: { toolCallId: "t1" },
+        fallback_title: "tool",
+        fallback_kind: "tool",
+        options: [],
+      },
+    },
+    {
+      name: "PERMISSION_CLEARED",
+      action: {
+        type: "PERMISSION_CLEARED",
+        contextKey: "k1",
+        requestId: "req-0",
+      },
+    },
+    {
+      name: "SET_ASK_QUESTION",
+      action: {
+        type: "SET_ASK_QUESTION",
+        contextKey: "k1",
+        pendingAskQuestion: {
+          question_id: "q1",
+          questions: [
+            {
+              id: "q1",
+              question: "?",
+              header: "H",
+              multi_select: false,
+              options: [],
+            },
+          ],
+          created_at: "2020-01-01T00:00:00.000Z",
+        },
+      },
+    },
+    {
+      name: "CLEAR_ASK_QUESTION",
+      action: {
+        type: "CLEAR_ASK_QUESTION",
+        contextKey: "k1",
+        questionId: "ask-0",
+      },
+    },
+    {
+      name: "SET_PENDING_QUESTION",
+      action: {
+        type: "SET_PENDING_QUESTION",
+        contextKey: "k1",
+        pendingQuestion: {
+          tool_call_id: "tq2",
+          question: "continue?",
+        },
+      },
+    },
+    {
+      name: "SET_BACKGROUND_OUTSTANDING",
+      action: {
+        type: "SET_BACKGROUND_OUTSTANDING",
+        contextKey: "k1",
+        outstanding: 2,
+        settledCount: 0,
+        turnsCount: 0,
+      },
+    },
+    {
+      name: "AVAILABLE_COMMANDS",
+      action: {
+        type: "AVAILABLE_COMMANDS",
+        contextKey: "k1",
+        commands: [{ name: "help", description: "Help" }],
+      },
+    },
+    {
+      name: "ACP_LOAD_ERROR",
+      action: {
+        type: "ACP_LOAD_ERROR",
+        contextKey: "k1",
+        message: "gone",
+        code: "resource_not_found",
+      },
+    },
+  ]
+
+  it("documents the closed frame-path FrameAction set", () => {
+    const types = framePathFixtures.map((f) => f.action.type).sort()
+    expect(types).toEqual(
+      [
+        "ACP_LOAD_ERROR",
+        "AVAILABLE_COMMANDS",
+        "CLAUDE_API_RETRY",
+        "CLEAR_ASK_QUESTION",
+        "CONFIG_STALE_CHANGED",
+        "CONTENT_DELTA",
+        "ERROR",
+        "FORK_SUPPORTED",
+        "MODE_CHANGED",
+        "PERMISSION_CLEARED",
+        "PERMISSION_REQUEST",
+        "PLAN_UPDATE",
+        "PROMPT_CAPABILITIES",
+        "SELECTORS_READY",
+        "SESSION_CONFIG_OPTIONS",
+        "SESSION_MODES",
+        "SESSION_STARTED",
+        "SET_ASK_QUESTION",
+        "SET_BACKGROUND_OUTSTANDING",
+        "SET_PENDING_QUESTION",
+        "STATUS_CHANGED",
+        "THINKING",
+        "TOOL_CALL",
+        "TOOL_CALL_UPDATE",
+        "USAGE_UPDATE",
+      ].sort()
+    )
+  })
+
+  it.each(framePathFixtures)(
+    "single-action and one-item frame match for $name",
+    ({ action, conn }) => {
+      const state = new Map([["k1", baseConn(conn)]])
+      __resetWritableConnectionsCloneCount()
+      const single = __connectionsReducerForTests(state, action)
+      __resetWritableConnectionsCloneCount()
+      const framed = __connectionsReducerForTests(state, {
+        type: "APPLY_EVENT_FRAME",
+        frames: [
+          {
+            contextKey: "k1",
+            deliveryIds: [1],
+            actions: [action],
+            highestSeq: 0,
+          },
+        ],
+      })
+      // Frame path clones the outer map exactly once.
+      expect(__getWritableConnectionsCloneCount()).toBe(1)
+      expect(framed.get("k1")).toEqual(single.get("k1"))
+    }
+  )
 })

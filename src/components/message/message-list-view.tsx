@@ -1,11 +1,32 @@
 "use client"
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import {
+  selectHistoricalTimelineTurns,
   selectTimelineTurns,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { useStreamingPerformanceFlag } from "@/lib/acp/streaming-performance-config"
+import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
+import {
+  useHasLiveTranscript,
+  useLiveTranscriptConversation,
+  type LiveTranscriptSnapshot,
+} from "@/stores/live-transcript-store"
+import type {
+  LiveContentBlock,
+  LiveMessage,
+} from "@/contexts/acp-connections-context"
 import { ContentPartsRenderer } from "./content-parts-renderer"
+import { LiveTranscriptRow } from "./live-transcript-row"
 import {
   createMessageTurnAdapter,
   groupGoalRuns,
@@ -26,7 +47,10 @@ import { UserImageAttachments } from "./user-image-attachments"
 import { useSessionStats } from "@/contexts/session-stats-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
-import { normalizeToolName } from "@/lib/tool-call-normalization"
+import {
+  inferLiveToolName,
+  normalizeToolName,
+} from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import {
@@ -446,6 +470,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   previousUserIndex = null,
   isResponseComplete = true,
   sourceTurns,
+  renderKind = "historicalRow",
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
@@ -453,7 +478,9 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   previousUserIndex?: number | null
   isResponseComplete?: boolean
   sourceTurns?: MessageTurn[]
+  renderKind?: "historicalRow" | "liveRow"
 }) {
+  streamingPerfRecorder.countRender(renderKind)
   if (group.role === "system") {
     return <CollapsibleSystemMessage group={group} />
   }
@@ -540,6 +567,162 @@ const AutoScrollOnSend = memo(function AutoScrollOnSend({
   return null
 })
 
+/**
+ * Build a UI-only LiveMessage projection from the live transcript snapshot so
+ * plan/stats overlays can reuse existing components without MessageListView
+ * subscribing to live content (keeps historicalThread cold).
+ */
+function liveSnapshotToLiveMessage(snap: LiveTranscriptSnapshot): LiveMessage {
+  const content: LiveContentBlock[] = []
+  for (const id of snap.segmentIds) {
+    const segment = snap.segments.get(id)
+    if (!segment) continue
+    switch (segment.type) {
+      case "text":
+        content.push({ type: "text", text: segment.text })
+        break
+      case "thinking":
+        content.push({ type: "thinking", text: segment.text })
+        break
+      case "plan":
+        content.push({ type: "plan", entries: segment.entries })
+        break
+      case "tool":
+      case "generated-image": {
+        const tool = snap.tools.get(segment.toolCallId)
+        if (tool) content.push({ type: "tool_call", info: tool })
+        break
+      }
+    }
+  }
+  return {
+    id: snap.messageId,
+    role: "assistant",
+    content,
+    startedAt: snap.startedAt,
+  }
+}
+
+function extractLiveDelegationSources(
+  message: LiveMessage
+): DelegationCardSource[] {
+  const liveSources: DelegationCardSource[] = []
+  for (const block of message.content) {
+    if (block.type !== "tool_call") continue
+    const toolName = normalizeToolName(
+      inferLiveToolName({
+        title: block.info.title,
+        kind: block.info.kind,
+        rawInput: block.info.raw_input,
+        meta: block.info.meta,
+      })
+    )
+    if (!isDelegateToAgentToolName(toolName)) continue
+    const resolvedOutput =
+      block.info.raw_output_chunks.length > 0
+        ? block.info.raw_output_chunks.join("")
+        : block.info.content
+    liveSources.push({
+      parentToolUseId: block.info.tool_call_id,
+      input: block.info.raw_input ?? null,
+      output: resolvedOutput,
+      errorText:
+        block.info.status === "failed" ? (resolvedOutput ?? null) : null,
+      state:
+        block.info.status === "completed"
+          ? "output-available"
+          : block.info.status === "failed"
+            ? "output-error"
+            : "input-available",
+      meta: block.info.meta ?? null,
+    })
+  }
+  return liveSources
+}
+
+/** Narrow-subscription live stats — parent list does not re-render per token. */
+const LiveTurnStatsFromTranscript = memo(function LiveTurnStatsFromTranscript({
+  conversationId,
+  agentType,
+}: {
+  conversationId: number
+  agentType: AgentType
+}) {
+  const snap = useLiveTranscriptConversation(conversationId)
+  const message = useMemo(
+    () => (snap ? liveSnapshotToLiveMessage(snap) : null),
+    [snap]
+  )
+  if (!message) return null
+  return <LiveTurnStats message={message} agentType={agentType} isStreaming />
+})
+
+/** Narrow-subscription plan overlay driven by live transcript segments. */
+const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
+  conversationId,
+  entries,
+  planKey,
+  isStreaming,
+}: {
+  conversationId: number
+  entries: ReturnType<typeof extractLatestPlanEntriesFromMessages>
+  planKey: string | null
+  isStreaming: boolean
+}) {
+  const snap = useLiveTranscriptConversation(conversationId)
+  const message = useMemo(
+    () => (snap ? liveSnapshotToLiveMessage(snap) : null),
+    [snap]
+  )
+  return (
+    <AgentPlanOverlay
+      key={message?.id != null ? `plan-${message.id}` : (planKey ?? undefined)}
+      message={message}
+      entries={entries}
+      planKey={planKey}
+      defaultExpanded={false}
+      isStreaming={isStreaming}
+    />
+  )
+})
+
+/**
+ * Sub-agent overlay: prefers live-transcript delegations while streaming so
+ * historical row adaptation is not required.
+ */
+const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
+  conversationId,
+  isStreaming,
+  historicalDelegations,
+  historicalKey,
+}: {
+  conversationId: number
+  isStreaming: boolean
+  historicalDelegations: DelegationCardSource[]
+  historicalKey: string
+}) {
+  const snap = useLiveTranscriptConversation(
+    isStreaming ? conversationId : null
+  )
+  const liveDelegations = useMemo(() => {
+    if (!snap || !isStreaming) return EMPTY_DELEGATIONS
+    return extractLiveDelegationSources(liveSnapshotToLiveMessage(snap))
+  }, [snap, isStreaming])
+  const delegations =
+    liveDelegations.length > 0 ? liveDelegations : historicalDelegations
+  const overlayKey =
+    liveDelegations.length > 0
+      ? `subagents-live-${snap?.messageId ?? conversationId}`
+      : historicalKey
+  return (
+    <SubAgentOverlay
+      key={overlayKey}
+      delegations={delegations}
+      overlayKey={overlayKey}
+    />
+  )
+})
+
 export function MessageListView({
   conversationId,
   agentType,
@@ -558,31 +741,60 @@ export function MessageListView({
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
-  // Subscribe to only this conversation's session + derived timeline. Another
-  // conversation's streaming token no longer re-renders this view; the timeline
-  // selector returns a reference-stable array (memoized per session object) so
-  // unrelated dispatches are inert here.
-  const session = useConversationRuntimeStore(
-    (s) => s.byConversationId.get(conversationId) ?? null
-  )
-  const liveMessage = session?.liveMessage ?? null
-  const timelineTurns = useConversationRuntimeStore((s) =>
-    selectTimelineTurns(s, conversationId)
+  const useIncrementalLive = useStreamingPerformanceFlag(
+    "incremental_live_transcript"
   )
 
+  // When incremental live is on: historical timeline only (reference-stable
+  // across live content updates) + narrow syncState. Compatibility path keeps
+  // the full timeline (incl. streaming phase) and liveMessage for overlays.
+  const timelineTurns = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        useIncrementalLive
+          ? selectHistoricalTimelineTurns(s, conversationId)
+          : selectTimelineTurns(s, conversationId),
+      [conversationId, useIncrementalLive]
+    )
+  )
+  const sessionSyncState = useConversationRuntimeStore(
+    useCallback(
+      (s) => s.byConversationId.get(conversationId)?.syncState ?? "idle",
+      [conversationId]
+    )
+  )
+  const compatibilityLiveMessage = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        useIncrementalLive
+          ? null
+          : (s.byConversationId.get(conversationId)?.liveMessage ?? null),
+      [conversationId, useIncrementalLive]
+    )
+  )
+  const hasLiveTranscript = useHasLiveTranscript(
+    useIncrementalLive ? conversationId : null
+  )
+  // Compatibility path only: incremental mode never reads session.liveMessage
+  // so content-only SET_LIVE_MESSAGE updates cannot re-render this list.
+  const liveMessage = compatibilityLiveMessage
+
   const { setSessionStats } = useSessionStats()
+
+  streamingPerfRecorder.countRender("historicalThread")
+
+  // After React commit, drain pending deliveries and let the recorder schedule
+  // a coalesced next-paint RAF. Paint scheduling lives on the recorder so
+  // rapid re-render effect cleanup cannot cancel samples before paint.
+  useLayoutEffect(() => {
+    streamingPerfRecorder.markReactCommit()
+  })
 
   useEffect(() => {
     if (isActive) {
       setSessionStats(sessionStats)
     }
   }, [isActive, sessionStats, setSessionStats])
-
-  const shouldUseSmoothResize = !(
-    isActive &&
-    !detailLoading &&
-    timelineTurns.length
-  )
 
   const adapterText = useMemo(
     () => ({
@@ -591,8 +803,6 @@ export function MessageListView({
     }),
     [sharedT]
   )
-
-  const sessionSyncState = session?.syncState ?? "idle"
 
   // Per-instance turn adapter: caches per-turn `AdaptedMessage` so unchanged
   // historical turns survive every streaming-token re-render with stable refs.
@@ -703,8 +913,11 @@ export function MessageListView({
       }
     }
 
+    // Pending typing is a footer concern under incremental live (outside
+    // Virtua). Compatibility path keeps the typing virtua item.
     const lastPhase = timelineTurns[timelineTurns.length - 1]?.phase ?? null
     if (
+      !useIncrementalLive &&
       lastPhase === "optimistic" &&
       (connStatus === "prompting" || sessionSyncState === "awaiting_persist")
     ) {
@@ -719,7 +932,26 @@ export function MessageListView({
     timelineTurns,
     turnAdapter,
     groupCache,
+    useIncrementalLive,
   ])
+
+  const lastTimelinePhase =
+    timelineTurns[timelineTurns.length - 1]?.phase ?? null
+  const showPendingTypingFooter =
+    useIncrementalLive &&
+    lastTimelinePhase === "optimistic" &&
+    (connStatus === "prompting" || sessionSyncState === "awaiting_persist")
+  const showLiveFooter =
+    useIncrementalLive && (hasLiveTranscript || showPendingTypingFooter)
+  const liveFooter = useMemo(() => {
+    if (!showLiveFooter) return null
+    return (
+      <LiveTranscriptRow
+        conversationId={conversationId}
+        agentType={agentType}
+      />
+    )
+  }, [showLiveFooter, conversationId, agentType])
 
   const historicalPlanEntries = useMemo(
     () => extractLatestPlanEntriesFromMessages(nonStreamingAdapted),
@@ -743,6 +975,9 @@ export function MessageListView({
               previousUserIndex={item.previousUserIndex}
               isResponseComplete={item.phase === "persisted"}
               sourceTurns={item.sourceTurns}
+              renderKind={
+                item.phase === "streaming" ? "liveRow" : "historicalRow"
+              }
             />
           </div>
         )
@@ -865,7 +1100,10 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
-  const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
+  const hasRenderableContent =
+    threadItems.length > 0 ||
+    Boolean(liveMessage) ||
+    (useIncrementalLive && (hasLiveTranscript || showLiveFooter))
 
   if (detailLoading && !hasRenderableContent) {
     return (
@@ -942,7 +1180,7 @@ export function MessageListView({
     <div className="relative flex h-full min-h-0 flex-col">
       <MessageThread
         className="flex-1 min-h-0"
-        resize={shouldUseSmoothResize ? "smooth" : undefined}
+        resize={hasLiveTranscript ? "instant" : "smooth"}
       >
         <AutoScrollOnSend signal={sendSignal} />
         <VirtualizedMessageThread
@@ -950,17 +1188,31 @@ export function MessageListView({
           getItemKey={getThreadItemKey}
           renderItem={renderThreadItem}
           emptyState={emptyState}
+          footer={liveFooter}
           scrollApiRef={scrollApiRef}
         />
-        <MessageThreadScrollButton />
-      </MessageThread>
-      {liveMessage && connStatus === "prompting" && (
-        <LiveTurnStats
-          message={liveMessage}
-          agentType={agentType}
-          isStreaming={connStatus === "prompting"}
+        <MessageThreadScrollButton
+          onBeforeScrollToBottom={() => {
+            scrollApiRef.current?.footerScroll?.markAtBottom()
+          }}
         />
-      )}
+      </MessageThread>
+      {useIncrementalLive
+        ? hasLiveTranscript &&
+          connStatus === "prompting" && (
+            <LiveTurnStatsFromTranscript
+              conversationId={conversationId}
+              agentType={agentType}
+            />
+          )
+        : liveMessage &&
+          connStatus === "prompting" && (
+            <LiveTurnStats
+              message={liveMessage}
+              agentType={agentType}
+              isStreaming={connStatus === "prompting"}
+            />
+          )}
       {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
           top-right in RTL). A flex column keeps the order stable regardless of
           each panel's expand/collapse height: the message navigator first, then
@@ -980,19 +1232,37 @@ export function MessageListView({
             scrollApiRef={scrollApiRef}
           />
         )}
-        <AgentPlanOverlay
-          key={agentPlanOverlayKey}
-          message={liveMessage ?? null}
-          entries={historicalPlanEntries}
-          planKey={historicalPlanKey}
-          defaultExpanded={false}
-          isStreaming={connStatus === "prompting"}
-        />
-        <SubAgentOverlay
-          key={subAgentOverlayKey}
-          delegations={lastAssistantDelegations}
-          overlayKey={subAgentOverlayKey}
-        />
+        {useIncrementalLive ? (
+          <LiveAgentPlanOverlay
+            conversationId={conversationId}
+            entries={historicalPlanEntries}
+            planKey={historicalPlanKey}
+            isStreaming={connStatus === "prompting"}
+          />
+        ) : (
+          <AgentPlanOverlay
+            key={agentPlanOverlayKey}
+            message={liveMessage ?? null}
+            entries={historicalPlanEntries}
+            planKey={historicalPlanKey}
+            defaultExpanded={false}
+            isStreaming={connStatus === "prompting"}
+          />
+        )}
+        {useIncrementalLive ? (
+          <LiveAwareSubAgentOverlay
+            conversationId={conversationId}
+            isStreaming={connStatus === "prompting"}
+            historicalDelegations={lastAssistantDelegations}
+            historicalKey={subAgentOverlayKey}
+          />
+        ) : (
+          <SubAgentOverlay
+            key={subAgentOverlayKey}
+            delegations={lastAssistantDelegations}
+            overlayKey={subAgentOverlayKey}
+          />
+        )}
       </div>
     </div>
   )

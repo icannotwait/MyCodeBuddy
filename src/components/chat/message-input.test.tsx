@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { RichComposerHandle } from "./composer/rich-composer"
 import { serializeDocToText } from "./composer/to-prompt-blocks"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
+import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
 // ref, so capture that handle through a partial mock that still renders the real
@@ -181,6 +182,77 @@ describe("MessageInput (RichComposer integration)", () => {
     // `.codeg-composer-chrome` rule in globals.css).
     expect(card.className).toContain("codeg-composer-chrome")
     expect(fireEvent.mouseDown(card)).toBe(false)
+  })
+
+  it("does not mutate editor content when streaming-perf input probes run", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    class FakeMessageChannel {
+      port1 = {
+        onmessage: null as ((ev: MessageEvent) => void) | null,
+        close: vi.fn(),
+      }
+      port2 = {
+        postMessage: (_data: unknown) => {
+          queueMicrotask(() => {
+            this.port1.onmessage?.(new MessageEvent("message"))
+          })
+        },
+        close: vi.fn(),
+      }
+    }
+    vi.stubGlobal("MessageChannel", FakeMessageChannel)
+
+    const onChange = vi.fn()
+    renderInput({})
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+
+    act(() => {
+      editor.commands.setContent("probe seed text")
+    })
+    const before = serializeDocToText(editor.state.doc)
+    const onUpdateCallsBefore = onChange.mock.calls.length
+
+    // Wire a side-channel to count editor updates without going through props.
+    let updateCount = 0
+    const onUpdate = () => {
+      updateCount += 1
+    }
+    editor.on("update", onUpdate)
+
+    act(() => {
+      streamingPerfRecorder.start({
+        runId: "probe-test",
+        seed: 1,
+        rateProfile: "eps_100",
+      })
+    })
+
+    // Fire several 100 ms probe intervals while the recorder is active.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350)
+      // Drain MessageChannel → rAF paint marks.
+      await Promise.resolve()
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve())
+      })
+    })
+
+    act(() => {
+      streamingPerfRecorder.stop()
+    })
+
+    editor.off("update", onUpdate)
+    expect(serializeDocToText(editor.state.doc)).toBe(before)
+    expect(updateCount).toBe(0)
+    expect(onChange.mock.calls.length).toBe(onUpdateCallsBefore)
+
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
   })
 })
 

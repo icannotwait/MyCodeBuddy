@@ -27,7 +27,11 @@ import type {
   SidebarData,
   ConnectionInfo,
   ConversationConnectionInfo,
+  DesktopDeliveryCapabilities,
+  EventBusMetricsSnapshot,
   LiveSessionSnapshot,
+  PerfReplayRequest,
+  PerfReplayResult,
   FeedbackItem,
   QuestionAnswer,
   AcpAgentInfo,
@@ -283,6 +287,30 @@ export async function acpTouchConnection(
 
 export async function acpListConnections(): Promise<ConnectionInfo[]> {
   return getTransport().call("acp_list_connections")
+}
+
+export function acpGetEventMetrics(): Promise<EventBusMetricsSnapshot> {
+  return getTransport().call("acp_get_event_metrics")
+}
+
+/**
+ * Startup-selected desktop ACP delivery mode and performance flags.
+ * Mode is fixed for the process lifetime (never hot-switched).
+ * Desktop/Tauri only — absent from pure server builds.
+ */
+export function acpGetDesktopDeliveryCapabilities(): Promise<DesktopDeliveryCapabilities> {
+  return getTransport().call("acp_get_desktop_delivery_capabilities")
+}
+
+/** Test-utils builds only; absent from release desktop/server command surfaces. */
+export function acpReplayStreamingPerfFixture(
+  connectionId: string,
+  request: PerfReplayRequest
+): Promise<PerfReplayResult> {
+  return getTransport().call("acp_replay_streaming_perf_fixture", {
+    connectionId,
+    request,
+  })
 }
 
 export async function acpGetSessionSnapshot(

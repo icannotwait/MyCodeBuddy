@@ -5,6 +5,8 @@ use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::sync::{broadcast, RwLock};
 
 use crate::acp::{AcpEvent, EventBusMetrics, EventEnvelope, InternalEventBus, SessionState};
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::{DesktopAcpDelivery, desktop_event_batcher};
 
 /// Broadcast-delivered event.
 ///
@@ -332,6 +334,30 @@ pub async fn emit_with_state(
     emit_with_state_gated(state, emitter, payload, |_| true).await;
 }
 
+/// Estimate serialized byte size of a desktop ACP payload for metrics only.
+///
+/// On failure, logs the error (no payload contents) and bumps
+/// `desktop_serialization_failure_count`, returning 0.
+///
+/// Compiled for the Tauri desktop emit path and for unit tests; server-only
+/// builds do not take the desktop leg and omit this helper.
+#[cfg(any(test, feature = "tauri-runtime"))]
+pub(crate) fn estimate_desktop_payload_bytes<T: Serialize>(
+    payload: &T,
+    metrics: &EventBusMetrics,
+) -> usize {
+    match serde_json::to_vec(payload) {
+        Ok(value) => value.len(),
+        Err(error) => {
+            tracing::error!("[ACP] desktop envelope size serialization failed: {error}");
+            metrics
+                .desktop_serialization_failure_count
+                .fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
 /// Like [`emit_with_state`], but a `gate` predicate — evaluated under the SAME
 /// write lock, BEFORE `apply_event` — can veto the emit: returning `false`
 /// aborts with no mutation, no seq bump, no broadcast, and returns `false`.
@@ -378,10 +404,10 @@ where
     match emitter {
         #[cfg(feature = "tauri-runtime")]
         EventEmitter::Tauri(app) => {
-            use tauri::{Emitter, Manager};
-            // Tauri webview listener is the desktop frontend's only ACP path
-            // (it subscribes via `app.listen`, not the WS attach protocol).
-            let _ = app.emit("acp://event", envelope_arc.as_ref());
+            use tauri::Manager;
+            // In-process consumers first so lifecycle / pet / chat-channel keep
+            // immediate per-envelope delivery even when the desktop queue
+            // applies backpressure on the awaited delivery branch below.
             if let Some(bus) = app.try_state::<Arc<InternalEventBus>>() {
                 bus.send(Arc::clone(&envelope_arc));
                 if evicted > 0 {
@@ -389,6 +415,38 @@ where
                         .ring_buffer_evict_count
                         .fetch_add(evicted as u64, Ordering::Relaxed);
                 }
+            }
+
+            // Tauri webview listener is the desktop frontend's only ACP path
+            // (it subscribes via `app.listen`, not the WS attach protocol).
+            // Desktop delivery counters are scoped to this arm only — WebOnly
+            // and Noop must not report desktop traffic.
+            let estimated_bytes = emitter
+                .metrics()
+                .map(|metrics| {
+                    estimate_desktop_payload_bytes(envelope_arc.as_ref(), metrics.as_ref())
+                })
+                .unwrap_or_default();
+
+            // Offer is recorded exactly once here — never again inside
+            // DesktopAcpDelivery::deliver or emit_legacy.
+            if let Some(metrics) = emitter.metrics() {
+                metrics.record_desktop_offer(estimated_bytes);
+            }
+
+            if let Some(delivery) = app.try_state::<Arc<DesktopAcpDelivery>>() {
+                if let Err(error) = delivery
+                    .deliver(Arc::clone(&envelope_arc), estimated_bytes)
+                    .await
+                {
+                    tracing::error!("[ACP] desktop delivery stopped: {error}");
+                }
+            } else {
+                desktop_event_batcher::emit_legacy(
+                    app,
+                    envelope_arc.as_ref(),
+                    emitter.metrics(),
+                );
             }
         }
         EventEmitter::WebOnly { bus, .. } => {
@@ -434,6 +492,7 @@ mod tests {
     use super::*;
     use crate::db::entities::conversation::ConversationStatus;
     use crate::models::AgentType;
+    use serde::Serializer;
 
     fn fresh_state() -> Arc<RwLock<SessionState>> {
         Arc::new(RwLock::new(SessionState::new(
@@ -443,6 +502,64 @@ mod tests {
             "win-test".to_string(),
             None,
         )))
+    }
+
+    #[cfg(any(test, feature = "tauri-runtime"))]
+    #[test]
+    fn serialization_failure_is_counted_without_payload_logging() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(serde::ser::Error::custom("injected"))
+            }
+        }
+        let metrics = EventBusMetrics::default();
+        assert_eq!(estimate_desktop_payload_bytes(&Fails, &metrics), 0);
+        assert_eq!(
+            metrics
+                .desktop_serialization_failure_count
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webonly_emit_does_not_increment_desktop_metrics() {
+        let state = fresh_state();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(Arc::clone(&metrics)));
+        let emitter = EventEmitter::web_only(broadcaster, bus);
+
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ContentDelta {
+                text: "hello".to_string(),
+            },
+        )
+        .await;
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.desktop_raw_envelope_count, 0);
+        assert_eq!(snap.desktop_raw_bytes, 0);
+        assert_eq!(snap.desktop_emit_attempt_count, 0);
+        assert_eq!(snap.desktop_serialization_failure_count, 0);
+        assert_eq!(snap.desktop_emit_failure_count, 0);
+        assert_eq!(snap.desktop_legacy_emit_count, 0);
+        assert_eq!(snap.desktop_batch_count, 0);
+        assert_eq!(snap.desktop_batch_event_count, 0);
+        assert_eq!(snap.desktop_batch_bytes, 0);
+        assert_eq!(snap.desktop_batch_max_events, 0);
+        assert_eq!(snap.desktop_batch_max_bytes, 0);
+        assert_eq!(snap.desktop_batch_latency_total_us, 0);
+        assert_eq!(snap.desktop_batch_latency_max_us, 0);
+        assert_eq!(snap.desktop_queue_full_count, 0);
+        assert_eq!(snap.desktop_startup_fallback_count, 0);
+        assert_eq!(snap.desktop_runtime_failure_count, 0);
     }
 
     #[tokio::test]

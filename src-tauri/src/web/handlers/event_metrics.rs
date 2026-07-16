@@ -14,10 +14,13 @@ use axum::{extract::Extension, Json};
 use crate::acp::EventBusMetricsSnapshot;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
+use crate::commands::acp::acp_get_event_metrics_core;
 
 /// Snapshot the current ACP event bus metrics.
 pub async fn get_event_metrics(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<EventBusMetricsSnapshot>, AppCommandError> {
-    Ok(Json(state.acp_event_bus.metrics().snapshot()))
+    Ok(Json(acp_get_event_metrics_core(
+        state.acp_event_bus.metrics().as_ref(),
+    )))
 }

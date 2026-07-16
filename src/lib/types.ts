@@ -1368,6 +1368,171 @@ export type EventEnvelope = {
   connection_id: string
 } & AcpEvent
 
+/**
+ * Predefined ACP streaming performance fixture IDs.
+ * Mirrors `PerfFixtureId` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export type PerfFixtureId = "grok_rich_v1"
+
+/**
+ * Fixed envelope-rate profiles for timed fixture replay.
+ * Mirrors `PerfRateProfile` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export type PerfRateProfile = "eps_100" | "eps_500" | "eps_1000"
+
+/**
+ * Request for `acp_replay_streaming_perf_fixture` (test-utils builds only).
+ * Mirrors `PerfReplayRequest` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export interface PerfReplayRequest {
+  fixture_id: PerfFixtureId
+  seed: number
+  rate_profile: PerfRateProfile
+}
+
+/**
+ * Result of a timed ACP streaming fixture replay.
+ * Mirrors `PerfReplayResult` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export interface PerfReplayResult {
+  version: string
+  event_count: number
+  tool_call_count: number
+  final_text_sha256: string
+  final_event_seq: number
+  elapsed_ms: number
+}
+
+/**
+ * Snapshot of ACP event-bus + desktop-delivery counters.
+ * Mirrors `EventBusMetricsSnapshot` in `src-tauri/src/acp/internal_bus.rs`.
+ * Desktop fields stay zero under WebOnly/server delivery.
+ */
+export interface EventBusMetricsSnapshot {
+  emitted_count: number
+  lagged_count: number
+  ring_buffer_evict_count: number
+  replay_count: number
+  replay_event_total: number
+  snapshot_fallback_count: number
+  snapshot_cold_count: number
+  forwarder_lagged_count: number
+  worker_queue_full_count: number
+  desktop_raw_envelope_count: number
+  desktop_raw_bytes: number
+  desktop_emit_attempt_count: number
+  desktop_serialization_failure_count: number
+  desktop_emit_failure_count: number
+  desktop_legacy_emit_count: number
+  desktop_batch_count: number
+  desktop_batch_event_count: number
+  desktop_batch_bytes: number
+  desktop_batch_max_events: number
+  desktop_batch_max_bytes: number
+  desktop_batch_latency_total_us: number
+  desktop_batch_latency_max_us: number
+  desktop_queue_full_count: number
+  desktop_startup_fallback_count: number
+  desktop_runtime_failure_count: number
+}
+
+/**
+ * Startup-selected desktop ACP delivery path for the local Tauri webview.
+ * Mirrors `DesktopDeliveryMode` in `src-tauri/src/acp/streaming_performance.rs`.
+ * Selected once at process start; never hot-switched.
+ */
+export type DesktopDeliveryMode = "legacy" | "batched"
+
+/**
+ * Three internal streaming-performance controls.
+ * Mirrors `StreamingPerformanceFlags` in
+ * `src-tauri/src/acp/streaming_performance.rs`.
+ */
+export interface StreamingPerformanceFlags {
+  desktop_acp_event_batching: boolean
+  incremental_live_transcript: boolean
+  deferred_streaming_rich_content: boolean
+}
+
+/**
+ * Capability snapshot for desktop ACP delivery diagnostics.
+ * Mirrors `DesktopDeliveryCapabilities` in
+ * `src-tauri/src/acp/streaming_performance.rs`.
+ */
+export interface DesktopDeliveryCapabilities {
+  mode: DesktopDeliveryMode
+  flags: StreamingPerformanceFlags
+  perf_replay_available: boolean
+  failure_event: "acp://delivery-failed"
+}
+
+/**
+ * One flushed desktop batch of unmodified envelopes.
+ * Mirrors `DesktopAcpEventBatch` in
+ * `src-tauri/src/acp/desktop_event_batcher.rs`.
+ */
+export interface DesktopAcpEventBatch {
+  batch_id: number
+  events: EventEnvelope[]
+}
+
+/**
+ * Inclusive outstanding seq range for one connection after terminal failure.
+ * Mirrors `DesktopConnectionSeqRange`.
+ */
+export interface DesktopConnectionSeqRange {
+  connection_id: string
+  first_seq: number
+  last_seq: number
+}
+
+/**
+ * Terminal desktop delivery failure (ranges + reason only; no content).
+ * Mirrors `DesktopDeliveryFailure`.
+ */
+export interface DesktopDeliveryFailure {
+  generation: number
+  reason: "batch_emit_failed" | "batch_task_stopped"
+  affected: DesktopConnectionSeqRange[]
+}
+
+/** Handlers for the single desktop ACP data subscription. */
+export interface DesktopAcpEventHandlers {
+  onBatch: (batch: DesktopAcpEventBatch) => void
+  onFailure: (failure: DesktopDeliveryFailure) => void
+}
+
+/**
+ * Per-connection slice of one accepted ingestor frame.
+ * `applyEvents` may be compacted; `rawEvents` preserves originals.
+ */
+export interface AcceptedConnectionFrame {
+  contextKey: string
+  connectionId: string
+  deliveryIds: readonly number[]
+  applyEvents: readonly EventEnvelope[]
+  rawEvents: readonly EventEnvelope[]
+  highestSeq: number
+}
+
+/**
+ * Immutable frame committed once per browser animation frame.
+ * Raw order is global delivery order across connections.
+ */
+export interface AcceptedEventFrame {
+  deliveryIds: readonly number[]
+  connections: readonly AcceptedConnectionFrame[]
+  rawEventsInDeliveryOrder: readonly EventEnvelope[]
+}
+
+/** Unexpected per-connection sequence discontinuity. */
+export interface SequenceGap {
+  contextKey: string
+  connectionId: string
+  expectedSeq: number
+  receivedSeq: number
+}
+
 // --- LiveSessionSnapshot wire types (mirror src-tauri/src/acp/session_state.rs) ---
 
 export type ToolCallStatus = "pending" | "in_progress" | "completed" | "failed"
