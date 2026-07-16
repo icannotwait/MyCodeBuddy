@@ -1210,6 +1210,7 @@
       "sectionOrderChatsFirst": "채팅을 위로",
       "statusRunningBadge": "실행 중",
       "statusCancelledBadge": "취소됨",
+      "statusAwaitingReplyBadge": "답변 대기 중",
       "conversationCountUnit": "{count}개",
       "emptyFolderHint": "대화 없음",
       "noMatchingConversations": "일치하는 대화가 없습니다",

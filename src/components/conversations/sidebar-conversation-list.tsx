@@ -1962,10 +1962,7 @@ export function SidebarConversationList({
           selectedConversation?.id === conv.id
         }
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
-        timeLabel={formatRelative(
-          sortMode === "updated" ? conv.updated_at : conv.created_at,
-          now
-        )}
+        timeLabel={formatRelative(conv.updated_at, now)}
         onSelect={handleSelect}
         onDoubleClick={handleDoubleClick}
         onRename={handleRename}

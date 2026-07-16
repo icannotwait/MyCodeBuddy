@@ -1210,6 +1210,7 @@
       "sectionOrderChatsFirst": "聊天在上",
       "statusRunningBadge": "运行中",
       "statusCancelledBadge": "已取消",
+      "statusAwaitingReplyBadge": "待回复",
       "conversationCountUnit": "{count} 条",
       "emptyFolderHint": "暂无会话",
       "noMatchingConversations": "未找到匹配的会话",

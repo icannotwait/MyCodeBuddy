@@ -461,7 +461,7 @@ export const STATUS_COLORS: Record<ConversationStatus, string> = {
   in_progress: "bg-yellow-400",
   pending_review: "bg-blue-500",
   completed: "bg-green-500",
-  cancelled: "bg-red-500",
+  cancelled: "bg-gray-400 dark:bg-gray-500",
 }
 
 export const AGENT_DISPLAY_ORDER: AgentType[] = [
