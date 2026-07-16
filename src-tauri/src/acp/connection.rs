@@ -418,15 +418,118 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
     })
 }
 
+/// Apply process-scoped route suppression for Codex env and Grok/CodeBuddy argv.
+/// Consumes `plan.native_suppression` only — never resolves policy.
+fn apply_process_route(
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    agent_type: AgentType,
+    env: &mut BTreeMap<String, String>,
+    argv: &mut Vec<String>,
+) -> Result<(), AcpError> {
+    apply_route_environment(agent_type, plan, env)?;
+    apply_route_argv(agent_type, plan, argv);
+    Ok(())
+}
+
+/// Codex Codeg only: set/override `CODEX_ACP_MULTI_AGENT=0`.
+/// Native, unmanaged, and non-Codex plans leave the key byte-for-byte untouched
+/// (including user values `0`/`1` and absence).
+fn apply_route_environment(
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), AcpError> {
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    if agent_type == AgentType::Codex
+        && matches!(
+            plan.native_suppression,
+            NativeSuppressionPlan::CodexMultiAgentFalse
+        )
+    {
+        env.insert("CODEX_ACP_MULTI_AGENT".into(), "0".into());
+    }
+    Ok(())
+}
+
+/// Route-scoped argv tokens for Grok (`--no-subagents`) and CodeBuddy
+/// (`--disallowedTools` union). No-ops for other agents / native plans.
+fn apply_route_argv(
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    argv: &mut Vec<String>,
+) {
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    match (&plan.native_suppression, agent_type) {
+        (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
+            // Caller places this among root flags, before `agent stdio`.
+            if !argv.iter().any(|a| a == "--no-subagents") {
+                argv.push("--no-subagents".into());
+            }
+        }
+        (
+            NativeSuppressionPlan::CodeBuddyDisallowedTools { tools },
+            AgentType::CodeBuddy,
+        ) => {
+            apply_codebuddy_disallowed_tools(argv, tools);
+        }
+        _ => {}
+    }
+}
+
+/// Form one stable de-duplicated `--disallowedTools` union in `argv`, inserting
+/// Codeg denial tools once while preserving existing user denies (including
+/// `TaskOutput` / `TaskStop`). Emits before any trailing `--acp` token when
+/// present; otherwise appends at the end.
+fn apply_codebuddy_disallowed_tools(argv: &mut Vec<String>, suppress_tools: &[String]) {
+    let mut existing: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--disallowedTools" {
+            argv.remove(i);
+            while i < argv.len() && !argv[i].starts_with('-') {
+                existing.push(argv.remove(i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut union = existing;
+    for tool in suppress_tools {
+        if !union.iter().any(|t| t == tool) {
+            union.push(tool.clone());
+        }
+    }
+    if union.is_empty() {
+        return;
+    }
+
+    // Prefer immediately before `--acp` when that flag is present.
+    let insert_at = argv
+        .iter()
+        .position(|a| a == "--acp")
+        .unwrap_or(argv.len());
+    let mut insert = Vec::with_capacity(1 + union.len());
+    insert.push("--disallowedTools".to_string());
+    insert.extend(union);
+    for (offset, tok) in insert.into_iter().enumerate() {
+        argv.insert(insert_at + offset, tok);
+    }
+}
+
 fn append_npx_launch_args(
     parts: &mut Vec<String>,
     agent_type: AgentType,
     args: &[&str],
     grok_always_approve: bool,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) {
     if agent_type == AgentType::Grok {
         // Grok's native ask_user_question waits outside Codeg's QuestionRequest
         // flow. Remove it so structured questions use codeg-mcp instead.
+        // Independent of route: resolves a different Codeg question-tool collision.
         for arg in [
             "--no-auto-update",
             "--disallowed-tools",
@@ -437,9 +540,22 @@ fn append_npx_launch_args(
         if grok_always_approve {
             parts.push("--always-approve".into());
         }
+        // Codeg route: --no-subagents after root flags, before agent stdio.
+        apply_route_argv(agent_type, plan, parts);
+    } else if agent_type == AgentType::CodeBuddy {
+        // Registry args are typically just `--acp`; build the deny union into
+        // `parts` first, then append args so `--disallowedTools` lands before
+        // `--acp` (apply_codebuddy also repositions if `--acp` is already in
+        // parts).
+        apply_route_argv(agent_type, plan, parts);
     }
     for arg in args {
         parts.push((*arg).into());
+    }
+    // When `--acp` arrives via `args` after a CodeBuddy deny list was pushed
+    // onto `parts`, re-run so the union sits immediately before `--acp`.
+    if agent_type == AgentType::CodeBuddy {
+        apply_route_argv(agent_type, plan, parts);
     }
 }
 
@@ -447,6 +563,7 @@ async fn build_agent(
     agent_type: AgentType,
     runtime_env: &BTreeMap<String, String>,
     cwd: &Path,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<AcpAgent, AcpError> {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
@@ -486,8 +603,13 @@ async fn build_agent(
             // CODEX_ACP_USE_CLI). Never overwrites an explicit user value;
             // fails with SdkNotInstalled if host Codex is missing.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
+            let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
+            // Immutable route plan: Codex multi-agent env suppression only.
+            // Argv suppressions for Grok/CodeBuddy are applied in
+            // `append_npx_launch_args` (must interleave with root flags / `--acp`).
+            apply_process_route(plan, agent_type, &mut env_map, &mut Vec::new())?;
             let mut parts: Vec<String> = Vec::new();
-            for (k, v) in &merged_env {
+            for (k, v) in &env_map {
                 parts.push(format!("{k}={v}"));
             }
             parts.push(
@@ -512,9 +634,13 @@ async fn build_agent(
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
+            //  - `--no-subagents` (Codeg route only): after root flags, before
+            //    `agent stdio`. Native plans omit it.
+            // CodeBuddy Codeg route injects a stable `--disallowedTools` union
+            // before `--acp`.
             let grok_always_approve =
                 agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
-            append_npx_launch_args(&mut parts, agent_type, args, grok_always_approve);
+            append_npx_launch_args(&mut parts, agent_type, args, grok_always_approve, plan);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -554,7 +680,10 @@ async fn build_agent(
                 agent_type,
                 merge_agent_env(env, runtime_env),
             )?;
-            let mut parts: Vec<String> = merged_env
+            let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
+            // Bundled Codex (Windows) receives the same env contract as npx.
+            apply_process_route(plan, agent_type, &mut env_map, &mut Vec::new())?;
+            let mut parts: Vec<String> = env_map
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
@@ -857,7 +986,7 @@ pub async fn spawn_agent_connection(
     // agree. Computed here because `working_dir` is moved into run_connection
     // below.
     let launch_cwd = resolve_working_dir(working_dir.as_deref());
-    let agent = build_agent(agent_type, &runtime_env, &launch_cwd).await?;
+    let agent = build_agent(agent_type, &runtime_env, &launch_cwd, &route_plan).await?;
 
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
@@ -911,7 +1040,7 @@ pub async fn spawn_agent_connection(
             spawn_config,
             observed_config,
             terminal_shell: terminal_shell.clone(),
-            route_plan,
+            route_plan: route_plan.clone(),
             origin,
             route_preference,
             route_capability,
@@ -941,6 +1070,7 @@ pub async fn spawn_agent_connection(
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
+            route_plan,
         )
         .await;
 
@@ -1594,15 +1724,91 @@ fn claude_raw_sdk_session_meta(
     Some(meta)
 }
 
-/// Merge Claude raw-SDK meta (when applicable) with the connection's
-/// authoritative terminal snapshot and any adapter contributions.
+/// Pure deep-merge of Claude Code route suppression into ACP `_meta`.
+///
+/// Validates `claudeCode` / `options` / `disallowedTools` object/array shapes.
+/// Malformed shapes return `RouteUnavailable { NativeSuppressionInvalid }`
+/// before any session request is sent. On Codeg, appends missing `Agent`/`Task`
+/// (from the plan) exactly once. On native / non-Claude plans, returns input
+/// metadata serde-value-equivalent (no Codeg deny injection).
+fn merge_claude_route_meta(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+) -> Result<serde_json::Map<String, serde_json::Value>, AcpError> {
+    use crate::acp::delegation::route::{NativeSuppressionPlan, RouteDegradedReason};
+
+    let suppress_tools = match &plan.native_suppression {
+        NativeSuppressionPlan::ClaudeDisallowedTools { tools } => tools.as_slice(),
+        _ => return Ok(meta),
+    };
+
+    // Validate shapes even when we will merge (and when empty map has no claudeCode yet).
+    if let Some(claude_val) = meta.get("claudeCode") {
+        if !claude_val.is_object() {
+            return Err(AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            });
+        }
+        let claude = claude_val.as_object().expect("checked is_object");
+        if let Some(options_val) = claude.get("options") {
+            if !options_val.is_object() {
+                return Err(AcpError::RouteUnavailable {
+                    reason: RouteDegradedReason::NativeSuppressionInvalid,
+                });
+            }
+            if let Some(tools_val) = options_val.get("disallowedTools") {
+                if !tools_val.is_array() {
+                    return Err(AcpError::RouteUnavailable {
+                        reason: RouteDegradedReason::NativeSuppressionInvalid,
+                    });
+                }
+            }
+        }
+    }
+
+    let claude = meta
+        .entry("claudeCode".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let claude_obj = claude.as_object_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    let options = claude_obj
+        .entry("options".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let options_obj = options.as_object_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    let tools_val = options_obj
+        .entry("disallowedTools".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let tools_arr = tools_val.as_array_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    for tool in suppress_tools {
+        let already = tools_arr.iter().any(|v| v.as_str() == Some(tool.as_str()));
+        if !already {
+            tools_arr.push(serde_json::Value::String(tool.clone()));
+        }
+    }
+
+    Ok(meta)
+}
+
+/// Merge Claude raw-SDK meta, route suppression, terminal snapshot, and adapter
+/// contributions. Consumes the immutable `route_plan` only for
+/// `native_suppression` (Claude deny list).
 fn session_request_meta(
     agent_type: AgentType,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
 ) -> Result<Meta, AcpError> {
     let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
-    terminal_metadata(existing, spec, adapter)
+    let with_route = merge_claude_route_meta(existing, route_plan)?;
+    terminal_metadata(with_route, spec, adapter)
 }
 
 /// Build the ACP `initialize` request, declaring client capabilities and the
@@ -1629,8 +1835,9 @@ fn build_new_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<NewSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = NewSessionRequest::new(cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -1645,8 +1852,9 @@ fn build_load_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<LoadSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -1666,8 +1874,9 @@ fn build_resume_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<ResumeSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -2095,6 +2304,7 @@ async fn run_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    route_plan: crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<(), AcpError> {
     let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // `terminal_base_env` already filtered to just the credential helper
@@ -2458,6 +2668,7 @@ async fn run_connection(
                         mcp_servers.clone(),
                         &terminal_shell.spec,
                         adapter_for(agent_type),
+                        &route_plan,
                     )
                     .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                     match send_resume_session(&cx, resume_req).await {
@@ -2576,6 +2787,7 @@ async fn run_connection(
                     mcp_servers.clone(),
                     &terminal_shell.spec,
                     adapter_for(agent_type),
+                    &route_plan,
                 )
                 .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                 let load_result = cx.send_request_to(Agent, load_req).block_task().await;
@@ -2784,6 +2996,7 @@ async fn run_connection(
                                     mcp_servers.clone(),
                                     &terminal_shell.spec,
                                     adapter_for(agent_type),
+                                    &route_plan,
                                 )
                                 .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                             )
@@ -2874,6 +3087,7 @@ async fn run_connection(
                             mcp_servers.clone(),
                             &terminal_shell.spec,
                             adapter_for(agent_type),
+                            &route_plan,
                         )
                         .map_err(|e| sacp::util::internal_error(e.to_string()))?,
                     )
@@ -6035,14 +6249,61 @@ mod tests {
         ToolCallContent::Diff(d)
     }
 
+    use crate::acp::delegation::route::{
+        DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+        NativeSuppressionPlan, RouteDegradedReason, ROUTE_ADAPTER_CONTRACT_VERSION,
+    };
+
+    fn codeg_plan(agent_type: AgentType) -> DelegationRoutePlan {
+        let native_suppression = match agent_type {
+            AgentType::Codex => NativeSuppressionPlan::CodexMultiAgentFalse,
+            AgentType::Grok => NativeSuppressionPlan::GrokNoSubagents,
+            AgentType::CodeBuddy => NativeSuppressionPlan::CodeBuddyDisallowedTools {
+                tools: vec!["Agent".into(), "Task".into()],
+            },
+            AgentType::ClaudeCode => NativeSuppressionPlan::ClaudeDisallowedTools {
+                tools: vec!["Agent".into(), "Task".into()],
+            },
+            _ => NativeSuppressionPlan::None,
+        };
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: format!("test-codeg-{agent_type:?}"),
+        }
+    }
+
+    fn native_plan(agent_type: AgentType) -> DelegationRoutePlan {
+        let _ = agent_type;
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Native,
+            effective: DelegationRoutePolicy::Native,
+            source: DelegationRouteSource::SessionOverride,
+            native_suppression: NativeSuppressionPlan::None,
+            expose_codeg_delegation: false,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: format!("test-native-{agent_type:?}"),
+        }
+    }
+
     #[test]
     fn grok_npx_launch_args_disable_native_question_before_subcommand() {
+        // Native plan: question deny remains; --no-subagents is omitted.
         let mut without_auto_approve = vec!["grok".to_string()];
         append_npx_launch_args(
             &mut without_auto_approve,
             AgentType::Grok,
             &["agent", "stdio"],
             false,
+            &native_plan(AgentType::Grok),
         );
         assert_eq!(
             without_auto_approve,
@@ -6062,6 +6323,7 @@ mod tests {
             AgentType::Grok,
             &["agent", "stdio"],
             true,
+            &native_plan(AgentType::Grok),
         );
         assert_eq!(
             with_auto_approve,
@@ -6080,8 +6342,359 @@ mod tests {
     #[test]
     fn non_grok_npx_launch_args_remain_unchanged() {
         let mut parts = vec!["codex-acp".to_string()];
-        append_npx_launch_args(&mut parts, AgentType::Codex, &["serve"], true);
+        append_npx_launch_args(
+            &mut parts,
+            AgentType::Codex,
+            &["serve"],
+            true,
+            &native_plan(AgentType::Codex),
+        );
         assert_eq!(parts, vec!["codex-acp", "serve"]);
+    }
+
+    #[test]
+    fn managed_process_adapters_suppress_only_on_codeg_route() {
+        let codeg_grok = codeg_plan(AgentType::Grok);
+        let mut grok = vec!["grok".to_string()];
+        append_npx_launch_args(
+            &mut grok,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            false,
+            &codeg_grok,
+        );
+        assert_eq!(
+            grok,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        // always-approve stays between question deny and --no-subagents.
+        let mut grok_approve = vec!["grok".to_string()];
+        append_npx_launch_args(
+            &mut grok_approve,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            true,
+            &codeg_plan(AgentType::Grok),
+        );
+        assert_eq!(
+            grok_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--always-approve",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        let mut codebuddy = vec!["codebuddy".to_string()];
+        append_npx_launch_args(
+            &mut codebuddy,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &codeg_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(
+            codebuddy,
+            vec!["codebuddy", "--disallowedTools", "Agent", "Task", "--acp"]
+        );
+
+        // Stable de-duplicated union preserves user denies (TaskOutput/TaskStop)
+        // and does not double-add Agent/Task.
+        let mut codebuddy_union = vec![
+            "codebuddy".to_string(),
+            "--disallowedTools".to_string(),
+            "Bash".to_string(),
+            "TaskOutput".to_string(),
+            "Task".to_string(),
+            "TaskStop".to_string(),
+        ];
+        append_npx_launch_args(
+            &mut codebuddy_union,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &codeg_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(
+            codebuddy_union,
+            vec![
+                "codebuddy",
+                "--disallowedTools",
+                "Bash",
+                "TaskOutput",
+                "Task",
+                "TaskStop",
+                "Agent",
+                "--acp",
+            ]
+        );
+
+        let mut native_grok = vec!["grok".to_string()];
+        append_npx_launch_args(
+            &mut native_grok,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            false,
+            &native_plan(AgentType::Grok),
+        );
+        assert!(!native_grok.contains(&"--no-subagents".to_string()));
+        // ask_user_question deny is independent of route.
+        assert!(native_grok.contains(&"ask_user_question".to_string()));
+
+        let mut native_cb = vec!["codebuddy".to_string()];
+        append_npx_launch_args(
+            &mut native_cb,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &native_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(native_cb, vec!["codebuddy", "--acp"]);
+        assert!(!native_cb.iter().any(|a| a == "--disallowedTools"));
+    }
+
+    #[test]
+    fn codex_env_and_claude_meta_are_additive_and_route_scoped() {
+        // Codex Codeg: set/override CODEX_ACP_MULTI_AGENT=0; leave unrelated keys.
+        // Exercise `apply_process_route` (env + argv) as the process-level entry.
+        let mut codeg_env = BTreeMap::from([
+            ("KEEP".into(), "yes".into()),
+            ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
+        ]);
+        let mut codeg_argv = Vec::new();
+        apply_process_route(
+            &codeg_plan(AgentType::Codex),
+            AgentType::Codex,
+            &mut codeg_env,
+            &mut codeg_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            codeg_env
+                .get("CODEX_ACP_MULTI_AGENT")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(codeg_env.get("KEEP").map(String::as_str), Some("yes"));
+        assert!(codeg_argv.is_empty());
+
+        // Native preserves user env byte-for-byte (fresh maps; no cross-route reuse).
+        for user_val in ["1", "0"] {
+            let mut native_env = BTreeMap::from([
+                ("KEEP".into(), "yes".into()),
+                ("CODEX_ACP_MULTI_AGENT".into(), user_val.into()),
+            ]);
+            apply_route_environment(
+                AgentType::Codex,
+                &native_plan(AgentType::Codex),
+                &mut native_env,
+            )
+            .unwrap();
+            assert_eq!(
+                native_env
+                    .get("CODEX_ACP_MULTI_AGENT")
+                    .map(String::as_str),
+                Some(user_val)
+            );
+            assert_eq!(native_env.get("KEEP").map(String::as_str), Some("yes"));
+        }
+
+        // Non-Codex plan never touches CODEX_ACP_MULTI_AGENT.
+        let mut grok_env =
+            BTreeMap::from([("CODEX_ACP_MULTI_AGENT".into(), "1".into())]);
+        apply_route_environment(
+            AgentType::Grok,
+            &codeg_plan(AgentType::Grok),
+            &mut grok_env,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_env
+                .get("CODEX_ACP_MULTI_AGENT")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let existing = serde_json::json!({
+            "claudeCode": {
+                "emitRawSDKMessages": true,
+                "options": { "disallowedTools": ["Bash"] }
+            },
+            "adapter": { "keep": true }
+        });
+        let merged = merge_claude_route_meta(
+            existing.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Bash", "Agent", "Task"])
+        );
+        assert_eq!(merged["claudeCode"]["emitRawSDKMessages"], true);
+        assert_eq!(merged["adapter"]["keep"], true);
+
+        // Existing Agent/Task are not duplicated; TaskOutput/TaskStop preserved.
+        let with_partial = serde_json::json!({
+            "claudeCode": {
+                "options": {
+                    "disallowedTools": ["Agent", "TaskOutput", "TaskStop"]
+                }
+            }
+        });
+        let merged_partial = merge_claude_route_meta(
+            with_partial.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(
+            merged_partial["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Agent", "TaskOutput", "TaskStop", "Task"])
+        );
+
+        // Native: serde-value equivalent to input (no Codeg deny injection).
+        let native_input = serde_json::json!({
+            "claudeCode": {
+                "emitRawSDKMessages": true,
+                "options": { "disallowedTools": ["Bash"] }
+            },
+            "adapter": { "keep": true }
+        });
+        let native_merged = merge_claude_route_meta(
+            native_input.as_object().unwrap().clone(),
+            &native_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(native_merged),
+            native_input
+        );
+
+        // Malformed shapes → RouteUnavailable NativeSuppressionInvalid.
+        let bad_claude = serde_json::json!({ "claudeCode": "not-an-object" });
+        let err = merge_claude_route_meta(
+            bad_claude.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+
+        let bad_options = serde_json::json!({
+            "claudeCode": { "options": [] }
+        });
+        let err = merge_claude_route_meta(
+            bad_options.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+
+        let bad_tools = serde_json::json!({
+            "claudeCode": {
+                "options": { "disallowedTools": "Agent" }
+            }
+        });
+        let err = merge_claude_route_meta(
+            bad_tools.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+    }
+
+    #[test]
+    fn session_request_meta_claude_deny_list_matches_new_load_resume() {
+        let plan = codeg_plan(AgentType::ClaudeCode);
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::ClaudeCode);
+
+        let new_req = build_new_session_request(
+            AgentType::ClaudeCode,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let load_req = build_load_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-load".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let resume_req = build_resume_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-resume".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+
+        let expected = serde_json::json!(["Agent", "Task"]);
+        for (label, meta) in [
+            ("new", new_req.meta.as_ref()),
+            ("load", load_req.meta.as_ref()),
+            ("resume", resume_req.meta.as_ref()),
+        ] {
+            let tools = meta
+                .expect(label)
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .cloned()
+                .expect("disallowedTools present");
+            assert_eq!(tools, expected, "{label} deny list");
+            assert_eq!(
+                meta.unwrap()
+                    .get("claudeCode")
+                    .and_then(|c| c.get("emitRawSDKMessages"))
+                    .and_then(|v| v.as_bool()),
+                Some(true),
+                "{label} emitRawSDKMessages"
+            );
+            assert!(
+                meta.unwrap().contains_key("codeg.dev/terminal"),
+                "{label} terminal meta"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6534,6 +7147,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
 
@@ -6545,6 +7159,13 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+        // Native plan: no Codeg-injected deny list.
+        assert!(req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("claudeCode"))
+            .and_then(|c| c.get("options"))
+            .is_none());
     }
 
     #[test]
@@ -6557,6 +7178,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
 
@@ -6576,6 +7198,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
 
@@ -6599,6 +7222,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
 
@@ -6636,6 +7260,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
@@ -6653,6 +7278,7 @@ mod tests {
             Vec::new(),
             &spec,
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
@@ -6673,6 +7299,7 @@ mod tests {
             Vec::new(),
             &spec,
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
