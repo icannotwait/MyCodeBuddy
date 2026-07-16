@@ -461,9 +461,7 @@ impl DelegationListener {
             None => StatusWait::Snapshot,
             Some(0) => StatusWait::Terminal,
             Some(ms) => {
-                StatusWait::Supervised(std::time::Duration::from_millis(
-                    ms.min(STATUS_WAIT_MAX_MS),
-                ))
+                StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
             }
         };
         self.broker
@@ -1588,6 +1586,139 @@ mod tests {
         assert_eq!(broker.pending_count().await, 1);
     }
 
+    /// Explicit cancel counters are **authenticated request-attempt** metrics
+    /// (after token validation, Timeout excluded), not "successful running→
+    /// settling transition only". Successful terminal cancels are already
+    /// counted separately via `record_terminal(Canceled)`. MCP tools/call
+    /// cancel is a distinct counter at the same attempt boundary. An asymmetric
+    /// "success-only explicit vs attempt MCP" contract would contradict the
+    /// brief's separation of the two cancel surfaces and the terminal counter.
+    #[tokio::test]
+    async fn explicit_cancel_metrics_are_authenticated_request_attempts() {
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_metrics(metrics.clone()),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+
+        // 1) Unknown task + valid token still counts as explicit cancel request.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "authenticated cancel_delegation attempt counts even when task is unknown"
+        );
+
+        // 2) Timeout is non-canceling and must not increment.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::Timeout,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "Timeout must remain non-canceling for metrics"
+        );
+
+        // 3) Invalid token does not count.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "bad".into(),
+                task_id: "x".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "invalid token must not count as explicit cancel"
+        );
+
+        // 4) MCP request cancel is a separate authenticated-attempt counter.
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::Cancel(BrokerCancelRequest {
+                token: "tok".into(),
+                external_handle: "no-such-handle".into(),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(metrics.snapshot().mcp_request_cancel_count, 1);
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "MCP cancel must not bleed into explicit cancel counters"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_message_routed_to_broker() {
         let mock = Arc::new(MockSpawner::new());
@@ -2451,7 +2582,10 @@ mod tests {
             wrote: false,
         };
         let result = listener.serve_one(&mut conn).await;
-        assert!(result.is_err(), "ack write failure must surface via serve_one");
+        assert!(
+            result.is_err(),
+            "ack write failure must surface via serve_one"
+        );
 
         // Host bootstrap must not observe Ready (Connected / RouteBootstrap Ready
         // depend on wait_ready succeeding). Fail closed — not merely availability.

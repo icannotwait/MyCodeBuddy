@@ -64,8 +64,8 @@ use crate::acp::delegation::meta_writer::{
 };
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
 use crate::acp::delegation::store::{
-    DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy,
-    Settlement, TerminalTaskWrite,
+    DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
+    TerminalTaskWrite,
 };
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
@@ -677,6 +677,17 @@ struct SettleContext {
     message: Option<String>,
 }
 
+/// Observability context for the process-local persistence retry worker.
+/// Terminal metrics/audit fire only if the worker's settle eventually Wins.
+#[derive(Debug, Clone)]
+struct PersistenceRetryAccounting {
+    parent_connection_id: String,
+    agent_type: AgentType,
+    child_conversation_id: i32,
+    /// Producer wall duration (ms) at first terminal attempt; saturating path.
+    duration_ms: u64,
+}
+
 impl SettleContext {
     fn from_running(task: &RunningTask, duration_ms: u64, cancel_turn: bool) -> Self {
         Self {
@@ -718,14 +729,16 @@ fn report_to_outcome_for_meta(
     ctx: &SettleContext,
 ) -> DelegationOutcome {
     match report.status {
-        TaskStatus::Completed => DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
-            text: report.text.clone().unwrap_or_default(),
-            child_conversation_id: ctx.child_conversation_id,
-            child_agent_type: ctx.agent_type,
-            turn_count: 1,
-            duration_ms: ctx.duration_ms,
-            token_usage: None,
-        }),
+        TaskStatus::Completed => {
+            DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
+                text: report.text.clone().unwrap_or_default(),
+                child_conversation_id: ctx.child_conversation_id,
+                child_agent_type: ctx.agent_type,
+                turn_count: 1,
+                duration_ms: ctx.duration_ms,
+                token_usage: None,
+            })
+        }
         _ => DelegationOutcome::Err {
             code: report
                 .error_code
@@ -761,10 +774,7 @@ fn canceled_outcome(child_conversation_id: i32, reason: &str) -> DelegationOutco
 /// The duration is captured ONCE here so the slow teardown reuses the exact
 /// value rather than recomputing `started_at.elapsed()` later — which would
 /// inflate it for the backgrounded `cancel_by_parent_turn` teardown.
-fn drain_running(
-    inner: &mut PendingInner,
-    keys: Vec<String>,
-) -> Vec<(String, RunningTask, u64)> {
+fn drain_running(inner: &mut PendingInner, keys: Vec<String>) -> Vec<(String, RunningTask, u64)> {
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
         let task = inner.running.remove(&k).expect("key just observed");
@@ -1468,10 +1478,7 @@ impl DelegationBroker {
     /// Install the soft-supervisor wake handle (production bootstrap). Tests
     /// leave the default noop.
     pub fn set_supervisor_wake(&self, wake: SupervisorWake) {
-        *self
-            .supervisor_wake
-            .lock()
-            .expect("supervisor_wake lock") = wake;
+        *self.supervisor_wake.lock().expect("supervisor_wake lock") = wake;
     }
 
     /// Park the wake receiver until startup takes it after reconcile.
@@ -1543,7 +1550,12 @@ impl DelegationBroker {
     /// and wakes waiters. Supervised re-evaluates **requested** ids only, so an
     /// unrelated clear is a harmless wake (re-park).
     pub async fn clear_observation(&self, task_id: &str) {
-        let removed = self.observation_cache.lock().await.remove(task_id).is_some();
+        let removed = self
+            .observation_cache
+            .lock()
+            .await
+            .remove(task_id)
+            .is_some();
         if removed {
             self.bump_status_version();
             self.result_notify.notify_waiters();
@@ -1621,9 +1633,7 @@ impl DelegationBroker {
     /// `reconcile_running` fails. Desktop and server startup call this with
     /// [`Self::reconcile_running_on_startup`]'s result.
     pub fn require_reconcile_ok(result: Result<u64, String>) -> Result<u64, String> {
-        result.map_err(|e| {
-            format!("delegation startup blocked: reconcile_running failed: {e}")
-        })
+        result.map_err(|e| format!("delegation startup blocked: reconcile_running failed: {e}"))
     }
 
     /// Replace the live-reply lookup used to enrich `get_delegation_status`'s
@@ -2742,11 +2752,7 @@ impl DelegationBroker {
                 }
                 // No row and no child id — unaccepted setup failure, no task id.
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                return report_err(
-                    req.agent_type,
-                    DelegationError::SpawnFailed(message),
-                    None,
-                );
+                return report_err(req.agent_type, DelegationError::SpawnFailed(message), None);
             }
         };
 
@@ -2910,9 +2916,7 @@ impl DelegationBroker {
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
-                return self
-                    .settle_task(&call_id, terminal, result_text, ctx)
-                    .await;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // A parent cancel reached this delegation mid-setup — after the
             // prompt was sent, before we registered.
@@ -2932,9 +2936,7 @@ impl DelegationBroker {
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
-                return self
-                    .settle_task(&call_id, terminal, result_text, ctx)
-                    .await;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // Registered in `running` — fall through to the second pre-cancel
             // check, then return the ack.
@@ -2961,8 +2963,7 @@ impl DelegationBroker {
                 };
                 if removed {
                     let duration_ms = started_at.elapsed().as_millis() as u64;
-                    let outcome =
-                        canceled_outcome(child_conversation_id, "canceled before await");
+                    let outcome = canceled_outcome(child_conversation_id, "canceled before await");
                     let (terminal, result_text) = terminal_from_outcome(&outcome);
                     let mut ctx = SettleContext {
                         parent_connection_id: req.parent_connection_id.clone(),
@@ -2977,9 +2978,7 @@ impl DelegationBroker {
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
-                    return self
-                        .settle_task(&call_id, terminal, result_text, ctx)
-                        .await;
+                    return self.settle_task(&call_id, terminal, result_text, ctx).await;
                 }
             }
         }
@@ -3070,20 +3069,17 @@ impl DelegationBroker {
                             task_id,
                             Some(ctx.child_conversation_id),
                             report.status,
-                            report
-                                .error_code
-                                .as_deref()
-                                .and_then(|c| {
-                                    // Only intern stable static codes we own.
-                                    match c {
-                                        "spawn_failed" => Some("spawn_failed"),
-                                        "persistence_error" => Some("persistence_error"),
-                                        "host_restarted" => Some("host_restarted"),
-                                        "depth_limit_exceeded" => Some("depth_limit_exceeded"),
-                                        "canceled" => Some("canceled"),
-                                        _ => None,
-                                    }
-                                }),
+                            report.error_code.as_deref().and_then(|c| {
+                                // Only intern stable static codes we own.
+                                match c {
+                                    "spawn_failed" => Some("spawn_failed"),
+                                    "persistence_error" => Some("persistence_error"),
+                                    "host_restarted" => Some("host_restarted"),
+                                    "depth_limit_exceeded" => Some("depth_limit_exceeded"),
+                                    "canceled" => Some("canceled"),
+                                    _ => None,
+                                }
+                            }),
                             Some(ctx.duration_ms),
                             Some(true),
                         );
@@ -3198,7 +3194,18 @@ impl DelegationBroker {
                     })
                     .await;
                 // Single-flight worker ownership per task id (no re-emit).
-                self.spawn_persistence_retry_worker(task_id.to_string());
+                // Terminal metrics/audit deferred until durable CAS winner.
+                self.spawn_persistence_retry_worker(
+                    task_id.to_string(),
+                    PersistenceRetryAccounting {
+                        parent_connection_id: ctx.parent_connection_id.clone(),
+                        agent_type: ctx.agent_type,
+                        child_conversation_id: ctx.child_conversation_id,
+                        // Defensible duration: producer wall time at first
+                        // terminal attempt (saturating path in record_terminal).
+                        duration_ms: ctx.duration_ms,
+                    },
+                );
                 report
             }
         }
@@ -3226,9 +3233,10 @@ impl DelegationBroker {
     /// Spawn at most one process-local persistence retry worker per task id.
     /// Concurrent exhaustion for the same id is single-flight: only the first
     /// ownership grant starts a worker. The worker retries only
-    /// `failed/persistence_error`, never re-emits events, and clears ownership
-    /// (and the retry record on success) when it exits.
-    fn spawn_persistence_retry_worker(&self, task_id: String) {
+    /// `failed/persistence_error`, never re-emits sidebar/meta/completion events,
+    /// and records terminal metrics/audit **only** when the eventual durable
+    /// settle returns [`Settlement::Won`] (Existing/loser does not count).
+    fn spawn_persistence_retry_worker(&self, task_id: String, obs: PersistenceRetryAccounting) {
         {
             let mut inflight = self
                 .persistence_retry_inflight
@@ -3244,6 +3252,7 @@ impl DelegationBroker {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         let store = self.task_store.clone();
+        let metrics = self.metrics.clone();
         let inflight = self.persistence_retry_inflight.clone();
         let interval = self.persistence_retry_worker_interval;
         tokio::spawn(async move {
@@ -3268,7 +3277,28 @@ impl DelegationBroker {
                     ConversationStatus::Cancelled,
                 );
                 match store.settle(&task_id, terminal).await {
-                    Ok(_) => {
+                    Ok(settlement) => {
+                        // Exact-once terminal accounting at the durable CAS
+                        // winner only. Initial process-local exhaustion must
+                        // not have counted; Existing/replay must not count.
+                        if settlement.won() {
+                            metrics.record_terminal(
+                                TaskStatus::Failed,
+                                std::time::Duration::from_millis(obs.duration_ms),
+                            );
+                            crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                                &obs.parent_connection_id,
+                                None,
+                                obs.agent_type,
+                                &task_id,
+                                Some(obs.child_conversation_id),
+                                TaskStatus::Failed,
+                                Some("persistence_error"),
+                                Some(obs.duration_ms),
+                                Some(true),
+                            )
+                            .emit_task_transition();
+                        }
                         store.remove_retry(&task_id).await;
                         clear_ownership(&task_id);
                         break;
@@ -3417,11 +3447,7 @@ impl DelegationBroker {
         status: ConversationStatus,
     ) {
         self.event_emitter
-            .emit_conversation_status_changed(
-                parent_connection_id,
-                child_conversation_id,
-                status,
-            )
+            .emit_conversation_status_changed(parent_connection_id, child_conversation_id, status)
             .await;
     }
 
@@ -4698,7 +4724,12 @@ mod tests {
         enable_delegation(&broker).await;
         let t1 = start_running(&broker, &mock, "child-1", 1, "pt-1").await;
         let reports = broker
-            .get_tasks_status("parent-conn", Some(1), &[t1], StatusWait::Supervised(Duration::from_millis(40)))
+            .get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &[t1],
+                StatusWait::Supervised(Duration::from_millis(40)),
+            )
             .await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, TaskStatus::Running);
@@ -5083,7 +5114,10 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = Some(other.into());
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(
             msg.contains(&format!(
@@ -5154,10 +5188,7 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
-        broker.set_mandatory_profile_routes(
-            "parent-conn",
-            [p_cb.to_string(), p_cx.to_string()],
-        );
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string(), p_cx.to_string()]);
 
         // Grok unconstrained → allow base
         let mut req_g = request(1, "pt-g");
@@ -5218,7 +5249,10 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = None;
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(msg.contains("agent_type=code_buddy"), "{msg}");
         assert!(msg.contains("(ambiguous or missing)"), "{msg}");
@@ -5306,17 +5340,17 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
-        broker.set_mandatory_profile_routes(
-            "parent-conn",
-            [p_cb.to_string(), p_cx.to_string()],
-        );
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string(), p_cx.to_string()]);
 
         let mut req = request(1, "pt-cross");
         req.parent_connection_id = "parent-conn".into();
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = Some(p_cx.into());
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         assert_ne!(
             ack.error_code.as_deref(),
             Some("delegation_profile_agent_mismatch")
@@ -5459,13 +5493,19 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = None;
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(
             msg.starts_with("mandatory profile_id required: for agent_type=code_buddy"),
             "{msg}"
         );
-        assert!(!msg.contains("CodeBuddy"), "Display label must not appear: {msg}");
+        assert!(
+            !msg.contains("CodeBuddy"),
+            "Display label must not appear: {msg}"
+        );
         assert_eq!(msg.matches("mandatory profile_id required").count(), 1);
     }
 
@@ -7966,8 +8006,7 @@ mod tests {
     async fn inflight_drained_on_send_failure() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c6".into())).await;
-        mock.queue_send(Err(SpawnerError::send("boom")))
-            .await;
+        mock.queue_send(Err(SpawnerError::send("boom"))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8797,8 +8836,9 @@ mod tests {
                 .expect("per-connection stream should receive DelegationCompleted within 500ms")
                 .expect("envelope recv must not error");
             match &env.payload {
-                AcpEvent::DelegationStarted { .. }
-                | AcpEvent::ConversationStatusChanged { .. } => continue,
+                AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
+                    continue
+                }
                 _ => break env,
             }
         };
@@ -8833,8 +8873,9 @@ mod tests {
                 .expect("InternalEventBus should receive DelegationCompleted within 500ms")
                 .expect("bus recv must not error");
             match &env.payload {
-                AcpEvent::DelegationStarted { .. }
-                | AcpEvent::ConversationStatusChanged { .. } => continue,
+                AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
+                    continue
+                }
                 _ => break env,
             }
         };
@@ -9213,10 +9254,7 @@ mod tests {
 
     use crate::acp::delegation::store::mock::MockTaskStore;
 
-    fn broker_with_store(
-        spawner: Arc<MockSpawner>,
-        store: Arc<MockTaskStore>,
-    ) -> DelegationBroker {
+    fn broker_with_store(spawner: Arc<MockSpawner>, store: Arc<MockTaskStore>) -> DelegationBroker {
         DelegationBroker::new(spawner as Arc<dyn ConnectionSpawner>, shallow_lookup())
             .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>)
     }
@@ -9322,7 +9360,11 @@ mod tests {
         }
 
         #[cfg(test)]
-        async fn status_one(&self, parent_connection_id: &str, task_id: &str) -> DelegationTaskReport {
+        async fn status_one(
+            &self,
+            parent_connection_id: &str,
+            task_id: &str,
+        ) -> DelegationTaskReport {
             self.get_task_status(parent_connection_id, Some(1), task_id, StatusWait::Snapshot)
                 .await
         }
@@ -9337,7 +9379,15 @@ mod tests {
         /// Test helper: invoke persistence-retry worker spawn (single-flight).
         #[cfg(test)]
         fn spawn_retry_worker_for_test(&self, task_id: &str) {
-            self.spawn_persistence_retry_worker(task_id.to_string());
+            self.spawn_persistence_retry_worker(
+                task_id.to_string(),
+                PersistenceRetryAccounting {
+                    parent_connection_id: "parent-conn".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    child_conversation_id: 42,
+                    duration_ms: 0,
+                },
+            );
         }
 
         #[cfg(test)]
@@ -9384,15 +9434,13 @@ mod tests {
     async fn exhausted_terminal_write_returns_persistence_error_and_keeps_retry() {
         let store = Arc::new(MockTaskStore::fail_settle_times(4));
         let mock = Arc::new(MockSpawner::new());
-        let broker = DelegationBroker::new(
-            mock.clone() as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        )
-        .with_task_store(store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>)
-        .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)));
-        let report = broker
-            .finish_for_test("task-1", successful_outcome())
-            .await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)));
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
         assert!(store.has_retry_record("task-1").await);
@@ -9523,7 +9571,8 @@ mod tests {
             shallow_lookup(),
             Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
                 as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
-            events.clone() as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
         )
         .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>);
         enable_delegation(&broker).await;
@@ -9532,9 +9581,7 @@ mod tests {
             .await
             .task_id
             .expect("id");
-        broker
-            .complete_call(&t1, successful_outcome())
-            .await;
+        broker.complete_call(&t1, successful_outcome()).await;
         // Second terminal producer loses the CAS.
         broker
             .cancel_task_by_id("parent-conn", Some(1), &t1, "late cancel")
@@ -9561,9 +9608,12 @@ mod tests {
             shallow_lookup(),
             Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
                 as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
-            events.clone() as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
         )
-        .with_task_store(store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>);
+        .with_task_store(
+            store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+        );
         enable_delegation(&broker).await;
         let t1 = broker
             .start_delegation(request(1, "tu-real-tool"))
@@ -9623,7 +9673,8 @@ mod tests {
             shallow_lookup(),
             Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
                 as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
-            events.clone() as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
         )
         .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>);
         enable_delegation(&broker).await;
@@ -9636,10 +9687,7 @@ mod tests {
         let status_emits = events.status_changed_snapshot().await;
         assert_eq!(status_emits.len(), 1);
         assert_eq!(status_emits[0].conversation_id, 42);
-        assert_eq!(
-            status_emits[0].status,
-            ConversationStatus::PendingReview
-        );
+        assert_eq!(status_emits[0].status, ConversationStatus::PendingReview);
         assert_eq!(events.count().await, 1);
     }
 
@@ -9824,18 +9872,16 @@ mod tests {
     async fn persistence_retry_worker_is_single_flight_per_task() {
         let store = Arc::new(MockTaskStore::fail_settle_times(4));
         let mock = Arc::new(MockSpawner::new());
-        let broker = DelegationBroker::new(
-            mock.clone() as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        )
-        .with_task_store(store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>)
-        .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
-        .with_persistence_retry_worker_interval(Duration::from_millis(5));
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5));
 
         // Exhaust once → put_retry + spawn worker.
-        let report = broker
-            .finish_for_test("task-1", successful_outcome())
-            .await;
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
         assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
         assert!(store.has_retry_record("task-1").await);
         assert_eq!(broker.persistence_worker_spawns_for_test(), 1);
@@ -9860,6 +9906,110 @@ mod tests {
             "worker must clear retry record after successful persistence"
         );
         assert_eq!(broker.persistence_worker_spawns_for_test(), 1);
+    }
+
+    /// Initial process-local `persistence_error` must not count as a terminal
+    /// metric; the background worker's durable CAS **Won** counts exactly once
+    /// with stable `persistence_error` accounting (duration saturating path).
+    #[tokio::test]
+    async fn persistence_retry_won_records_terminal_metrics_once() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        // Authoritative CAS winner not known yet — do not count.
+        let snap_before = metrics.snapshot();
+        assert_eq!(
+            snap_before.failed_count, 0,
+            "initial exhaustion must not record terminal before durable CAS"
+        );
+        assert_eq!(snap_before.completed_count, 0);
+        assert_eq!(snap_before.canceled_count, 0);
+        assert_eq!(snap_before.terminal_duration_ms_total, 0);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-1").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-1").await,
+            "worker must clear retry after Won"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.failed_count, 1,
+            "eventual durable Won must count failed/persistence_error once"
+        );
+        assert_eq!(snap.completed_count, 0);
+        assert_eq!(snap.canceled_count, 0);
+        // duration_ms from Instant::now() at finish is small but saturating path ran
+        assert!(
+            snap.terminal_duration_ms_total < u64::MAX,
+            "duration must use saturating conversion path"
+        );
+    }
+
+    /// Worker settle that returns Existing (CAS loser/replay) must not record
+    /// terminal metrics — exact-once is CAS-winner only.
+    #[tokio::test]
+    async fn persistence_retry_existing_does_not_record_terminal() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(3));
+        // After three transient fails (max_attempts=3), script returns Existing.
+        store
+            .queue_settle_ok(Settlement::Existing(DelegationTaskReport {
+                task_id: Some("task-1".into()),
+                status: TaskStatus::Failed,
+                child_conversation_id: Some(42),
+                agent_type: Some(AgentType::ClaudeCode),
+                text: None,
+                error_code: Some("persistence_error".into()),
+                message: None,
+                duration_ms: None,
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+            }))
+            .await;
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        assert_eq!(metrics.snapshot().failed_count, 0);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-1").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-1").await,
+            "Existing still clears the process-local retry record"
+        );
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            0,
+            "CAS Existing/loser must not record terminal metrics"
+        );
+        assert_eq!(metrics.snapshot().terminal_duration_ms_total, 0);
     }
 
     #[test]
@@ -10208,11 +10358,8 @@ mod tests {
         let mock = Arc::new(MockSpawner::new());
         let store = Arc::new(MockTaskStore::with_running("cold-running", 42));
         let broker = Arc::new(
-            DelegationBroker::new(
-                mock as Arc<dyn ConnectionSpawner>,
-                shallow_lookup(),
-            )
-            .with_task_store(store as Arc<dyn DelegationTaskStore>),
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(store as Arc<dyn DelegationTaskStore>),
         );
         enable_delegation(&broker).await;
 

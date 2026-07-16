@@ -11,9 +11,9 @@ use sacp::schema::{
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
     TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
     ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
@@ -38,7 +38,6 @@ use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
-use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
@@ -48,6 +47,7 @@ use crate::acp::types::{
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
+use crate::terminal::shell::ResolvedShellSpec;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
@@ -494,10 +494,7 @@ fn apply_route_argv(
                 .unwrap_or(argv.len());
             argv.insert(insert_at, "--no-subagents".into());
         }
-        (
-            NativeSuppressionPlan::CodeBuddyDisallowedTools { tools },
-            AgentType::CodeBuddy,
-        ) => {
+        (NativeSuppressionPlan::CodeBuddyDisallowedTools { tools }, AgentType::CodeBuddy) => {
             apply_codebuddy_disallowed_tools(argv, tools);
         }
         _ => {}
@@ -533,10 +530,7 @@ fn apply_codebuddy_disallowed_tools(argv: &mut Vec<String>, suppress_tools: &[St
     }
 
     // Prefer immediately before `--acp` when that flag is present.
-    let insert_at = argv
-        .iter()
-        .position(|a| a == "--acp")
-        .unwrap_or(argv.len());
+    let insert_at = argv.iter().position(|a| a == "--acp").unwrap_or(argv.len());
     let mut insert = Vec::with_capacity(1 + union.len());
     insert.push("--disallowedTools".to_string());
     insert.extend(union);
@@ -650,10 +644,7 @@ async fn build_agent(
                 agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
             append_npx_launch_args(&mut argv, agent_type, args, grok_always_approve);
             apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
-            let mut parts: Vec<String> = env_map
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
+            let mut parts: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
             parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
@@ -690,10 +681,8 @@ async fn build_agent(
                             meta.name
                         ))
                     })?;
-            let merged_env = apply_codex_cli_path_env(
-                agent_type,
-                merge_agent_env(env, runtime_env),
-            )?;
+            let merged_env =
+                apply_codex_cli_path_env(agent_type, merge_agent_env(env, runtime_env))?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
             // Bundled: complete argv first, then one route application (env + argv).
             let mut argv: Vec<String> = Vec::new();
@@ -884,7 +873,8 @@ async fn build_agent(
                 // than provisioned through uvx.
                 tracing::warn!(
                     "[ACP][{}] uvx unavailable; falling back to system command {:?}",
-                    meta.name, sys_path
+                    meta.name,
+                    sys_path
                 );
                 // `system_cmd` is a complete launch recipe for the PATH binary;
                 // the uvx entry-script `args` don't necessarily apply to it
@@ -2359,9 +2349,33 @@ fn canonical_spec_to_mcp_server(name: &str, spec: &serde_json::Value) -> Result<
     }
 }
 
+/// Emit the single post-ready companion-unavailable surface: availability event
+/// plus secret-free `delegation_unavailable` audit. Does not touch route fields.
+async fn emit_post_ready_unavailable(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    connection_id: &str,
+    conversation_id: Option<i32>,
+    agent_type: AgentType,
+) {
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::DelegationAvailabilityChanged { available: false },
+    )
+    .await;
+    crate::acp::delegation::metrics::DelegationAuditRecord::availability(
+        connection_id,
+        conversation_id,
+        agent_type,
+    )
+    .emit_availability();
+}
+
 /// After ACP session/new|load|resume succeeds: wait for Codeg ready lease when
 /// required, emit Connected, signal bootstrap Ready, and monitor post-ready
-/// availability (false → one `DelegationAvailabilityChanged` only).
+/// availability (false → one `DelegationAvailabilityChanged` only + one
+/// `delegation_unavailable` audit). Never mutates immutable route fields.
 async fn finish_route_ready(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -2407,13 +2421,23 @@ async fn finish_route_ready(
         let mut availability = waiter.availability();
         let state_m = Arc::clone(state);
         let emitter_m = emitter.clone();
+        // Capture ids for the availability audit before the monitor task;
+        // route plan fields stay immutable. Metrics Arc is not recreated here —
+        // availability is an audit-only surface (no counter); injection metrics
+        // remain the single process-wide instance elsewhere.
+        let (audit_connection_id, audit_conversation_id, audit_agent_type) = {
+            let s = state.read().await;
+            (s.connection_id.clone(), s.conversation_id, s.agent_type)
+        };
         tokio::spawn(async move {
             loop {
                 if !*availability.borrow() {
-                    emit_with_state(
+                    emit_post_ready_unavailable(
                         &state_m,
                         &emitter_m,
-                        AcpEvent::DelegationAvailabilityChanged { available: false },
+                        &audit_connection_id,
+                        audit_conversation_id,
+                        audit_agent_type,
                     )
                     .await;
                     break;
@@ -2421,10 +2445,12 @@ async fn finish_route_ready(
                 if availability.changed().await.is_err() {
                     // Sender dropped while still true — treat as unavailable.
                     if *availability.borrow() {
-                        emit_with_state(
+                        emit_post_ready_unavailable(
                             &state_m,
                             &emitter_m,
-                            AcpEvent::DelegationAvailabilityChanged { available: false },
+                            &audit_connection_id,
+                            audit_conversation_id,
+                            audit_agent_type,
                         )
                         .await;
                     }
@@ -3402,21 +3428,21 @@ async fn run_connection(
             }
         }})
         .await;
-        match connect_with_result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let acp_err = classify_connect_error_residual(&e.to_string());
-                // Deterministic awaited send: never try_lock-suppress the outcome.
-                // If a typed path already took the sender (suppression preflight /
-                // finish_route_ready), this is a no-op.
-                send_bootstrap_outcome_once(
-                    &route_bootstrap_tx,
-                    bootstrap_outcome_from_acp_error(&acp_err),
-                )
-                .await;
-                Err(acp_err)
-            }
+    match connect_with_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let acp_err = classify_connect_error_residual(&e.to_string());
+            // Deterministic awaited send: never try_lock-suppress the outcome.
+            // If a typed path already took the sender (suppression preflight /
+            // finish_route_ready), this is a no-op.
+            send_bootstrap_outcome_once(
+                &route_bootstrap_tx,
+                bootstrap_outcome_from_acp_error(&acp_err),
+            )
+            .await;
+            Err(acp_err)
         }
+    }
 }
 
 /// Typed mapping from [`AcpError`] to bootstrap outcome. **No string parsing.**
@@ -3435,9 +3461,7 @@ fn bootstrap_outcome_from_acp_error(err: &AcpError) -> RouteBootstrapOutcome {
         {
             RouteBootstrapOutcome::RouteSpecific(*reason)
         }
-        AcpError::InitializeTimeout => {
-            RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout)
-        }
+        AcpError::InitializeTimeout => RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout),
         AcpError::SdkNotInstalled(m) => {
             RouteBootstrapOutcome::Fatal(AcpError::SdkNotInstalled(m.clone()))
         }
@@ -7086,9 +7110,7 @@ mod tests {
             bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
                 reason: RouteDegradedReason::NativeSuppressionInvalid,
             }),
-            RouteBootstrapOutcome::RouteSpecific(
-                RouteDegradedReason::NativeSuppressionInvalid
-            )
+            RouteBootstrapOutcome::RouteSpecific(RouteDegradedReason::NativeSuppressionInvalid)
         ));
         assert!(matches!(
             bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
@@ -7165,9 +7187,8 @@ mod tests {
         assert!(!sacp_err.to_string().is_empty());
         assert!(slot.lock().await.is_none(), "sender must be taken");
         match rx.await.unwrap() {
-            RouteBootstrapOutcome::RouteSpecific(
-                RouteDegradedReason::NativeSuppressionInvalid,
-            ) => {}
+            RouteBootstrapOutcome::RouteSpecific(RouteDegradedReason::NativeSuppressionInvalid) => {
+            }
             other => panic!("expected typed RouteSpecific, got {other:?}"),
         }
         // Second bridge does not panic / double-send.
@@ -9687,6 +9708,73 @@ mod tests {
     // enabled groups so the companion hides the rest. Crucially, feedback alone
     // must still inject the companion (the historical delegation-only gate would
     // have skipped it).
+
+    /// Post-ready unavailability helper carries the stable audit code without
+    /// inventing a second metrics Arc or mutating route plan fields.
+    #[tokio::test]
+    async fn post_ready_unavailable_audit_stable_code_no_route_mutation() {
+        use crate::acp::delegation::metrics::{DelegationAuditRecord, DELEGATION_UNAVAILABLE_CODE};
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        use crate::acp::session_state::SessionState;
+        use crate::web::event_bridge::EventEmitter;
+
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "test-ready-avail".into(),
+        };
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            "conn-avail-test".into(),
+            AgentType::Codex,
+            None,
+            "win".into(),
+            None,
+        )));
+        {
+            let mut s = state.write().await;
+            s.set_route_plan_snapshot(&plan);
+            s.set_delegation_available(true);
+            s.conversation_id = Some(7);
+        }
+        let route_before = state.read().await.delegation_route.clone();
+        assert!(route_before.delegation_available);
+        assert_eq!(route_before.effective, DelegationRoutePolicy::Codeg);
+        assert!(route_before.degraded_reason.is_none());
+
+        // Reuse audit constructor (same as finish_route_ready monitor path).
+        let audit =
+            DelegationAuditRecord::availability("conn-avail-test", Some(7), AgentType::Codex);
+        assert_eq!(audit.stable_code(), Some(DELEGATION_UNAVAILABLE_CODE));
+        emit_post_ready_unavailable(
+            &state,
+            &EventEmitter::Noop,
+            "conn-avail-test",
+            Some(7),
+            AgentType::Codex,
+        )
+        .await;
+
+        let after = state.read().await.delegation_route.clone();
+        assert!(!after.delegation_available, "availability must flip false");
+        assert_eq!(
+            after.effective, route_before.effective,
+            "immutable route fields must not change"
+        );
+        assert_eq!(after.requested, route_before.requested);
+        assert_eq!(after.source, route_before.source);
+        assert_eq!(after.managed, route_before.managed);
+        assert_eq!(after.degraded_reason, route_before.degraded_reason);
+    }
+
     #[test]
     fn companion_features_follow_plan_not_live_broker_route_setting() {
         // Plan-driven feature helper: expose_codeg_delegation maps to the

@@ -242,11 +242,11 @@ impl DelegationMetrics {
             }
         }
         let ms = Self::duration_ms_saturating(wall);
-        let _ = self.wait_duration_ms_total.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_add(ms)),
-        );
+        let _ =
+            self.wait_duration_ms_total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_add(ms))
+                });
         Self::inc_labeled(
             &self.wait_return_reasons,
             wait_return_reason_label(reason).to_string(),
@@ -436,6 +436,9 @@ pub struct DelegationAuditRecord {
     cancel_reason: Option<CancelDelegationReason>,
     terminal_winner: Option<bool>,
     duration_ms: Option<u64>,
+    /// Stable English code for route-degraded / companion-unavailable state
+    /// (never free-form; only interned constants).
+    stable_code: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -446,6 +449,8 @@ enum AuditKind {
     Observation,
     Wait,
     Cancel,
+    /// Post-ready companion availability transition (false only).
+    Availability,
 }
 
 impl DelegationAuditRecord {
@@ -484,6 +489,8 @@ impl DelegationAuditRecord {
             cancel_reason: None,
             terminal_winner: None,
             duration_ms: None,
+            // Only when the plan is actually degraded — not for healthy routes.
+            stable_code: plan.degraded_reason.map(|_| ROUTE_DEGRADED_CODE),
         }
     }
 
@@ -527,6 +534,7 @@ impl DelegationAuditRecord {
             cancel_reason: None,
             terminal_winner,
             duration_ms,
+            stable_code: None,
         }
     }
 
@@ -563,6 +571,7 @@ impl DelegationAuditRecord {
             cancel_reason: None,
             terminal_winner: None,
             duration_ms: None,
+            stable_code: None,
         }
     }
 
@@ -600,6 +609,7 @@ impl DelegationAuditRecord {
             cancel_reason: None,
             terminal_winner: None,
             duration_ms: None,
+            stable_code: None,
         }
     }
 
@@ -636,6 +646,47 @@ impl DelegationAuditRecord {
             cancel_reason: Some(reason),
             terminal_winner: None,
             duration_ms: None,
+            stable_code: None,
+        }
+    }
+
+    /// Post-ready companion availability became false (state flip only).
+    ///
+    /// Carries stable code [`DELEGATION_UNAVAILABLE_CODE`]. Never mutates route
+    /// fields; no free-form / secret-bearing payload.
+    pub fn availability(
+        connection_id: impl Into<String>,
+        conversation_id: Option<i32>,
+        agent_type: AgentType,
+    ) -> Self {
+        Self {
+            kind: AuditKind::Availability,
+            connection_id: Some(connection_id.into()),
+            conversation_id,
+            agent_type: Some(agent_type),
+            requested_route: None,
+            effective_route: None,
+            route_source: None,
+            managed: None,
+            degraded_reason: None,
+            expose_codeg_delegation: None,
+            native_creation_exposed: None,
+            suppression_adapter: None,
+            suppression_application: None,
+            task_id: None,
+            child_conversation_id: None,
+            task_status: None,
+            error_code: None,
+            observation_from: None,
+            observation_to: None,
+            wait_mode: None,
+            requested_wait_ms: None,
+            wait_wall_ms: None,
+            wait_return_reason: None,
+            cancel_reason: None,
+            terminal_winner: None,
+            duration_ms: None,
+            stable_code: Some(DELEGATION_UNAVAILABLE_CODE),
         }
     }
 
@@ -707,6 +758,10 @@ impl DelegationAuditRecord {
         self.cancel_reason
     }
 
+    pub fn stable_code(&self) -> Option<&'static str> {
+        self.stable_code
+    }
+
     /// Emit a structured info log for a route audit record.
     pub fn emit_route_resolved(&self) {
         tracing::info!(
@@ -720,6 +775,7 @@ impl DelegationAuditRecord {
             route_source_code = self.route_source().map(route_source_label).unwrap_or(""),
             managed = ?self.managed(),
             degraded_reason = ?self.degraded_reason(),
+            stable_code = self.stable_code().unwrap_or(""),
             expose_codeg_delegation = ?self.expose_codeg_delegation,
             native_creation_exposed = ?self.native_creation_exposed,
             suppression_adapter = ?self.suppression_adapter(),
@@ -776,6 +832,18 @@ impl DelegationAuditRecord {
             task_id = self.task_id().unwrap_or(""),
             cancel_reason = ?self.cancel_reason(),
             "delegation explicit cancel"
+        );
+    }
+
+    /// Emit a structured info log for post-ready companion unavailability.
+    pub fn emit_availability(&self) {
+        tracing::info!(
+            target: "codeg::delegation",
+            connection_id = self.connection_id().unwrap_or(""),
+            conversation_id = ?self.conversation_id(),
+            agent_type = ?self.agent_type(),
+            stable_code = self.stable_code().unwrap_or(""),
+            "delegation companion unavailable"
         );
     }
 }
@@ -836,14 +904,8 @@ mod tests {
         let metrics = DelegationMetrics::default();
         metrics.record_route(AgentType::Codex, &codeg_plan(AgentType::Codex));
         metrics.record_accepted(AgentType::Codex);
-        metrics.record_observation_transition(
-            TaskObservation::Active,
-            TaskObservation::Stalled,
-        );
-        metrics.record_observation_transition(
-            TaskObservation::Stalled,
-            TaskObservation::Active,
-        );
+        metrics.record_observation_transition(TaskObservation::Active, TaskObservation::Stalled);
+        metrics.record_observation_transition(TaskObservation::Stalled, TaskObservation::Active);
         metrics.record_wait(
             WaitModeLabel::Supervised,
             Duration::from_millis(1250),
@@ -1053,5 +1115,87 @@ mod tests {
         );
         assert_eq!(ROUTE_DEGRADED_CODE, "route_degraded");
         assert_eq!(DELEGATION_UNAVAILABLE_CODE, "delegation_unavailable");
+    }
+
+    #[test]
+    fn route_audit_carries_route_degraded_only_when_degraded() {
+        let healthy = codeg_plan(AgentType::Codex);
+        let healthy_rec = DelegationAuditRecord::route(
+            "conn-healthy",
+            Some(1),
+            AgentType::Codex,
+            &healthy,
+            SuppressionApplication::Applied,
+        );
+        assert_eq!(
+            healthy_rec.stable_code(),
+            None,
+            "healthy route must not emit route_degraded"
+        );
+        healthy_rec.emit_route_resolved();
+
+        let mut degraded = codeg_plan(AgentType::Codex);
+        degraded.effective = DelegationRoutePolicy::Native;
+        degraded.source = DelegationRouteSource::SafeFallback;
+        degraded.native_suppression = NativeSuppressionPlan::None;
+        degraded.expose_codeg_delegation = false;
+        degraded.degraded_reason = Some(RouteDegradedReason::CompanionBinaryUnavailable);
+        let degraded_rec = DelegationAuditRecord::route(
+            "conn-degraded",
+            Some(2),
+            AgentType::Codex,
+            &degraded,
+            SuppressionApplication::NotApplicable,
+        );
+        assert_eq!(degraded_rec.stable_code(), Some(ROUTE_DEGRADED_CODE));
+        let value = serde_json::to_value(&degraded_rec).unwrap();
+        assert_eq!(value["stable_code"], ROUTE_DEGRADED_CODE);
+        // Field *names* only — substring on full JSON false-positives structural keys.
+        let object = value.as_object().unwrap();
+        for forbidden in [
+            "prompt",
+            "task",
+            "result_text",
+            "token",
+            "api_key",
+            "environment",
+            "raw_payload",
+            "companion_token",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "degraded route audit must not have field {forbidden}"
+            );
+        }
+        degraded_rec.emit_route_resolved();
+    }
+
+    #[test]
+    fn availability_audit_carries_delegation_unavailable_code() {
+        let rec = DelegationAuditRecord::availability("conn-1", Some(42), AgentType::Grok);
+        assert_eq!(rec.stable_code(), Some(DELEGATION_UNAVAILABLE_CODE));
+        let value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(value["kind"], "availability");
+        assert_eq!(value["stable_code"], DELEGATION_UNAVAILABLE_CODE);
+        assert_eq!(value["connection_id"], "conn-1");
+        // Deny list is field *names* (substring on full JSON would false-positive
+        // on `task_id` / similar structural keys).
+        let object = value.as_object().unwrap();
+        for forbidden in [
+            "prompt",
+            "task",
+            "result_text",
+            "token",
+            "api_key",
+            "environment",
+            "raw_payload",
+            "companion_token",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "availability audit must not have field {forbidden}"
+            );
+        }
+        rec.emit_availability();
     }
 }
