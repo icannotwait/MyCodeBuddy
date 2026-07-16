@@ -324,6 +324,9 @@ pub struct AgentConnection {
     /// row-less drafts it may be updated by
     /// `set_draft_delegation_route_preference` without touching `route_plan`.
     pub route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    /// Exact capability snapshot used when resolving `route_plan` at launch.
+    /// Stale comparison re-resolves with these facts only — never optimistic.
+    pub route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot,
 }
 
 impl AgentConnection {
@@ -805,6 +808,7 @@ pub async fn spawn_agent_connection(
     route_plan: crate::acp::delegation::route::DelegationRoutePlan,
     origin: crate::acp::delegation::route::DelegationConnectionOrigin,
     route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot,
     owner_window_label: String,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
@@ -910,6 +914,7 @@ pub async fn spawn_agent_connection(
             route_plan,
             origin,
             route_preference,
+            route_capability,
         },
     );
 

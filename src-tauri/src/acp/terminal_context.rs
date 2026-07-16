@@ -12,8 +12,8 @@ use sacp::schema::{ContentBlock, Meta, TextContent};
 
 use crate::acp::connection::{agent_delivers_wire_mcp, locate_codeg_mcp_binary};
 use crate::acp::delegation::route::{
-    resolve_route, suppression_capability, DelegationConnectionOrigin, DelegationRoutePlan,
-    DelegationRoutePolicy, RouteResolutionError, RouteResolutionInput,
+    resolve_route, DelegationConnectionOrigin, DelegationRoutePlan, DelegationRoutePolicy,
+    RouteCapabilitySnapshot, RouteResolutionError, RouteResolutionInput,
 };
 use crate::acp::error::AcpError;
 use crate::acp::registry;
@@ -59,7 +59,7 @@ impl AcpRouteRequest {
 }
 
 /// Inputs loaded before reuse / spawn: agent runtime env + terminal settings +
-/// one already-resolved route plan.
+/// one already-resolved route plan + the exact capability snapshot used.
 #[derive(Debug, Clone)]
 pub struct AcpLaunchInputs {
     pub runtime_env: BTreeMap<String, String>,
@@ -69,11 +69,15 @@ pub struct AcpLaunchInputs {
     /// Preference used for later comparison re-resolution (not source-of-truth
     /// for the live process — that is `route_plan`).
     pub route_preference: Option<DelegationRoutePolicy>,
+    /// Exact capability facts used when resolving `route_plan`. Stored on the
+    /// connection so every stale comparison reuses them — never optimistic.
+    pub route_capability: RouteCapabilitySnapshot,
 }
 
 impl AcpLaunchInputs {
     /// Construct launch inputs with a feature-disabled native plan.
-    /// Used by tests and legacy call sites that do not exercise route reuse.
+    /// **Tests only** — production call sites must resolve a real route plan.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_placeholder_route(
         runtime_env: BTreeMap<String, String>,
         terminal_settings: SystemTerminalSettings,
@@ -82,15 +86,20 @@ impl AcpLaunchInputs {
             resolve_route, SuppressionCapability, ROUTE_ADAPTER_CONTRACT_VERSION,
         };
         // Feature-disabled root: native effective, stable empty-capability path.
+        let capability = RouteCapabilitySnapshot {
+            suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        };
         let route_plan = resolve_route(RouteResolutionInput {
             agent_type: AgentType::ClaudeCode,
             origin: DelegationConnectionOrigin::Root,
             session_override: None,
             global_policy: DelegationRoutePolicy::Codeg,
             delegation_enabled: false,
-            suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
-            agent_mcp_supported: true,
-            companion_binary_available: true,
+            suppression: capability.suppression.clone(),
+            agent_mcp_supported: capability.agent_mcp_supported,
+            companion_binary_available: capability.companion_binary_available,
         })
         .expect("feature-disabled native plan must resolve");
         Self {
@@ -99,6 +108,7 @@ impl AcpLaunchInputs {
             route_plan,
             origin: DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: capability,
         }
     }
 }
@@ -111,24 +121,65 @@ pub(crate) struct AcpLaunchConfig {
     pub route_plan: DelegationRoutePlan,
     pub origin: DelegationConnectionOrigin,
     pub route_preference: Option<DelegationRoutePolicy>,
+    pub route_capability: RouteCapabilitySnapshot,
+}
+
+/// Build the exact capability snapshot for a launch from installed-version and
+/// runtime-env facts. Companion/MCP gates use live process facts.
+pub fn build_route_capability_snapshot(
+    agent_type: AgentType,
+    installed_version: Option<&str>,
+    runtime_env: &BTreeMap<String, String>,
+) -> RouteCapabilitySnapshot {
+    let meta = registry::get_agent_meta(agent_type);
+    let agent_mcp_supported = meta.supports_mcp && agent_delivers_wire_mcp(agent_type);
+    let companion_binary_available = locate_codeg_mcp_binary().is_some();
+    RouteCapabilitySnapshot::from_launch_facts(
+        agent_type,
+        installed_version,
+        runtime_env,
+        agent_mcp_supported,
+        companion_binary_available,
+    )
 }
 
 /// Resolve the immutable route plan for a connect request.
 ///
+/// Public test-friendly entry: builds a capability snapshot from empty
+/// runtime env and no installed-version (managed host pin). Production
+/// launch paths use [`resolve_connect_route_with_capability`] after building
+/// real runtime_env facts.
+///
 /// Persisted conversation override is authoritative when `conversation_id` is
 /// present; a mismatching payload override is ignored and logged. Draft roots
-/// (no row) use `draft_override`. Children force Codeg via origin.
+/// (no row) use `draft_override`. Children force Codeg via origin. The
+/// conversation row must exist and its Agent type must match `agent_type`.
 pub async fn resolve_connect_route(
     conn: &DatabaseConnection,
     agent_type: AgentType,
     request: AcpRouteRequest,
     runtime: &DelegationRuntimeSnapshot,
 ) -> Result<DelegationRoutePlan, AcpError> {
+    let capability = build_route_capability_snapshot(agent_type, None, &BTreeMap::new());
+    resolve_connect_route_with_capability(conn, agent_type, request, runtime, &capability).await
+}
+
+/// Capability-aware connect resolution. Callers that already built
+/// `RouteCapabilitySnapshot` from real runtime_env/installed-version must use
+/// this so suppression/MCP/companion facts match the launch process.
+pub async fn resolve_connect_route_with_capability(
+    conn: &DatabaseConnection,
+    agent_type: AgentType,
+    request: AcpRouteRequest,
+    runtime: &DelegationRuntimeSnapshot,
+    capability: &RouteCapabilitySnapshot,
+) -> Result<DelegationRoutePlan, AcpError> {
     let session_override = match request.origin {
         DelegationConnectionOrigin::CodegChild => None,
         DelegationConnectionOrigin::Root => {
             if let Some(conversation_id) = request.conversation_id {
-                let persisted = load_persisted_route_override(conn, conversation_id).await?;
+                let persisted =
+                    load_persisted_route_override(conn, conversation_id, agent_type).await?;
                 if let Some(payload) = request.draft_override {
                     if Some(payload) != persisted {
                         tracing::warn!(
@@ -147,33 +198,36 @@ pub async fn resolve_connect_route(
         }
     };
 
-    let meta = registry::get_agent_meta(agent_type);
-    // No product surface yet for unverified custom managed-agent binaries.
-    let custom_executable = false;
-    let suppression =
-        suppression_capability(agent_type, meta.registry_version(), custom_executable);
-    let agent_mcp_supported = meta.supports_mcp && agent_delivers_wire_mcp(agent_type);
-    let companion_binary_available = locate_codeg_mcp_binary().is_some();
-
     resolve_route(RouteResolutionInput {
         agent_type,
         origin: request.origin,
         session_override,
         global_policy: runtime.route_policy,
         delegation_enabled: runtime.enabled,
-        suppression,
-        agent_mcp_supported,
-        companion_binary_available,
+        suppression: capability.suppression.clone(),
+        agent_mcp_supported: capability.agent_mcp_supported,
+        companion_binary_available: capability.companion_binary_available,
     })
     .map_err(route_resolution_to_acp)
 }
 
+/// Load a conversation's route override only when the row exists and its
+/// stored Agent type equals `expected_agent`.
 async fn load_persisted_route_override(
     conn: &DatabaseConnection,
     conversation_id: i32,
+    expected_agent: AgentType,
 ) -> Result<Option<DelegationRoutePolicy>, AcpError> {
     match crate::db::service::conversation_service::get_by_id(conn, conversation_id).await {
-        Ok(summary) => Ok(summary.delegation_route_override),
+        Ok(summary) => {
+            if summary.agent_type != expected_agent {
+                return Err(AcpError::protocol(format!(
+                    "conversation {conversation_id} agent type is {:?}, but connect requested {:?}",
+                    summary.agent_type, expected_agent
+                )));
+            }
+            Ok(summary.delegation_route_override)
+        }
         Err(crate::db::error::DbError::Migration(msg)) if msg.contains("not found") => {
             Err(AcpError::protocol(format!(
                 "conversation not found: {conversation_id}"
@@ -341,6 +395,10 @@ pub(crate) fn build_terminal_base_env(
 }
 
 /// Load agent runtime env + system terminal settings + one resolved route plan.
+///
+/// Builds `runtime_env` **before** route resolution so capability facts
+/// (host contract, custom CODEX_PATH, MCP/companion) match the process that
+/// will actually launch.
 pub(crate) async fn build_acp_launch_inputs(
     db: &AppDatabase,
     agent_type: AgentType,
@@ -349,23 +407,45 @@ pub(crate) async fn build_acp_launch_inputs(
     route_request: AcpRouteRequest,
     runtime: &DelegationRuntimeSnapshot,
 ) -> Result<AcpLaunchInputs, AcpError> {
+    let runtime_env =
+        crate::commands::acp::build_session_runtime_env(db, agent_type, session_id, data_dir)
+            .await?;
+
+    let installed_version = crate::db::service::agent_setting_service::get_by_agent_type(
+        &db.conn,
+        agent_type,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.installed_version);
+
+    let route_capability = build_route_capability_snapshot(
+        agent_type,
+        installed_version.as_deref(),
+        &runtime_env,
+    );
+
     let route_preference = match route_request.origin {
         DelegationConnectionOrigin::CodegChild => None,
         DelegationConnectionOrigin::Root => {
             if let Some(conversation_id) = route_request.conversation_id {
-                load_persisted_route_override(&db.conn, conversation_id).await?
+                load_persisted_route_override(&db.conn, conversation_id, agent_type).await?
             } else {
                 route_request.draft_override
             }
         }
     };
     let origin = route_request.origin;
-    let route_plan =
-        resolve_connect_route(&db.conn, agent_type, route_request, runtime).await?;
+    let route_plan = resolve_connect_route_with_capability(
+        &db.conn,
+        agent_type,
+        route_request,
+        runtime,
+        &route_capability,
+    )
+    .await?;
 
-    let runtime_env =
-        crate::commands::acp::build_session_runtime_env(db, agent_type, session_id, data_dir)
-            .await?;
     let terminal_settings =
         crate::commands::system_settings::load_system_terminal_settings(&db.conn)
             .await
@@ -377,6 +457,7 @@ pub(crate) async fn build_acp_launch_inputs(
         route_plan,
         origin,
         route_preference,
+        route_capability,
     })
 }
 
@@ -420,6 +501,7 @@ fn finalize_acp_launch_config_with_adapter(
         route_plan: inputs.route_plan,
         origin: inputs.origin,
         route_preference: inputs.route_preference,
+        route_capability: inputs.route_capability,
     })
 }
 
@@ -813,6 +895,170 @@ earlier terminal context records.\n\
         .await
         .unwrap();
         assert_eq!(draft.effective, DelegationRoutePolicy::Native);
+    }
+
+    #[tokio::test]
+    async fn resolve_connect_route_rejects_mismatched_conversation_agent_type() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource,
+        };
+        use crate::db::test_helpers;
+        use crate::commands::delegation::DelegationRuntimeSnapshot;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/route-mismatch").await;
+        let conversation_id = crate::commands::conversations::create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let runtime = DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy: DelegationRoutePolicy::Codeg,
+            stalled_after_seconds: 300,
+        };
+
+        let err = resolve_connect_route(
+            &db.conn,
+            AgentType::Grok,
+            AcpRouteRequest::root(Some(conversation_id), None),
+            &runtime,
+        )
+        .await
+        .expect_err("mismatched agent type must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent type") || msg.contains("Grok") || msg.contains("Codex"),
+            "expected agent mismatch detail, got {msg}"
+        );
+        // Matching agent still works (public resolve uses managed host pin).
+        let ok = resolve_connect_route(
+            &db.conn,
+            AgentType::Codex,
+            AcpRouteRequest::root(Some(conversation_id), None),
+            &runtime,
+        )
+        .await
+        .expect("matching agent resolves");
+        assert_eq!(ok.source, DelegationRouteSource::GlobalDefault);
+    }
+
+    #[tokio::test]
+    async fn codex_built_in_host_contract_resolves_child_without_route_unavailable() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, PINNED_CODEX_CLI_VERSION,
+        };
+        use crate::commands::delegation::DelegationRuntimeSnapshot;
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let runtime = DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy: DelegationRoutePolicy::Codeg,
+            stalled_after_seconds: 300,
+        };
+        // Empty env + ACP adapter installed id: managed host pin 0.144.1, not 1.1.2.
+        let capability =
+            build_route_capability_snapshot(AgentType::Codex, Some("1.1.2"), &BTreeMap::new());
+        assert!(
+            capability.suppression.failure.is_none(),
+            "ACP adapter version must not make host contract unsupported"
+        );
+        let _ = PINNED_CODEX_CLI_VERSION;
+
+        let child = resolve_connect_route_with_capability(
+            &db.conn,
+            AgentType::Codex,
+            AcpRouteRequest::codeg_child(),
+            &runtime,
+            &capability,
+        )
+        .await
+        .expect("codex child with host contract must not RouteUnavailable");
+        assert_eq!(child.effective, DelegationRoutePolicy::Codeg);
+        assert_eq!(child.source, DelegationRouteSource::ForcedChild);
+    }
+
+    #[tokio::test]
+    async fn build_acp_launch_inputs_uses_runtime_env_for_capability_and_conversation_id() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
+        };
+        use crate::commands::delegation::DelegationRuntimeSnapshot;
+        use crate::db::service::agent_setting_service;
+        use crate::db::test_helpers;
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/launch-cap").await;
+        let conversation_id = crate::commands::conversations::create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            Some(DelegationRoutePolicy::Native),
+        )
+        .await
+        .unwrap();
+
+        // Ensure agent setting row exists, then inject custom CODEX_PATH.
+        agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[agent_setting_service::AgentDefaultInput {
+                agent_type: AgentType::Codex,
+                registry_id: "codex-acp".into(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .unwrap();
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        env.insert(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            "C:\\custom\\codex.exe".into(),
+        );
+        let env_json = serde_json::to_string(&env).unwrap();
+        let model = agent_setting_service::get_by_agent_type(&db.conn, AgentType::Codex)
+            .await
+            .unwrap()
+            .expect("codex setting row");
+        let mut active: crate::db::entities::agent_setting::ActiveModel = model.into();
+        active.env_json = Set(Some(env_json));
+        active.enabled = Set(true);
+        active.update(&db.conn).await.unwrap();
+
+        let runtime = DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy: DelegationRoutePolicy::Codeg,
+            stalled_after_seconds: 300,
+        };
+        let inputs = build_acp_launch_inputs(
+            &db,
+            AgentType::Codex,
+            None,
+            Path::new("."),
+            AcpRouteRequest::root(Some(conversation_id), None),
+            &runtime,
+        )
+        .await
+        .expect("launch inputs");
+
+        assert_eq!(inputs.route_preference, Some(DelegationRoutePolicy::Native));
+        assert_eq!(
+            inputs.route_capability.suppression.failure,
+            Some(RouteDegradedReason::NativeSuppressionUnsupported)
+        );
+        // Persisted Native override → native effective even with custom path.
+        assert_eq!(inputs.route_plan.effective, DelegationRoutePolicy::Native);
+        assert_eq!(
+            inputs.route_plan.source,
+            DelegationRouteSource::SessionOverride
+        );
+        assert_eq!(inputs.origin, DelegationConnectionOrigin::Root);
     }
 
     #[tokio::test]

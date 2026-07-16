@@ -4,6 +4,8 @@
 //! preflight inputs. Does not spawn processes, inject MCP, or touch settings
 //! persistence.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -180,10 +182,177 @@ pub fn is_managed_agent(agent_type: AgentType) -> bool {
     )
 }
 
+/// Canonical managed **host** suppression-contract version for an Agent type.
+///
+/// This is distinct from the ACP adapter/package `registry_version` (e.g. Codex
+/// ACP `1.1.2`). Suppression pin checks use host contracts only.
+pub fn managed_host_contract_version(agent_type: AgentType) -> Option<&'static str> {
+    match agent_type {
+        AgentType::Codex => Some(PINNED_CODEX_CLI_VERSION),
+        AgentType::Grok => Some(PINNED_GROK_VERSION),
+        AgentType::CodeBuddy => Some(PINNED_CODEBUDDY_VERSION),
+        // Wrapper is the primary host contract; product pin is also accepted.
+        AgentType::ClaudeCode => Some(PINNED_CLAUDE_ACP_VERSION),
+        _ => None,
+    }
+}
+
+/// Classification of whether a launch uses the managed host contract or an
+/// unverified custom override. Built from persisted installed-version and
+/// runtime-env facts only — never from a per-connect `--help`/version probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedHostContractFacts {
+    /// Version string passed to [`suppression_capability`].
+    pub contract_version: Option<String>,
+    /// True when the launch uses an unverified custom path/version override.
+    pub custom_executable: bool,
+}
+
+fn env_has_nonempty(runtime_env: &BTreeMap<String, String>, key: &str) -> bool {
+    runtime_env.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case(key) && !v.trim().is_empty()
+    })
+}
+
+fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool {
+    match agent_type {
+        AgentType::Grok => installed == PINNED_GROK_VERSION,
+        AgentType::CodeBuddy => installed == PINNED_CODEBUDDY_VERSION,
+        AgentType::ClaudeCode => {
+            installed == PINNED_CLAUDE_ACP_VERSION || installed == PINNED_CLAUDE_CODE_VERSION
+        }
+        // Codex host contract is CLI pin, not installed ACP adapter version.
+        AgentType::Codex => installed == PINNED_CODEX_CLI_VERSION,
+        _ => false,
+    }
+}
+
+/// Classify managed-host contract identity from installed-version + runtime env.
+///
+/// Rules:
+/// - **Codex:** explicit non-empty `CODEX_PATH` in user/runtime config → custom;
+///   otherwise managed host contract is the pinned CLI `0.144.1` (never ACP
+///   adapter `registry_version`).
+/// - **Grok / CodeBuddy / Claude:** an installed version that differs from the
+///   managed pin(s) → custom; missing installed version is treated as managed
+///   (uses the host contract pin). Claude accepts wrapper `0.58.1` or product
+///   `2.1.205`.
+pub fn classify_managed_host_contract(
+    agent_type: AgentType,
+    installed_version: Option<&str>,
+    runtime_env: &BTreeMap<String, String>,
+) -> ManagedHostContractFacts {
+    if !is_managed_agent(agent_type) {
+        return ManagedHostContractFacts {
+            contract_version: None,
+            custom_executable: false,
+        };
+    }
+
+    match agent_type {
+        AgentType::Codex => {
+            let custom =
+                env_has_nonempty(runtime_env, crate::acp::codex_cli::CODEX_PATH_ENV);
+            ManagedHostContractFacts {
+                contract_version: Some(PINNED_CODEX_CLI_VERSION.to_string()),
+                custom_executable: custom,
+            }
+        }
+        AgentType::Grok | AgentType::CodeBuddy | AgentType::ClaudeCode => {
+            match installed_version.map(str::trim).filter(|s| !s.is_empty()) {
+                None => ManagedHostContractFacts {
+                    contract_version: managed_host_contract_version(agent_type)
+                        .map(str::to_string),
+                    custom_executable: false,
+                },
+                Some(installed) => {
+                    let custom = !installed_matches_managed_pin(agent_type, installed);
+                    ManagedHostContractFacts {
+                        contract_version: Some(installed.to_string()),
+                        custom_executable: custom,
+                    }
+                }
+            }
+        }
+        _ => ManagedHostContractFacts {
+            contract_version: None,
+            custom_executable: false,
+        },
+    }
+}
+
+/// Derive suppression capability from host-contract classification.
+pub fn resolve_managed_host_suppression(
+    agent_type: AgentType,
+    installed_version: Option<&str>,
+    runtime_env: &BTreeMap<String, String>,
+) -> SuppressionCapability {
+    let facts = classify_managed_host_contract(agent_type, installed_version, runtime_env);
+    suppression_capability(
+        agent_type,
+        facts.contract_version.as_deref(),
+        facts.custom_executable,
+    )
+}
+
+/// Exact capability facts captured once at launch and reused for every later
+/// comparison re-resolution. Never synthesize optimistic facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCapabilitySnapshot {
+    pub suppression: SuppressionCapability,
+    pub agent_mcp_supported: bool,
+    pub companion_binary_available: bool,
+}
+
+impl RouteCapabilitySnapshot {
+    /// Build capability facts from installed-version, runtime env, MCP meta,
+    /// and companion preflight. Call only after `runtime_env` is available.
+    pub fn from_launch_facts(
+        agent_type: AgentType,
+        installed_version: Option<&str>,
+        runtime_env: &BTreeMap<String, String>,
+        agent_mcp_supported: bool,
+        companion_binary_available: bool,
+    ) -> Self {
+        Self {
+            suppression: resolve_managed_host_suppression(
+                agent_type,
+                installed_version,
+                runtime_env,
+            ),
+            agent_mcp_supported,
+            companion_binary_available,
+        }
+    }
+
+    /// Optimistic supported capability — tests only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_supported() -> Self {
+        Self {
+            suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        }
+    }
+
+    /// Degraded unsupported suppression capability — tests only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_suppression_unsupported() -> Self {
+        Self {
+            suppression: SuppressionCapability::unsupported(
+                RouteDegradedReason::NativeSuppressionUnsupported,
+            ),
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        }
+    }
+}
+
 /// Pinned capability table for the four managed platforms.
 ///
-/// `version` is the Agent/package version under test. `custom_executable` is
-/// true when the user points at an unverified custom binary; that path is
+/// `version` is the **host contract / package version under test**, not the
+/// ACP adapter install id unless they are the same product. `custom_executable`
+/// is true when the user points at an unverified custom binary; that path is
 /// always unsupported without a per-connect `--help` probe.
 pub fn suppression_capability(
     agent_type: AgentType,
@@ -489,14 +658,17 @@ pub fn test_empty_route_plan() -> DelegationRoutePlan {
 }
 
 /// Deterministic comparison fingerprint used by staleness refresh helpers.
-/// Uses optimistic capability inputs so preference-only drift is isolated from
-/// companion/MCP availability at refresh time.
+///
+/// Must use the **exact** [`RouteCapabilitySnapshot`] captured at launch so
+/// degraded launch fingerprints and later preference-only comparisons stay
+/// consistent. Never synthesize optimistic supported/true/true facts.
 pub fn comparison_route_fingerprint(
     agent_type: AgentType,
     origin: DelegationConnectionOrigin,
     session_override: Option<DelegationRoutePolicy>,
     global_policy: DelegationRoutePolicy,
     delegation_enabled: bool,
+    capability: &RouteCapabilitySnapshot,
 ) -> String {
     resolve_route(RouteResolutionInput {
         agent_type,
@@ -504,9 +676,9 @@ pub fn comparison_route_fingerprint(
         session_override,
         global_policy,
         delegation_enabled,
-        suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
-        agent_mcp_supported: true,
-        companion_binary_available: true,
+        suppression: capability.suppression.clone(),
+        agent_mcp_supported: capability.agent_mcp_supported,
+        companion_binary_available: capability.companion_binary_available,
     })
     .map(|p| p.fingerprint)
     .unwrap_or_default()
@@ -621,6 +793,132 @@ mod tests {
         native_input.global_policy = DelegationRoutePolicy::Native;
         let native = resolve_route(native_input).unwrap();
         assert_ne!(inherited.fingerprint, native.fingerprint);
+    }
+
+    #[test]
+    fn codex_host_contract_ignores_acp_adapter_registry_version() {
+        let empty = BTreeMap::new();
+        // Built-in managed path: no CODEX_PATH override → pinned CLI contract.
+        let facts = classify_managed_host_contract(AgentType::Codex, Some("1.1.2"), &empty);
+        assert!(!facts.custom_executable);
+        assert_eq!(
+            facts.contract_version.as_deref(),
+            Some(PINNED_CODEX_CLI_VERSION)
+        );
+        let suppression = resolve_managed_host_suppression(AgentType::Codex, Some("1.1.2"), &empty);
+        assert!(suppression.failure.is_none());
+
+        // Child with managed host contract must resolve Codeg, not RouteUnavailable.
+        let child = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::Codex,
+            origin: DelegationConnectionOrigin::CodegChild,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Codeg,
+            delegation_enabled: true,
+            suppression,
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        })
+        .expect("codex child with host contract must resolve");
+        assert_eq!(child.effective, DelegationRoutePolicy::Codeg);
+        assert_eq!(child.source, DelegationRouteSource::ForcedChild);
+    }
+
+    #[test]
+    fn codex_custom_path_and_non_pin_install_are_unsupported() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
+            "C:\\custom\\codex.exe".into(),
+        );
+        let custom = resolve_managed_host_suppression(AgentType::Codex, None, &env);
+        assert_eq!(
+            custom.failure,
+            Some(RouteDegradedReason::NativeSuppressionUnsupported)
+        );
+
+        let root = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::Codex,
+            origin: DelegationConnectionOrigin::Root,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Codeg,
+            delegation_enabled: true,
+            suppression: custom.clone(),
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        })
+        .expect("root falls back");
+        assert_eq!(root.source, DelegationRouteSource::SafeFallback);
+        assert_eq!(root.effective, DelegationRoutePolicy::Native);
+        assert_eq!(
+            root.degraded_reason,
+            Some(RouteDegradedReason::NativeSuppressionUnsupported)
+        );
+
+        let child_err = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::Codex,
+            origin: DelegationConnectionOrigin::CodegChild,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Codeg,
+            delegation_enabled: true,
+            suppression: custom,
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        })
+        .expect_err("child unavailable");
+        assert_eq!(child_err.stable_code(), "route_unavailable");
+
+        // Grok/CodeBuddy non-pin installed version is custom.
+        let empty = BTreeMap::new();
+        let grok = classify_managed_host_contract(AgentType::Grok, Some("0.1.0"), &empty);
+        assert!(grok.custom_executable);
+        let cap = resolve_managed_host_suppression(AgentType::Grok, Some("0.1.0"), &empty);
+        assert_eq!(
+            cap.failure,
+            Some(RouteDegradedReason::NativeSuppressionUnsupported)
+        );
+    }
+
+    #[test]
+    fn capability_snapshot_keeps_degraded_launch_and_comparison_consistent() {
+        let capability = RouteCapabilitySnapshot::test_suppression_unsupported();
+        let plan = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::Codex,
+            origin: DelegationConnectionOrigin::Root,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Codeg,
+            delegation_enabled: true,
+            suppression: capability.suppression.clone(),
+            agent_mcp_supported: capability.agent_mcp_supported,
+            companion_binary_available: capability.companion_binary_available,
+        })
+        .expect("root degraded plan");
+        assert_eq!(plan.source, DelegationRouteSource::SafeFallback);
+
+        let comparison = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+            &capability,
+        );
+        assert_eq!(
+            comparison, plan.fingerprint,
+            "stale comparison must reuse launch capability snapshot"
+        );
+
+        // Optimistic supported facts would diverge — prove we do not use them.
+        let optimistic = RouteCapabilitySnapshot::test_supported();
+        let optimistic_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+            &optimistic,
+        );
+        assert_ne!(optimistic_fp, plan.fingerprint);
     }
 
     #[test]

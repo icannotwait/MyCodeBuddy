@@ -379,12 +379,14 @@ pub async fn acp_describe_agent_options(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpDescribeAgentOptionsParams>,
 ) -> Result<Json<crate::acp::types::AgentOptionsSnapshot>, AppCommandError> {
+    let runtime = state.delegation_runtime_settings.snapshot();
     let snapshot = crate::commands::acp::acp_describe_agent_options_core(
         &state.connection_manager,
         &state.db,
         &state.data_dir,
         params.agent_type,
         params.working_dir,
+        &runtime,
     )
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;

@@ -446,8 +446,15 @@ mod tauri_app {
                         .clone();
                     let cm = app.state::<ConnectionManager>().clone_ref();
                     let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let runtime = app
+                        .state::<crate::commands::delegation::DelegationRuntimeSettings>()
+                        .inner()
+                        .clone();
+                    let data_dir = effective_data_dir.clone();
                     tauri::async_runtime::spawn(async move {
-                        ccm_ref.start_background(br, bus, db_conn, cm, emitter).await;
+                        ccm_ref
+                            .start_background(br, bus, db_conn, cm, emitter, runtime, data_dir)
+                            .await;
                     });
                 }
 
@@ -690,6 +697,9 @@ mod tauri_app {
                         .inner()
                         .clone(),
                     effective_data_dir.clone(),
+                    app.state::<crate::commands::delegation::DelegationRuntimeSettings>()
+                        .inner()
+                        .clone(),
                 ) {
                     tauri::async_runtime::spawn(crate::automation::run_automation_engine(engine));
                 }

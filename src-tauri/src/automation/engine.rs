@@ -70,6 +70,9 @@ pub struct AutomationEngine {
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    /// Shared live delegation runtime (enabled / route_policy / stall).
+    /// Row-less automation roots resolve routes from `runtime.snapshot()`.
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
     /// Live automation runs: `connection_id -> (run_id, automation_id)`. The only
     /// way `TurnComplete` (keyed by connection_id) maps back to a run. Lost on
     /// restart — which is why boot reconcile + the conversation-status backstop
@@ -115,6 +118,7 @@ pub fn build_engine(
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
 ) -> Option<Arc<AutomationEngine>> {
     let engine_lock = match acquire_engine_ownership(&data_dir) {
         Ownership::Exclusive(file) => file,
@@ -141,6 +145,7 @@ pub fn build_engine(
         emitter,
         bus,
         data_dir,
+        runtime,
         index: Arc::new(Mutex::new(HashMap::new())),
         automation_locks: Arc::new(Mutex::new(HashMap::new())),
         root_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -380,7 +385,8 @@ impl AutomationEngine {
 
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
-        let runtime = crate::commands::delegation::DelegationRuntimeSnapshot::default();
+        // Automation is a row-less root: resolve against the shared live runtime.
+        let runtime = self.runtime.snapshot();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,8 +12,10 @@ use super::types::{MessageLevel, RichMessage};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::registry::all_acp_agents;
 use crate::acp::types::PromptInputBlock;
+use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::entities::conversation;
 use crate::db::service::{conversation_service, folder_service, sender_context_service};
+use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::EventEmitter;
 
@@ -243,6 +246,8 @@ pub async fn handle_task(
     bridge: &Arc<Mutex<SessionBridge>>,
     lang: Lang,
     prefix: &str,
+    runtime: &DelegationRuntimeSettings,
+    data_dir: &Path,
 ) -> RichMessage {
     if task_description.is_empty() {
         return RichMessage::info(i18n::task_usage(lang, prefix));
@@ -298,20 +303,25 @@ pub async fn handle_task(
         }
     };
 
-    // 5. Spawn ACP agent
-    let terminal_settings =
-        match crate::commands::system_settings::load_system_terminal_settings(db).await {
-            Ok(s) => s,
-            Err(e) => {
-                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
-            }
-        };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs::with_placeholder_route(
-        // Chat-channel historically launched without agent credentials; keep
-        // that shape while still snapshotting the global terminal selection.
-        BTreeMap::new(),
-        terminal_settings,
-    );
+    // 5. Spawn ACP agent with a real one-shot route resolution against the
+    // live runtime snapshot and the just-created conversation row.
+    let app_db = AppDatabase { conn: db.clone() };
+    let runtime_snap = runtime.snapshot();
+    let launch_inputs = match crate::acp::terminal_context::build_acp_launch_inputs(
+        &app_db,
+        agent_type,
+        None,
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(Some(conv.id), None),
+        &runtime_snap,
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+        }
+    };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(
@@ -466,6 +476,8 @@ pub async fn handle_resume(
     bridge: &Arc<Mutex<SessionBridge>>,
     lang: Lang,
     prefix: &str,
+    runtime: &DelegationRuntimeSettings,
+    data_dir: &Path,
 ) -> RichMessage {
     if args.is_empty() {
         return list_recent_sessions(db, lang, prefix).await;
@@ -492,18 +504,25 @@ pub async fn handle_resume(
         }
     };
 
-    // Spawn agent with session_id for resume
-    let terminal_settings =
-        match crate::commands::system_settings::load_system_terminal_settings(db).await {
-            Ok(s) => s,
-            Err(e) => {
-                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
-            }
-        };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs::with_placeholder_route(
-        BTreeMap::new(),
-        terminal_settings,
-    );
+    // Spawn agent with session_id for resume; resolve route once against the
+    // live runtime and the persisted conversation row (agent-type validated).
+    let app_db = AppDatabase { conn: db.clone() };
+    let runtime_snap = runtime.snapshot();
+    let launch_inputs = match crate::acp::terminal_context::build_acp_launch_inputs(
+        &app_db,
+        conv.agent_type,
+        conv.external_id.as_deref(),
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(Some(conv.id), None),
+        &runtime_snap,
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+        }
+    };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(

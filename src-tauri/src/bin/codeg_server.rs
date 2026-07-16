@@ -411,6 +411,8 @@ async fn async_main() -> ExitCode {
             state.db.conn.clone(),
             state.connection_manager.clone_ref(),
             state.emitter.clone(),
+            state.delegation_runtime_settings.clone(),
+            state.data_dir.clone(),
         )
         .await;
 
@@ -467,6 +469,7 @@ async fn async_main() -> ExitCode {
         state.emitter.clone(),
         state.acp_event_bus.clone(),
         state.data_dir.clone(),
+        state.delegation_runtime_settings.clone(),
     ) {
         tokio::spawn(codeg_lib::automation::run_automation_engine(engine));
     }

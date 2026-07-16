@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use super::session_bridge::SessionBridge;
 use super::session_commands;
 use super::types::IncomingCommand;
 use crate::acp::manager::ConnectionManager;
+use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
 use crate::web::event_bridge::EventEmitter;
 
@@ -60,6 +62,8 @@ pub fn spawn_command_dispatcher(
     conn_mgr: ConnectionManager,
     emitter: EventEmitter,
     bridge: Arc<Mutex<SessionBridge>>,
+    runtime: DelegationRuntimeSettings,
+    data_dir: PathBuf,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut config = CommandConfigCache::new();
@@ -96,6 +100,8 @@ pub fn spawn_command_dispatcher(
                 cmd.channel_id,
                 &cmd.sender_id,
                 config.lang,
+                &runtime,
+                &data_dir,
             )
             .await;
 
@@ -144,6 +150,8 @@ async fn dispatch_command(
     channel_id: i32,
     sender_id: &str,
     lang: Lang,
+    runtime: &DelegationRuntimeSettings,
+    data_dir: &std::path::Path,
 ) -> super::types::RichMessage {
     // Strip prefix; if text doesn't start with it, try as follow-up
     let without_prefix = match text.strip_prefix(prefix) {
@@ -198,7 +206,17 @@ async fn dispatch_command(
         }
         "task" | "do" => {
             session_commands::handle_task(
-                db, args, channel_id, sender_id, conn_mgr, emitter, bridge, lang, prefix,
+                db,
+                args,
+                channel_id,
+                sender_id,
+                conn_mgr,
+                emitter,
+                bridge,
+                lang,
+                prefix,
+                runtime,
+                data_dir,
             )
             .await
         }
@@ -207,7 +225,17 @@ async fn dispatch_command(
         }
         "resume" => {
             session_commands::handle_resume(
-                db, args, channel_id, sender_id, conn_mgr, emitter, bridge, lang, prefix,
+                db,
+                args,
+                channel_id,
+                sender_id,
+                conn_mgr,
+                emitter,
+                bridge,
+                lang,
+                prefix,
+                runtime,
+                data_dir,
             )
             .await
         }

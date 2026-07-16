@@ -370,6 +370,7 @@ impl ConnectionManager {
             route_plan,
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -423,6 +424,7 @@ impl ConnectionManager {
             route_plan,
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -525,6 +527,7 @@ impl ConnectionManager {
             route_plan,
             origin,
             route_preference,
+            route_capability,
         } = finalize_acp_launch_config(launch_inputs, agent_type)?;
 
         let connection_id = uuid::Uuid::new_v4().to_string();
@@ -547,6 +550,7 @@ impl ConnectionManager {
             route_plan,
             origin,
             route_preference,
+            route_capability,
             owner_window_label,
             emitter,
             self.connections.clone(),
@@ -843,6 +847,7 @@ impl ConnectionManager {
                     conn.route_preference,
                     global_policy,
                     delegation_enabled,
+                    &conn.route_capability,
                 );
                 conn.observed_config.fingerprint.delegation_route = new_fp;
 
@@ -925,6 +930,7 @@ impl ConnectionManager {
                 conn.route_preference,
                 global_policy,
                 delegation_enabled,
+                &conn.route_capability,
             );
 
             let new_effective = effective_stale_kind(conn);
@@ -3000,6 +3006,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -3153,6 +3160,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -3246,6 +3254,7 @@ mod tests {
             None,
             DelegationRoutePolicy::Codeg,
             true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         );
         let mgr = ConnectionManager::new();
         seed_route_root(&mgr, "root", None, &codeg_fp).await;
@@ -3287,6 +3296,7 @@ mod tests {
             None,
             DelegationRoutePolicy::Codeg,
             true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         );
         let native_fp = comparison_route_fingerprint(
             AgentType::Codex,
@@ -3294,6 +3304,7 @@ mod tests {
             Some(DelegationRoutePolicy::Native),
             DelegationRoutePolicy::Codeg,
             true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         );
         let mgr = ConnectionManager::new();
         seed_route_root(&mgr, "inherited", None, &codeg_fp).await;
@@ -3326,6 +3337,7 @@ mod tests {
             Some(DelegationRoutePolicy::Codeg),
             DelegationRoutePolicy::Codeg,
             true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         );
         let mgr = ConnectionManager::new();
         seed_route_root(
@@ -3475,6 +3487,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         mgr.connections
             .lock()
@@ -3829,6 +3842,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -5603,6 +5617,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5988,6 +6003,7 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
+            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         {

@@ -225,6 +225,8 @@ impl ChatChannelManager {
         db_conn: DatabaseConnection,
         conn_mgr: ConnectionManager,
         emitter: EventEmitter,
+        runtime: crate::commands::delegation::DelegationRuntimeSettings,
+        data_dir: std::path::PathBuf,
     ) {
         // Store broadcaster for status event emission
         *self.inner.broadcaster.lock().await = Some(broadcaster.clone());
@@ -264,6 +266,8 @@ impl ChatChannelManager {
                 conn_mgr,
                 emitter,
                 bridge,
+                runtime,
+                data_dir,
             );
         } else {
             tracing::warn!("[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started");
