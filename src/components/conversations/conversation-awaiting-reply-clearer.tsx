@@ -63,10 +63,16 @@ export function ConversationAwaitingReplyClearer() {
     getServerDocumentActivity
   )
   const inFlight = useRef(new Set<string>())
+  // Monotonic reconnect generation: a reconnect while the same key is in-flight
+  // is not lost when the effect early-returns on inFlight; finally re-bumps retry.
+  const reconnectGeneration = useRef(0)
   const [retryEpoch, requestRetry] = useReducer((value: number) => value + 1, 0)
 
   useEffect(() => {
-    const offReconnect = onTransportReconnect(requestRetry)
+    const offReconnect = onTransportReconnect(() => {
+      reconnectGeneration.current += 1
+      requestRetry()
+    })
     return () => offReconnect?.()
   }, [])
 
@@ -77,6 +83,7 @@ export function ConversationAwaitingReplyClearer() {
     const key = `${activeConversationId}:${token}`
     if (inFlight.current.has(key)) return
     inFlight.current.add(key)
+    const startedGeneration = reconnectGeneration.current
     void clearAwaitingReply(activeConversationId, token)
       .then(applyPatch)
       .catch((error) => {
@@ -84,6 +91,11 @@ export function ConversationAwaitingReplyClearer() {
       })
       .finally(() => {
         inFlight.current.delete(key)
+        // Only schedule another attempt when a reconnect arrived during this
+        // request. Ordinary failure with no reconnect must not loop.
+        if (reconnectGeneration.current !== startedGeneration) {
+          requestRetry()
+        }
       })
   }, [
     activeConversationId,

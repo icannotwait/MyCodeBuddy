@@ -315,4 +315,58 @@ describe("ConversationAwaitingReplyClearer", () => {
     ).toBeNull()
     warn.mockRestore()
   })
+
+  it("retries clear after reconnect while the same key is still in-flight", async () => {
+    seedActiveConversation({ id: 12, awaiting_reply_token: "generation-12" })
+    let reconnectCb: (() => void) | null = null
+    onTransportReconnect.mockImplementation((cb: () => void) => {
+      reconnectCb = cb
+      return () => {}
+    })
+
+    let rejectFirst!: (error: Error) => void
+    const firstPending = new Promise<never>((_resolve, reject) => {
+      rejectFirst = reject
+    })
+    clearAwaitingReply
+      .mockImplementationOnce(() => firstPending)
+      .mockResolvedValueOnce(nullTokenPatch(12))
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    render(<ConversationAwaitingReplyClearer />)
+
+    await waitFor(() => expect(clearAwaitingReply).toHaveBeenCalledTimes(1))
+    expect(clearAwaitingReply).toHaveBeenCalledWith(12, "generation-12")
+
+    // Reconnect while first clear still pending — no concurrent duplicate.
+    act(() => {
+      reconnectCb?.()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(clearAwaitingReply).toHaveBeenCalledTimes(1)
+
+    // After first rejects and key is released, exactly one second clear.
+    await act(async () => {
+      rejectFirst(new Error("network"))
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(clearAwaitingReply).toHaveBeenCalledTimes(2))
+    expect(clearAwaitingReply).toHaveBeenNthCalledWith(2, 12, "generation-12")
+    await waitFor(() =>
+      expect(
+        useAppWorkspaceStore.getState().conversations[0].awaiting_reply_token
+      ).toBeNull()
+    )
+
+    // No third call without another signal.
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(clearAwaitingReply).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
+  })
 })
