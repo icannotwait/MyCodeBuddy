@@ -1210,6 +1210,7 @@
       "sectionOrderChatsFirst": "المحادثة في الأعلى",
       "statusRunningBadge": "قيد التشغيل",
       "statusCancelledBadge": "ملغى",
+      "statusAwaitingReplyBadge": "بانتظار ردك",
       "conversationCountUnit": "{count} محادثة",
       "emptyFolderHint": "لا توجد محادثات",
       "noMatchingConversations": "لا توجد محادثات مطابقة",

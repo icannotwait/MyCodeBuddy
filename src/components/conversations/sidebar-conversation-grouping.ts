@@ -92,7 +92,13 @@ export function formatRelative(iso: string, now: number): string {
   if (m < 1) return "now"
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h`
+  if (h < 24) {
+    const remainingMinutes = m % 60
+    if (h < 10 && remainingMinutes > 0) {
+      return `${h}h${remainingMinutes}m`
+    }
+    return `${h}h`
+  }
   const d = Math.floor(h / 24)
   if (d < 30) return `${d}d`
   const mo = Math.floor(d / 30)

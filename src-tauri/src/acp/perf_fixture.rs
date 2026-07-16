@@ -141,9 +141,9 @@ fn sha256_hex(text: &str) -> String {
 /// (first Rust fence starts at character 88 → ends of chunk 2 has two
 /// backticks, chunk 3 continues with the third).
 fn code_fence_is_split(chunks: &[String]) -> bool {
-    chunks.windows(2).any(|pair| {
-        pair[0].ends_with("``") && pair[1].starts_with('`')
-    })
+    chunks
+        .windows(2)
+        .any(|pair| pair[0].ends_with("``") && pair[1].starts_with('`'))
 }
 
 fn tool_call(id: &str, index: usize, seed: u64) -> AcpEvent {
@@ -268,6 +268,7 @@ fn build_events(final_text: &str, seed: u64) -> (Vec<AcpEvent>, usize, bool) {
         session_id: "perf-grok-rich-v1".into(),
         stop_reason: "end_turn".into(),
         agent_type: "grok".into(),
+        mark_awaiting_reply: false,
     });
 
     debug_assert_eq!(events.len(), 1_223);

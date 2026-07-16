@@ -54,6 +54,7 @@ function detailWithTurns(
       title: "t",
       title_locked: false,
       status: "in_progress",
+      awaiting_reply_token: null,
       kind: "regular",
       model: null,
       git_branch: null,

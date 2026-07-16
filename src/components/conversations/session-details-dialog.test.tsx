@@ -39,6 +39,7 @@ function summary(
     title_locked: false,
     agent_type: "claude_code",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: "claude-opus-4-8",
     git_branch: "main",

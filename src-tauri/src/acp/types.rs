@@ -127,6 +127,10 @@ pub enum AcpEvent {
         session_id: String,
         stop_reason: String,
         agent_type: String,
+        /// Whether this turn is eligible for awaiting-reply attention (UI root
+        /// prompts only). Automation, chat-channel, and delegation turns pass
+        /// `false`. Consumed by the lifecycle subscriber on `end_turn`.
+        mark_awaiting_reply: bool,
     },
     /// Session established with agent-assigned session ID
     SessionStarted { session_id: String },
@@ -332,10 +336,7 @@ pub enum AcpEvent {
     /// clear its "restart to apply" banner. Carried into `SessionState` so a
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
-    SessionConfigStale {
-        stale: bool,
-        kind: ConfigStaleKind,
-    },
+    SessionConfigStale { stale: bool, kind: ConfigStaleKind },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,
@@ -770,5 +771,20 @@ mod envelope_tests {
             }
             other => panic!("expected ConversationStatusChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn turn_complete_serializes_mark_awaiting_reply() {
+        let event = AcpEvent::TurnComplete {
+            session_id: "session-1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            mark_awaiting_reply: true,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["mark_awaiting_reply"], true);
+        assert_eq!(json["type"], "turn_complete");
+        assert_eq!(json["session_id"], "session-1");
+        assert_eq!(json["stop_reason"], "end_turn");
     }
 }

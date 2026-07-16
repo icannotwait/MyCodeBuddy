@@ -75,13 +75,6 @@ vi.mock("@/lib/api", () => ({
   getFolder: vi.fn(),
 }))
 
-// The provider imports `useAcpEvent` only for the separate
-// `ConversationStatusEventBridge` (not rendered here); stub the module so we
-// don't pull in the heavy ACP context.
-vi.mock("@/contexts/acp-connections-context", () => ({
-  useAcpEvent: vi.fn(),
-}))
-
 function makeSummary(
   overrides: Partial<DbConversationSummary> & { id: number }
 ): DbConversationSummary {
@@ -91,6 +84,7 @@ function makeSummary(
     title_locked: false,
     agent_type: "claude_code",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -263,14 +257,51 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
     expect(screen.getByTestId("ids").textContent).toBe("")
   })
 
-  it("patches status for a known conversation and no-ops for an unknown one", async () => {
+  it("applies a state patch for a known conversation and no-ops for an unknown one", async () => {
     await mountProvider()
-    emit({ kind: "upsert", summary: makeSummary({ id: 1 }) })
-    emit({ kind: "status", id: 1, status: "pending_review" })
+    emit({
+      kind: "upsert",
+      summary: makeSummary({
+        id: 1,
+        status: "in_progress",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-16T01:00:00.000Z",
+      }),
+    })
+    const statsBefore = useAppWorkspaceStore.getState().stats
+    emit({
+      kind: "state",
+      patch: {
+        id: 1,
+        status: "pending_review",
+        awaiting_reply_token: "generation-b",
+        updated_at: "2026-07-16T02:03:04.000Z",
+      },
+    })
     expect(screen.getByTestId("statuses")).toHaveTextContent("1:pending_review")
-    emit({ kind: "status", id: 999, status: "cancelled" })
+    const row = useAppWorkspaceStore.getState().conversations[0]
+    expect(row).toMatchObject({
+      status: "pending_review",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
+    expect(useAppWorkspaceStore.getState().stats).toBe(statsBefore)
+    const conversationsBeforeUnknown =
+      useAppWorkspaceStore.getState().conversations
+    emit({
+      kind: "state",
+      patch: {
+        id: 999,
+        status: "cancelled",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-16T03:00:00.000Z",
+      },
+    })
     expect(screen.getByTestId("count")).toHaveTextContent("1")
     expect(screen.getByTestId("statuses")).toHaveTextContent("1:pending_review")
+    expect(useAppWorkspaceStore.getState().conversations).toBe(
+      conversationsBeforeUnknown
+    )
   })
 
   it("derives stats.total_messages from upserted message counts", async () => {

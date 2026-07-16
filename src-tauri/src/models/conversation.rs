@@ -35,6 +35,7 @@ pub struct DbConversationSummary {
     pub title_locked: bool,
     pub agent_type: AgentType,
     pub status: String,
+    pub awaiting_reply_token: Option<String>,
     /// Mirrors `conversation.kind` — drives sidebar visibility/grouping
     /// (serialized as "regular" | "chat" | "loop" | "delegate").
     pub kind: ConversationKind,
@@ -62,6 +63,14 @@ pub struct DbConversationSummary {
     pub parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationStatePatch {
+    pub id: i32,
+    pub status: String,
+    pub awaiting_reply_token: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

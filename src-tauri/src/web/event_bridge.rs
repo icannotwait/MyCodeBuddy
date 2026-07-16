@@ -197,11 +197,14 @@ pub enum ConversationChange {
     },
     /// Remove by id (soft delete).
     Deleted { id: i32 },
-    /// Lightweight running-state change. Emitted centrally from
-    /// [`emit_with_state`] whenever a `ConversationStatusChanged` ACP event
-    /// flows through, so the sidebar's status reaches every client (not just
-    /// those attached to the connection).
-    Status { id: i32, status: String },
+    /// Authoritative conversation state patch from a successful DB status
+    /// transition. Emitted explicitly by status owners (not auto-bridged from
+    /// per-connection `ConversationStatusChanged`) so every client converges
+    /// on backend `status` / `awaiting_reply_token` / `updated_at` without a
+    /// re-fetch.
+    State {
+        patch: crate::models::ConversationStatePatch,
+    },
 }
 
 /// Global side-channel for cross-client folder list sync. Mirrors
@@ -460,30 +463,10 @@ where
         EventEmitter::Noop => {}
     }
 
-    // Bridge conversation status transitions onto the global
-    // `conversation://changed` side-channel so clients NOT attached to this
-    // connection (only showing the sidebar, or a different browser entirely)
-    // still observe running-state changes live — the per-connection delivery
-    // above only reaches attached clients. One central hook here covers every
-    // `ConversationStatusChanged` emit site (manager + lifecycle). `status`
-    // serializes to the same snake_case string the DB stores (e.g.
-    // "in_progress"), matching `DbConversationSummary.status`.
-    if let AcpEvent::ConversationStatusChanged {
-        conversation_id,
-        status,
-    } = &envelope_arc.payload
-    {
-        if let Ok(serde_json::Value::String(status_str)) = serde_json::to_value(status) {
-            emit_event(
-                emitter,
-                CONVERSATION_CHANGED_EVENT,
-                ConversationChange::Status {
-                    id: *conversation_id,
-                    status: status_str,
-                },
-            );
-        }
-    }
+    // Intentionally no global conversation://changed bridge here.
+    // Status owners emit ConversationChange::State with the exact backend
+    // ConversationStatePatch after a successful DB write (see
+    // emit_conversation_state). Per-connection ACP delivery above is unchanged.
     true
 }
 
@@ -563,10 +546,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_with_state_bridges_status_change_to_global_channel() {
-        // A ConversationStatusChanged ACP event must ALSO surface on the global
-        // `conversation://changed` channel so clients NOT attached to this
-        // connection (e.g. only viewing the sidebar) still observe the flip.
+    async fn conversation_status_changed_does_not_bridge_globally() {
+        // Per-connection ConversationStatusChanged must NOT auto-bridge onto
+        // conversation://changed; status owners emit ConversationChange::State
+        // explicitly with the backend patch after a successful DB write.
         let state = fresh_state();
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let mut rx = broadcaster.subscribe();
@@ -582,20 +565,16 @@ mod tests {
         )
         .await;
 
-        let evt = rx
-            .try_recv()
-            .expect("status change should bridge to the global channel");
-        let p = &*evt.payload;
-        assert_eq!(evt.channel, CONVERSATION_CHANGED_EVENT);
-        assert_eq!(p["kind"], "status");
-        assert_eq!(p["id"], 7);
-        assert_eq!(p["status"], "pending_review");
+        assert!(
+            rx.try_recv().is_err(),
+            "ConversationStatusChanged must not emit on conversation://changed"
+        );
     }
 
     #[tokio::test]
     async fn emit_with_state_non_status_event_does_not_touch_global_channel() {
         // High-frequency stream events (deltas, etc.) must NOT spam the global
-        // sidebar channel — only status transitions bridge.
+        // sidebar channel. Status transitions also do not auto-bridge.
         let state = fresh_state();
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let mut rx = broadcaster.subscribe();

@@ -171,6 +171,7 @@ async fn import_one(
         updated_at: Set(updated_at),
         deleted_at: Set(None),
         pinned_at: Set(None),
+        awaiting_reply_token: Set(None),
     };
     conv.insert(conn).await?;
     Ok(ImportOutcome::Imported)
@@ -383,6 +384,7 @@ mod tests {
             updated_at: Set(now),
             deleted_at: Set(None),
             pinned_at: Set(None),
+            awaiting_reply_token: Set(None),
         }
         .insert(&db.conn)
         .await

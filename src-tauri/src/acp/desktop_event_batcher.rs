@@ -928,6 +928,7 @@ mod tests {
                 session_id: "session-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "grok".into(),
+            mark_awaiting_reply: false,
             },
             1,
         )
@@ -1151,6 +1152,7 @@ mod tests {
                         session_id: "s".into(),
                         stop_reason: "end_turn".into(),
                         agent_type: "grok".into(),
+                    mark_awaiting_reply: false,
                     },
                 }),
                 1,

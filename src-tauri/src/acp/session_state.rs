@@ -1480,6 +1480,7 @@ mod tests {
             session_id: "sess".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         assert!(
             s.pending_user_message.is_none(),
@@ -1977,6 +1978,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         assert!(s.live_message.is_none());
         assert!(s.active_tool_calls.is_empty());
@@ -2064,6 +2066,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
 
         assert!(
@@ -2180,6 +2183,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -2205,6 +2209,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("part 1 part 2"));
     }
@@ -2231,6 +2236,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -2264,6 +2270,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -2291,6 +2298,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -2988,6 +2996,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         // The existing `live_message = None` clear handles the new block kinds
         // automatically — they live inside live_message, not as siblings.

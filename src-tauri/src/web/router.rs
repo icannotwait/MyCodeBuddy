@@ -152,6 +152,10 @@ pub fn build_router(
             post(handlers::conversations::update_conversation_pinned),
         )
         .route(
+            "/clear_awaiting_reply",
+            post(handlers::conversations::clear_awaiting_reply),
+        )
+        .route(
             "/delete_conversation",
             post(handlers::conversations::delete_conversation),
         )

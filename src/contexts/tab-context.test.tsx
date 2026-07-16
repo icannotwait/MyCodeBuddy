@@ -16,7 +16,7 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
-import { resetTabStore } from "@/stores/tab-store"
+import { resetTabStore, useTabStore } from "@/stores/tab-store"
 
 const listOpenedTabsMock = vi.fn()
 const saveOpenedTabsMock = vi.fn()
@@ -118,6 +118,7 @@ const defaultConversationsMock: DbConversationSummary[] = [
     title_locked: false,
     agent_type: "codex",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -135,6 +136,7 @@ const defaultConversationsMock: DbConversationSummary[] = [
     title_locked: false,
     agent_type: "codex",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -152,6 +154,7 @@ const defaultConversationsMock: DbConversationSummary[] = [
     title_locked: false,
     agent_type: "codex",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -1375,6 +1378,7 @@ describe("TabProvider sub-session tabs", () => {
       title_locked: false,
       agent_type: "codex",
       status: "in_progress",
+      awaiting_reply_token: null,
       kind: "delegate",
       model: null,
       git_branch: null,
@@ -1412,12 +1416,16 @@ describe("TabProvider sub-session tabs", () => {
     await act(async () => {})
     expect(subTab()?.title).toBe("Review the auth module")
     expect(subTab()?.status).toBe("in_progress")
-    // A live status event for the running sub-agent flips the tab's status dot.
+    // A live state event for the running sub-agent flips the tab's status + token.
     act(() => {
       conversationChangedHandler?.({
-        kind: "status",
-        id: 99,
-        status: "completed",
+        kind: "state",
+        patch: {
+          id: 99,
+          status: "completed",
+          awaiting_reply_token: "generation-b",
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
       })
     })
     expect(subTab()?.status).toBe("completed")
@@ -1438,7 +1446,7 @@ describe("TabProvider sub-session tabs", () => {
     ).toBe("First")
   })
 
-  it("applies a status event that arrives while the seed fetch is still in flight (no lost event)", async () => {
+  it("applies a state event that arrives while the seed fetch is still in flight (no lost event)", async () => {
     // Hold the seed fetch open so an event can land mid-flight.
     let resolveFetch: (detail: unknown) => void = () => {}
     getFolderConversationMock.mockReturnValue(
@@ -1453,27 +1461,42 @@ describe("TabProvider sub-session tabs", () => {
     })
     await act(async () => {}) // reconcile effect → seed fetch in flight
     // An event lands before the seed resolves — it must be buffered, then win
-    // over the (older) fetched status when the seed commits.
+    // over all three older fetched fields when the seed commits.
     act(() => {
       conversationChangedHandler?.({
-        kind: "status",
-        id: 99,
-        status: "completed",
+        kind: "state",
+        patch: {
+          id: 99,
+          status: "completed",
+          awaiting_reply_token: "generation-b",
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
       })
     })
     await act(async () => {
       resolveFetch({
-        summary: subSummary({ status: "in_progress" }),
+        summary: subSummary({
+          status: "in_progress",
+          awaiting_reply_token: null,
+          updated_at: "2026-07-16T01:00:00.000Z",
+        }),
         turns: [],
         session_stats: null,
       })
     })
     const subTab = latestContext?.tabs.find((tab) => tab.conversationId === 99)
     expect(subTab?.title).toBe("Review the auth module")
-    expect(subTab?.status).toBe("completed") // buffered event won over the fetch
+    expect(subTab?.status).toBe("completed") // buffered state won over the fetch
+    // TabItem exposes status; assert the full three-field merge via the store.
+    const summary = useTabStore.getState().childSummaries.get(99)
+    expect(summary).toMatchObject({
+      status: "completed",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
   })
 
-  it("merges an upsert then a status that both land during the seed window (upsert title + later status)", async () => {
+  it("merges an upsert then a state that both land during the seed window (upsert title + later state)", async () => {
     let resolveFetch: (detail: unknown) => void = () => {}
     getFolderConversationMock.mockReturnValue(
       new Promise((res) => {
@@ -1486,21 +1509,30 @@ describe("TabProvider sub-session tabs", () => {
       latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {}) // seed in flight
-    // Two events during the fetch: a full upsert (new title) THEN a status. The
-    // status must not clobber the upsert's title — both must survive.
+    // Two events during the fetch: a full upsert (new title) THEN a state. The
+    // state must not clobber the upsert's title — both must survive.
     act(() => {
       conversationChangedHandler?.({
         kind: "upsert",
-        summary: subSummary({ title: "Renamed by AI", status: "in_progress" }),
+        summary: subSummary({
+          title: "Renamed by AI",
+          status: "in_progress",
+          awaiting_reply_token: "token-a",
+          updated_at: "2026-07-16T01:30:00.000Z",
+        }),
       })
       conversationChangedHandler?.({
-        kind: "status",
-        id: 99,
-        status: "completed",
+        kind: "state",
+        patch: {
+          id: 99,
+          status: "completed",
+          awaiting_reply_token: "generation-b",
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
       })
     })
     // The fetched snapshot carries the OLD title; the merge must prefer the
-    // upsert's summary and the later status.
+    // upsert's summary and the later state patch on top.
     await act(async () => {
       resolveFetch({
         summary: subSummary({ title: "OLD", status: "pending" }),
@@ -1510,10 +1542,17 @@ describe("TabProvider sub-session tabs", () => {
     })
     const subTab = latestContext?.tabs.find((tab) => tab.conversationId === 99)
     expect(subTab?.title).toBe("Renamed by AI") // upsert summary won over the fetch
-    expect(subTab?.status).toBe("completed") // later status patched on top
+    expect(subTab?.status).toBe("completed") // later state patched on top
+    const summary = useTabStore.getState().childSummaries.get(99)
+    expect(summary).toMatchObject({
+      title: "Renamed by AI",
+      status: "completed",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
   })
 
-  it("keeps a delete terminal across a late status during the seed window (no resurrection)", async () => {
+  it("keeps a delete terminal across a late state during the seed window (no resurrection)", async () => {
     let resolveFetch: (detail: unknown) => void = () => {}
     getFolderConversationMock.mockReturnValue(
       new Promise((res) => {
@@ -1529,9 +1568,13 @@ describe("TabProvider sub-session tabs", () => {
     act(() => {
       conversationChangedHandler?.({ kind: "deleted", id: 99 })
       conversationChangedHandler?.({
-        kind: "status",
-        id: 99,
-        status: "completed",
+        kind: "state",
+        patch: {
+          id: 99,
+          status: "completed",
+          awaiting_reply_token: "generation-b",
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
       })
     })
     await act(async () => {
@@ -1542,10 +1585,67 @@ describe("TabProvider sub-session tabs", () => {
       })
     })
     // A child deleted mid-fetch must not be committed by the seed despite a later
-    // status — the tab stays unresolved ("Untitled"), with no status.
+    // state — the tab stays unresolved ("Untitled"), with no status.
     const subTab = latestContext?.tabs.find((tab) => tab.conversationId === 99)
     expect(subTab?.title).toBe("untitledConversation")
     expect(subTab?.status).toBeUndefined()
+  })
+
+  it("lets a post-state upsert supersede the buffered state during seed fetch", async () => {
+    let resolveFetch: (detail: unknown) => void = () => {}
+    getFolderConversationMock.mockReturnValue(
+      new Promise((res) => {
+        resolveFetch = res
+      })
+    )
+    renderTabs()
+    await act(async () => {})
+    act(() => {
+      latestContext?.openTab(1, 99, "codex", true)
+    })
+    await act(async () => {})
+    // State first, then a full upsert — the upsert must clear the buffered
+    // state so the upsert's three fields win over both the earlier state and
+    // the older fetch snapshot.
+    act(() => {
+      conversationChangedHandler?.({
+        kind: "state",
+        patch: {
+          id: 99,
+          status: "completed",
+          awaiting_reply_token: "stale-token",
+          updated_at: "2026-07-16T02:00:00.000Z",
+        },
+      })
+      conversationChangedHandler?.({
+        kind: "upsert",
+        summary: subSummary({
+          title: "From upsert",
+          status: "in_progress",
+          awaiting_reply_token: "fresh-token",
+          updated_at: "2026-07-16T03:00:00.000Z",
+        }),
+      })
+    })
+    await act(async () => {
+      resolveFetch({
+        summary: subSummary({
+          title: "OLD",
+          status: "pending",
+          awaiting_reply_token: null,
+          updated_at: "2026-07-16T01:00:00.000Z",
+        }),
+        turns: [],
+        session_stats: null,
+      })
+    })
+    const summary = useTabStore.getState().childSummaries.get(99)
+    expect(summary).toMatchObject({
+      title: "From upsert",
+      status: "in_progress",
+      awaiting_reply_token: "fresh-token",
+      updated_at: "2026-07-16T03:00:00.000Z",
+    })
   })
 
   it("seeds an open child tab even when the (loaded) root list is empty", async () => {

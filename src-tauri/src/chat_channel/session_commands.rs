@@ -328,13 +328,16 @@ pub async fn handle_task(
     {
         Ok(id) => id,
         Err(e) => {
-            // Clean up the conversation record
-            let _ = conversation_service::update_status(
+            // Clean up the conversation record and broadcast the exact patch.
+            if let Ok(patch) = conversation_service::update_status_with_patch(
                 db,
                 conv.id,
                 conversation::ConversationStatus::Cancelled,
             )
-            .await;
+            .await
+            {
+                crate::commands::conversations::emit_conversation_state(emitter, patch);
+            }
             return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
         }
     };
@@ -587,22 +590,14 @@ pub async fn handle_cancel(
         }
     };
 
-    // Cancel the ACP connection (also CAS-updates the row to Cancelled and
-    // emits ConversationStatusChanged when the row is still InProgress).
+    // Cancel the ACP connection (CAS-updates InProgress → Cancelled, emits
+    // per-connection ConversationStatusChanged + global State patch when the
+    // CAS wins). Do not write status again here — a second unconditional write
+    // would emit a duplicate/out-of-order patch for the same user cancel.
     let _ = conn_mgr.cancel(db, &connection_id).await;
 
     // Remove from bridge
     bridge.lock().await.remove(&connection_id);
-
-    // Update conversation status
-    if let Some(conv_id) = ctx.current_conversation_id {
-        let _ = conversation_service::update_status(
-            db,
-            conv_id,
-            conversation::ConversationStatus::Cancelled,
-        )
-        .await;
-    }
 
     // Clear session from context
     let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
@@ -742,7 +737,11 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         text: req.text.to_string(),
     }];
 
-    if let Err(e) = req.conn_mgr.send_prompt(&connection_id, blocks).await {
+    if let Err(e) = req
+        .conn_mgr
+        .send_prompt_background(&connection_id, blocks)
+        .await
+    {
         // A turn is already in flight on this (shared) connection — another
         // client, or a previous prompt still running. This is transient: the
         // connection is alive, so do NOT tear down the bridge/session. Tell the

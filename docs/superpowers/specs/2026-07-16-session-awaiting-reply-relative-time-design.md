@@ -265,6 +265,9 @@ transition; the frontend never invents `updated_at` for backend state events.
   though frontend runtime reducers do not consume it.
 - Core prompt APIs require an explicit policy; convenience wrappers encode the
   correct choice for UI, delegation, automation, and chat-channel callers.
+- The attention-policy wrappers do not change mandatory profile-route
+  registration. Chat-channel prompts keep their existing route registration
+  behavior while passing `mark_awaiting_reply = false`.
 - A reused connection therefore follows the source of the current turn rather
   than the source that originally spawned the process.
 
@@ -333,8 +336,11 @@ Add `applyConversationStatePatch(patch)`:
 - Use the backend `updated_at` exactly.
 - Preserve conversation order and stats reference behavior already used by
   lightweight status patches.
-- Unknown ids remain a no-op; child state continues through the existing child
-  session paths.
+- Unknown ids remain a no-op.
+- Existing child-session consumers in `tab-store` and `use-subsession-sync`
+  consume the same `state` variant and merge all three patch fields. The
+  tab-store's in-flight seed buffer stores the whole patch so a late fetch
+  cannot overwrite newer child status, token, or backend `updated_at`.
 
 The global conversation-change subscriber applies the new `state` variant.
 Remove the app-workspace update performed by `ConversationStatusEventBridge` so
@@ -442,6 +448,8 @@ stale or malformed input even though the backend maintains the invariant.
   `9h59m`, `10h`, `23h`, `24h`, `2d`, invalid, and future timestamps.
 - Created sort still orders by `created_at` but displays `updated_at`.
 - State patch applies backend `updated_at` verbatim and does not recompute stats.
+- Child tab and sub-session caches consume the `state` variant, including a
+  state patch that arrives while child seeding is in flight.
 - Awaiting + not selected + PendingReview renders red dot/time and required
   accessible label.
 - Selected, running, completed, and cancelled precedence paths do not show

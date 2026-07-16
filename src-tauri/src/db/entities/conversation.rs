@@ -64,6 +64,9 @@ pub struct Model {
     /// the sidebar's "Pinned" section (sorted by this timestamp descending).
     /// Pinning never bumps `updated_at` — it is a view preference, not activity.
     pub pinned_at: Option<DateTimeUtc>,
+    /// Opaque generation token for race-safe awaiting-reply CAS. `None` means
+    /// not currently awaiting a reply generation (historical/default).
+    pub awaiting_reply_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

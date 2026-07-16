@@ -13,10 +13,7 @@ import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { Sidebar } from "@/components/layout/sidebar"
 import { StatusBar } from "@/components/layout/status-bar"
-import {
-  AppWorkspaceProvider,
-  ConversationStatusEventBridge,
-} from "@/contexts/app-workspace-context"
+import { AppWorkspaceProvider } from "@/contexts/app-workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { TaskProvider } from "@/contexts/task-context"
 import { AlertProvider } from "@/contexts/alert-context"
@@ -64,6 +61,7 @@ import {
   PetFocusBridge,
 } from "@/components/workspace/deep-link-bootstrap"
 import { WorkspaceOpenFolderListener } from "@/components/workspace/workspace-open-folder-listener"
+import { ConversationAwaitingReplyClearer } from "@/components/conversations/conversation-awaiting-reply-clearer"
 import { HeavyPluginsWarmup } from "@/components/ai-elements/heavy-plugins-warmup"
 import {
   ResizableHandle,
@@ -937,7 +935,6 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
           <TaskProvider>
             <AcpConnectionsProvider>
               <DelegationProvider>
-                <ConversationStatusEventBridge />
                 <ConversationRuntimeProvider>
                   <WorkspaceProvider>
                     <TabProvider>
@@ -957,6 +954,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                 <AutomationsViewProvider>
                                   <WorkbenchRouteProvider>
                                     <WorkbenchRouteConversationSync />
+                                    <ConversationAwaitingReplyClearer />
                                     {/* Inside WorkbenchRouteProvider: the
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}

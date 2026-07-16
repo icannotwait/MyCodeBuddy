@@ -15,6 +15,7 @@ import { toErrorMessage } from "@/lib/app-error"
 import type {
   AgentStats,
   AgentType,
+  ConversationStatePatch,
   DbConversationSummary,
   FolderDetail,
   GitHeadInfo,
@@ -78,6 +79,12 @@ export interface AppWorkspaceStoreState {
       Pick<DbConversationSummary, "status" | "title" | "pinned_at">
     >
   ) => void
+  /**
+   * Apply an authoritative backend state patch (`status`, `awaiting_reply_token`,
+   * `updated_at`). Does NOT invent client `updated_at` — use this for
+   * `conversation://changed` kind `"state"`, never `updateConversationLocal`.
+   */
+  applyConversationStatePatch: (patch: ConversationStatePatch) => void
   applyConversationUpsert: (summary: DbConversationSummary) => void
   applyConversationRemove: (id: number) => void
   getBranch: (folderId: number) => string | null | undefined
@@ -227,6 +234,26 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
           ? withConversations(next)
           : { conversations: next, stats: get().stats }
       )
+    },
+
+    // Authoritative backend state for status / awaiting_reply_token / updated_at.
+    // Never invents client timestamps — those would race the backend clock and
+    // break relative-time display. Stats are identity-stable: state patches
+    // cannot change count, agent type, or message count.
+    applyConversationStatePatch: (patch) => {
+      const prev = get().conversations
+      const index = prev.findIndex(
+        (conversation) => conversation.id === patch.id
+      )
+      if (index < 0) return
+      const next = prev.slice()
+      next[index] = {
+        ...next[index],
+        status: patch.status,
+        awaiting_reply_token: patch.awaiting_reply_token,
+        updated_at: patch.updated_at,
+      }
+      set({ conversations: next, stats: get().stats })
     },
 
     // Insert-or-replace a conversation by id (create + field updates). Root-only:

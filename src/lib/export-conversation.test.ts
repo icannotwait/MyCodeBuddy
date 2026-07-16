@@ -84,6 +84,7 @@ function makeData(): ExportConversationData {
       title_locked: false,
       agent_type: "claude_code",
       status: "completed",
+      awaiting_reply_token: null,
       kind: "regular",
       model: null,
       git_branch: null,

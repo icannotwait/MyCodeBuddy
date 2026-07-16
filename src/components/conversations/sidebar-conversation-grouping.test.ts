@@ -35,6 +35,7 @@ function conv(
     title_locked: false,
     agent_type: "claude_code",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -56,19 +57,23 @@ describe("formatRelative", () => {
     expect(formatRelative("not-a-date", now)).toBe("")
   })
 
-  it("buckets the elapsed time into compact units", () => {
-    expect(formatRelative(new Date(now - 30_000).toISOString(), now)).toBe(
-      "now"
+  it.each([
+    [30_000, "now"],
+    [5 * MINUTE, "5m"],
+    [59 * MINUTE, "59m"],
+    [60 * MINUTE, "1h"],
+    [61 * MINUTE, "1h1m"],
+    [(3 * 60 + 5) * MINUTE, "3h5m"],
+    [(3 * 60 + 25) * MINUTE, "3h25m"],
+    [(9 * 60 + 59) * MINUTE, "9h59m"],
+    [10 * 60 * MINUTE, "10h"],
+    [(23 * 60 + 59) * MINUTE, "23h"],
+    [24 * 60 * MINUTE, "1d"],
+    [2 * 24 * 60 * MINUTE, "2d"],
+  ])("formats %i milliseconds as %s", (elapsed, label) => {
+    expect(formatRelative(new Date(now - elapsed).toISOString(), now)).toBe(
+      label
     )
-    expect(formatRelative(new Date(now - 5 * MINUTE).toISOString(), now)).toBe(
-      "5m"
-    )
-    expect(
-      formatRelative(new Date(now - 3 * 60 * MINUTE).toISOString(), now)
-    ).toBe("3h")
-    expect(
-      formatRelative(new Date(now - 2 * 24 * 60 * MINUTE).toISOString(), now)
-    ).toBe("2d")
   })
 
   it("is deterministic for a given `now` regardless of the wall clock", () => {

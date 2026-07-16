@@ -571,6 +571,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         }
     }
@@ -840,6 +841,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         process_envelope(
@@ -886,6 +888,7 @@ mod permission_push_tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         process_envelope(

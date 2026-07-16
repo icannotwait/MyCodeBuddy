@@ -256,6 +256,7 @@ function conv(
     title_locked: false,
     agent_type: "claude_code",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -797,5 +798,39 @@ describe("SidebarConversationList — folder ⋯ opens the same menu as right-cl
 
     // The identical menu is now open — assert a label unique to the folder menu.
     expect(document.body.textContent).toContain("Manage conversations")
+  })
+})
+
+describe("SidebarConversationList — card time label always uses updated_at", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+    probes.card = 0
+    probes.folder = 0
+    const folders = [folder(1, "Folder 1")]
+    // Old created_at (2d) vs five-minute-old updated_at — with sortMode="created"
+    // the list must still render the updated_at label ("5m"), not "2d".
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [
+        conv(11, 1, {
+          created_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+          updated_at: new Date(FIXED - 5 * MINUTE).toISOString(),
+        }),
+      ],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("shows updated_at relative time under created sort mode", () => {
+    render(tree())
+    const text = document.body.textContent ?? ""
+    expect(text).toContain("5m")
+    expect(text).not.toContain("2d")
   })
 })

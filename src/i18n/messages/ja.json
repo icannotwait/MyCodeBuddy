@@ -1210,6 +1210,7 @@
       "sectionOrderChatsFirst": "チャットを上に",
       "statusRunningBadge": "実行中",
       "statusCancelledBadge": "キャンセル済み",
+      "statusAwaitingReplyBadge": "返信待ち",
       "conversationCountUnit": "{count} 件",
       "emptyFolderHint": "会話がありません",
       "noMatchingConversations": "一致する会話がありません",

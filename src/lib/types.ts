@@ -319,6 +319,7 @@ export interface DbConversationSummary {
   title_locked: boolean
   agent_type: AgentType
   status: string
+  awaiting_reply_token: string | null
   /** Mirrors `conversation.kind` — drives sidebar visibility and grouping. */
   kind: ConversationKind
   model: string | null
@@ -340,13 +341,20 @@ export interface DbConversationSummary {
   delegation_call_id?: string | null
 }
 
+export interface ConversationStatePatch {
+  id: number
+  status: string
+  awaiting_reply_token: string | null
+  updated_at: string
+}
+
 /** Payload for the global `conversation://changed` side-channel that keeps
  *  every client's sidebar list/status in sync across desktop + browsers.
  *  Mirrors the Rust `ConversationChange` enum (serde `tag = "kind"`). */
 export type ConversationChange =
   | { kind: "upsert"; summary: DbConversationSummary }
   | { kind: "deleted"; id: number }
-  | { kind: "status"; id: number; status: string }
+  | { kind: "state"; patch: ConversationStatePatch }
 
 export const CONVERSATION_CHANGED_EVENT = "conversation://changed"
 
@@ -453,7 +461,7 @@ export const STATUS_COLORS: Record<ConversationStatus, string> = {
   in_progress: "bg-yellow-400",
   pending_review: "bg-blue-500",
   completed: "bg-green-500",
-  cancelled: "bg-red-500",
+  cancelled: "bg-gray-400 dark:bg-gray-500",
 }
 
 export const AGENT_DISPLAY_ORDER: AgentType[] = [
@@ -1136,6 +1144,7 @@ export type AcpEvent =
       type: "turn_complete"
       session_id: string
       stop_reason: string
+      mark_awaiting_reply: boolean
     }
   | {
       // Synthetic notification-only event (chat-channel "user message" push).

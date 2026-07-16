@@ -1210,6 +1210,7 @@
       "sectionOrderChatsFirst": "Chat no topo",
       "statusRunningBadge": "Executando",
       "statusCancelledBadge": "Cancelado",
+      "statusAwaitingReplyBadge": "Aguardando sua resposta",
       "conversationCountUnit": "{count, plural, one {# conversa} other {# conversas}}",
       "emptyFolderHint": "Sem conversas",
       "noMatchingConversations": "Nenhuma conversa correspondente",

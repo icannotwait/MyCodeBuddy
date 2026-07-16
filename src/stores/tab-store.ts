@@ -17,6 +17,7 @@ import {
 import type {
   AgentType,
   ConversationChange,
+  ConversationStatePatch,
   ConversationStatus,
   DbConversationSummary,
   OpenedTab,
@@ -251,7 +252,12 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 const childSummaryInFlight = new Set<number>()
 const childSeedBuffer = new Map<
   number,
-  { summary?: DbConversationSummary; status?: string; deleted?: boolean }
+  {
+    summary?: DbConversationSummary
+    /** Full state patch buffered while seed fetch is in flight. */
+    state?: ConversationStatePatch
+    deleted?: boolean
+  }
 >()
 let seedEpoch = 0
 const previewReplacedCallbacks = new Set<(tabId: string) => void>()
@@ -1153,9 +1159,16 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           const buffered = childSeedBuffer.get(id)
           if (buffered?.deleted) return
           if (!get().rawTabs.some((tb) => tb.conversationId === id)) return
+          // Prefer a live upsert summary over the fetch snapshot; then apply any
+          // later state patch on top so the newest three fields win.
           let summary = buffered?.summary ?? detail.summary
-          if (buffered?.status != null) {
-            summary = { ...summary, status: buffered.status }
+          if (buffered?.state != null) {
+            summary = {
+              ...summary,
+              status: buffered.state.status,
+              awaiting_reply_token: buffered.state.awaiting_reply_token,
+              updated_at: buffered.state.updated_at,
+            }
           }
           const nextChild = new Map(get().childSummaries)
           nextChild.set(id, summary)
@@ -1174,7 +1187,12 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
   },
 
   handleChildConversationChange: (change) => {
-    const id = change.kind === "upsert" ? change.summary.id : change.id
+    const id =
+      change.kind === "upsert"
+        ? change.summary.id
+        : change.kind === "state"
+          ? change.patch.id
+          : change.id
     if (get().childSummaries.has(id)) {
       if (change.kind === "upsert") {
         const summary = change.summary
@@ -1184,12 +1202,24 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         next.set(summary.id, summary)
         set({ childSummaries: next })
         recomputeTabs()
-      } else if (change.kind === "status") {
+      } else if (change.kind === "state") {
         const prev = get().childSummaries
-        const cur = prev.get(change.id)
-        if (!cur || cur.status === change.status) return
+        const cur = prev.get(change.patch.id)
+        if (!cur) return
+        if (
+          cur.status === change.patch.status &&
+          cur.awaiting_reply_token === change.patch.awaiting_reply_token &&
+          cur.updated_at === change.patch.updated_at
+        ) {
+          return
+        }
         const next = new Map(prev)
-        next.set(change.id, { ...cur, status: change.status })
+        next.set(change.patch.id, {
+          ...cur,
+          status: change.patch.status,
+          awaiting_reply_token: change.patch.awaiting_reply_token,
+          updated_at: change.patch.updated_at,
+        })
         set({ childSummaries: next })
         recomputeTabs()
       } else {
@@ -1203,6 +1233,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       return
     }
     // Seed for this id is still in flight — accumulate into the pending buffer.
+    // Ordering: upsert supersedes a prior buffered state; a later state applies
+    // on top of a buffered upsert; deleted remains terminal for any late event.
     if (childSummaryInFlight.has(id)) {
       const pending = childSeedBuffer.get(id) ?? {}
       if (change.kind === "deleted") {
@@ -1210,9 +1242,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       } else if (!pending.deleted) {
         if (change.kind === "upsert") {
           pending.summary = change.summary
-          pending.status = undefined
+          pending.state = undefined
         } else {
-          pending.status = change.status
+          pending.state = change.patch
         }
       }
       childSeedBuffer.set(id, pending)

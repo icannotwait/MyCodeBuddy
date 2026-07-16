@@ -17,6 +17,7 @@ use crate::acp::types::{
 };
 
 use crate::db::service::{app_metadata_service, conversation_service, sender_context_service};
+use crate::web::event_bridge::EventEmitter;
 
 use super::manager::ChatChannelManager;
 
@@ -27,12 +28,17 @@ const MESSAGE_LANGUAGE_KEY: &str = "chat_message_language";
 const COMMAND_PREFIX_KEY: &str = "chat_command_prefix";
 const DEFAULT_COMMAND_PREFIX: &str = "/";
 
+/// `emitter` is the durable app-level emitter for global
+/// `conversation://changed` state patches. Must not depend on a live
+/// ConnectionManager entry — the connection may already be gone when chat
+/// turns complete or fail.
 pub fn spawn_session_event_subscriber(
     bus: Arc<InternalEventBus>,
     bridge: Arc<Mutex<SessionBridge>>,
     manager: ChatChannelManager,
     conn_mgr: ConnectionManager,
     db_conn: DatabaseConnection,
+    emitter: EventEmitter,
 ) -> JoinHandle<()> {
     let mut rx = bus.subscribe();
     let metrics = Arc::clone(bus.metrics());
@@ -59,6 +65,7 @@ pub fn spawn_session_event_subscriber(
                         &manager,
                         &conn_mgr,
                         &db_conn,
+                        &emitter,
                     )
                     .await;
                 }
@@ -100,6 +107,7 @@ async fn handle_acp_envelope(
     manager: &ChatChannelManager,
     conn_mgr: &ConnectionManager,
     db: &DatabaseConnection,
+    emitter: &EventEmitter,
 ) {
     let connection_id = envelope.connection_id.as_str();
 
@@ -120,7 +128,7 @@ async fn handle_acp_envelope(
                     let blocks = vec![PromptInputBlock::Text {
                         text: prompt_text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
                         // A turn is already in flight on this shared connection
                         // (another client raced this kickoff between
                         // SessionStarted and here). Transient, not a failure —
@@ -469,12 +477,18 @@ async fn handle_acp_envelope(
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
                 if stop_reason == "end_turn" {
-                    let _ = conversation_service::update_status(
+                    if let Ok(patch) = conversation_service::update_status_with_patch(
                         db,
                         conv_id,
                         crate::db::entities::conversation::ConversationStatus::Completed,
                     )
-                    .await;
+                    .await
+                    {
+                        // Emit via the durable app-level emitter so the global
+                        // state patch is not dropped when ConnectionManager
+                        // has already removed this connection.
+                        crate::commands::conversations::emit_conversation_state(emitter, patch);
+                    }
                 }
 
                 // Retry the deferred kickoff now the turn that blocked it ended.
@@ -485,7 +499,7 @@ async fn handle_acp_envelope(
                     let blocks = vec![PromptInputBlock::Text {
                         text: prompt_text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
                             let mut g = bridge.lock().await;
                             if let Some(s) = g.get_mut(connection_id) {
@@ -496,7 +510,9 @@ async fn handle_acp_envelope(
                                  next TurnComplete"
                             );
                         } else {
-                            tracing::error!("[SessionEventSub] failed to send deferred kickoff: {e}");
+                            tracing::error!(
+                                "[SessionEventSub] failed to send deferred kickoff: {e}"
+                            );
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_channel(channel_id, &msg).await;
                         }
@@ -552,12 +568,19 @@ async fn handle_acp_envelope(
 
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
-                let _ = conversation_service::update_status(
+                // CAS InProgress → Cancelled so a lifecycle terminal winner
+                // (or prior cancel) leaves chat as a no-op: no second
+                // updated_at bump and no duplicate state patch.
+                if let Ok(Some(patch)) = conversation_service::update_status_if_with_patch(
                     db,
                     conv_id,
+                    crate::db::entities::conversation::ConversationStatus::InProgress,
                     crate::db::entities::conversation::ConversationStatus::Cancelled,
                 )
-                .await;
+                .await
+                {
+                    crate::commands::conversations::emit_conversation_state(emitter, patch);
+                }
                 let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
             }
         }
@@ -919,9 +942,7 @@ mod delegation_relay_tests {
         assert!(is_delegation_title("delegate_to_agent"));
         assert!(is_delegation_title("Delegate To Agent"));
         assert!(is_delegation_title("delegate-to-agent"));
-        assert!(is_delegation_title(
-            "mcp__codeg-mcp__delegate_to_agent"
-        ));
+        assert!(is_delegation_title("mcp__codeg-mcp__delegate_to_agent"));
         assert!(is_delegation_title("Run mcp__codeg__delegate_to_agent"));
         assert!(!is_delegation_title("agent"));
         assert!(!is_delegation_title("write"));
@@ -1224,6 +1245,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         let msgs = sent(&rec).await;
@@ -1239,7 +1261,15 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn).await;
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
         // The later terminal update carries raw_input (re-creating the old
         // input-map token) AND terminal output.
         handle_acp_envelope(
@@ -1248,6 +1278,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         let msgs = sent(&rec).await;
@@ -1272,9 +1303,18 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn).await;
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
         let msgs = sent(&rec).await;
         assert_eq!(msgs.len(), 2, "ack + result, got {msgs:?}");
         assert!(msgs[0].contains("running in background"));
@@ -1288,7 +1328,15 @@ mod async_relay_dedup_tests {
         let (bridge, chat, rec) = harness().await;
         let conn = ConnectionManager::new();
         let db = test_helpers::fresh_in_memory_db().await;
-        handle_acp_envelope(&delegation_completed_ok(), &bridge, &chat, &conn, &db.conn).await;
+        handle_acp_envelope(
+            &delegation_completed_ok(),
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
         // Host re-emits the running ack after completion, with raw_input.
         handle_acp_envelope(
             &completed_update(ACK, true),
@@ -1296,6 +1344,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         let msgs = sent(&rec).await;
@@ -1317,6 +1366,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         let msgs = sent(&rec).await;
@@ -1359,7 +1409,15 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
             },
         };
-        handle_acp_envelope(&started, &bridge, &chat, &conn, &db.conn).await;
+        handle_acp_envelope(
+            &started,
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
 
         assert_eq!(
             bridge
@@ -1398,9 +1456,18 @@ mod async_relay_dedup_tests {
                 session_id: "S1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude".into(),
+                mark_awaiting_reply: false,
             },
         };
-        handle_acp_envelope(&complete, &bridge, &chat, &conn, &db.conn).await;
+        handle_acp_envelope(
+            &complete,
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
 
         assert!(
             bridge
@@ -1503,7 +1570,15 @@ mod error_terminal_gate_tests {
                 terminal: false,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn).await;
+        handle_acp_envelope(
+            &envelope,
+            &bridge,
+            &chat_mgr,
+            &conn_mgr,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
 
         // Session bridge entry is preserved — the next user message on the
         // same connection can still flow through it.
@@ -1535,7 +1610,15 @@ mod error_terminal_gate_tests {
                 terminal: true,
             },
         };
-        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn).await;
+        handle_acp_envelope(
+            &envelope,
+            &bridge,
+            &chat_mgr,
+            &conn_mgr,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
 
         assert!(
             bridge.lock().await.get("c-term").is_none(),
@@ -1544,6 +1627,129 @@ mod error_terminal_gate_tests {
         assert_eq!(
             read_row_status(&db, conv_id).await,
             ConversationStatus::Cancelled
+        );
+    }
+
+    /// Completed (end_turn) must broadcast the exact DB state patch even when
+    /// ConnectionManager has no live entry for the connection — the durable
+    /// app-level emitter is the sole delivery path.
+    #[tokio::test]
+    async fn completed_emits_state_patch_without_live_connection() {
+        use crate::db::entities::conversation;
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (bridge, conv_id) = seed_session(&db, "c-gone").await;
+        let chat_mgr = ChatChannelManager::new();
+        // Empty ConnectionManager — get_state_and_emitter would return None.
+        let conn_mgr = ConnectionManager::new();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let envelope = EventEnvelope {
+            seq: 1,
+            connection_id: "c-gone".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "S1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter).await;
+
+        let row = conversation::Entity::find_by_id(conv_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::Completed);
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(
+            state_events.len(),
+            1,
+            "Completed must emit exactly one conversation://changed even without a live connection"
+        );
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], conv_id);
+        assert_eq!(p["patch"]["status"], "completed");
+        assert_eq!(p["patch"]["awaiting_reply_token"], serde_json::Value::Null);
+        assert_eq!(
+            p["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
+    /// Terminal Error after the row is already Cancelled (lifecycle won the
+    /// race) must be a no-op: no second `updated_at` bump and no extra state
+    /// patch.
+    #[tokio::test]
+    async fn terminal_error_after_cancelled_is_noop_no_second_patch() {
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (bridge, conv_id) = seed_session(&db, "c-raced").await;
+        let chat_mgr = ChatChannelManager::new();
+        let conn_mgr = ConnectionManager::new();
+
+        // Lifecycle (or prior cancel) already wrote Cancelled.
+        let prior = conversation_service::update_status_with_patch(
+            &db.conn,
+            conv_id,
+            ConversationStatus::Cancelled,
+        )
+        .await
+        .unwrap();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let envelope = EventEnvelope {
+            seq: 1,
+            connection_id: "c-raced".to_string(),
+            payload: AcpEvent::Error {
+                message: "transport closed".into(),
+                agent_type: "claude_code".into(),
+                code: None,
+                terminal: true,
+            },
+        };
+        handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter).await;
+
+        let row = conversation::Entity::find_by_id(conv_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::Cancelled);
+        assert_eq!(
+            row.updated_at, prior.updated_at,
+            "CAS loser must not bump updated_at"
+        );
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert!(
+            state_events.is_empty(),
+            "CAS loser must not emit a second state patch, got {state_events:?}"
         );
     }
 }

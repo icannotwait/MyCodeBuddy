@@ -243,7 +243,9 @@ impl ChatChannelManager {
             bridge.clone(),
         );
 
-        // Spawn session event subscriber (ACP event routing to channels)
+        // Spawn session event subscriber (ACP event routing to channels).
+        // Clone the durable app-level emitter so global state patches still
+        // fire after ConnectionManager drops the live connection entry.
         let manager_for_session_events = self.clone_ref();
         super::session_event_subscriber::spawn_session_event_subscriber(
             bus,
@@ -251,6 +253,7 @@ impl ChatChannelManager {
             manager_for_session_events,
             conn_mgr.clone_ref(),
             db_conn.clone(),
+            emitter.clone(),
         );
 
         // Spawn command dispatcher

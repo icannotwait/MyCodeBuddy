@@ -37,6 +37,7 @@ function child(
     title_locked: false,
     agent_type: "codex",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "delegate",
     model: null,
     git_branch: null,
@@ -71,19 +72,43 @@ describe("useSubsessionSync", () => {
     reconnectCb = null
   })
 
-  it("routes a child status event into its parent's array", async () => {
+  it("routes a child state event into its parent's array with all three fields", async () => {
     const { result } = await setup(
-      new Map([[1, [child(100, 1), child(101, 1)]]])
+      new Map([
+        [
+          1,
+          [
+            child(100, 1, {
+              status: "pending",
+              awaiting_reply_token: null,
+              updated_at: "2026-07-16T01:00:00.000Z",
+            }),
+            child(101, 1),
+          ],
+        ],
+      ])
     )
     act(() =>
-      capturedHandler!({ kind: "status", id: 100, status: "completed" })
+      capturedHandler!({
+        kind: "state",
+        patch: {
+          id: 100,
+          status: "completed",
+          awaiting_reply_token: "generation-b",
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
+      })
     )
     const arr = result.current.get(1)!
-    expect(arr[0].status).toBe("completed")
+    expect(arr[0]).toMatchObject({
+      status: "completed",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
     expect(arr[1].status).toBe("pending") // sibling untouched
   })
 
-  it("keeps sibling parent arrays referentially stable on a status event", async () => {
+  it("keeps sibling parent arrays referentially stable on a state event", async () => {
     const a = [child(100, 1)]
     const b = [child(200, 2)]
     const { result } = await setup(
@@ -93,7 +118,15 @@ describe("useSubsessionSync", () => {
       ])
     )
     act(() =>
-      capturedHandler!({ kind: "status", id: 100, status: "completed" })
+      capturedHandler!({
+        kind: "state",
+        patch: {
+          id: 100,
+          status: "completed",
+          awaiting_reply_token: null,
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
+      })
     )
     expect(result.current.get(2)).toBe(b) // untouched parent keeps identity
     expect(result.current.get(1)).not.toBe(a) // touched parent rebuilt
@@ -148,11 +181,19 @@ describe("useSubsessionSync", () => {
     expect(result.current.has(200)).toBe(false) // grandchild subtree dropped
   })
 
-  it("ignores a status event for an unknown (root or unloaded) id", async () => {
+  it("ignores a state event for an unknown (root or unloaded) id", async () => {
     const a = [child(100, 1)]
     const { result } = await setup(new Map([[1, a]]))
     act(() =>
-      capturedHandler!({ kind: "status", id: 999, status: "completed" })
+      capturedHandler!({
+        kind: "state",
+        patch: {
+          id: 999,
+          status: "completed",
+          awaiting_reply_token: null,
+          updated_at: "2026-07-16T02:03:04.000Z",
+        },
+      })
     )
     expect(result.current.get(1)).toBe(a) // no change, identity stable
   })

@@ -14,6 +14,7 @@ function makeSummary(
     title_locked: false,
     agent_type: "claude_code",
     status: "in_progress",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -99,5 +100,48 @@ describe("updateConversationLocal — stats reference stability", () => {
       .applyConversationUpsert(makeSummary({ id: 1, message_count: 10 }))
 
     expect(useAppWorkspaceStore.getState().stats?.total_messages).toBe(14)
+  })
+})
+
+describe("applyConversationStatePatch — backend authority exactness", () => {
+  it("applies backend conversation state without inventing updated_at", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({
+        id: 1,
+        status: "in_progress",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-16T01:00:00.000Z",
+      })
+    )
+    const statsBefore = useAppWorkspaceStore.getState().stats
+
+    store.applyConversationStatePatch({
+      id: 1,
+      status: "pending_review",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
+
+    const state = useAppWorkspaceStore.getState()
+    expect(state.conversations[0]).toMatchObject({
+      status: "pending_review",
+      awaiting_reply_token: "generation-b",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
+    expect(state.stats).toBe(statsBefore)
+  })
+
+  it("ignores a state patch for an unknown conversation", () => {
+    const before = useAppWorkspaceStore.getState()
+    before.applyConversationStatePatch({
+      id: 999,
+      status: "pending_review",
+      awaiting_reply_token: "unknown",
+      updated_at: "2026-07-16T02:03:04.000Z",
+    })
+    expect(useAppWorkspaceStore.getState().conversations).toBe(
+      before.conversations
+    )
   })
 })
