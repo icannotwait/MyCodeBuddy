@@ -1441,6 +1441,43 @@ pub async fn update_conversation_pinned(
     Ok(())
 }
 
+/// Expected-token CAS clear of `awaiting_reply_token`. Emits a global state
+/// event only when the service reports `changed=true` (matching token). Stale
+/// or already-cleared clears return the current backend patch with no event.
+/// Never mutates `status` / `updated_at` (enforced by the service).
+pub async fn clear_awaiting_reply_core(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    expected_token: String,
+) -> Result<ConversationStatePatch, AppCommandError> {
+    let outcome =
+        conversation_service::clear_awaiting_reply(conn, conversation_id, &expected_token)
+            .await
+            .map_err(AppCommandError::from)?;
+    if outcome.changed {
+        emit_conversation_state(emitter, outcome.patch.clone());
+    }
+    Ok(outcome.patch)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn clear_awaiting_reply(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+    expected_token: String,
+) -> Result<ConversationStatePatch, AppCommandError> {
+    clear_awaiting_reply_core(
+        &db.conn,
+        &EventEmitter::Tauri(app),
+        conversation_id,
+        expected_token,
+    )
+    .await
+}
+
 pub async fn delete_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
@@ -3208,6 +3245,78 @@ mod tests {
         assert_eq!(event.payload["kind"], "state");
         assert_eq!(event.payload["patch"]["id"], 42);
         assert_eq!(event.payload["patch"]["awaiting_reply_token"], "token-42");
+    }
+
+    #[tokio::test]
+    async fn clear_awaiting_reply_core_emits_state_only_when_changed() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-clear-awaiting").await;
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+            .await
+            .expect("create");
+        let before = conversation_service::finish_end_turn_if_in_progress(&db.conn, id, true)
+            .await
+            .expect("finish")
+            .expect("CAS changed");
+        let token = before.awaiting_reply_token.clone().expect("token");
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut rx = broadcaster.subscribe();
+
+        let cleared = clear_awaiting_reply_core(&db.conn, &emitter, id, token.clone())
+            .await
+            .expect("clear");
+        assert!(cleared.awaiting_reply_token.is_none());
+        assert_eq!(cleared.updated_at, before.updated_at);
+        let event = rx.try_recv().expect("state event");
+        assert_eq!(event.channel, CONVERSATION_CHANGED_EVENT);
+        assert_eq!(event.payload["kind"], "state");
+        assert_eq!(
+            event.payload["patch"]["awaiting_reply_token"],
+            serde_json::Value::Null
+        );
+
+        // Stale / already-cleared: return current backend patch, no second event.
+        let stale = clear_awaiting_reply_core(&db.conn, &emitter, id, token)
+            .await
+            .expect("stale clear");
+        assert!(stale.awaiting_reply_token.is_none());
+        assert_eq!(stale.updated_at, before.updated_at);
+        assert!(
+            rx.try_recv().is_err(),
+            "already-cleared clear must not emit a second state event"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_folder_conversation_does_not_clear_awaiting_reply() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-getter-awaiting").await;
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+            .await
+            .expect("create");
+        let marked = conversation_service::finish_end_turn_if_in_progress(&db.conn, id, true)
+            .await
+            .expect("finish")
+            .expect("CAS changed");
+        let token = marked.awaiting_reply_token.clone().expect("token");
+
+        let (detail, _) = get_folder_conversation_core(&db.conn, id)
+            .await
+            .expect("get");
+        assert_eq!(
+            detail.summary.awaiting_reply_token.as_deref(),
+            Some(token.as_str()),
+            "read-only getter must not clear awaiting_reply_token"
+        );
+
+        let after = conversation_service::get_by_id(&db.conn, id)
+            .await
+            .expect("row after getter");
+        assert_eq!(
+            after.awaiting_reply_token.as_deref(),
+            Some(token.as_str()),
+            "DB token must survive get_folder_conversation_core"
+        );
     }
 
     #[tokio::test]

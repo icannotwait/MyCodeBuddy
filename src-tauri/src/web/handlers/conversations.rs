@@ -306,6 +306,28 @@ pub async fn update_conversation_pinned(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClearAwaitingReplyParams {
+    pub conversation_id: i32,
+    pub expected_token: String,
+}
+
+pub async fn clear_awaiting_reply(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ClearAwaitingReplyParams>,
+) -> Result<Json<ConversationStatePatch>, AppCommandError> {
+    Ok(Json(
+        conv_commands::clear_awaiting_reply_core(
+            &state.db.conn,
+            &state.emitter,
+            params.conversation_id,
+            params.expected_token,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteConversationParams {
     pub conversation_id: i32,
 }
