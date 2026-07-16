@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Switch } from "@/components/ui/switch"
@@ -20,21 +20,34 @@ export function AgentThinkingVisibilitySwitch({
   onCheckedChange,
 }: AgentThinkingVisibilitySwitchProps) {
   const t = useTranslations("AcpAgentSettings")
-  const [saving, setSaving] = useState(false)
+  const [savingByAgent, setSavingByAgent] = useState<
+    Partial<Record<AgentType, boolean>>
+  >({})
+  const inflightRef = useRef<Partial<Record<AgentType, boolean>>>({})
+
+  const saving = Boolean(savingByAgent[agentType])
 
   const handleChange = async (next: boolean) => {
-    if (saving) return
-    onCheckedChange(agentType, next)
-    setSaving(true)
+    if (inflightRef.current[agentType]) return
+    inflightRef.current[agentType] = true
+
+    const requestAgent = agentType
+    const previous = checked
+    onCheckedChange(requestAgent, next)
+    setSavingByAgent((prev) => ({ ...prev, [requestAgent]: true }))
+
     try {
-      await acpUpdateAgentDisplayPreferences(agentType, next)
+      await acpUpdateAgentDisplayPreferences(requestAgent, next)
+      // Re-apply in case a parent list refresh overwrote the optimistic value.
+      onCheckedChange(requestAgent, next)
     } catch (error) {
-      onCheckedChange(agentType, !next)
+      onCheckedChange(requestAgent, previous)
       toast.error(t("toasts.saveThinkingVisibilityFailed"), {
         description: toErrorMessage(error),
       })
     } finally {
-      setSaving(false)
+      inflightRef.current[requestAgent] = false
+      setSavingByAgent((prev) => ({ ...prev, [requestAgent]: false }))
     }
   }
 
