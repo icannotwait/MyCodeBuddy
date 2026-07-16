@@ -131,12 +131,23 @@ export function canReloadSessionLoadError(
   return code !== "legacy_cli_session"
 }
 
+type AutolinkableTextPart = Extract<AdaptedContentPart, { type: "text" }>
+
+const EMPTY_AUTOLINKABLE_TEXT_PARTS: ReadonlySet<AutolinkableTextPart> =
+  new Set()
+
 interface ResolvedMessageGroup {
   id: string
   role: "user" | "assistant" | "system"
   parts: AdaptedContentPart[]
   resources: UserResourceDisplay[]
   images: UserImageDisplay[]
+  /**
+   * Top-level adapted text parts from source-role `assistant` messages only.
+   * Object-identity membership gates local-path autolinking; tool text that
+   * is display-normalized to assistant is intentionally excluded.
+   */
+  autolinkableTextParts: ReadonlySet<AutolinkableTextPart>
   usage?: import("@/lib/types").TurnUsage | null
   duration_ms?: number | null
   model?: string | null
@@ -148,6 +159,18 @@ interface ResolvedMessageGroup {
    * duration.
    */
   completed_at?: string | null
+}
+
+function topLevelAssistantTextParts(
+  message: AdaptedMessage
+): ReadonlySet<AutolinkableTextPart> {
+  if (message.role !== "assistant") return EMPTY_AUTOLINKABLE_TEXT_PARTS
+  const parts = message.content.filter(
+    (part): part is AutolinkableTextPart => part.type === "text"
+  )
+  return parts.length > 0
+    ? new Set(parts)
+    : EMPTY_AUTOLINKABLE_TEXT_PARTS
 }
 
 type ThreadRenderItem =
@@ -335,6 +358,15 @@ function mergeConsecutiveAssistantTurns(
       const last = buffer[buffer.length - 1]
       const first = buffer[0]
 
+      // Union source-assistant text identities across sub-turns so eligibility
+      // survives display-role merges (tool text identities stay out).
+      const mergedAutolinkableTextParts = new Set<AutolinkableTextPart>()
+      for (const item of buffer) {
+        for (const part of item.group.autolinkableTextParts) {
+          mergedAutolinkableTextParts.add(part)
+        }
+      }
+
       // Aggregate stats across the merged sub-turns so the post-stream
       // stats row reflects the whole assistant response, not just the
       // last sub-turn. Without this, multi-turn agents (Task tool, codex
@@ -380,6 +412,10 @@ function mergeConsecutiveAssistantTurns(
           ...last.group,
           id: first.group.id,
           parts: mergedParts,
+          autolinkableTextParts:
+            mergedAutolinkableTextParts.size > 0
+              ? mergedAutolinkableTextParts
+              : EMPTY_AUTOLINKABLE_TEXT_PARTS,
           usage: mergedUsage,
           duration_ms: mergedDuration,
           model: mergedModels[0] ?? last.group.model,
@@ -500,7 +536,13 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           </div>
         ) : (
           <MessageContent>
-            <ContentPartsRenderer parts={group.parts} role={group.role} />
+            <ContentPartsRenderer
+              parts={group.parts}
+              role={group.role}
+              autolinkLocalPathParts={
+                isResponseComplete ? group.autolinkableTextParts : undefined
+              }
+            />
           </MessageContent>
         )}
         {group.role === "user" && group.resources.length > 0 ? (
@@ -745,15 +787,47 @@ export function MessageListView({
     "incremental_live_transcript"
   )
 
+  // Compatibility `selectTimelineTurns` allocates a new outer array whenever a
+  // live message is present. Zustand v5's getSnapshot must return a stable
+  // reference across consecutive reads or React 19 infinite-loops. Cache the
+  // result by the stable historical array + liveMessage object identity.
+  const compatibilityTimelineCacheRef = useRef<{
+    conversationId: number
+    historical: ReturnType<typeof selectHistoricalTimelineTurns>
+    liveMessage: LiveMessage | null
+    result: ReturnType<typeof selectTimelineTurns>
+  } | null>(null)
+
   // When incremental live is on: historical timeline only (reference-stable
   // across live content updates) + narrow syncState. Compatibility path keeps
   // the full timeline (incl. streaming phase) and liveMessage for overlays.
   const timelineTurns = useConversationRuntimeStore(
     useCallback(
-      (s) =>
-        useIncrementalLive
-          ? selectHistoricalTimelineTurns(s, conversationId)
-          : selectTimelineTurns(s, conversationId),
+      (s) => {
+        if (useIncrementalLive) {
+          return selectHistoricalTimelineTurns(s, conversationId)
+        }
+        const historical = selectHistoricalTimelineTurns(s, conversationId)
+        const liveMessage =
+          s.byConversationId.get(conversationId)?.liveMessage ?? null
+        const cached = compatibilityTimelineCacheRef.current
+        if (
+          cached &&
+          cached.conversationId === conversationId &&
+          cached.historical === historical &&
+          cached.liveMessage === liveMessage
+        ) {
+          return cached.result
+        }
+        const result = selectTimelineTurns(s, conversationId)
+        compatibilityTimelineCacheRef.current = {
+          conversationId,
+          historical,
+          liveMessage,
+          result,
+        }
+        return result
+      },
       [conversationId, useIncrementalLive]
     )
   )
@@ -856,6 +930,7 @@ export function MessageListView({
           parts: msg.content,
           resources: msg.userResources ?? [],
           images: msg.userImages ?? [],
+          autolinkableTextParts: topLevelAssistantTextParts(msg),
           usage: msg.usage,
           duration_ms: msg.duration_ms,
           model: msg.model,

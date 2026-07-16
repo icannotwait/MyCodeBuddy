@@ -2094,11 +2094,13 @@ function parseCliExecutionEnvelope(text: string): {
 const TextPart = memo(function TextPart({
   text,
   isUser = false,
+  autolinkLocalPaths = false,
 }: {
   text: string
   // User messages render as plain text + inline reference badges (no Markdown),
   // matching the plain-text composer. Assistant / system text keeps full Markdown.
   isUser?: boolean
+  autolinkLocalPaths?: boolean
 }) {
   if (isUser) {
     return (
@@ -2121,13 +2123,16 @@ const TextPart = memo(function TextPart({
         <StreamingMarkdownDocument
           document={partition}
           richContentState="complete"
+          autolinkLocalPaths={autolinkLocalPaths}
         />
       </div>
     )
   }
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-      <MessageResponse>{text}</MessageResponse>
+      <MessageResponse autolinkLocalPaths={autolinkLocalPaths}>
+        {text}
+      </MessageResponse>
     </div>
   )
 })
@@ -2802,22 +2807,35 @@ const ToolGroupPart = memo(function ToolGroupPart({
 
 // ── Main renderer ─────────────────────────────────────────────────────
 
+type AutolinkableTextPart = Extract<AdaptedContentPart, { type: "text" }>
+
 interface ContentPartsRendererProps {
   parts: AdaptedContentPart[]
   role?: MessageRole
+  autolinkLocalPathParts?: ReadonlySet<AutolinkableTextPart>
 }
 
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
+  autolinkLocalPathParts,
 }: ContentPartsRendererProps) {
-  const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
+  const renderPart = (
+    part: AdaptedContentPart,
+    keyId: string,
+    isTopLevel: boolean
+  ): ReactNode => {
     if (part.type === "text") {
       return (
         <TextPart
           key={`text-${keyId}`}
           text={part.text}
           isUser={role === "user"}
+          autolinkLocalPaths={
+            isTopLevel &&
+            role === "assistant" &&
+            (autolinkLocalPathParts?.has(part) ?? false)
+          }
         />
       )
     }
@@ -2835,7 +2853,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
         <GoalRunPart
           key={`goal-${keyId}`}
           part={part}
-          renderPart={(child, childKey) => renderPart(child, childKey)}
+          renderPart={(child, childKey) => renderPart(child, childKey, false)}
         />
       )
     }
@@ -2880,7 +2898,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
 
   return (
     <div className="space-y-4">
-      {parts.map((part, i) => renderPart(part, `${i}`))}
+      {parts.map((part, i) => renderPart(part, `${i}`, true))}
     </div>
   )
 })

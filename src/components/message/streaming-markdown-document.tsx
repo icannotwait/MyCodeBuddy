@@ -18,6 +18,8 @@ interface Props {
    * history can upgrade math/Mermaid/code engines.
    */
   richContentState?: "sealed-streaming" | "complete"
+  /** Opt-in local-path autolinking for completed assistant prose only. */
+  autolinkLocalPaths?: boolean
 }
 
 const SealedBlock = memo(
@@ -25,15 +27,21 @@ const SealedBlock = memo(
     block,
     onRender,
     richContentState,
+    autolinkLocalPaths,
   }: {
     block: SealedMarkdownBlock
     onRender?: (blockId: string) => void
     richContentState: "sealed-streaming" | "complete"
+    autolinkLocalPaths: boolean
   }) {
     streamingPerfRecorder.countRender("markdownBlock")
     onRender?.(block.id)
     return (
-      <MessageResponse mode="static" richContentState={richContentState}>
+      <MessageResponse
+        mode="static"
+        richContentState={richContentState}
+        autolinkLocalPaths={autolinkLocalPaths}
+      >
         {block.markdown}
       </MessageResponse>
     )
@@ -42,7 +50,8 @@ const SealedBlock = memo(
     previous.block.id === next.block.id &&
     previous.block.markdown === next.block.markdown &&
     previous.onRender === next.onRender &&
-    previous.richContentState === next.richContentState
+    previous.richContentState === next.richContentState &&
+    previous.autolinkLocalPaths === next.autolinkLocalPaths
 )
 
 function getOpenFenceTail(document: IncrementalStreamBlocks): {
@@ -63,6 +72,7 @@ export function StreamingMarkdownDocument({
   document,
   onBlockRender,
   richContentState = "sealed-streaming",
+  autolinkLocalPaths = false,
 }: Props) {
   if (!document.valid) {
     return (
@@ -71,6 +81,7 @@ export function StreamingMarkdownDocument({
         richContentState={
           richContentState === "complete" ? "complete" : undefined
         }
+        autolinkLocalPaths={autolinkLocalPaths}
       >
         {joinStreamingMarkdown(document)}
       </MessageResponse>
@@ -85,6 +96,7 @@ export function StreamingMarkdownDocument({
           block={block}
           onRender={onBlockRender}
           richContentState={richContentState}
+          autolinkLocalPaths={autolinkLocalPaths}
         />
       ))}
       {openFence ? (

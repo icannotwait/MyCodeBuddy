@@ -1,14 +1,38 @@
 import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
+import type {
+  AdaptedContentPart,
+  AdaptedGoalRunPart,
+  AdaptedToolCallPart,
+} from "@/lib/adapters/ai-elements-adapter"
 import enMessages from "@/i18n/messages/en.json"
 import * as tryParseJsonMod from "@/lib/try-parse-json"
 import * as unifiedDiff from "@/lib/unified-diff-generator"
+import {
+  appendStreamingMarkdown,
+  cacheCompletedStreamingPartition,
+  clearCompletedStreamingPartitions,
+  completeStreamingMarkdown,
+  createIncrementalStreamBlocks,
+} from "@/lib/markdown/incremental-stream-blocks"
+
+type AdaptedTextPart = Extract<AdaptedContentPart, { type: "text" }>
 
 vi.mock("@/components/ai-elements/message", () => ({
-  MessageResponse: ({ children }: { children?: React.ReactNode }) => (
-    <div data-testid="markdown-response">{children}</div>
+  MessageResponse: ({
+    children,
+    autolinkLocalPaths,
+  }: {
+    children?: React.ReactNode
+    autolinkLocalPaths?: boolean
+  }) => (
+    <div
+      data-testid="markdown-response"
+      data-autolink-local-paths={String(!!autolinkLocalPaths)}
+    >
+      {children}
+    </div>
   ),
 }))
 
@@ -44,6 +68,10 @@ function wrap(ui: React.ReactElement) {
     </NextIntlClientProvider>
   )
 }
+
+beforeEach(() => {
+  clearCompletedStreamingPartitions()
+})
 
 function completedEditTool(): AdaptedToolCallPart {
   return {
@@ -202,5 +230,119 @@ describe("ContentPartsRenderer lazy tools", () => {
       )
     })
     expect(screen.getByText(/line-3/)).toBeInTheDocument()
+  })
+})
+
+describe("ContentPartsRenderer local-path autolink scope", () => {
+  it("requires assistant role and membership in the eligible set", () => {
+    const part: AdaptedTextPart = {
+      type: "text",
+      text: String.raw`D:\repo\src\app.ts`,
+    }
+    const eligible = new Set<AdaptedTextPart>([part])
+    const { rerender } = wrap(
+      <ContentPartsRenderer parts={[part]} role="assistant" />
+    )
+    expect(screen.getByTestId("markdown-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "false"
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ContentPartsRenderer
+          parts={[part]}
+          role="assistant"
+          autolinkLocalPathParts={eligible}
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("markdown-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "true"
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ContentPartsRenderer
+          parts={[part]}
+          role="system"
+          autolinkLocalPathParts={eligible}
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByTestId("markdown-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "false"
+    )
+  })
+
+  it("keeps user text on the plain-text renderer", () => {
+    const part: AdaptedTextPart = {
+      type: "text",
+      text: String.raw`D:\repo\src\app.ts`,
+    }
+    wrap(
+      <ContentPartsRenderer
+        parts={[part]}
+        role="user"
+        autolinkLocalPathParts={new Set([part])}
+      />
+    )
+    expect(screen.queryByTestId("markdown-response")).toBeNull()
+  })
+
+  it("does not inherit the opt-in inside a structured goal run", () => {
+    const start: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "goal-1",
+      toolName: "create_goal",
+      input: JSON.stringify({ objective: "test" }),
+      state: "output-error",
+      errorText: "failed",
+    }
+    const nested: AdaptedTextPart = {
+      type: "text",
+      text: String.raw`D:\nested\src\app.ts`,
+    }
+    const goal: AdaptedGoalRunPart = {
+      type: "goal-run",
+      start,
+      end: null,
+      items: [nested],
+      isRunning: false,
+    }
+    wrap(
+      <ContentPartsRenderer
+        parts={[goal]}
+        role="assistant"
+        autolinkLocalPathParts={new Set([nested])}
+      />
+    )
+    expect(screen.getByTestId("markdown-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "false"
+    )
+  })
+
+  it("enables the opt-in after a completed partition handoff", () => {
+    const text = String.raw`D:\repo\src\app.ts`
+    const part: AdaptedTextPart = { type: "text", text }
+    let document = createIncrementalStreamBlocks("completed-assistant")
+    document = appendStreamingMarkdown(document, text)
+    document = completeStreamingMarkdown(document)
+    expect(cacheCompletedStreamingPartition(text, document)).toBe(true)
+
+    wrap(
+      <ContentPartsRenderer
+        parts={[part]}
+        role="assistant"
+        autolinkLocalPathParts={new Set([part])}
+      />
+    )
+    expect(screen.getByTestId("markdown-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "true"
+    )
   })
 })

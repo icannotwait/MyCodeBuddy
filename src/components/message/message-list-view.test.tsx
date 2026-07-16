@@ -121,17 +121,28 @@ vi.mock("@/components/ai-elements/reasoning", () => ({
 vi.mock("./content-parts-renderer", () => ({
   ContentPartsRenderer: ({
     parts,
+    autolinkLocalPathParts,
   }: {
     parts: Array<{ type: string; text?: string }>
+    autolinkLocalPathParts?: ReadonlySet<{
+      type: string
+      text?: string
+    }>
   }) => (
     <div data-testid="content-parts">
-      {parts.map((p, i) =>
-        p.type === "text" ? (
-          <span key={i} data-testid="assistant-text">
-            {p.text}
+      {parts.map((part, index) =>
+        part.type === "text" ? (
+          <span
+            key={index}
+            data-testid="assistant-text"
+            data-autolink-local-paths={String(
+              autolinkLocalPathParts?.has(part) ?? false
+            )}
+          >
+            {part.text}
           </span>
         ) : (
-          <span key={i} data-part={p.type} />
+          <span key={index} data-part={part.type} />
         )
       )}
     </div>
@@ -206,6 +217,15 @@ function assistantTurn(id: string, text: string): MessageTurn {
   }
 }
 
+function toolTurn(id: string, text: string): MessageTurn {
+  return {
+    id,
+    role: "tool",
+    blocks: [{ type: "text", text }],
+    timestamp: "2026-05-28T00:00:02.000Z",
+  }
+}
+
 function liveMessage(text: string, id = "lm-1"): LiveMessage {
   return {
     id,
@@ -236,7 +256,12 @@ function frame(applyEvents: EventEnvelope[]): AcceptedConnectionFrame {
   }
 }
 
-function seedHistory() {
+function seedHistory(
+  turns: MessageTurn[] = [
+    userTurn("u1", "hello"),
+    assistantTurn("a1", "prior reply"),
+  ]
+) {
   useConversationRuntimeStore.setState({
     byConversationId: new Map([
       [
@@ -255,16 +280,13 @@ function seedHistory() {
               model: null,
               git_branch: null,
               external_id: "sid-1",
-              message_count: 2,
+              message_count: turns.length,
               child_count: 0,
               created_at: "2026-05-28T00:00:00.000Z",
               updated_at: "2026-05-28T00:00:00.000Z",
               pinned_at: null,
             },
-            turns: [
-              userTurn("u1", "hello"),
-              assistantTurn("a1", "prior reply"),
-            ],
+            turns,
             session_stats: null,
           },
           detailLoading: false,
@@ -487,6 +509,51 @@ describe("MessageListView live footer isolation", () => {
     expect(screen.getByTestId("message-thread")).toHaveAttribute(
       "data-resize",
       "smooth"
+    )
+  })
+
+  it("keeps the compatibility streaming row opted out until completion", () => {
+    __resetStreamingPerformanceConfigForTests()
+    act(() => {
+      useConversationRuntimeStore
+        .getState()
+        .actions.setLiveMessage(CID, liveMessage("compat live reply"), true)
+    })
+
+    renderMessageList()
+
+    expect(screen.getByText("compat live reply")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "false"
+    )
+
+    act(() => {
+      completeLiveTranscriptTurn(CID, liveMessage("compat live reply"))
+    })
+    expect(screen.getByText("compat live reply")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "true"
+    )
+  })
+
+  it("keeps source tool text ineligible after assistant-display merging", () => {
+    const assistantText = String.raw`D:\assistant\src\app.ts`
+    const toolText = String.raw`D:\tool-output\src\app.ts`
+    seedHistory([
+      userTurn("u1", "hello"),
+      assistantTurn("a1", assistantText),
+      toolTurn("t1", toolText),
+    ])
+
+    renderMessageList()
+
+    expect(screen.getByText(assistantText)).toHaveAttribute(
+      "data-autolink-local-paths",
+      "true"
+    )
+    expect(screen.getByText(toolText)).toHaveAttribute(
+      "data-autolink-local-paths",
+      "false"
     )
   })
 })

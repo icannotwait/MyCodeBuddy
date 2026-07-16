@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 import {
   appendStreamingMarkdown,
+  completeStreamingMarkdown,
   createIncrementalStreamBlocks,
   type IncrementalStreamBlocks,
 } from "@/lib/markdown/incremental-stream-blocks"
@@ -11,11 +12,17 @@ vi.mock("@/components/ai-elements/message", () => ({
   MessageResponse: ({
     children,
     mode,
+    autolinkLocalPaths,
   }: {
     children?: React.ReactNode
     mode?: string
+    autolinkLocalPaths?: boolean
   }) => (
-    <div data-testid="message-response" data-mode={mode}>
+    <div
+      data-testid="message-response"
+      data-mode={mode}
+      data-autolink-local-paths={String(!!autolinkLocalPaths)}
+    >
       {children}
     </div>
   ),
@@ -83,5 +90,62 @@ describe("StreamingMarkdownDocument", () => {
     render(<StreamingMarkdownDocument document={invalidDoc("**visible")} />)
     // Mock MessageResponse echoes raw source; real Streamdown would strip **.
     expect(screen.getByText("**visible")).toBeInTheDocument()
+  })
+
+  it("keeps live sealed blocks opted out by default", () => {
+    render(<StreamingMarkdownDocument document={doc("first\n\ntail")} />)
+    for (const response of screen.getAllByTestId("message-response")) {
+      expect(response).toHaveAttribute("data-autolink-local-paths", "false")
+    }
+  })
+
+  it("propagates the opt-in to every completed sealed block", () => {
+    const completed = completeStreamingMarkdown(
+      doc(String.raw`D:\repo\src\app.ts`)
+    )
+    render(
+      <StreamingMarkdownDocument
+        document={completed}
+        richContentState="complete"
+        autolinkLocalPaths
+      />
+    )
+    for (const response of screen.getAllByTestId("message-response")) {
+      expect(response).toHaveAttribute("data-autolink-local-paths", "true")
+    }
+  })
+
+  it("propagates the opt-in through the invalid-document fallback", () => {
+    render(
+      <StreamingMarkdownDocument
+        document={invalidDoc(String.raw`D:\repo\src\app.ts`)}
+        richContentState="complete"
+        autolinkLocalPaths
+      />
+    )
+    expect(screen.getByTestId("message-response")).toHaveAttribute(
+      "data-autolink-local-paths",
+      "true"
+    )
+  })
+
+  it("rerenders a sealed block when the opt-in changes", () => {
+    const blockRender = vi.fn()
+    const document = doc("first\n\ntail")
+    const { rerender } = render(
+      <StreamingMarkdownDocument
+        document={document}
+        onBlockRender={blockRender}
+      />
+    )
+    const before = blockRender.mock.calls.length
+    rerender(
+      <StreamingMarkdownDocument
+        document={document}
+        onBlockRender={blockRender}
+        autolinkLocalPaths
+      />
+    )
+    expect(blockRender.mock.calls.length).toBeGreaterThan(before)
   })
 })
