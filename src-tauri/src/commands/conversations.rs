@@ -970,6 +970,20 @@ pub(crate) fn emit_conversation_deleted(emitter: &EventEmitter, conversation_id:
     );
 }
 
+/// Emit a `conversation://changed` State carrying the exact backend patch from
+/// a successful status transition. Callers must pass the returned patch
+/// unchanged (no synthesized timestamp/token).
+pub(crate) fn emit_conversation_state(
+    emitter: &EventEmitter,
+    patch: ConversationStatePatch,
+) {
+    emit_event(
+        emitter,
+        CONVERSATION_CHANGED_EVENT,
+        ConversationChange::State { patch },
+    );
+}
+
 /// Broadcast a `tabs://changed` snapshot so every client converges its open-tab
 /// set. `origin` is the originating client's id (echoed so it can ignore its own
 /// change) or the sentinel `"server"` for cascade-originated changes that every
@@ -3176,6 +3190,24 @@ mod tests {
         assert_eq!(evt.channel, CONVERSATION_CHANGED_EVENT);
         assert_eq!(p["kind"], "deleted");
         assert_eq!(p["id"], 4242);
+    }
+
+    #[tokio::test]
+    async fn conversation_state_event_serializes_patch() {
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut rx = broadcaster.subscribe();
+        let patch = ConversationStatePatch {
+            id: 42,
+            status: "pending_review".into(),
+            awaiting_reply_token: Some("token-42".into()),
+            updated_at: chrono::Utc::now(),
+        };
+        emit_conversation_state(&emitter, patch.clone());
+        let event = rx.try_recv().expect("global state event");
+        assert_eq!(event.channel, CONVERSATION_CHANGED_EVENT);
+        assert_eq!(event.payload["kind"], "state");
+        assert_eq!(event.payload["patch"]["id"], 42);
+        assert_eq!(event.payload["patch"]["awaiting_reply_token"], "token-42");
     }
 
     #[tokio::test]

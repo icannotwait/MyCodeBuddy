@@ -26,7 +26,9 @@ use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
 use crate::commands::acp::verify_agent_installed;
-use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
+use crate::commands::conversations::{
+    create_conversation_core, emit_conversation_state, emit_conversation_upsert,
+};
 use crate::commands::folders::{
     emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
     git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
@@ -928,18 +930,24 @@ impl AutomationEngine {
     async fn cancel_conversation(&self, conversation_id: i32) {
         // Route through the service so a rare automation-launch cancel also
         // clears any stale awaiting_reply_token atomically with the status write.
-        if conversation_service::update_status_with_patch(
+        // Emit the returned backend patch on conversation://changed (no
+        // synthesized timestamp/token; no full-summary upsert needed for a
+        // pure status flip).
+        match conversation_service::update_status_with_patch(
             &self.db.conn,
             conversation_id,
             ConversationStatus::Cancelled,
         )
         .await
-        .is_ok()
         {
-            // The create-time upsert announced this row as InProgress; converge
-            // every sidebar to the terminal status (this path emits no
-            // ConversationStatusChanged of its own).
-            emit_conversation_upsert(&self.emitter, &self.db.conn, conversation_id).await;
+            Ok(patch) => {
+                emit_conversation_state(&self.emitter, patch);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[automation] failed to cancel conversation {conversation_id}: {e}"
+                );
+            }
         }
     }
 }

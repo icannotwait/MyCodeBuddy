@@ -1215,14 +1215,19 @@ impl ConnectionManager {
         // row is currently `pending_review` correctly transitions back. The
         // DB write precedes the event emit so any subscriber observing
         // `ConversationStatusChanged` can assume the row is consistent.
-        // `update_status` is a single UPDATE — idempotent with respect to
-        // the same status value, so re-writing `InProgress` is a benign no-op
-        // on the row (touches `updated_at` only).
+        // `update_status_with_patch` is a single UPDATE — idempotent with
+        // respect to the same status value, so re-writing `InProgress` is a
+        // benign no-op on the row (touches `updated_at` only) and returns the
+        // patch for the global state broadcast.
         let conversation_id_for_status = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id_for_status {
-            conversation_service::update_status(&db.conn, cid, ConversationStatus::InProgress)
-                .await
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
+            let patch = conversation_service::update_status_with_patch(
+                &db.conn,
+                cid,
+                ConversationStatus::InProgress,
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
             emit_with_state(
                 &state_arc,
                 &emitter,
@@ -1232,6 +1237,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            crate::commands::conversations::emit_conversation_state(&emitter, patch);
         }
 
         // Capture a bounded preview of the user's message BEFORE `blocks` is
@@ -1319,14 +1325,14 @@ impl ConnectionManager {
             }
             Err(send_err) => {
                 if let Some(cid) = conversation_id_for_status {
-                    match conversation_service::update_status(
+                    match conversation_service::update_status_with_patch(
                         &db.conn,
                         cid,
                         ConversationStatus::Cancelled,
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(patch) => {
                             emit_with_state(
                                 &state_arc,
                                 &emitter,
@@ -1336,6 +1342,9 @@ impl ConnectionManager {
                                 },
                             )
                             .await;
+                            crate::commands::conversations::emit_conversation_state(
+                                &emitter, patch,
+                            );
                         }
                         Err(rollback_err) => {
                             // Best-effort: original send error is the load-bearing
@@ -1414,7 +1423,7 @@ impl ConnectionManager {
         // status if the turn happened to end just before the user clicked.
         let conversation_id = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id {
-            match conversation_service::update_status_if(
+            match conversation_service::update_status_if_with_patch(
                 db,
                 cid,
                 ConversationStatus::InProgress,
@@ -1422,7 +1431,7 @@ impl ConnectionManager {
             )
             .await
             {
-                Ok(true) => {
+                Ok(Some(patch)) => {
                     emit_with_state(
                         &state_arc,
                         &emitter,
@@ -1432,8 +1441,9 @@ impl ConnectionManager {
                         },
                     )
                     .await;
+                    crate::commands::conversations::emit_conversation_state(&emitter, patch);
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(
                         "[ACP][ERROR] failed to mark conversation {cid} cancelled \
@@ -5054,6 +5064,149 @@ mod tests {
     fn with_spawn_handshake_timeout_overrides_default_for_tests() {
         let mgr = ConnectionManager::with_spawn_handshake_timeout(Duration::from_secs(7));
         assert_eq!(mgr.spawn_handshake_timeout, Duration::from_secs(7));
+    }
+
+    /// Successful status owners emit exactly one authoritative `state` patch
+    /// on conversation://changed (no legacy `status` bridge, no duplicates).
+    #[tokio::test]
+    async fn cancel_emits_exactly_one_state_event_with_backend_patch() {
+        use crate::db::entities::conversation;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/cancel-state-event").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(conv.status, ConversationStatus::InProgress);
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-cancel-state";
+        // Keep cmd_rx alive so Cancel enqueues; a dropped receiver fails before
+        // the status CAS.
+        let _cmd_rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/cancel-state-event")),
+                EventEmitter::test_web_only(broadcaster.clone()),
+            )
+            .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            state.write().await.conversation_id = Some(conv.id);
+        }
+        let mut acp_rx = subscribe_conn_stream(&mgr, conn_id).await;
+
+        mgr.cancel(&db.conn, conn_id).await.expect("cancel");
+
+        // Per-connection status event first.
+        let env = recv_first_acp_event(&mut acp_rx).await;
+        match env.payload {
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status,
+            } => {
+                assert_eq!(conversation_id, conv.id);
+                assert_eq!(status, ConversationStatus::Cancelled);
+            }
+            other => panic!("expected ConversationStatusChanged(Cancelled), got {other:?}"),
+        }
+
+        // Exactly one global state patch, values match the backend row.
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == crate::web::event_bridge::CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(
+            state_events.len(),
+            1,
+            "cancel must emit exactly one conversation://changed event"
+        );
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], conv.id);
+        assert_eq!(p["patch"]["status"], "cancelled");
+        assert!(p["patch"]["awaiting_reply_token"].is_null());
+        assert_eq!(
+            p["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_status_owners_emit_one_state_patch_each() {
+        use crate::db::entities::conversation;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-state-event").await;
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-prompt-state";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/prompt-state-event")),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+
+        let _ = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "trigger send failure".into(),
+                }],
+                Some(folder_id),
+                None,
+                None,
+            )
+            .await;
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel != crate::web::event_bridge::CONVERSATION_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "state" {
+                state_events.push(p.clone());
+            }
+        }
+        // InProgress (prompt start) + Cancelled (send rollback) — no legacy status,
+        // and no duplicate of either.
+        assert_eq!(
+            state_events.len(),
+            2,
+            "expected one state patch per successful status write, got {state_events:?}"
+        );
+        assert_eq!(state_events[0]["patch"]["status"], "in_progress");
+        assert_eq!(state_events[1]["patch"]["status"], "cancelled");
+        let conv_id = state_events[1]["patch"]["id"].as_i64().unwrap() as i32;
+        let row = conversation::Entity::find_by_id(conv_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::Cancelled);
+        assert_eq!(
+            state_events[1]["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
     }
 
     /// When `send_prompt_inner` fails (process gone, channel closed) the row

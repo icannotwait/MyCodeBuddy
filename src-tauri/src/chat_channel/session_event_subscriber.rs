@@ -469,12 +469,22 @@ async fn handle_acp_envelope(
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
                 if stop_reason == "end_turn" {
-                    let _ = conversation_service::update_status(
+                    if let Ok(patch) = conversation_service::update_status_with_patch(
                         db,
                         conv_id,
                         crate::db::entities::conversation::ConversationStatus::Completed,
                     )
-                    .await;
+                    .await
+                    {
+                        // Clone the connection emitter for the global state patch.
+                        if let Some((_, emitter)) =
+                            conn_mgr.get_state_and_emitter(connection_id).await
+                        {
+                            crate::commands::conversations::emit_conversation_state(
+                                &emitter, patch,
+                            );
+                        }
+                    }
                 }
 
                 // Retry the deferred kickoff now the turn that blocked it ended.
@@ -554,12 +564,18 @@ async fn handle_acp_envelope(
 
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
-                let _ = conversation_service::update_status(
+                if let Ok(patch) = conversation_service::update_status_with_patch(
                     db,
                     conv_id,
                     crate::db::entities::conversation::ConversationStatus::Cancelled,
                 )
-                .await;
+                .await
+                {
+                    if let Some((_, emitter)) = conn_mgr.get_state_and_emitter(connection_id).await
+                    {
+                        crate::commands::conversations::emit_conversation_state(&emitter, patch);
+                    }
+                }
                 let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
             }
         }
