@@ -51,6 +51,8 @@ function settings(
   return {
     enabled: false,
     depth_limit: 1,
+    route_policy: "codeg",
+    stalled_after_seconds: 300,
     completed_cache_max_mb: 512,
     agent_defaults: {},
     ...overrides,
@@ -100,6 +102,8 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 1,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 0,
           agent_defaults: {},
         },
@@ -126,6 +130,8 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 1,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 512,
           agent_defaults: {},
         },
@@ -150,11 +156,40 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 5,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 512,
           agent_defaults: {},
         },
         profiles: { profiles: [] },
       })
+    })
+  })
+
+  it("disables route choice with delegation off and clamps watchdog on save", async () => {
+    mockGetDelegationSettings.mockResolvedValue({
+      enabled: false,
+      depth_limit: 1,
+      route_policy: "codeg",
+      stalled_after_seconds: 300,
+      completed_cache_max_mb: 512,
+    })
+    renderWithIntl()
+    expect(await screen.findByRole("button", { name: "Codeg" })).toBeDisabled()
+    expect(screen.getByText(/effective.*Native/i)).toBeInTheDocument()
+
+    // Enable to edit watchdog, then save an out-of-range value.
+    const enableSwitch = screen.getByLabelText("Enable delegation")
+    fireEvent.click(enableSwitch)
+    const watchdog = screen.getByLabelText(/soft watchdog/i)
+    fireEvent.change(watchdog, { target: { value: "10" } })
+    fireEvent.click(screen.getByRole("button", { name: /save/i }))
+    await waitFor(() => {
+      expect(mockSetDelegationBundle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settings: expect.objectContaining({ stalled_after_seconds: 60 }),
+        })
+      )
     })
   })
 

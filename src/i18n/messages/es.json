@@ -562,7 +562,16 @@
       "noConfigAvailable": "Este agente no tiene opciones configurables.",
       "modeLabel": "Modo",
       "agentDefaultHint": "Predeterminado del agente: {value}",
-      "defaultOptionLabel": "Predeterminado ({value})"
+      "defaultOptionLabel": "Predeterminado ({value})",
+      "routePolicy": "Ruta predeterminada",
+      "routePolicyHint": "Los agentes administrados usan esta ruta cuando la conversacion no tiene anulacion.",
+      "routeEffectiveNative": "La delegacion esta desactivada: la ruta efectiva es Native.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "Watchdog suave (segundos)",
+      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). No cancela ni cambia la ruta."
     },
     "actions": {
       "dragSort": "Arrastrar para reordenar",
@@ -2416,7 +2425,10 @@
             "child_empty": "subagente sin salida",
             "child_unknown": "subagente: error",
             "unknown": "tarea desconocida"
-          }
+          },
+          "active": "Activo",
+          "waitingInput": "Esperando entrada",
+          "stalled": "Sin actividad reciente del agente"
         }
       },
       "contentParts": {
@@ -2615,7 +2627,8 @@
         "dismiss": "Descartar",
         "reconnectFailed": "No se pudo reconectar la sesión",
         "applied": "Nueva configuración aplicada",
-        "terminalShellTitle": "Shell del terminal actualizado"
+        "terminalShellTitle": "Shell del terminal actualizado",
+        "delegationRouteTitle": "Ruta de delegacion actualizada"
       },
       "collabAgent": {
         "title": "Subagente",
@@ -2642,6 +2655,30 @@
         "cardCompleted": "Tarea en segundo plano completada",
         "cardFinishedWithStatus": "Tarea en segundo plano finalizada ({status})",
         "cardResultPending": "El resultado aún no ha llegado"
+      },
+      "delegationRoute": {
+        "menuLabel": "Ruta de delegacion",
+        "inheritGlobal": "Heredar global",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg (heredada)",
+        "updateFailed": "Error al actualizar la ruta"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Se volvio a Native ({reason}). Vuelve a conectar para reintentar Codeg.",
+        "delegationUnavailable": "La ruta Codeg esta activa, pero la delegacion no esta disponible.",
+        "reconnect": "Volver a conectar",
+        "reconnecting": "Reconectando…",
+        "reconnected": "Reconectado",
+        "reconnectFailed": "Error al reconectar",
+        "reason": {
+          "native_suppression_unsupported": "supresion nativa no admitida",
+          "native_suppression_invalid": "supresion nativa no valida",
+          "companion_binary_unavailable": "binario companero no disponible",
+          "agent_mcp_unsupported": "MCP del agente no admitido",
+          "companion_initialization_failed": "fallo la inicializacion del companero",
+          "unknown": "degradado"
+        }
       }
     },
     "diffPreview": {

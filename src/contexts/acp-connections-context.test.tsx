@@ -12,10 +12,7 @@ import {
   __resetWritableConnectionsCloneCount,
   __getWritableConnectionsCloneCount,
 } from "@/contexts/acp-connections-context"
-import type {
-  DesktopAcpEventBatch,
-  DesktopDeliveryFailure,
-} from "@/lib/types"
+import type { DesktopAcpEventBatch, DesktopDeliveryFailure } from "@/lib/types"
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
 import type { AttachHandlers } from "@/lib/transport/types"
@@ -60,8 +57,9 @@ const h = vi.hoisted(() => {
     isDesktop: true,
     rafQueue,
     desktopBatchHandler: null as ((batch: DesktopAcpEventBatch) => void) | null,
-    desktopFailureHandler:
-      null as ((failure: DesktopDeliveryFailure) => void) | null,
+    desktopFailureHandler: null as
+      | ((failure: DesktopDeliveryFailure) => void)
+      | null,
     setDesktopHandlers(
       onBatch: (batch: DesktopAcpEventBatch) => void,
       onFailure: (failure: DesktopDeliveryFailure) => void
@@ -241,6 +239,7 @@ beforeEach(() => {
     connectionId: "owner-conn",
     eventSeq: 0,
     activeDelegations: [],
+    delegationRoute: null,
   })
   // Agent is installed + available so the connect preflight passes.
   h.acpGetAgentStatus.mockResolvedValue({
@@ -737,6 +736,54 @@ describe("AcpConnectionsProvider session load failures", () => {
       /^backendErrors\.sessionLoadLegacyCliSession/
     )
     expect(connection?.loadErrorCode).toBe("legacy_cli_session")
+  })
+})
+
+describe("AcpConnectionsProvider route override + conflict", () => {
+  it("sends conversationId and route override to acpConnect", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "codex",
+        "/repo",
+        undefined,
+        undefined,
+        "native"
+      )
+    })
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "codex",
+      "/repo",
+      undefined,
+      undefined,
+      {},
+      undefined,
+      "native"
+    )
+  })
+
+  it("attaches session_route_conflict detail as viewer without disconnect", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockRejectedValue({
+      code: "session_route_conflict",
+      message: "Session route conflict",
+      detail: "existing-conn",
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "codex", "/repo", "sess-1", 42, "codeg")
+    })
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.attach).toHaveBeenCalledWith(
+      "existing-conn",
+      { sinceSeq: undefined },
+      expect.anything()
+    )
+    const conn = h.store!.getConnection(TAB)
+    expect(conn?.isViewer).toBe(true)
+    expect(conn?.connectionId).toBe("existing-conn")
   })
 })
 
@@ -1284,7 +1331,6 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
   })
 })
 
-
 // ── Task 7: one store transaction per browser frame ──
 
 function batch(
@@ -1385,10 +1431,8 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     h.eventStreamValue = null
     h.acpConnect.mockResolvedValue("owner-conn")
 
-    const {
-      createLiveTranscriptStore,
-      createLiveTranscriptFrameSink,
-    } = await import("@/stores/live-transcript-store")
+    const { createLiveTranscriptStore, createLiveTranscriptFrameSink } =
+      await import("@/stores/live-transcript-store")
     const transcriptStore = createLiveTranscriptStore()
     const baseSink = createLiveTranscriptFrameSink(
       42,
@@ -1463,9 +1507,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
     expect(publish).toHaveBeenCalledTimes(1)
     const publishedFrame = publish.mock.calls[0]![0]
-    expect(publishedFrame.applyEvents.map((e: { type: string }) => e.type)).toEqual([
-      "turn_complete",
-    ])
+    expect(
+      publishedFrame.applyEvents.map((e: { type: string }) => e.type)
+    ).toEqual(["turn_complete"])
     expect(h.store!.getConnection(TAB)?.liveMessage).toBe(liveMessage)
     expect(transcriptStore.getConversation(42)?.status).toBe("completing")
   })
@@ -1518,7 +1562,10 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
     act(() => {
       h.emitDesktopBatch(
-        batch(9, [content("owner-conn", 2, "a"), thinking("owner-conn", 3, "b")])
+        batch(9, [
+          content("owner-conn", 2, "a"),
+          thinking("owner-conn", 3, "b"),
+        ])
       )
       h.runAnimationFrame()
     })
@@ -1575,10 +1622,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
     expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(1)
     expect(seen).toEqual([1])
-    expect(warn).toHaveBeenCalledWith(
-      "[acp-context] unknown ACP event type",
-      { type: "future_extension_event" }
-    )
+    expect(warn).toHaveBeenCalledWith("[acp-context] unknown ACP event type", {
+      type: "future_extension_event",
+    })
     const logged = JSON.stringify(warn.mock.calls)
     expect(logged).not.toContain("secret_payload")
     expect(logged).not.toContain("must-not-log")
@@ -1635,9 +1681,8 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
   it("runtime failure never starts the legacy listener", async () => {
     h.eventStreamValue = null
     h.acpConnect.mockResolvedValue("owner-conn")
-    const { subscribeDesktopAcpEvents } = await import(
-      "@/lib/transport/desktop-acp-events"
-    )
+    const { subscribeDesktopAcpEvents } =
+      await import("@/lib/transport/desktop-acp-events")
 
     render(
       <AcpConnectionsProvider>
@@ -1658,9 +1703,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       h.emitDesktopFailure({
         generation: 1,
         reason: "batch_emit_failed",
-        affected: [
-          { connection_id: "owner-conn", first_seq: 1, last_seq: 3 },
-        ],
+        affected: [{ connection_id: "owner-conn", first_seq: 1, last_seq: 3 }],
       })
     })
 
@@ -1688,12 +1731,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       await Promise.resolve()
     })
     await act(async () => {
-      await h.actions!.connect(
-        contextKey,
-        "claude_code",
-        "/tmp/x",
-        sessionId
-      )
+      await h.actions!.connect(contextKey, "claude_code", "/tmp/x", sessionId)
     })
   }
 
@@ -1883,9 +1921,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       h.runAnimationFrame()
     })
 
-    const tool = h.store!.getConnection(TAB)!.liveMessage?.content.find(
-      (b) => b.type === "tool_call"
-    )
+    const tool = h
+      .store!.getConnection(TAB)!
+      .liveMessage?.content.find((b) => b.type === "tool_call")
     expect(tool?.type).toBe("tool_call")
     if (tool?.type !== "tool_call") throw new Error("expected tool_call")
     expect(tool.info.raw_output_chunks).toEqual(["hello ", "world", "!"])
@@ -1958,32 +1996,34 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           resolveSnapshot = resolve
         })
     )
-    h.denormalizeSnapshot.mockImplementation((snap: { connection_id: string; event_seq: number }) => ({
-      connectionId: snap.connection_id,
-      eventSeq: snap.event_seq,
-      activeDelegations: [],
-      status: "prompting",
-      sessionId: "sess-1",
-      modes: null,
-      configOptions: null,
-      availableCommands: null,
-      usage: null,
-      liveMessage: {
-        id: "snap-lm",
-        role: "assistant",
-        content: [{ type: "text", text: "from-snapshot" }],
-        startedAt: 1,
-      },
-      pendingPermission: null,
-      pendingAskQuestion: null,
-      pendingUserMessage: null,
-      promptCapabilities: null,
-      selectorsReady: false,
-      supportsFork: false,
-      configStale: false,
-      configStaleKind: null,
-      backgroundOutstanding: 0,
-    }))
+    h.denormalizeSnapshot.mockImplementation(
+      (snap: { connection_id: string; event_seq: number }) => ({
+        connectionId: snap.connection_id,
+        eventSeq: snap.event_seq,
+        activeDelegations: [],
+        status: "prompting",
+        sessionId: "sess-1",
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: {
+          id: "snap-lm",
+          role: "assistant",
+          content: [{ type: "text", text: "from-snapshot" }],
+          startedAt: 1,
+        },
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        backgroundOutstanding: 0,
+      })
+    )
 
     render(
       <AcpConnectionsProvider>
@@ -2233,12 +2273,12 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
     // B commits contiguous work immediately; A stays at 3 pending recovery.
     expect(h.store!.getConnection(TAB_B)?.lastAppliedSeq).toBe(3)
-    expect(h.store!.getConnection(TAB_B)?.liveMessage?.content[0]).toMatchObject(
-      {
-        type: "text",
-        text: "xy",
-      }
-    )
+    expect(
+      h.store!.getConnection(TAB_B)?.liveMessage?.content[0]
+    ).toMatchObject({
+      type: "text",
+      text: "xy",
+    })
     expect(h.store!.getConnection(TAB_A)?.lastAppliedSeq).toBe(3)
 
     await act(async () => {
@@ -2333,7 +2373,9 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       sessionId: "s1",
       modes: {
         current_mode_id: "default",
-        available_modes: [{ id: "default", name: "Default", description: null }],
+        available_modes: [
+          { id: "default", name: "Default", description: null },
+        ],
       },
       configOptions: null,
       availableCommands: null,
@@ -2381,9 +2423,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
   const framePathFixtures: Array<{
     name: string
     action: import("@/contexts/acp-connections-context").__FrameActionForTests
-    conn?: Partial<
-      import("@/contexts/acp-connections-context").ConnectionState
-    >
+    conn?: Partial<import("@/contexts/acp-connections-context").ConnectionState>
   }> = [
     {
       name: "CONTENT_DELTA",

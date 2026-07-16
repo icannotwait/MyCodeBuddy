@@ -74,3 +74,35 @@ describe("denormalizeSnapshot — config staleness", () => {
     expect(patch.configStaleKind).toBeNull()
   })
 })
+
+describe("denormalizeSnapshot — delegation route", () => {
+  it("denormalizes route snapshot without deriving it from settings", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        delegation_route: {
+          requested: "codeg",
+          effective: "native",
+          source: "safe_fallback",
+          managed: true,
+          degraded_reason: "companion_binary_unavailable",
+          delegation_available: false,
+        },
+      })
+    )
+    expect(patch.delegationRoute).toEqual({
+      requested: "codeg",
+      effective: "native",
+      source: "safe_fallback",
+      managed: true,
+      degraded_reason: "companion_binary_unavailable",
+      delegation_available: false,
+    })
+  })
+
+  it("defaults delegationRoute to null when the field is absent", () => {
+    const snap = baseSnapshot()
+    delete (snap as { delegation_route?: unknown }).delegation_route
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.delegationRoute).toBeNull()
+  })
+})

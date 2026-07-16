@@ -338,6 +338,13 @@ export interface DbConversationSummary {
   parent_id?: number | null
   parent_tool_use_id?: string | null
   delegation_call_id?: string | null
+  /** Root-only managed route override; null/omit = inherit global. */
+  delegation_route_override?: DelegationRoutePolicy | null
+  /** Latest Broker task status for this conversation (sidebar health). */
+  delegation_task_status?: string | null
+  delegation_error_code?: string | null
+  delegation_started_at?: string | null
+  delegation_finished_at?: string | null
 }
 
 /** Payload for the global `conversation://changed` side-channel that keeps
@@ -1261,6 +1268,27 @@ export type AcpEvent =
       result: DelegationResultSummary
     }
   /**
+   * Soft-supervisor observation transition for a still-running Broker task.
+   * Updates the existing active-delegation card only — never creates,
+   * removes, or completes a task.
+   */
+  | {
+      type: "delegation_observation_changed"
+      parent_tool_use_id: string
+      task_id: string
+      observation: TaskObservation
+      last_agent_activity_at: string
+      stalled_since?: string | null
+    }
+  /**
+   * Post-ready companion lease closed/opened: only the mutable
+   * `delegation_available` bit flips; route plan is immutable.
+   */
+  | {
+      type: "delegation_availability_changed"
+      available: boolean
+    }
+  /**
    * The user's submitted prompt, broadcast on the connection stream so OTHER
    * clients viewing this conversation synthesize the user turn in real time.
    * The sending client renders its own optimistic turn and ignores this echo.
@@ -1329,6 +1357,42 @@ export type ConfigStaleKind =
   | "agent_config"
   | "model_provider"
   | "terminal_shell"
+  | "delegation_route"
+
+/** Managed delegation route preference (mirror of Rust `DelegationRoutePolicy`). */
+export type DelegationRoutePolicy = "codeg" | "native"
+
+/** How the effective route was chosen (mirror of Rust `DelegationRouteSource`). */
+export type DelegationRouteSource =
+  | "forced_child"
+  | "session_override"
+  | "global_default"
+  | "feature_disabled"
+  | "safe_fallback"
+
+/** Typed preflight/bootstrap degradation that triggered a safe fallback. */
+export type RouteDegradedReason =
+  | "native_suppression_unsupported"
+  | "native_suppression_invalid"
+  | "companion_binary_unavailable"
+  | "agent_mcp_unsupported"
+  | "companion_initialization_failed"
+
+/** Soft-watchdog health for a still-running Broker task (never terminal). */
+export type TaskObservation = "active" | "stalled" | "waiting_input"
+
+/**
+ * Immutable launch plan plus post-ready availability bit, carried on live
+ * snapshots so attach payloads have one stable shape.
+ */
+export interface DelegationRouteSnapshot {
+  requested: DelegationRoutePolicy
+  effective: DelegationRoutePolicy
+  source: DelegationRouteSource
+  managed: boolean
+  degraded_reason?: RouteDegradedReason | null
+  delegation_available: boolean
+}
 
 /** A block of a broadcast user prompt (mirror of Rust `UserMessageBlock`).
  *  Narrower than the persisted `ContentBlock`: only what a viewer needs to
@@ -1616,6 +1680,10 @@ export interface ActiveDelegationState {
   child_connection_id: string
   child_conversation_id: number
   agent_type: AgentType
+  /** Soft-watchdog health for this still-running card. */
+  observation?: TaskObservation | null
+  last_agent_activity_at?: string | null
+  stalled_since?: string | null
 }
 
 /** Lifecycle of a live-feedback note (mirror of Rust `FeedbackStatus`). */
@@ -1680,6 +1748,11 @@ export interface LiveSessionSnapshot {
   config_stale?: boolean
   /** Which settings surface drifted; present only while `config_stale`. */
   config_stale_kind?: ConfigStaleKind | null
+  /**
+   * Managed route snapshot (immutable plan + mutable availability). Absent on
+   * older payloads — denormalized to `null`, never derived from live settings.
+   */
+  delegation_route?: DelegationRouteSnapshot
   event_seq: number
 }
 

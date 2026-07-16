@@ -9,6 +9,7 @@ const h = vi.hoisted(() => ({
     | "agent_config"
     | "model_provider"
     | "terminal_shell"
+    | "delegation_route"
     | null,
   configStaleDismissed: false,
   isViewer: false,
@@ -74,6 +75,12 @@ describe("SessionConfigStaleBanner", () => {
     await waitFor(() => {
       expect(h.reapplyConfig).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it("shows delegationRouteTitle for delegation_route kind", () => {
+    h.configStaleKind = "delegation_route"
+    render(<SessionConfigStaleBanner contextKey="tab-1" />)
+    expect(screen.getByText("delegationRouteTitle")).toBeInTheDocument()
   })
 
   it("shows modelProviderTitle for model_provider kind", () => {

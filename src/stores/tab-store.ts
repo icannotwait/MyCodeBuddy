@@ -19,6 +19,7 @@ import type {
   ConversationChange,
   ConversationStatus,
   DbConversationSummary,
+  DelegationRoutePolicy,
   OpenedTab,
   TabsChanged,
 } from "@/lib/types"
@@ -79,6 +80,13 @@ export interface TabItemInternal {
    * composer hides the branch picker and shows the "no-folder" chip.
    */
   isChat?: boolean
+  /**
+   * Memory-only draft route override for managed agents (`null` = inherit
+   * global). Participates in sameDerivedTab / binding / actions. Cleared on
+   * bind (persisted override lives on the conversation row). Not written to
+   * opened_tabs.
+   */
+  delegationRouteOverride?: DelegationRoutePolicy | null
 }
 
 export type TabItem = TabItemInternal
@@ -157,6 +165,15 @@ export interface TabStoreState {
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: AgentType) => void
   setDraftAgentFromFallback: (tabId: string, agentType: AgentType) => void
+  /**
+   * Memory-only draft route override. Cleared when the draft binds to a
+   * persisted conversation. Does not reconnect — connected drafts mark stale
+   * via `setDraftDelegationRoutePreference` separately.
+   */
+  setDraftDelegationRoute: (
+    tabId: string,
+    routeOverride: DelegationRoutePolicy | null
+  ) => void
   bindConversationTab: (
     tabId: string,
     conversationId: number,
@@ -308,7 +325,8 @@ function sameDerivedTab(a: TabItemInternal, b: TabItemInternal): boolean {
     a.workingDir === b.workingDir &&
     a.status === b.status &&
     a.agentTypeProvisional === b.agentTypeProvisional &&
-    a.isChat === b.isChat
+    a.isChat === b.isChat &&
+    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null)
   )
 }
 
@@ -904,6 +922,21 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     recomputeTabs()
   },
 
+  setDraftDelegationRoute: (tabId, routeOverride) => {
+    const prev = get().rawTabs
+    const next = prev.map((t) => {
+      if (t.id !== tabId) return t
+      if (t.conversationId != null) return t // only drafts
+      if ((t.delegationRouteOverride ?? null) === (routeOverride ?? null)) {
+        return t
+      }
+      return { ...t, delegationRouteOverride: routeOverride }
+    })
+    if (next.every((t, i) => t === prev[i])) return
+    set({ rawTabs: next })
+    recomputeTabs()
+  },
+
   bindConversationTab: (
     tabId,
     conversationId,
@@ -923,6 +956,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           title: formatConversationTitle(title) || tab.title,
           runtimeConversationId,
           agentTypeProvisional: false,
+          // Override is now on the conversation row; drop the memory-only flag.
+          delegationRouteOverride: undefined,
           ...(folderId != null ? { folderId } : {}),
           ...(workingDir != null ? { workingDir } : {}),
         }
@@ -1510,6 +1545,7 @@ export function useTabActions() {
       setChatDraftWorkingDir: s.setChatDraftWorkingDir,
       confirmDraftAgent: s.confirmDraftAgent,
       setDraftAgentFromFallback: s.setDraftAgentFromFallback,
+      setDraftDelegationRoute: s.setDraftDelegationRoute,
       bindConversationTab: s.bindConversationTab,
       setTabRuntimeConversationId: s.setTabRuntimeConversationId,
       reorderTabs: s.reorderTabs,
