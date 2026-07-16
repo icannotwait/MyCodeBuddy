@@ -1389,16 +1389,25 @@ impl DelegationBroker {
             .notify();
     }
 
-    /// Running Broker tasks as `(task_id, child_connection_id)` for the
-    /// observation source. Settling tasks are still lifecycle-running for
-    /// status, but observation only covers `running` (not mid-settle).
+    /// Logical Running Broker tasks as `(task_id, child_connection_id)` for
+    /// the observation source: `pending.running` ∪ `pending.settling` — the
+    /// same set Task 8 status/wait classify as [`TaskStatus::Running`].
+    /// Child connection id is preserved for both maps so the production
+    /// source can join `SessionState` through settlement.
     pub async fn running_task_child_ids(&self) -> Vec<(String, String)> {
         let inner = self.pending.inner.lock().await;
-        inner
+        let mut out: Vec<(String, String)> = inner
             .running
             .iter()
             .map(|(id, t)| (id.clone(), t.child_connection_id.clone()))
-            .collect()
+            .collect();
+        out.extend(
+            inner
+                .settling
+                .iter()
+                .map(|(id, t)| (id.clone(), t.child_connection_id.clone())),
+        );
+        out
     }
 
     /// Cache a soft-supervisor observation (observe-only; never mutates status).
@@ -1409,7 +1418,8 @@ impl DelegationBroker {
             .insert(task_id.to_string(), snap);
     }
 
-    /// Drop a cached observation when the task leaves `running`.
+    /// Drop a cached observation when the task leaves logical Running
+    /// (neither `running` nor `settling` — true terminal).
     pub async fn clear_observation(&self, task_id: &str) {
         self.observation_cache.lock().await.remove(task_id);
     }
@@ -3837,7 +3847,8 @@ use crate::acp::delegation::supervisor::{
 };
 use crate::acp::manager::ConnectionManager;
 
-/// Joins Broker running-task ids to child `SessionState` snapshots (read-only).
+/// Joins Broker logical-Running task ids (`running` ∪ `settling`) to child
+/// `SessionState` snapshots (read-only).
 pub struct BrokerObservationSource {
     pub broker: Arc<DelegationBroker>,
     pub manager: Arc<ConnectionManager>,
@@ -9381,6 +9392,60 @@ mod tests {
             .expect("wait0 must release after settle")
             .expect("wait0 join");
         assert_eq!(terminal.status, TaskStatus::Completed);
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
+    }
+
+    /// Observation membership matches Task 8 logical Running: present while
+    /// accepted (`running`) and mid-settle (`settling`), gone only after true
+    /// terminal (`completed`). Child connection id is preserved for the join.
+    #[tokio::test]
+    async fn running_task_child_ids_includes_settling_until_completed() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.install_settle_gate(entered_tx, release_rx).await;
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(valid_request())
+            .await
+            .task_id
+            .expect("id");
+
+        let running_ids = broker.running_task_child_ids().await;
+        assert_eq!(
+            running_ids,
+            vec![(t1.clone(), "child-conn".into())],
+            "accepted running task must be in observation membership"
+        );
+
+        let complete = {
+            let broker = broker.clone();
+            let t1 = t1.clone();
+            tokio::spawn(async move {
+                broker.complete_call(&t1, successful_outcome()).await;
+            })
+        };
+        entered_rx.await.expect("settle entered");
+
+        let settling_ids = broker.running_task_child_ids().await;
+        assert_eq!(
+            settling_ids,
+            vec![(t1.clone(), "child-conn".into())],
+            "settling tasks remain logical Running for observation (with child id)"
+        );
+
+        release_tx.send(()).expect("release settle");
+        complete.await.expect("complete join");
+
+        let terminal_ids = broker.running_task_child_ids().await;
+        assert!(
+            terminal_ids.is_empty(),
+            "completed tasks leave observation membership: {terminal_ids:?}"
+        );
         assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
     }
 

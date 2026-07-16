@@ -157,7 +157,8 @@ impl DelegationSupervisor {
         let live_ids: std::collections::HashSet<String> =
             health.iter().map(|h| h.task_id.clone()).collect();
 
-        // Remove observations for tasks no longer running.
+        // Remove observations for tasks no longer logical Running
+        // (absent from health = not in running ∪ settling).
         let stale: Vec<String> = {
             let last = self.last_emitted.lock().expect("last_emitted lock");
             last.keys()
@@ -302,6 +303,12 @@ mod tests {
             }
         }
 
+        /// Drop from health as if the task left logical Running (true terminal).
+        async fn leave_logical_running(&self) {
+            self.health.lock().await.clear();
+            *self.task_status.lock().await = TaskStatus::Completed;
+        }
+
         async fn task_status(&self) -> TaskStatus {
             *self.task_status.lock().await
         }
@@ -329,12 +336,22 @@ mod tests {
     #[derive(Default)]
     struct MockObservationSink {
         transitions: AsyncMutex<Vec<(String, TaskObservation)>>,
+        snapshots: AsyncMutex<Vec<(String, ObservationSnapshot)>>,
         last: AsyncMutex<Option<ObservationSnapshot>>,
+        clears: AsyncMutex<Vec<String>>,
     }
 
     impl MockObservationSink {
         async fn transitions(&self) -> Vec<(String, TaskObservation)> {
             self.transitions.lock().await.clone()
+        }
+
+        async fn snapshots(&self) -> Vec<(String, ObservationSnapshot)> {
+            self.snapshots.lock().await.clone()
+        }
+
+        async fn clears(&self) -> Vec<String> {
+            self.clears.lock().await.clone()
         }
 
         async fn last(&self) -> ObservationSnapshot {
@@ -353,10 +370,17 @@ mod tests {
                 .lock()
                 .await
                 .push((task_id.to_string(), observation.observation));
+            self.snapshots
+                .lock()
+                .await
+                .push((task_id.to_string(), observation.clone()));
             *self.last.lock().await = Some(observation);
         }
 
-        async fn clear_observation(&self, _task_id: &str) {}
+        async fn clear_observation(&self, task_id: &str) {
+            self.clears.lock().await.push(task_id.to_string());
+            *self.last.lock().await = None;
+        }
     }
 
     fn supervisor_with(
@@ -491,5 +515,82 @@ mod tests {
             sink.last().await.stalled_since,
             Some(last + chrono::Duration::seconds(300))
         );
+    }
+
+    /// Settling is still logical Running: health continues to include the task,
+    /// so a mid-settle scan must retain the observation. Cache/`last_emitted`
+    /// clear only after the task leaves health (true terminal), once.
+    #[tokio::test]
+    async fn observation_remains_through_settling_then_clears_once_at_terminal() {
+        let clock = Arc::new(FakeClock::at("2026-07-16T10:00:00Z"));
+        let source = Arc::new(MockObservationSource::running("task-1", clock.now_value()));
+        let sink = Arc::new(MockObservationSink::default());
+        let supervisor = supervisor_with(source.clone(), sink.clone(), clock.clone(), 300);
+
+        supervisor.scan_once().await;
+        assert_eq!(
+            sink.transitions().await,
+            vec![("task-1".into(), TaskObservation::Active)]
+        );
+        assert!(sink.clears().await.is_empty());
+
+        // Mid-settle scan: source still reports the task (running ∪ settling).
+        supervisor.scan_once().await;
+        assert_eq!(
+            sink.transitions().await,
+            vec![("task-1".into(), TaskObservation::Active)],
+            "identical Active snapshot must not re-emit during settling"
+        );
+        assert!(
+            sink.clears().await.is_empty(),
+            "settling must not clear observation as stale/terminal"
+        );
+        assert_eq!(sink.last().await.observation, TaskObservation::Active);
+
+        // True terminal: leave both running and settling.
+        source.leave_logical_running().await;
+        supervisor.scan_once().await;
+        assert_eq!(sink.clears().await, vec!["task-1".to_string()]);
+        assert!(
+            sink.last.lock().await.is_none(),
+            "terminal clear drops the cached last snapshot"
+        );
+
+        // Second scan after terminal: no duplicate clear.
+        supervisor.scan_once().await;
+        assert_eq!(
+            sink.clears().await,
+            vec!["task-1".to_string()],
+            "terminal clear must be once"
+        );
+    }
+
+    /// Production de-dup uses full `ObservationSnapshot` equality (enum +
+    /// timestamps). An activity refresh that stays `Active` must re-emit.
+    #[tokio::test]
+    async fn active_snapshot_re_emits_when_last_agent_activity_at_changes() {
+        let clock = Arc::new(FakeClock::at("2026-07-16T10:00:00Z"));
+        let source = Arc::new(MockObservationSource::running("task-1", clock.now_value()));
+        let sink = Arc::new(MockObservationSink::default());
+        let supervisor = supervisor_with(source.clone(), sink.clone(), clock.clone(), 300);
+
+        supervisor.scan_once().await;
+        let first_at = sink.last().await.last_agent_activity_at;
+
+        clock.advance_seconds(10);
+        source.mark_activity(clock.now_value()).await;
+        supervisor.scan_once().await;
+
+        let snaps = sink.snapshots().await;
+        assert_eq!(snaps.len(), 2, "timestamp-only change must re-emit");
+        assert_eq!(snaps[0].1.observation, TaskObservation::Active);
+        assert_eq!(snaps[1].1.observation, TaskObservation::Active);
+        assert_eq!(snaps[0].1.last_agent_activity_at, first_at);
+        assert_eq!(snaps[1].1.last_agent_activity_at, clock.now_value());
+        assert_ne!(
+            snaps[0].1.last_agent_activity_at,
+            snaps[1].1.last_agent_activity_at
+        );
+        assert!(sink.clears().await.is_empty());
     }
 }
