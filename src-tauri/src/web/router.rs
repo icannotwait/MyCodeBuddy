@@ -144,6 +144,10 @@ pub fn build_router(
             post(handlers::conversations::set_conversation_delegation_route),
         )
         .route(
+            "/set_draft_delegation_route_preference",
+            post(handlers::conversations::set_draft_delegation_route_preference),
+        )
+        .route(
             "/update_conversation_status",
             post(handlers::conversations::update_conversation_status),
         )

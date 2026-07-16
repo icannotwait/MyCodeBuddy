@@ -908,6 +908,7 @@ mod tauri_app {
                 conversations::create_chat_conversation,
                 conversations::create_chat_dir,
                 conversations::set_conversation_delegation_route,
+                conversations::set_draft_delegation_route_preference,
                 conversations::update_conversation_status,
                 conversations::update_conversation_title,
                 conversations::update_conversation_pinned,

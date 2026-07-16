@@ -5881,10 +5881,15 @@ pub async fn acp_connect(
     agent_type: AgentType,
     working_dir: Option<String>,
     session_id: Option<String>,
+    conversation_id: Option<i32>,
+    delegation_route_override: Option<
+        crate::acp::delegation::route::DelegationRoutePolicy,
+    >,
     preferred_mode_id: Option<String>,
     preferred_config_values: Option<BTreeMap<String, String>>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
+    runtime: State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
     app_handle: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<String, AcpError> {
@@ -5898,11 +5903,17 @@ pub async fn acp_connect(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let runtime_snap = runtime.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         &db,
         agent_type,
         session_id.as_deref(),
         &app_data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(
+            conversation_id,
+            delegation_route_override,
+        ),
+        &runtime_snap,
     )
     .await?;
 
@@ -5996,8 +6007,15 @@ pub async fn acp_describe_agent_options_core(
     // Without this, the settings UI could show options that the agent
     // never advertises in production (settings override an API URL,
     // model_provider injects a different model list, etc.).
-    let launch_inputs =
-        crate::acp::terminal_context::build_acp_launch_inputs(db, agent_type, None, data_dir)
+    let runtime = crate::commands::delegation::DelegationRuntimeSnapshot::default();
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+        db,
+        agent_type,
+        None,
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+        &runtime,
+    )
             .await?;
     manager
         .probe_agent_options(agent_type, working_dir, launch_inputs)

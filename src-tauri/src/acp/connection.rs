@@ -241,12 +241,13 @@ impl Drop for ConnectionCleanupGuard {
 }
 
 /// Per-component config fingerprint captured at spawn and compared after
-/// settings saves. Agent config and terminal shell are tracked independently
-/// so one surface can stay stale while the other is reverted.
+/// settings saves. Agent config, terminal shell, and delegation route are
+/// tracked independently so one surface can stay stale while another reverts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfigFingerprint {
     pub agent_config: String,
     pub terminal_shell: String,
+    pub delegation_route: String,
 }
 
 /// Latest settings values observed by staleness refresh (not necessarily the
@@ -263,10 +264,12 @@ pub struct ConnectionObservedConfig {
 pub fn matching_config_pair(
     agent_config: impl Into<String>,
     terminal_shell: impl Into<String>,
+    delegation_route: impl Into<String>,
 ) -> (ConnectionConfigFingerprint, ConnectionObservedConfig) {
     let fingerprint = ConnectionConfigFingerprint {
         agent_config: agent_config.into(),
         terminal_shell: terminal_shell.into(),
+        delegation_route: delegation_route.into(),
     };
     let observed = ConnectionObservedConfig {
         fingerprint: fingerprint.clone(),
@@ -304,12 +307,23 @@ pub struct AgentConnection {
     /// Most recent settings values seen by staleness refresh. Starts equal to
     /// `spawn_config`. Tracks "did anything change since we last looked" so a
     /// second real change re-emits `SessionConfigStale` while a no-op save
-    /// stays silent. Agent and shell components update independently.
+    /// stays silent. Agent, shell, and route components update independently.
     pub observed_config: ConnectionObservedConfig,
     /// Immutable terminal shell snapshot captured when this connection's
     /// process was spawned. Never re-read from settings after launch; reuse
     /// and reconnect keep this value for the connection's lifetime.
     pub terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
+    /// Immutable managed-route plan resolved once before process launch.
+    /// Settings/override changes never mutate this; they only refresh
+    /// `observed_config.fingerprint.delegation_route`.
+    pub route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    /// Connection origin used at launch (root vs forced Codeg child).
+    pub origin: crate::acp::delegation::route::DelegationConnectionOrigin,
+    /// Session route preference used for comparison re-resolution.
+    /// For persisted roots this mirrors the launch-time override; for
+    /// row-less drafts it may be updated by
+    /// `set_draft_delegation_route_preference` without touching `route_plan`.
+    pub route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 }
 
 impl AgentConnection {
@@ -788,6 +802,9 @@ pub async fn spawn_agent_connection(
     session_id: Option<String>,
     runtime_env: BTreeMap<String, String>,
     terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
+    route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    origin: crate::acp::delegation::route::DelegationConnectionOrigin,
+    route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
     owner_window_label: String,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
@@ -870,6 +887,7 @@ pub async fn spawn_agent_connection(
     let (spawn_config, observed_config) = matching_config_pair(
         crate::commands::acp::fingerprint_config(agent_type, &runtime_env),
         terminal_shell.selection_key.clone(),
+        route_plan.fingerprint.clone(),
     );
 
     // Insert the entry BEFORE spawning the background task so that a
@@ -889,6 +907,9 @@ pub async fn spawn_agent_connection(
             spawn_config,
             observed_config,
             terminal_shell: terminal_shell.clone(),
+            route_plan,
+            origin,
+            route_preference,
         },
     );
 
@@ -1682,7 +1703,7 @@ async fn send_resume_session(
 /// (`feedback_tool_available`, a registered delegation token pi can never use).
 /// `supports_mcp` stays `true` for pi (session/new tolerates the field), so this
 /// is a separate, narrower gate. Gate codeg-mcp injection on it.
-fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
+pub(crate) fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
     !matches!(agent_type, AgentType::Pi)
 }
 
@@ -1785,7 +1806,7 @@ pub struct DelegationInjection {
 /// injection — never paper over with a phantom path, because that fails
 /// inside the agent's MCP spawn loop and may take the entire ACP session
 /// down on stricter agents.
-fn locate_codeg_mcp_binary() -> Option<PathBuf> {
+pub(crate) fn locate_codeg_mcp_binary() -> Option<PathBuf> {
     let filename = if cfg!(windows) {
         "codeg-mcp.exe"
     } else {

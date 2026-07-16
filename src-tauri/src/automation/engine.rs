@@ -380,11 +380,14 @@ impl AutomationEngine {
 
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
+        let runtime = crate::commands::delegation::DelegationRuntimeSnapshot::default();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
             &self.data_dir,
+            crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+            &runtime,
         )
         .await
         .map_err(|e| e.to_string())?;

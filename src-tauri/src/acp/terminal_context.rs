@@ -10,20 +10,97 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sacp::schema::{ContentBlock, Meta, TextContent};
 
+use crate::acp::connection::{agent_delivers_wire_mcp, locate_codeg_mcp_binary};
+use crate::acp::delegation::route::{
+    resolve_route, suppression_capability, DelegationConnectionOrigin, DelegationRoutePlan,
+    DelegationRoutePolicy, RouteResolutionError, RouteResolutionInput,
+};
 use crate::acp::error::AcpError;
+use crate::acp::registry;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
+use crate::commands::delegation::DelegationRuntimeSnapshot;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::SystemTerminalSettings;
 use crate::terminal::shell::{
     resolve_terminal_shell, ResolvedShellSnapshot, ResolvedShellSpec, ShellDialect,
 };
+use sea_orm::DatabaseConnection;
 
-/// Inputs loaded before reuse / spawn: agent runtime env + persisted terminal settings.
+/// Connect-time route preference inputs. Resolved exactly once before process
+/// launch; the resulting plan is stored immutable on the connection.
+#[derive(Debug, Clone)]
+pub struct AcpRouteRequest {
+    pub conversation_id: Option<i32>,
+    pub draft_override: Option<DelegationRoutePolicy>,
+    pub origin: DelegationConnectionOrigin,
+}
+
+impl AcpRouteRequest {
+    pub fn root(
+        conversation_id: Option<i32>,
+        draft_override: Option<DelegationRoutePolicy>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            draft_override,
+            origin: DelegationConnectionOrigin::Root,
+        }
+    }
+
+    /// Broker-spawned children always force Codeg regardless of global settings.
+    pub fn codeg_child() -> Self {
+        Self {
+            conversation_id: None,
+            draft_override: None,
+            origin: DelegationConnectionOrigin::CodegChild,
+        }
+    }
+}
+
+/// Inputs loaded before reuse / spawn: agent runtime env + terminal settings +
+/// one already-resolved route plan.
 #[derive(Debug, Clone)]
 pub struct AcpLaunchInputs {
     pub runtime_env: BTreeMap<String, String>,
     pub terminal_settings: SystemTerminalSettings,
+    pub route_plan: DelegationRoutePlan,
+    pub origin: DelegationConnectionOrigin,
+    /// Preference used for later comparison re-resolution (not source-of-truth
+    /// for the live process — that is `route_plan`).
+    pub route_preference: Option<DelegationRoutePolicy>,
+}
+
+impl AcpLaunchInputs {
+    /// Construct launch inputs with a feature-disabled native plan.
+    /// Used by tests and legacy call sites that do not exercise route reuse.
+    pub fn with_placeholder_route(
+        runtime_env: BTreeMap<String, String>,
+        terminal_settings: SystemTerminalSettings,
+    ) -> Self {
+        use crate::acp::delegation::route::{
+            resolve_route, SuppressionCapability, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        // Feature-disabled root: native effective, stable empty-capability path.
+        let route_plan = resolve_route(RouteResolutionInput {
+            agent_type: AgentType::ClaudeCode,
+            origin: DelegationConnectionOrigin::Root,
+            session_override: None,
+            global_policy: DelegationRoutePolicy::Codeg,
+            delegation_enabled: false,
+            suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+            agent_mcp_supported: true,
+            companion_binary_available: true,
+        })
+        .expect("feature-disabled native plan must resolve");
+        Self {
+            runtime_env,
+            terminal_settings,
+            route_plan,
+            origin: DelegationConnectionOrigin::Root,
+            route_preference: None,
+        }
+    }
 }
 
 /// Immutable config for a connection that is about to spawn a process.
@@ -31,6 +108,88 @@ pub struct AcpLaunchInputs {
 pub(crate) struct AcpLaunchConfig {
     pub runtime_env: BTreeMap<String, String>,
     pub terminal_shell: ResolvedShellSnapshot,
+    pub route_plan: DelegationRoutePlan,
+    pub origin: DelegationConnectionOrigin,
+    pub route_preference: Option<DelegationRoutePolicy>,
+}
+
+/// Resolve the immutable route plan for a connect request.
+///
+/// Persisted conversation override is authoritative when `conversation_id` is
+/// present; a mismatching payload override is ignored and logged. Draft roots
+/// (no row) use `draft_override`. Children force Codeg via origin.
+pub async fn resolve_connect_route(
+    conn: &DatabaseConnection,
+    agent_type: AgentType,
+    request: AcpRouteRequest,
+    runtime: &DelegationRuntimeSnapshot,
+) -> Result<DelegationRoutePlan, AcpError> {
+    let session_override = match request.origin {
+        DelegationConnectionOrigin::CodegChild => None,
+        DelegationConnectionOrigin::Root => {
+            if let Some(conversation_id) = request.conversation_id {
+                let persisted = load_persisted_route_override(conn, conversation_id).await?;
+                if let Some(payload) = request.draft_override {
+                    if Some(payload) != persisted {
+                        tracing::warn!(
+                            conversation_id,
+                            ?payload,
+                            ?persisted,
+                            "[ACP] ignoring connect payload delegation_route_override; \
+                             persisted conversation override is authoritative"
+                        );
+                    }
+                }
+                persisted
+            } else {
+                request.draft_override
+            }
+        }
+    };
+
+    let meta = registry::get_agent_meta(agent_type);
+    // No product surface yet for unverified custom managed-agent binaries.
+    let custom_executable = false;
+    let suppression =
+        suppression_capability(agent_type, meta.registry_version(), custom_executable);
+    let agent_mcp_supported = meta.supports_mcp && agent_delivers_wire_mcp(agent_type);
+    let companion_binary_available = locate_codeg_mcp_binary().is_some();
+
+    resolve_route(RouteResolutionInput {
+        agent_type,
+        origin: request.origin,
+        session_override,
+        global_policy: runtime.route_policy,
+        delegation_enabled: runtime.enabled,
+        suppression,
+        agent_mcp_supported,
+        companion_binary_available,
+    })
+    .map_err(route_resolution_to_acp)
+}
+
+async fn load_persisted_route_override(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<DelegationRoutePolicy>, AcpError> {
+    match crate::db::service::conversation_service::get_by_id(conn, conversation_id).await {
+        Ok(summary) => Ok(summary.delegation_route_override),
+        Err(crate::db::error::DbError::Migration(msg)) if msg.contains("not found") => {
+            Err(AcpError::protocol(format!(
+                "conversation not found: {conversation_id}"
+            )))
+        }
+        Err(e) => Err(AcpError::protocol(e.to_string())),
+    }
+}
+
+fn route_resolution_to_acp(err: RouteResolutionError) -> AcpError {
+    match err {
+        RouteResolutionError::RouteUnavailable { reason } => AcpError::RouteUnavailable { reason },
+        RouteResolutionError::MixedCreationSurfaces => {
+            AcpError::protocol("managed plan exposes both native creation and codeg delegation")
+        }
+    }
 }
 
 /// Case-aware env key equality: Windows env keys are case-insensitive.
@@ -181,13 +340,29 @@ pub(crate) fn build_terminal_base_env(
         .collect()
 }
 
-/// Load agent runtime env + system terminal settings for an ACP entry point.
+/// Load agent runtime env + system terminal settings + one resolved route plan.
 pub(crate) async fn build_acp_launch_inputs(
     db: &AppDatabase,
     agent_type: AgentType,
     session_id: Option<&str>,
     data_dir: &Path,
+    route_request: AcpRouteRequest,
+    runtime: &DelegationRuntimeSnapshot,
 ) -> Result<AcpLaunchInputs, AcpError> {
+    let route_preference = match route_request.origin {
+        DelegationConnectionOrigin::CodegChild => None,
+        DelegationConnectionOrigin::Root => {
+            if let Some(conversation_id) = route_request.conversation_id {
+                load_persisted_route_override(&db.conn, conversation_id).await?
+            } else {
+                route_request.draft_override
+            }
+        }
+    };
+    let origin = route_request.origin;
+    let route_plan =
+        resolve_connect_route(&db.conn, agent_type, route_request, runtime).await?;
+
     let runtime_env =
         crate::commands::acp::build_session_runtime_env(db, agent_type, session_id, data_dir)
             .await?;
@@ -199,6 +374,9 @@ pub(crate) async fn build_acp_launch_inputs(
     Ok(AcpLaunchInputs {
         runtime_env,
         terminal_settings,
+        route_plan,
+        origin,
+        route_preference,
     })
 }
 
@@ -239,6 +417,9 @@ fn finalize_acp_launch_config_with_adapter(
     Ok(AcpLaunchConfig {
         runtime_env: inputs.runtime_env,
         terminal_shell,
+        route_plan: inputs.route_plan,
+        origin: inputs.origin,
+        route_preference: inputs.route_preference,
     })
 }
 
@@ -461,15 +642,15 @@ earlier terminal context records.\n\
         adapter_env.insert("CODEG_TERMINAL_DIALECT".into(), "cmd".into());
         adapter_env.insert("ADAPTER_EXTRA".into(), "1".into());
 
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::from([(
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::from([(
                 "COMSPEC".into(),
                 r"C:\Windows\System32\cmd.exe".into(),
             )]),
-            terminal_settings: SystemTerminalSettings {
+            SystemTerminalSettings {
                 default_shell: Some(path.to_string_lossy().into_owned()),
             },
-        };
+        );
         let adapter = FakeAdapter { env: adapter_env };
         let config = finalize_acp_launch_config_with_adapter(inputs, &adapter)
             .expect("pwsh temp shell must resolve");
@@ -517,12 +698,12 @@ earlier terminal context records.\n\
         adapter_env.insert("ADAPTER_EXTRA".into(), "1".into());
 
         let original_comspec = r"C:\Windows\System32\cmd.exe".to_string();
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
-            terminal_settings: SystemTerminalSettings {
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
+            SystemTerminalSettings {
                 default_shell: None,
             },
-        };
+        );
         let adapter = FakeAdapter { env: adapter_env };
 
         // Even when resolve succeeds, COMSPEC addition must error. When resolve
@@ -547,12 +728,12 @@ earlier terminal context records.\n\
                     "bash"
                 };
                 let path = make_usable_shell(dir.path(), shell_name);
-                let inputs = AcpLaunchInputs {
-                    runtime_env: BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
-                    terminal_settings: SystemTerminalSettings {
+                let inputs = AcpLaunchInputs::with_placeholder_route(
+                    BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
+                    SystemTerminalSettings {
                         default_shell: Some(path.to_string_lossy().into_owned()),
                     },
-                };
+                );
                 let mut adapter_env = BTreeMap::new();
                 adapter_env.insert("COMSPEC".into(), r"C:\evil\cmd.exe".into());
                 let err =
@@ -585,6 +766,56 @@ earlier terminal context records.\n\
     }
 
     #[tokio::test]
+    async fn persisted_override_beats_connect_payload_but_draft_uses_payload() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource,
+        };
+        use crate::commands::delegation::DelegationRuntimeSnapshot;
+        use crate::db::test_helpers::seed_folder;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/route-resolve").await;
+        let conversation_id = crate::commands::conversations::create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            Some(DelegationRoutePolicy::Native),
+        )
+        .await
+        .unwrap();
+        let runtime = DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy: DelegationRoutePolicy::Codeg,
+            stalled_after_seconds: 300,
+        };
+
+        let persisted = resolve_connect_route(
+            &db.conn,
+            AgentType::Codex,
+            AcpRouteRequest::root(
+                Some(conversation_id),
+                Some(DelegationRoutePolicy::Codeg),
+            ),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(persisted.effective, DelegationRoutePolicy::Native);
+        assert_eq!(persisted.source, DelegationRouteSource::SessionOverride);
+
+        let draft = resolve_connect_route(
+            &db.conn,
+            AgentType::Codex,
+            AcpRouteRequest::root(None, Some(DelegationRoutePolicy::Native)),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(draft.effective, DelegationRoutePolicy::Native);
+    }
+
+    #[tokio::test]
     async fn finalize_rejects_unavailable_shell_from_db_settings() {
         let db = test_helpers::fresh_in_memory_db().await;
         let settings = SystemTerminalSettings {
@@ -599,7 +830,15 @@ earlier terminal context records.\n\
         .await
         .unwrap();
 
-        let inputs = build_acp_launch_inputs(&db, AgentType::Grok, None, Path::new("."))
+        let runtime = crate::commands::delegation::DelegationRuntimeSnapshot::default();
+        let inputs = build_acp_launch_inputs(
+            &db,
+            AgentType::Grok,
+            None,
+            Path::new("."),
+            AcpRouteRequest::root(None, None),
+            &runtime,
+        )
             .await
             .expect("launch inputs load");
         let err = finalize_acp_launch_config(inputs, AgentType::Grok).unwrap_err();
@@ -638,7 +877,15 @@ earlier terminal context records.\n\
         .await
         .unwrap();
 
-        let inputs = build_acp_launch_inputs(&db, AgentType::Grok, None, Path::new("."))
+        let runtime = crate::commands::delegation::DelegationRuntimeSnapshot::default();
+        let inputs = build_acp_launch_inputs(
+            &db,
+            AgentType::Grok,
+            None,
+            Path::new("."),
+            AcpRouteRequest::root(None, None),
+            &runtime,
+        )
             .await
             .expect("launch inputs load");
         let err = finalize_acp_launch_config(inputs, AgentType::Grok).unwrap_err();

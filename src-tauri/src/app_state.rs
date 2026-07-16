@@ -135,10 +135,14 @@ pub fn build_delegation_stack(
     let db_arc = Arc::new(AppDatabase {
         conn: db_conn.clone(),
     });
+    // Create the shared runtime handle before the spawner so child launches
+    // always resolve against the live watch snapshot (never a second DB load).
+    let runtime_settings = DelegationRuntimeSettings::default();
     let spawner = Arc::new(ConnectionManagerSpawner {
         manager: cm_arc.clone(),
         db: db_arc.clone(),
         data_dir: Arc::new(data_dir),
+        runtime: runtime_settings.clone(),
     }) as Arc<dyn ConnectionSpawner>;
     let depth_lookup =
         Arc::new(DbDepthLookup { db: db_arc.clone() }) as Arc<dyn ConversationDepthLookup>;
@@ -161,7 +165,6 @@ pub fn build_delegation_stack(
     let feedback = crate::acp::feedback::FeedbackRuntimeConfig::new();
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
-    let runtime_settings = DelegationRuntimeSettings::default();
 
     // Install the injection on the manager so spawn_agent picks it up
     // without an extra parameter at every call site.

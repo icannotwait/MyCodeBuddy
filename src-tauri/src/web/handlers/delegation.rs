@@ -38,6 +38,7 @@ pub async fn set_delegation_settings(
         &state.db.conn,
         &state.delegation_broker,
         &state.delegation_runtime_settings,
+        &state.connection_manager,
         params.settings,
     )
     .await?;
@@ -77,6 +78,7 @@ pub async fn set_delegation_bundle(
         &state.db.conn,
         &state.delegation_broker,
         &state.delegation_runtime_settings,
+        &state.connection_manager,
         params.bundle,
     )
     .await?;

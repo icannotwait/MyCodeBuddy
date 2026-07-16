@@ -364,6 +364,8 @@ pub enum ConfigStaleKind {
     ModelProvider,
     /// Global terminal shell selection changed after this connection spawned.
     TerminalShell,
+    /// Managed delegation route preference drifted from the launch-time plan.
+    DelegationRoute,
 }
 
 /// A block of the user's submitted prompt, broadcast via [`AcpEvent::UserMessage`]

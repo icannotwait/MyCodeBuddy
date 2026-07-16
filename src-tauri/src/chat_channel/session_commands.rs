@@ -306,12 +306,12 @@ pub async fn handle_task(
                 return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
             }
         };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
+    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs::with_placeholder_route(
         // Chat-channel historically launched without agent credentials; keep
         // that shape while still snapshotting the global terminal selection.
-        runtime_env: BTreeMap::new(),
+        BTreeMap::new(),
         terminal_settings,
-    };
+    );
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(
@@ -500,10 +500,10 @@ pub async fn handle_resume(
                 return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
             }
         };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
-        runtime_env: BTreeMap::new(),
+    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs::with_placeholder_route(
+        BTreeMap::new(),
         terminal_settings,
-    };
+    );
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
     let connection_id = match conn_mgr
         .spawn_agent(

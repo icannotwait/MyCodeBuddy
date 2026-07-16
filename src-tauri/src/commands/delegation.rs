@@ -367,14 +367,17 @@ async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
 /// the clamp / re-apply chain is in exactly one place. Settings keys are
 /// written in one DB transaction so a mid-write failure does not leave a
 /// partial settings document. The runtime watch channel is updated **only
-/// after** a successful commit.
+/// after** a successful commit. Route/enabled changes refresh managed-root
+/// route staleness; a watchdog-only save updates the channel without stale.
 pub async fn set_delegation_settings_core(
     conn: &DatabaseConnection,
     broker: &DelegationBroker,
     runtime: &DelegationRuntimeSettings,
+    manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationSettings,
 ) -> Result<DelegationSettings, AppCommandError> {
     use sea_orm::TransactionTrait;
+    let before = runtime.snapshot();
     let clamped = desired.clamped();
     let txn = conn
         .begin()
@@ -387,11 +390,17 @@ pub async fn set_delegation_settings_core(
         .map_err(crate::db::error::DbError::from)
         .map_err(AppCommandError::from)?;
     // Commit succeeded — notify live consumers. Must not run on txn failure.
-    runtime.set(clamped.into_runtime_snapshot());
+    let after = clamped.into_runtime_snapshot();
+    runtime.set(after.clone());
     let profiles = broker.config_snapshot().await.profiles;
     let mut config = clamped.clone().into_broker_config();
     config.profiles = profiles;
     broker.set_config(config).await;
+    if before.enabled != after.enabled || before.route_policy != after.route_policy {
+        manager
+            .refresh_delegation_route_staleness(after.route_policy, after.enabled)
+            .await;
+    }
     Ok(clamped)
 }
 
@@ -409,9 +418,11 @@ pub async fn set_delegation_bundle_core(
     conn: &DatabaseConnection,
     broker: &DelegationBroker,
     runtime: &DelegationRuntimeSettings,
+    manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationBundle,
 ) -> Result<DelegationBundle, AppCommandError> {
     use sea_orm::TransactionTrait;
+    let before = runtime.snapshot();
     let clamped = desired.settings.clamped();
     let normalized = DelegationProfileDocument {
         profiles: normalize_profiles(desired.profiles.profiles)?,
@@ -433,7 +444,8 @@ pub async fn set_delegation_bundle_core(
         .map_err(crate::db::error::DbError::from)
         .map_err(AppCommandError::from)?;
 
-    runtime.set(clamped.into_runtime_snapshot());
+    let after = clamped.into_runtime_snapshot();
+    runtime.set(after.clone());
     let mut config = clamped.clone().into_broker_config();
     config.profiles = normalized
         .profiles
@@ -442,6 +454,11 @@ pub async fn set_delegation_bundle_core(
         .map(|profile| (profile.id.clone(), profile))
         .collect();
     broker.set_config(config).await;
+    if before.enabled != after.enabled || before.route_policy != after.route_policy {
+        manager
+            .refresh_delegation_route_staleness(after.route_policy, after.enabled)
+            .await;
+    }
     Ok(DelegationBundle {
         settings: clamped,
         profiles: normalized,
@@ -559,11 +576,22 @@ pub async fn set_delegation_settings(
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
     #[cfg(feature = "tauri-runtime")] runtime: tauri::State<'_, DelegationRuntimeSettings>,
+    #[cfg(feature = "tauri-runtime")] manager: tauri::State<
+        '_,
+        crate::acp::manager::ConnectionManager,
+    >,
     settings: DelegationSettings,
 ) -> Result<DelegationSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        set_delegation_settings_core(&db.conn, broker.inner(), runtime.inner(), settings).await
+        set_delegation_settings_core(
+            &db.conn,
+            broker.inner(),
+            runtime.inner(),
+            manager.inner(),
+            settings,
+        )
+        .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -610,11 +638,22 @@ pub async fn set_delegation_bundle(
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
     #[cfg(feature = "tauri-runtime")] runtime: tauri::State<'_, DelegationRuntimeSettings>,
+    #[cfg(feature = "tauri-runtime")] manager: tauri::State<
+        '_,
+        crate::acp::manager::ConnectionManager,
+    >,
     bundle: DelegationBundle,
 ) -> Result<DelegationBundle, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        set_delegation_bundle_core(&db.conn, broker.inner(), runtime.inner(), bundle).await
+        set_delegation_bundle_core(
+            &db.conn,
+            broker.inner(),
+            runtime.inner(),
+            manager.inner(),
+            bundle,
+        )
+        .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -733,7 +772,7 @@ mod tests {
                 profiles: vec![profile("11111111-1111-4111-8111-111111111111", " GLM5.2 ")],
             },
         };
-        let saved = set_delegation_bundle_core(&db.conn, &broker, &runtime, bundle)
+        let saved = set_delegation_bundle_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), bundle)
             .await
             .unwrap();
         assert!(saved.settings.enabled);
@@ -784,7 +823,7 @@ mod tests {
             depth_limit: 3,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, desired)
+        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
             .await
             .unwrap();
         assert!(!saved.enabled);
@@ -822,7 +861,7 @@ mod tests {
             agent_defaults: agent_defaults.clone(),
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, desired)
+        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
             .await
             .unwrap();
         assert_eq!(saved.agent_defaults, agent_defaults);
@@ -871,6 +910,7 @@ mod tests {
             &db.conn,
             &broker,
             &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
             DelegationSettings {
                 enabled: true,
                 depth_limit: 999,
@@ -893,7 +933,7 @@ mod tests {
             completed_cache_max_mb: 8,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, desired)
+        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
             .await
             .unwrap();
         assert_eq!(saved.completed_cache_max_mb, 8);
@@ -1000,7 +1040,7 @@ mod tests {
             completed_cache_max_mb: 512,
         };
 
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, desired)
+        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
             .await
             .unwrap();
         rx.changed().await.unwrap();

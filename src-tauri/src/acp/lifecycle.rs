@@ -1523,10 +1523,28 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: crate::acp::connection::matching_config_pair(String::new(), "system").0,
-            observed_config: crate::acp::connection::matching_config_pair(String::new(), "system")
-                .1,
+            spawn_config: {
+                let plan = crate::acp::delegation::route::test_empty_route_plan();
+                crate::acp::connection::matching_config_pair(
+                    String::new(),
+                    "system",
+                    plan.fingerprint.clone(),
+                )
+                .0
+            },
+            observed_config: {
+                let plan = crate::acp::delegation::route::test_empty_route_plan();
+                crate::acp::connection::matching_config_pair(
+                    String::new(),
+                    "system",
+                    plan.fingerprint,
+                )
+                .1
+            },
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         }
     }
 

@@ -54,16 +54,40 @@ fn is_reserved_turn_id(id: &str) -> bool {
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Prefer shell drift over agent drift so the banner wording matches the most
-/// recent surface the user still needs to reapply. When both components match
-/// spawn, returns `None` (not stale).
+/// Prefer shell drift over route drift over agent drift so the banner wording
+/// matches the highest-priority surface the user still needs to reapply.
+/// When all components match spawn, returns `None` (not stale).
 fn effective_stale_kind(conn: &AgentConnection) -> Option<ConfigStaleKind> {
-    if conn.observed_config.fingerprint.terminal_shell != conn.spawn_config.terminal_shell {
+    let observed = &conn.observed_config.fingerprint;
+    if observed.terminal_shell != conn.spawn_config.terminal_shell {
         Some(ConfigStaleKind::TerminalShell)
-    } else if conn.observed_config.fingerprint.agent_config != conn.spawn_config.agent_config {
+    } else if observed.delegation_route != conn.spawn_config.delegation_route {
+        Some(ConfigStaleKind::DelegationRoute)
+    } else if observed.agent_config != conn.spawn_config.agent_config {
         Some(conn.observed_config.agent_kind)
     } else {
         None
+    }
+}
+
+/// Session-id dedup reuses only when the route fingerprint matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteReuseDecision {
+    Reuse,
+    Conflict { existing_connection_id: String },
+}
+
+fn route_reuse_decision(
+    existing_fingerprint: &str,
+    requested_fingerprint: &str,
+    existing_connection_id: &str,
+) -> RouteReuseDecision {
+    if existing_fingerprint == requested_fingerprint {
+        RouteReuseDecision::Reuse
+    } else {
+        RouteReuseDecision::Conflict {
+            existing_connection_id: existing_connection_id.to_string(),
+        }
     }
 }
 
@@ -325,8 +349,12 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
-        let (spawn_config, observed_config) =
-            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
@@ -339,6 +367,9 @@ impl ConnectionManager {
             spawn_config,
             observed_config,
             terminal_shell,
+            route_plan,
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -371,8 +402,12 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
-        let (spawn_config, observed_config) =
-            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
@@ -385,6 +420,9 @@ impl ConnectionManager {
             spawn_config,
             observed_config,
             terminal_shell,
+            route_plan,
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -442,20 +480,51 @@ impl ConnectionManager {
             .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
             .await
         {
-            tracing::info!(
-                "[ACP] reusing connection id={} for session_id={}",
-                existing,
-                session_id.as_deref().unwrap_or("")
-            );
-            // Reuse must not resolve, validate, or apply newly loaded terminal
-            // settings — the live connection keeps its launch-time snapshot.
-            return Ok(existing);
+            let existing_fp = {
+                let map = self.connections.lock().await;
+                map.get(&existing)
+                    .map(|c| c.spawn_config.delegation_route.clone())
+                    .unwrap_or_default()
+            };
+            match route_reuse_decision(
+                &existing_fp,
+                &launch_inputs.route_plan.fingerprint,
+                &existing,
+            ) {
+                RouteReuseDecision::Reuse => {
+                    tracing::info!(
+                        "[ACP] reusing connection id={} for session_id={}",
+                        existing,
+                        session_id.as_deref().unwrap_or("")
+                    );
+                    // Reuse must not resolve, validate, or apply newly loaded
+                    // terminal/route settings — the live connection keeps its
+                    // launch-time snapshot.
+                    return Ok(existing);
+                }
+                RouteReuseDecision::Conflict {
+                    existing_connection_id,
+                } => {
+                    tracing::info!(
+                        "[ACP] session route conflict existing={} requested_fp={}",
+                        existing_connection_id,
+                        launch_inputs.route_plan.fingerprint
+                    );
+                    return Err(AcpError::SessionRouteConflict {
+                        existing_connection_id,
+                    });
+                }
+            }
         }
 
         // Only the no-reuse branch finalizes an immutable shell snapshot.
+        // The route plan is already resolved and passes through unchanged.
         let AcpLaunchConfig {
             runtime_env,
             terminal_shell,
+            route_plan,
+            origin,
+            route_preference,
         } = finalize_acp_launch_config(launch_inputs, agent_type)?;
 
         let connection_id = uuid::Uuid::new_v4().to_string();
@@ -475,6 +544,9 @@ impl ConnectionManager {
             session_id,
             runtime_env,
             terminal_shell,
+            route_plan,
+            origin,
+            route_preference,
             owner_window_label,
             emitter,
             self.connections.clone(),
@@ -700,6 +772,179 @@ impl ConnectionManager {
             emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
         }
         stale_count
+    }
+
+    /// Recompute the observed route fingerprint for managed root connections
+    /// against a new global policy/enabled pair. Forced children and unmanaged
+    /// agents are skipped. Never mutates `route_plan` / argv / env.
+    pub async fn refresh_delegation_route_staleness(
+        &self,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> usize {
+        self.refresh_delegation_route_staleness_filtered(
+            global_policy,
+            delegation_enabled,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::refresh_delegation_route_staleness`] but only connections
+    /// bound to `conversation_id`.
+    pub async fn refresh_delegation_route_staleness_for_conversation(
+        &self,
+        conversation_id: i32,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> usize {
+        self.refresh_delegation_route_staleness_filtered(
+            global_policy,
+            delegation_enabled,
+            Some(conversation_id),
+        )
+        .await
+    }
+
+    async fn refresh_delegation_route_staleness_filtered(
+        &self,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+        only_conversation_id: Option<i32>,
+    ) -> usize {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, is_managed_agent, DelegationConnectionOrigin,
+        };
+
+        let mut targets = Vec::new();
+        let mut stale_count = 0usize;
+        {
+            let mut connections = self.connections.lock().await;
+            for conn in connections.values_mut() {
+                if !is_managed_agent(conn.agent_type) {
+                    continue;
+                }
+                if conn.origin == DelegationConnectionOrigin::CodegChild {
+                    continue;
+                }
+                if let Some(only_cid) = only_conversation_id {
+                    let cid = conn.state.try_read().ok().and_then(|s| s.conversation_id);
+                    if cid != Some(only_cid) {
+                        continue;
+                    }
+                }
+
+                let prev_route = conn.observed_config.fingerprint.delegation_route.clone();
+                let prev_effective = effective_stale_kind(conn);
+
+                let new_fp = comparison_route_fingerprint(
+                    conn.agent_type,
+                    conn.origin,
+                    conn.route_preference,
+                    global_policy,
+                    delegation_enabled,
+                );
+                conn.observed_config.fingerprint.delegation_route = new_fp;
+
+                let route_stale = conn.observed_config.fingerprint.delegation_route
+                    != conn.spawn_config.delegation_route;
+                if route_stale {
+                    stale_count += 1;
+                }
+
+                let new_effective = effective_stale_kind(conn);
+                let observed_changed =
+                    prev_route != conn.observed_config.fingerprint.delegation_route;
+                if observed_changed || prev_effective != new_effective {
+                    let stale = new_effective.is_some();
+                    let emit_kind =
+                        new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
+                    targets.push((
+                        Arc::clone(&conn.state),
+                        conn.emitter.clone(),
+                        stale,
+                        emit_kind,
+                    ));
+                }
+            }
+        }
+        for (state, emitter, stale, kind) in targets {
+            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+        }
+        stale_count
+    }
+
+    /// Update a row-less connected draft's observed route preference.
+    /// Rejects persisted roots, forced children, and unmanaged agents.
+    /// Never mutates `route_plan`, process argv/env, or session metadata.
+    pub async fn set_draft_delegation_route_preference(
+        &self,
+        connection_id: &str,
+        route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> Result<(), AcpError> {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, is_managed_agent, DelegationConnectionOrigin,
+        };
+
+        let mut targets = Vec::new();
+        {
+            let mut connections = self.connections.lock().await;
+            let conn = connections
+                .get_mut(connection_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.to_string()))?;
+
+            if !is_managed_agent(conn.agent_type) {
+                return Err(AcpError::protocol(
+                    "draft route preference is only valid for managed agents",
+                ));
+            }
+            if conn.origin == DelegationConnectionOrigin::CodegChild {
+                return Err(AcpError::protocol(
+                    "draft route preference is not allowed on forced Codeg children",
+                ));
+            }
+            let conversation_id = {
+                let state = conn.state.read().await;
+                state.conversation_id
+            };
+            if conversation_id.is_some() {
+                return Err(AcpError::protocol(
+                    "draft route preference is only allowed on row-less draft connections",
+                ));
+            }
+
+            let prev_route = conn.observed_config.fingerprint.delegation_route.clone();
+            let prev_effective = effective_stale_kind(conn);
+
+            conn.route_preference = route_override;
+            conn.observed_config.fingerprint.delegation_route = comparison_route_fingerprint(
+                conn.agent_type,
+                conn.origin,
+                conn.route_preference,
+                global_policy,
+                delegation_enabled,
+            );
+
+            let new_effective = effective_stale_kind(conn);
+            let observed_changed =
+                prev_route != conn.observed_config.fingerprint.delegation_route;
+            if observed_changed || prev_effective != new_effective {
+                let stale = new_effective.is_some();
+                let emit_kind = new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
+                targets.push((
+                    Arc::clone(&conn.state),
+                    conn.emitter.clone(),
+                    stale,
+                    emit_kind,
+                ));
+            }
+        }
+        for (state, emitter, stale, kind) in targets {
+            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+        }
+        Ok(())
     }
 
     /// Look up an existing live connection that we can reuse instead of
@@ -2470,6 +2715,7 @@ pub struct ConnectionManagerSpawner {
     pub manager: Arc<ConnectionManager>,
     pub db: Arc<AppDatabase>,
     pub data_dir: Arc<PathBuf>,
+    pub runtime: crate::commands::delegation::DelegationRuntimeSettings,
 }
 
 #[async_trait::async_trait]
@@ -2512,11 +2758,15 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         // user-initiated session — disabled check, settings overrides,
         // model provider creds, git helper, and terminal settings. Without
         // this, delegated subagents would skip the user's configuration.
+        // Children always force Codeg origin regardless of global settings.
+        let runtime = self.runtime.snapshot();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
             self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
         )
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
@@ -2736,9 +2986,20 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         }
     }
 
@@ -2817,7 +3078,7 @@ mod tests {
             let mut map = mgr.connections.lock().await;
             let conn = map.get_mut("c1").unwrap();
             let (spawn_config, observed_config) =
-                matching_config_pair(agent_fp.to_string(), shell_fp.to_string());
+                matching_config_pair(agent_fp.to_string(), shell_fp.to_string(), String::new());
             conn.spawn_config = spawn_config;
             conn.observed_config = observed_config;
         }
@@ -2859,6 +3120,244 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(50), receiver.recv())
             .await
             .is_err());
+    }
+
+    fn synthetic_connection_with_fingerprints(
+        agent: &str,
+        shell: &str,
+        route: &str,
+    ) -> AgentConnection {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = SessionState::new(
+            "synth".into(),
+            AgentType::Codex,
+            None,
+            "test-window".into(),
+            None,
+        );
+        state.status = ConnectionStatus::Connected;
+        let (spawn_config, observed_config) =
+            matching_config_pair(agent.to_string(), shell.to_string(), route.to_string());
+        AgentConnection {
+            id: "synth".into(),
+            agent_type: AgentType::Codex,
+            status: ConnectionStatus::Connected,
+            owner_window_label: "test-window".into(),
+            cmd_tx: tx,
+            state: Arc::new(RwLock::new(state)),
+            emitter: EventEmitter::Noop,
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            spawn_config,
+            observed_config,
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+        }
+    }
+
+    #[test]
+    fn reuse_requires_route_compatibility_and_stale_priority_is_stable() {
+        assert_eq!(
+            route_reuse_decision("route-a", "route-a", "conn-1"),
+            RouteReuseDecision::Reuse
+        );
+        assert_eq!(
+            route_reuse_decision("route-a", "route-b", "conn-1"),
+            RouteReuseDecision::Conflict {
+                existing_connection_id: "conn-1".into(),
+            }
+        );
+
+        let mut conn =
+            synthetic_connection_with_fingerprints("agent-v1", "shell-v1", "route-v1");
+        conn.observed_config.fingerprint.agent_config = "agent-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::AgentConfig)
+        );
+        conn.observed_config.fingerprint.delegation_route = "route-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        conn.observed_config.fingerprint.terminal_shell = "shell-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::TerminalShell)
+        );
+    }
+
+    async fn manager_stale_kind(mgr: &ConnectionManager, id: &str) -> Option<ConfigStaleKind> {
+        let state = mgr.get_state(id).await.unwrap();
+        let kind = state.read().await.config_stale_kind;
+        kind
+    }
+
+    async fn seed_route_root(
+        mgr: &ConnectionManager,
+        id: &str,
+        preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+        fingerprint: &str,
+    ) {
+        use crate::acp::delegation::route::{
+            DelegationConnectionOrigin, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        insert_fake_connection(mgr, id, AgentType::Codex, None, EventEmitter::Noop).await;
+        let mut map = mgr.connections.lock().await;
+        let conn = map.get_mut(id).unwrap();
+        let (spawn_config, observed_config) =
+            matching_config_pair("agent-v1", "shell-v1", fingerprint.to_string());
+        conn.spawn_config = spawn_config;
+        conn.observed_config = observed_config;
+        conn.origin = DelegationConnectionOrigin::Root;
+        conn.route_preference = preference;
+        conn.route_plan = crate::acp::delegation::route::DelegationRoutePlan {
+            managed: true,
+            requested: preference.unwrap_or(DelegationRoutePolicy::Codeg),
+            effective: preference.unwrap_or(DelegationRoutePolicy::Codeg),
+            source: if preference.is_some() {
+                DelegationRouteSource::SessionOverride
+            } else {
+                DelegationRouteSource::GlobalDefault
+            },
+            native_suppression: if preference == Some(DelegationRoutePolicy::Native) {
+                NativeSuppressionPlan::None
+            } else {
+                NativeSuppressionPlan::CodexMultiAgentFalse
+            },
+            expose_codeg_delegation: preference != Some(DelegationRoutePolicy::Native),
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: fingerprint.to_string(),
+        };
+    }
+
+    #[tokio::test]
+    async fn route_setting_revert_clears_root_staleness_and_never_marks_child() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(&mgr, "root", None, &codeg_fp).await;
+        // Forced child with matching Codeg fingerprint.
+        insert_fake_connection(&mgr, "child", AgentType::Codex, None, EventEmitter::Noop).await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let child = map.get_mut("child").unwrap();
+            let (spawn_config, observed_config) =
+                matching_config_pair("agent-v1", "shell-v1", codeg_fp.clone());
+            child.spawn_config = spawn_config;
+            child.observed_config = observed_config;
+            child.origin = DelegationConnectionOrigin::CodegChild;
+            child.route_preference = None;
+        }
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Native, true)
+            .await;
+        assert_eq!(
+            manager_stale_kind(&mgr, "root").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        assert_eq!(manager_stale_kind(&mgr, "child").await, None);
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Codeg, true)
+            .await;
+        assert_eq!(manager_stale_kind(&mgr, "root").await, None);
+    }
+
+    #[tokio::test]
+    async fn global_route_refresh_respects_each_root_override() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+        );
+        let native_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            Some(DelegationRoutePolicy::Native),
+            DelegationRoutePolicy::Codeg,
+            true,
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(&mgr, "inherited", None, &codeg_fp).await;
+        seed_route_root(
+            &mgr,
+            "native-override",
+            Some(DelegationRoutePolicy::Native),
+            &native_fp,
+        )
+        .await;
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Native, true)
+            .await;
+        assert_eq!(
+            manager_stale_kind(&mgr, "inherited").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        assert_eq!(manager_stale_kind(&mgr, "native-override").await, None);
+    }
+
+    #[tokio::test]
+    async fn draft_route_change_marks_stale_without_mutating_launch_plan() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            Some(DelegationRoutePolicy::Codeg),
+            DelegationRoutePolicy::Codeg,
+            true,
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(
+            &mgr,
+            "draft",
+            Some(DelegationRoutePolicy::Codeg),
+            &codeg_fp,
+        )
+        .await;
+        let before = {
+            let map = mgr.connections.lock().await;
+            map.get("draft").unwrap().route_plan.clone()
+        };
+
+        mgr.set_draft_delegation_route_preference(
+            "draft",
+            Some(DelegationRoutePolicy::Native),
+            DelegationRoutePolicy::Codeg,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager_stale_kind(&mgr, "draft").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        let after = {
+            let map = mgr.connections.lock().await;
+            map.get("draft").unwrap().route_plan.clone()
+        };
+        assert_eq!(after, before);
     }
 
     /// Subscribe directly to the per-connection event stream. Phase 4b
@@ -2962,9 +3461,20 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         mgr.connections
             .lock()
@@ -3305,9 +3815,20 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -4407,12 +4928,12 @@ mod tests {
             s.status = ConnectionStatus::Connected;
         }
 
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::new(),
-            terminal_settings: SystemTerminalSettings {
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
             },
-        };
+        );
         let id = mgr
             .spawn_agent(
                 AgentType::ClaudeCode,
@@ -4440,12 +4961,12 @@ mod tests {
         use crate::models::SystemTerminalSettings;
 
         let mgr = ConnectionManager::new();
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::new(),
-            terminal_settings: SystemTerminalSettings {
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
             },
-        };
+        );
         let err = mgr
             .spawn_agent(
                 AgentType::ClaudeCode,
@@ -4496,23 +5017,23 @@ mod tests {
         let path_b = make_usable_shell(dir.path(), name_b);
 
         let snap_a: ResolvedShellSnapshot = finalize_acp_launch_config(
-            AcpLaunchInputs {
-                runtime_env: BTreeMap::new(),
-                terminal_settings: SystemTerminalSettings {
+            AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                     default_shell: Some(path_a.to_string_lossy().into_owned()),
                 },
-            },
+        ),
             AgentType::ClaudeCode,
         )
         .expect("shell a")
         .terminal_shell;
         let snap_b: ResolvedShellSnapshot = finalize_acp_launch_config(
-            AcpLaunchInputs {
-                runtime_env: BTreeMap::new(),
-                terminal_settings: SystemTerminalSettings {
+            AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                     default_shell: Some(path_b.to_string_lossy().into_owned()),
                 },
-            },
+        ),
             AgentType::ClaudeCode,
         )
         .expect("shell b")
@@ -4546,12 +5067,12 @@ mod tests {
                 AgentType::ClaudeCode,
                 Some(working_dir.to_string_lossy().into_owned()),
                 Some("ext-snap".into()),
-                AcpLaunchInputs {
-                    runtime_env: BTreeMap::new(),
-                    terminal_settings: SystemTerminalSettings {
+                AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                         default_shell: Some(path_b.to_string_lossy().into_owned()),
                     },
-                },
+        ),
                 "test-window".into(),
                 EventEmitter::Noop,
                 None,
@@ -5068,9 +5589,20 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5442,9 +5974,20 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            ).1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
         };
         let mgr = ConnectionManager::new();
         {

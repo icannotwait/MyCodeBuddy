@@ -1433,13 +1433,62 @@ pub async fn set_conversation_delegation_route_core(
 pub async fn set_conversation_delegation_route(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    runtime: tauri::State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
     conversation_id: i32,
     route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<DbConversationSummary, AppCommandError> {
     let summary =
         set_conversation_delegation_route_core(&db.conn, conversation_id, route_override).await?;
+    let snap = runtime.snapshot();
+    // Update stored preference on bound connections then recompute observed route.
+    {
+        let mut map = manager.connections.lock().await;
+        for conn in map.values_mut() {
+            let bound = conn
+                .state
+                .try_read()
+                .ok()
+                .and_then(|s| s.conversation_id)
+                == Some(conversation_id);
+            if bound {
+                conn.route_preference = route_override;
+            }
+        }
+    }
+    manager
+        .refresh_delegation_route_staleness_for_conversation(
+            conversation_id,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
     Ok(summary)
+}
+
+/// Update the observed route preference for a row-less connected draft.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_draft_delegation_route_preference(
+    manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    runtime: tauri::State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
+    connection_id: String,
+    route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+) -> Result<(), AppCommandError> {
+    let snap = runtime.snapshot();
+    manager
+        .set_draft_delegation_route_preference(
+            &connection_id,
+            route_override,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await
+        .map_err(|e| {
+            e.shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+        })
 }
 
 /// Eagerly create a chat-mode scratch directory (no DB rows) and return its

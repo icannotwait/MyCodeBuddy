@@ -113,9 +113,9 @@ impl AcpError {
         }
     }
 
-    /// Structured wire payload for shell preflight failures only.
+    /// Structured wire payload for shell preflight and route boundary failures.
     ///
-    /// Non-shell variants return `None` so Tauri serialization stays a bare
+    /// Other variants return `None` so Tauri serialization stays a bare
     /// legacy string (preserving SdkNotInstalled substring matching, etc.).
     pub(crate) fn shell_command_error(&self) -> Option<AppCommandError> {
         match self {
@@ -146,6 +146,22 @@ impl AcpError {
                     "backendErrors.terminalShellUnsupported",
                     BTreeMap::from([("shell".into(), display_name.clone())]),
                 ),
+            ),
+            AcpError::RouteUnavailable { reason } => Some(
+                AppCommandError::new(
+                    AppErrorCode::RouteUnavailable,
+                    "Delegation route unavailable",
+                )
+                .with_detail(format!("{reason:?}")),
+            ),
+            AcpError::SessionRouteConflict {
+                existing_connection_id,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::SessionRouteConflict,
+                    "Session route conflict with an existing connection",
+                )
+                .with_detail(existing_connection_id.clone()),
             ),
             _ => None,
         }

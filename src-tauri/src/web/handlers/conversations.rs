@@ -249,9 +249,60 @@ pub async fn set_conversation_delegation_route(
         params.route_override,
     )
     .await?;
+    let snap = state.delegation_runtime_settings.snapshot();
+    {
+        let mut map = state.connection_manager.connections.lock().await;
+        for conn in map.values_mut() {
+            let bound = conn
+                .state
+                .try_read()
+                .ok()
+                .and_then(|s| s.conversation_id)
+                == Some(params.conversation_id);
+            if bound {
+                conn.route_preference = params.route_override;
+            }
+        }
+    }
+    state
+        .connection_manager
+        .refresh_delegation_route_staleness_for_conversation(
+            params.conversation_id,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await;
     conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, params.conversation_id)
         .await;
     Ok(Json(summary))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDraftDelegationRoutePreferenceParams {
+    pub connection_id: String,
+    pub route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+}
+
+pub async fn set_draft_delegation_route_preference(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SetDraftDelegationRoutePreferenceParams>,
+) -> Result<Json<()>, AppCommandError> {
+    let snap = state.delegation_runtime_settings.snapshot();
+    state
+        .connection_manager
+        .set_draft_delegation_route_preference(
+            &params.connection_id,
+            params.route_override,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await
+        .map_err(|e| {
+            e.shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+        })?;
+    Ok(Json(()))
 }
 
 /// Eagerly create a chat-mode scratch directory (no DB rows) and return its

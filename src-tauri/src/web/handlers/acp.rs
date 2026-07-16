@@ -50,6 +50,11 @@ pub struct AcpConnectParams {
     pub working_dir: Option<String>,
     pub session_id: Option<String>,
     #[serde(default)]
+    pub conversation_id: Option<i32>,
+    #[serde(default)]
+    pub delegation_route_override:
+        Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    #[serde(default)]
     pub preferred_mode_id: Option<String>,
     #[serde(default)]
     pub preferred_config_values: Option<BTreeMap<String, String>>,
@@ -62,14 +67,23 @@ pub async fn acp_connect(
     let db = &state.db;
     let manager = &state.connection_manager;
 
+    let runtime = state.delegation_runtime_settings.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         db,
         params.agent_type,
         params.session_id.as_deref(),
         &state.data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(
+            params.conversation_id,
+            params.delegation_route_override,
+        ),
+        &runtime,
     )
     .await
-    .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    .map_err(|e| {
+        e.shell_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+    })?;
 
     // Guard: the session page must never trigger a download or install.
     // If the agent isn't ready, return SdkNotInstalled here so the frontend

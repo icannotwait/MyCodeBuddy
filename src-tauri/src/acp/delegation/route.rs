@@ -470,6 +470,48 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Placeholder plan for test connections that do not exercise route reuse.
+/// Matches `AcpLaunchInputs::with_placeholder_route` so session-id reuse tests
+/// that rebuild launch inputs with that helper remain compatible.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_empty_route_plan() -> DelegationRoutePlan {
+    resolve_route(RouteResolutionInput {
+        agent_type: crate::models::AgentType::ClaudeCode,
+        origin: DelegationConnectionOrigin::Root,
+        session_override: None,
+        global_policy: DelegationRoutePolicy::Codeg,
+        delegation_enabled: false,
+        suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+        agent_mcp_supported: true,
+        companion_binary_available: true,
+    })
+    .expect("feature-disabled native plan must resolve")
+}
+
+/// Deterministic comparison fingerprint used by staleness refresh helpers.
+/// Uses optimistic capability inputs so preference-only drift is isolated from
+/// companion/MCP availability at refresh time.
+pub fn comparison_route_fingerprint(
+    agent_type: AgentType,
+    origin: DelegationConnectionOrigin,
+    session_override: Option<DelegationRoutePolicy>,
+    global_policy: DelegationRoutePolicy,
+    delegation_enabled: bool,
+) -> String {
+    resolve_route(RouteResolutionInput {
+        agent_type,
+        origin,
+        session_override,
+        global_policy,
+        delegation_enabled,
+        suppression: SuppressionCapability::supported(ROUTE_ADAPTER_CONTRACT_VERSION),
+        agent_mcp_supported: true,
+        companion_binary_available: true,
+    })
+    .map(|p| p.fingerprint)
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
