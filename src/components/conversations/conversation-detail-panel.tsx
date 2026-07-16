@@ -32,6 +32,7 @@ import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
+import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
@@ -197,6 +198,12 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
 }: ConversationTabViewProps) {
+  // Freeze mount-time eligibility for uncached history scroll. Lazy useState
+  // inside the hook keeps a draft (null) ineligible after first-send bind, and
+  // keep-alive tab identity (key=tab.id) means active/inactive CSS and reloads
+  // do not recreate the latch.
+  const initialHistoryScrollEligible =
+    useInitialHistoryScrollEligibility(conversationId)
   const t = useTranslations("Folder.conversation")
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -1387,6 +1394,8 @@ const ConversationTabView = memo(function ConversationTabView({
       onNewSession={
         canShowDetailErrorActions ? handleOpenNewSession : undefined
       }
+      initialHistoryScrollEligible={initialHistoryScrollEligible}
+      historyLoadComplete={detail != null}
     />
   )
 

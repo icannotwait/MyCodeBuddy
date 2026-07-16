@@ -222,3 +222,49 @@ describe("ConversationDetailPanel send-path hardening", () => {
     )
   })
 })
+
+describe("ConversationTabView initial history eligibility", () => {
+  it("captures persisted eligibility at mount and passes successful load state", () => {
+    expect(source).toMatch(
+      /useInitialHistoryScrollEligibility\(\s*conversationId\s*\)/
+    )
+    expect(source).toContain(
+      "initialHistoryScrollEligible={initialHistoryScrollEligible}"
+    )
+    expect(source).toContain("historyLoadComplete={detail != null}")
+  })
+
+  // Identity audit: draft first-send bind must not remount ConversationTabView
+  // or the lazy eligibility latch would re-sample a non-null conversationId.
+  it("keeps ConversationTabView identity on draft bind (tab.id key, not conversationId)", () => {
+    // Parent maps keep-alive wrappers by stable tab id, not conversation id.
+    expect(source).toContain("key={tab.id}")
+    expect(source).not.toMatch(/key=\{tab\.conversationId\}/)
+    // bindConversationTab updates conversationId on the same tab row.
+    expect(source).toContain("bindConversationTab(")
+    // Hook call is unconditional near the start of ConversationTabView (before
+    // any early return) and freezes via useState — prop changes do not remount.
+    const tabViewStart = source.indexOf(
+      "const ConversationTabView = memo(function ConversationTabView"
+    )
+    const hookIdx = source.indexOf(
+      "useInitialHistoryScrollEligibility(conversationId)",
+      tabViewStart
+    )
+    expect(tabViewStart).toBeGreaterThan(-1)
+    expect(hookIdx).toBeGreaterThan(tabViewStart)
+    // No early return between function open and the hook call.
+    const between = source.slice(tabViewStart, hookIdx)
+    expect(between).not.toMatch(/\breturn\b/)
+  })
+
+  it("does not remount the tab view on manual reload (reloadSignal only refetches)", () => {
+    // Manual reload bumps reloadSignal / calls refetchDetail; it does not
+    // change the React key or recreate ConversationTabView.
+    expect(source).toContain("refetchDetail(dbConversationId)")
+    expect(source).toContain("reloadSignal={reloadByTabId[tab.id] ?? 0}")
+    // historyLoadComplete tracks detail presence, so a failed load stays false
+    // until a successful fetch retains detail on the session.
+    expect(source).toContain("historyLoadComplete={detail != null}")
+  })
+})
