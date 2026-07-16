@@ -45,8 +45,9 @@ existing explicit project default.
 - Recording delegation children, imported sessions, automations, or folderless
   Chat mode as project recency.
 - Translating the new setting into all ten supported languages in this change.
-  Schema-required locale entries may temporarily share a fallback string, but
-  full localization is deferred.
+  Author the new copy in `en` and `zh-CN`; use the English value for the same
+  keys in the other locale catalogs so every locale remains runtime-safe. Full
+  localization is deferred.
 
 ## Decision
 
@@ -96,7 +97,7 @@ value and shows an error toast.
 
 ### Persistence API
 
-Add a focused display-preference command and matching web handler, for example
+Add a dedicated command and matching web handler:
 `acp_update_agent_display_preferences(agent_type, show_thinking)`. It updates
 only `agent_setting.show_thinking` and emits the existing
 `app://acp-agents-updated` event so every settings/chat window refreshes through
@@ -214,8 +215,8 @@ pointer, PageUp, Home, or ArrowUp navigation before stabilization completes,
 cancel the controller and clear the latch immediately so it does not fight user
 intent.
 
-Closing the tab unmounts its keep-alive view. Reopening it creates a new uncached
-view and correctly performs the first-open behavior again.
+Closing the tab unmounts its keep-alive view. Reopening it creates a new
+uncached view and correctly performs the first-open behavior again.
 
 ## Error Handling
 
@@ -226,8 +227,8 @@ view and correctly performs the first-open behavior again.
 - Thinking remains hidden while agent preferences are unavailable or loading.
 - Initial-scroll observers and animation frames are disposed on completion,
   user escape, or unmount.
-- Existing live-follow escape, message navigation, and cached scroll state remain
-  authoritative after the initial latch clears.
+- Existing live-follow escape, message navigation, and cached scroll state
+  remain authoritative after the initial latch clears.
 
 ## Testing
 
@@ -256,8 +257,8 @@ view and correctly performs the first-open behavior again.
 - Live transcript tests prove thinking disappears while live activity and tool
   statistics remain.
 - Copy/export tests prove hidden reasoning is still included in complete output.
-- Message-thread tests prove loading/measurement uses instant resize and performs
-  a final instant correction after two stable frames.
+- Message-thread tests prove loading/measurement uses instant resize and
+  performs a final instant correction after two stable frames.
 - Keep-alive tests prove switching away/back and manual reload do not re-run the
   initial scroll, while close/reopen does.
 - Escape tests prove user scrolling cancels initialization without changing the
@@ -281,5 +282,5 @@ commands and file-level test targets.
 7. Agent selection follows explicit default, requested inheritance, project
    recency, ordered available agent, then hard fallback.
 8. Tauri and server deployments share the same persisted behavior.
-9. Full ten-language localization is deferred without introducing missing-key
-   runtime failures.
+9. `en` and `zh-CN` contain authored setting copy; the other locale catalogs use
+   the English values until full localization, without missing-key failures.
