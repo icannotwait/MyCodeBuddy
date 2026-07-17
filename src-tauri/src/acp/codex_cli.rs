@@ -84,7 +84,7 @@ fn default_npm_global_prefix() -> Option<PathBuf> {
 fn missing_codex_cli_message() -> &'static str {
     "Codex CLI is not installed. Install with `npm install -g @openai/codex`, \
      or set CODEX_PATH to your codex executable (or codex.js). \
-     MyCodeBuddy's bundled codex-acp adapter requires a host Codex CLI \
+     DrawCode's bundled codex-acp adapter requires a host Codex CLI \
      to run `codex app-server`."
 }
 
@@ -168,8 +168,14 @@ mod tests {
         let explicit = touch_file(temp.path(), "explicit-codex.cmd");
         let on_path = touch_file(temp.path(), "path-codex.cmd");
         let prefix = temp.path().join("npm-prefix");
-        fs::create_dir_all(prefix.join("node_modules").join("@openai").join("codex").join("bin"))
-            .unwrap();
+        fs::create_dir_all(
+            prefix
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin"),
+        )
+        .unwrap();
         let npm_js = touch_file(
             &prefix
                 .join("node_modules")
@@ -189,8 +195,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let on_path = touch_file(temp.path(), "path-codex.cmd");
         let prefix = temp.path().join("npm-prefix");
-        fs::create_dir_all(prefix.join("node_modules").join("@openai").join("codex").join("bin"))
-            .unwrap();
+        fs::create_dir_all(
+            prefix
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin"),
+        )
+        .unwrap();
         touch_file(
             &prefix
                 .join("node_modules")
@@ -246,7 +258,10 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("CODEX_PATH".into(), "C:\\already\\set\\codex.cmd".into());
         ensure_codex_path_in_env(&mut env).unwrap();
-        assert_eq!(env.get("CODEX_PATH").unwrap(), "C:\\already\\set\\codex.cmd");
+        assert_eq!(
+            env.get("CODEX_PATH").unwrap(),
+            "C:\\already\\set\\codex.cmd"
+        );
     }
 
     #[test]
@@ -271,7 +286,10 @@ mod tests {
                 let mut env = BTreeMap::new();
                 env.insert("CODEX_ACP_USE_CLI".into(), "1".into());
                 let out = prepare_codex_launch_env(env).unwrap();
-                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(fake_str.as_str()));
+                assert_eq!(
+                    out.get(CODEX_PATH_ENV).map(String::as_str),
+                    Some(fake_str.as_str())
+                );
             },
         );
     }
@@ -313,7 +331,10 @@ mod tests {
             || {
                 let env = BTreeMap::new();
                 let out = prepare_codex_launch_env(env).unwrap();
-                assert_eq!(out.get(CODEX_PATH_ENV).map(String::as_str), Some(fake_str.as_str()));
+                assert_eq!(
+                    out.get(CODEX_PATH_ENV).map(String::as_str),
+                    Some(fake_str.as_str())
+                );
             },
         );
     }

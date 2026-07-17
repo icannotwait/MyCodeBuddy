@@ -77,8 +77,8 @@ function WorkspaceDocumentTitle() {
 
   useEffect(() => {
     document.title = activeFolder
-      ? `${activeFolder.name} - MyCodeBuddy`
-      : "MyCodeBuddy"
+      ? `${activeFolder.name} - DrawCode`
+      : "DrawCode"
   }, [activeFolder])
 
   return null

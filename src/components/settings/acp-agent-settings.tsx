@@ -2855,7 +2855,7 @@ export function buildVersionCheck(
           })
         : acpText(
             "version.bundledMissing",
-            "Built-in adapter is missing. Reinstall or update MyCodeBuddy."
+            "Built-in adapter is missing. Reinstall or update DrawCode."
           ),
       fixes: [],
     }

@@ -210,7 +210,7 @@ fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) 
                     check_id: "bundled_executable".into(),
                     label: "Built-in adapter".into(),
                     status: CheckStatus::Fail,
-                    message: "Built-in adapter is missing; reinstall or update MyCodeBuddy.".into(),
+                    message: "Built-in adapter is missing; reinstall or update DrawCode.".into(),
                     fixes: vec![],
                 },
                 Err(error) => CheckItem {

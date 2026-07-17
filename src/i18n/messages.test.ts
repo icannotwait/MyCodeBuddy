@@ -49,10 +49,10 @@ describe("i18n locale key parity vs en.json", () => {
   })
 })
 
-describe("MyCodeBuddy branding", () => {
+describe("DrawCode branding", () => {
   it("uses the fork name in every science settings description", () => {
     for (const messages of locales) {
-      expect(messages.ScienceSettings.description).toContain("MyCodeBuddy")
+      expect(messages.ScienceSettings.description).toContain("DrawCode")
       expect(messages.ScienceSettings.description).not.toMatch(/\bcodeg\b/i)
     }
   })

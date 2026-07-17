@@ -533,7 +533,7 @@ async fn build_agent(
                 crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env)?
                     .ok_or_else(|| {
                         AcpError::SdkNotInstalled(format!(
-                            "Bundled {} executable is missing; reinstall or update MyCodeBuddy.",
+                            "Bundled {} executable is missing; reinstall or update DrawCode.",
                             meta.name
                         ))
                     })?;
