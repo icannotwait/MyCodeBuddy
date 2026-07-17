@@ -24,16 +24,22 @@ The repository contains only the generated public key in
 `local-build.env`, or copies of their contents.
 
 Normal local desktop builds do not use this signing material.
-`src-tauri/tauri.conf.json` sets `bundle.createUpdaterArtifacts` to `false`, so
-the following command must run with all Tauri signing variables unset:
+`src-tauri/tauri.conf.json` sets `bundle.createUpdaterArtifacts` to `false` and
+`bundle.targets` to `["nsis"]` (MSI is disabled: Windows MSI rejects non-numeric
+pre-release labels such as `mycodebuddy` in `0.20.2-mycodebuddy.6`). Run with
+all Tauri signing variables unset:
 
 ```bash
+# NSIS installer only (default targets)
+pnpm tauri build
+
+# App package without an installer
 pnpm tauri build --bundles app
 ```
 
 The command still bundles `LICENSE`, `NOTICE`, and
 `THIRD_PARTY_LICENSES.txt`. Do not source `local-build.env` for a normal local
-app build.
+app build. CI release already passes `--bundles nsis` and is unaffected.
 
 Back up the private key and password together in an encrypted, access-controlled
 location. Losing either prevents publishing updates that existing
