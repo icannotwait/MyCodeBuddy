@@ -169,6 +169,25 @@ pub struct ReferenceRegexMatch {
     pub rank: ReferenceRegexRank,
 }
 
+/// Immutable start arguments used for equal-sequence join/replay comparison.
+///
+/// Computed without compiling the query so ordering preflight can advance the
+/// high-water mark before pattern validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestFingerprint {
+    pub query: String,
+    pub workspace_path: Option<String>,
+}
+
+impl RequestFingerprint {
+    pub fn from_start(request: &StartReferenceSearchRequest) -> Self {
+        Self {
+            query: request.query.clone(),
+            workspace_path: request.workspace_path.clone(),
+        }
+    }
+}
+
 /// Validated search / page / cancel identity triple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchIdentity {
