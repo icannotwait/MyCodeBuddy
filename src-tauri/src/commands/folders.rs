@@ -2778,7 +2778,9 @@ const WORKSPACE_FILE_SEARCH_ID_MAX_BYTES: usize = 128;
 /// Shared walk options for file-tree builds and workspace file search.
 /// Hard exclusions and visible dotfiles apply in both modes; ignore sources
 /// can be disabled only for the auxiliary file-tree display.
-fn workspace_walk_builder(
+///
+/// Also used by incremental reference-search file cursors (ignores enabled).
+pub(crate) fn workspace_walk_builder(
     root: &Path,
     max_depth: Option<usize>,
     respect_ignores: bool,

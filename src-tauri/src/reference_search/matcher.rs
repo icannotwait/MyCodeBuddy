@@ -390,8 +390,9 @@ pub fn encode_uri_component(value: &str) -> String {
 }
 
 /// Normalize path separators and strip Windows verbatim (`\\?\`) prefixes
-/// before URI classification.
-fn normalize_path_for_uri(path: &Path) -> String {
+/// before URI classification / wire metadata. Public to reference sources so
+/// Windows canonicalize output is not misclassified as UNC in metadata.
+pub(crate) fn normalize_path_for_uri(path: &Path) -> String {
     let mut normalized = path.to_string_lossy().replace('\\', "/");
     // `//?/C:/...` → `C:/...`
     if let Some(rest) = normalized.strip_prefix("//?/") {

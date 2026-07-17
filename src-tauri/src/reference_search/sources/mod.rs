@@ -1,8 +1,8 @@
 //! Source cursor contract for incremental reference search.
 //!
-//! Production file / conversation / commit cursors land in later tasks.
-//! Task 3 only defines the trait surface and `SourcePage` so the registry can
-//! run against test factories.
+//! Production file / conversation cursors live here; commit lands in Task 5.
+//! Task 3 defined the trait surface and `SourcePage` so the registry can run
+//! against test factories.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +12,12 @@ use crate::reference_search::matcher::SearchPattern;
 use crate::reference_search::types::{
     ReferenceCandidate, ReferenceDoneReason, StartReferenceSearchRequest,
 };
+
+pub mod conversation;
+pub mod file;
+
+pub use conversation::ConversationCursor;
+pub use file::FileCursor;
 
 /// One pull page from a source cursor (not yet stamped with identity/page index).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,4 +49,27 @@ pub trait ReferenceSourceFactory: Send + Sync {
         pattern: SearchPattern,
         limit: usize,
     ) -> Result<Box<dyn ReferenceSourceCursor>, AppCommandError>;
+}
+
+#[cfg(test)]
+pub(crate) fn literal(query: &str) -> SearchPattern {
+    SearchPattern::parse(query).expect("literal pattern")
+}
+
+#[cfg(test)]
+pub(crate) async fn drain_cursor(
+    cursor: &mut dyn ReferenceSourceCursor,
+) -> Vec<ReferenceCandidate> {
+    let mut items = Vec::new();
+    loop {
+        let page = cursor
+            .next_page(5, CancellationToken::new())
+            .await
+            .expect("source page");
+        items.extend(page.items);
+        assert!(items.len() <= 500, "test cursor exceeded the protocol cap");
+        if page.done {
+            return items;
+        }
+    }
 }
