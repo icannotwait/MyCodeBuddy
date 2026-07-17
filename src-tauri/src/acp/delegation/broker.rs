@@ -7701,6 +7701,266 @@ mod tests {
         }
     }
 
+    /// Step 7: timeout-bounded reply-clear × terminal-settlement publication race.
+    /// Uses real broker path + mock event/meta + publication/settle gates so both
+    /// orderings complete without hang and emit exactly one user-visible resolution
+    /// for the contested open attention (clear and/or terminal card removal; never
+    /// a duplicate clear or a clear after completed).
+    #[tokio::test]
+    async fn reply_publication_racing_terminal_settlement_has_one_visible_resolution() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        use crate::acp::delegation::event_emitter::mock::{MockEventEmitter, ProjectionEmit};
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+        use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+
+        async fn fixture() -> (
+            DelegationBroker,
+            Arc<MockSpawner>,
+            Arc<MockTaskStore>,
+            Arc<crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore>,
+            Arc<MockEventEmitter>,
+        ) {
+            let spawner = Arc::new(MockSpawner::new());
+            let store = Arc::new(MockTaskStore::accept_any_running(22));
+            let attention = Arc::new(
+                crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore::new(),
+            );
+            let meta = Arc::new(MockMetaWriter::new());
+            let events = Arc::new(MockEventEmitter::new());
+            let broker = DelegationBroker::with_writers(
+                spawner.clone() as Arc<dyn ConnectionSpawner>,
+                shallow_lookup(),
+                meta as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+                events.clone()
+                    as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+            )
+            .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
+            enable_delegation(&broker).await;
+            (broker, spawner, store, attention, events)
+        }
+
+        fn assert_exclusive_attention_resolution(
+            ordered: &[ProjectionEmit],
+            expect_clear: bool,
+        ) {
+            let mut clears = 0usize;
+            let mut completed = 0usize;
+            let mut clear_after_completed = false;
+            for item in ordered {
+                match item {
+                    ProjectionEmit::AttentionChanged(call)
+                        if call.attention_request.is_none() =>
+                    {
+                        clears += 1;
+                        if completed > 0 {
+                            clear_after_completed = true;
+                        }
+                    }
+                    ProjectionEmit::Completed(_) => completed += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                completed, 1,
+                "exactly one terminal card-removal/completion event, ordered={ordered:?}"
+            );
+            assert!(
+                clears <= 1,
+                "at most one attention clear, ordered={ordered:?}"
+            );
+            assert!(
+                !clear_after_completed,
+                "clear must not publish after terminal removal, ordered={ordered:?}"
+            );
+            assert_eq!(
+                clears == 1,
+                expect_clear,
+                "expected clear={expect_clear}, ordered={ordered:?}"
+            );
+        }
+
+        // --- Ordering A: terminal owns publication_lock first (reply clear skipped) ---
+        {
+            let (broker, spawner, store, attention, events) = fixture().await;
+            let task = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+            seed_edge(&store, &attention, &task, 11, 22).await;
+
+            let decision = tokio::spawn({
+                let broker = broker.clone();
+                async move {
+                    broker
+                        .request_parent_decision("child-conn", "tc-pub-a", "Choose A?")
+                        .await
+                }
+            });
+            let open = wait_for_open_request(&attention, &task).await;
+            assert_eq!(events.started_count().await, 1);
+            assert!(
+                events
+                    .attention_snapshot()
+                    .await
+                    .iter()
+                    .any(|c| c.attention_request.is_some()),
+                "open attention must publish before the race"
+            );
+
+            let runtime = broker
+                .coordination_for_test("child-conn")
+                .await
+                .expect("live coordination")
+                .runtime;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            runtime
+                .install_publication_gate(entered_tx, release_rx)
+                .await;
+
+            let settle = tokio::spawn({
+                let broker = broker.clone();
+                let task = task.clone();
+                async move {
+                    broker
+                        .complete_call(&task, completed_outcome("terminal-first"))
+                        .await;
+                }
+            });
+            entered_rx
+                .await
+                .expect("terminal should enter publication_lock");
+            assert!(
+                runtime.terminal.load(Ordering::Acquire),
+                "terminal flag must be set before/while holding publication_lock"
+            );
+
+            let reply = tokio::spawn({
+                let broker = broker.clone();
+                let request_id = open.request_id.clone();
+                async move {
+                    broker
+                        .reply_to_delegation("parent", Some(11), &request_id, "A")
+                        .await
+                }
+            });
+            // Give reply a chance to finish durable CAS and park on the lock.
+            for _ in 0..30 {
+                tokio::task::yield_now().await;
+            }
+
+            release_tx.send(()).unwrap();
+            let reply_result = tokio::time::timeout(Duration::from_secs(2), async {
+                let reply_result = reply.await.expect("reply task");
+                settle.await.expect("settle task");
+                reply_result
+            })
+            .await
+            .expect("terminal-first reply×settle must not deadlock");
+
+            let _ = within(decision).await;
+            assert!(matches!(
+                reply_result,
+                DelegationReplyResult::Replied { .. }
+                    | DelegationReplyResult::Idempotent { .. }
+                    | DelegationReplyResult::AlreadyResolved { .. }
+            ));
+            assert_eq!(
+                store.load(&task).await.unwrap().unwrap().status,
+                TaskStatus::Completed
+            );
+            assert_exclusive_attention_resolution(&events.ordered_snapshot().await, false);
+        }
+
+        // --- Ordering B: reply publishes clear while terminal is mid-settle CAS ---
+        {
+            let (broker, spawner, store, attention, events) = fixture().await;
+            let task = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+            seed_edge(&store, &attention, &task, 11, 22).await;
+
+            let decision = tokio::spawn({
+                let broker = broker.clone();
+                async move {
+                    broker
+                        .request_parent_decision("child-conn", "tc-pub-b", "Choose B?")
+                        .await
+                }
+            });
+            let open = wait_for_open_request(&attention, &task).await;
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            store.install_settle_gate(entered_tx, release_rx).await;
+
+            let settle = tokio::spawn({
+                let broker = broker.clone();
+                let task = task.clone();
+                async move {
+                    broker
+                        .complete_call(&task, completed_outcome("reply-clear-first"))
+                        .await;
+                }
+            });
+            entered_rx
+                .await
+                .expect("terminal settle should enter store settle gate");
+            // terminal flag still false — reply may publish a nonterminal clear.
+            let runtime = broker
+                .coordination_for_test("child-conn")
+                .await
+                .map(|id| id.runtime);
+            if let Some(runtime) = runtime.as_ref() {
+                assert!(
+                    !runtime.terminal.load(Ordering::Acquire),
+                    "settle gate must pin before terminal=true"
+                );
+            }
+
+            let reply_result = tokio::time::timeout(
+                Duration::from_secs(2),
+                broker.reply_to_delegation("parent", Some(11), &open.request_id, "B"),
+            )
+            .await
+            .expect("reply clear while settle is gated must not hang");
+            assert!(
+                matches!(reply_result, DelegationReplyResult::Replied { .. }),
+                "reply must win durable open attention while settle is gated, got {reply_result:?}"
+            );
+            let clears_mid = events
+                .attention_snapshot()
+                .await
+                .iter()
+                .filter(|c| c.attention_request.is_none())
+                .count();
+            assert_eq!(
+                clears_mid, 1,
+                "reply must publish exactly one clear before terminal resumes"
+            );
+            assert_eq!(
+                events.count().await,
+                0,
+                "terminal completed must wait until settle gate releases"
+            );
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), settle)
+                .await
+                .expect("terminal settle after clear must not deadlock")
+                .expect("settle task");
+
+            let decision_result = within(decision).await.unwrap();
+            assert!(matches!(
+                decision_result,
+                ParentDecisionResult::Replied { .. }
+            ));
+            assert_eq!(
+                store.load(&task).await.unwrap().unwrap().status,
+                TaskStatus::Completed
+            );
+            assert_exclusive_attention_resolution(&events.ordered_snapshot().await, true);
+        }
+    }
+
     #[tokio::test]
     async fn parent_cancel_while_child_spawn_is_gated_uses_parent_canceled() {
         let mock = Arc::new(MockSpawner::new());
