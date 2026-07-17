@@ -228,7 +228,8 @@ impl TitleAgentRunner for HiddenAgentRunner {
 
         // Exclusive discovery lease immediately before spawn. Race through the
         // shared phase helper so cancellation/timeout prevent later phases.
-        let lease_deadline = Instant::now() + Duration::from_secs(DISCOVERY_LEASE_SECS);
+        // Arm the 15s hold budget only after the exclusive guard is acquired so
+        // a blocked acquire cannot shrink/expire the identity exclusive window.
         let mut lease = match phase(
             &cancellation,
             overall_deadline,
@@ -246,6 +247,7 @@ impl TitleAgentRunner for HiddenAgentRunner {
             }
             PhaseOutcome::Ready(guard) => Some(guard),
         };
+        let lease_deadline = Instant::now() + Duration::from_secs(DISCOVERY_LEASE_SECS);
 
         // --- spawn ---
         let spawn_result = phase(
@@ -344,25 +346,36 @@ impl HiddenAgentRunner {
         };
 
         // --- durable registration before prompt ---
-        let reg_result = if let Some(ref mut guard) = lease {
-            self.registry
-                .register_with_lease(
-                    guard,
-                    attempt.agent,
-                    &external_id,
-                    InternalSessionPurpose::Title,
-                )
-                .await
-        } else {
-            self.registry
-                .register(attempt.agent, &external_id, InternalSessionPurpose::Title)
-                .await
-        };
-        // Drop long lease after register_with_lease (or if already released).
+        // Single overall deadline covers identity registration (brief). Race
+        // cancel/timeout through phase() so a blocked register cannot hang the
+        // attempt or reach prompt after cancel/timeout.
+        let reg_outcome = phase(cancellation, overall_deadline, async {
+            if let Some(ref mut guard) = lease {
+                self.registry
+                    .register_with_lease(
+                        guard,
+                        attempt.agent,
+                        &external_id,
+                        InternalSessionPurpose::Title,
+                    )
+                    .await
+            } else {
+                self.registry
+                    .register(attempt.agent, &external_id, InternalSessionPurpose::Title)
+                    .await
+            }
+        })
+        .await;
+        // Drop long lease on every path (cancel/timeout/ready) before mapping.
         drop(lease.take());
 
-        if let Err(e) = reg_result {
-            return Err(AutoTitleRunError::Registry(e.to_string()));
+        match reg_outcome {
+            PhaseOutcome::Cancelled => return Err(AutoTitleRunError::Cancelled),
+            PhaseOutcome::Timeout => return Err(AutoTitleRunError::Timeout),
+            PhaseOutcome::Ready(Err(e)) => {
+                return Err(AutoTitleRunError::Registry(e.to_string()));
+            }
+            PhaseOutcome::Ready(Ok(())) => {}
         }
 
         // --- prompt ---
@@ -511,7 +524,12 @@ async fn collect_title_output(
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Lag is terminal: partial ContentDelta may already be lost.
+                        return Err(AutoTitleRunError::AbnormalStop(
+                            "private stream lagged".into(),
+                        ));
+                    }
                     Err(broadcast::error::RecvError::Closed) => {
                         return Err(AutoTitleRunError::AbnormalStop(
                             "private stream closed".into(),
@@ -1788,6 +1806,303 @@ mod tests {
         drop(held_lease);
     }
 
+    /// Full 15s exclusive discovery budget must start after acquisition, not
+    /// before a blocked acquire. Pre-arming the Instant shortens/expires the
+    /// hold window when acquisition waits under real or virtual time.
+    #[tokio::test]
+    async fn discovery_lease_budget_starts_after_acquisition() {
+        let fixture = hidden_runner_fixture().await;
+        // No SessionStarted — remain in identity wait with the exclusive lease.
+        let registry = Arc::clone(&fixture.registry);
+        let agent = Arc::clone(&fixture.agent);
+        let attempt = fixture.attempt(AppLocale::En);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        let runner = fixture.runner;
+
+        // External exclusive lease blocks runner acquisition.
+        let held_lease = registry.exclusive_discovery_lease().await;
+
+        let mut handle = tokio::spawn(async move { runner.run(attempt, cancel2).await });
+
+        // Real time: finish status/config and block on exclusive acquisition.
+        timeout(Duration::from_secs(5), async {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await
+        .expect("status/config must finish under real time");
+        assert!(
+            !agent.order.lock().unwrap().contains(&"spawn_enter"),
+            "spawn must not start while external exclusive lease is held"
+        );
+
+        // Freeze clock, then burn a meaningful virtual delay while still blocked.
+        // OLD code armed lease_deadline before this wait, so the post-acquire
+        // identity exclusive window is already shortened by these 10s.
+        tokio::time::pause();
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Release external lease; runner acquires, spawns, and reaches identity wait.
+        drop(held_lease);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let live = agent.manager.get_state(&agent.conn_id).await.is_some();
+                let identity = agent.identity_ready.load(Ordering::SeqCst);
+                if live && identity {
+                    break;
+                }
+                // Under pause, allow the blocked write future + spawn to progress
+                // without sleeping (no virtual advance needed for lock/spawn).
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner must reach identity subscription after exclusive acquisition");
+        // One extra yield so wait_for_session_identity arms its select.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            agent.prompt_count(),
+            0,
+            "no SessionStarted: must not prompt"
+        );
+
+        // Under pause, probe exclusive hold without advancing the virtual clock
+        // (spawned shared_filter either finishes immediately or waits on the lock).
+        async fn exclusive_still_held(registry: &Arc<InternalAgentSessionRegistry>) -> bool {
+            let probe = tokio::spawn({
+                let registry = Arc::clone(registry);
+                async move { registry.shared_filter().await }
+            });
+            for _ in 0..80 {
+                if probe.is_finished() {
+                    let _ = probe.await;
+                    return false;
+                }
+                tokio::task::yield_now().await;
+            }
+            probe.abort();
+            let _ = probe.await;
+            true
+        }
+
+        // Resolve shared_filter under pause by racing completion with tiny advances
+        // (same pattern as slow_handshake; timeout alone needs virtual time).
+        async fn await_shared_filter_under_pause(
+            registry: &Arc<InternalAgentSessionRegistry>,
+        ) -> Result<(), String> {
+            let fut = registry.shared_filter();
+            tokio::pin!(fut);
+            for _ in 0..100 {
+                tokio::select! {
+                    biased;
+                    res = &mut fut => {
+                        return res.map(|_| ()).map_err(|e| e.to_string());
+                    }
+                    _ = async {
+                        tokio::time::advance(Duration::from_millis(10)).await;
+                        tokio::task::yield_now().await;
+                    } => {}
+                }
+            }
+            Err("shared_filter did not resolve under pause".into())
+        }
+
+        assert!(
+            exclusive_still_held(&registry).await,
+            "exclusive lease must be held immediately after identity subscribe"
+        );
+
+        // Advance 10 virtual seconds of the post-acquire 15s budget.
+        // OLD (deadline pre-armed): only ~5s remained after the 10s blocked wait,
+        // so the lease is already shareable here → intended assertion failure.
+        // GREEN: still exclusive until a full 15s after acquisition.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            exclusive_still_held(&registry).await,
+            "exclusive lease must still be held 10s after acquisition (full 15s budget)"
+        );
+
+        // Remaining 5s of the 15s post-acquire budget → lease becomes shareable.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        await_shared_filter_under_pause(&registry)
+            .await
+            .expect("exclusive lease must release after 15 virtual seconds post-acquisition");
+
+        // Clean up: cancel blocked identity wait; require Cancelled (no prompt).
+        cancel.cancel();
+        let settled = timeout(Duration::from_millis(500), &mut handle).await;
+        assert!(
+            settled.is_ok(),
+            "runner must settle after cancel once lease race is proven"
+        );
+        let result = settled.unwrap().expect("join");
+        assert!(
+            matches!(result, Err(AutoTitleRunError::Cancelled)),
+            "expected Cancelled after lease-budget proof, got {result:?}"
+        );
+        assert_eq!(agent.prompt_count(), 0);
+        assert_eq!(agent.disconnect_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Durable registration (short `register` after the long exclusive lease drops)
+    /// must observe cancellation. Hold a shared discovery read so `register()`
+    /// queues for the exclusive write; cancel while that queue is blocked.
+    #[tokio::test]
+    async fn cancellation_interrupts_blocked_durable_registration() {
+        let fixture = hidden_runner_fixture().await;
+        let registry = Arc::clone(&fixture.registry);
+        let agent = Arc::clone(&fixture.agent);
+        let attempt = fixture.attempt(AppLocale::En);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        let runner = fixture.runner;
+
+        let mut handle = tokio::spawn(async move { runner.run(attempt, cancel2).await });
+
+        // Real time until spawn + identity subscribe (no SessionStarted yet).
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let live = agent.manager.get_state(&agent.conn_id).await.is_some();
+                let identity = agent.identity_ready.load(Ordering::SeqCst);
+                if live && identity {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawn + identity subscribe before lease race");
+        tokio::task::yield_now().await;
+        assert_eq!(agent.prompt_count(), 0);
+
+        // Virtual 15s drops the long exclusive discovery lease.
+        tokio::time::pause();
+        for _ in 0..15 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Acquire and HOLD a shared read guard so short register() cannot take write.
+        let held_shared = {
+            let fut = registry.shared_filter();
+            tokio::pin!(fut);
+            let mut resolved = None;
+            for _ in 0..100 {
+                tokio::select! {
+                    biased;
+                    res = &mut fut => {
+                        resolved = Some(res.expect("shared_filter after lease drop"));
+                        break;
+                    }
+                    _ = async {
+                        tokio::time::advance(Duration::from_millis(10)).await;
+                        tokio::task::yield_now().await;
+                    } => {}
+                }
+            }
+            let (guard, _) = resolved.expect("shared discovery must be acquirable after 15s");
+            guard
+        };
+
+        // Resume real time for SessionStarted delivery + register lock queueing.
+        tokio::time::resume();
+        agent.emit_session_started().await;
+
+        // Prove a writer is queued: Tokio RwLock fairness blocks new readers while
+        // a write waiter exists behind our held shared guard.
+        let probe_blocked = timeout(Duration::from_secs(2), async {
+            loop {
+                let probe = tokio::spawn({
+                    let registry = Arc::clone(&registry);
+                    async move { registry.shared_filter().await }
+                });
+                // Brief real-time window: if no write is queued, the probe finishes.
+                let finished = timeout(Duration::from_millis(30), async {
+                    loop {
+                        if probe.is_finished() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                if finished.is_err() {
+                    // Still running after 30ms ⇒ blocked behind write waiter.
+                    probe.abort();
+                    let _ = probe.await;
+                    return;
+                }
+                let _ = probe.await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            probe_blocked.is_ok(),
+            "short register() must queue exclusive write (new shared_filter stays blocked)"
+        );
+        assert_eq!(
+            agent.prompt_count(),
+            0,
+            "must not prompt before registration"
+        );
+
+        // Cancel while shared read is still held (register remains blocked).
+        cancel.cancel();
+
+        // OLD: register() ignores cancellation → hangs past this bound (assertion fail).
+        // GREEN: phase()-wrapped register returns Cancelled promptly.
+        let settled = timeout(Duration::from_millis(500), &mut handle).await;
+        assert!(
+            settled.is_ok(),
+            "runner must settle on cancellation while durable registration is blocked"
+        );
+        let result = settled.unwrap().expect("join");
+        assert!(
+            matches!(result, Err(AutoTitleRunError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(
+            agent.prompt_count(),
+            0,
+            "must not prompt after cancel at register"
+        );
+        assert_eq!(
+            agent.disconnect_count.load(Ordering::SeqCst),
+            1,
+            "post-spawn cancel must disconnect exactly once"
+        );
+        assert!(
+            agent.manager.get_state(&agent.conn_id).await.is_none(),
+            "no manager entry after cancelled registration cleanup"
+        );
+
+        // Release held shared guard only after result assertions.
+        drop(held_shared);
+    }
+
     #[tokio::test]
     async fn blocked_disconnect_cleanup_is_bounded_and_releases_the_attempt() {
         let fixture = hidden_runner_fixture().await;
@@ -1866,6 +2181,60 @@ mod tests {
             sentinel_dir.exists() && sentinel_file.exists(),
             "sibling sentinel under reserved_root must remain"
         );
+    }
+
+    /// Completion path must treat broadcast `RecvError::Lagged` as terminal
+    /// (same strictness as Closed / identity lag), not silently continue into
+    /// partial or empty title text.
+    #[tokio::test]
+    async fn collect_title_output_treats_lagged_as_abnormal_stop() {
+        // Tiny capacity so a few sends without a recv produce Lagged first.
+        let (tx, mut rx) = broadcast::channel::<Arc<EventEnvelope>>(1);
+        let make = |seq: u64, payload: AcpEvent| {
+            Arc::new(EventEnvelope {
+                seq,
+                connection_id: "title-lag".into(),
+                payload,
+            })
+        };
+
+        // Overflow retained buffer; first recv is Lagged. Keep an end_turn so
+        // OLD (ignore Lagged) can still accept a partial/empty Ok completion.
+        let _ = tx.send(make(
+            1,
+            AcpEvent::ContentDelta {
+                text: "partial-title".into(),
+            },
+        ));
+        let _ = tx.send(make(
+            2,
+            AcpEvent::ContentDelta {
+                text: "more".into(),
+            },
+        ));
+        let _ = tx.send(make(
+            3,
+            AcpEvent::TurnComplete {
+                session_id: "internal-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "codex".into(),
+                mark_awaiting_reply: false,
+            },
+        ));
+
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = collect_title_output(&cancel, deadline, &mut rx).await;
+
+        match result {
+            Err(AutoTitleRunError::AbnormalStop(msg)) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("lagged"),
+                    "AbnormalStop message must mention stream lag, got {msg:?}"
+                );
+            }
+            other => panic!("expected AbnormalStop with lagged message, got {other:?}"),
+        }
     }
 
     #[test]
