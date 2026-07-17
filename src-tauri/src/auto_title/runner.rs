@@ -2005,7 +2005,6 @@ mod tests {
     #[tokio::test]
     async fn blocked_disconnect_cleanup_is_bounded_and_releases_the_attempt() {
         let fixture = hidden_runner_fixture().await;
-        tokio::time::pause();
         fixture
             .agent
             .emit_session_started_before_subscription("internal-1");
@@ -2031,14 +2030,13 @@ mod tests {
             tokio::spawn(async move { runner.run(attempt, CancellationToken::new()).await });
 
         // Reach completion wait then expire overall deadline.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-            if agent.prompt_count() > 0 {
-                break;
-            }
-            tokio::time::advance(Duration::from_millis(1)).await;
-        }
-        assert!(agent.prompt_count() > 0, "must reach completion phase");
+        wait_condition_wall(
+            Duration::from_secs(5),
+            || agent.prompt_count() > 0 && agent.completion_gate.was_entered(),
+            "runner must reach completion phase",
+        )
+        .await;
+        tokio::time::pause();
         let run_dir = driver
             .last_working_dir()
             .expect("spawn records exact per-run working_dir");
@@ -2055,11 +2053,15 @@ mod tests {
         tokio::time::advance(Duration::from_secs(90)).await;
 
         // Disconnect is blocked; advance 5s cleanup budget.
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
+        wait_condition_wall(
+            Duration::from_secs(5),
+            || agent.disconnect_count.load(Ordering::SeqCst) >= 1,
+            "runner must enter cleanup before its cleanup budget is advanced",
+        )
+        .await;
         tokio::time::advance(Duration::from_secs(5)).await;
-
+        // The cleanup deadline is due; resumed time lets the driver observe it.
+        tokio::time::resume();
         let result = timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "runner must settle after cleanup budget");
         let outcome = result.unwrap().expect("join");
