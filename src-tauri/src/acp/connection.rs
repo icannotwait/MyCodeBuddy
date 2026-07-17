@@ -36,6 +36,7 @@ use crate::acp::file_system_runtime::{
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
+use crate::acp::terminal_assoc::{TerminalAssocFallback, ToolCallAssocHint};
 use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
 use crate::acp::types::{
@@ -2561,6 +2562,12 @@ async fn run_connection(
         )
         .with_default_cwd(Some(cwd.clone())),
     );
+    // Grok's ACP terminal adapter creates client terminals but omits
+    // ToolCallContent::Terminal. This bridge synthesizes the association
+    // only when a unique in-progress shell tool is the sole candidate.
+    let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(
+        agent_type == AgentType::Grok,
+    )));
     let cwd_string = cwd.to_string_lossy().to_string();
     let file_system_runtime = Arc::new(
         FileSystemRuntime::new(cwd.clone()).with_allow_outside_workspace(
@@ -2658,10 +2665,28 @@ async fn run_connection(
         .on_receive_request(
             {
                 let runtime = terminal_runtime.clone();
+                let assoc = terminal_assoc.clone();
                 async move |req: CreateTerminalRequest,
                             responder: Responder<CreateTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
-                    respond_terminal_request(responder, runtime.create_terminal(req).await)?;
+                    let session_id = req.session_id.to_string();
+                    let result = runtime.create_terminal(req).await;
+                    if let Ok(ref response) = result {
+                        if let Ok(mut bridge) = assoc.lock() {
+                            if let Some(tool_call_id) = bridge
+                                .on_terminal_created(&session_id, &response.terminal_id.to_string())
+                            {
+                                tracing::debug!(
+                                    target: "acp::terminal_assoc",
+                                    session_id = %session_id,
+                                    terminal_id = %response.terminal_id,
+                                    tool_call_id = %tool_call_id,
+                                    "fallback-bound client terminal to shell tool call"
+                                );
+                            }
+                        }
+                    }
+                    respond_terminal_request(responder, result)?;
                     Ok(())
                 }
             },
@@ -2972,6 +2997,7 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 terminal_runtime.clone(),
+                                terminal_assoc.clone(),
                                 file_system_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
@@ -2983,6 +3009,9 @@ async fn run_connection(
                             )
                             .await;
                             terminal_runtime.release_all_for_session(&sid).await;
+                            if let Ok(mut bridge) = terminal_assoc.lock() {
+                                bridge.clear_session(&sid);
+                            }
                             drop(session);
                             // Explicit return: this arm is NOT in tail position
                             // (the session/load block follows it), so without
@@ -2997,6 +3026,7 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 terminal_runtime.clone(),
+                                terminal_assoc.clone(),
                                 file_system_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
@@ -3161,6 +3191,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            terminal_assoc.clone(),
                             file_system_runtime.clone(),
                             &cwd_string,
                             supports_fork,
@@ -3172,6 +3203,9 @@ async fn run_connection(
                         )
                         .await;
                         terminal_runtime.release_all_for_session(&sid).await;
+                        if let Ok(mut bridge) = terminal_assoc.lock() {
+                            bridge.clear_session(&sid);
+                        }
                         drop(session);
                         handle_fork_or_exit(
                             loop_result,
@@ -3182,6 +3216,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            terminal_assoc.clone(),
                             file_system_runtime.clone(),
                             &cwd,
                             &cwd_string,
@@ -3325,6 +3360,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            terminal_assoc.clone(),
                             file_system_runtime.clone(),
                             &cwd_string,
                             supports_fork,
@@ -3348,6 +3384,7 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             terminal_runtime.clone(),
+                            terminal_assoc.clone(),
                             file_system_runtime.clone(),
                             &cwd,
                             &cwd_string,
@@ -3428,6 +3465,7 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     terminal_runtime.clone(),
+                    terminal_assoc.clone(),
                     file_system_runtime.clone(),
                     &cwd_string,
                     supports_fork,
@@ -3439,6 +3477,9 @@ async fn run_connection(
                 )
                 .await;
                 terminal_runtime.release_all_for_session(&sid).await;
+                if let Ok(mut bridge) = terminal_assoc.lock() {
+                    bridge.clear_session(&sid);
+                }
                 drop(session);
                 handle_fork_or_exit(
                     loop_result,
@@ -3449,6 +3490,7 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     terminal_runtime.clone(),
+                    terminal_assoc.clone(),
                     file_system_runtime.clone(),
                     &cwd,
                     &cwd_string,
@@ -4168,6 +4210,79 @@ fn track_terminal_tool_calls(
     }
 }
 
+/// Feed shell tool_call / tool_call_update signals into the Grok terminal
+/// association fallback (no-op when the bridge is disabled).
+fn observe_terminal_assoc_from_update(
+    update: &SessionUpdate,
+    session_id: &str,
+    assoc: &std::sync::Mutex<TerminalAssocFallback>,
+) {
+    let hint = match update {
+        SessionUpdate::ToolCall(tc) => ToolCallAssocHint {
+            tool_call_id: tc.tool_call_id.to_string(),
+            kind: Some(format!("{:?}", tc.kind).to_lowercase()),
+            title: Some(tc.title.clone()),
+            has_terminal_content: !extract_terminal_ids(&tc.content).is_empty(),
+            status: Some(format!("{:?}", tc.status).to_lowercase()),
+        },
+        SessionUpdate::ToolCallUpdate(tcu) => {
+            let terminal_ids = tcu
+                .fields
+                .content
+                .as_ref()
+                .map(|content| extract_terminal_ids(content))
+                .unwrap_or_default();
+            ToolCallAssocHint {
+                tool_call_id: tcu.tool_call_id.to_string(),
+                kind: tcu
+                    .fields
+                    .kind
+                    .map(|k| format!("{:?}", k).to_lowercase()),
+                title: tcu.fields.title.clone(),
+                has_terminal_content: !terminal_ids.is_empty(),
+                status: tcu
+                    .fields
+                    .status
+                    .map(|s| format!("{:?}", s).to_lowercase()),
+            }
+        }
+        _ => return,
+    };
+
+    if let Ok(mut bridge) = assoc.lock() {
+        bridge.observe_tool(session_id, hint);
+    }
+}
+
+/// Merge fallback `tool_call_id ↔ terminal_id` binds into the live poller map.
+/// Returns true when at least one new terminal id was attached.
+fn merge_terminal_assoc_binds(
+    session_id: &str,
+    assoc: &std::sync::Mutex<TerminalAssocFallback>,
+    tracked: &mut HashMap<String, TrackedTerminalToolCall>,
+) -> bool {
+    let binds = match assoc.lock() {
+        Ok(mut bridge) => bridge.drain_pending_binds(session_id),
+        Err(_) => return false,
+    };
+    if binds.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for (tool_call_id, terminal_id) in binds {
+        let entry = tracked.entry(tool_call_id).or_default();
+        if merge_terminal_ids(&mut entry.terminal_ids, vec![terminal_id]) {
+            changed = true;
+        }
+        if entry.status.is_none() {
+            // Keep the poller from treating an unbound entry as already final.
+            entry.status = Some("inprogress".into());
+        }
+    }
+    changed
+}
+
 fn format_terminal_exit_status(exit_status: &TerminalExitStatus) -> String {
     let mut parts = Vec::new();
     if let Some(code) = exit_status.exit_code {
@@ -4437,6 +4552,7 @@ async fn handle_fork_or_exit(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     terminal_runtime: Arc<TerminalRuntime>,
+    terminal_assoc: Arc<std::sync::Mutex<TerminalAssocFallback>>,
     file_system_runtime: Arc<FileSystemRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
@@ -4528,6 +4644,7 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         terminal_runtime.clone(),
+        terminal_assoc.clone(),
         file_system_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
@@ -4539,6 +4656,9 @@ async fn handle_fork_or_exit(
     )
     .await;
     terminal_runtime.release_all_for_session(&new_sid).await;
+    if let Ok(mut bridge) = terminal_assoc.lock() {
+        bridge.clear_session(&new_sid);
+    }
     drop(session);
 
     // Recursively handle nested forks
@@ -4551,6 +4671,7 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         terminal_runtime,
+        terminal_assoc,
         file_system_runtime,
         _cwd,
         cwd_string,
@@ -4718,6 +4839,7 @@ async fn run_conversation_loop<'a>(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     terminal_runtime: Arc<TerminalRuntime>,
+    terminal_assoc: Arc<std::sync::Mutex<TerminalAssocFallback>>,
     file_system_runtime: Arc<FileSystemRuntime>,
     cwd: &str,
     supports_fork: bool,
@@ -4925,8 +5047,18 @@ async fn run_conversation_loop<'a>(
                                     if let Err(e) = MatchDispatch::new(dispatch)
                                         .if_notification(
                                             async |notif: SessionNotification| {
+                                                observe_terminal_assoc_from_update(
+                                                    &notif.update,
+                                                    session_id.0.as_ref(),
+                                                    terminal_assoc.as_ref(),
+                                                );
                                                 let should_poll_now = track_terminal_tool_calls(
                                                     &notif.update,
+                                                    &mut tracked_terminal_tool_calls,
+                                                );
+                                                let bound = merge_terminal_assoc_binds(
+                                                    session_id.0.as_ref(),
+                                                    terminal_assoc.as_ref(),
                                                     &mut tracked_terminal_tool_calls,
                                                 );
                                                 if is_agent_output_update(&notif.update) {
@@ -4940,7 +5072,7 @@ async fn run_conversation_loop<'a>(
                                                         .mark_agent_activity(chrono::Utc::now());
                                                 }
                                                 emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
-                                                if should_poll_now {
+                                                if should_poll_now || bound {
                                                     poll_tracked_terminal_tool_calls(
                                                         runtime.as_ref(),
                                                         &session_id,
@@ -4972,6 +5104,11 @@ async fn run_conversation_loop<'a>(
                                     }
                                 }
                                 SessionMessage::StopReason(reason) => {
+                                    let _ = merge_terminal_assoc_binds(
+                                        sid.0.as_ref(),
+                                        terminal_assoc.as_ref(),
+                                        &mut tracked_terminal_tool_calls,
+                                    );
                                     if !tracked_terminal_tool_calls.is_empty() {
                                         poll_tracked_terminal_tool_calls(
                                             terminal_runtime.as_ref(),
@@ -5044,6 +5181,11 @@ async fn run_conversation_loop<'a>(
                         }
                         prompt_result = &mut prompt_response => {
                             let reason = prompt_result?.stop_reason;
+                            let _ = merge_terminal_assoc_binds(
+                                sid.0.as_ref(),
+                                terminal_assoc.as_ref(),
+                                &mut tracked_terminal_tool_calls,
+                            );
                             if !tracked_terminal_tool_calls.is_empty() {
                                 poll_tracked_terminal_tool_calls(
                                     terminal_runtime.as_ref(),
@@ -5094,15 +5236,34 @@ async fn run_conversation_loop<'a>(
                             }
                             break;
                         }
-                        _ = terminal_poll_interval.tick(), if !tracked_terminal_tool_calls.is_empty() => {
-                            poll_tracked_terminal_tool_calls(
-                                terminal_runtime.as_ref(),
-                                &sid,
-                                state,
-                                emitter,
+                        // Always tick for Grok (fallback may attach a terminal
+                        // without an official ToolCallContent::Terminal). Other
+                        // agents only poll while something is already tracked.
+                        _ = terminal_poll_interval.tick(),
+                            if !tracked_terminal_tool_calls.is_empty()
+                                || terminal_assoc
+                                    .lock()
+                                    .map(|b| b.enabled())
+                                    .unwrap_or(false)
+                        => {
+                            // Merge create-time binds even when tracked was empty
+                            // (Grok creates the terminal after tool_call but the
+                            // association arrives only via this fallback).
+                            let _ = merge_terminal_assoc_binds(
+                                sid.0.as_ref(),
+                                terminal_assoc.as_ref(),
                                 &mut tracked_terminal_tool_calls,
-                            )
-                            .await;
+                            );
+                            if !tracked_terminal_tool_calls.is_empty() {
+                                poll_tracked_terminal_tool_calls(
+                                    terminal_runtime.as_ref(),
+                                    &sid,
+                                    state,
+                                    emitter,
+                                    &mut tracked_terminal_tool_calls,
+                                )
+                                .await;
+                            }
                         }
                         cmd = cmd_rx.recv() => {
                             match cmd {

@@ -27,6 +27,7 @@ pub mod session_info;
 pub mod session_state;
 pub mod streaming_performance;
 pub mod terminal_adapter;
+pub mod terminal_assoc;
 pub mod terminal_context;
 pub mod terminal_runtime;
 pub mod types;
