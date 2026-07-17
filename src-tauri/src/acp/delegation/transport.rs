@@ -29,6 +29,13 @@
 //!     batch wait wakes as soon as ANY requested task reaches a terminal state.
 //!   * `cancel_task` — [`BrokerCancelTaskRequest`] for `cancel_delegation`;
 //!     returns a task report.
+//!   * `parent_decision` — [`BrokerParentDecisionRequest`] for
+//!     `request_parent_decision`. Blocking, peer-close-safe: dropping the
+//!     companion socket abandons only this waiter; the durable attention row
+//!     stays open for replay with the same internal `child_tool_call_id`.
+//!   * `reply_delegation` — [`BrokerReplyDelegationRequest`] for
+//!     `reply_to_delegation`. Immediate (no long-poll): first durable reply wins;
+//!     identical replay is idempotent.
 //!   * `cancel` — fire-and-forget [`BrokerCancelRequest`] from MCP
 //!     `notifications/cancelled`, targeting an in-flight `delegate_to_agent`
 //!     call by `external_handle`; gets a `Value::Null` ack.
@@ -226,6 +233,28 @@ pub struct BrokerSessionRequest {
     pub max_messages: Option<u32>,
 }
 
+/// Child asks its direct parent for one blocking decision. Backs
+/// `request_parent_decision`. `child_tool_call_id` is an internal correlation
+/// id derived from MCP metadata/request identity — never accepted from LLM
+/// arguments. Peer-close drops only the socket waiter; the durable row remains
+/// open for the same call id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerParentDecisionRequest {
+    pub token: String,
+    /// Internal correlation only. Never accepted from the LLM arguments.
+    pub child_tool_call_id: String,
+    pub message: String,
+}
+
+/// Direct parent replies to an open child decision request. Backs
+/// `reply_to_delegation`. Immediate (no long-poll); first durable reply wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerReplyDelegationRequest {
+    pub token: String,
+    pub request_id: String,
+    pub reply: String,
+}
+
 /// Companion → listener ready-lease request. First frame of the two-frame
 /// ready handshake: listener authenticates `token`, acks, then both keep the
 /// socket open until peer EOF or revoke.
@@ -255,6 +284,8 @@ pub enum BrokerMessage {
     CommitFeedback(BrokerCommitFeedbackRequest),
     Ask(BrokerAskRequest),
     SessionInfo(BrokerSessionRequest),
+    ParentDecision(BrokerParentDecisionRequest),
+    ReplyDelegation(BrokerReplyDelegationRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -477,6 +508,25 @@ pub async fn client_session_round_trip(
     req: &BrokerSessionRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::SessionInfo(req.clone())).await
+}
+
+/// Dispatch a blocking `request_parent_decision` and read back the
+/// [`crate::acp::delegation::types::ParentDecisionResult`] outcome. Peer-close
+/// (cancel) drops this future and the listener abandons only the waiter.
+pub async fn client_parent_decision_round_trip(
+    socket_path: &str,
+    req: &BrokerParentDecisionRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::ParentDecision(req.clone())).await
+}
+
+/// Dispatch an immediate `reply_to_delegation` and read back the
+/// [`crate::acp::delegation::types::DelegationReplyResult`] outcome.
+pub async fn client_reply_delegation_round_trip(
+    socket_path: &str,
+    req: &BrokerReplyDelegationRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::ReplyDelegation(req.clone())).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be

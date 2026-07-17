@@ -19,13 +19,13 @@ use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionReadyAck, CompanionRole,
+    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerParentDecisionRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    DelegationRequest, DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport,
-    DelegationWakeReason, TaskStatus,
+    DelegationReplyResult, DelegationRequest, DelegationReturnWhen, DelegationStatusBatch,
+    DelegationTaskReport, DelegationWakeReason, ParentDecisionResult, TaskStatus,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
@@ -378,6 +378,26 @@ impl DelegationListener {
                 // and there is nothing to tear down on cancel.
                 session_response(self.process_session_info(req).await)?
             }
+            BrokerMessage::ParentDecision(req) => {
+                // Blocking parent decision: race Broker wait against peer-close
+                // on this one-shot socket. Peer close drops ONLY this waiter —
+                // the durable attention row stays open for replay; no task or
+                // attention mutation on abandon.
+                let decision_fut = self.process_parent_decision(req);
+                tokio::pin!(decision_fut);
+                let mut probe = [0_u8; 1];
+                let outcome = tokio::select! {
+                    biased;
+                    outcome = &mut decision_fut => outcome,
+                    _ = conn.read(&mut probe) => return Ok(()),
+                };
+                write_frame(conn, &value_response(&outcome)?).await?;
+                return Ok(());
+            }
+            BrokerMessage::ReplyDelegation(req) => {
+                // Immediate: serialize through the normal final write_frame path.
+                value_response(&self.process_reply_delegation(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -529,6 +549,78 @@ impl DelegationListener {
                 Vec::new(),
             ),
         }
+    }
+
+    /// Stable non-secret rejection for unauthorized or capability-denied
+    /// parent-decision attempts.
+    fn decision_unavailable(code: &str, message: &str) -> ParentDecisionResult {
+        ParentDecisionResult::Rejected {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Backs `request_parent_decision`. Token must advertise `coordination_v1`
+    /// and role `DelegationChild`. Connection id bound to the token is the
+    /// child's ACP connection (see injection).
+    async fn process_parent_decision(
+        &self,
+        request: BrokerParentDecisionRequest,
+    ) -> ParentDecisionResult {
+        let Some(entry) = self.tokens.lookup(&request.token).await else {
+            return Self::decision_unavailable(
+                "unauthorized",
+                "decision request is not authorized on this connection",
+            );
+        };
+        if !entry.coordination_v1 {
+            return Self::decision_unavailable(
+                "coordination_unavailable",
+                "delegation coordination is unavailable on this connection",
+            );
+        }
+        if entry.role != CompanionRole::DelegationChild {
+            return Self::decision_unavailable(
+                "not_delegation_child",
+                "only a live Codeg delegation child can request a parent decision",
+            );
+        }
+        self.broker
+            .request_parent_decision(
+                &entry.parent_connection_id,
+                &request.child_tool_call_id,
+                &request.message,
+            )
+            .await
+    }
+
+    /// Backs `reply_to_delegation`. Any coordination-aware token may attempt
+    /// a reply; Broker enforces direct-parent ownership.
+    async fn process_reply_delegation(
+        &self,
+        request: BrokerReplyDelegationRequest,
+    ) -> DelegationReplyResult {
+        let Some(entry) = self.tokens.lookup(&request.token).await else {
+            return DelegationReplyResult::Unauthorized;
+        };
+        if !entry.coordination_v1 {
+            return DelegationReplyResult::Rejected {
+                code: "coordination_unavailable".into(),
+                message: "delegation coordination is unavailable on this connection".into(),
+            };
+        }
+        let conversation_id = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await;
+        self.broker
+            .reply_to_delegation(
+                &entry.parent_connection_id,
+                conversation_id,
+                &request.request_id,
+                &request.reply,
+            )
+            .await
     }
 
     /// Backs the `cancel_delegation` tool. A `timeout` reason is explicitly
@@ -714,6 +806,15 @@ impl DelegationListener {
 fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&report).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+/// Serialize an arbitrary serde value as the broker outcome envelope.
+fn value_response<T: serde::Serialize>(outcome: &T) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(outcome).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
         })?,
     })
@@ -2698,5 +2799,653 @@ mod tests {
             leases.mark_ready("fail-ack").await.is_err(),
             "failed ack path should revoke/forget lease so host cannot mark ready later"
         );
+    }
+
+    // -- Role-aware parent decision tools (Task 6) -------------------------
+
+    use crate::acp::delegation::attention::{
+        mock::MemoryDelegationAttentionStore, AttentionResolutionCode, DelegationAttentionStore,
+    };
+    use crate::acp::delegation::store::mock::MockTaskStore;
+    use crate::acp::delegation::store::DelegationTaskStore;
+    use crate::acp::delegation::transport::{
+        BrokerParentDecisionRequest, BrokerReplyDelegationRequest,
+    };
+    use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+    use std::collections::HashMap as StdHashMap;
+
+    struct MapParentLookup(StdHashMap<String, i32>);
+    #[async_trait]
+    impl ParentSessionLookup for MapParentLookup {
+        async fn current_conversation_id(&self, parent_connection_id: &str) -> Option<i32> {
+            self.0.get(parent_connection_id).copied()
+        }
+    }
+
+    fn child_token_entry(conn: &str) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: conn.to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: true,
+            role: CompanionRole::DelegationChild,
+        }
+    }
+
+    fn root_token_entry(conn: &str) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: conn.to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: true,
+            role: CompanionRole::Root,
+        }
+    }
+
+    async fn decision_fixture() -> (
+        Arc<DelegationListener>,
+        Arc<DelegationBroker>,
+        Arc<MemoryDelegationAttentionStore>,
+        String,
+    ) {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn".into())).await;
+        mock.queue_send(Ok(22)).await;
+        let task_store = Arc::new(MockTaskStore::accept_any_running(22));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>)
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let ack = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 11,
+                parent_tool_use_id: "pt-decision".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "decide".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await;
+        let task_id = ack.task_id.expect("running");
+        task_store.seed_edge(&task_id, 11, 22).await;
+        attention.seed_edge(&task_id, 11, 22).await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("child-tok".into(), child_token_entry("child-conn"))
+            .await;
+        tokens
+            .register("parent-tok".into(), root_token_entry("parent"))
+            .await;
+        tokens
+            .register("foreign-tok".into(), root_token_entry("foreign"))
+            .await;
+        tokens
+            .register(
+                "legacy-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+
+        let mut convs = StdHashMap::new();
+        convs.insert("parent".into(), 11);
+        convs.insert("child-conn".into(), 22);
+        convs.insert("foreign".into(), 99);
+
+        let listener = DelegationListener::new(
+            broker.clone(),
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(MapParentLookup(convs)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        );
+        (listener, broker, attention, task_id)
+    }
+
+    async fn wait_open_request(
+        attention: &MemoryDelegationAttentionStore,
+        task_id: &str,
+    ) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(open) = attention.list_open_for_tasks(11, &[task_id.to_string()]).await {
+                if let Some(summary) = open.into_iter().next() {
+                    return summary.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("open attention request did not appear for {task_id}");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn root_token_request_parent_decision_is_rejected() {
+        let (listener, _broker, _attention, _task_id) = decision_fixture().await;
+        let outcome = listener
+            .process_parent_decision(BrokerParentDecisionRequest {
+                token: "parent-tok".into(),
+                child_tool_call_id: "tc-1".into(),
+                message: "choose".into(),
+            })
+            .await;
+        assert!(matches!(
+            outcome,
+            ParentDecisionResult::Rejected {
+                code,
+                ..
+            } if code == "not_delegation_child"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_decision_round_trip_blocks_until_direct_parent_replies() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+
+        // Child connection: ParentDecision blocks until reply.
+        let (mut child_client, mut child_server) = duplex(16 * 1024);
+        let child_listener = listener.clone();
+        let child_task = tokio::spawn(async move {
+            child_listener.serve_one(&mut child_server).await.unwrap();
+        });
+        write_frame(
+            &mut child_client,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "child-tool-1".into(),
+                message: "Use A or B?".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let request_id = wait_open_request(&attention, &task_id).await;
+
+        // Still pending: negative 25 ms timeout must not observe a response.
+        let early = tokio::time::timeout(Duration::from_millis(25), async {
+            read_frame::<_, BrokerResponse>(&mut child_client).await
+        })
+        .await;
+        assert!(early.is_err(), "ParentDecision must remain pending until reply");
+
+        // Parent replies on a second connection.
+        let (mut parent_client, mut parent_server) = duplex(8 * 1024);
+        let parent_listener = listener.clone();
+        let parent_task = tokio::spawn(async move {
+            parent_listener.serve_one(&mut parent_server).await.unwrap();
+        });
+        write_frame(
+            &mut parent_client,
+            &BrokerMessage::ReplyDelegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id: request_id.clone(),
+                reply: "Use A".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let parent_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut parent_client).await.unwrap()
+        })
+        .await
+        .expect("reply should complete");
+        parent_task.await.unwrap();
+        assert_eq!(parent_resp.outcome["status"], "replied");
+
+        let child_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut child_client).await.unwrap()
+        })
+        .await
+        .expect("decision should unblock");
+        child_task.await.unwrap();
+        assert_eq!(child_resp.outcome["status"], "replied");
+        assert_eq!(child_resp.outcome["reply"], "Use A");
+        assert_eq!(child_resp.outcome["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn decision_socket_peer_close_keeps_row_open_and_replay_recovers_request_id() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+
+        let (mut child_client, mut child_server) = duplex(16 * 1024);
+        let child_listener = listener.clone();
+        let child_task = tokio::spawn(async move {
+            child_listener.serve_one(&mut child_server).await.unwrap();
+        });
+        write_frame(
+            &mut child_client,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "replay-tool".into(),
+                message: "Need choice".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let request_id = wait_open_request(&attention, &task_id).await;
+
+        // Peer close after persistence: abandon waiter only.
+        drop(child_client);
+        tokio::time::timeout(Duration::from_secs(1), child_task)
+            .await
+            .expect("serve_one must exit on peer close")
+            .unwrap();
+
+        let still_open = attention
+            .list_open_for_tasks(11, &[task_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(still_open.len(), 1);
+        assert_eq!(still_open[0].request_id, request_id);
+
+        // Replay with same internal call id recovers the same request_id.
+        let (mut child_client2, mut child_server2) = duplex(16 * 1024);
+        let child_listener2 = listener.clone();
+        let child_task2 = tokio::spawn(async move {
+            child_listener2.serve_one(&mut child_server2).await.unwrap();
+        });
+        write_frame(
+            &mut child_client2,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "replay-tool".into(),
+                message: "Need choice".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Let recover settle; row still open with same id.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let open_again = attention
+            .list_open_for_tasks(11, &[task_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(open_again.len(), 1);
+        assert_eq!(open_again[0].request_id, request_id);
+
+        // Clean up by replying so the server task finishes.
+        let (mut parent_client, mut parent_server) = duplex(8 * 1024);
+        let parent_listener = listener.clone();
+        let parent_task = tokio::spawn(async move {
+            parent_listener.serve_one(&mut parent_server).await.unwrap();
+        });
+        write_frame(
+            &mut parent_client,
+            &BrokerMessage::ReplyDelegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id: request_id.clone(),
+                reply: "ok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame::<_, BrokerResponse>(&mut parent_client).await.unwrap()
+        })
+        .await;
+        parent_task.await.unwrap();
+        let child_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut child_client2).await.unwrap()
+        })
+        .await
+        .expect("replay should unblock");
+        child_task2.await.unwrap();
+        assert_eq!(child_resp.outcome["request_id"], request_id);
+        assert_eq!(child_resp.outcome["status"], "replied");
+    }
+
+    #[tokio::test]
+    async fn foreign_parent_reply_is_unauthorized() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-foreign".into(),
+                        message: "x".into(),
+                    })
+                    .await
+            }
+        });
+        let request_id = wait_open_request(&attention, &task_id).await;
+        let reply = listener
+            .process_reply_delegation(BrokerReplyDelegationRequest {
+                token: "foreign-tok".into(),
+                request_id: request_id.clone(),
+                reply: "nope".into(),
+            })
+            .await;
+        assert_eq!(reply, DelegationReplyResult::Unauthorized);
+        // Direct parent still succeeds.
+        let ok = listener
+            .process_reply_delegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id,
+                reply: "yes".into(),
+            })
+            .await;
+        assert!(matches!(ok, DelegationReplyResult::Replied { .. }));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), decision)
+                .await
+                .expect("decision completes")
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_direct_parent_reply_replay_is_idempotent_and_conflict_is_already_resolved() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-idem".into(),
+                        message: "x".into(),
+                    })
+                    .await
+            }
+        });
+        let request_id = wait_open_request(&attention, &task_id).await;
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id: request_id.clone(),
+                    reply: "A".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id: request_id.clone(),
+                    reply: "A".into(),
+                })
+                .await,
+            DelegationReplyResult::Idempotent { .. }
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id,
+                    reply: "B".into(),
+                })
+                .await,
+            DelegationReplyResult::AlreadyResolved { .. }
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(1), decision).await;
+    }
+
+    #[tokio::test]
+    async fn task_terminal_while_decision_blocked_closes_with_task_terminal() {
+        let (listener, broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-term".into(),
+                        message: "continue?".into(),
+                    })
+                    .await
+            }
+        });
+        wait_open_request(&attention, &task_id).await;
+        broker
+            .complete_call(
+                &task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 22,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 1,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), decision)
+            .await
+            .expect("decision closed")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ParentDecisionResult::Closed {
+                resolution_code: AttentionResolutionCode::TaskTerminal,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_child_can_request_from_parent_and_reply_to_grandchild() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn".into())).await;
+        mock.queue_send(Ok(2)).await;
+        mock.queue_spawn(Ok("grand-conn".into())).await;
+        mock.queue_send(Ok(3)).await;
+        let task_store = Arc::new(MockTaskStore::accept_any_running(2));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>)
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let root_child = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "root-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: "pt-root".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "mid".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await
+            .task_id
+            .unwrap();
+        let grandchild = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "child-conn".into(),
+                parent_conversation_id: 2,
+                parent_tool_use_id: "pt-mid".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "leaf".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await
+            .task_id
+            .unwrap();
+        task_store.seed_edge(&root_child, 1, 2).await;
+        task_store.seed_edge(&grandchild, 2, 3).await;
+        attention.seed_edge(&root_child, 1, 2).await;
+        attention.seed_edge(&grandchild, 2, 3).await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        // Middle connection is a coordination child (can request + reply).
+        tokens
+            .register("mid-tok".into(), child_token_entry("child-conn"))
+            .await;
+        tokens
+            .register("grand-tok".into(), child_token_entry("grand-conn"))
+            .await;
+        tokens
+            .register("root-tok".into(), root_token_entry("root-conn"))
+            .await;
+
+        let mut convs = StdHashMap::new();
+        convs.insert("root-conn".into(), 1);
+        convs.insert("child-conn".into(), 2);
+        convs.insert("grand-conn".into(), 3);
+
+        let listener = DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(MapParentLookup(convs)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        );
+
+        // Grandchild requests from middle child.
+        let grand_wait = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "grand-tok".into(),
+                        child_tool_call_id: "tc-grand".into(),
+                        message: "Which API?".into(),
+                    })
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let grand_request_id = loop {
+            if let Ok(open) = attention
+                .list_open_for_tasks(2, &[grandchild.clone()])
+                .await
+            {
+                if let Some(s) = open.into_iter().next() {
+                    break s.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("grandchild attention missing");
+            }
+            tokio::task::yield_now().await;
+        };
+        // Middle child replies to its child.
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "mid-tok".into(),
+                    request_id: grand_request_id,
+                    reply: "v2".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), grand_wait)
+                .await
+                .unwrap()
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+
+        // Middle child can also request from root.
+        let mid_wait = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "mid-tok".into(),
+                        child_tool_call_id: "tc-mid".into(),
+                        message: "Ship?".into(),
+                    })
+                    .await
+            }
+        });
+        let mid_request_id = loop {
+            if let Ok(open) = attention.list_open_for_tasks(1, &[root_child.clone()]).await {
+                if let Some(s) = open.into_iter().next() {
+                    break s.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("mid attention missing");
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "root-tok".into(),
+                    request_id: mid_request_id,
+                    reply: "ship".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), mid_wait)
+                .await
+                .unwrap()
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_token_cannot_use_decision_tools() {
+        let (listener, _broker, _attention, _task_id) = decision_fixture().await;
+        assert!(matches!(
+            listener
+                .process_parent_decision(BrokerParentDecisionRequest {
+                    token: "legacy-tok".into(),
+                    child_tool_call_id: "tc".into(),
+                    message: "x".into(),
+                })
+                .await,
+            ParentDecisionResult::Rejected {
+                code,
+                ..
+            } if code == "coordination_unavailable"
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "legacy-tok".into(),
+                    request_id: "missing".into(),
+                    reply: "x".into(),
+                })
+                .await,
+            DelegationReplyResult::Rejected {
+                code,
+                ..
+            } if code == "coordination_unavailable"
+        ));
     }
 }

@@ -1,9 +1,12 @@
 //! `codeg-mcp` — the per-launch stdio MCP companion that an agent CLI runs
 //! to surface codeg's tools to its LLM: the multi-agent delegation tools
-//! (`delegate_to_agent` etc.), `check_user_feedback` (pull the user's mid-turn
-//! steering notes), `ask_user_question` (block on a multiple-choice card), and
+//! (`delegate_to_agent` etc.), coordination decision tools
+//! (`request_parent_decision` / `reply_to_delegation`, role-gated),
+//! `check_user_feedback` (pull the user's mid-turn steering notes),
+//! `ask_user_question` (block on a multiple-choice card), and
 //! `get_session_info` (resolve a referenced session by id), gated by the
-//! `--features` groups (`delegation` / `feedback` / `ask` / `sessions`).
+//! `--features` groups (`delegation` / `coordination_v1` / `feedback` /
+//! `ask` / `sessions`) and `--role` (`root` | `delegation_child`).
 //!
 //! The agent's MCP config (injected by codeg via `load_mcp_servers_for_agent`)
 //! spawns this binary with three required flags:

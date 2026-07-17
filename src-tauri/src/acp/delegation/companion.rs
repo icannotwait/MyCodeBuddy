@@ -5,16 +5,18 @@
 //! The companion speaks newline-delimited JSON-RPC 2.0 on stdio:
 //! one request → one response per line, with concurrent dispatch so
 //! `notifications/cancelled` can race an in-flight `tools/call`. It exposes up
-//! to six tools — `delegate_to_agent` (async; returns a `task_id` ack),
+//! to eight tools — `delegate_to_agent` (async; returns a `task_id` ack),
 //! `get_delegation_status` (poll/long-poll for the result), `cancel_delegation`,
 //! `check_user_feedback` (pull the user's mid-turn steering notes),
-//! `ask_user_question` (block on a multiple-choice card), and `get_session_info`
-//! (resolve a referenced session by id) — whose schemas are embedded at compile
-//! time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups (delegation
-//! / feedback / ask / sessions). Only `delegate_to_agent` registers a broker-side
-//! cancel handle; canceling a status / cancel / feedback / session round-trip
-//! merely suppresses its response — and for `check_user_feedback` also skips the
-//! delivery commit, so a cancelled note stays pending.
+//! `ask_user_question` (block on a multiple-choice card), `get_session_info`
+//! (resolve a referenced session by id), plus coordination-only
+//! `request_parent_decision` / `reply_to_delegation` — whose schemas are embedded
+//! at compile time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups
+//! (delegation / coordination_v1 / feedback / ask / sessions) and launch role.
+//! Only `delegate_to_agent` registers a broker-side cancel handle; canceling a
+//! status / cancel / feedback / session / decision round-trip merely suppresses
+//! its response — and for `check_user_feedback` also skips the delivery commit,
+//! so a cancelled note stays pending.
 //!
 //! Notifications (id = None) produce no response, matching MCP's expectation
 //! that `notifications/initialized` etc. are fire-and-forget.
@@ -41,12 +43,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
+use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_feedback_round_trip, client_round_trip, client_session_round_trip,
-    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_feedback_round_trip, client_parent_decision_round_trip, client_reply_delegation_round_trip,
+    client_round_trip, client_session_round_trip, client_status_round_trip, BrokerAskRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerFeedbackRequest, BrokerParentDecisionRequest, BrokerReplyDelegationRequest, BrokerRequest,
+    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    CompanionRole,
 };
 use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::parse_questions;
@@ -187,13 +192,15 @@ impl CompanionFeatures {
         f
     }
 
-    /// Whether the named MCP tool is exposed under the enabled feature groups.
-    pub fn allows_tool(&self, name: &str) -> bool {
+    /// Whether a pre-coordination MCP tool is exposed under the enabled groups.
+    fn allows_legacy_tool(&self, name: &str) -> bool {
         match name {
             "check_user_feedback" => self.feedback,
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
-            "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
+            "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => {
+                self.delegation
+            }
             _ => false,
         }
     }
@@ -210,6 +217,25 @@ pub struct CompanionContext {
     pub features: CompanionFeatures,
     /// Immutable launch role (`--role root|delegation_child`).
     pub role: CompanionRole,
+}
+
+impl CompanionContext {
+    /// Whether the named MCP tool is exposed under this launch's features and
+    /// role. Used independently by `tools/list` and `tools/call` so a disabled
+    /// tool is indistinguishable from an unknown one.
+    pub fn allows_tool(&self, name: &str) -> bool {
+        match name {
+            "request_parent_decision" => {
+                self.features.delegation
+                    && self.features.coordination_v1
+                    && self.role == CompanionRole::DelegationChild
+            }
+            "reply_to_delegation" => {
+                self.features.delegation && self.features.coordination_v1
+            }
+            other => self.features.allows_legacy_tool(other),
+        }
+    }
 }
 
 /// Per-in-flight-call state. The companion stashes one of these per
@@ -372,7 +398,7 @@ pub async fn dispatch_line(
                         .filter(|t| {
                             t.get("name")
                                 .and_then(|v| v.as_str())
-                                .map(|n| ctx.features.allows_tool(n))
+                                .map(|n| ctx.allows_tool(n))
                                 .unwrap_or(false)
                         })
                         .cloned()
@@ -442,7 +468,7 @@ async fn build_tools_call_spawn(
     // tool is rejected uniformly as "unknown tool" — indistinguishable from a
     // genuinely nonexistent one (no leak that the feature exists but is off),
     // and matching the legacy unknown-tool rejection shape.
-    if !ctx.features.allows_tool(&name) {
+    if !ctx.allows_tool(&name) {
         return LineAction::Respond(err(id, -32602, format!("unknown tool: {name}")));
     }
     match name.as_str() {
@@ -605,6 +631,47 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+        }
+        "request_parent_decision" => {
+            let args = match parse_parent_decision_args(&arguments) {
+                Ok(args) => args,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            // Internal correlation only — never accepted from LLM arguments.
+            // Prefer MCP `_meta.tool_use_id` when the host provides it; otherwise
+            // the stable JSON-RPC request id for this tools/call lifetime/replay.
+            let child_tool_call_id = params
+                .get("_meta")
+                .and_then(|meta| meta.get("tool_use_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("mcp_request:{}", request_id_key(&id)));
+            let req = BrokerParentDecisionRequest {
+                token: ctx.token.clone(),
+                child_tool_call_id,
+                message: args.message,
+            };
+            // No external_handle: cancel suppresses the response and closes the
+            // socket (listener drops only the waiter) without Broker task cancel.
+            let round_trip =
+                Box::pin(async move { client_parent_decision_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_parent_decision_result).await
+        }
+        "reply_to_delegation" => {
+            let args = match parse_reply_args(&arguments) {
+                Ok(args) => args,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            let req = BrokerReplyDelegationRequest {
+                token: ctx.token.clone(),
+                request_id: args.request_id,
+                reply: args.reply,
+            };
+            let round_trip =
+                Box::pin(async move { client_reply_delegation_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_reply_delegation_result)
+                .await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -977,6 +1044,137 @@ pub fn parse_return_when(
         return Err("return_when=all_terminal_or_attention requires explicit wait_ms=0".into());
     }
     Ok(Some(DelegationReturnWhen::AllTerminalOrAttention))
+}
+
+struct ParentDecisionArgs {
+    message: String,
+}
+
+struct ReplyArgs {
+    request_id: String,
+    reply: String,
+}
+
+fn exact_object<'a>(
+    value: &'a Value,
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "arguments must be an object".to_string())?;
+    if object
+        .keys()
+        .any(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err("arguments contain unexpected keys".into());
+    }
+    Ok(object)
+}
+
+fn bounded_nonblank(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
+    let value = object
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{key} must be a string"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{key} must not be blank"));
+    }
+    // `str::len` is UTF-8 byte length (same as `as_bytes().len()`).
+    if value.len() > ATTENTION_PAYLOAD_MAX_BYTES {
+        return Err(format!("{key} exceeds 16 KiB UTF-8"));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_parent_decision_args(arguments: &Value) -> Result<ParentDecisionArgs, String> {
+    let object = exact_object(arguments, &["message"])?;
+    Ok(ParentDecisionArgs {
+        message: bounded_nonblank(object, "message")?,
+    })
+}
+
+fn parse_reply_args(arguments: &Value) -> Result<ReplyArgs, String> {
+    let object = exact_object(arguments, &["request_id", "reply"])?;
+    let request_id = object
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "request_id must be a nonblank string".to_string())?
+        .to_string();
+    Ok(ReplyArgs {
+        request_id,
+        reply: bounded_nonblank(object, "reply")?,
+    })
+}
+
+fn render_parent_decision_result(outcome: &Value) -> Value {
+    let status = match outcome.get("status").and_then(Value::as_str) {
+        Some("replied") => "replied",
+        Some("closed") => "closed",
+        _ => "rejected",
+    };
+    let text = match status {
+        "replied" => outcome
+            .get("reply")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "closed" => format!(
+            "Parent decision request closed: {}",
+            outcome
+                .get("resolution_code")
+                .and_then(Value::as_str)
+                .unwrap_or("task_terminal")
+        ),
+        _ => outcome
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Parent decision request was rejected.")
+            .to_string(),
+    };
+    json!({
+        "content": [{"type":"text", "text":text}],
+        "isError": status == "rejected",
+        "structuredContent": outcome,
+    })
+}
+
+fn render_reply_delegation_result(outcome: &Value) -> Value {
+    let status = match outcome.get("status").and_then(Value::as_str) {
+        Some("replied") => "replied",
+        Some("idempotent") => "idempotent",
+        Some("already_resolved") => "already_resolved",
+        Some("missing") => "missing",
+        Some("unauthorized") => "unauthorized",
+        Some("rejected") => "rejected",
+        _ => "rejected",
+    };
+    let text = match status {
+        "replied" => "Reply delivered".to_string(),
+        "idempotent" => "Reply already delivered".to_string(),
+        "already_resolved" => format!(
+            "Request already resolved: {}",
+            outcome
+                .get("resolution_code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        "missing" => "Decision request was not found.".to_string(),
+        "unauthorized" => "Decision request is not owned by this parent.".to_string(),
+        _ => outcome
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Delegation reply was rejected.")
+            .to_string(),
+    };
+    json!({
+        "content": [{"type":"text", "text":text}],
+        "isError": matches!(
+            status,
+            "missing" | "unauthorized" | "already_resolved" | "rejected"
+        ),
+        "structuredContent": outcome,
+    })
 }
 
 /// Map a serialized [`super::types::DelegationTaskReport`] into MCP `tools/call`
@@ -1981,7 +2179,9 @@ mod tests {
         sessions: false,
     };
 
-    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 7_680;
+    // Two coordination tools add ~1.2 KiB; keep Grok stdio tools/list under
+    // a still-safe budget for hosts that serialize the full list in one line.
+    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 9_000;
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
         let resp = unwrap_respond(action);
@@ -1991,6 +2191,68 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn legacy_root() -> CompanionContext {
+        ctx_with(CompanionFeatures {
+            delegation: true,
+            coordination_v1: false,
+            feedback: false,
+            ask: false,
+            sessions: false,
+        })
+    }
+
+    fn coordination_root() -> CompanionContext {
+        let mut c = ctx_with(COORDINATION);
+        c.role = CompanionRole::Root;
+        c
+    }
+
+    fn coordination_child() -> CompanionContext {
+        let mut c = ctx_with(COORDINATION);
+        c.role = CompanionRole::DelegationChild;
+        c
+    }
+
+    async fn dispatch_with_context(ctx: CompanionContext, line: &str) -> LineAction {
+        dispatch_line(&ctx, Arc::new(InflightCalls::new()), line).await
+    }
+
+    fn tools_list() -> &'static str {
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+    }
+
+    fn call(id: i64, name: &str, arguments: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+        .to_string()
+    }
+
+    fn tool_names(action: LineAction) -> Vec<String> {
+        list_tool_names(action)
+    }
+
+    fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
+        for forbidden in [
+            "progress",
+            "warning",
+            "log",
+            "heartbeat",
+            "detach",
+            "deliver_result",
+            "send_result",
+            "result_delivery",
+        ] {
+            assert!(
+                !names.iter().any(|n| n.contains(forbidden)),
+                "unexpected side-channel tool name containing {forbidden:?}: {names:?}"
+            );
+        }
     }
 
     fn collect_descriptions(value: &Value, output: &mut String) {
@@ -2033,7 +2295,7 @@ mod tests {
             tool_guidance(ask_tool).contains("meaning or trade-off"),
             "ask_user_question guidance lost nested option description"
         );
-        let cases: [(&str, &[&str]); 6] = [
+        let cases: [(&str, &[&str]); 8] = [
             (
                 "delegate_to_agent",
                 &[
@@ -2123,6 +2385,24 @@ mod tests {
                     "not an error",
                 ],
             ),
+            (
+                "request_parent_decision",
+                &[
+                    "direct parent",
+                    "blocking decision",
+                    "cannot continue safely",
+                    "do not use it for progress, logs, warnings",
+                ],
+            ),
+            (
+                "reply_to_delegation",
+                &[
+                    "open direct-child decision",
+                    "attention_requests",
+                    "first durable reply wins",
+                    "idempotent",
+                ],
+            ),
         ];
 
         for (name, required_phrases) in cases {
@@ -2186,6 +2466,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
+        // Root role + coordination_v1: reply only (no request_parent_decision).
         assert_eq!(
             names,
             vec![
@@ -2195,6 +2476,7 @@ mod tests {
                 "check_user_feedback",
                 "ask_user_question",
                 "get_session_info",
+                "reply_to_delegation",
             ]
         );
         let mut line = serde_json::to_vec(&response).unwrap();
@@ -2765,5 +3047,127 @@ mod tests {
             !*saw_commit.lock().await,
             "a cancelled check must not commit"
         );
+    }
+
+    // -- Role-aware decision tools (Task 6) ---------------------------------
+
+    #[tokio::test]
+    async fn decision_tools_are_capability_and_role_scoped() {
+        let legacy = tool_names(dispatch_with_context(legacy_root(), tools_list()).await);
+        assert!(!legacy.contains(&"request_parent_decision".into()));
+        assert!(!legacy.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&legacy);
+
+        let root = tool_names(dispatch_with_context(coordination_root(), tools_list()).await);
+        assert!(!root.contains(&"request_parent_decision".into()));
+        assert!(root.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&root);
+
+        let child = tool_names(dispatch_with_context(coordination_child(), tools_list()).await);
+        assert!(child.contains(&"request_parent_decision".into()));
+        assert!(child.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&child);
+    }
+
+    #[tokio::test]
+    async fn root_direct_call_to_child_only_tool_is_rejected_without_socket_io() {
+        let response = unwrap_respond(
+            dispatch_with_context(
+                coordination_root(),
+                &call(7, "request_parent_decision", json!({"message":"choose"})),
+            )
+            .await,
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_call_to_decision_tools_is_rejected() {
+        for name in ["request_parent_decision", "reply_to_delegation"] {
+            let args = if name == "request_parent_decision" {
+                json!({"message":"choose"})
+            } else {
+                json!({"request_id":"r1","reply":"A"})
+            };
+            let response = unwrap_respond(
+                dispatch_with_context(legacy_root(), &call(8, name, args)).await,
+            );
+            assert_eq!(response.error.unwrap().code, -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_child_spawns_request_parent_decision() {
+        let action = dispatch_with_context(
+            coordination_child(),
+            &call(9, "request_parent_decision", json!({"message":"choose"})),
+        )
+        .await;
+        assert!(matches!(action, LineAction::Spawn(_)));
+    }
+
+    #[tokio::test]
+    async fn coordination_root_spawns_reply_to_delegation() {
+        let action = dispatch_with_context(
+            coordination_root(),
+            &call(
+                10,
+                "reply_to_delegation",
+                json!({"request_id":"r1","reply":"A"}),
+            ),
+        )
+        .await;
+        assert!(matches!(action, LineAction::Spawn(_)));
+    }
+
+    #[test]
+    fn decision_payload_validation_is_utf8_byte_bounded_and_exact_keyed() {
+        assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024)})).is_ok());
+        assert!(parse_parent_decision_args(&json!({"message":"界".repeat(6000)})).is_err());
+        assert!(parse_parent_decision_args(&json!({"message":"  "})).is_err());
+        assert!(parse_parent_decision_args(
+            &json!({"message":"choose", "task_id":"foreign"})
+        )
+        .is_err());
+        assert!(parse_reply_args(&json!({"request_id":"r1", "reply":"A", "parent_id":1})).is_err());
+        assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024 + 1)})).is_err());
+        assert!(parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024)})).is_ok());
+        assert!(
+            parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024 + 1)}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn render_parent_decision_surfaces_reply_text_without_error_flag() {
+        let rendered = render_parent_decision_result(&json!({
+            "status": "replied",
+            "request_id": "r1",
+            "reply": "Use A",
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["content"][0]["text"], "Use A");
+        assert_eq!(rendered["structuredContent"]["status"], "replied");
+    }
+
+    #[test]
+    fn render_reply_delegation_idempotent_is_not_error() {
+        let rendered = render_reply_delegation_result(&json!({
+            "status": "idempotent",
+            "request_id": "r1",
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["content"][0]["text"], "Reply already delivered");
+    }
+
+    #[test]
+    fn render_reply_delegation_does_not_echo_reply_in_text() {
+        let rendered = render_reply_delegation_result(&json!({
+            "status": "replied",
+            "request_id": "r1",
+        }));
+        assert_eq!(rendered["content"][0]["text"], "Reply delivered");
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("secret-reply-body"));
     }
 }
