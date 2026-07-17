@@ -7,6 +7,7 @@ import {
   type DbConversationSummary,
   type DelegationProfile,
   type GitLogEntry,
+  type ReferenceCandidate,
 } from "@/lib/types"
 
 import type { SuggestionItem } from "./types"
@@ -17,11 +18,68 @@ function joinPath(root: string, relative: string): string {
   return left ? `${left}/${right}` : right
 }
 
+function withControllerDefaults(
+  item: Omit<
+    SuggestionItem,
+    "selectable" | "freshness" | "sourceOrdinal" | "regexRank"
+  > &
+    Partial<
+      Pick<
+        SuggestionItem,
+        "selectable" | "freshness" | "sourceOrdinal" | "regexRank"
+      >
+    >
+): SuggestionItem {
+  return {
+    ...item,
+    selectable: item.selectable ?? true,
+    freshness: item.freshness ?? "fresh",
+    sourceOrdinal: item.sourceOrdinal ?? 0,
+    regexRank: item.regexRank ?? null,
+  }
+}
+
+export type CatalogSearchEntry =
+  | { kind: "agent"; agent: AcpAgentInfo }
+  | {
+      kind: "profile"
+      profile: DelegationProfile
+      backingAgent: AcpAgentInfo
+    }
+
+/**
+ * Declared primary/secondary fields for Agent/Profile catalog matching.
+ * Primary is the display name; secondary is agent type, description, model
+ * (empty model slot for base agents so field tiers stay comparable).
+ */
+export function catalogSearchFields(entry: CatalogSearchEntry): {
+  primary: string[]
+  secondary: string[]
+} {
+  if (entry.kind === "agent") {
+    const { agent } = entry
+    return {
+      primary: [agent.name || AGENT_LABELS[agent.agent_type]],
+      secondary: [agent.agent_type, agent.description, ""],
+    }
+  }
+  const { profile, backingAgent } = entry
+  return {
+    primary: [`${AGENT_LABELS[profile.agent_type]}:${profile.name}`],
+    secondary: [
+      profile.agent_type,
+      backingAgent.description,
+      profile.config_values.model ?? "",
+    ],
+  }
+}
+
 export function profileToSuggestion(
-  profile: DelegationProfile
+  profile: DelegationProfile,
+  sourceOrdinal = 0
 ): SuggestionItem {
   const agentLabel = AGENT_LABELS[profile.agent_type]
-  return {
+  return withControllerDefaults({
     reference: {
       refType: "delegation_profile",
       id: profile.id,
@@ -31,15 +89,17 @@ export function profileToSuggestion(
     },
     detail: profile.config_values.model ?? null,
     keywords: `${profile.name} ${profile.agent_type} ${profile.config_values.model ?? ""}`,
-  }
+    sourceOrdinal,
+  })
 }
 
 /** Workspace file → file reference (uri built from the workspace root). */
 export function fileToSuggestion(
   entry: FlatFileEntry,
-  workspaceRoot: string
+  workspaceRoot: string,
+  sourceOrdinal = 0
 ): SuggestionItem {
-  return {
+  return withControllerDefaults({
     reference: {
       refType: "file",
       id: entry.relativePath,
@@ -49,7 +109,8 @@ export function fileToSuggestion(
     },
     detail: entry.relativePath,
     keywords: entry.relativePath,
-  }
+    sourceOrdinal,
+  })
 }
 
 /**
@@ -59,8 +120,11 @@ export function fileToSuggestion(
  * readable `@label` carries the meaning); resolving it to real routing is a
  * future, separate concern.
  */
-export function agentToSuggestion(agent: AcpAgentInfo): SuggestionItem {
-  return {
+export function agentToSuggestion(
+  agent: AcpAgentInfo,
+  sourceOrdinal = 0
+): SuggestionItem {
+  return withControllerDefaults({
     reference: {
       refType: "agent",
       id: agent.agent_type,
@@ -70,7 +134,8 @@ export function agentToSuggestion(agent: AcpAgentInfo): SuggestionItem {
     },
     detail: agent.description || null,
     keywords: agent.agent_type,
-  }
+    sourceOrdinal,
+  })
 }
 
 /**
@@ -82,7 +147,8 @@ export function agentToSuggestion(agent: AcpAgentInfo): SuggestionItem {
  * badge shows a neutral conversation glyph, not the agent icon.
  */
 export function sessionToSuggestion(
-  conversation: DbConversationSummary
+  conversation: DbConversationSummary,
+  sourceOrdinal = 0
 ): SuggestionItem {
   // Fold any inline reference badges in the title (`[name](file://…)`, …) down
   // to their bracket text, so the panel row and the inserted session badge read
@@ -92,7 +158,7 @@ export function sessionToSuggestion(
   const label =
     formatConversationTitle(conversation.title).trim() || `#${conversation.id}`
   const uri = `codeg://session/${conversation.id}`
-  return {
+  return withControllerDefaults({
     reference: {
       refType: "session",
       id: String(conversation.id),
@@ -106,7 +172,8 @@ export function sessionToSuggestion(
     },
     detail: conversation.git_branch || conversation.status,
     keywords: `${label} ${conversation.agent_type}`,
-  }
+    sourceOrdinal,
+  })
 }
 
 /**
@@ -115,9 +182,10 @@ export function sessionToSuggestion(
  */
 export function commitToSuggestion(
   entry: GitLogEntry,
-  repoKey: string
+  repoKey: string,
+  sourceOrdinal = 0
 ): SuggestionItem {
-  return {
+  return withControllerDefaults({
     reference: {
       refType: "commit",
       id: entry.full_hash,
@@ -132,6 +200,99 @@ export function commitToSuggestion(
     },
     detail: entry.message,
     keywords: `${entry.hash} ${entry.message} ${entry.author}`,
+    sourceOrdinal,
+  })
+}
+
+/**
+ * Map an authoritative backend candidate into a mention suggestion without
+ * rebuilding URI/identity/rank values.
+ */
+export function candidateToSuggestion(
+  candidate: ReferenceCandidate,
+  freshness: SuggestionItem["freshness"],
+  selectable = true
+): SuggestionItem {
+  const meta = candidate.metadata
+  if (meta.kind === "file") {
+    return {
+      reference: {
+        refType: "file",
+        id: candidate.id,
+        label: candidate.label,
+        uri: candidate.uri,
+        meta: {
+          fileKind: meta.entryKind === "directory" ? "dir" : "file",
+        },
+      },
+      detail: candidate.detail,
+      keywords: candidate.keywords,
+      selectable,
+      freshness,
+      sourceOrdinal: candidate.sourceOrdinal,
+      regexRank: candidate.regexRank,
+    }
+  }
+  if (meta.kind === "conversation") {
+    return {
+      reference: {
+        refType: "session",
+        id: candidate.id,
+        label: candidate.label,
+        uri: candidate.uri,
+        meta: {
+          agentType: meta.agentType,
+          status: meta.status,
+          branch: meta.branch,
+        },
+      },
+      detail: candidate.detail,
+      keywords: candidate.keywords,
+      selectable,
+      freshness,
+      sourceOrdinal: candidate.sourceOrdinal,
+      regexRank: candidate.regexRank,
+    }
+  }
+  return {
+    reference: {
+      refType: "commit",
+      id: candidate.id,
+      label: candidate.label,
+      uri: candidate.uri,
+      meta: {
+        shortHash: meta.shortHash,
+        message: meta.subject,
+        author: meta.author,
+        pushed: null,
+      },
+    },
+    detail: candidate.detail,
+    keywords: candidate.keywords,
+    selectable,
+    freshness,
+    sourceOrdinal: candidate.sourceOrdinal,
+    regexRank: candidate.regexRank,
+  }
+}
+
+export function catalogEntryToSuggestion(
+  entry: CatalogSearchEntry,
+  sourceOrdinal: number,
+  freshness: SuggestionItem["freshness"] = "fresh",
+  selectable = true
+): SuggestionItem {
+  if (entry.kind === "agent") {
+    return {
+      ...agentToSuggestion(entry.agent, sourceOrdinal),
+      freshness,
+      selectable,
+    }
+  }
+  return {
+    ...profileToSuggestion(entry.profile, sourceOrdinal),
+    freshness,
+    selectable,
   }
 }
 

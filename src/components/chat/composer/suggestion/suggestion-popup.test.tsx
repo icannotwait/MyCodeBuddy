@@ -49,16 +49,31 @@ const agentRef2 = {
 }
 
 // The provider keeps file-first order; the panel reorders to agent-first tabs.
+function item(
+  reference: typeof fileRef | typeof agentRef | typeof agentRef2,
+  detail?: string | null,
+  sourceOrdinal = 0
+) {
+  return {
+    reference,
+    detail,
+    selectable: true,
+    freshness: "fresh" as const,
+    sourceOrdinal,
+    regexRank: null,
+  }
+}
+
 const groups: SuggestionGroup[] = [
   {
     kind: "file",
     label: "Files",
-    items: [{ reference: fileRef, detail: "docs/alpha.md" }],
+    items: [item(fileRef, "docs/alpha.md", 0)],
   },
   {
     kind: "agent",
     label: "Agents",
-    items: [{ reference: agentRef }, { reference: agentRef2 }],
+    items: [item(agentRef, null, 0), item(agentRef2, null, 1)],
   },
 ]
 
@@ -120,15 +135,15 @@ describe("SuggestionPopup", () => {
         kind: "file",
         label: "Files",
         items: [
-          {
-            reference: {
+          item(
+            {
               ...fileRef,
               id: LONG_REFERENCE_TEXT,
               label: LONG_REFERENCE_TEXT,
               uri: `file:///repo/${LONG_REFERENCE_TEXT}`,
             },
-            detail: longPath,
-          },
+            longPath
+          ),
         ],
       },
     ]
@@ -442,7 +457,7 @@ describe("SuggestionPopup", () => {
       {
         kind: "agent",
         label: "Agents",
-        items: [{ reference: agentRef }],
+        items: [item(agentRef)],
         truncated: true,
       },
     ]

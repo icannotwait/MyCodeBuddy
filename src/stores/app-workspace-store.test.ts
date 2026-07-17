@@ -145,3 +145,28 @@ describe("applyConversationStatePatch — backend authority exactness", () => {
     )
   })
 })
+
+describe("applyGitHead", () => {
+  it("apply_git_head_updates_when_full_head_or_reference_epoch_changes_on_the_same_branch", () => {
+    const store = useAppWorkspaceStore.getState()
+    const first = {
+      is_repo: true,
+      branch: "main",
+      detached: false,
+      short_sha: null as string | null,
+      canonical_repo: "/repo",
+      head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      reference_source_epoch: "v1:epoch-a",
+    }
+    store.applyGitHead(1, first)
+    expect(useAppWorkspaceStore.getState().gitHeads.get(1)).toEqual(first)
+
+    const second = {
+      ...first,
+      head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      reference_source_epoch: "v1:epoch-b",
+    }
+    store.applyGitHead(1, second)
+    expect(useAppWorkspaceStore.getState().gitHeads.get(1)).toEqual(second)
+  })
+})
