@@ -16,6 +16,9 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tokio::sync::Mutex;
 
+use crate::acp::delegation::runtime_stats::{
+    decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
+};
 use crate::acp::delegation::types::{DelegationTaskReport, TaskStatus};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::AppDatabase;
@@ -89,6 +92,7 @@ pub struct PersistedTask {
     pub error_code: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub runtime_stats: Option<DelegationRuntimeStats>,
 }
 
 impl PersistedTask {
@@ -215,6 +219,11 @@ pub trait DelegationTaskStore: Send + Sync {
         terminal: TerminalTaskWrite,
     ) -> Result<Settlement, TaskStoreError>;
     async fn reconcile_running(&self, at: DateTime<Utc>) -> Result<u64, TaskStoreError>;
+    async fn write_runtime_stats(
+        &self,
+        task_id: &str,
+        stats: &DelegationRuntimeStats,
+    ) -> Result<(), TaskStoreError>;
     async fn put_retry(&self, retry: PendingTerminalRetry);
     async fn remove_retry(&self, task_id: &str);
     async fn has_retry_record(&self, task_id: &str) -> bool;
@@ -250,6 +259,14 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn reconcile_running(&self, _at: DateTime<Utc>) -> Result<u64, TaskStoreError> {
         Ok(0)
+    }
+
+    async fn write_runtime_stats(
+        &self,
+        _task_id: &str,
+        _stats: &DelegationRuntimeStats,
+    ) -> Result<(), TaskStoreError> {
+        Ok(())
     }
 
     async fn put_retry(&self, retry: PendingTerminalRetry) {
@@ -301,6 +318,27 @@ impl DbDelegationTaskStore {
             Some(DelegationTaskStatus::Canceled) => TaskStatus::Canceled,
             None => return None,
         };
+        let runtime_stats = match decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
+            started_at: row.delegation_started_at,
+            finished_at: row.delegation_finished_at,
+            tool_call_count: row.delegation_tool_call_count,
+            edit_tool_call_count: row.delegation_edit_tool_call_count,
+            touched_files_json: row.delegation_touched_files_json.as_deref(),
+            touched_files_truncated: row.delegation_touched_files_truncated,
+            additions: row.delegation_additions,
+            deletions: row.delegation_deletions,
+            line_counts_complete: row.delegation_line_counts_complete,
+        }) {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = ?err,
+                    "[delegation_store] failed to decode runtime_stats"
+                );
+                None
+            }
+        };
         Some(PersistedTask {
             task_id,
             child_conversation_id: row.id,
@@ -310,6 +348,7 @@ impl DbDelegationTaskStore {
             error_code: row.delegation_error_code,
             started_at: row.delegation_started_at,
             finished_at: row.delegation_finished_at,
+            runtime_stats,
         })
     }
 }
@@ -445,6 +484,108 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         Ok(result.rows_affected)
     }
 
+    async fn write_runtime_stats(
+        &self,
+        task_id: &str,
+        stats: &DelegationRuntimeStats,
+    ) -> Result<(), TaskStoreError> {
+        let tool_call_count = i64::try_from(stats.tool_call_count).map_err(|_| {
+            TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into())
+        })?;
+        let edit_tool_call_count = i64::try_from(stats.edit_tool_call_count).map_err(|_| {
+            TaskStoreError::Permanent("runtime edit_tool_call_count exceeds i64".into())
+        })?;
+        let additions = stats
+            .additions
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| TaskStoreError::Permanent("runtime additions exceeds i64".into()))?;
+        let deletions = stats
+            .deletions
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| TaskStoreError::Permanent("runtime deletions exceeds i64".into()))?;
+        let touched_files_json = serde_json::to_string(&stats.touched_files).map_err(|err| {
+            TaskStoreError::Permanent(format!("serialize touched_files failed: {err}"))
+        })?;
+
+        let mut update = conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::DelegationToolCallCount,
+                sea_orm::sea_query::Expr::value(tool_call_count),
+            )
+            .col_expr(
+                conversation::Column::DelegationEditToolCallCount,
+                sea_orm::sea_query::Expr::value(edit_tool_call_count),
+            )
+            .col_expr(
+                conversation::Column::DelegationTouchedFilesJson,
+                sea_orm::sea_query::Expr::value(touched_files_json),
+            )
+            .col_expr(
+                conversation::Column::DelegationTouchedFilesTruncated,
+                sea_orm::sea_query::Expr::value(stats.touched_files_truncated),
+            )
+            .col_expr(
+                conversation::Column::DelegationAdditions,
+                sea_orm::sea_query::Expr::value(additions),
+            )
+            .col_expr(
+                conversation::Column::DelegationDeletions,
+                sea_orm::sea_query::Expr::value(deletions),
+            )
+            .col_expr(
+                conversation::Column::DelegationLineCountsComplete,
+                sea_orm::sea_query::Expr::value(stats.line_counts_complete),
+            )
+            .col_expr(
+                conversation::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(conversation::Column::DelegationCallId.eq(task_id));
+
+        if stats.finished_at.is_none() {
+            update = update.filter(
+                conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running),
+            );
+        } else {
+            update = update
+                .filter(
+                    conversation::Column::DelegationTaskStatus
+                        .ne(DelegationTaskStatus::Running),
+                )
+                .filter(
+                    conversation::Column::DelegationFinishedAt.eq(stats.finished_at),
+                );
+        }
+
+        let result = update
+            .exec(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
+
+        if result.rows_affected > 0 {
+            return Ok(());
+        }
+
+        if stats.finished_at.is_none() {
+            // Running write affected zero rows — terminal supersession is benign.
+            match self.load(task_id).await? {
+                Some(row) if row.status != TaskStatus::Running => Ok(()),
+                Some(_) => Err(TaskStoreError::Permanent(format!(
+                    "running runtime_stats write matched no rows for still-running task {task_id}"
+                ))),
+                None => Err(TaskStoreError::Permanent(format!(
+                    "running runtime_stats write matched no rows; task {task_id} missing"
+                ))),
+            }
+        } else {
+            Err(TaskStoreError::Permanent(format!(
+                "terminal runtime_stats write matched no rows for task {task_id}"
+            )))
+        }
+    }
+
     async fn put_retry(&self, retry: PendingTerminalRetry) {
         // Deduplicated by task_id — first record wins.
         self.retries
@@ -550,6 +691,7 @@ pub mod mock {
                     error_code: None,
                     started_at: Some(Utc::now()),
                     finished_at: None,
+                    runtime_stats: None,
                 },
             );
             drop(map);
@@ -595,6 +737,7 @@ pub mod mock {
                     error_code: None,
                     started_at: Some(Utc::now()),
                     finished_at: None,
+                    runtime_stats: None,
                 },
             );
         }
@@ -637,6 +780,7 @@ pub mod mock {
                     error_code: None,
                     started_at: Some(Utc::now()),
                     finished_at: None,
+                    runtime_stats: None,
                 });
         }
     }
@@ -719,6 +863,35 @@ pub mod mock {
                 }
             }
             Ok(n)
+        }
+
+        async fn write_runtime_stats(
+            &self,
+            task_id: &str,
+            stats: &DelegationRuntimeStats,
+        ) -> Result<(), TaskStoreError> {
+            let mut map = self.tasks.lock().await;
+            let Some(entry) = map.get_mut(task_id) else {
+                return Err(TaskStoreError::Permanent(format!(
+                    "runtime_stats write for missing task {task_id}"
+                )));
+            };
+            let accept = if stats.finished_at.is_none() {
+                entry.status == TaskStatus::Running
+            } else {
+                entry.status != TaskStatus::Running && entry.finished_at == stats.finished_at
+            };
+            if accept {
+                entry.runtime_stats = Some(stats.clone());
+                return Ok(());
+            }
+            if stats.finished_at.is_none() && entry.status != TaskStatus::Running {
+                // Stale running snapshot superseded by terminal row.
+                return Ok(());
+            }
+            Err(TaskStoreError::Permanent(format!(
+                "runtime_stats write rejected for task {task_id}"
+            )))
         }
 
         async fn put_retry(&self, retry: PendingTerminalRetry) {
@@ -919,5 +1092,196 @@ mod tests {
         let report = row.to_report(None);
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_round_trip_preserves_counts_paths_and_nullable_lines() {
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+
+        let db = test_store_with_running_task("rt-round-1").await;
+        let store = DbDelegationTaskStore::new(db.clone());
+        let started = store
+            .load("rt-round-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at
+            .expect("started_at");
+        let stats = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: None,
+            tool_call_count: 3,
+            edit_tool_call_count: 2,
+            touched_files: vec![
+                DelegationTouchedFile {
+                    path: "src/a.rs".into(),
+                    outside_workspace: false,
+                    additions: Some(4),
+                    deletions: Some(1),
+                },
+                DelegationTouchedFile {
+                    path: "/outside/b.rs".into(),
+                    outside_workspace: true,
+                    additions: None,
+                    deletions: None,
+                },
+            ],
+            touched_files_truncated: true,
+            additions: Some(4),
+            deletions: Some(1),
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats("rt-round-1", &stats)
+            .await
+            .expect("write running snapshot");
+        let loaded = store
+            .load("rt-round-1")
+            .await
+            .expect("load")
+            .expect("row")
+            .runtime_stats
+            .expect("runtime_stats");
+        assert_eq!(loaded.tool_call_count, 3);
+        assert_eq!(loaded.edit_tool_call_count, 2);
+        assert_eq!(loaded.touched_files, stats.touched_files);
+        assert!(loaded.touched_files_truncated);
+        assert_eq!(loaded.additions, Some(4));
+        assert_eq!(loaded.deletions, Some(1));
+        assert!(loaded.line_counts_complete);
+        assert_eq!(loaded.started_at, started);
+        assert!(loaded.finished_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_stale_running_write_does_not_overwrite_terminal() {
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+
+        let db = test_store_with_running_task("rt-stale-1").await;
+        let store = DbDelegationTaskStore::new(db.clone());
+        let started = store
+            .load("rt-stale-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at
+            .expect("started_at");
+        let finished = Utc::now();
+        store
+            .settle(
+                "rt-stale-1",
+                TerminalTaskWrite::completed(finished, ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("settle");
+        let terminal = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: Some(finished),
+            tool_call_count: 5,
+            edit_tool_call_count: 2,
+            touched_files: vec![DelegationTouchedFile {
+                path: "final.rs".into(),
+                outside_workspace: false,
+                additions: Some(2),
+                deletions: Some(0),
+            }],
+            touched_files_truncated: false,
+            additions: Some(2),
+            deletions: Some(0),
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats("rt-stale-1", &terminal)
+            .await
+            .expect("terminal write");
+        let after_terminal = store
+            .load("rt-stale-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_stats
+            .clone();
+        let stale_running = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: None,
+            tool_call_count: 1,
+            edit_tool_call_count: 0,
+            touched_files: vec![],
+            touched_files_truncated: false,
+            additions: None,
+            deletions: None,
+            line_counts_complete: false,
+        };
+        store
+            .write_runtime_stats("rt-stale-1", &stale_running)
+            .await
+            .expect("stale running write is benign");
+        let after_stale = store
+            .load("rt-stale-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_stats;
+        assert_eq!(after_stale, after_terminal);
+        let terminal_bytes = serde_json::to_vec(&after_terminal).expect("serialize");
+        let stale_bytes = serde_json::to_vec(&after_stale).expect("serialize");
+        assert_eq!(terminal_bytes, stale_bytes);
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_historical_null_load_yields_none() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-delegation-hist-null").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        // Non-delegate rows have null rollup columns; load by minting a
+        // synthetic call id is not available. Instead verify a fresh
+        // delegate's zero snapshot decodes, and a missing task is None.
+        let store = DbDelegationTaskStore::new(db.clone());
+        assert!(store.load("missing-task").await.unwrap().is_none());
+        let _ = parent;
+        // Regular conversation has no task id — create a delegate then clear
+        // rollups via raw SQL-less update to simulate historical nulls is not
+        // needed: decode path on null required fields is covered by model_to_persisted
+        // when columns are null. Seed a running task and overwrite columns to null
+        // through entity update.
+        let link = DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-hist".into(),
+            delegation_call_id: "hist-null".into(),
+        };
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child".into()),
+            None,
+            Some(link),
+        )
+        .await
+        .expect("child");
+        use sea_orm::{ActiveModelTrait, Set};
+        let mut active: conversation::ActiveModel = child.into();
+        active.delegation_tool_call_count = Set(None);
+        active.delegation_edit_tool_call_count = Set(None);
+        active.delegation_touched_files_json = Set(None);
+        active.delegation_touched_files_truncated = Set(None);
+        active.delegation_additions = Set(None);
+        active.delegation_deletions = Set(None);
+        active.delegation_line_counts_complete = Set(None);
+        active.update(&db.conn).await.expect("null rollups");
+        let loaded = store.load("hist-null").await.unwrap().unwrap();
+        assert!(loaded.runtime_stats.is_none());
     }
 }

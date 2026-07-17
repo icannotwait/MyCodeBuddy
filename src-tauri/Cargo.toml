@@ -119,6 +119,7 @@ argon2 = "0.5"
 tempfile = "3"
 minisign-verify = "0.2"
 semver = "1"
+similar = "2.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry", "std"] }
 tracing-appender = "0.2"
