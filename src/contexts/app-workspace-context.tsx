@@ -4,6 +4,8 @@ import { useEffect, type ReactNode } from "react"
 import { getGitHead } from "@/lib/api"
 import { selectAcpAgentsFresh, useAcpAgents } from "@/hooks/use-acp-agents"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
+import { referenceSearchCache } from "@/lib/reference-search-cache"
+import { getActiveBackendCacheKey } from "@/lib/transport"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useConversationExperienceBootstrap } from "@/stores/conversation-experience-store"
 import {
@@ -27,9 +29,7 @@ interface AppWorkspaceProviderProps {
  * permits agent-only mentions because `ready` latches true on failure.
  */
 export function selectReferenceCatalogReady(): boolean {
-  return (
-    selectAcpAgentsFresh() && useDelegationProfileStore.getState().ready
-  )
+  return selectAcpAgentsFresh() && useDelegationProfileStore.getState().ready
 }
 
 /**
@@ -65,12 +65,20 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
         CONVERSATION_CHANGED_EVENT,
         (change) => {
           const store = useAppWorkspaceStore.getState()
+          const backend = getActiveBackendCacheKey()
           if (change.kind === "upsert") {
             store.applyConversationUpsert(change.summary)
+            referenceSearchCache.markConversationUpsert(backend, change.summary)
           } else if (change.kind === "deleted") {
             store.applyConversationRemove(change.id)
+            referenceSearchCache.markConversationDelete(backend, change.id)
           } else {
             store.applyConversationStatePatch(change.patch)
+            referenceSearchCache.markConversationStatus(
+              backend,
+              change.patch.id,
+              change.patch.status
+            )
           }
         }
       )

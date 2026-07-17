@@ -5,6 +5,7 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
+import { getActiveBackendCacheKey } from "@/lib/transport"
 import type {
   ConversationChange,
   DbConversationSummary,
@@ -31,6 +32,17 @@ const h = vi.hoisted(() => ({
   conversationExperienceBootstrap: vi.fn(),
   delegationProfileBootstrap: vi.fn(),
   useAcpAgents: vi.fn(() => ({ agents: [], fresh: false, refresh: vi.fn() })),
+  markConversationUpsert: vi.fn(),
+  markConversationStatus: vi.fn(),
+  markConversationDelete: vi.fn(),
+}))
+
+vi.mock("@/lib/reference-search-cache", () => ({
+  referenceSearchCache: {
+    markConversationUpsert: h.markConversationUpsert,
+    markConversationStatus: h.markConversationStatus,
+    markConversationDelete: h.markConversationDelete,
+  },
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -213,6 +225,9 @@ beforeEach(() => {
   h.conversationExperienceBootstrap.mockClear()
   h.delegationProfileBootstrap.mockClear()
   h.useAcpAgents.mockClear()
+  h.markConversationUpsert.mockClear()
+  h.markConversationStatus.mockClear()
+  h.markConversationDelete.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -223,6 +238,46 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
     await mountProvider()
     expect(h.handler).toBeTypeOf("function")
     expect(h.reconnect).toBeTypeOf("function")
+  })
+
+  it("forwards_conversation_changes_to_the_reference_cache_once", async () => {
+    await mountProvider()
+    // Seed an existing row so the status path mutates workspace state.
+    const existing = makeSummary({ id: 10, status: "in_progress" })
+    emit({ kind: "upsert", summary: existing })
+    h.markConversationUpsert.mockClear()
+
+    const upsert = makeSummary({
+      id: 10,
+      title: "Renamed",
+      status: "in_progress",
+    })
+    emit({ kind: "upsert", summary: upsert })
+    emit({
+      kind: "state",
+      patch: {
+        id: 10,
+        status: "pending_review",
+        awaiting_reply_token: "tok",
+        updated_at: "2026-07-16T02:00:00.000Z",
+      },
+    })
+    emit({ kind: "deleted", id: 10 })
+
+    const backend = getActiveBackendCacheKey()
+    expect(h.markConversationUpsert).toHaveBeenCalledTimes(1)
+    expect(h.markConversationUpsert).toHaveBeenCalledWith(backend, upsert)
+    expect(h.markConversationStatus).toHaveBeenCalledTimes(1)
+    expect(h.markConversationStatus).toHaveBeenCalledWith(
+      backend,
+      10,
+      "pending_review"
+    )
+    expect(h.markConversationDelete).toHaveBeenCalledTimes(1)
+    expect(h.markConversationDelete).toHaveBeenCalledWith(backend, 10)
+
+    // Original workspace-store behavior still occurs.
+    expect(screen.getByTestId("count")).toHaveTextContent("0")
   })
 
   it("mounts conversation experience bootstrap on provider mount", async () => {
