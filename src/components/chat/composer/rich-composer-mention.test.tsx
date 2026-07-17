@@ -300,6 +300,74 @@ describe("RichComposer @ mention integration", () => {
     expect(ref.current?.getEditor()).toBe(editor)
   })
 
+  it("compositionstart_closes_an_open_picker_and_blocks_pointer_confirmation", async () => {
+    const onSubmit = vi.fn()
+    const { editor, controller } = await mount(onSubmit)
+    act(() => {
+      editor.commands.insertContent("@app")
+    })
+    const row = await screen.findByText("app.ts", {}, { timeout: 5000 })
+    const dom = editor.view.dom as HTMLElement
+
+    act(() => {
+      dom.dispatchEvent(
+        new CompositionEvent("compositionstart", {
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    })
+    await waitFor(() =>
+      expect(screen.queryByTestId("mention-popup")).toBeNull()
+    )
+    expect(controller.closeCallCount()).toBe(1)
+
+    act(() => {
+      const enter = new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+      })
+      Object.defineProperty(enter, "isComposing", { value: true })
+      Object.defineProperty(enter, "keyCode", { value: 229 })
+      dom.dispatchEvent(enter)
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(controller.confirmCallCount()).toBe(0)
+    expect(findReference(editor.getJSON())).toBeUndefined()
+
+    act(() => {
+      row.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true })
+      )
+    })
+    expect(controller.confirmCallCount()).toBe(0)
+    expect(findReference(editor.getJSON())).toBeUndefined()
+    expect(onSubmit).not.toHaveBeenCalled()
+    // compositionstart closed once; further interactions must not re-close.
+    expect(controller.closeCallCount()).toBe(1)
+
+    act(() => {
+      dom.dispatchEvent(
+        new CompositionEvent("compositionend", {
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    })
+    // compositionend queues a rematch microtask; suggestion view.update is
+    // async (`await items()`), so drain a few ticks before asserting reopen.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(
+      await screen.findByText("app.ts", {}, { timeout: 5000 })
+    ).toBeTruthy()
+  }, 15000)
+
   it("replacing_or_disabling_controller_has_one_idempotent_close_effect", async () => {
     const controllerA = makeController()
     const controllerB = makeController()

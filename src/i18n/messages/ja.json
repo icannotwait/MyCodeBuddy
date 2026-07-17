@@ -1103,7 +1103,11 @@
     "autoTitleOff": "オフ",
     "autoTitleUnavailable": "{agent}（利用不可）",
     "autoTitleSaveFailed": "自動タイトルエージェントを保存できませんでした: {message}",
-    "autoTitleLoading": "自動タイトル設定を読み込んでいます..."
+    "autoTitleLoading": "自動タイトル設定を読み込んでいます...",
+    "referenceSearchLimit": "参照結果の上限",
+    "referenceSearchLimitHint": "リソースソースごとにキャッシュおよび検索する結果の最大数（10～500）。",
+    "referenceSearchLimitSave": "参照上限を保存",
+    "referenceSearchLimitSaveFailed": "参照結果の上限を保存できませんでした: {message}"
   },
   "LoginPage": {
     "documentTitle": "ログイン - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "エージェント",
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
-        "mentionGroupSkill": "スキル"
+        "mentionGroupSkill": "スキル",
+        "mentionInvalidPattern": "正規表現が無効です",
+        "mentionSourceError": "このソースを更新できませんでした",
+        "mentionProfileError": "委任プロファイルを読み込めませんでした"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",

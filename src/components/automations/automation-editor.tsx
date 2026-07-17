@@ -163,6 +163,9 @@ export function AutomationEditor({
       listbox: tComposer("mentionListLabel"),
       more: tComposer("mentionMore"),
       count: (count: number) => tComposer("mentionCount", { count }),
+      invalidPattern: tComposer("mentionInvalidPattern"),
+      sourceError: tComposer("mentionSourceError"),
+      profileError: tComposer("mentionProfileError"),
     }),
     [tComposer]
   )

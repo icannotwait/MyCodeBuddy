@@ -692,6 +692,9 @@ export function MessageInput({
       listbox: t("mentionListLabel"),
       more: t("mentionMore"),
       count: (count: number) => t("mentionCount", { count }),
+      invalidPattern: t("mentionInvalidPattern"),
+      sourceError: t("mentionSourceError"),
+      profileError: t("mentionProfileError"),
     }),
     [t]
   )

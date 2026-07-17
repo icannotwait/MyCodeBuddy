@@ -285,7 +285,6 @@ export class ReferenceSearchController {
   /** Last pinned bucket object per serialized key (needed to unpin abandoned aliases). */
   private pinnedBuckets = new Map<string, ReferenceCacheBucketKey>()
   private selectedUri: string | null = null
-  private selectedBucket: ReferenceCacheBucketKey | null = null
   private validation: ValidationState | null = null
   private gitRefresh: GitRefreshGate | null = null
   private conversationUnsub: (() => void) | null = null
@@ -463,7 +462,6 @@ export class ReferenceSearchController {
   setSelectedUri(uri: string | null): void {
     this.selectedUri = uri
     if (uri == null) {
-      this.selectedBucket = null
       this.cache.pinSelected(
         this.searchSessionId,
         this.conversationBucket,
@@ -477,7 +475,6 @@ export class ReferenceSearchController {
 
     const located = this.locateMembership(uri)
     if (!located) {
-      this.selectedBucket = null
       this.cache.pinSelected(
         this.searchSessionId,
         this.conversationBucket,
@@ -489,7 +486,6 @@ export class ReferenceSearchController {
     }
 
     const bucket = this.bucketForGroup(located.group)
-    this.selectedBucket = bucket
     if (bucket) {
       this.cache.pinSelected(this.searchSessionId, bucket, uri)
     }
@@ -544,7 +540,6 @@ export class ReferenceSearchController {
     this.cache.releaseController(this.searchSessionId)
     this.pinnedBuckets.clear()
     this.selectedUri = null
-    this.selectedBucket = null
     this.resetAllMembership()
     this.sourceLoading = { file: false, conversation: false, commit: false }
     this.sourceError = { file: false, conversation: false, commit: false }
@@ -1130,7 +1125,7 @@ export class ReferenceSearchController {
 
   private ingestCommitPage(
     generation: number,
-    live: LiveSourceIdentity,
+    _live: LiveSourceIdentity,
     page: ReferenceSearchPage
   ): boolean {
     const head = this.inputs.gitHead

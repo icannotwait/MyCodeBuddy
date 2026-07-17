@@ -1103,7 +1103,11 @@
     "autoTitleOff": "Désactivé",
     "autoTitleUnavailable": "{agent} (Indisponible)",
     "autoTitleSaveFailed": "Impossible d'enregistrer l'agent de titre automatique : {message}",
-    "autoTitleLoading": "Chargement des paramètres de titre automatique..."
+    "autoTitleLoading": "Chargement des paramètres de titre automatique...",
+    "referenceSearchLimit": "Limite de résultats de référence",
+    "referenceSearchLimitHint": "Nombre maximal de résultats mis en cache et recherchés par source de ressources (10-500).",
+    "referenceSearchLimitSave": "Enregistrer la limite de références",
+    "referenceSearchLimitSaveFailed": "Impossible d'enregistrer la limite de résultats de référence : {message}"
   },
   "LoginPage": {
     "documentTitle": "Connexion - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Compétences"
+        "mentionGroupSkill": "Compétences",
+        "mentionInvalidPattern": "Expression régulière non valide",
+        "mentionSourceError": "Impossible d'actualiser cette source",
+        "mentionProfileError": "Impossible de charger les profils de délégation"
       },
       "messageQueue": {
         "addToQueue": "Mettre en file",

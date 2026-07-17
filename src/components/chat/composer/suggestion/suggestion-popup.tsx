@@ -167,6 +167,11 @@ export interface SuggestionPopupProps {
    * `aria-activedescendant`. Must be referentially stable.
    */
   onActiveOptionChange?: (optionId: string | null) => void
+  /**
+   * True while the host editor has an IME composition in flight. Pointer
+   * confirmation has no KeyboardEvent, so the host supplies this check.
+   */
+  isEditorComposing?: () => boolean
 }
 
 /**
@@ -193,6 +198,7 @@ export const SuggestionPopup = forwardRef<
     sourceErrorLabel = DEFAULT_SOURCE_ERROR,
     profileErrorLabel = DEFAULT_PROFILE_ERROR,
     onActiveOptionChange,
+    isEditorComposing,
   },
   ref
 ) {
@@ -369,6 +375,8 @@ export const SuggestionPopup = forwardRef<
   const selectCandidate = useCallback(
     async (uri: string, range: { from: number; to: number }) => {
       if (confirmingUriRef.current != null) return
+      // Pointer path has no KeyboardEvent — refuse while IME is composing.
+      if (isEditorComposing?.()) return
       const live = stateRef.current
       const activeController = controllerRef.current
       const target = flat.find((entry) => entry.reference.uri === uri)
@@ -422,7 +430,7 @@ export const SuggestionPopup = forwardRef<
       // Known-negative (null): keep picker open; snapshot reconcile moves
       // selection to the nearest survivor.
     },
-    [flat]
+    [flat, isEditorComposing]
   )
 
   const moveSelection = useCallback(
@@ -458,6 +466,14 @@ export const SuggestionPopup = forwardRef<
     ref,
     (): SuggestionPopupHandle => ({
       onKeyDown: (event) => {
+        // Return control to IME: no navigation, confirm, or dismiss mid-compose.
+        if (
+          event.isComposing ||
+          event.keyCode === 229 ||
+          isEditorComposing?.()
+        ) {
+          return false
+        }
         switch (event.key) {
           case "ArrowDown":
             moveSelection(1)
@@ -496,6 +512,7 @@ export const SuggestionPopup = forwardRef<
       selectedUri,
       selectCandidate,
       onClose,
+      isEditorComposing,
       state.range,
     ]
   )

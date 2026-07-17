@@ -1103,7 +1103,11 @@
     "autoTitleOff": "关闭",
     "autoTitleUnavailable": "{agent}（不可用）",
     "autoTitleSaveFailed": "保存自动标题智能体失败：{message}",
-    "autoTitleLoading": "正在加载自动标题设置..."
+    "autoTitleLoading": "正在加载自动标题设置...",
+    "referenceSearchLimit": "引用结果上限",
+    "referenceSearchLimitHint": "每个资源来源最多缓存和搜索的结果数（10-500）。",
+    "referenceSearchLimitSave": "保存引用上限",
+    "referenceSearchLimitSaveFailed": "保存引用结果上限失败：{message}"
   },
   "LoginPage": {
     "documentTitle": "登录 - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "智能体",
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionInvalidPattern": "正则表达式无效",
+        "mentionSourceError": "无法刷新此来源",
+        "mentionProfileError": "无法加载委托配置"
       },
       "messageQueue": {
         "addToQueue": "加入队列",

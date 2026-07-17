@@ -294,6 +294,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           ...(ariaLabel ? { "aria-label": ariaLabel } : {}),
         },
         handleKeyDown: (view, event) => {
+          // IME: never route submit/newline/menu keys while a composition is in
+          // flight (isComposing, legacy keyCode 229, or ProseMirror composing).
+          if (event.isComposing || event.keyCode === 229 || view.composing) {
+            return false
+          }
           // The internal `@` panel's suggestion plugin owns its navigation keys;
           // never submit/break while it is open.
           if (mentionOpenRef.current) return false
@@ -466,6 +471,8 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
 
     const handleReferenceSelect = useCallback(
       (reference: ReferenceAttrs, range: { from: number; to: number }) => {
+        // Pointer confirmation has no KeyboardEvent — block while IME is live.
+        if (editor?.view.composing) return
         editor
           ?.chain()
           .focus()
@@ -476,6 +483,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         closeMention()
       },
       [editor, closeMention]
+    )
+
+    const isEditorComposing = useCallback(
+      () => editor?.view.composing === true,
+      [editor]
     )
 
     // Combobox ARIA on the editing surface: DOM focus stays in the editor while
@@ -532,6 +544,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             onSelect={handleReferenceSelect}
             onClose={closeMention}
             onActiveOptionChange={handleActiveOptionChange}
+            isEditorComposing={isEditorComposing}
             emptyLabel={mentionUiLabels?.empty}
             loadingLabel={mentionUiLabels?.loading}
             listboxLabel={mentionUiLabels?.listbox}

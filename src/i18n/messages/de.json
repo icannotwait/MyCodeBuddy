@@ -1103,7 +1103,11 @@
     "autoTitleOff": "Aus",
     "autoTitleUnavailable": "{agent} (Nicht verfügbar)",
     "autoTitleSaveFailed": "Agent für automatische Titel konnte nicht gespeichert werden: {message}",
-    "autoTitleLoading": "Einstellungen für automatische Titel werden geladen..."
+    "autoTitleLoading": "Einstellungen für automatische Titel werden geladen...",
+    "referenceSearchLimit": "Limit für Referenzergebnisse",
+    "referenceSearchLimitHint": "Maximale Anzahl zwischengespeicherter und durchsuchter Ergebnisse pro Ressourcenquelle (10-500).",
+    "referenceSearchLimitSave": "Referenzlimit speichern",
+    "referenceSearchLimitSaveFailed": "Referenzlimit konnte nicht gespeichert werden: {message}"
   },
   "LoginPage": {
     "documentTitle": "Anmelden - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "Agenten",
         "mentionGroupSession": "Sitzungen",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Fähigkeiten"
+        "mentionGroupSkill": "Fähigkeiten",
+        "mentionInvalidPattern": "Ungültiger regulärer Ausdruck",
+        "mentionSourceError": "Diese Quelle konnte nicht aktualisiert werden",
+        "mentionProfileError": "Delegierungsprofile konnten nicht geladen werden"
       },
       "messageQueue": {
         "addToQueue": "Zur Warteschlange",

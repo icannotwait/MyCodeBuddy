@@ -257,14 +257,16 @@ export function rankLiteralFields(
   const lowered = query.toLowerCase()
   if (!lowered) return null
 
-  let best: { tier: number; index: number } | null = null
+  let bestTier: number | null = null
+  let bestIndex = Number.POSITIVE_INFINITY
   const consider = (tier: number, index: number) => {
     if (
-      !best ||
-      tier < best.tier ||
-      (tier === best.tier && index < best.index)
+      bestTier == null ||
+      tier < bestTier ||
+      (tier === bestTier && index < bestIndex)
     ) {
-      best = { tier, index }
+      bestTier = tier
+      bestIndex = index
     }
   }
 
@@ -277,7 +279,7 @@ export function rankLiteralFields(
       consider(4, i)
     }
   }
-  return best?.tier ?? null
+  return bestTier
 }
 
 function cloneCandidate(candidate: ReferenceCandidate): ReferenceCandidate {
