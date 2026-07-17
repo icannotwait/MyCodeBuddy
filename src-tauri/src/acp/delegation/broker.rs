@@ -7259,11 +7259,11 @@ mod tests {
 
     #[tokio::test]
     async fn pre_start_tool_and_attention_do_not_publish_until_started() {
-        use crate::acp::delegation::attention::DelegationAttentionStore;
         use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
         use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
         use crate::acp::delegation::store::mock::MockTaskStore;
         use crate::acp::delegation::store::DelegationTaskStore;
+        use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
 
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
@@ -7307,25 +7307,26 @@ mod tests {
             .await
             .unwrap()
             .task_id;
+        store.seed_running(&task_id, 33, Some(11)).await;
 
-        // Project one ToolCall and open attention after coordination but
-        // before start_delegation returns (send still gated).
+        // Project one ToolCall and open attention through the child decision
+        // path after coordination but before start_delegation returns (send
+        // still gated).
         broker
             .project_child_tool_event("child-conn", &tool_call("tc-pre", "read", "Read"))
             .await;
-        attention
-            .open_or_recover(valid_attention_at(
-                &task_id,
-                11,
-                33,
-                "tc-pre-att",
-                "Choose path",
-                dt("2026-07-17T13:00:05Z"),
-            ))
-            .await
-            .expect("open attention before start");
-        // Direct store open does not publish; assert no pre-start leak from
-        // the tool projection either.
+        let decision = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("child-conn", "tc-pre-att", "Choose path")
+                    .await
+            }
+        });
+        let open = wait_for_open_request(&attention, &task_id).await;
+
+        // The real publisher observes started_published=false, so neither
+        // projection can leak before the enriched start publishes.
         assert_eq!(
             events.runtime_snapshot().await.len(),
             0,
@@ -7355,11 +7356,27 @@ mod tests {
         let s = &started[0];
         assert_eq!(s.started_at, persisted_start);
         assert_eq!(s.runtime_stats.tool_call_count, 1);
-        assert!(
-            s.attention_request.is_some(),
-            "enriched start must carry the open attention closed under the race"
-        );
+        let start_attention = s
+            .attention_request
+            .as_ref()
+            .expect("enriched start must carry the open attention");
+        assert_eq!(start_attention.request_id, open.request_id);
+        assert_eq!(start_attention.message, "Choose path");
         assert_eq!(s.runtime_stats.started_at, persisted_start);
+
+        assert!(matches!(
+            broker
+                .reply_to_delegation("parent", Some(11), &open.request_id, "Use A")
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert_eq!(
+            within(decision).await.unwrap(),
+            ParentDecisionResult::Replied {
+                request_id: open.request_id,
+                reply: "Use A".into(),
+            }
+        );
     }
 
     #[tokio::test]
