@@ -972,7 +972,8 @@
       "piBinaryInstallFailed": "Échec de l'installation de pi",
       "piBinaryUninstalled": "pi désinstallé",
       "piBinaryUninstallFailed": "Échec de la désinstallation de pi",
-      "savePiTrustFailed": "Échec de l'enregistrement de la confiance de l'espace de travail"
+      "savePiTrustFailed": "Échec de l'enregistrement de la confiance de l'espace de travail",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "Statut de version",
@@ -1061,7 +1062,8 @@
       "trustDescription": "Lorsque codeg connecte pi à un dossier, ce dossier est marqué comme fiable afin que pi charge la configuration et les compétences locales du projet sans confirmation séparée.",
       "trustHint": "Seuls les dossiers que vous ouvrez ici sont approuvés, jamais l'ensemble de votre machine — et cela n'affecte que le chargement de la configuration, pas ce que pi est autorisé à exécuter.",
       "configDirSkillsNote": "Avec un répertoire de configuration personnalisé, les compétences, experts et outils bureautiques gérés dans les Paramètres ne s'appliquent pas à ce pi — gérez ses compétences directement dans ce dossier."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "Chargement des paramètres des agents...",

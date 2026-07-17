@@ -586,6 +586,28 @@ pub async fn acp_update_agent_preferences(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpUpdateAgentDisplayPreferencesParams {
+    pub agent_type: AgentType,
+    pub show_thinking: bool,
+}
+
+pub async fn acp_update_agent_display_preferences(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpUpdateAgentDisplayPreferencesParams>,
+) -> Result<Json<()>, AppCommandError> {
+    acp_commands::acp_update_agent_display_preferences_core(
+        params.agent_type,
+        params.show_thinking,
+        &state.db,
+        &state.emitter,
+    )
+    .await
+    .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpUpdateAgentEnvParams {
     pub agent_type: AgentType,
     pub enabled: bool,

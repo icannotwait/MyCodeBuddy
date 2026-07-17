@@ -32,7 +32,11 @@ vi.mock("@/lib/platform", () => ({
   onTransportReconnect: vi.fn(() => () => {}),
 }))
 
-import { resetAcpAgentsStore, useAcpAgents } from "./use-acp-agents"
+import {
+  resetAcpAgentsStore,
+  useAcpAgents,
+  useAgentThinkingVisibility,
+} from "./use-acp-agents"
 
 function makeAgent(agentType: AgentType, sortOrder: number): AcpAgentInfo {
   return {
@@ -57,6 +61,7 @@ function makeAgent(agentType: AgentType, sortOrder: number): AcpAgentInfo {
     cline_secrets_json: null,
     hermes_config_yaml: null,
     model_provider_id: null,
+    show_thinking: false,
   }
 }
 
@@ -245,5 +250,34 @@ describe("useAcpAgents — shared subscription", () => {
     second.unmount()
     // Resolve the deferred first subscribe so its (eventDisposed) disposer runs.
     mockResolveSubscribe?.(mockSubscribeDispose)
+  })
+})
+
+describe("useAgentThinkingVisibility", () => {
+  it("selects thinking visibility without flashing the loaded value", async () => {
+    mockAcpListAgents.mockResolvedValue([
+      { ...makeAgent("codex", 0), show_thinking: true },
+    ])
+    const { result } = renderHook(() => useAgentThinkingVisibility("codex"))
+    expect(result.current).toBe(false)
+    await waitFor(() => expect(result.current).toBe(true))
+  })
+
+  it("refreshes thinking visibility after the shared agent event", async () => {
+    mockAcpListAgents
+      .mockResolvedValueOnce([
+        { ...makeAgent("codex", 0), show_thinking: false },
+      ])
+      .mockResolvedValueOnce([
+        { ...makeAgent("codex", 0), show_thinking: true },
+      ])
+    const { result } = renderHook(() => useAgentThinkingVisibility("codex"))
+    await waitFor(() => expect(mockAcpListAgents).toHaveBeenCalledTimes(1))
+    expect(result.current).toBe(false)
+
+    act(() => mockEventHandler?.())
+
+    await waitFor(() => expect(result.current).toBe(true))
+    expect(mockAcpListAgents).toHaveBeenCalledTimes(2)
   })
 })

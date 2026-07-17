@@ -19,6 +19,7 @@ pub struct FolderDetail {
     pub path: String,
     pub git_branch: Option<String>,
     pub default_agent_type: Option<AgentType>,
+    pub last_agent_type: Option<AgentType>,
     pub last_opened_at: DateTime<Utc>,
     pub sort_order: i32,
     pub color: String,

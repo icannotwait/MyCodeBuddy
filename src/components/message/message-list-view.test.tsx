@@ -1,4 +1,4 @@
-import { act, render, screen, cleanup } from "@testing-library/react"
+import { act, fireEvent, render, screen, cleanup } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ReactNode } from "react"
@@ -94,8 +94,16 @@ vi.mock("use-stick-to-bottom", () => ({
 }))
 
 vi.mock("@/components/ai-elements/message", () => ({
-  Message: ({ children, ...rest }: { children?: ReactNode; from?: string }) => (
-    <div data-testid="ai-message" data-from={rest.from}>
+  Message: ({
+    children,
+    from,
+    ...rest
+  }: {
+    children?: ReactNode
+    from?: string
+    [key: string]: unknown
+  }) => (
+    <div data-testid="ai-message" data-from={from} {...rest}>
       {children}
     </div>
   ),
@@ -189,6 +197,10 @@ vi.mock("./conversation-message-nav", () => ({
   ConversationMessageNav: () => null,
 }))
 
+vi.mock("@/hooks/use-acp-agents", () => ({
+  useAgentThinkingVisibility: () => false,
+}))
+
 const historicalRenderSpy = vi.fn()
 const liveRenderSpy = vi.fn()
 
@@ -207,7 +219,27 @@ vi.mock("@/lib/perf/streaming-perf-recorder", () => ({
   },
 }))
 
-import { MessageListView } from "./message-list-view"
+const initialScrollControllerSpy = vi.fn()
+vi.mock("./initial-history-scroll-controller", () => ({
+  InitialHistoryScrollController: (props: {
+    pending: boolean
+    historyReady: boolean
+    hasHistoryRows: boolean
+    onFinish: () => void
+  }) => {
+    initialScrollControllerSpy(props)
+    return props.pending ? (
+      <button
+        type="button"
+        data-testid="finish-initial-history-scroll"
+        onClick={props.onFinish}
+      />
+    ) : null
+  },
+}))
+
+import { extractTextFromParts, MessageListView } from "./message-list-view"
+import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
 import type { DelegationActivityView } from "@/lib/types"
 
 const CID = 501
@@ -537,6 +569,118 @@ describe("canReloadSessionLoadError", () => {
   })
 })
 
+describe("extractTextFromParts", () => {
+  it("copies reasoning even when its view is hidden", () => {
+    expect(
+      extractTextFromParts([
+        { type: "reasoning", content: "hidden thought", isStreaming: false },
+        { type: "text", text: "final answer" },
+      ])
+    ).toBe("hidden thought\nfinal answer")
+  })
+
+  it("copies reasoning recursively through goal runs", () => {
+    const start: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "goal-1",
+      toolName: "update_goal",
+      input: null,
+      state: "input-available",
+    }
+    expect(
+      extractTextFromParts([
+        {
+          type: "goal-run",
+          start,
+          end: null,
+          items: [
+            {
+              type: "reasoning",
+              content: "nested hidden thought",
+              isStreaming: false,
+            },
+          ],
+          isRunning: false,
+        },
+      ])
+    ).toBe("nested hidden thought")
+  })
+})
+
+describe("MessageListView initial history scroll latch", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    initialScrollControllerSpy.mockClear()
+    listScrollToBottom.mockClear()
+    seedHistory()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  const ui = (isActive: boolean, detailLoading: boolean) => (
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <MessageListView
+        conversationId={CID}
+        agentType="codex"
+        connStatus="connected"
+        isActive={isActive}
+        detailLoading={detailLoading}
+        initialHistoryScrollEligible
+        historyLoadComplete
+        showMessageNav={false}
+      />
+    </NextIntlClientProvider>
+  )
+
+  it("uses instant resize once and does not reset for cache switches or reloads", () => {
+    const view = render(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "instant"
+    )
+    expect(
+      screen.getByTestId("finish-initial-history-scroll")
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("finish-initial-history-scroll"))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "smooth"
+    )
+    expect(
+      screen.queryByTestId("finish-initial-history-scroll")
+    ).not.toBeInTheDocument()
+
+    view.rerender(ui(false, false))
+    view.rerender(ui(true, true))
+    view.rerender(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "smooth"
+    )
+    expect(
+      screen.queryByTestId("finish-initial-history-scroll")
+    ).not.toBeInTheDocument()
+
+    view.unmount()
+    render(ui(true, false))
+    expect(screen.getByTestId("message-thread")).toHaveAttribute(
+      "data-resize",
+      "instant"
+    )
+    expect(
+      screen.getByTestId("finish-initial-history-scroll")
+    ).toBeInTheDocument()
+  })
+})
+
 describe("MessageListView live footer isolation", () => {
   beforeEach(() => {
     resetConversationRuntimeStore()
@@ -711,6 +855,24 @@ describe("MessageListView live footer isolation", () => {
       "data-autolink-local-paths",
       "false"
     )
+  })
+
+  it("keeps live activity visible for a hidden thinking-only footer", () => {
+    const message: LiveMessage = {
+      id: "thinking-only",
+      role: "assistant",
+      content: [{ type: "thinking", text: "hidden live thought" }],
+      startedAt: 1,
+    }
+    liveTranscriptStore.rebuild(CID, "c1", message, 1)
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, message, true)
+
+    renderMessageList()
+
+    expect(screen.queryByTestId("live-transcript-row")).not.toBeInTheDocument()
+    expect(screen.getByTestId("live-turn-stats")).toBeInTheDocument()
   })
 })
 

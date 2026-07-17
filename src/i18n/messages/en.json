@@ -517,6 +517,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK Management",
     "description": "Manage Agent SDK connection, enabled state, environment variables, config management and version preflight info in one place.",
+    "showThinking": "Show thinking",
     "loadingAgents": "Loading agent list...",
     "agentList": "Agent List",
     "emptyNoAgent": "No available agent.",
@@ -930,6 +931,7 @@
       "localVersionRemoved": "Local version removed",
       "saveAgentOrderFailed": "Failed to save Agent order",
       "saveAgentSwitchFailed": "Failed to save Agent switch",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "Failed to save environment variables",
       "grokSaved": "Grok config saved",
       "saveGrokNativeFailed": "Failed to save Grok native config",

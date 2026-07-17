@@ -191,7 +191,7 @@ pub async fn create_conversation(
     Json(params): Json<CreateConversationParams>,
 ) -> Result<Json<i32>, AppCommandError> {
     let db = &state.db;
-    let result = conv_commands::create_conversation_core(
+    let created = conv_commands::create_project_conversation_core(
         &db.conn,
         params.folder_id,
         params.agent_type,
@@ -199,8 +199,8 @@ pub async fn create_conversation(
         params.delegation_route_override,
     )
     .await?;
-    conv_commands::emit_conversation_upsert(&state.emitter, &db.conn, result).await;
-    Ok(Json(result))
+    conv_commands::emit_project_conversation_created(&state.emitter, &db.conn, &created).await;
+    Ok(Json(created.conversation_id))
 }
 
 #[derive(Deserialize)]

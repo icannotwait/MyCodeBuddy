@@ -223,6 +223,7 @@ export interface TabContextValue {
     options?: {
       inheritFromActive?: boolean
       folderDefaultAgent?: TabItem["agentType"] | null
+      folderRecentAgent?: TabItem["agentType"] | null
     }
   ) => void
   openChatModeTab: () => void

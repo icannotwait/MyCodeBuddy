@@ -959,6 +959,21 @@ pub(crate) async fn emit_conversation_upsert(
     }
 }
 
+/// Shared post-create broadcast for the normal project create path: conversation
+/// upsert always, plus a folder upsert carrying the fresh recency-updated
+/// [`FolderDetail`] when the recency write succeeded. No folder event when
+/// recency write failed — refresh/reconnect is the backstop.
+pub(crate) async fn emit_project_conversation_created(
+    emitter: &EventEmitter,
+    conn: &sea_orm::DatabaseConnection,
+    created: &ProjectConversationCreateResult,
+) {
+    emit_conversation_upsert(emitter, conn, created.conversation_id).await;
+    if let Some(folder) = created.updated_folder.clone() {
+        crate::commands::folders::emit_folder_upsert(emitter, folder);
+    }
+}
+
 /// Emit a `conversation://changed` Deleted for `conversation_id` so every
 /// client removes the row. No re-fetch: the row is already soft-deleted.
 pub(crate) fn emit_conversation_deleted(emitter: &EventEmitter, conversation_id: i32) {
@@ -1034,6 +1049,9 @@ pub(crate) async fn cleanup_tabs_for_deleted_conversation(
 /// Core logic for creating a conversation with git branch detection.
 /// Shared by both the Tauri command and the web handler.
 ///
+/// Generic non-recording primitive: automations, tests, and non-project paths
+/// must continue using this so they never touch folder recency.
+///
 /// `delegation_route_override` is persisted on the same INSERT. A non-null
 /// value is rejected for unmanaged Agent types
 /// ([`crate::acp::delegation::route::is_managed_agent`]).
@@ -1075,6 +1093,51 @@ pub async fn create_conversation_core(
     Ok(model.id)
 }
 
+/// Result of a normal project conversation create: the new conversation id plus
+/// the folder detail refreshed after a successful recency write (or `None` when
+/// the warning-only recency write failed / was skipped).
+#[derive(Debug, Clone)]
+pub struct ProjectConversationCreateResult {
+    pub conversation_id: i32,
+    pub updated_folder: Option<FolderDetail>,
+}
+
+/// Normal project create: insert the conversation first, then best-effort write
+/// folder last-agent recency. Recency failure is warning-only so clients do not
+/// retry-create and duplicate conversations. Last successful DB write wins.
+pub async fn create_project_conversation_core(
+    conn: &sea_orm::DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+) -> Result<ProjectConversationCreateResult, AppCommandError> {
+    let conversation_id = create_conversation_core(
+        conn,
+        folder_id,
+        agent_type,
+        title,
+        delegation_route_override,
+    )
+    .await?;
+    let updated_folder =
+        match folder_service::update_folder_last_agent(conn, folder_id, agent_type).await {
+            Ok(folder) => folder,
+            Err(error) => {
+                tracing::warn!(
+                    "[conversations] created {conversation_id}, but failed to update \
+                     folder {folder_id} recent agent: {error}"
+                );
+                None
+            }
+        };
+
+    Ok(ProjectConversationCreateResult {
+        conversation_id,
+        updated_folder,
+    })
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn create_conversation(
@@ -1085,7 +1148,7 @@ pub async fn create_conversation(
     title: Option<String>,
     delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<i32, AppCommandError> {
-    let id = create_conversation_core(
+    let created = create_project_conversation_core(
         &db.conn,
         folder_id,
         agent_type,
@@ -1093,8 +1156,8 @@ pub async fn create_conversation(
         delegation_route_override,
     )
     .await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, id).await;
-    Ok(id)
+    emit_project_conversation_created(&EventEmitter::Tauri(app), &db.conn, &created).await;
+    Ok(created.conversation_id)
 }
 
 /// Result of [`create_chat_conversation_core`]: the new conversation id plus the
@@ -3860,5 +3923,163 @@ mod tests {
             saw_parent_upsert,
             "parent must re-broadcast an Upsert for child_count convergence"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Project Last Agent Recall — normal project create records recency only
+    // after a successful insert; generic create / failed insert do not.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn project_create_records_only_after_insert_and_last_write_wins() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-project-agent").await;
+
+        let first = create_project_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("first".to_string()),
+            None,
+        )
+        .await
+        .expect("first project create");
+        assert!(first.conversation_id > 0);
+        assert_eq!(
+            first
+                .updated_folder
+                .as_ref()
+                .and_then(|folder| folder.last_agent_type),
+            Some(AgentType::ClaudeCode)
+        );
+
+        let second = create_project_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("second".to_string()),
+            None,
+        )
+        .await
+        .expect("second project create");
+        assert!(second.conversation_id > first.conversation_id);
+        let folder = folder_service::get_folder_by_id(&db.conn, folder_id)
+            .await
+            .expect("read folder")
+            .expect("folder");
+        assert_eq!(folder.last_agent_type, Some(AgentType::Codex));
+        assert_eq!(folder.default_agent_type, None);
+    }
+
+    #[tokio::test]
+    async fn project_create_succeeds_when_recency_write_fails() {
+        use sea_orm::ConnectionTrait;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-project-agent-write-fail").await;
+        db.conn
+            .execute_unprepared(
+                "CREATE TRIGGER reject_last_agent_update \
+                 BEFORE UPDATE OF last_agent_type ON folder \
+                 BEGIN SELECT RAISE(FAIL, 'forced recency failure'); END",
+            )
+            .await
+            .expect("install update trigger");
+
+        let created =
+            create_project_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
+                .await
+                .expect("conversation creation must remain successful");
+
+        assert!(created.conversation_id > 0);
+        assert!(created.updated_folder.is_none());
+        let summary = conversation_service::get_by_id(&db.conn, created.conversation_id)
+            .await
+            .expect("conversation was inserted");
+        assert_eq!(summary.agent_type, AgentType::Codex);
+    }
+
+    #[tokio::test]
+    async fn failed_project_insert_does_not_change_recency() {
+        use sea_orm::ConnectionTrait;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-project-agent-insert-fail").await;
+        folder_service::update_folder_last_agent(&db.conn, folder_id, AgentType::ClaudeCode)
+            .await
+            .expect("seed recency");
+        db.conn
+            .execute_unprepared(
+                "CREATE TRIGGER reject_conversation_insert \
+                 BEFORE INSERT ON conversation \
+                 BEGIN SELECT RAISE(FAIL, 'forced insert failure'); END",
+            )
+            .await
+            .expect("install insert trigger");
+
+        let result =
+            create_project_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
+                .await;
+        assert!(result.is_err());
+
+        let folder = folder_service::get_folder_by_id(&db.conn, folder_id)
+            .await
+            .expect("read folder")
+            .expect("folder");
+        assert_eq!(folder.last_agent_type, Some(AgentType::ClaudeCode));
+    }
+
+    #[tokio::test]
+    async fn generic_create_does_not_record_project_recency() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-non-project-create").await;
+        folder_service::update_folder_last_agent(&db.conn, folder_id, AgentType::ClaudeCode)
+            .await
+            .expect("seed recency");
+
+        create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
+            .await
+            .expect("generic create");
+
+        let folder = folder_service::get_folder_by_id(&db.conn, folder_id)
+            .await
+            .expect("read folder")
+            .expect("folder");
+        assert_eq!(folder.last_agent_type, Some(AgentType::ClaudeCode));
+    }
+
+    #[tokio::test]
+    async fn project_create_emits_conversation_and_fresh_folder_upserts() {
+        use crate::web::event_bridge::{
+            WebEventBroadcaster, CONVERSATION_CHANGED_EVENT, FOLDER_CHANGED_EVENT,
+        };
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-project-create-events").await;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let mut rx = broadcaster.subscribe();
+        let created =
+            create_project_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
+                .await
+                .expect("project create");
+
+        emit_project_conversation_created(&emitter, &db.conn, &created).await;
+
+        let events = [
+            rx.try_recv().expect("first upsert"),
+            rx.try_recv().expect("second upsert"),
+        ];
+        assert!(events
+            .iter()
+            .any(|event| event.channel == CONVERSATION_CHANGED_EVENT));
+        let folder_event = events
+            .iter()
+            .find(|event| event.channel == FOLDER_CHANGED_EVENT)
+            .expect("folder upsert");
+        assert_eq!(folder_event.payload["kind"], "upsert");
+        assert_eq!(folder_event.payload["folder"]["id"], folder_id);
+        assert_eq!(folder_event.payload["folder"]["last_agent_type"], "codex");
     }
 }

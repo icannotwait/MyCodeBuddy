@@ -109,6 +109,7 @@ function makeFolder(
     path: `/repo/folder-${overrides.id}`,
     git_branch: null,
     default_agent_type: null,
+    last_agent_type: null,
     last_opened_at: "2026-01-01T00:00:00.000Z",
     sort_order: overrides.id,
     color: "inherit",
@@ -385,6 +386,22 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
     expect(screen.getByTestId("folder-ids")).toHaveTextContent("12")
     expect(screen.getByTestId("all-folder-ids")).toHaveTextContent("12")
+  })
+
+  it("updates recent agent in both folder lists from a folder upsert", async () => {
+    await mountProvider()
+    emitFolder({
+      kind: "upsert",
+      folder: makeFolder({ id: 12, last_agent_type: "gemini" }),
+    })
+
+    const state = useAppWorkspaceStore.getState()
+    expect(
+      state.folders.find((folder) => folder.id === 12)?.last_agent_type
+    ).toBe("gemini")
+    expect(
+      state.allFolders.find((folder) => folder.id === 12)?.last_agent_type
+    ).toBe("gemini")
   })
 
   it("replaces an existing folder in place on a repeat upsert", async () => {

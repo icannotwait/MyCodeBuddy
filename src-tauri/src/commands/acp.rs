@@ -6602,6 +6602,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             available,
             distribution_type: dist_type.to_string(),
             enabled: setting.map(|m| m.enabled).unwrap_or(true),
+            show_thinking: setting.map(|model| model.show_thinking).unwrap_or(false),
             sort_order,
             installed_version: local_installed_version,
             env,
@@ -6739,6 +6740,43 @@ pub(crate) async fn acp_update_agent_preferences_core(
     persist_agent_local_config_json(agent_type, Some(local_patch_json.as_str()))?;
     emit_acp_agents_updated(emitter, "preferences_updated", Some(agent_type));
     Ok(())
+}
+
+pub(crate) async fn acp_update_agent_display_preferences_core(
+    agent_type: AgentType,
+    show_thinking: bool,
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+) -> Result<(), AcpError> {
+    let default = agent_setting_service::AgentDefaultInput {
+        agent_type,
+        registry_id: registry::registry_id_for(agent_type).to_string(),
+        default_sort_order: i32::MAX / 2,
+    };
+    agent_setting_service::ensure_defaults(&db.conn, &[default])
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    agent_setting_service::update_show_thinking(&db.conn, agent_type, show_thinking)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    emit_acp_agents_updated(
+        emitter,
+        "display_preferences_updated",
+        Some(agent_type),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_update_agent_display_preferences(
+    agent_type: AgentType,
+    show_thinking: bool,
+    db: State<'_, AppDatabase>,
+    app: tauri::AppHandle,
+) -> Result<(), AcpError> {
+    let emitter = EventEmitter::Tauri(app);
+    acp_update_agent_display_preferences_core(agent_type, show_thinking, &db, &emitter).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -8497,6 +8535,39 @@ pub(crate) async fn codex_poll_device_code_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn display_preferences_update_projection_and_emit() {
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::web::event_bridge::WebEventBroadcaster;
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let mut rx = broadcaster.subscribe();
+
+        acp_update_agent_display_preferences_core(
+            AgentType::Codex,
+            true,
+            &db,
+            &emitter,
+        )
+        .await
+        .expect("update display preference");
+
+        let agents = acp_list_agents_core(&db).await.expect("list agents");
+        let codex = agents
+            .iter()
+            .find(|agent| agent.agent_type == AgentType::Codex)
+            .expect("codex projection");
+        assert!(codex.show_thinking);
+
+        let event = rx.try_recv().expect("agents-updated event");
+        assert_eq!(event.channel, ACP_AGENTS_UPDATED_EVENT);
+        assert_eq!(event.payload["reason"], "display_preferences_updated");
+        assert_eq!(event.payload["agent_type"], "codex");
+    }
 
     #[test]
     fn parse_grok_settings_reads_documented_keys() {

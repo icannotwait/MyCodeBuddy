@@ -562,6 +562,7 @@ pub struct AcpAgentInfo {
     pub available: bool,
     pub distribution_type: String,
     pub enabled: bool,
+    pub show_thinking: bool,
     pub sort_order: i32,
     pub installed_version: Option<String>,
     pub env: BTreeMap<String, String>,

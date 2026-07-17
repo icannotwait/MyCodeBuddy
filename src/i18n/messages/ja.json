@@ -972,7 +972,8 @@
       "piBinaryInstallFailed": "pi のインストールに失敗しました",
       "piBinaryUninstalled": "pi をアンインストールしました",
       "piBinaryUninstallFailed": "pi のアンインストールに失敗しました",
-      "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました"
+      "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "バージョン状態",
@@ -1061,7 +1062,8 @@
       "trustDescription": "codeg が pi をフォルダーに接続する際、そのフォルダーを信頼済みとして登録し、別途の確認なしにプロジェクトのローカル設定とスキルを読み込めるようにします。",
       "trustHint": "信頼されるのはここで開いたフォルダーのみで、マシン全体ではありません。また影響するのは設定の読み込みだけで、pi が実行できる内容には影響しません。",
       "configDirSkillsNote": "カスタム設定ディレクトリを指定すると、設定画面で管理するスキル・エキスパート・オフィスツールはこの pi に適用されません。スキルはそのフォルダー内で直接管理してください。"
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "エージェント設定を読み込み中...",

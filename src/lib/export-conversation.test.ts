@@ -108,6 +108,24 @@ function makeData(): ExportConversationData {
   }
 }
 
+function makeDataWithThinking(): ExportConversationData {
+  const data = makeData()
+  return {
+    ...data,
+    turns: [
+      {
+        id: "thinking-turn",
+        role: "assistant",
+        blocks: [
+          { type: "thinking", text: "hidden thought" },
+          { type: "text", text: "visible answer" },
+        ],
+        timestamp: "2026-05-27T00:00:00Z",
+      },
+    ],
+  }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
 })
@@ -213,6 +231,29 @@ describe("exportAsHtml", () => {
       { name: "HTML", extensions: ["html"] },
     ])
     expect(mockInvoke.mock.calls[0][0]).toBe("save_text_file")
+  })
+})
+
+describe("canonical thinking in export", () => {
+  it("keeps canonical thinking in Markdown, HTML, and image export source", async () => {
+    mockIsDesktop.mockReturnValue(true)
+    mockSave.mockResolvedValue("/Users/me/out.md")
+    mockInvoke.mockResolvedValue(undefined)
+
+    await exportAsMarkdown(makeDataWithThinking())
+    const markdown = (mockInvoke.mock.calls[0][1] as { contents: string })
+      .contents
+    expect(markdown).toContain("> hidden thought")
+
+    mockSave.mockResolvedValue("/Users/me/out.html")
+    mockInvoke.mockClear()
+    await exportAsHtml(makeDataWithThinking())
+    const html = (mockInvoke.mock.calls[0][1] as { contents: string }).contents
+    expect(html).toContain(
+      '<blockquote class="thinking">hidden thought</blockquote>'
+    )
+    // `exportAsImage` consumes this same `buildHtmlDocument` output before
+    // rasterization, so this assertion locks both HTML and image source data.
   })
 })
 

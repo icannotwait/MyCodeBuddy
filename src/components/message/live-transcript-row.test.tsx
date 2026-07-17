@@ -217,12 +217,13 @@ function publishToolAppend(
   })
 }
 
-function renderRow(onToolRender?: (id: string) => void) {
+function renderRow(onToolRender?: (id: string) => void, showThinking = true) {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <LiveTranscriptRow
         conversationId={CID}
         agentType="codex"
+        showThinking={showThinking}
         onToolRender={onToolRender}
       />
     </NextIntlClientProvider>
@@ -236,6 +237,35 @@ describe("LiveTranscriptRow", () => {
 
   afterEach(() => {
     __resetLiveTranscriptStoreForTests()
+  })
+
+  it("does not mount a thinking segment when visibility is off", () => {
+    const message: LiveMessage = {
+      id: "thinking-only",
+      role: "assistant",
+      content: [{ type: "thinking", text: "hidden live thought" }],
+      startedAt: 1,
+    }
+    liveTranscriptStore.rebuild(CID, "c1", message, 1)
+    renderRow(undefined, false)
+    expect(screen.queryByTestId("reasoning")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("live-transcript-row")).not.toBeInTheDocument()
+  })
+
+  it("keeps tools visible when a thinking segment is hidden", () => {
+    const message: LiveMessage = {
+      id: "thinking-and-tool",
+      role: "assistant",
+      content: [
+        { type: "thinking", text: "hidden live thought" },
+        { type: "tool_call", info: tool("visible-tool") },
+      ],
+      startedAt: 1,
+    }
+    liveTranscriptStore.rebuild(CID, "c1", message, 2)
+    renderRow(undefined, false)
+    expect(screen.queryByTestId("reasoning")).not.toBeInTheDocument()
+    expect(screen.getByTestId("tool-part-visible-tool")).toBeInTheDocument()
   })
 
   it("shows a typing indicator when the live snapshot has no segments yet", () => {

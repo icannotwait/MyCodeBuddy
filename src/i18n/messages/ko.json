@@ -972,7 +972,8 @@
       "piBinaryInstallFailed": "pi 설치 실패",
       "piBinaryUninstalled": "pi 제거됨",
       "piBinaryUninstallFailed": "pi 제거 실패",
-      "savePiTrustFailed": "작업 공간 신뢰 저장 실패"
+      "savePiTrustFailed": "작업 공간 신뢰 저장 실패",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "버전 상태",
@@ -1061,7 +1062,8 @@
       "trustDescription": "DrawCode가 pi를 폴더에 연결할 때 해당 폴더를 신뢰됨으로 표시하여 pi가 별도 확인 없이 프로젝트의 로컬 설정과 스킬을 로드하도록 합니다.",
       "trustHint": "여기서 여는 폴더만 신뢰되며 전체 컴퓨터는 신뢰되지 않습니다. 또한 설정 로드에만 영향을 주며 pi가 실행할 수 있는 작업에는 영향을 주지 않습니다.",
       "configDirSkillsNote": "사용자 지정 구성 디렉터리를 설정하면 설정에서 관리하는 스킬, 전문가, 오피스 도구가 이 pi에 적용되지 않습니다. 해당 폴더에서 스킬을 직접 관리하세요."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "에이전트 설정을 불러오는 중...",

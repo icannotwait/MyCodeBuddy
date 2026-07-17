@@ -300,7 +300,7 @@ function SubAgentSessionBody({
 
   // Reader only — its built-in auto-fetch is disabled; the effect above is
   // the sole fetch path.
-  const { loading, error, acpLoadError } = useConversationDetail(
+  const { detail, loading, error, acpLoadError } = useConversationDetail(
     childConversationId,
     { enabled: false }
   )
@@ -385,6 +385,8 @@ function SubAgentSessionBody({
           acpLoadError={acpLoadError}
           hideEmptyState={false}
           showMessageNav={false}
+          initialHistoryScrollEligible
+          historyLoadComplete={detail != null}
         />
       </div>
     </div>

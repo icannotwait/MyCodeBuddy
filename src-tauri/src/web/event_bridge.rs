@@ -645,6 +645,7 @@ mod tests {
                     path: "/home/me/repo".to_string(),
                     git_branch: Some("main".to_string()),
                     default_agent_type: None,
+                    last_agent_type: None,
                     last_opened_at: chrono::Utc::now(),
                     sort_order: 0,
                     color: "inherit".to_string(),

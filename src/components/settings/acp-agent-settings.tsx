@@ -131,6 +131,7 @@ import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
+import { AgentThinkingVisibilitySwitch } from "./agent-thinking-visibility-switch"
 
 interface AgentCheckState {
   result?: PreflightResult
@@ -4795,6 +4796,19 @@ export function AcpAgentSettings() {
     pendingOrderRef.current = reordered.map((agent) => agent.agent_type)
   }, [])
 
+  const handleThinkingVisibilityChange = useCallback(
+    (agentType: AgentType, showThinking: boolean) => {
+      setAgents((current) =>
+        current.map((agent) =>
+          agent.agent_type === agentType
+            ? { ...agent, show_thinking: showThinking }
+            : agent
+        )
+      )
+    },
+    []
+  )
+
   const renderCheck = (agent: AcpAgentInfo, check: UiCheckItem) => {
     const checkKey = `${agent.agent_type}:${check.check_id}`
     const expanded = expandedChecks[checkKey] ?? check.status !== "pass"
@@ -7198,6 +7212,11 @@ export function AcpAgentSettings() {
                 <p className="mt-2 text-xs text-muted-foreground">
                   {selectedAgent.description}
                 </p>
+                <AgentThinkingVisibilitySwitch
+                  agentType={selectedAgent.agent_type}
+                  checked={selectedAgent.show_thinking}
+                  onCheckedChange={handleThinkingVisibilityChange}
+                />
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 space-y-4">

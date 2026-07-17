@@ -34,6 +34,7 @@ vi.mock("@/components/ai-elements/message", () => ({
       {children}
     </div>
   ),
+  normalizeMathDelimiters: (children: React.ReactNode) => children,
 }))
 
 vi.mock("@/components/ai-elements/terminal", () => ({
@@ -341,5 +342,45 @@ describe("ContentPartsRenderer local-path autolink scope", () => {
       "data-autolink-local-paths",
       "true"
     )
+  })
+})
+
+describe("ContentPartsRenderer thinking visibility", () => {
+  it("omits reasoning when showThinking is false", () => {
+    const reasoning: AdaptedContentPart = {
+      type: "reasoning",
+      content: "private chain",
+      isStreaming: false,
+    }
+    wrap(<ContentPartsRenderer parts={[reasoning]} showThinking={false} />)
+    expect(screen.queryByText("private chain")).not.toBeInTheDocument()
+  })
+
+  it("omits reasoning nested in a goal run", () => {
+    const start: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "goal-1",
+      toolName: "update_goal",
+      input: null,
+      state: "input-available",
+    }
+    const goalRun: AdaptedContentPart = {
+      type: "goal-run",
+      start,
+      end: null,
+      items: [
+        {
+          type: "reasoning",
+          content: "nested private chain",
+          isStreaming: false,
+        },
+        { type: "text", text: "visible result" },
+      ],
+      isRunning: false,
+    }
+    wrap(<ContentPartsRenderer parts={[goalRun]} showThinking={false} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.queryByText("nested private chain")).not.toBeInTheDocument()
+    expect(screen.getByText("visible result")).toBeInTheDocument()
   })
 })

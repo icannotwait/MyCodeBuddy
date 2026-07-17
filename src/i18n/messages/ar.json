@@ -972,7 +972,8 @@
       "piBinaryInstallFailed": "فشل تثبيت pi",
       "piBinaryUninstalled": "تم إلغاء تثبيت pi",
       "piBinaryUninstallFailed": "فشل إلغاء تثبيت pi",
-      "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل"
+      "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "حالة الإصدار",
@@ -1061,7 +1062,8 @@
       "trustDescription": "عندما يربط codeg أداة pi بمجلد، يضع علامة موثوق على ذلك المجلد ليحمّل pi إعدادات المشروع المحلية ومهاراته دون تأكيد منفصل.",
       "trustHint": "يُوثَق فقط بالمجلدات التي تفتحها هنا، وليس جهازك بالكامل، كما أن ذلك يؤثر على تحميل الإعدادات فقط، لا على ما يُسمح لـ pi بتشغيله.",
       "configDirSkillsNote": "عند تحديد دليل إعدادات مخصص، لن تنطبق المهارات والخبراء وأدوات المكتب المُدارة في الإعدادات على pi هذا — أدِر مهاراته مباشرةً في ذلك المجلد."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",

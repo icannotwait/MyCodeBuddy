@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -216,6 +218,8 @@ vi.mock("@/components/message/message-list-view", () => ({
       data-has-on-reload={String(props.onReload !== undefined)}
       data-has-on-new-session={String(props.onNewSession !== undefined)}
       data-has-send-signal={String(props.sendSignal !== undefined)}
+      data-initial-history-scroll={String(props.initialHistoryScrollEligible)}
+      data-history-load-complete={String(props.historyLoadComplete)}
       data-conn-status={
         props.connStatus === null || props.connStatus === undefined
           ? "null"
@@ -454,6 +458,10 @@ describe("SubAgentSessionDialog", () => {
     // isActive=false suppresses session-stats side effects on the active panel.
     expect(list).toHaveAttribute("data-is-active", "false")
     expect(list).toHaveAttribute("data-conversation-id", "99")
+    // Uncached body opts into initial history scroll; detail mock starts null
+    // so historyLoadComplete is false until a successful load retains detail.
+    expect(list).toHaveAttribute("data-initial-history-scroll", "true")
+    expect(list).toHaveAttribute("data-history-load-complete", "false")
   })
 
   it("bridges conn.liveMessage to setLiveMessage while open and clears the runtime session on close", () => {
@@ -832,5 +840,35 @@ describe("SubAgentSessionDialog", () => {
     const closeButton = screen.getByRole("button", { name: /close/i })
     fireEvent.click(closeButton)
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+})
+
+describe("SubAgentSessionBody initial history identity", () => {
+  const source = readFileSync(
+    resolve(
+      process.cwd(),
+      "src/components/message/sub-agent-session-dialog.tsx"
+    ),
+    "utf8"
+  )
+
+  it("opts in with literal true and gates readiness on detail retention", () => {
+    expect(source).toContain("initialHistoryScrollEligible")
+    expect(source).toContain("historyLoadComplete={detail != null}")
+    // Literal boolean prop (true), not the mount-time hook — each body open is
+    // an uncached viewer and is always eligible for one initialization pass.
+    expect(source).not.toContain("useInitialHistoryScrollEligibility")
+  })
+
+  it("remounts the body only when the dialog opens (no separate scroll impl)", () => {
+    // Conditional body mount: close/reopen creates a new eligible viewer.
+    expect(source).toMatch(/\{open \? \([\s\S]*?<SubAgentSessionBody/)
+    // No key={childConversationId}: if the id changed while open, React would
+    // reuse the instance. That is fine for eligibility (literal true) and
+    // historyLoadComplete tracks the new detail via the hook re-render.
+    const bodyOpen = source.indexOf("<SubAgentSessionBody")
+    const bodyClose = source.indexOf("/>", bodyOpen)
+    const bodyJsx = source.slice(bodyOpen, bodyClose)
+    expect(bodyJsx).not.toContain("key=")
   })
 })

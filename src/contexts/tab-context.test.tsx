@@ -69,10 +69,15 @@ vi.mock("@/contexts/acp-connections-context", () => ({
   }),
 }))
 
+const agentRegistryMock = vi.hoisted(() => ({
+  sortedTypes: ["codex"] as AgentType[],
+  fresh: true,
+}))
+
 vi.mock("@/hooks/use-sorted-available-agents", () => ({
   useSortedAvailableAgents: () => ({
-    sortedTypes: ["codex" satisfies AgentType],
-    fresh: true,
+    sortedTypes: agentRegistryMock.sortedTypes,
+    fresh: agentRegistryMock.fresh,
   }),
 }))
 
@@ -90,6 +95,7 @@ const defaultFoldersMock: FolderDetail[] = [
     path: "/repo",
     git_branch: null,
     default_agent_type: "codex",
+    last_agent_type: null,
     last_opened_at: "2026-05-24T00:00:00Z",
     sort_order: 0,
     color: "blue",
@@ -102,6 +108,7 @@ const defaultFoldersMock: FolderDetail[] = [
     path: "/other",
     git_branch: null,
     default_agent_type: "codex",
+    last_agent_type: null,
     last_opened_at: "2026-05-24T00:00:00Z",
     sort_order: 1,
     color: "green",
@@ -235,6 +242,8 @@ function openConversationTab(
 describe("TabProvider tab state transitions", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    agentRegistryMock.sortedTypes = ["codex"]
+    agentRegistryMock.fresh = true
     seedWorkspaceStore()
     listOpenedTabsMock.mockReturnValue(new Promise(() => {}))
     saveOpenedTabsMock.mockResolvedValue({
@@ -411,6 +420,7 @@ describe("TabProvider tab state transitions", () => {
       path: "/data/chat-sessions/x",
       git_branch: null,
       default_agent_type: null,
+      last_agent_type: null,
       last_opened_at: "2026-06-11T00:00:00Z",
       sort_order: 99,
       color: "inherit",
@@ -444,6 +454,7 @@ describe("TabProvider tab state transitions", () => {
       path: "/data/chat-sessions/x",
       git_branch: null,
       default_agent_type: null,
+      last_agent_type: null,
       last_opened_at: "2026-06-11T00:00:00Z",
       sort_order: 99,
       color: "inherit",
@@ -521,6 +532,31 @@ describe("TabProvider tab state transitions", () => {
     const draft = latestContext?.tabs.find((tab) => tab.id === activeId)
     expect(draft?.folderId).toBe(999)
     expect(draft?.agentType).toBe("claude_code")
+  })
+
+  it("uses the folder recent agent for a normal new draft", () => {
+    agentRegistryMock.sortedTypes = ["codex", "gemini"]
+    const recentFolder: FolderDetail = {
+      ...defaultFoldersMock[0],
+      default_agent_type: null,
+      last_agent_type: "gemini",
+    }
+    useAppWorkspaceStore.setState({
+      folders: [recentFolder],
+      allFolders: [recentFolder],
+    })
+    renderTabs()
+
+    act(() => {
+      latestContext?.openNewConversationTab(recentFolder.id, recentFolder.path)
+    })
+
+    const draft = latestContext?.tabs.find(
+      (tab) => tab.id === latestContext?.activeTabId
+    )
+    expect(draft?.conversationId).toBeNull()
+    expect(draft?.agentType).toBe("gemini")
+    expect(draft?.agentTypeProvisional).toBe(false)
   })
 
   it("activates an opened tab when another tab update is already queued", () => {

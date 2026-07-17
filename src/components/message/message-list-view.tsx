@@ -26,6 +26,7 @@ import type {
   LiveContentBlock,
   LiveMessage,
 } from "@/contexts/acp-connections-context"
+import { useAgentThinkingVisibility } from "@/hooks/use-acp-agents"
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import { LiveTranscriptRow } from "./live-transcript-row"
 import {
@@ -99,6 +100,7 @@ import {
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
+import { InitialHistoryScrollController } from "./initial-history-scroll-controller"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
@@ -130,6 +132,10 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
+  /** Immutable mount-time eligibility supplied by the owning conversation view. */
+  initialHistoryScrollEligible?: boolean
+  /** True only after a persisted detail payload has loaded successfully. */
+  historyLoadComplete?: boolean
 }
 
 export function canReloadSessionLoadError(
@@ -257,8 +263,10 @@ function collectDelegationSources(
 
 const CollapsibleSystemMessage = memo(function CollapsibleSystemMessage({
   group,
+  showThinking,
 }: {
   group: ResolvedMessageGroup
+  showThinking: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const t = useTranslations("Folder.chat.messageList")
@@ -282,7 +290,11 @@ const CollapsibleSystemMessage = memo(function CollapsibleSystemMessage({
       {expanded && (
         <div className="px-3 pb-3 border-t border-yellow-500/20">
           <div className="text-sm text-muted-foreground mt-2.5 max-h-96 overflow-auto">
-            <ContentPartsRenderer parts={group.parts} role={group.role} />
+            <ContentPartsRenderer
+              parts={group.parts}
+              role={group.role}
+              showThinking={showThinking}
+            />
           </div>
         </div>
       )}
@@ -290,11 +302,12 @@ const CollapsibleSystemMessage = memo(function CollapsibleSystemMessage({
   )
 })
 
-function extractTextFromParts(parts: AdaptedContentPart[]): string {
+export function extractTextFromParts(parts: AdaptedContentPart[]): string {
   return parts
-    .flatMap((p): string[] => {
-      if (p.type === "text") return [p.text]
-      if (p.type === "goal-run") return [extractTextFromParts(p.items)]
+    .flatMap((part): string[] => {
+      if (part.type === "text") return [part.text]
+      if (part.type === "reasoning") return [part.content]
+      if (part.type === "goal-run") return [extractTextFromParts(part.items)]
       return []
     })
     .filter((text) => text.length > 0)
@@ -504,6 +517,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   isResponseComplete = true,
   sourceTurns,
   renderKind = "historicalRow",
+  showThinking = true,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
@@ -512,10 +526,13 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   isResponseComplete?: boolean
   sourceTurns?: MessageTurn[]
   renderKind?: "historicalRow" | "liveRow"
+  showThinking?: boolean
 }) {
   streamingPerfRecorder.countRender(renderKind)
   if (group.role === "system") {
-    return <CollapsibleSystemMessage group={group} />
+    return (
+      <CollapsibleSystemMessage group={group} showThinking={showThinking} />
+    )
   }
 
   return (
@@ -528,7 +545,11 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
-              <ContentPartsRenderer parts={group.parts} role={group.role} />
+              <ContentPartsRenderer
+                parts={group.parts}
+                role={group.role}
+                showThinking={showThinking}
+              />
             </MessageContent>
           </div>
         ) : (
@@ -539,6 +560,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
               autolinkLocalPathParts={
                 isResponseComplete ? group.autolinkableTextParts : undefined
               }
+              showThinking={showThinking}
             />
           </MessageContent>
         )}
@@ -843,12 +865,23 @@ export function MessageListView({
   onReload,
   onNewSession,
   showMessageNav = true,
+  initialHistoryScrollEligible = false,
+  historyLoadComplete = false,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
   const useIncrementalLive = useStreamingPerformanceFlag(
     "incremental_live_transcript"
   )
+  const showThinking = useAgentThinkingVisibility(agentType)
+
+  // One-shot latch: initialized once from mount-time eligibility; only the
+  // controller clears it. Later prop changes never re-arm this state.
+  const [initialHistoryScrollPending, setInitialHistoryScrollPending] =
+    useState(() => initialHistoryScrollEligible)
+  const finishInitialHistoryScroll = useCallback(() => {
+    setInitialHistoryScrollPending(false)
+  }, [])
 
   // Compatibility `selectTimelineTurns` allocates a new outer array whenever a
   // live message is present. Zustand v5's getSnapshot must return a stable
@@ -1087,9 +1120,10 @@ export function MessageListView({
       <LiveTranscriptRow
         conversationId={conversationId}
         agentType={agentType}
+        showThinking={showThinking}
       />
     )
-  }, [showLiveFooter, conversationId, agentType])
+  }, [showLiveFooter, conversationId, agentType, showThinking])
 
   const historicalPlanEntries = useMemo(
     () => extractLatestPlanEntriesFromMessages(nonStreamingAdapted),
@@ -1100,32 +1134,36 @@ export function MessageListView({
     [historicalPlanEntries]
   )
 
-  const renderThreadItem = useCallback((item: ThreadRenderItem) => {
-    switch (item.kind) {
-      case "turn": {
-        const pt = item.isRoleTransition ? 16 : 0
-        return (
-          <div style={pt > 0 ? { paddingTop: pt } : undefined}>
-            <HistoricalMessageGroup
-              group={item.group}
-              dimmed={item.phase === "optimistic"}
-              showStats={item.showStats}
-              previousUserIndex={item.previousUserIndex}
-              isResponseComplete={item.phase === "persisted"}
-              sourceTurns={item.sourceTurns}
-              renderKind={
-                item.phase === "streaming" ? "liveRow" : "historicalRow"
-              }
-            />
-          </div>
-        )
+  const renderThreadItem = useCallback(
+    (item: ThreadRenderItem) => {
+      switch (item.kind) {
+        case "turn": {
+          const pt = item.isRoleTransition ? 16 : 0
+          return (
+            <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+              <HistoricalMessageGroup
+                group={item.group}
+                dimmed={item.phase === "optimistic"}
+                showStats={item.showStats}
+                previousUserIndex={item.previousUserIndex}
+                isResponseComplete={item.phase === "persisted"}
+                sourceTurns={item.sourceTurns}
+                renderKind={
+                  item.phase === "streaming" ? "liveRow" : "historicalRow"
+                }
+                showThinking={showThinking}
+              />
+            </div>
+          )
+        }
+        case "typing":
+          return <PendingTypingIndicator />
+        default:
+          return null
       }
-      case "typing":
-        return <PendingTypingIndicator />
-      default:
-        return null
-    }
-  }, [])
+    },
+    [showThinking]
+  )
 
   const emptyState = useMemo(
     () =>
@@ -1304,6 +1342,10 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
+  const hasPersistedHistoryRows = threadItems.some(
+    (item) => item.kind === "turn" && item.phase === "persisted"
+  )
+
   const hasRenderableContent =
     threadItems.length > 0 ||
     Boolean(liveMessage) ||
@@ -1384,8 +1426,18 @@ export function MessageListView({
     <div className="relative flex h-full min-h-0 flex-col">
       <MessageThread
         className="flex-1 min-h-0"
-        resize={hasLiveTranscript ? "instant" : "smooth"}
+        resize={
+          hasLiveTranscript || initialHistoryScrollPending
+            ? "instant"
+            : "smooth"
+        }
       >
+        <InitialHistoryScrollController
+          pending={initialHistoryScrollPending}
+          historyReady={historyLoadComplete}
+          hasHistoryRows={hasPersistedHistoryRows}
+          onFinish={finishInitialHistoryScroll}
+        />
         <AutoScrollOnSend signal={sendSignal} />
         <VirtualizedMessageThread
           items={threadItems}

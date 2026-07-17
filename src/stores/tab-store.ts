@@ -160,6 +160,7 @@ export interface TabStoreState {
     options?: {
       inheritFromActive?: boolean
       folderDefaultAgent?: AgentType | null
+      folderRecentAgent?: AgentType | null
     }
   ) => void
   openChatModeTab: () => void
@@ -413,21 +414,30 @@ function recomputeTabs() {
 
 /** Pick the agent + provisional flag for a new draft tab. Wraps the pure
  *  `resolveDefaultAgent` helper with tab-store-scoped lookups (folder default
- *  from the live app-workspace store, latest sorted types, fresh flag). */
+ *  and recent agent from the live app-workspace store, latest sorted types,
+ *  fresh flag). */
 function resolveAgentForFolder(
   folderId: number,
   inherit: AgentType | null,
   // `undefined` = look the folder default up; `null` = explicitly none.
-  folderDefaultOverride?: AgentType | null
+  folderDefaultOverride?: AgentType | null,
+  folderRecentOverride?: AgentType | null
 ): { agentType: AgentType; provisional: boolean } {
+  const folder = useAppWorkspaceStore
+    .getState()
+    .folders.find((item) => item.id === folderId)
   const folderDefault =
     folderDefaultOverride !== undefined
       ? folderDefaultOverride
-      : (useAppWorkspaceStore.getState().folders.find((f) => f.id === folderId)
-          ?.default_agent_type ?? null)
+      : (folder?.default_agent_type ?? null)
+  const folderRecent =
+    folderRecentOverride !== undefined
+      ? folderRecentOverride
+      : (folder?.last_agent_type ?? null)
   return resolveDefaultAgent({
     folderDefault,
     inherit,
+    folderRecent,
     sortedTypes: runtime.sortedAvailableAgents,
     fresh: runtime.agentsFresh,
   })
@@ -740,7 +750,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const { agentType: targetAgent, provisional } = resolveAgentForFolder(
       folderId,
       inherit,
-      options?.folderDefaultAgent
+      options?.folderDefaultAgent,
+      options?.folderRecentAgent
     )
 
     const tabId = makeNewConversationTabId()
