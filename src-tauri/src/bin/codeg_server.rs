@@ -287,6 +287,28 @@ async fn async_main() -> ExitCode {
     let conversation_experience_gate = Arc::new(
         codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
     );
+    // Load the persisted reference-search limit before constructing the
+    // production registry so the first start observes the operator's cap.
+    let reference_search_limit = codeg_lib::commands::conversation_experience::load_settings_from(
+        &db.conn,
+    )
+    .await
+    .map(|settings| settings.reference_search_limit)
+    .unwrap_or(
+        codeg_lib::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+    );
+    let reference_search_registry = codeg_lib::reference_search::ReferenceSearchRegistry::new(
+        reference_search_limit,
+        Arc::new(codeg_lib::reference_search::ProductionReferenceSourceFactory {
+            db: db.conn.clone(),
+        }),
+    );
+    {
+        let registry = Arc::clone(&reference_search_registry);
+        tokio::spawn(codeg_lib::reference_search::run_reference_search_sweeper(
+            registry,
+        ));
+    }
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -298,6 +320,7 @@ async fn async_main() -> ExitCode {
         internal_sessions: internal_sessions.clone(),
         auto_title_coordinator: auto_title_coordinator.clone(),
         conversation_experience_gate,
+        reference_search_registry,
         web_server_state: WebServerState::new(),
         chat_channel_manager: codeg_lib::app_state::default_chat_channel_manager(),
         workspace_transfer: Arc::new(

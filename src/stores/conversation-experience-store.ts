@@ -5,6 +5,7 @@ import { create } from "zustand"
 import {
   getConversationExperienceSettings,
   setAutoTitleAgent as setAutoTitleAgentApi,
+  setReferenceSearchLimit as setReferenceSearchLimitApi,
 } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import type { UnsubscribeFn } from "@/lib/transport/types"
@@ -34,6 +35,9 @@ interface ConversationExperienceState {
   refresh: () => Promise<void>
   setAutoTitleAgent: (
     agent: AgentType | null
+  ) => Promise<ConversationExperienceSettings>
+  setReferenceSearchLimit: (
+    limit: number
   ) => Promise<ConversationExperienceSettings>
 }
 
@@ -122,6 +126,12 @@ export const useConversationExperienceStore =
 
     setAutoTitleAgent: async (agent) => {
       const saved = await setAutoTitleAgentApi(agent)
+      get().applySnapshot(saved)
+      return saved
+    },
+
+    setReferenceSearchLimit: async (limit) => {
+      const saved = await setReferenceSearchLimitApi(limit)
       get().applySnapshot(saved)
       return saved
     },

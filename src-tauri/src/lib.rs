@@ -359,6 +359,35 @@ mod tauri_app {
                     ));
                 }
 
+                // Process-wide reference-search registry (shared with embedded Axum).
+                // Load the persisted limit before construction so the first start
+                // observes the operator's cap; start one idle sweeper for production.
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    let limit = tauri::async_runtime::block_on(
+                        crate::commands::conversation_experience::load_settings_from(&db.conn),
+                    )
+                    .map(|settings| settings.reference_search_limit)
+                    .unwrap_or(
+                        crate::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+                    );
+                    let registry = crate::reference_search::ReferenceSearchRegistry::new(
+                        limit,
+                        std::sync::Arc::new(
+                            crate::reference_search::ProductionReferenceSourceFactory {
+                                db: db.conn.clone(),
+                            },
+                        ),
+                    );
+                    {
+                        let registry = std::sync::Arc::clone(&registry);
+                        tauri::async_runtime::spawn(
+                            crate::reference_search::run_reference_search_sweeper(registry),
+                        );
+                    }
+                    app.manage(registry);
+                }
+
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
                 tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
@@ -1155,6 +1184,12 @@ mod tauri_app {
                 feedback_commands::submit_session_feedback,
                 crate::commands::conversation_experience::get_conversation_experience_settings,
                 crate::commands::conversation_experience::set_auto_title_agent,
+                crate::commands::conversation_experience::set_reference_search_limit,
+                crate::commands::reference_search::start_reference_search,
+                crate::commands::reference_search::next_reference_search_page,
+                crate::commands::reference_search::cancel_reference_search,
+                crate::commands::reference_search::validate_reference_candidate,
+                crate::commands::reference_search::match_reference_regex,
                 question_commands::get_question_settings,
                 question_commands::set_question_settings,
                 session_info_commands::get_session_info_settings,

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const h = vi.hoisted(() => ({
   getSettings: vi.fn(),
   setAgent: vi.fn(),
+  setLimit: vi.fn(),
   subscribe: vi.fn(async () => () => {}),
   onReconnect: vi.fn(() => () => {}),
 }))
@@ -10,6 +11,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@/lib/api", () => ({
   getConversationExperienceSettings: h.getSettings,
   setAutoTitleAgent: h.setAgent,
+  setReferenceSearchLimit: h.setLimit,
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -26,6 +28,7 @@ beforeEach(() => {
   resetConversationExperienceStore()
   h.getSettings.mockReset()
   h.setAgent.mockReset()
+  h.setLimit.mockReset()
   h.subscribe.mockReset()
   h.subscribe.mockResolvedValue(() => {})
   h.onReconnect.mockReset()
@@ -79,6 +82,23 @@ describe("useConversationExperienceStore", () => {
       auto_title_agent: "codex",
       reference_search_limit: 50,
       revision: 2,
+    })
+  })
+
+  it("setReferenceSearchLimit applies the returned full document", async () => {
+    h.setLimit.mockResolvedValue({
+      auto_title_agent: null,
+      reference_search_limit: 25,
+      revision: 3,
+    })
+    await useConversationExperienceStore
+      .getState()
+      .setReferenceSearchLimit(25)
+    expect(h.setLimit).toHaveBeenCalledWith(25)
+    expect(useConversationExperienceStore.getState().settings).toEqual({
+      auto_title_agent: null,
+      reference_search_limit: 25,
+      revision: 3,
     })
   })
 })

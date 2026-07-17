@@ -15,7 +15,12 @@ export class TauriTransport implements Transport {
     // Tauri invoke() has no client-side timeout — the IPC channel runs
     // for as long as the command needs. `options.timeoutMs` is part
     // of the Transport contract for web-mode parity, ignored here.
-    void options
+    // Caller AbortSignal is checked only before dispatch: an already-
+    // dispatched IPC command cannot be physically aborted. Controllers
+    // must send guarded cancel commands and reject late results by
+    // generation.
+    options?.signal?.throwIfAborted()
+    void options?.timeoutMs
     const { invoke } = await import("@tauri-apps/api/core")
     return invoke(command, args)
   }

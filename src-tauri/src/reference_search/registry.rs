@@ -142,6 +142,16 @@ pub struct ReferenceSearchRegistry {
     commit_scan: Arc<Semaphore>,
     #[cfg(test)]
     advance_counter: Arc<AtomicUsize>,
+    /// One-shot pause at the start of the next `set_limit` (before epoch
+    /// cancellation). Armed by tests so concurrent limit wrappers can prove
+    /// the mutation gate is held through registry application.
+    #[cfg(test)]
+    limit_apply_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl ReferenceSearchRegistry {
@@ -189,7 +199,34 @@ impl ReferenceSearchRegistry {
             conversation_scan: Arc::new(Semaphore::new(MAX_SOURCE_SCANS)),
             commit_scan: Arc::new(Semaphore::new(MAX_SOURCE_SCANS)),
             advance_counter,
+            limit_apply_pause: Mutex::new(None),
         })
+    }
+
+    /// Arm a one-shot pause at the start of the next `set_limit` call, before
+    /// epoch cancellation. Returns `(arrival, release)`. Compiled out of
+    /// production.
+    #[cfg(test)]
+    pub async fn pause_next_limit_apply_before_effect(
+        self: &Arc<Self>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.limit_apply_pause.lock().await = Some((arrival_tx, release_rx));
+        (arrival_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub async fn current_limit(&self) -> u16 {
+        self.inner.lock().await.limit
+    }
+
+    #[cfg(test)]
+    pub async fn current_limit_epoch(&self) -> u64 {
+        self.inner.lock().await.limit_epoch
     }
 
     pub async fn start(
@@ -457,6 +494,15 @@ impl ReferenceSearchRegistry {
     /// the new limit epoch.
     pub async fn set_limit(&self, limit: u16) -> u64 {
         let limit = clamp_reference_search_limit_for_registry(limit);
+
+        #[cfg(test)]
+        {
+            if let Some((arrival_tx, release_rx)) = self.limit_apply_pause.lock().await.take() {
+                let _ = arrival_tx.send(());
+                let _ = release_rx.await;
+            }
+        }
+
         let mut state = self.inner.lock().await;
         let now = Instant::now();
         state.limit = limit;

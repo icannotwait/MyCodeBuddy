@@ -15,7 +15,15 @@ import type {
   AgentType,
   AcpPromptContext,
   AgentDelegationDefaults,
+  CancelReferenceSearchRequest,
   ConversationExperienceSettings,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
+  ReferenceCandidateValidation,
+  ReferenceRegexMatch,
+  ReferenceSearchPage,
+  StartReferenceSearchRequest,
+  ValidateReferenceCandidateRequest,
   DelegationProfileCatalog,
   DelegationProfileDocument,
   DelegationRoutePolicy,
@@ -3403,6 +3411,80 @@ export async function setAutoTitleAgent(
   agent: AgentType | null
 ): Promise<ConversationExperienceSettings> {
   return getTransport().call("set_auto_title_agent", { agent })
+}
+
+export async function setReferenceSearchLimit(
+  limit: number
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call("set_reference_search_limit", { limit })
+}
+
+// ─── Incremental reference search ───────────────────────────────────────────
+// Flat protocol payloads (no nested `request`). Start/page use 35s so the
+// backend's 30s page deadline remains authoritative.
+
+export type {
+  CancelReferenceSearchRequest,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
+  ReferenceCandidate,
+  ReferenceCandidateValidation,
+  ReferenceDescriptor,
+  ReferenceDoneReason,
+  ReferenceRegexMatch,
+  ReferenceRegexRank,
+  ReferenceSearchPage,
+  ReferenceSearchSource,
+  StartReferenceSearchRequest,
+  ValidateReferenceCandidateRequest,
+} from "./types"
+
+export async function startReferenceSearch(
+  request: StartReferenceSearchRequest,
+  signal?: AbortSignal
+): Promise<ReferenceSearchPage> {
+  return getTransport().call("start_reference_search", { ...request }, {
+    timeoutMs: 35_000,
+    signal,
+  })
+}
+
+export async function nextReferenceSearchPage(
+  request: NextReferenceSearchPageRequest,
+  signal?: AbortSignal
+): Promise<ReferenceSearchPage> {
+  return getTransport().call(
+    "next_reference_search_page",
+    { ...request },
+    {
+      timeoutMs: 35_000,
+      signal,
+    }
+  )
+}
+
+export async function cancelReferenceSearch(
+  request: CancelReferenceSearchRequest
+): Promise<boolean> {
+  return getTransport().call("cancel_reference_search", { ...request })
+}
+
+export async function validateReferenceCandidate(
+  request: ValidateReferenceCandidateRequest,
+  signal?: AbortSignal
+): Promise<ReferenceCandidateValidation> {
+  return getTransport().call("validate_reference_candidate", { ...request }, {
+    signal,
+  })
+}
+
+export async function matchReferenceRegex(
+  request: MatchReferenceRegexRequest,
+  signal?: AbortSignal
+): Promise<ReferenceRegexMatch[]> {
+  return getTransport().call("match_reference_regex", { ...request }, {
+    signal,
+  })
 }
 
 /**

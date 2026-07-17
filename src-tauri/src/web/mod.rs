@@ -797,6 +797,12 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::commands::conversation_experience::ConversationExperienceMutationGate>>()
             .inner()
             .clone(),
+        // Clone the desktop-managed registry so HTTP handlers and direct Tauri
+        // commands observe the same limit epoch and live jobs.
+        reference_search_registry: app
+            .state::<Arc<crate::reference_search::ReferenceSearchRegistry>>()
+            .inner()
+            .clone(),
         web_server_state: WebServerState::new(), // placeholder; not used by handlers
         chat_channel_manager: crate::app_state::default_chat_channel_manager(),
         workspace_transfer: app
