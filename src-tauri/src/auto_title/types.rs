@@ -43,7 +43,8 @@ pub struct ConnectionLaunchContext {
 
 impl Default for ConnectionLaunchContext {
     /// Test-only English user default. Production UI/automation roots must use
-    /// [`user_launch_context_from_db`]; chat channel is Task 4C2.
+    /// [`user_launch_context_from_db`]; chat roots/resume use
+    /// `channel_launch_context_from_db`.
     fn default() -> Self {
         Self {
             purpose: ConnectionPurpose::User,

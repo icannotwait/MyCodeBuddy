@@ -12,9 +12,7 @@ use super::tool_detail::{format_tool_call_detail, truncate_str};
 use super::types::{MessageLevel, RichMessage};
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
-use crate::acp::types::{
-    AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope, PromptInputBlock,
-};
+use crate::acp::types::{AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope};
 
 use crate::db::service::{app_metadata_service, conversation_service, sender_context_service};
 use crate::web::event_bridge::EventEmitter;
@@ -125,10 +123,16 @@ async fn handle_acp_envelope(
                 if let Some(prompt_text) = session.pending_prompt.take() {
                     // Clone so the prompt can be RESTORED (not dropped) if a turn
                     // is already in flight — see the TurnInProgress arm below.
-                    let blocks = vec![PromptInputBlock::Text {
-                        text: prompt_text.clone(),
-                    }];
-                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
+                    let conversation_id = session.conversation_id;
+                    if let Err(e) = super::session_commands::send_prompt_linked_for_chat(
+                        db,
+                        conn_mgr,
+                        connection_id,
+                        conversation_id,
+                        &prompt_text,
+                    )
+                    .await
+                    {
                         // A turn is already in flight on this shared connection
                         // (another client raced this kickoff between
                         // SessionStarted and here). Transient, not a failure —
@@ -496,10 +500,15 @@ async fn handle_acp_envelope(
                 // TurnComplete), restore the prompt for the next TurnComplete —
                 // never drop it.
                 if let Some(prompt_text) = deferred_kickoff {
-                    let blocks = vec![PromptInputBlock::Text {
-                        text: prompt_text.clone(),
-                    }];
-                    if let Err(e) = conn_mgr.send_prompt_background(connection_id, blocks).await {
+                    if let Err(e) = super::session_commands::send_prompt_linked_for_chat(
+                        db,
+                        conn_mgr,
+                        connection_id,
+                        conv_id,
+                        &prompt_text,
+                    )
+                    .await
+                    {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
                             let mut g = bridge.lock().await;
                             if let Some(s) = g.get_mut(connection_id) {
@@ -1087,6 +1096,7 @@ mod delegation_relay_tests {
 mod async_relay_dedup_tests {
     use super::*;
     use crate::acp::manager::ConnectionManager;
+    use crate::acp::types::PromptInputBlock;
     use crate::chat_channel::error::ChatChannelError;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::chat_channel::session_bridge::{ActiveSession, SessionBridge};
@@ -1378,28 +1388,84 @@ mod async_relay_dedup_tests {
     /// shared connection: SessionStarted bounces with `TurnInProgress` → the
     /// pending prompt is RESTORED and an info line is posted; `TurnComplete`
     /// then retries it successfully. Regression for the silent kickoff-drop.
+    /// Linked IDs + visible capture must survive the defer/retry cycle.
     #[tokio::test]
     async fn kickoff_defers_on_turn_in_progress_then_retries_on_turn_complete() {
         use crate::acp::connection::ConnectionCommand;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::service::conversation_service;
+        use crate::models::system::AppLocale;
         use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
 
-        let (bridge, chat, rec) = harness().await;
         let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "ja")
+            .await
+            .expect("channel locale");
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/chat-kickoff-defer").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("kickoff".into()),
+            None,
+        )
+        .await
+        .expect("pre-create conversation");
+
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "conn".into(),
+            ActiveSession {
+                channel_id: 7,
+                sender_id: "u".into(),
+                conversation_id: conv.id,
+                connection_id: "conn".into(),
+                agent_type: AgentType::ClaudeCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: HashMap::new(),
+                delegation_rendered: HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: Some("do the task".into()),
+                permission_pending: None,
+            },
+        );
+        let chat = ChatChannelManager::new();
+        let rec = Recorder::default();
+        chat.add_channel(
+            7,
+            "test".into(),
+            ChannelType::Telegram,
+            Box::new(RecordingBackend { rec: rec.clone() }),
+        )
+        .await
+        .unwrap();
 
         // A LIVE connection (receiver kept) so `send_prompt` reaches the gate —
         // a dropped receiver would fail `reserve()` with ProcessExited before it.
+        // SessionState starts unlinked (chat pre-create path).
         let conn = ConnectionManager::new();
         let mut cmd_rx = conn
             .insert_test_connection_live("conn", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
-        // Seed the kickoff prompt + simulate another client's turn in flight.
-        bridge.lock().await.get_mut("conn").unwrap().pending_prompt = Some("do the task".into());
-        conn.get_state("conn")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .turn_in_flight = true;
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = crate::auto_title::ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+            s.turn_in_flight = true;
+            assert!(s.conversation_id.is_none(), "initially unlinked");
+        }
 
         // SessionStarted → kickoff bounces (turn in flight) and is DEFERRED.
         let started = EventEnvelope {
@@ -1435,14 +1501,33 @@ mod async_relay_dedup_tests {
             "no Prompt should be enqueued while the turn is in flight"
         );
         assert!(
-            sent(&rec)
-                .await
-                .iter()
-                .any(|m| m.contains("start automatically")),
+            sent(&rec).await.iter().any(|m| {
+                m.contains("start automatically")
+                    || m.contains("自動的に開始")
+                    || m.contains("自动开始")
+            }),
             "the user should be told the task is deferred"
         );
+        // Deferred path must not partial-link or capture.
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let s = state.read().await;
+            assert!(
+                s.conversation_id.is_none(),
+                "TurnInProgress must not install conversation_id"
+            );
+        }
+        let job_before = auto_title_job::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("job");
+        assert!(
+            job_before.first_user_text.is_none(),
+            "deferred kickoff must not capture yet"
+        );
 
-        // Turn ends → kickoff retried and now succeeds.
+        // Turn ends → kickoff retried and now succeeds with linked capture.
         conn.get_state("conn")
             .await
             .unwrap()
@@ -1479,6 +1564,19 @@ mod async_relay_dedup_tests {
                 .is_none(),
             "a retried kickoff must clear the pending prompt"
         );
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let s = state.read().await;
+            assert_eq!(s.conversation_id, Some(conv.id));
+            assert_eq!(s.folder_id, Some(folder_id));
+        }
+        let job = auto_title_job::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("job");
+        assert_eq!(job.first_user_text.as_deref(), Some("do the task"));
+        assert_eq!(job.locale.as_deref(), Some("ja"));
         // The retried prompt landed on the connection's command channel.
         let mut got_prompt = None;
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -1490,6 +1588,162 @@ mod async_relay_dedup_tests {
         assert!(
             matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == "do the task"),
             "the retried prompt must carry the deferred text, got {blocks:?}"
+        );
+    }
+
+    /// SessionStarted first-send adopts the pre-created conversation (Branch A)
+    /// and persists capture before a Prompt command is observed.
+    #[tokio::test]
+    async fn chat_first_send_adopts_precreated_conversation_before_capture() {
+        use crate::acp::connection::ConnectionCommand;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::service::conversation_service;
+        use crate::models::system::AppLocale;
+        use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "zh-cn")
+            .await
+            .expect("channel locale");
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/chat-first-send").await;
+        let visible = "refactor the auth module".to_string();
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some(visible.clone()),
+            None,
+        )
+        .await
+        .expect("pre-create chat conversation");
+
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "conn".into(),
+            ActiveSession {
+                channel_id: 7,
+                sender_id: "u".into(),
+                conversation_id: conv.id,
+                connection_id: "conn".into(),
+                agent_type: AgentType::ClaudeCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: HashMap::new(),
+                delegation_rendered: HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: Some(visible.clone()),
+                permission_pending: None,
+            },
+        );
+        let chat = ChatChannelManager::new();
+        let rec = Recorder::default();
+        chat.add_channel(
+            7,
+            "test".into(),
+            ChannelType::Telegram,
+            Box::new(RecordingBackend { rec: rec.clone() }),
+        )
+        .await
+        .unwrap();
+
+        let conn = ConnectionManager::new();
+        let mut cmd_rx = conn
+            .insert_test_connection_live(
+                "conn",
+                AgentType::ClaudeCode,
+                Some(std::path::PathBuf::from("/tmp/chat-first-send")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let mut s = state.write().await;
+            // Unlinked SessionState — chat creates the row before spawn.
+            s.conversation_id = None;
+            s.folder_id = None;
+            s.purpose = crate::auto_title::ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+            s.active_turn = None;
+        }
+
+        let started = EventEnvelope {
+            seq: 1,
+            connection_id: "conn".into(),
+            payload: AcpEvent::SessionStarted {
+                session_id: "S-chat-1".into(),
+            },
+        };
+        handle_acp_envelope(
+            &started,
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+            &EventEmitter::Noop,
+        )
+        .await;
+
+        // Capture + link must be durable before the Prompt is observed.
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let s = state.read().await;
+            assert_eq!(
+                s.conversation_id,
+                Some(conv.id),
+                "Branch A must install pre-created conversation_id"
+            );
+            assert_eq!(
+                s.folder_id,
+                Some(folder_id),
+                "Branch A must install conversation folder_id"
+            );
+        }
+        let job = auto_title_job::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("enrolled job");
+        assert_eq!(
+            job.first_user_text.as_deref(),
+            Some(visible.as_str()),
+            "exact channel visible text must be captured"
+        );
+        assert_eq!(
+            job.locale.as_deref(),
+            Some("zh_cn"),
+            "channel locale must be captured as AppLocale wire id"
+        );
+
+        let mut got_prompt = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let ConnectionCommand::Prompt { blocks, .. } = cmd {
+                got_prompt = Some(blocks);
+            }
+        }
+        let blocks = got_prompt.expect("Prompt command must be enqueued after capture");
+        assert!(
+            matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == &visible),
+            "prompt blocks must carry exact channel text, got {blocks:?}"
+        );
+        assert!(
+            bridge
+                .lock()
+                .await
+                .get("conn")
+                .unwrap()
+                .pending_prompt
+                .is_none(),
+            "successful first send clears pending_prompt"
         );
     }
 }
