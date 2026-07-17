@@ -481,15 +481,22 @@ pub enum ParentDecisionResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DelegationReplyResult {
-    Replied { request_id: String },
-    Idempotent { request_id: String },
+    Replied {
+        request_id: String,
+    },
+    Idempotent {
+        request_id: String,
+    },
     AlreadyResolved {
         request_id: String,
         resolution_code: AttentionResolutionCode,
     },
     Missing,
     Unauthorized,
-    Rejected { code: String, message: String },
+    Rejected {
+        code: String,
+        message: String,
+    },
 }
 
 impl DelegationOutcome {

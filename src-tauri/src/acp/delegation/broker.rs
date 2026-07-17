@@ -384,14 +384,12 @@ pub(crate) struct CoordinationIdentity {
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
     match error {
-        AttentionStoreError::PayloadTooLarge => (
-            "payload_too_large",
-            "attention payload exceeds 16 KiB",
-        ),
-        AttentionStoreError::BlankPayload => (
-            "invalid_payload",
-            "attention payload must not be blank",
-        ),
+        AttentionStoreError::PayloadTooLarge => {
+            ("payload_too_large", "attention payload exceeds 16 KiB")
+        }
+        AttentionStoreError::BlankPayload => {
+            ("invalid_payload", "attention payload must not be blank")
+        }
         AttentionStoreError::Unauthorized => (
             "unauthorized",
             "delegation attention edge is not authorized",
@@ -400,14 +398,12 @@ fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static s
             "already_open",
             "this task already has an open parent decision request",
         ),
-        AttentionStoreError::TaskNotRunning => (
-            "task_not_running",
-            "delegation task is no longer running",
-        ),
-        AttentionStoreError::NotFound => (
-            "not_found",
-            "delegation attention request was not found",
-        ),
+        AttentionStoreError::TaskNotRunning => {
+            ("task_not_running", "delegation task is no longer running")
+        }
+        AttentionStoreError::NotFound => {
+            ("not_found", "delegation attention request was not found")
+        }
         AttentionStoreError::Database(_) => (
             "attention_unavailable",
             "delegation attention persistence is unavailable",
@@ -1599,8 +1595,7 @@ impl DelegationBroker {
         let Some(identity) = identity else {
             return ParentDecisionResult::Rejected {
                 code: "not_delegation_child".into(),
-                message: "only a live Codeg delegation child can request a parent decision"
-                    .into(),
+                message: "only a live Codeg delegation child can request a parent decision".into(),
             };
         };
         let persisted = match self.task_store.load(&identity.task_id).await {
@@ -1642,10 +1637,7 @@ impl DelegationBroker {
             if let Some(code) = record.resolution_code {
                 return if code == AttentionResolutionCode::ParentReply {
                     match record.reply {
-                        Some(reply) => ParentDecisionResult::Replied {
-                            request_id,
-                            reply,
-                        },
+                        Some(reply) => ParentDecisionResult::Replied { request_id, reply },
                         None => ParentDecisionResult::Rejected {
                             code: "attention_invariant".into(),
                             message: "parent reply resolution is missing its reply".into(),
@@ -3386,9 +3378,7 @@ impl DelegationBroker {
                         .await;
                     {
                         let mut inner = self.pending.inner.lock().await;
-                        inner
-                            .coordination_by_child
-                            .remove(&ctx.child_connection_id);
+                        inner.coordination_by_child.remove(&ctx.child_connection_id);
                     }
                 }
                 // Atomic settling → completed (or first completed insert for
@@ -5486,7 +5476,9 @@ mod tests {
             // Broker tests seed edges with known parent ids; poll both common
             // parents and any open row matching task_id.
             for parent in [1i32, 2, 3, 11, 22] {
-                if let Ok(open) = attention.list_open_for_tasks(parent, &[task_id.to_string()]).await
+                if let Ok(open) = attention
+                    .list_open_for_tasks(parent, &[task_id.to_string()])
+                    .await
                 {
                     if let Some(summary) = open.into_iter().next() {
                         return summary;
@@ -5586,7 +5578,10 @@ mod tests {
         });
 
         let joined = within(join).await.unwrap();
-        assert_eq!(joined.wake_reason, Some(DelegationWakeReason::AttentionRequired));
+        assert_eq!(
+            joined.wake_reason,
+            Some(DelegationWakeReason::AttentionRequired)
+        );
         let request_id = joined.attention_requests.unwrap()[0].request_id.clone();
         assert!(!decision.is_finished());
 

@@ -132,6 +132,7 @@ pub fn build_delegation_stack(
     data_dir: PathBuf,
 ) -> DelegationStack {
     use crate::acp::connection::DelegationInjection;
+    use crate::acp::delegation::attention::{DbDelegationAttentionStore, DelegationAttentionStore};
     use crate::acp::delegation::broker::{
         ChildStatusLookup, ConversationDepthLookup, DbChildStatusLookup, DbDepthLookup,
     };
@@ -144,9 +145,6 @@ pub fn build_delegation_stack(
     };
     use crate::acp::delegation::meta_writer::{ConnectionManagerMetaWriter, DelegationMetaWriter};
     use crate::acp::delegation::spawner::ConnectionSpawner;
-    use crate::acp::delegation::attention::{
-        DbDelegationAttentionStore, DelegationAttentionStore,
-    };
     use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
     use crate::acp::manager::ConnectionManagerSpawner;
 
