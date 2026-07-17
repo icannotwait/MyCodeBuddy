@@ -1219,11 +1219,7 @@ mod tests {
             "EventEmitter::Noop must not expose an ACP internal bus"
         );
         assert!(
-            fixture
-                .agent
-                .private_stream_events
-                .load(Ordering::SeqCst)
-                > 0,
+            fixture.agent.private_stream_events.load(Ordering::SeqCst) > 0,
             "private connection stream must receive Noop-emitted events"
         );
     }
@@ -1520,19 +1516,12 @@ mod tests {
 
         let (_, filter) = fixture.registry.shared_filter().await.expect("filter");
         assert!(
-            filter.contains(
-                AgentType::Codex,
-                None,
-                Some(&run_dir.to_string_lossy()),
-            ),
+            filter.contains(AgentType::Codex, None, Some(&run_dir.to_string_lossy()),),
             "recorded run path must remain matched by reserved-root filter after removal"
         );
 
         // Outside reserved_root is not hidden by path fallback.
-        let outside = fixture
-            .data_dir
-            .path()
-            .join("outside-reserved-run");
+        let outside = fixture.data_dir.path().join("outside-reserved-run");
         assert!(
             !filter.contains(AgentType::Codex, None, Some(&outside.to_string_lossy())),
             "path outside reserved_root must not match the filter"
@@ -1553,11 +1542,7 @@ mod tests {
             .last_working_dir()
             .expect("registry-failure path still spawns");
         let (_, filter2) = fixture2.registry.shared_filter().await.expect("filter");
-        let path_hit = filter2.contains(
-            AgentType::Codex,
-            None,
-            Some(&recorded2.to_string_lossy()),
-        );
+        let path_hit = filter2.contains(AgentType::Codex, None, Some(&recorded2.to_string_lossy()));
         let id_hit = filter2.contains(AgentType::Codex, Some("internal-1"), None);
         assert!(
             path_hit || id_hit,
