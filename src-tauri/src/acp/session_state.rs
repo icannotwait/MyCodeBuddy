@@ -15,8 +15,17 @@ use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
     PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
 };
+use crate::auto_title::ConnectionPurpose;
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
+use crate::models::system::AppLocale;
+
+/// Opaque per-turn token + originating locale for automatic title coordination.
+#[derive(Debug, Clone)]
+pub struct ActiveTurnContext {
+    pub token: String,
+    pub locale: AppLocale,
+}
 
 /// 当前 streaming 中的 turn 的累积内容。turn 完成后清空。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +399,20 @@ pub struct SessionState {
     /// Which settings surface drifted, for the banner's wording. `Some` iff
     /// `config_stale`; reset to `None` when staleness clears.
     pub config_stale_kind: Option<ConfigStaleKind>,
+
+    /// Why this connection was launched (user, delegation, internal probe/title).
+    /// Internal purposes bypass title capture on prompt admission.
+    pub purpose: ConnectionPurpose,
+
+    /// Latest resolved title/locale for this connection. Initialized from the
+    /// launch context's inherited locale (English when absent) and refreshed on
+    /// every accepted capture.
+    pub effective_locale: AppLocale,
+
+    /// In-flight turn capture context set only after successful admission
+    /// capture (linked, non-internal). `None` outside an admitted turn or when
+    /// capture was bypassed/failed.
+    pub active_turn: Option<ActiveTurnContext>,
 }
 
 impl SessionState {
@@ -440,6 +463,12 @@ impl SessionState {
             turn_in_flight: false,
             config_stale: false,
             config_stale_kind: None,
+            // Test/helper default: User purpose + English. Production spawn paths
+            // overwrite these from `ConnectionLaunchContext` (Task 4B temporary
+            // defaults; Task 4C wires real persisted/channel/parent locales).
+            purpose: ConnectionPurpose::User,
+            effective_locale: AppLocale::En,
+            active_turn: None,
         }
     }
 

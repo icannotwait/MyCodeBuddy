@@ -89,6 +89,7 @@ pub async fn acp_connect(
             emitter,
             params.preferred_mode_id,
             params.preferred_config_values.unwrap_or_default(),
+            crate::auto_title::ConnectionLaunchContext::default(),
         )
         .await
         .map_err(|error| {
@@ -157,6 +158,7 @@ pub async fn acp_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            None, // Task 4C: wire visibleText/locale
         )
         .await
         .map_err(|e| {

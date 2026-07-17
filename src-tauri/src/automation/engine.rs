@@ -437,6 +437,7 @@ impl AutomationEngine {
                 self.emitter.clone(),
                 cfg.mode_id.clone(),
                 cfg.config_values.clone(),
+                crate::auto_title::ConnectionLaunchContext::default(),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -505,6 +506,7 @@ impl AutomationEngine {
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
+                None, // Task 4C: automation visible capture
             )
             .await
         {

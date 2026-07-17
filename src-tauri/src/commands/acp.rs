@@ -5922,6 +5922,7 @@ pub async fn acp_connect(
             emitter,
             preferred_mode_id,
             preferred_config_values.unwrap_or_default(),
+            crate::auto_title::ConnectionLaunchContext::default(),
         )
         .await
 }
@@ -5946,6 +5947,7 @@ pub async fn acp_prompt(
             conversation_id,
             None,
             client_message_id,
+            None, // Task 4C: wire visibleText/locale
         )
         .await
         .map(|_| ())

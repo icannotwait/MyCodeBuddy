@@ -39,6 +39,17 @@ pub struct ConnectionLaunchContext {
     pub inherited_locale: Option<AppLocale>,
 }
 
+impl Default for ConnectionLaunchContext {
+    /// Temporary English user default for tests and Task 4B production callers
+    /// until Task 4C wires persisted/channel/parent locale sources.
+    fn default() -> Self {
+        Self {
+            purpose: ConnectionPurpose::User,
+            inherited_locale: Some(AppLocale::En),
+        }
+    }
+}
+
 /// Optional explicit visible text and locale supplied by a prompt producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCaptureContext {

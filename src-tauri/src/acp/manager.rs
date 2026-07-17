@@ -22,15 +22,20 @@ use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
+use crate::acp::session_state::ActiveTurnContext;
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
 };
+use crate::auto_title::{
+    capture_prompt_context, ConnectionLaunchContext, ConnectionPurpose, PromptCaptureContext,
+};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+use crate::models::system::AppLocale;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
 
 /// Cap on the number of prompt-text chars kept in the `user_prompt_sent`
@@ -397,6 +402,9 @@ impl ConnectionManager {
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        // Temporary Task 4B launch context (purpose + inherited locale). Task 4C
+        // replaces production defaults with persisted/channel/parent sources.
+        launch_context: ConnectionLaunchContext,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -479,6 +487,7 @@ impl ConnectionManager {
             preferred_mode_id,
             preferred_config_values,
             self.delegation_snapshot(),
+            launch_context,
         )
         .await?;
 
@@ -763,8 +772,19 @@ impl ConnectionManager {
     /// `send_prompt_linked` acquire the lock externally and then call
     /// this. Re-entering through `send_prompt` from `send_prompt_linked`
     /// while holding the lock would deadlock, hence the split.
+    ///
+    /// Admission order (under the caller's per-connection prompt lock):
+    /// 1. `reserve()` — only cancellable/blocking point before capture
+    /// 2. state write guard; reject in-flight turn
+    /// 3. linked + non-internal: `capture_prompt_context` while holding the
+    ///    write guard (serializes write-once first text)
+    /// 4. set `active_turn` / `effective_locale` / `turn_in_flight`
+    /// 5. mandatory-route sync tail (no `.await`)
+    /// 6. `permit.send` — no `.await` after successful capture
+    #[allow(clippy::too_many_arguments)]
     async fn send_prompt_inner(
         &self,
+        db: Option<&AppDatabase>,
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
@@ -777,6 +797,7 @@ impl ConnectionManager {
         // Independent of route registration: chat-channel keeps routes on
         // while setting this false.
         mark_awaiting_reply: bool,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -791,7 +812,8 @@ impl ConnectionManager {
         }
         // Precompute mandatory ids only if this is a root user prompt. Applied
         // AFTER the turn is admitted (below) so a rejected concurrent send
-        // cannot overwrite the live turn's routes.
+        // cannot overwrite the live turn's routes. Must be ready before the
+        // post-capture synchronous tail (no await after capture).
         let pending_mandatory_ids = if register_mandatory_routes {
             let mut joined = String::new();
             for block in &blocks {
@@ -815,34 +837,49 @@ impl ConnectionManager {
         };
         // Concurrency gate: reject a second prompt while a turn is already in
         // flight on this connection. Reserve channel capacity FIRST — that
-        // `reserve().await` is the only point that can block or be cancelled.
-        // Then check+set the gate and hand the command to the permit
-        // synchronously: because there is NO await between setting
-        // `turn_in_flight` and the infallible `permit.send`, a dropped/cancelled
-        // future can never strand the flag true (it is either never set — when
-        // cancelled during reserve or the lock acquisition — or always followed
-        // by the enqueue). The flag is set BEFORE the enqueue so it is in place
-        // before the loop can dequeue and clear it on `TurnComplete`. Without
-        // the gate the second `Prompt` would queue behind the active turn and be
-        // silently dropped by the loop's in-turn handler (`_ => {}`) while the
-        // caller saw success. `send_prompt` callers (e.g. the chat channel)
-        // rely on this gate alone (no `prompt_lock`).
+        // `reserve().await` is the only point that can block or be cancelled
+        // before capture. Cancellation while waiting here writes no capture and
+        // no active-turn state.
         let permit = cmd_tx
             .reserve()
             .await
             .map_err(|_| AcpError::ProcessExited)?;
-        {
-            let mut s = state_arc.write().await;
-            if s.turn_in_flight {
-                return Err(AcpError::TurnInProgress);
-            }
-            s.turn_in_flight = true;
+
+        // Hold the write guard across capture so write-once first_user_text is
+        // serialized with turn admission. After successful capture there is no
+        // `.await` before `permit.send`.
+        let mut state = state_arc.write().await;
+        if state.turn_in_flight {
+            return Err(AcpError::TurnInProgress);
         }
-        // Admitted: install/clear mandatory routes for this root prompt only.
-        // Must stay synchronous (no `.await`) between setting `turn_in_flight`
-        // and `permit.send` so a dropped future cannot strand the gate or
-        // mutate routes for a prompt that never enqueued. Child paths pass
-        // register_mandatory_routes=false and skip this.
+
+        let is_internal = matches!(
+            state.purpose,
+            ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
+        );
+        // Unlinked and internal-purpose sends bypass capture entirely.
+        if let (Some(db), Some(conversation_id)) = (db, state.conversation_id) {
+            if !is_internal {
+                let captured = capture_prompt_context(
+                    &db.conn,
+                    conversation_id,
+                    &blocks,
+                    capture.as_ref(),
+                    state.effective_locale,
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                let token = uuid::Uuid::new_v4().to_string();
+                state.effective_locale = captured.locale;
+                state.active_turn = Some(ActiveTurnContext {
+                    token,
+                    locale: captured.locale,
+                });
+            }
+        }
+
+        state.turn_in_flight = true;
+        // Synchronous tail: mandatory routes then permit.send. No await.
         if let Some(ids) = pending_mandatory_ids {
             if let Some(injection) = self.delegation_snapshot() {
                 injection.broker.set_mandatory_profile_routes(conn_id, ids);
@@ -872,18 +909,23 @@ impl ConnectionManager {
 
     pub async fn send_prompt(
         &self,
+        db: &AppDatabase,
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
         // Non-linked UI sends: register mandatory routes + mark attention.
-        self.send_prompt_inner(conn_id, blocks, None, true, true)
+        // Capture runs only when the connection is already linked (and not
+        // internal); unlinked paths bypass capture by design.
+        self.send_prompt_inner(Some(db), conn_id, blocks, None, true, true, capture)
             .await
     }
 
     /// Background (non-UI) prompt: keeps mandatory profile-route registration
-    /// but does not mark the turn as awaiting-reply eligible.
+    /// but does not mark the turn as awaiting-reply eligible. Unlinked path —
+    /// no title capture (Task 4C may convert chat kickoffs to linked sends).
     pub async fn send_prompt_background(
         &self,
         conn_id: &str,
@@ -891,7 +933,41 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None, true, false)
+        self.send_prompt_inner(None, conn_id, blocks, None, true, false, None)
+            .await
+    }
+
+    /// Unlinked internal enqueue for probe/title workers. Rejects every purpose
+    /// except `InternalProbe` and `InternalTitle`, remains unlinked, and
+    /// bypasses title capture. Crate-visible for Task 7's runner outside
+    /// `acp::manager`.
+    // No production Task 4B caller yet — Task 7 owns the first real consumer.
+    // Keep crate-visible without inventing a fake call solely to silence lint.
+    #[allow(dead_code)]
+    pub(crate) async fn send_prompt_unlinked_internal(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), AcpError> {
+        {
+            let state_arc = self
+                .get_state(conn_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let purpose = state_arc.read().await.purpose;
+            if !matches!(
+                purpose,
+                ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
+            ) {
+                return Err(AcpError::protocol(format!(
+                    "send_prompt_unlinked_internal requires InternalProbe or InternalTitle purpose, got {purpose:?}"
+                )));
+            }
+        }
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        // No db / capture: internal purposes always bypass title capture.
+        self.send_prompt_inner(None, conn_id, blocks, None, false, false, None)
             .await
     }
 
@@ -913,6 +989,9 @@ impl ConnectionManager {
     /// (the delegation broker, internal/test paths). The UI send path uses
     /// [`send_prompt_linked_with_message_id`] so the sender's optimistic turn
     /// dedups against the broadcast `UserMessage` echo by exact id.
+    // Plan-required public signature includes `capture`; argument count is
+    // intentional and shared with the message-id variant below.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_prompt_linked(
         &self,
         db: &AppDatabase,
@@ -921,6 +1000,7 @@ impl ConnectionManager {
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         self.send_prompt_linked_with_message_id(
             db,
@@ -930,6 +1010,7 @@ impl ConnectionManager {
             conversation_id,
             delegation,
             None,
+            capture,
         )
         .await
     }
@@ -956,6 +1037,7 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         let mark_awaiting_reply = delegation.is_none();
         self.send_prompt_linked_impl(
@@ -967,6 +1049,7 @@ impl ConnectionManager {
             delegation,
             client_message_id,
             mark_awaiting_reply,
+            capture,
         )
         .await
     }
@@ -980,6 +1063,7 @@ impl ConnectionManager {
         blocks: Vec<PromptInputBlock>,
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         self.send_prompt_linked_impl(
             db,
@@ -990,12 +1074,15 @@ impl ConnectionManager {
             None,
             None,
             false,
+            capture,
         )
         .await
     }
 
     /// Shared linked-prompt implementation. `mark_awaiting_reply` is independent
     /// of mandatory profile-route registration (`delegation.is_none()`).
+    /// Linked first-send and already-linked paths both call the shared
+    /// admission hook (`send_prompt_inner`) exactly once.
     #[allow(clippy::too_many_arguments)]
     async fn send_prompt_linked_impl(
         &self,
@@ -1007,6 +1094,7 @@ impl ConnectionManager {
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
         mark_awaiting_reply: bool,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1301,11 +1389,13 @@ impl ConnectionManager {
         // Awaiting-reply eligibility is a separate policy bit.
         match self
             .send_prompt_inner(
+                Some(db),
                 conn_id,
                 blocks,
                 user_message,
                 delegation.is_none(),
                 mark_awaiting_reply,
+                capture,
             )
             .await
         {
@@ -1889,6 +1979,7 @@ impl ConnectionManager {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await?;
 
@@ -2626,6 +2717,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
 
+        // Temporary Task 4B: Delegation purpose; parent locale inheritance is Task 4C.
+        let launch_context = ConnectionLaunchContext {
+            purpose: ConnectionPurpose::Delegation,
+            inherited_locale: Some(AppLocale::En),
+        };
         self.manager
             .spawn_agent(
                 agent_type,
@@ -2636,6 +2732,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 emitter,
                 preferred_mode_id,
                 preferred_config_values,
+                launch_context,
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
@@ -2681,6 +2778,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 Some(folder.id),
                 None,
                 Some(link),
+                None, // Task 4C: broker task as explicit visible text
             )
             .await
             .map_err(|e| SpawnerError::Send(e.to_string()))?;
@@ -3039,6 +3137,550 @@ mod tests {
         }]
     }
 
+    /// Live command receiver + linked conversation + enrolled auto-title job.
+    /// Uses `insert_test_connection_live` so `reserve()` can succeed or block.
+    struct PromptAdmissionFixture {
+        db: AppDatabase,
+        manager: ConnectionManager,
+        connection_id: String,
+        conversation_id: i32,
+        #[allow(dead_code)]
+        folder_id: i32,
+        command_receiver: mpsc::Receiver<ConnectionCommand>,
+    }
+
+    impl PromptAdmissionFixture {
+        async fn state(&self) -> Arc<RwLock<SessionState>> {
+            self.manager
+                .get_state(&self.connection_id)
+                .await
+                .expect("fixture connection state")
+        }
+
+        async fn fail_next_capture_transaction(&self) {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            self.db
+                .conn
+                .execute(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "CREATE TRIGGER fail_title_capture BEFORE UPDATE ON auto_title_jobs \
+                     BEGIN SELECT RAISE(ABORT, 'capture failure'); END"
+                        .to_owned(),
+                ))
+                .await
+                .expect("install capture failure trigger");
+        }
+
+        async fn job_first_user_text(&self) -> Option<String> {
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            auto_title_job::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .expect("query job")
+                .and_then(|j| j.first_user_text)
+        }
+
+        async fn job_locale(&self) -> Option<String> {
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            auto_title_job::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .expect("query job")
+                .and_then(|j| j.locale)
+        }
+    }
+
+    async fn prompt_admission_fixture() -> PromptAdmissionFixture {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-admission").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conversation with job enrollment");
+
+        let manager = ConnectionManager::new();
+        let connection_id = "admission-conn".to_string();
+        let command_receiver = manager
+            .insert_test_connection_live(
+                &connection_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/prompt-admission")),
+                EventEmitter::Noop,
+            )
+            .await;
+
+        {
+            let state = manager.get_state(&connection_id).await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(conversation.id);
+            s.folder_id = Some(folder_id);
+            s.purpose = crate::auto_title::ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+            s.active_turn = None;
+        }
+
+        PromptAdmissionFixture {
+            db,
+            manager,
+            connection_id,
+            conversation_id: conversation.id,
+            folder_id,
+            command_receiver,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_failure_prevents_enqueue_and_fast_completion_cannot_win() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let mut fixture = prompt_admission_fixture().await;
+        fixture.fail_next_capture_transaction().await;
+        let result = fixture
+            .manager
+            .send_prompt(
+                &fixture.db,
+                &fixture.connection_id,
+                one_text_block(),
+                Some(PromptCaptureContext::new(
+                    Some("visible".into()),
+                    Some(AppLocale::ZhCn),
+                )),
+            )
+            .await;
+        assert!(result.is_err(), "capture failure must reject the send");
+        assert!(
+            fixture.command_receiver.try_recv().is_err(),
+            "failed capture must not enqueue a Prompt command"
+        );
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(
+                state.active_turn.is_none(),
+                "failed capture must leave active_turn unset"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "failed capture must leave turn_in_flight clear"
+            );
+        }
+        assert_eq!(
+            fixture.job_first_user_text().await,
+            None,
+            "aborted capture must not persist first_user_text"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_while_reserving_stages_no_title_context() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let fixture = prompt_admission_fixture().await;
+        // Fill the live channel (capacity 4) so the next reserve() blocks.
+        let tx = fixture
+            .manager
+            .connections
+            .lock()
+            .await
+            .get(&fixture.connection_id)
+            .unwrap()
+            .cmd_tx
+            .clone();
+        for _ in 0..4 {
+            tx.send(ConnectionCommand::Prompt {
+                blocks: one_text_block(),
+                user_message: None,
+                mark_awaiting_reply: false,
+            })
+            .await
+            .unwrap();
+        }
+
+        let send_fut = fixture.manager.send_prompt(
+            &fixture.db,
+            &fixture.connection_id,
+            one_text_block(),
+            Some(PromptCaptureContext::new(
+                Some("cancelled-visible".into()),
+                Some(AppLocale::Ja),
+            )),
+        );
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), send_fut).await;
+        assert!(
+            timed_out.is_err(),
+            "send must still be blocked on channel reserve"
+        );
+
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(
+                state.active_turn.is_none(),
+                "cancellation during reserve stages no active_turn"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "cancellation during reserve must not set turn_in_flight"
+            );
+        }
+        assert_eq!(
+            fixture.job_first_user_text().await,
+            None,
+            "cancellation during reserve stages no capture write"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_persists_capture_before_immediate_completion() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let mut fixture = prompt_admission_fixture().await;
+        let result = fixture
+            .manager
+            .send_prompt(
+                &fixture.db,
+                &fixture.connection_id,
+                one_text_block(),
+                Some(PromptCaptureContext::new(
+                    Some("persist-before-complete".into()),
+                    Some(AppLocale::ZhCn),
+                )),
+            )
+            .await;
+        assert!(result.is_ok(), "accepted send: {result:?}");
+
+        // Capture must already be durable before the agent can process the
+        // enqueued command (immediate-completion race).
+        assert_eq!(
+            fixture.job_first_user_text().await.as_deref(),
+            Some("persist-before-complete")
+        );
+        assert_eq!(fixture.job_locale().await.as_deref(), Some("zh_cn"));
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(state.turn_in_flight);
+            let active = state
+                .active_turn
+                .as_ref()
+                .expect("accepted prompt sets active_turn");
+            assert_eq!(active.locale, AppLocale::ZhCn);
+            assert!(!active.token.is_empty());
+            assert_eq!(state.effective_locale, AppLocale::ZhCn);
+        }
+
+        // Immediate completion path: receive the queued command with no delay.
+        let cmd = fixture
+            .command_receiver
+            .try_recv()
+            .expect("prompt must already be enqueued after successful admission");
+        assert!(matches!(cmd, ConnectionCommand::Prompt { .. }));
+    }
+
+    #[tokio::test]
+    async fn linked_and_already_linked_sends_share_capture_once() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).unwrap(),
+        )
+        .await
+        .unwrap();
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/share-capture-once").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "share-once-conn";
+        let mut cmd_rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/share-capture-once")),
+                EventEmitter::Noop,
+            )
+            .await;
+
+        // First linked send (Branch B create + single admission capture).
+        let first = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "first linked task".into(),
+                }],
+                Some(folder_id),
+                None,
+                None,
+                Some(PromptCaptureContext::new(
+                    Some("first linked task".into()),
+                    Some(AppLocale::En),
+                )),
+            )
+            .await
+            .expect("first linked send");
+        let conversation_id = first.expect("conversation id bound");
+
+        use crate::db::entities::auto_title_job;
+        use sea_orm::EntityTrait;
+        let job_after_first = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job after first send");
+        assert_eq!(
+            job_after_first.first_user_text.as_deref(),
+            Some("first linked task")
+        );
+        assert_eq!(job_after_first.locale.as_deref(), Some("en"));
+
+        // Drain + clear gate so the already-linked path can admit again.
+        let _ = cmd_rx.try_recv();
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.active_turn = None;
+        }
+
+        // Second already-linked send shares the same capture hook once:
+        // locale refreshes, first_user_text stays write-once.
+        mgr.send_prompt_linked(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "second linked task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+            Some(PromptCaptureContext::new(
+                Some("second linked task".into()),
+                Some(AppLocale::Ja),
+            )),
+        )
+        .await
+        .expect("already-linked send");
+
+        let job_after_second = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job after second send");
+        assert_eq!(
+            job_after_second.first_user_text.as_deref(),
+            Some("first linked task"),
+            "first_user_text is write-once across linked + already-linked"
+        );
+        assert_eq!(
+            job_after_second.locale.as_deref(),
+            Some("ja"),
+            "locale refreshes on the second admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_failure_stages_no_capture() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        // Dropped command receiver: reserve() fails with ProcessExited.
+        let fixture_db = {
+            use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+            use crate::db::service::app_metadata_service;
+            use crate::db::test_helpers;
+            let db = test_helpers::fresh_in_memory_db().await;
+            app_metadata_service::upsert_value(
+                &db.conn,
+                KEY_AUTO_TITLE_AGENT,
+                &serde_json::to_string(&AgentType::Codex).unwrap(),
+            )
+            .await
+            .unwrap();
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/reserve-fail").await;
+            let conversation = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mgr = ConnectionManager::new();
+            let conn_id = "reserve-fail-conn";
+            mgr.insert_test_connection(conn_id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                .await;
+            {
+                let state = mgr.get_state(conn_id).await.unwrap();
+                let mut s = state.write().await;
+                s.conversation_id = Some(conversation.id);
+                s.folder_id = Some(folder_id);
+            }
+            let err = mgr
+                .send_prompt(
+                    &db,
+                    conn_id,
+                    one_text_block(),
+                    Some(PromptCaptureContext::new(
+                        Some("never-written".into()),
+                        Some(AppLocale::Ko),
+                    )),
+                )
+                .await
+                .expect_err("dropped receiver must fail reserve");
+            assert!(
+                matches!(err, AcpError::ProcessExited),
+                "expected ProcessExited, got {err:?}"
+            );
+            let state = mgr.get_state(conn_id).await.unwrap();
+            assert!(state.read().await.active_turn.is_none());
+            assert!(!state.read().await.turn_in_flight);
+
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            let job = auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .expect("job");
+            assert_eq!(job.first_user_text, None);
+            assert_eq!(job.locale, None);
+            db
+        };
+        drop(fixture_db);
+    }
+
+    #[tokio::test]
+    async fn unlinked_send_bypasses_capture() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live(
+                "unlinked-conn",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        mgr.send_prompt(
+            &db,
+            "unlinked-conn",
+            one_text_block(),
+            Some(PromptCaptureContext::new(
+                Some("should-not-need-job".into()),
+                Some(AppLocale::Fr),
+            )),
+        )
+        .await
+        .expect("unlinked send succeeds without capture");
+
+        assert!(matches!(
+            rx.try_recv().expect("enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        let state = mgr.get_state("unlinked-conn").await.unwrap();
+        let s = state.read().await;
+        assert!(
+            s.active_turn.is_none(),
+            "unlinked path must not set active_turn"
+        );
+        assert!(s.turn_in_flight);
+        assert_eq!(s.effective_locale, AppLocale::En);
+    }
+
+    #[tokio::test]
+    async fn internal_helper_rejects_user_and_delegation_accepts_internal() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live(
+                "internal-helper-conn",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        // Default purpose is User → reject.
+        let err = mgr
+            .send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect_err("User purpose rejected");
+        assert!(
+            matches!(err, AcpError::Protocol(_)) || err.to_string().contains("internal"),
+            "unexpected error: {err:?}"
+        );
+
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            state.write().await.purpose = crate::auto_title::ConnectionPurpose::Delegation;
+        }
+        let err = mgr
+            .send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect_err("Delegation purpose rejected");
+        assert!(
+            matches!(err, AcpError::Protocol(_)) || err.to_string().contains("internal"),
+            "unexpected error: {err:?}"
+        );
+
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            state.write().await.purpose = crate::auto_title::ConnectionPurpose::InternalProbe;
+        }
+        mgr.send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect("InternalProbe accepted");
+        assert!(matches!(
+            rx.try_recv().expect("probe enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.purpose = crate::auto_title::ConnectionPurpose::InternalTitle;
+        }
+        mgr.send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect("InternalTitle accepted");
+        assert!(matches!(
+            rx.try_recv().expect("title enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        // Internal path never stages title capture context.
+        let state = mgr.get_state("internal-helper-conn").await.unwrap();
+        assert!(state.read().await.active_turn.is_none());
+        let _ = db; // keep db alive for API symmetry with other admission tests
+    }
+
     #[tokio::test]
     async fn prompt_wrappers_encode_user_facing_and_background_attention() {
         let mgr = ConnectionManager::new();
@@ -3046,7 +3688,8 @@ mod tests {
             .insert_test_connection_live("policy-conn", AgentType::Codex, None, EventEmitter::Noop)
             .await;
 
-        mgr.send_prompt("policy-conn", one_text_block())
+        let policy_db = crate::db::test_helpers::fresh_in_memory_db().await;
+        mgr.send_prompt(&policy_db, "policy-conn", one_text_block(), None)
             .await
             .expect("UI prompt");
         let ConnectionCommand::Prompt {
@@ -3145,6 +3788,7 @@ mod tests {
                 Some(folder_id),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(
@@ -3205,6 +3849,7 @@ mod tests {
                 Some(folder_id),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(first.is_ok(), "first prompt accepted");
@@ -3217,6 +3862,7 @@ mod tests {
                     text: "second".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3255,7 +3901,7 @@ mod tests {
 
         let rows_before = count_conversation_rows(&db).await;
         let empty = mgr
-            .send_prompt_linked(&db, conn_id, vec![], Some(folder_id), None, None)
+            .send_prompt_linked(&db, conn_id, vec![], Some(folder_id), None, None, None)
             .await;
         assert!(empty.is_err(), "an empty prompt must be rejected");
         assert_eq!(
@@ -3280,6 +3926,7 @@ mod tests {
                 conn_id,
                 vec![PromptInputBlock::Text { text: "hi".into() }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3311,8 +3958,14 @@ mod tests {
             .await
             .turn_in_flight = true;
 
+        let busy_db = crate::db::test_helpers::fresh_in_memory_db().await;
         let res = mgr
-            .send_prompt(conn_id, vec![PromptInputBlock::Text { text: "hi".into() }])
+            .send_prompt(
+                &busy_db,
+                conn_id,
+                vec![PromptInputBlock::Text { text: "hi".into() }],
+                None,
+            )
             .await;
         assert!(
             matches!(res, Err(AcpError::TurnInProgress)),
@@ -3555,6 +4208,7 @@ mod tests {
 
         // send_prompt_inner now blocks on reserve(); drop it via a short timeout.
         let fut = mgr.send_prompt_inner(
+            None,
             conn_id,
             vec![PromptInputBlock::Text {
                 text: "blocked".into(),
@@ -3562,6 +4216,7 @@ mod tests {
             None,
             true,
             true,
+            None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(
@@ -3605,6 +4260,7 @@ mod tests {
             None,
             None,
             Some("optimistic-abc".to_string()),
+            None,
         )
         .await
         .expect("send");
@@ -3650,6 +4306,7 @@ mod tests {
                     text: "never enqueued".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3705,6 +4362,7 @@ mod tests {
                 parent_tool_use_id: "tu-1".into(),
                 delegation_call_id: "call-1".into(),
             }),
+            None,
         )
         .await
         .expect("delegation kickoff enqueues");
@@ -3836,6 +4494,7 @@ mod tests {
             Some(folder_id),
             None,
             None,
+            None,
         )
         .await
         .expect("send should succeed with a live receiver");
@@ -3878,6 +4537,7 @@ mod tests {
                 uri: None,
             }],
             Some(folder_id),
+            None,
             None,
             None,
         )
@@ -3953,7 +4613,15 @@ mod tests {
         // First call: creates conversation row, sets state.conversation_id.
         // The mpsc send error after linking is expected and ignored here.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
         let snap = mgr
             .get_state(conn_id)
@@ -3971,7 +4639,15 @@ mod tests {
 
         // Second call: ignores folder_id, does NOT create another row.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
         let snap2 = mgr
             .get_state(conn_id)
@@ -3994,7 +4670,7 @@ mod tests {
             map.insert(conn_id.into(), fake_connection(conn_id, None));
         }
         let result = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), None, None, None)
+            .send_prompt_linked(&db, conn_id, one_text_block(), None, None, None, None)
             .await;
         assert!(
             result.is_err(),
@@ -4054,6 +4730,7 @@ mod tests {
                 one_text_block(),
                 Some(folder_id),
                 Some(pre_existing.id),
+                None,
                 None,
             )
             .await;
@@ -4132,7 +4809,15 @@ mod tests {
         // cmd_tx receiver is dropped → the prompt send fails after linking, but
         // the link + external_id persist + broadcast already happened.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let cid = mgr
@@ -4187,6 +4872,7 @@ mod tests {
                 Some(folder_id),
                 Some(pre.id),
                 None,
+                None,
             )
             .await;
 
@@ -4217,7 +4903,7 @@ mod tests {
         .await;
 
         let err = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), None, Some(42), None)
+            .send_prompt_linked(&db, conn_id, one_text_block(), None, Some(42), None, None)
             .await
             .expect_err("should reject conversation_id without folder_id");
         assert!(matches!(err, AcpError::Protocol(_)));
@@ -4259,6 +4945,7 @@ mod tests {
                 one_text_block(),
                 Some(folder_id),
                 Some(pre.id),
+                None,
                 None,
             )
             .await;
@@ -4330,7 +5017,15 @@ mod tests {
         //   2. ConversationStatusChanged(InProgress)  [pre-send write]
         //   3. ConversationStatusChanged(Cancelled)   [rollback after send failure]
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let env1 = recv_first_acp_event(&mut rx).await;
@@ -4399,7 +5094,15 @@ mod tests {
             .unwrap();
 
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let env4 = recv_first_acp_event(&mut rx).await;
@@ -4566,6 +5269,7 @@ mod tests {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect("reuse must succeed even when new shell is unavailable");
@@ -4599,6 +5303,7 @@ mod tests {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect_err("unavailable shell must fail before process spawn");
@@ -4697,6 +5402,7 @@ mod tests {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect("reuse");
@@ -4977,12 +5683,28 @@ mod tests {
         tokio::join!(
             async {
                 let _ = mgr_ref
-                    .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+                    .send_prompt_linked(
+                        &db,
+                        conn_id,
+                        one_text_block(),
+                        Some(folder_id),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             },
             async {
                 let _ = mgr_ref
-                    .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+                    .send_prompt_linked(
+                        &db,
+                        conn_id,
+                        one_text_block(),
+                        Some(folder_id),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             },
         );
@@ -5180,6 +5902,7 @@ mod tests {
                 Some(folder_id),
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -5256,6 +5979,7 @@ mod tests {
                     text: "trigger send failure".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
