@@ -541,15 +541,15 @@ impl RuntimeStatsProjector {
                     },
                 );
             }
+            // Per-path counts come only from the single selected evidence;
+            // set rather than sum so equivalent representations never stack.
             if let (Some(entry), Some((a, d))) = (path_map.get_mut(&key), path_add) {
-                let add = entry.additions.unwrap_or(0).saturating_add(a);
-                let del = entry.deletions.unwrap_or(0).saturating_add(d);
-                entry.additions = Some(add);
-                entry.deletions = Some(del);
+                entry.additions = Some(a);
+                entry.deletions = Some(d);
             }
         };
 
-        // Collect paths from locations / structured sources.
+        // Path discovery unions every allowed source; line counts do not.
         for path in extract_paths_from_locations(state.locations.as_ref()) {
             insert_path(&path, None);
         }
@@ -567,94 +567,44 @@ impl RuntimeStatsProjector {
             for path in extract_paths_from_object(&value) {
                 insert_path(&path, None);
             }
-            // Per-path counts from changes map entries.
-            for (path, (a, d)) in extract_per_path_line_counts(&value) {
-                insert_path(&path, Some((a, d)));
-            }
         }
 
-        // Call-level line counts from structured sources.
+        // At most one line-count evidence representation per stable call.
         let mut call_additions: Option<u64> = None;
         let mut call_deletions: Option<u64> = None;
-        let mut accumulate_call = |add: u64, del: u64| {
-            call_additions = Some(call_additions.unwrap_or(0).saturating_add(add));
-            call_deletions = Some(call_deletions.unwrap_or(0).saturating_add(del));
-        };
-
-        for value in [
-            state
-                .raw_input
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-            state.meta.clone(),
-            state.structured_result.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some((a, d)) = extract_call_level_line_counts(&value) {
-                accumulate_call(a, d);
-            }
-        }
-
-        // If we have call-level counts and exactly one path with no per-path
-        // attribution yet, attribute them to that path.
-        if let (Some(add), Some(del)) = (call_additions, call_deletions) {
-            let unattributed: Vec<_> = path_order
-                .iter()
-                .filter(|k| {
-                    path_map
-                        .get(*k)
-                        .is_some_and(|p| p.additions.is_none() && p.deletions.is_none())
-                })
-                .cloned()
-                .collect();
-            if unattributed.len() == 1 {
-                if let Some(entry) = path_map.get_mut(&unattributed[0]) {
-                    entry.additions = Some(add);
-                    entry.deletions = Some(del);
-                }
-            }
-            // Prefer per-path sum when every path has counts; else call-level.
-            let all_paths_counted = !path_order.is_empty()
-                && path_order.iter().all(|k| {
-                    path_map
-                        .get(k)
-                        .is_some_and(|p| p.additions.is_some() && p.deletions.is_some())
-                });
-            if all_paths_counted {
+        match select_line_evidence(state) {
+            Some(SelectedLineEvidence::Changes(per_path)) => {
                 let mut sum_a = 0u64;
                 let mut sum_d = 0u64;
-                for k in &path_order {
-                    if let Some(p) = path_map.get(k) {
-                        sum_a = sum_a.saturating_add(p.additions.unwrap_or(0));
-                        sum_d = sum_d.saturating_add(p.deletions.unwrap_or(0));
-                    }
-                }
-                // Prefer explicit call-level if present; they may equal sum.
-                // Keep call-level as the aggregate when set.
-                let _ = (sum_a, sum_d);
-            }
-        } else {
-            // Derive call-level from per-path if all paths have counts.
-            let all_paths_counted = !path_order.is_empty()
-                && path_order.iter().all(|k| {
-                    path_map
-                        .get(k)
-                        .is_some_and(|p| p.additions.is_some() && p.deletions.is_some())
-                });
-            if all_paths_counted {
-                let mut sum_a = 0u64;
-                let mut sum_d = 0u64;
-                for k in &path_order {
-                    if let Some(p) = path_map.get(k) {
-                        sum_a = sum_a.saturating_add(p.additions.unwrap_or(0));
-                        sum_d = sum_d.saturating_add(p.deletions.unwrap_or(0));
-                    }
+                for (path, (a, d)) in &per_path {
+                    insert_path(path, Some((*a, *d)));
+                    sum_a = sum_a.saturating_add(*a);
+                    sum_d = sum_d.saturating_add(*d);
                 }
                 call_additions = Some(sum_a);
                 call_deletions = Some(sum_d);
             }
+            Some(SelectedLineEvidence::Aggregate(add, del)) => {
+                call_additions = Some(add);
+                call_deletions = Some(del);
+                // Attribute call-level counts to a single unattributed path.
+                let unattributed: Vec<_> = path_order
+                    .iter()
+                    .filter(|k| {
+                        path_map
+                            .get(*k)
+                            .is_some_and(|p| p.additions.is_none() && p.deletions.is_none())
+                    })
+                    .cloned()
+                    .collect();
+                if unattributed.len() == 1 {
+                    if let Some(entry) = path_map.get_mut(&unattributed[0]) {
+                        entry.additions = Some(add);
+                        entry.deletions = Some(del);
+                    }
+                }
+            }
+            None => {}
         }
 
         // Paths without per-path counts: for textual edits leave None so
@@ -813,25 +763,7 @@ fn is_pure_move_or_rename(state: &ToolProjectionState) -> bool {
 }
 
 fn has_usable_textual_payload(state: &ToolProjectionState) -> bool {
-    for value in [
-        state
-            .raw_input
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
-        state.meta.clone(),
-        state.structured_result.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if extract_call_level_line_counts(&value).is_some() {
-            return true;
-        }
-        if !extract_per_path_line_counts(&value).is_empty() {
-            return true;
-        }
-    }
-    false
+    select_line_evidence(state).is_some()
 }
 
 fn canonical_tool_name(state: &ToolProjectionState) -> Option<String> {
@@ -1073,38 +1005,38 @@ fn extract_paths_from_object(value: &serde_json::Value) -> Vec<String> {
     paths
 }
 
-fn extract_per_path_line_counts(value: &serde_json::Value) -> Vec<(String, (u64, u64))> {
-    let mut out = Vec::new();
-    let candidates = [
-        Some(value),
-        value.get("structuredContent"),
-        value.get("result"),
-        value
-            .get("result")
-            .and_then(|result| result.get("structuredContent")),
-        value.get("output"),
-        value
-            .get("output")
-            .and_then(|output| output.get("structuredContent")),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        let Some(object) = candidate.as_object() else {
-            continue;
-        };
-        let Some(changes) = object.get("changes").and_then(|c| c.as_object()) else {
-            continue;
-        };
-        for (path, entry) in changes {
-            if let Some((a, d)) = line_counts_from_change_entry(entry) {
-                out.push((path.clone(), (a, d)));
-            }
-        }
-    }
-    out
+/// One selected line-count evidence representation for a stable tool call.
+/// Paths may still be discovered from every source; counts come only from here.
+#[derive(Debug, Clone)]
+enum SelectedLineEvidence {
+    /// Fully countable `changes` map: each entry contributes per-path counts.
+    Changes(Vec<(String, (u64, u64))>),
+    /// Call-level counts from one patch/diff, old/new, or content write.
+    Aggregate(u64, u64),
 }
 
-fn extract_call_level_line_counts(value: &serde_json::Value) -> Option<(u64, u64)> {
-    let candidates = [
+/// Source precedence: structured_result > meta > parsed raw_input.
+/// Within one source: complete changes > first patch/diff key > old/new > content.
+/// Never sums equivalent wrapper candidates, keys, or sources.
+fn select_line_evidence(state: &ToolProjectionState) -> Option<SelectedLineEvidence> {
+    let sources = [
+        state.structured_result.clone(),
+        state.meta.clone(),
+        state
+            .raw_input
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+    ];
+    for source in sources.into_iter().flatten() {
+        if let Some(evidence) = select_line_evidence_from_source(&source) {
+            return Some(evidence);
+        }
+    }
+    None
+}
+
+fn wrapper_candidates(value: &serde_json::Value) -> [Option<&serde_json::Value>; 6] {
+    [
         Some(value),
         value.get("structuredContent"),
         value.get("result"),
@@ -1115,61 +1047,68 @@ fn extract_call_level_line_counts(value: &serde_json::Value) -> Option<(u64, u64
         value
             .get("output")
             .and_then(|output| output.get("structuredContent")),
-    ];
-    let mut total_add = 0u64;
-    let mut total_del = 0u64;
-    let mut found = false;
-    for candidate in candidates.into_iter().flatten() {
+    ]
+}
+
+fn select_line_evidence_from_source(value: &serde_json::Value) -> Option<SelectedLineEvidence> {
+    // 1. Prefer one fully countable changes map (first wrapper that qualifies).
+    for candidate in wrapper_candidates(value).into_iter().flatten() {
+        if let Some(per_path) = fully_countable_changes(candidate) {
+            return Some(SelectedLineEvidence::Changes(per_path));
+        }
+    }
+    // 2. First usable patch / diff / unified_diff / unifiedDiff.
+    for candidate in wrapper_candidates(value).into_iter().flatten() {
         let Some(object) = candidate.as_object() else {
             continue;
         };
-        // Per-path changes summed as call-level when present.
-        if let Some(changes) = object.get("changes").and_then(|c| c.as_object()) {
-            let mut all_ok = !changes.is_empty();
-            let mut sum_a = 0u64;
-            let mut sum_d = 0u64;
-            for entry in changes.values() {
-                if let Some((a, d)) = line_counts_from_change_entry(entry) {
-                    sum_a = sum_a.saturating_add(a);
-                    sum_d = sum_d.saturating_add(d);
-                } else {
-                    all_ok = false;
-                    break;
-                }
-            }
-            if all_ok {
-                total_add = total_add.saturating_add(sum_a);
-                total_del = total_del.saturating_add(sum_d);
-                found = true;
-            }
-        }
         for key in ["patch", "diff", "unified_diff", "unifiedDiff"] {
             if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
                 let (a, d) = count_unified_diff_lines(text);
-                total_add = total_add.saturating_add(a);
-                total_del = total_del.saturating_add(d);
-                found = true;
+                return Some(SelectedLineEvidence::Aggregate(a, d));
             }
         }
-        // old/new pairs at top level
+    }
+    // 3. One old/new pair.
+    for candidate in wrapper_candidates(value).into_iter().flatten() {
+        let Some(object) = candidate.as_object() else {
+            continue;
+        };
         if let Some((a, d)) = line_counts_from_old_new(object) {
-            total_add = total_add.saturating_add(a);
-            total_del = total_del.saturating_add(d);
-            found = true;
+            return Some(SelectedLineEvidence::Aggregate(a, d));
         }
-        // write content / new_source
+    }
+    // 4. One content / new_source write.
+    for candidate in wrapper_candidates(value).into_iter().flatten() {
+        let Some(object) = candidate.as_object() else {
+            continue;
+        };
         if let Some(content) = object
             .get("content")
             .or_else(|| object.get("new_source"))
             .and_then(|v| v.as_str())
         {
             let (a, d) = count_write_content_lines(content);
-            total_add = total_add.saturating_add(a);
-            total_del = total_del.saturating_add(d);
-            found = true;
+            return Some(SelectedLineEvidence::Aggregate(a, d));
         }
     }
-    found.then_some((total_add, total_del))
+    None
+}
+
+/// Returns per-path counts only when every entry in `changes` is countable.
+/// A partially countable map is not selected; callers fall through to other keys.
+fn fully_countable_changes(value: &serde_json::Value) -> Option<Vec<(String, (u64, u64))>> {
+    let object = value.as_object()?;
+    let changes = object.get("changes")?.as_object()?;
+    if changes.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(changes.len());
+    for (path, entry) in changes {
+        let (a, d) = line_counts_from_change_entry(entry)?;
+        out.push((path.clone(), (a, d)));
+    }
+    Some(out)
 }
 
 fn line_counts_from_change_entry(entry: &serde_json::Value) -> Option<(u64, u64)> {
@@ -1625,6 +1564,110 @@ mod tests {
         assert_eq!(after_replay.touched_files[0].path, "a.rs");
         assert_eq!(
             (after_replay.additions, after_replay.deletions),
+            (Some(1), Some(0))
+        );
+    }
+
+    #[test]
+    fn equivalent_line_evidence_is_counted_once_per_stable_call() {
+        let mut projector = RuntimeStatsProjector::new(Utc::now(), PathBuf::from("/repo"));
+        projector.apply(&tool_call_with_input(
+            "duplicate-evidence",
+            "edit",
+            "apply_patch",
+            r#"{"file_path":"/repo/a.rs","old_text":"a","new_text":"a\nb"}"#,
+        ));
+        projector.apply(&tool_update_with_output(
+            "duplicate-evidence",
+            Some(
+                r#"{"changes":{"/repo/a.rs":{"old_text":"a","new_text":"a\nb"}},"diff":" a\n+b"}"#,
+            ),
+            Some(false),
+        ));
+        let stats = projector.snapshot();
+        assert_eq!(stats.edit_tool_call_count, 1);
+        assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
+        assert_eq!(
+            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (Some(1), Some(0))
+        );
+    }
+
+    #[test]
+    fn line_counts_fall_back_to_meta_when_structured_result_has_none() {
+        let mut projector = RuntimeStatsProjector::new(Utc::now(), PathBuf::from("/repo"));
+        // Path-only structured result (classifies as edit via kind, no counts).
+        projector.apply(&tool_call(
+            "meta-fallback",
+            "edit",
+            "edit",
+            Some(json!([{"path": "/repo/a.rs"}])),
+            Some(json!({
+                "file_path": "/repo/a.rs",
+                "old_text": "a",
+                "new_text": "a\nb"
+            })),
+        ));
+        // Structured result without usable line evidence should not block meta.
+        projector.apply(&tool_update_with_output(
+            "meta-fallback",
+            Some(r#"{"ok":true}"#),
+            Some(false),
+        ));
+        let stats = projector.snapshot();
+        assert_eq!(stats.edit_tool_call_count, 1);
+        assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
+        assert_eq!(
+            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (Some(1), Some(0))
+        );
+    }
+
+    #[test]
+    fn line_counts_fall_back_to_raw_input_when_higher_sources_have_none() {
+        let mut projector = RuntimeStatsProjector::new(Utc::now(), PathBuf::from("/repo"));
+        projector.apply(&tool_call_with_input(
+            "raw-fallback",
+            "edit",
+            "apply_patch",
+            r#"{"file_path":"/repo/a.rs","old_text":"a","new_text":"a\nb"}"#,
+        ));
+        // Opaque non-count structured_result must not clear raw_input counts.
+        projector.apply(&tool_update_with_output(
+            "raw-fallback",
+            Some(r#"{"status":"done"}"#),
+            Some(false),
+        ));
+        let stats = projector.snapshot();
+        assert_eq!(stats.edit_tool_call_count, 1);
+        assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
+        assert_eq!(
+            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (Some(1), Some(0))
+        );
+    }
+
+    #[test]
+    fn partially_countable_changes_fall_through_to_sibling_diff_key() {
+        let mut projector = RuntimeStatsProjector::new(Utc::now(), PathBuf::from("/repo"));
+        projector.apply(&tool_call_with_input(
+            "partial-changes",
+            "edit",
+            "apply_patch",
+            &json!({
+                "file_path": "/repo/a.rs",
+                "changes": {
+                    "/repo/a.rs": {"note": "no countable payload"}
+                },
+                "diff": " a\n+b"
+            })
+            .to_string(),
+        ));
+        let stats = projector.snapshot();
+        assert_eq!(stats.edit_tool_call_count, 1);
+        assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
+        assert_eq!(
+            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
             (Some(1), Some(0))
         );
     }
