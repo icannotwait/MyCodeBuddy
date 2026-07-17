@@ -146,7 +146,10 @@ impl LiveRuntimeState {
         }
     }
 
+    /// Test-only: pin the projector critical section for deterministic races.
+    /// Compiled under `test-utils` for fixture parity; only unit tests call it.
     #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
     async fn install_projector_gate(
         &self,
         entered: tokio::sync::oneshot::Sender<()>,
@@ -158,7 +161,10 @@ impl LiveRuntimeState {
         });
     }
 
+    /// Test-only: pin the publication critical section for deterministic races.
+    /// Compiled under `test-utils` for fixture parity; only unit tests call it.
     #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
     async fn install_publication_gate(
         &self,
         entered: tokio::sync::oneshot::Sender<()>,
