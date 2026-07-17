@@ -7,6 +7,7 @@ use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
+use crate::auto_title::InternalAgentSessionRegistry;
 use crate::chat_channel::manager::ChatChannelManager;
 use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
@@ -28,6 +29,9 @@ pub struct AppState {
     pub acp_event_bus: Arc<InternalEventBus>,
     pub emitter: EventEmitter,
     pub data_dir: PathBuf,
+    /// Shared registry of internal-only agent sessions (auto-title runs, etc.).
+    /// One instance is cloned into Tauri managed state and embedded Axum state.
+    pub internal_sessions: Arc<InternalAgentSessionRegistry>,
     pub web_server_state: WebServerState,
     pub chat_channel_manager: ChatChannelManager,
     pub workspace_transfer: Arc<WorkspaceTransferManager>,
@@ -310,6 +314,11 @@ impl AppState {
 
         let connection_manager = default_connection_manager();
         let stack = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
+        // Freshly migrated fixture DB: empty registry is correct and keeps
+        // this constructor synchronous for existing integration tests.
+        let internal_sessions =
+            InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), &data_dir)
+                .expect("empty internal session registry for tests");
 
         Self {
             db,
@@ -319,6 +328,7 @@ impl AppState {
             acp_event_bus,
             emitter,
             data_dir,
+            internal_sessions,
             web_server_state: crate::web::WebServerState::new(),
             chat_channel_manager: default_chat_channel_manager(),
             workspace_transfer: Arc::new(

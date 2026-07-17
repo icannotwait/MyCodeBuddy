@@ -783,6 +783,12 @@ pub(crate) async fn do_start_web_server_tauri(
         data_dir: crate::paths::resolve_effective_data_dir(
             &app.path().app_data_dir().unwrap_or_default(),
         ),
+        // Clone the desktop-managed registry so HTTP handlers and direct Tauri
+        // commands observe the same exclusion set.
+        internal_sessions: app
+            .state::<Arc<crate::auto_title::InternalAgentSessionRegistry>>()
+            .inner()
+            .clone(),
         web_server_state: WebServerState::new(), // placeholder; not used by handlers
         chat_channel_manager: crate::app_state::default_chat_channel_manager(),
         workspace_transfer: app

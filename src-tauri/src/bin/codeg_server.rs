@@ -260,6 +260,16 @@ async fn async_main() -> ExitCode {
         db.conn.clone(),
         data_dir.clone(),
     );
+    let internal_sessions =
+        match codeg_lib::auto_title::InternalAgentSessionRegistry::load(db.conn.clone(), &data_dir)
+            .await
+        {
+            Ok(reg) => reg,
+            Err(e) => {
+                tracing::error!("[SERVER] failed to load internal session registry: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -268,6 +278,7 @@ async fn async_main() -> ExitCode {
         acp_event_bus: acp_event_bus.clone(),
         emitter,
         data_dir,
+        internal_sessions: internal_sessions.clone(),
         web_server_state: WebServerState::new(),
         chat_channel_manager: codeg_lib::app_state::default_chat_channel_manager(),
         workspace_transfer: Arc::new(
@@ -358,6 +369,7 @@ async fn async_main() -> ExitCode {
                 Arc::new(codeg_lib::db::AppDatabase {
                     conn: state.db.conn.clone(),
                 }),
+                state.internal_sessions.clone(),
             )),
         );
         let socket = stack.socket_path.clone();

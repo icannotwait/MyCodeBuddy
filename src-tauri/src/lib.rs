@@ -321,6 +321,20 @@ mod tauri_app {
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
 
+                // One shared internal-session registry for Tauri commands and the
+                // embedded Axum AppState (cloned into both surfaces).
+                let internal_sessions = {
+                    let db = app.state::<db::AppDatabase>();
+                    tauri::async_runtime::block_on(
+                        crate::auto_title::InternalAgentSessionRegistry::load(
+                            db.conn.clone(),
+                            &effective_data_dir,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+                };
+                app.manage(internal_sessions);
+
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
                 tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
@@ -624,6 +638,11 @@ mod tauri_app {
                                 std::sync::Arc::new(db::AppDatabase {
                                     conn: db_conn.clone(),
                                 }),
+                                app.state::<std::sync::Arc<
+                                    crate::auto_title::InternalAgentSessionRegistry,
+                                >>()
+                                .inner()
+                                .clone(),
                             ),
                         ),
                     );

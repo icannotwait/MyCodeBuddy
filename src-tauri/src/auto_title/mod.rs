@@ -4,8 +4,13 @@
 //! claims, the runner, and the coordinator land in later tasks.
 
 pub mod context;
+pub mod internal_sessions;
 pub mod service;
 pub mod types;
+
+pub use internal_sessions::{
+    InternalAgentSessionRegistry, InternalSessionFilter, InternalSessionPurpose,
+};
 
 pub use context::{bound_context, project_visible_prompt};
 pub use service::{
