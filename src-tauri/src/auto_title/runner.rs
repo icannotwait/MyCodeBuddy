@@ -1309,11 +1309,25 @@ mod tests {
         assert!(registry_failure.was_disconnected());
     }
 
+    /// Yield until `pred` is true or wall-clock `budget` elapses.
+    /// Does not advance Tokio virtual time — used when SQLite/registry work
+    /// must finish outside a paused clock.
+    async fn wait_condition_wall(budget: Duration, mut pred: impl FnMut() -> bool, failure: &str) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < budget {
+            if pred() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(pred(), "{failure}");
+    }
+
     #[tokio::test]
     async fn overall_timeout_is_shared_across_spawn_handshake_and_completion() {
         let fixture = hidden_runner_fixture().await;
-        // Pause only after DB/fixture setup — start_paused breaks sqlite pool open.
-        tokio::time::pause();
+        // Configure phase blocks first; run status/config/lease/spawn under
+        // real Tokio time so SQLite setup is not starved by a paused clock.
         fixture.driver.block_spawn.store(true, Ordering::SeqCst);
         fixture.driver.block_identity.store(true, Ordering::SeqCst);
         fixture
@@ -1329,19 +1343,31 @@ mod tests {
         let handle =
             tokio::spawn(async move { runner.run(attempt, CancellationToken::new()).await });
 
-        // Wait until spawn gate entered, advance 40s, release spawn.
-        while !agent.spawn_gate.was_entered() {
-            tokio::task::yield_now().await;
-        }
+        // Real-time condition: spawn gate must be entered before virtual advances.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if agent.spawn_gate.was_entered() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawn gate must be entered before the first timeout slice");
+
+        // Freeze only for the strict 40+40+10 shared-deadline sequence.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(40)).await;
         // Identity will block after spawn; release spawn so identity runs.
         agent.spawn_gate.release();
 
-        // Allow identity subscribe to start, then hold SessionStarted path:
-        // release identity gate after another 40s of wall budget.
-        while !agent.identity_gate.was_entered() {
-            tokio::task::yield_now().await;
-        }
+        // Pure async progress under pause; bound by wall clock, not yield count.
+        wait_condition_wall(
+            Duration::from_secs(5),
+            || agent.identity_gate.was_entered(),
+            "identity gate must be entered after spawn release",
+        )
+        .await;
         tokio::time::advance(Duration::from_secs(40)).await;
         agent.identity_gate.release();
         // identity_and_subscribe returns (None, rx); deliver SessionStarted
@@ -1349,31 +1375,23 @@ mod tests {
         tokio::task::yield_now().await;
         agent.emit_session_started().await;
 
-        // Wait until prompt has been sent (registration complete) then
-        // advance remaining 10s to hit the shared 90s deadline.
-        for _ in 0..200 {
-            if agent.prompt_count.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::advance(Duration::from_millis(1)).await;
-        }
-        assert!(
-            agent.prompt_count.load(Ordering::SeqCst) > 0,
-            "prompt must be sent before final timeout slice"
-        );
+        // Durable registry registration is SQLite work outside virtual time.
+        // Wait on the real prompt_count condition with a wall-clock budget and
+        // only yields — do not advance the virtual clock past second 80.
+        wait_condition_wall(
+            Duration::from_secs(5),
+            || agent.prompt_count.load(Ordering::SeqCst) > 0,
+            "prompt must be sent before final timeout slice",
+        )
+        .await;
         // Shared deadline is exactly 90s: settle before awaiting the join.
         tokio::time::advance(Duration::from_secs(10)).await;
-        for _ in 0..100 {
-            if handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            handle.is_finished(),
-            "runner must settle at overall second 90 (shared deadline)"
-        );
+        wait_condition_wall(
+            Duration::from_secs(5),
+            || handle.is_finished(),
+            "runner must settle at overall second 90 (shared deadline)",
+        )
+        .await;
 
         let result = handle.await.expect("join");
         assert!(
@@ -1477,6 +1495,11 @@ mod tests {
             "must not prompt before registration"
         );
 
+        // Resume real Tokio time before SessionStarted so durable registry DB
+        // work and end_turn completion are not raced by virtual auto-advance
+        // or fixed yield budgets under full-suite load.
+        tokio::time::resume();
+
         // Deliver identity before the overall 90s deadline.
         agent.emit_session_started().await;
         {
@@ -1492,15 +1515,11 @@ mod tests {
                 "SessionStarted must apply external_id on session state"
             );
         }
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-            if handle.is_finished() {
-                break;
-            }
-            tokio::time::advance(Duration::from_millis(5)).await;
-        }
-        assert!(handle.is_finished(), "runner must settle after end_turn");
-        let title = handle.await.expect("task").expect("title ok");
+        let title = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("runner must settle after end_turn")
+            .expect("task")
+            .expect("title ok");
         assert_eq!(title, "Slow handshake title");
         assert_eq!(
             agent.prompt_count(),
