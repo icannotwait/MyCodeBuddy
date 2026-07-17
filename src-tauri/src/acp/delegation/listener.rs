@@ -474,8 +474,9 @@ impl DelegationListener {
     /// and query the status of every requested task id. Legacy requests (no
     /// `return_when`) keep snapshot / supervised / any-terminal waits. Join
     /// requests require `return_when=all_terminal_or_attention` with explicit
-    /// `wait_ms=0`. Invalid-token Join still returns Join-shaped additive fields
-    /// without revealing ownership.
+    /// `wait_ms=0` and a token that advertised `coordination_v1`. Invalid-token
+    /// or capability-denied Join still returns Join-shaped additive fields
+    /// without revealing ownership and without parking.
     async fn process_status(&self, req: BrokerStatusRequest) -> DelegationStatusBatch {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             let unknown_reports: Vec<_> =
@@ -489,6 +490,15 @@ impl DelegationListener {
                 ),
             };
         };
+        // Connection-bound capability: a legacy token must not enter Join or
+        // consult Broker ownership even if raw socket JSON sends return_when.
+        if req.return_when.is_some() && !entry.coordination_v1 {
+            return DelegationStatusBatch::joined(
+                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            );
+        }
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
@@ -1303,6 +1313,29 @@ mod tests {
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
         (broker, tokens, task_id)
+    }
+
+    /// A legacy token (`coordination_v1=false`) must not enter Join or reveal
+    /// whether a requested running task exists, even if raw socket JSON sends
+    /// `return_when=all_terminal_or_attention`.
+    #[tokio::test]
+    async fn legacy_token_cannot_enter_join_or_reveal_a_running_task() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let batch = tokio::time::timeout(
+            Duration::from_secs(1),
+            listener.process_status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec![task_id],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .expect("legacy-token Join rejection must not park");
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
+        assert!(batch.attention_requests.unwrap().is_empty());
     }
 
     /// Omitted `wait_ms` (the safe default) maps to an immediate snapshot: the
