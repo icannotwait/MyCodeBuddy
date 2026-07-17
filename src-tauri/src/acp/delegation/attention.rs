@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
 };
-use sea_orm::sea_query::Expr;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -167,10 +167,8 @@ pub trait DelegationAttentionStore: Send + Sync {
         parent_conversation_id: i32,
         task_ids: &[String],
     ) -> Result<Vec<AttentionRequestSummary>, AttentionStoreError>;
-    async fn wait_snapshot(
-        &self,
-        request_id: &str,
-    ) -> Result<AttentionRecord, AttentionStoreError>;
+    async fn wait_snapshot(&self, request_id: &str)
+        -> Result<AttentionRecord, AttentionStoreError>;
     async fn reply(
         &self,
         parent_conversation_id: i32,
@@ -277,7 +275,10 @@ impl DbDelegationAttentionStore {
         Self { db }
     }
 
-    async fn load_required(&self, request_id: &str) -> Result<AttentionRecord, AttentionStoreError> {
+    async fn load_required(
+        &self,
+        request_id: &str,
+    ) -> Result<AttentionRecord, AttentionStoreError> {
         match self.find_by_id(request_id).await? {
             Some(record) => Ok(record),
             None => Err(AttentionStoreError::Database(
@@ -566,7 +567,10 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
                 .one(&self.db.conn)
                 .await
                 .map_err(map_db)?;
-            let code = match child.as_ref().and_then(|c| c.delegation_task_status.as_ref()) {
+            let code = match child
+                .as_ref()
+                .and_then(|c| c.delegation_task_status.as_ref())
+            {
                 Some(DelegationTaskStatus::Running) => AttentionResolutionCode::HostRestarted,
                 _ => AttentionResolutionCode::TaskTerminal,
             };

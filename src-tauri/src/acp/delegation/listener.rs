@@ -713,9 +713,9 @@ fn legacy_wait_from(wait_ms: Option<u64>) -> StatusWait {
     match wait_ms {
         None => StatusWait::Snapshot,
         Some(0) => StatusWait::Terminal,
-        Some(ms) => StatusWait::Supervised(std::time::Duration::from_millis(
-            ms.min(STATUS_WAIT_MAX_MS),
-        )),
+        Some(ms) => {
+            StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
+        }
     }
 }
 
@@ -1262,7 +1262,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(1_000),
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1319,7 +1319,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: None,
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         // No completion ever happens — an immediate poll must still return.
@@ -1346,7 +1346,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(0),
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1396,7 +1396,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: Some(0),
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1484,7 +1484,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![t1.clone(), t2.clone()],
             wait_ms: None,
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1515,7 +1515,7 @@ mod tests {
             token: "bad-token".into(),
             task_ids: vec!["a".into(), "b".into()],
             wait_ms: None,
-                    return_when: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1820,22 +1820,13 @@ mod tests {
     async fn token_registry_revoke_and_revoke_by_parent() {
         let registry = TokenRegistry::default();
         registry
-            .register(
-                "t1".into(),
-                TokenEntry::legacy("p1", PathBuf::from("/tmp")),
-            )
+            .register("t1".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
             .await;
         registry
-            .register(
-                "t2".into(),
-                TokenEntry::legacy("p1", PathBuf::from("/tmp")),
-            )
+            .register("t2".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
             .await;
         registry
-            .register(
-                "t3".into(),
-                TokenEntry::legacy("p2", PathBuf::from("/tmp")),
-            )
+            .register("t3".into(), TokenEntry::legacy("p2", PathBuf::from("/tmp")))
             .await;
 
         registry.revoke("t1").await;

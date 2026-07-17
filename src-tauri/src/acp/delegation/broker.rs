@@ -57,9 +57,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::acp::delegation::attention::{
-    DelegationAttentionStore, NoopDelegationAttentionStore,
-};
+use crate::acp::delegation::attention::{DelegationAttentionStore, NoopDelegationAttentionStore};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -3956,8 +3954,7 @@ impl DelegationBroker {
 
             let unavailable = tasks.iter().any(|task| task.status == TaskStatus::Unknown)
                 || class_views.iter().zip(&tasks).any(|(class, task)| {
-                    matches!(class, StatusClass::NotInMemory)
-                        && task.status == TaskStatus::Running
+                    matches!(class, StatusClass::NotInMemory) && task.status == TaskStatus::Running
                 });
             if unavailable {
                 return DelegationStatusBatch::joined(
@@ -5004,10 +5001,8 @@ mod tests {
         use crate::acp::delegation::store::DelegationTaskStore;
 
         let (broker, _spawner, _attention) = join_broker().await;
-        let unknown = within(
-            broker.join_tasks_status("parent", Some(1), &["missing".to_string()]),
-        )
-        .await;
+        let unknown =
+            within(broker.join_tasks_status("parent", Some(1), &["missing".to_string()])).await;
         assert_eq!(unknown.wake_reason, Some(DelegationWakeReason::Unavailable));
         assert_eq!(unknown.tasks[0].status, TaskStatus::Unknown);
 
@@ -5025,10 +5020,9 @@ mod tests {
         )
         .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>);
         enable_delegation(&cold_broker).await;
-        let cold = within(
-            cold_broker.join_tasks_status("parent", Some(1), &["cold-running".to_string()]),
-        )
-        .await;
+        let cold =
+            within(cold_broker.join_tasks_status("parent", Some(1), &["cold-running".to_string()]))
+                .await;
         assert_eq!(cold.wake_reason, Some(DelegationWakeReason::Unavailable));
         assert_eq!(cold.tasks[0].status, TaskStatus::Running);
         assert_eq!(

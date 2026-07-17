@@ -632,8 +632,8 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", r.status));
     let conversation_id = r.id;
-    let delegation_runtime_stats = match decode_persisted_runtime_stats(
-        PersistedRuntimeStatsColumns {
+    let delegation_runtime_stats =
+        match decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
             started_at: r.delegation_started_at,
             finished_at: r.delegation_finished_at,
             tool_call_count: r.delegation_tool_call_count,
@@ -643,18 +643,17 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
             additions: r.delegation_additions,
             deletions: r.delegation_deletions,
             line_counts_complete: r.delegation_line_counts_complete,
-        },
-    ) {
-        Ok(stats) => stats,
-        Err(err) => {
-            tracing::warn!(
-                conversation_id,
-                error = %err,
-                "[conversation_service] failed to decode delegation_runtime_stats"
-            );
-            None
-        }
-    };
+        }) {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %err,
+                    "[conversation_service] failed to decode delegation_runtime_stats"
+                );
+                None
+            }
+        };
     DbConversationSummary {
         id: r.id,
         folder_id: r.folder_id,
@@ -1457,7 +1456,10 @@ mod tests {
         assert!(regular.delegation_tool_call_count.is_none());
         assert_eq!(delegated.delegation_tool_call_count, Some(0));
         assert_eq!(delegated.delegation_edit_tool_call_count, Some(0));
-        assert_eq!(delegated.delegation_touched_files_json.as_deref(), Some("[]"));
+        assert_eq!(
+            delegated.delegation_touched_files_json.as_deref(),
+            Some("[]")
+        );
         assert_eq!(delegated.delegation_touched_files_truncated, Some(false));
         assert_eq!(delegated.delegation_line_counts_complete, Some(false));
     }

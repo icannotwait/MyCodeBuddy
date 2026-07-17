@@ -158,8 +158,7 @@ async fn end_to_end_named_pipe_happy_path() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp"),
-            ),
+            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp")),
         )
         .await;
 
@@ -220,8 +219,8 @@ async fn end_to_end_named_pipe_happy_path() {
         token: "tok".into(),
         task_ids: vec![task_id],
         wait_ms: Some(1_000),
-                return_when: None,
-        };
+        return_when: None,
+    };
     let resp = client_status_round_trip_with_retry(&pipe, &status_req)
         .await
         .expect("status round-trip");
@@ -260,8 +259,7 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp"),
-            ),
+            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp")),
         )
         .await;
     let listener = DelegationListener::new(

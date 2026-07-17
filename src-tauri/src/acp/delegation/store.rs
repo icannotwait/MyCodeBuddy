@@ -489,9 +489,8 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         task_id: &str,
         stats: &DelegationRuntimeStats,
     ) -> Result<(), TaskStoreError> {
-        let tool_call_count = i64::try_from(stats.tool_call_count).map_err(|_| {
-            TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into())
-        })?;
+        let tool_call_count = i64::try_from(stats.tool_call_count)
+            .map_err(|_| TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into()))?;
         let edit_tool_call_count = i64::try_from(stats.edit_tool_call_count).map_err(|_| {
             TaskStoreError::Permanent("runtime edit_tool_call_count exceeds i64".into())
         })?;
@@ -551,18 +550,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         } else {
             update = update
                 .filter(
-                    conversation::Column::DelegationTaskStatus
-                        .ne(DelegationTaskStatus::Running),
+                    conversation::Column::DelegationTaskStatus.ne(DelegationTaskStatus::Running),
                 )
-                .filter(
-                    conversation::Column::DelegationFinishedAt.eq(stats.finished_at),
-                );
+                .filter(conversation::Column::DelegationFinishedAt.eq(stats.finished_at));
         }
 
-        let result = update
-            .exec(&self.db.conn)
-            .await
-            .map_err(Self::map_db_err)?;
+        let result = update.exec(&self.db.conn).await.map_err(Self::map_db_err)?;
 
         if result.rows_affected > 0 {
             return Ok(());

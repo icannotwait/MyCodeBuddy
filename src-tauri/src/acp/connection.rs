@@ -2232,9 +2232,7 @@ async fn inject_codeg_mcp(
     let delegation_enabled = plan.expose_codeg_delegation;
     // Join capability is connection-bound and follows Codeg delegation exposure.
     let coordination_v1 = plan.expose_codeg_delegation;
-    let role = if plan.source
-        == crate::acp::delegation::route::DelegationRouteSource::ForcedChild
-    {
+    let role = if plan.source == crate::acp::delegation::route::DelegationRouteSource::ForcedChild {
         crate::acp::delegation::transport::CompanionRole::DelegationChild
     } else {
         crate::acp::delegation::transport::CompanionRole::Root
@@ -2281,9 +2279,7 @@ async fn inject_codeg_mcp(
     };
     let role_arg = match role {
         crate::acp::delegation::transport::CompanionRole::Root => "root",
-        crate::acp::delegation::transport::CompanionRole::DelegationChild => {
-            "delegation_child"
-        }
+        crate::acp::delegation::transport::CompanionRole::DelegationChild => "delegation_child",
     };
     let mut server = McpServerStdio::new("codeg-mcp", binary_path);
     server = server.args(vec![

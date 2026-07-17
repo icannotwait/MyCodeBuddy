@@ -107,8 +107,8 @@ pub fn decode_persisted_runtime_stats(
     };
     let tool_call_count =
         u64::try_from(tool_call_count).map_err(|_| RuntimeStatsDecodeError::InvalidCount)?;
-    let edit_tool_call_count = u64::try_from(edit_tool_call_count)
-        .map_err(|_| RuntimeStatsDecodeError::InvalidCount)?;
+    let edit_tool_call_count =
+        u64::try_from(edit_tool_call_count).map_err(|_| RuntimeStatsDecodeError::InvalidCount)?;
     let additions = additions
         .map(u64::try_from)
         .transpose()
@@ -266,7 +266,8 @@ impl RuntimeStatsProjector {
         let id = tool_call_id.to_string();
         let is_new = !self.calls.contains_key(&id);
         if is_new {
-            self.calls.insert(id.clone(), ToolProjectionState::default());
+            self.calls
+                .insert(id.clone(), ToolProjectionState::default());
             self.stats.tool_call_count = self.stats.tool_call_count.saturating_add(1);
         }
         {
@@ -326,10 +327,7 @@ impl RuntimeStatsProjector {
             }
         }
 
-        let previous = self
-            .contributions
-            .remove(&id)
-            .unwrap_or_default();
+        let previous = self.contributions.remove(&id).unwrap_or_default();
         self.subtract_contribution(&previous);
 
         let state = self.calls.get(&id).cloned().unwrap_or_default();
@@ -389,9 +387,7 @@ impl RuntimeStatsProjector {
             if path.textual_edit {
                 match (path.additions, path.deletions) {
                     (Some(add), Some(del)) => {
-                        if let Some(c) =
-                            self.retained_path_textual_with_counts.get_mut(&path.key)
-                        {
+                        if let Some(c) = self.retained_path_textual_with_counts.get_mut(&path.key) {
                             *c = c.saturating_sub(1);
                             if *c == 0 {
                                 self.retained_path_textual_with_counts.remove(&path.key);
@@ -410,8 +406,7 @@ impl RuntimeStatsProjector {
                         {
                             *c = c.saturating_sub(1);
                             if *c == 0 {
-                                self.retained_path_textual_without_counts
-                                    .remove(&path.key);
+                                self.retained_path_textual_without_counts.remove(&path.key);
                             }
                         }
                     }
@@ -440,10 +435,8 @@ impl RuntimeStatsProjector {
                 (Some(add), Some(del)) => {
                     self.textual_edits_with_counts =
                         self.textual_edits_with_counts.saturating_add(1);
-                    self.known_additions =
-                        self.known_additions.saturating_add(u128::from(add));
-                    self.known_deletions =
-                        self.known_deletions.saturating_add(u128::from(del));
+                    self.known_additions = self.known_additions.saturating_add(u128::from(add));
+                    self.known_deletions = self.known_deletions.saturating_add(u128::from(del));
                 }
                 _ => {
                     self.textual_edits_without_counts =
@@ -522,10 +515,8 @@ impl RuntimeStatsProjector {
             .collect();
 
         if self.textual_edits_with_counts > 0 && self.textual_edits_without_counts == 0 {
-            self.stats.additions =
-                Some(self.known_additions.min(u128::from(u64::MAX)) as u64);
-            self.stats.deletions =
-                Some(self.known_deletions.min(u128::from(u64::MAX)) as u64);
+            self.stats.additions = Some(self.known_additions.min(u128::from(u64::MAX)) as u64);
+            self.stats.deletions = Some(self.known_deletions.min(u128::from(u64::MAX)) as u64);
             self.stats.line_counts_complete = true;
         } else {
             self.stats.additions = None;
@@ -741,10 +732,7 @@ fn is_structured_edit(state: &ToolProjectionState) -> bool {
         // wrapper applied a mutation; no command text is inspected.
         return true;
     }
-    if matches!(
-        state.kind.as_deref(),
-        Some("command" | "shell" | "execute")
-    ) {
+    if matches!(state.kind.as_deref(), Some("command" | "shell" | "execute")) {
         return false;
     }
     matches!(
@@ -787,23 +775,16 @@ fn has_usable_textual_payload(state: &ToolProjectionState) -> bool {
 }
 
 fn canonical_tool_name(state: &ToolProjectionState) -> Option<String> {
-    if matches!(
-        state.kind.as_deref(),
-        Some("command" | "shell" | "execute")
-    ) {
+    if matches!(state.kind.as_deref(), Some("command" | "shell" | "execute")) {
         return None;
     }
-    let title_name = state
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| {
-            !title.is_empty()
-                && !matches!(
-                    title.to_ascii_lowercase().as_str(),
-                    "tool" | "use_tool" | "mcp"
-                )
-        });
+    let title_name = state.title.as_deref().map(str::trim).filter(|title| {
+        !title.is_empty()
+            && !matches!(
+                title.to_ascii_lowercase().as_str(),
+                "tool" | "use_tool" | "mcp"
+            )
+    });
     let meta_name = state.meta.as_ref().and_then(|meta| {
         meta.get("tool_name")
             .or_else(|| meta.get("toolName"))
@@ -818,10 +799,7 @@ fn canonical_tool_name(state: &ToolProjectionState) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    let normalized = raw
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .replace(' ', "_");
+    let normalized = raw.to_ascii_lowercase().replace('-', "_").replace(' ', "_");
     normalized
         .rsplit("__")
         .next()
@@ -877,7 +855,12 @@ fn has_structured_mutation(value: &serde_json::Value) -> bool {
         "movePath",
     ]
     .iter()
-    .any(|key| object.get(*key).and_then(serde_json::Value::as_str).is_some());
+    .any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    });
     let has_payload = [
         "old_string",
         "new_string",
@@ -944,11 +927,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn lexical_strip_prefix(
-    path: &Path,
-    workspace: &Path,
-    case_insensitive: bool,
-) -> Option<PathBuf> {
+fn lexical_strip_prefix(path: &Path, workspace: &Path, case_insensitive: bool) -> Option<PathBuf> {
     if !case_insensitive {
         return path.strip_prefix(workspace).ok().map(Path::to_path_buf);
     }
@@ -1299,7 +1278,10 @@ mod tests {
 
     fn tool_call_with_input(id: &str, kind: &str, title: &str, raw_input: &str) -> AcpEvent {
         let mut event = tool_call(id, kind, title, None, None);
-        if let AcpEvent::ToolCall { raw_input: slot, .. } = &mut event {
+        if let AcpEvent::ToolCall {
+            raw_input: slot, ..
+        } = &mut event
+        {
             *slot = Some(raw_input.to_string());
         }
         event
@@ -1394,9 +1376,7 @@ mod tests {
 
         // more than 200 paths
         let many: Vec<_> = (0..201)
-            .map(|i| {
-                format!(r#"{{"path":"f{i}.rs","outside_workspace":false}}"#)
-            })
+            .map(|i| format!(r#"{{"path":"f{i}.rs","outside_workspace":false}}"#))
             .collect();
         let json = format!("[{}]", many.join(","));
         let mut cols = base_columns();
@@ -1409,8 +1389,7 @@ mod tests {
 
         // blank path
         let mut cols = base_columns();
-        cols.touched_files_json =
-            Some(r#"[{"path":"  ","outside_workspace":false}]"#);
+        cols.touched_files_json = Some(r#"[{"path":"  ","outside_workspace":false}]"#);
         assert_eq!(
             decode_persisted_runtime_stats(cols),
             Err(RuntimeStatsDecodeError::InvalidInvariant)
@@ -1608,7 +1587,10 @@ mod tests {
         assert_eq!(stats.edit_tool_call_count, 1);
         assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
         assert_eq!(
-            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (
+                stats.touched_files[0].additions,
+                stats.touched_files[0].deletions
+            ),
             (Some(1), Some(0))
         );
     }
@@ -1638,7 +1620,10 @@ mod tests {
         assert_eq!(stats.edit_tool_call_count, 1);
         assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
         assert_eq!(
-            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (
+                stats.touched_files[0].additions,
+                stats.touched_files[0].deletions
+            ),
             (Some(1), Some(0))
         );
     }
@@ -1662,7 +1647,10 @@ mod tests {
         assert_eq!(stats.edit_tool_call_count, 1);
         assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
         assert_eq!(
-            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (
+                stats.touched_files[0].additions,
+                stats.touched_files[0].deletions
+            ),
             (Some(1), Some(0))
         );
     }
@@ -1687,22 +1675,19 @@ mod tests {
         assert_eq!(stats.edit_tool_call_count, 1);
         assert_eq!((stats.additions, stats.deletions), (Some(1), Some(0)));
         assert_eq!(
-            (stats.touched_files[0].additions, stats.touched_files[0].deletions),
+            (
+                stats.touched_files[0].additions,
+                stats.touched_files[0].deletions
+            ),
             (Some(1), Some(0))
         );
     }
 
     #[test]
     fn case_insensitive_paths_dedupe_and_cap_at_two_hundred() {
-        let mut projector = RuntimeStatsProjector::new_for_test(
-            Utc::now(),
-            PathBuf::from("/repo"),
-            true,
-        );
-        projector.apply(&edit_with_paths(
-            "tc-case",
-            vec!["A.rs", "a.rs"],
-        ));
+        let mut projector =
+            RuntimeStatsProjector::new_for_test(Utc::now(), PathBuf::from("/repo"), true);
+        projector.apply(&edit_with_paths("tc-case", vec!["A.rs", "a.rs"]));
         for i in 0..MAX_TOUCHED_FILES + 5 {
             projector.apply(&edit_with_paths(
                 &format!("tc-{i}"),
@@ -1721,12 +1706,8 @@ mod tests {
         assert!(projector.retained_path_ref_counts.len() <= MAX_TOUCHED_FILES);
         assert!(projector.retained_path_additions.len() <= MAX_TOUCHED_FILES);
         assert!(projector.retained_path_deletions.len() <= MAX_TOUCHED_FILES);
-        assert!(
-            projector.retained_path_textual_with_counts.len() <= MAX_TOUCHED_FILES
-        );
-        assert!(
-            projector.retained_path_textual_without_counts.len() <= MAX_TOUCHED_FILES
-        );
+        assert!(projector.retained_path_textual_with_counts.len() <= MAX_TOUCHED_FILES);
+        assert!(projector.retained_path_textual_without_counts.len() <= MAX_TOUCHED_FILES);
         assert_eq!(
             projector
                 .contributions
@@ -1739,11 +1720,8 @@ mod tests {
 
     #[test]
     fn overflow_only_edit_keeps_call_counts_without_retaining_path() {
-        let mut projector = RuntimeStatsProjector::new_for_test(
-            Utc::now(),
-            PathBuf::from("/repo"),
-            true,
-        );
+        let mut projector =
+            RuntimeStatsProjector::new_for_test(Utc::now(), PathBuf::from("/repo"), true);
         for i in 0..MAX_TOUCHED_FILES {
             projector.apply(&structured_patch(
                 &format!("tc-{i}"),
@@ -1769,10 +1747,7 @@ mod tests {
         );
         assert_eq!(
             (stats.additions, stats.deletions),
-            (
-                Some((MAX_TOUCHED_FILES as u64).saturating_add(1)),
-                Some(0)
-            )
+            (Some((MAX_TOUCHED_FILES as u64).saturating_add(1)), Some(0))
         );
         assert!(stats.line_counts_complete);
         assert_eq!(projector.retained_path_order.len(), MAX_TOUCHED_FILES);

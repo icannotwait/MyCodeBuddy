@@ -8471,8 +8471,7 @@ mod tests {
         tokens
             .register(
                 token.clone(),
-                TokenEntry::legacy("unexposed-1", PathBuf::from("/tmp"),
-                ),
+                TokenEntry::legacy("unexposed-1", PathBuf::from("/tmp")),
             )
             .await;
         let mut waiter = leases.register(&token).await;
@@ -8663,8 +8662,7 @@ mod tests {
         tokens
             .register(
                 token.clone(),
-                TokenEntry::legacy("stuck-1", PathBuf::from("/tmp"),
-                ),
+                TokenEntry::legacy("stuck-1", PathBuf::from("/tmp")),
             )
             .await;
         let _waiter = leases.register(&token).await;

@@ -381,10 +381,7 @@ pub async fn dispatch_line(
                     // and hide return_when so old connections cannot call Join.
                     if !ctx.features.coordination_v1 {
                         for tool in &mut filtered {
-                            let name = tool
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
+                            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                             match name {
                                 "delegate_to_agent" => {
                                     if let Some(obj) = tool.as_object_mut() {
@@ -953,8 +950,7 @@ fn render_status_envelope(envelope: Value, tasks: &[Value]) -> Value {
         && tasks
             .iter()
             .all(|task| task.get("status").and_then(Value::as_str) == Some("failed"));
-    let text = serde_json::to_string(&envelope)
-        .unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
+    let text = serde_json::to_string(&envelope).unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
     json!({
         "content": [{"type": "text", "text": text}],
         "isError": all_failed,
@@ -978,9 +974,7 @@ pub fn parse_return_when(
         return Err("return_when must be all_terminal_or_attention".into());
     }
     if arguments.get("wait_ms").and_then(Value::as_u64) != Some(0) {
-        return Err(
-            "return_when=all_terminal_or_attention requires explicit wait_ms=0".into(),
-        );
+        return Err("return_when=all_terminal_or_attention requires explicit wait_ms=0".into());
     }
     Ok(Some(DelegationReturnWhen::AllTerminalOrAttention))
 }
@@ -1835,11 +1829,9 @@ mod tests {
             false,
         )
         .is_err());
-        assert!(parse_return_when(
-            &json!({"return_when":"all_terminal_or_attention"}),
-            true,
-        )
-        .is_err());
+        assert!(
+            parse_return_when(&json!({"return_when":"all_terminal_or_attention"}), true,).is_err()
+        );
         assert!(parse_return_when(
             &json!({"return_when":"all_terminal_or_attention","wait_ms":1}),
             true,
@@ -2156,13 +2148,7 @@ mod tests {
         let all = CompanionFeatures::parse(Some(
             " delegation , coordination_v1 , feedback , ask , sessions ,bogus",
         ));
-        assert!(
-            all.delegation
-                && all.coordination_v1
-                && all.feedback
-                && all.ask
-                && all.sessions
-        );
+        assert!(all.delegation && all.coordination_v1 && all.feedback && all.ask && all.sessions);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
         let ask = CompanionFeatures::parse(Some("ask"));
