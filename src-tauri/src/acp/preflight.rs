@@ -84,7 +84,7 @@ pub async fn run_preflight(
     };
 
     // Host Codex CLI is required when the effective launch env enables CLI mode
-    // (distribution defaults include CODEX_ACP_USE_CLI=1; user env can override),
+    // (distribution defaults to CODEX_ACP_USE_CLI=0; user env can set 1),
     // and always on Windows (bundled adapter spawns host `codex app-server`).
     let effective_env = merge_distribution_env(meta.distribution.env(), runtime_env);
     if agent_type == AgentType::Codex

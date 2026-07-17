@@ -314,14 +314,15 @@ function patchEnvText(
 export const CODEX_ACP_USE_CLI_ENV = "CODEX_ACP_USE_CLI"
 
 /**
- * Product default injects `CODEX_ACP_USE_CLI=1` at launch via distribution env
- * on all platforms. Agent Settings can pin `0` to opt out (user env wins).
- * Platform arg kept for call-site compatibility; default is platform-independent.
+ * Product default injects `CODEX_ACP_USE_CLI=0` at launch via distribution env
+ * on all platforms (app-server). Agent Settings can pin `1` to enable CLI exec
+ * (user env wins). Platform arg kept for call-site compatibility; default is
+ * platform-independent.
  */
 export function codexCliRuntimeDefaultOn(
   _platform?: "macos" | "windows" | "linux" | "unknown"
 ): boolean {
-  return true
+  return false
 }
 
 /** Effective CLI-exec switch from Agent env text + platform default. */

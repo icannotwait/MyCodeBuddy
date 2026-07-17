@@ -81,11 +81,11 @@ const emptyCustoms = {
 
 describe("Codex CLI runtime env toggle", () => {
   it("defaults on for all platforms", () => {
-    expect(codexCliRuntimeDefaultOn("windows")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("macos")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("linux")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("unknown")).toBe(true)
-    expect(codexCliRuntimeDefaultOn()).toBe(true)
+    expect(codexCliRuntimeDefaultOn("windows")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("macos")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("linux")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("unknown")).toBe(false)
+    expect(codexCliRuntimeDefaultOn()).toBe(false)
   })
 
   it("treats absent env as the platform default", () => {
