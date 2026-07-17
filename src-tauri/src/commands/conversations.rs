@@ -567,42 +567,63 @@ pub async fn import_local_conversations(
     .await
 }
 
-/// Build the `meta["codeg.delegation"]` value for a delegation child loaded
-/// from the DB. Mirrors the shape produced at runtime by
-/// `acp::delegation::meta_writer::build_delegation_meta`, but only includes
-/// the fields the DB can vouch for: `status` and `child_conversation_id`.
-/// `child_connection_id` is omitted (no live connection for a historical
-/// view; the frontend's parser treats it as optional).
+/// Build the INNER `meta["codeg.delegation"]` value for a delegation child
+/// loaded from the DB. Uses one canonical [`DelegationMetaSnapshot`] shape so
+/// cold reconstruction matches live broker writes.
 ///
-/// Status mapping:
-///  - `in_progress` → `running` (still streaming or about to)
-///  - `pending_review` → `completed` (set by `TurnComplete { stop_reason:
-///    "end_turn" }` — the success path; the live broker writes `completed`
-///    for this same outcome, see `acp/delegation/broker.rs` Ok arm).
-///  - `completed` → `completed`
-///  - `cancelled` → `failed` with NO `error_code`. The DB's `Cancelled`
-///    variant covers both user-cancel and turn-failure modes (refusal,
-///    max_tokens, max_turn_requests, empty, unknown — see
-///    `acp/lifecycle.rs` TurnComplete branch), and the broker writes a
-///    distinct `error_code` per failure mode at runtime. Since the DB
-///    persists only the bucket and not the specific code, we cannot
-///    truthfully label the failure here — emit `failed` without a code
-///    rather than mislabel non-cancel failures as `"canceled"`.
-///  - other (defensive) → `running`
+/// Durable lifecycle rows (`delegation_task_status` present) take precedence
+/// over conversation-row status and carry task id, error code, timestamps,
+/// optional runtime stats, and optional open attention. Pre-lifecycle rows
+/// (null task status) fall back to conversation-status mapping; runtime is
+/// omitted entirely when durable stats are absent — never fabricate zeroes.
 fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json::Value {
-    let status: &str = match child.status.as_str() {
-        "in_progress" => "running",
-        "pending_review" | "completed" => "completed",
-        "cancelled" => "failed",
-        _ => "running",
+    use crate::acp::delegation::meta_writer::DelegationMetaSnapshot;
+    use crate::db::entities::conversation::DelegationTaskStatus;
+
+    let (status, error_code): (String, Option<String>) =
+        if let Some(task_status) = child.delegation_task_status.as_ref() {
+            match task_status {
+                DelegationTaskStatus::Running => ("running".into(), None),
+                DelegationTaskStatus::Completed => ("completed".into(), None),
+                DelegationTaskStatus::Failed => {
+                    ("failed".into(), child.delegation_error_code.clone())
+                }
+                DelegationTaskStatus::Canceled => {
+                    ("failed".into(), child.delegation_error_code.clone())
+                }
+            }
+        } else {
+            // Pre-lifecycle conversation-status mapping (no durable task row).
+            // `cancelled` covers both user-cancel and turn-failure modes; the
+            // DB does not persist a distinct error_code for those rows.
+            let status = match child.status.as_str() {
+                "in_progress" => "running",
+                "pending_review" | "completed" => "completed",
+                "cancelled" => "failed",
+                _ => "running",
+            };
+            (status.into(), None)
+        };
+
+    let snapshot = DelegationMetaSnapshot {
+        status,
+        task_id: child
+            .delegation_call_id
+            .clone()
+            .unwrap_or_default(),
+        child_connection_id: None,
+        child_conversation_id: child.id,
+        error_code,
+        text_preview: None,
+        started_at: child
+            .delegation_started_at
+            .unwrap_or(child.created_at),
+        finished_at: child.delegation_finished_at,
+        // Historical null → omit; never fabricate zero counts.
+        runtime_stats: child.delegation_runtime_stats.clone(),
+        attention_request: child.delegation_attention_request.clone(),
     };
-    let mut obj = serde_json::Map::new();
-    obj.insert("status".into(), serde_json::Value::String(status.into()));
-    obj.insert(
-        "child_conversation_id".into(),
-        serde_json::Value::Number(child.id.into()),
-    );
-    serde_json::Value::Object(obj)
+    serde_json::to_value(&snapshot).expect("historical delegation meta is serializable")
 }
 
 fn delegation_task_id_from_value(value: &serde_json::Value) -> Option<String> {
@@ -678,13 +699,23 @@ fn delegation_task_ids_by_tool_use_id(turns: &[MessageTurn]) -> HashMap<String, 
 }
 
 /// Walk every `delegate_to_agent` ToolUse block in `turns` and, when its
-/// `tool_use_id` matches a child conversation in `children`, set
-/// `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
-/// whose meta is already populated so the live-broker write (when present)
-/// always wins. Tool-name match is by substring to cover the
-/// MCP-prefixed (`mcp__codeg-mcp__delegate_to_agent`) and bare forms
-/// the host may have emitted.
+/// `tool_use_id` matches a child conversation in `children`, project
+/// durable `meta["codeg.delegation"]`.
+///
+/// Precedence:
+/// - Durable lifecycle rows (`delegation_task_status` present): replace only
+///   the `codeg.delegation` subobject (preserve sibling metadata). This
+///   recovers terminal truth after a crash between task CAS and meta write
+///   even when stale live meta still says `running`.
+/// - Pre-lifecycle rows (null task status): live-meta-wins fallback — inject
+///   only when `meta` is absent (historical recovery without clobbering a
+///   live broker write).
+///
+/// Tool-name match is by substring to cover the MCP-prefixed
+/// (`mcp__codeg-mcp__delegate_to_agent`) and bare forms the host may emit.
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
+    use crate::acp::delegation::meta_writer::DELEGATION_META_KEY;
+
     if children.is_empty() {
         return;
     }
@@ -706,9 +737,6 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
                 ..
             } = block
             {
-                if meta.is_some() {
-                    continue;
-                }
                 if !tool_name.contains("delegate_to_agent") {
                     continue;
                 }
@@ -717,10 +745,25 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
                         .get(tu.as_str())
                         .and_then(|task_id| by_delegation_call_id.get(task_id.as_str()).copied())
                 });
-                if let Some(child) = child {
-                    *meta = Some(serde_json::json!({
-                        "codeg.delegation": build_historical_delegation_meta(child),
-                    }));
+                let Some(child) = child else {
+                    continue;
+                };
+                let durable = build_historical_delegation_meta(child);
+                if child.delegation_task_status.is_some() {
+                    let object = meta
+                        .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
+                        .as_object_mut();
+                    if let Some(object) = object {
+                        object.insert(DELEGATION_META_KEY.to_string(), durable);
+                    } else {
+                        let mut object = serde_json::Map::new();
+                        object.insert(DELEGATION_META_KEY.to_string(), durable);
+                        *meta = Some(serde_json::Value::Object(object));
+                    }
+                } else if meta.is_none() {
+                    let mut object = serde_json::Map::new();
+                    object.insert(DELEGATION_META_KEY.to_string(), durable);
+                    *meta = Some(serde_json::Value::Object(object));
                 }
             }
         }
@@ -2279,7 +2322,96 @@ mod tests {
             delegation_started_at: None,
             delegation_finished_at: None,
             delegation_runtime_stats: None,
+            delegation_attention_request: None,
         }
+    }
+
+    fn finished_stats() -> crate::acp::delegation::runtime_stats::DelegationRuntimeStats {
+        use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
+        let started = chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut stats = DelegationRuntimeStats::empty(started);
+        stats.tool_call_count = 4;
+        stats.finished_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-07-17T10:05:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        stats
+    }
+
+    #[test]
+    fn historical_meta_carries_durable_rollup_and_stable_terminal_code() {
+        use crate::db::entities::conversation::DelegationTaskStatus;
+
+        let mut child = summary_child(2, "tool-1", "failed");
+        child.delegation_call_id = Some("task-1".into());
+        child.delegation_error_code = Some("join_abandoned".into());
+        child.delegation_task_status = Some(DelegationTaskStatus::Failed);
+        child.delegation_started_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        child.delegation_finished_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-07-17T10:05:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        child.delegation_runtime_stats = Some(finished_stats());
+        let meta = build_historical_delegation_meta(&child);
+        assert_eq!(meta["task_id"], "task-1");
+        assert_eq!(meta["error_code"], "join_abandoned");
+        assert_eq!(meta["runtime_stats"]["tool_call_count"], 4);
+        assert!(meta["runtime_stats"]["finished_at"].is_string());
+    }
+
+    #[test]
+    fn pre_feature_meta_omits_runtime_instead_of_fabricating_zeroes() {
+        let child = summary_child(2, "tool-1", "completed");
+        let meta = build_historical_delegation_meta(&child);
+        assert!(meta.get("runtime_stats").is_none());
+    }
+
+    #[test]
+    fn inject_delegation_meta_durable_lifecycle_replaces_stale_running_preserves_sibling() {
+        use crate::db::entities::conversation::DelegationTaskStatus;
+
+        let pre_existing = serde_json::json!({
+            "codeg.delegation": {
+                "status": "running",
+                "child_conversation_id": 999
+            },
+            "sibling_key": "keep-me"
+        });
+        let mut turns = vec![MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                tool_use_id: Some("tu-1".into()),
+                tool_name: "delegate_to_agent".into(),
+                input_preview: None,
+                meta: Some(pre_existing),
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+        let mut child = summary_child(42, "tu-1", "cancelled");
+        child.delegation_call_id = Some("task-join".into());
+        child.delegation_task_status = Some(DelegationTaskStatus::Failed);
+        child.delegation_error_code = Some("join_abandoned".into());
+        inject_delegation_meta(&mut turns, &[child]);
+        let meta = first_block_meta(&turns[0]).expect("meta");
+        assert_eq!(meta["sibling_key"], "keep-me");
+        let inner = meta.get("codeg.delegation").expect("delegation");
+        assert_eq!(inner["status"], "failed");
+        assert_eq!(inner["error_code"], "join_abandoned");
+        assert_eq!(inner["child_conversation_id"], 42);
+        assert_eq!(inner["task_id"], "task-join");
     }
 
     async fn make_parent_and_delegate(db: &crate::db::AppDatabase) -> (i32, i32, i32) {

@@ -80,6 +80,11 @@ pub struct DbConversationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_runtime_stats:
         Option<crate::acp::delegation::runtime_stats::DelegationRuntimeStats>,
+    /// Open parent-decision attention for this delegate task, if any.
+    /// Filled by a bulk query in conversation_service (never N+1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_attention_request:
+        Option<crate::acp::delegation::attention::AttentionRequestSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]

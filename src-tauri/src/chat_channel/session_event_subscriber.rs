@@ -1245,6 +1245,11 @@ mod async_relay_dedup_tests {
                 child_connection_id: "child".into(),
                 child_conversation_id: 5,
                 agent_type: AgentType::Codex,
+                task_id: "task-1".into(),
+                runtime_stats:
+                    crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(
+                        chrono::Utc::now(),
+                    ),
                 result: DelegationResultSummary::Ok {
                     duration_ms: 3,
                     text_preview: Some("done".into()),

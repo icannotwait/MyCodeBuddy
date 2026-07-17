@@ -683,7 +683,65 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         delegation_started_at: r.delegation_started_at,
         delegation_finished_at: r.delegation_finished_at,
         delegation_runtime_stats,
+        // Pure mapper: open attention is bulk-filled by
+        // `fill_open_delegation_attention` over the returned set.
+        delegation_attention_request: None,
     }
+}
+
+/// Attach at most one open attention request per summary that carries a
+/// non-empty `delegation_call_id`. ONE SeaORM query over all task ids —
+/// never N+1. Ordered by `CreatedAt ASC, RequestId ASC` so the earliest open
+/// request wins when duplicates exist.
+pub async fn fill_open_delegation_attention(
+    conn: &DatabaseConnection,
+    summaries: &mut [DbConversationSummary],
+) -> Result<(), DbError> {
+    use crate::acp::delegation::attention::AttentionRequestSummary;
+    use crate::db::entities::delegation_attention_request;
+
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    let task_ids: Vec<String> = summaries
+        .iter()
+        .filter_map(|s| {
+            s.delegation_call_id
+                .as_ref()
+                .filter(|id| !id.is_empty())
+                .cloned()
+        })
+        .collect();
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+    let rows = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::TaskId.is_in(task_ids))
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .order_by_asc(delegation_attention_request::Column::CreatedAt)
+        .order_by_asc(delegation_attention_request::Column::RequestId)
+        .all(conn)
+        .await?;
+    let mut by_task: std::collections::HashMap<String, AttentionRequestSummary> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_task.entry(row.task_id.clone()).or_insert_with(|| {
+            AttentionRequestSummary {
+                request_id: row.request_id,
+                task_id: row.task_id,
+                message: row.message,
+                created_at: row.created_at,
+            }
+        });
+    }
+    for summary in summaries.iter_mut() {
+        if let Some(task_id) = summary.delegation_call_id.as_ref() {
+            if let Some(req) = by_task.get(task_id) {
+                summary.delegation_attention_request = Some(req.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Backfill each summary's `child_count` with its number of direct, non-deleted
@@ -911,6 +969,7 @@ pub async fn list_children(
         .await?;
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_child_counts(conn, &mut summaries).await?;
+    fill_open_delegation_attention(conn, &mut summaries).await?;
     Ok(summaries)
 }
 
@@ -1000,6 +1059,109 @@ mod tests {
         );
         assert_eq!(rows[0].id, child_a);
         assert_eq!(rows[0].parent_id, Some(parent_a));
+    }
+
+    #[tokio::test]
+    async fn fill_open_delegation_attention_attaches_at_most_one_open_per_task() {
+        use crate::db::entities::delegation_attention_request;
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-fill-open-attention").await;
+        let (parent_a, child_a) = seed_parent_with_child(&db.conn, folder).await;
+        // Second parent/child uses the same seed helper → call-1 again would
+        // collide; create an extra sibling with a distinct task id.
+        let parent_b = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("P2".into()),
+            None,
+        )
+        .await
+        .expect("parent_b");
+        let child_b = create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("C2".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_b.id,
+                parent_tool_use_id: "tu-2".into(),
+                delegation_call_id: "call-2".into(),
+            }),
+        )
+        .await
+        .expect("child_b");
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // One open row per task (schema UNIQUE on open task_id).
+        for (req_id, task_id, p, c) in [
+            ("req-a", "call-1", parent_a, child_a),
+            ("req-b", "call-2", parent_b.id, child_b.id),
+        ] {
+            let row = delegation_attention_request::ActiveModel {
+                request_id: Set(req_id.into()),
+                task_id: Set(task_id.into()),
+                parent_conversation_id: Set(p),
+                child_conversation_id: Set(c),
+                child_tool_call_id: Set(format!("tc-{req_id}")),
+                status: Set("open".into()),
+                message: Set(format!("msg-{req_id}")),
+                reply: Set(None),
+                resolution_code: Set(None),
+                created_at: Set(t0),
+                resolved_at: Set(None),
+            };
+            row.insert(&db.conn).await.expect("insert attention");
+        }
+        // Bulk fill over two unrelated parent lists proves one query path per
+        // list_children call (not N+1 per child).
+        let rows_a = list_children(&db.conn, parent_a).await.expect("list a");
+        let rows_b = list_children(&db.conn, parent_b.id).await.expect("list b");
+        assert_eq!(
+            rows_a[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-a"
+        );
+        assert_eq!(
+            rows_b[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .message,
+            "msg-req-b"
+        );
+
+        // Explicit fill over a mixed slice still attaches by task id once.
+        let mut mixed = vec![rows_a[0].clone(), rows_b[0].clone()];
+        // Clear then refill.
+        mixed[0].delegation_attention_request = None;
+        mixed[1].delegation_attention_request = None;
+        fill_open_delegation_attention(&db.conn, &mut mixed)
+            .await
+            .expect("bulk fill");
+        assert_eq!(
+            mixed[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-a"
+        );
+        assert_eq!(
+            mixed[1]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-b"
+        );
     }
 
     #[tokio::test]

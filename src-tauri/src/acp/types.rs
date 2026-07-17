@@ -252,13 +252,42 @@ pub enum AcpEvent {
     /// A `delegate_to_agent` MCP tool call from the parent agent has spawned a
     /// child sub-session and the child's prompt is in flight. Emitted as soon
     /// as the broker registers the pending call. The frontend uses this to
-    /// build the parent ↔ child mapping for inline rendering.
+    /// build the parent ↔ child mapping for inline rendering. Carries the
+    /// authoritative accepted-start snapshot (rebased `started_at`, projected
+    /// runtime stats, any already-open attention) so attach/replay recovers
+    /// the visible card without provisional timestamps.
     DelegationStarted {
         parent_connection_id: String,
         parent_tool_use_id: String,
         child_connection_id: String,
         child_conversation_id: i32,
         agent_type: crate::models::agent::AgentType,
+        task_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention_request:
+            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    },
+    /// Live replacement for the active card's runtime rollup. Idempotent: clients
+    /// replace (do not accumulate) the prior `runtime_stats` when `task_id`
+    /// matches the card. Parent-stream operational event only — not a chat
+    /// message.
+    DelegationRuntimeStatsChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    },
+    /// Live replacement for the active card's open attention summary.
+    /// `attention_request: None` clears the card (wire omits the field;
+    /// deserializing/replaying still means clear — Task 10 must map missing to
+    /// `null`, not "preserve prior"). Parent-stream operational event only.
+    DelegationAttentionChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention_request:
+            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.
@@ -273,6 +302,8 @@ pub enum AcpEvent {
         /// can synthesize the binding with the correct agent instead of a
         /// hardcoded default. Mirrors `DelegationStarted.agent_type`.
         agent_type: crate::models::agent::AgentType,
+        task_id: String,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
         result: DelegationResultSummary,
     },
     /// A human submitted a prompt from the Codeg conversation UI (desktop or

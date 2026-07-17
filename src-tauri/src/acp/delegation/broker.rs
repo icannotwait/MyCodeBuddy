@@ -61,14 +61,16 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, Notify};
 
 use crate::acp::delegation::attention::{
-    validate_attention_payload, AttentionRecord, AttentionResolutionCode, AttentionResolveResult,
+    validate_attention_payload, AttentionOpenResult, AttentionRecord, AttentionResolutionCode,
+    AttentionResolveResult,
     AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
     NoopDelegationAttentionStore,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
-    build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaWriter, NoopMetaWriter,
+    build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaSnapshot,
+    DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
@@ -109,6 +111,10 @@ pub(crate) struct LiveRuntimeState {
     flush_scheduled: AtomicBool,
     coalesced_persistence_disabled: AtomicBool,
     terminal: AtomicBool,
+    /// Set true only after enriched `DelegationStarted` publishes under
+    /// `publication_lock`. Gates runtime/attention replacement events and
+    /// running-meta refreshes so pre-start work cannot leak provisional state.
+    started_published: AtomicBool,
     persist_lock: Mutex<()>,
     publication_lock: Mutex<()>,
     /// After acquiring the projector lock and re-checking `terminal`, tests may
@@ -127,6 +133,7 @@ impl LiveRuntimeState {
             flush_scheduled: AtomicBool::new(false),
             coalesced_persistence_disabled: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            started_published: AtomicBool::new(false),
             persist_lock: Mutex::new(()),
             publication_lock: Mutex::new(()),
             projector_gate: Mutex::new(None),
@@ -1773,6 +1780,26 @@ impl DelegationBroker {
         };
         let request_id = opened.record().summary.request_id.clone();
 
+        match &opened {
+            AttentionOpenResult::Opened(record) | AttentionOpenResult::Recovered(record)
+                if record.resolution_code.is_none() =>
+            {
+                // Newly-open or recovered-open: publish running meta + event
+                // only after start publication and while non-terminal.
+                self.publish_attention_open_if_live(
+                    &identity,
+                    &record.summary,
+                    persisted.child_conversation_id,
+                )
+                .await;
+            }
+            AttentionOpenResult::Recovered(record) if record.resolution_code.is_some() => {
+                // Recovered resolved: return stored reply/closure; no open
+                // meta/event (already closed durably).
+            }
+            _ => {}
+        }
+
         // The row is durable before either waiter is nudged.
         self.result_notify.notify_waiters();
         loop {
@@ -1859,7 +1886,17 @@ impl DelegationBroker {
             public,
             DelegationReplyResult::Replied { .. } | DelegationReplyResult::Idempotent { .. }
         ) {
-            // Resolution is durable before the child waiter is nudged.
+            // Durable CAS won (or was already resolved). Publish clear only
+            // while non-terminal and after start; terminal path owns the lock
+            // and does not double-clear. Always wake waiters after.
+            if matches!(public, DelegationReplyResult::Replied { .. }) {
+                self.publish_attention_clear_if_live(
+                    caller_connection_id,
+                    caller_conversation_id,
+                    &record.summary.task_id,
+                )
+                .await;
+            }
             self.attention_notify.notify_waiters();
             self.result_notify.notify_waiters();
         }
@@ -1870,6 +1907,7 @@ impl DelegationBroker {
     /// Persist-before-notify; storage errors are logged and do not undo a
     /// winning task CAS. Always nudges attention waiters so a stuck child can
     /// recheck (and fail open via NotFound / already-resolved snapshot).
+    /// Does **not** publish running-meta clear (terminal path removes the card).
     async fn close_task_attention(
         &self,
         task_id: &str,
@@ -1898,6 +1936,137 @@ impl DelegationBroker {
                 None
             }
         }
+    }
+
+    /// Nonterminal publication for a newly/recovered-open attention request.
+    async fn publish_attention_open_if_live(
+        &self,
+        identity: &CoordinationIdentity,
+        summary: &crate::acp::delegation::attention::AttentionRequestSummary,
+        child_conversation_id: i32,
+    ) {
+        let runtime = &identity.runtime;
+        let _publication = runtime.publication_lock.lock().await;
+        LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
+        if runtime.terminal.load(Ordering::Acquire)
+            || !runtime.started_published.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let stats = runtime.projector.lock().await.snapshot();
+        self.write_meta_if_real(
+            &identity.parent_connection_id,
+            &identity.parent_tool_use_id,
+            build_delegation_meta(&DelegationMetaSnapshot {
+                status: "running".into(),
+                task_id: identity.task_id.clone(),
+                child_connection_id: Some(identity.child_connection_id.clone()),
+                child_conversation_id,
+                error_code: None,
+                text_preview: None,
+                started_at: stats.started_at,
+                finished_at: None,
+                runtime_stats: Some(stats),
+                attention_request: Some(summary.clone()),
+            }),
+        )
+        .await;
+        self.emit_attention_changed_if_real(
+            &identity.parent_connection_id,
+            &identity.parent_tool_use_id,
+            &identity.task_id,
+            Some(summary.clone()),
+        )
+        .await;
+    }
+
+    /// Nonterminal publication for parent-reply clear. Skips when terminal.
+    async fn publish_attention_clear_if_live(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+        task_id: &str,
+    ) {
+        let identity = {
+            self.pending
+                .inner
+                .lock()
+                .await
+                .coordination_by_child
+                .values()
+                .find(|id| {
+                    id.task_id == task_id
+                        && id.parent_connection_id == parent_connection_id
+                        && id.parent_conversation_id == parent_conversation_id
+                })
+                .cloned()
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let runtime = &identity.runtime;
+        let _publication = runtime.publication_lock.lock().await;
+        LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
+        if runtime.terminal.load(Ordering::Acquire)
+            || !runtime.started_published.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let stats = runtime.projector.lock().await.snapshot();
+        let child_conversation_id = {
+            let from_running = self
+                .pending
+                .inner
+                .lock()
+                .await
+                .running
+                .get(task_id)
+                .map(|t| t.child_conversation_id);
+            if let Some(id) = from_running {
+                id
+            } else if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                task.child_conversation_id
+            } else {
+                return;
+            }
+        };
+        self.write_meta_if_real(
+            &identity.parent_connection_id,
+            &identity.parent_tool_use_id,
+            build_delegation_meta(&DelegationMetaSnapshot {
+                status: "running".into(),
+                task_id: identity.task_id.clone(),
+                child_connection_id: Some(identity.child_connection_id.clone()),
+                child_conversation_id,
+                error_code: None,
+                text_preview: None,
+                started_at: stats.started_at,
+                finished_at: None,
+                runtime_stats: Some(stats),
+                attention_request: None,
+            }),
+        )
+        .await;
+        self.emit_attention_changed_if_real(
+            &identity.parent_connection_id,
+            &identity.parent_tool_use_id,
+            &identity.task_id,
+            None,
+        )
+        .await;
+    }
+
+    async fn latest_open_attention(
+        &self,
+        parent_conversation_id: i32,
+        task_id: &str,
+    ) -> Option<crate::acp::delegation::attention::AttentionRequestSummary> {
+        let open = self
+            .attention_store
+            .list_open_for_tasks(parent_conversation_id, &[task_id.to_string()])
+            .await
+            .ok()?;
+        open.into_iter().next()
     }
 
     /// Shared metrics handle for supervisor / listener / tests.
@@ -3409,39 +3578,51 @@ impl DelegationBroker {
             // fall through to the second pre-cancel check and return the ack.
             Disposition::Running => {
                 // Dual-lock protocol: hold publication_lock for running meta +
-                // DelegationStarted; if a child terminal already won and set
-                // `terminal=true`, suppress start publication so it cannot land
-                // after terminal state. If start owns the lock first, it may
-                // finish; terminal publication waits and runs afterward.
+                // enriched DelegationStarted; if a child terminal already won
+                // and set `terminal=true`, suppress start publication so it
+                // cannot land after terminal state. Snapshot current runtime +
+                // open attention under the lock so the start card closes both
+                // pre-start races without leaking a provisional timestamp.
                 let _publication = runtime.publication_lock.lock().await;
                 LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
                 if !runtime.terminal.load(Ordering::Acquire) {
-                    // Mark the parent's tool call as in-flight so the frontend
-                    // DelegationContext can rebind child ids on snapshot replay.
+                    let runtime_stats = runtime.projector.lock().await.snapshot();
+                    let attention_request = self
+                        .latest_open_attention(req.parent_conversation_id, &call_id)
+                        .await;
+                    let started_at = runtime_stats.started_at;
                     self.write_meta_if_real(
                         &req.parent_connection_id,
                         &req.parent_tool_use_id,
-                        build_delegation_meta(
-                            "running",
-                            Some(&child_connection_id),
-                            Some(child_conversation_id),
-                            None,
-                            None,
-                            // No meaningful elapsed yet — the child just started.
-                            None,
-                        ),
+                        build_delegation_meta(&DelegationMetaSnapshot {
+                            status: "running".into(),
+                            task_id: call_id.clone(),
+                            child_connection_id: Some(child_connection_id.clone()),
+                            child_conversation_id,
+                            error_code: None,
+                            text_preview: None,
+                            started_at,
+                            finished_at: None,
+                            runtime_stats: Some(runtime_stats.clone()),
+                            attention_request: attention_request.clone(),
+                        }),
                     )
                     .await;
-                    // Announce on the PARENT stream (symmetric with terminal
-                    // emit_completed_if_real).
                     self.emit_started_if_real(
                         &req.parent_connection_id,
                         &req.parent_tool_use_id,
                         &child_connection_id,
                         child_conversation_id,
                         req.agent_type,
+                        &call_id,
+                        started_at,
+                        runtime_stats,
+                        attention_request,
                     )
                     .await;
+                    runtime
+                        .started_published
+                        .store(true, Ordering::Release);
                 }
             }
         }
@@ -3550,19 +3731,19 @@ impl DelegationBroker {
                 // On win: set terminal=true then hold publication_lock for
                 // attention → final runtime flush → terminal meta → event so a
                 // later runtime publisher cannot overwrite terminal state.
-                let mut _runtime_stats: Option<DelegationRuntimeStats> = None;
                 if won {
                     if let Some(runtime) = ctx.runtime.as_ref() {
                         runtime.terminal.store(true, Ordering::Release);
                         let _publication = runtime.publication_lock.lock().await;
                         LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
+                        // Durable-only attention close under the same lock; no
+                        // redundant clear event (terminal removes the card).
                         let _ = self
                             .close_task_attention(task_id, ctx.attention_resolution)
                             .await;
-                        _runtime_stats = Some(
-                            self.flush_terminal_runtime(task_id, runtime, finished_at)
-                                .await,
-                        );
+                        let runtime_stats = self
+                            .flush_terminal_runtime(task_id, runtime, finished_at)
+                            .await;
                         {
                             let mut inner = self.pending.inner.lock().await;
                             inner.coordination_by_child.remove(&ctx.child_connection_id);
@@ -3573,6 +3754,7 @@ impl DelegationBroker {
                             &report,
                             &ctx,
                             conversation_status,
+                            runtime_stats,
                         )
                         .await;
                     } else {
@@ -3583,11 +3765,13 @@ impl DelegationBroker {
                             let mut inner = self.pending.inner.lock().await;
                             inner.coordination_by_child.remove(&ctx.child_connection_id);
                         }
+                        let runtime_stats = DelegationRuntimeStats::empty(finished_at);
                         self.publish_terminal_meta_and_event(
                             task_id,
                             &report,
                             &ctx,
                             conversation_status,
+                            runtime_stats,
                         )
                         .await;
                     }
@@ -3653,7 +3837,6 @@ impl DelegationBroker {
                     // DelegationCompleted / terminal meta.
                     let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 }
-                let _ = _runtime_stats;
                 report
             }
             Err(err) => {
@@ -3749,10 +3932,11 @@ impl DelegationBroker {
     /// Caller holds `runtime.publication_lock` when a runtime Arc is present.
     async fn publish_terminal_meta_and_event(
         &self,
-        _task_id: &str,
+        task_id: &str,
         report: &DelegationTaskReport,
         ctx: &SettleContext,
         conversation_status: ConversationStatus,
+        runtime_stats: DelegationRuntimeStats,
     ) {
         self.emit_conversation_status_if_real(
             &ctx.parent_connection_id,
@@ -3761,27 +3945,38 @@ impl DelegationBroker {
         )
         .await;
         let outcome_for_meta = report_to_outcome_for_meta(report, ctx);
+        let finished_at = runtime_stats.finished_at;
+        let started_at = runtime_stats.started_at;
+        let snapshot = match &outcome_for_meta {
+            DelegationOutcome::Ok(ok) => DelegationMetaSnapshot {
+                status: "completed".into(),
+                task_id: task_id.to_string(),
+                child_connection_id: Some(ctx.child_connection_id.clone()),
+                child_conversation_id: ctx.child_conversation_id,
+                error_code: None,
+                text_preview: build_text_preview(&ok.text),
+                started_at,
+                finished_at,
+                runtime_stats: Some(runtime_stats.clone()),
+                attention_request: None,
+            },
+            DelegationOutcome::Err { code, .. } => DelegationMetaSnapshot {
+                status: "failed".into(),
+                task_id: task_id.to_string(),
+                child_connection_id: Some(ctx.child_connection_id.clone()),
+                child_conversation_id: ctx.child_conversation_id,
+                error_code: Some(code.clone()),
+                text_preview: None,
+                started_at,
+                finished_at,
+                runtime_stats: Some(runtime_stats.clone()),
+                attention_request: None,
+            },
+        };
         self.write_meta_if_real(
             &ctx.parent_connection_id,
             &ctx.parent_tool_use_id,
-            match &outcome_for_meta {
-                DelegationOutcome::Ok(ok) => build_delegation_meta(
-                    "completed",
-                    Some(&ctx.child_connection_id),
-                    Some(ctx.child_conversation_id),
-                    None,
-                    build_text_preview(&ok.text).as_deref(),
-                    Some(ctx.duration_ms),
-                ),
-                DelegationOutcome::Err { code, .. } => build_delegation_meta(
-                    "failed",
-                    Some(&ctx.child_connection_id),
-                    Some(ctx.child_conversation_id),
-                    Some(code),
-                    None,
-                    Some(ctx.duration_ms),
-                ),
-            },
+            build_delegation_meta(&snapshot),
         )
         .await;
         self.emit_completed_if_real(
@@ -3790,6 +3985,8 @@ impl DelegationBroker {
             &ctx.child_connection_id,
             ctx.child_conversation_id,
             ctx.agent_type,
+            task_id,
+            runtime_stats,
             outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
         )
         .await;
@@ -3823,7 +4020,9 @@ impl DelegationBroker {
         if identity.runtime.terminal.load(Ordering::Acquire) {
             return;
         }
-        let changed = {
+        // Capture the exact post-apply snapshot under the same projector lock
+        // when apply=true — do not unlock/re-lock merely to snapshot.
+        let event_snapshot = {
             let mut projector = identity.runtime.projector.lock().await;
             // Terminal flush sets terminal before taking the projector lock. If
             // this event got the lock first, terminal flush will include it; if
@@ -3835,15 +4034,37 @@ impl DelegationBroker {
             // concurrent terminal flush waits on this lock while the event still
             // owns the right to apply.
             LiveRuntimeState::honor_gate(&identity.runtime.projector_gate).await;
-            projector.apply(event)
+            if projector.apply(event) {
+                Some(projector.snapshot())
+            } else {
+                None
+            }
         };
-        if !changed {
+        let Some(stats) = event_snapshot else {
             return;
-        }
+        };
         identity
             .runtime
             .dirty_version
             .fetch_add(1, Ordering::AcqRel);
+        // Publish live replacement only after start and while non-terminal.
+        // Do not wait 500 ms for SQLite — the coalesced worker owns persistence
+        // and running-meta refresh from the exact written snapshot.
+        {
+            let _publication = identity.runtime.publication_lock.lock().await;
+            LiveRuntimeState::honor_gate(&identity.runtime.publication_gate).await;
+            if identity.runtime.started_published.load(Ordering::Acquire)
+                && !identity.runtime.terminal.load(Ordering::Acquire)
+            {
+                self.emit_runtime_stats_changed_if_real(
+                    &identity.parent_connection_id,
+                    &identity.parent_tool_use_id,
+                    &identity.task_id,
+                    stats,
+                )
+                .await;
+            }
+        }
         self.schedule_runtime_flush(identity.task_id.clone(), identity.runtime);
     }
 
@@ -3878,6 +4099,8 @@ impl DelegationBroker {
             loop {
                 tokio::time::sleep(RUNTIME_STATS_FLUSH_INTERVAL).await;
                 let written_version;
+                let write_ok;
+                let written_stats;
                 {
                     let _persist = state.persist_lock.lock().await;
                     if state.terminal.load(Ordering::Acquire) {
@@ -3886,13 +4109,14 @@ impl DelegationBroker {
                     }
                     written_version = state.dirty_version.load(Ordering::Acquire);
                     let stats = state.projector.lock().await.snapshot();
-                    match tokio::time::timeout(
+                    written_stats = stats.clone();
+                    write_ok = match tokio::time::timeout(
                         RUNTIME_STATS_WRITE_TIMEOUT,
                         broker.task_store.write_runtime_stats(&task_id, &stats),
                     )
                     .await
                     {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => true,
                         Ok(Err(error)) => {
                             if !error.is_transient() {
                                 state
@@ -3903,6 +4127,7 @@ impl DelegationBroker {
                                 RuntimeProjectionErrorKind::Persistence,
                                 &task_id,
                             );
+                            false
                         }
                         Err(_error) => {
                             state
@@ -3912,6 +4137,63 @@ impl DelegationBroker {
                                 RuntimeProjectionErrorKind::Persistence,
                                 &task_id,
                             );
+                            false
+                        }
+                    };
+                    // Release persist_lock before publication_lock — never hold
+                    // persist while waiting on publication.
+                }
+                if write_ok {
+                    // Refresh running meta from the exact snapshot just written
+                    // (not a newer projector view that has not hit SQLite).
+                    let _publication = state.publication_lock.lock().await;
+                    LiveRuntimeState::honor_gate(&state.publication_gate).await;
+                    if state.started_published.load(Ordering::Acquire)
+                        && !state.terminal.load(Ordering::Acquire)
+                    {
+                        if let Some(identity) = broker
+                            .pending
+                            .inner
+                            .lock()
+                            .await
+                            .coordination_by_child
+                            .values()
+                            .find(|id| id.task_id == task_id)
+                            .cloned()
+                        {
+                            let attention = broker
+                                .latest_open_attention(identity.parent_conversation_id, &task_id)
+                                .await;
+                            let child_conversation_id = broker
+                                .pending
+                                .inner
+                                .lock()
+                                .await
+                                .running
+                                .get(&task_id)
+                                .map(|t| t.child_conversation_id);
+                            if let Some(child_conversation_id) = child_conversation_id {
+                                broker
+                                    .write_meta_if_real(
+                                        &identity.parent_connection_id,
+                                        &identity.parent_tool_use_id,
+                                        build_delegation_meta(&DelegationMetaSnapshot {
+                                            status: "running".into(),
+                                            task_id: task_id.clone(),
+                                            child_connection_id: Some(
+                                                identity.child_connection_id.clone(),
+                                            ),
+                                            child_conversation_id,
+                                            error_code: None,
+                                            text_preview: None,
+                                            started_at: written_stats.started_at,
+                                            finished_at: None,
+                                            runtime_stats: Some(written_stats),
+                                            attention_request: attention,
+                                        }),
+                                    )
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -4149,6 +4431,7 @@ impl DelegationBroker {
     /// event rides the parent's stream so the frontend `DelegationContext`
     /// receives it via the parent's per-connection attach stream in
     /// web/server mode (not only via the desktop firehose).
+    #[allow(clippy::too_many_arguments)]
     async fn emit_started_if_real(
         &self,
         parent_connection_id: &str,
@@ -4156,6 +4439,10 @@ impl DelegationBroker {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        task_id: &str,
+        started_at: DateTime<Utc>,
+        runtime_stats: DelegationRuntimeStats,
+        attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     ) {
         if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
             return;
@@ -4167,6 +4454,10 @@ impl DelegationBroker {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_id,
+                started_at,
+                runtime_stats,
+                attention_request,
             )
             .await;
     }
@@ -4176,6 +4467,7 @@ impl DelegationBroker {
     /// Synthetic ids (the `"delegation-<uuid>"` UUID fallback) map to no
     /// live UI binding, so the emit would be wasted noise — same skip
     /// criterion as `write_meta_if_real`.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_completed_if_real(
         &self,
         parent_connection_id: &str,
@@ -4183,6 +4475,8 @@ impl DelegationBroker {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        task_id: &str,
+        runtime_stats: DelegationRuntimeStats,
         result: DelegationResultSummary,
     ) {
         if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
@@ -4195,7 +4489,49 @@ impl DelegationBroker {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_id,
+                runtime_stats,
                 result,
+            )
+            .await;
+    }
+
+    async fn emit_runtime_stats_changed_if_real(
+        &self,
+        parent_connection_id: &str,
+        parent_tool_use_id: &str,
+        task_id: &str,
+        runtime_stats: DelegationRuntimeStats,
+    ) {
+        if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
+            return;
+        }
+        self.event_emitter
+            .emit_runtime_stats_changed(
+                parent_connection_id,
+                parent_tool_use_id,
+                task_id,
+                runtime_stats,
+            )
+            .await;
+    }
+
+    async fn emit_attention_changed_if_real(
+        &self,
+        parent_connection_id: &str,
+        parent_tool_use_id: &str,
+        task_id: &str,
+        attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    ) {
+        if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
+            return;
+        }
+        self.event_emitter
+            .emit_attention_changed(
+                parent_connection_id,
+                parent_tool_use_id,
+                task_id,
+                attention_request,
             )
             .await;
     }
@@ -6339,6 +6675,12 @@ mod tests {
             _child_connection_id: &str,
             _child_conversation_id: i32,
             _agent_type: AgentType,
+            _task_id: &str,
+            _started_at: DateTime<Utc>,
+            _runtime_stats: DelegationRuntimeStats,
+            _attention_request: Option<
+                crate::acp::delegation::attention::AttentionRequestSummary,
+            >,
         ) {
         }
         async fn emit_completed(
@@ -6348,9 +6690,31 @@ mod tests {
             _child_connection_id: &str,
             _child_conversation_id: i32,
             _agent_type: AgentType,
+            _task_id: &str,
+            _runtime_stats: DelegationRuntimeStats,
             _result: crate::acp::types::DelegationResultSummary,
         ) {
             self.log.lock().await.push("terminal_event".into());
+        }
+        async fn emit_runtime_stats_changed(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            _task_id: &str,
+            _runtime_stats: DelegationRuntimeStats,
+        ) {
+            self.log.lock().await.push("runtime_event".into());
+        }
+        async fn emit_attention_changed(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            _task_id: &str,
+            _attention_request: Option<
+                crate::acp::delegation::attention::AttentionRequestSummary,
+            >,
+        ) {
+            self.log.lock().await.push("attention_event".into());
         }
         async fn emit_conversation_status_changed(
             &self,
@@ -6891,6 +7255,111 @@ mod tests {
             TaskStatus::Completed
         );
         let _ = report;
+    }
+
+    #[tokio::test]
+    async fn pre_start_tool_and_attention_do_not_publish_until_started() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        let persisted_start = dt("2026-07-17T13:00:00Z");
+        spawner
+            .queue_send(Ok(accepted(33, persisted_start)))
+            .await;
+        let send_release = spawner.install_send_gate().await;
+        let store = Arc::new(MockTaskStore::accept_any_running_loadable(33));
+        let meta = Arc::new(MockMetaWriter::new());
+        let events = Arc::new(MockEventEmitter::new());
+        let attention = Arc::new(
+            crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore::new(),
+        );
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            meta.clone() as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+        .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
+        enable_delegation(&broker).await;
+
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+        let task_id = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .task_id;
+
+        // Project one ToolCall and open attention after coordination but
+        // before start_delegation returns (send still gated).
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-pre", "read", "Read"))
+            .await;
+        attention
+            .open_or_recover(valid_attention_at(
+                &task_id,
+                11,
+                33,
+                "tc-pre-att",
+                "Choose path",
+                dt("2026-07-17T13:00:05Z"),
+            ))
+            .await
+            .expect("open attention before start");
+        // Direct store open does not publish; assert no pre-start leak from
+        // the tool projection either.
+        assert_eq!(
+            events.runtime_snapshot().await.len(),
+            0,
+            "no runtime replacement while started_published=false"
+        );
+        assert_eq!(
+            events.attention_snapshot().await.len(),
+            0,
+            "no attention replacement while started_published=false"
+        );
+        assert!(
+            meta.snapshot().await.iter().all(|m| {
+                m.meta
+                    .get("codeg.delegation")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|s| s.as_str())
+                    != Some("running")
+            }),
+            "no running meta before start publication"
+        );
+
+        send_release.send(()).unwrap();
+        let report = start.await.unwrap();
+        assert_eq!(report.status, TaskStatus::Running);
+        let started = events.started_snapshot().await;
+        assert_eq!(started.len(), 1);
+        let s = &started[0];
+        assert_eq!(s.started_at, persisted_start);
+        assert_eq!(s.runtime_stats.tool_call_count, 1);
+        assert!(
+            s.attention_request.is_some(),
+            "enriched start must carry the open attention closed under the race"
+        );
+        assert_eq!(s.runtime_stats.started_at, persisted_start);
     }
 
     #[tokio::test]
@@ -11673,12 +12142,19 @@ mod tests {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_id,
+                runtime_stats,
+                attention_request,
+                ..
             } => {
                 assert_eq!(parent_connection_id, "parent-conn");
                 assert_eq!(parent_tool_use_id, "pt-started");
                 assert_eq!(child_connection_id, "child-conn-started");
                 assert_eq!(*child_conversation_id, 88);
                 assert_eq!(*agent_type, AgentType::ClaudeCode);
+                assert!(!task_id.is_empty());
+                assert!(runtime_stats.tool_call_count == 0);
+                assert!(attention_request.is_none());
             }
             other => panic!("expected DelegationStarted, got {other:?}"),
         }

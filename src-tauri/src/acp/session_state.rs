@@ -240,6 +240,19 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Durable Broker task id — guards runtime/attention replacements so a
+    /// stale event for a previous task on the same tool id cannot clobber
+    /// the live card.
+    pub task_id: String,
+    /// Authoritative accepted-start timestamp (rebased from durable child row).
+    pub started_at: DateTime<Utc>,
+    /// Latest projected runtime rollup for the visible card.
+    pub runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    /// Open parent-decision request, if any. Cleared by
+    /// `DelegationAttentionChanged { attention_request: None }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request:
+        Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     /// Soft-watchdog health for this still-running card. Absent until the
     /// supervisor publishes; cleared only when the card is removed on complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -955,9 +968,13 @@ impl SessionState {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_id,
+                started_at,
+                runtime_stats,
+                attention_request,
                 ..
             } => {
-                // Record the running delegation so the binding is snapshot-
+                // Record the full running card so the binding is snapshot-
                 // recoverable (survives this connection's TurnComplete and any
                 // re-attach on the snapshot path). The broker only emits this for
                 // a REAL (non-synthetic) parent_tool_use_id, so synthetic-fallback
@@ -970,38 +987,76 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        task_id: task_id.clone(),
+                        started_at: *started_at,
+                        runtime_stats: runtime_stats.clone(),
+                        attention_request: attention_request.clone(),
                         observation: None,
                         last_agent_activity_at: None,
                         stalled_since: None,
                     },
                 );
             }
+            AcpEvent::DelegationRuntimeStatsChanged {
+                parent_tool_use_id,
+                task_id,
+                runtime_stats,
+            } => {
+                // Replace-only: update an existing card whose task_id matches.
+                // Unknown tool id or mismatched task id is ignored (replay-safe
+                // for reordered / stale events).
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        card.runtime_stats = runtime_stats.clone();
+                    }
+                }
+            }
+            AcpEvent::DelegationAttentionChanged {
+                parent_tool_use_id,
+                task_id,
+                attention_request,
+            } => {
+                // Replace-only (including clear when attention_request is None).
+                // Task-id guarded like runtime replacements.
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        card.attention_request = attention_request.clone();
+                    }
+                }
+            }
             AcpEvent::DelegationObservationChanged {
                 parent_tool_use_id,
+                task_id,
                 observation,
                 last_agent_activity_at,
                 stalled_since,
-                ..
             } => {
                 // Observe-only: update an existing card. Never insert, remove,
-                // or synthesize Completion from a health transition.
+                // or synthesize Completion from a health transition. Task-id
+                // guarded so a stale observation cannot clobber a new task.
                 if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
-                    card.observation = Some(*observation);
-                    card.last_agent_activity_at = Some(*last_agent_activity_at);
-                    card.stalled_since = *stalled_since;
+                    if card.task_id == *task_id {
+                        card.observation = Some(*observation);
+                        card.last_agent_activity_at = Some(*last_agent_activity_at);
+                        card.stalled_since = *stalled_since;
+                    }
                 }
             }
             AcpEvent::DelegationCompleted {
-                parent_tool_use_id, ..
+                parent_tool_use_id,
+                task_id,
+                ..
             } => {
-                // A running delegation finished: drop it from the live set. Its
-                // terminal status/result reaches the LLM via
-                // `get_delegation_status` and the UI via the live
-                // `DelegationCompleted` event (DelegationProvider) or, on a cold
-                // load, the child's persisted DB row (`inject_delegation_meta`).
-                // Retaining it would turn this map into an unbounded history log;
-                // it is deliberately only the in-flight set.
-                self.active_delegations.remove(parent_tool_use_id);
+                // A running delegation finished: drop it from the live set only
+                // when the task_id matches (guards against a late complete for a
+                // prior task on a recycled tool id). Terminal state reaches the
+                // LLM via `get_delegation_status` and the UI via the live event
+                // or, on a cold load, the child's DB row (`inject_delegation_meta`).
+                if let Some(card) = self.active_delegations.get(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        self.active_delegations.remove(parent_tool_use_id);
+                    }
+                }
             }
             AcpEvent::FeedbackSubmitted { item } => {
                 // Idempotent by id (replay / double-attach safe): append only if
@@ -2285,28 +2340,219 @@ mod tests {
 
     // --- active_delegations: running-only, snapshot-recoverable binding ---
 
+    fn dt(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339")
+            .with_timezone(&Utc)
+    }
+
+    fn empty_stats(started: DateTime<Utc>) -> crate::acp::delegation::runtime_stats::DelegationRuntimeStats {
+        crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started)
+    }
+
     fn delegation_started(parent_tool_use_id: &str, child_conv: i32) -> AcpEvent {
+        let started = dt("2026-07-17T10:00:00Z");
         AcpEvent::DelegationStarted {
             parent_connection_id: "conn-test".into(),
             parent_tool_use_id: parent_tool_use_id.into(),
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_id: "task-1".into(),
+            started_at: started,
+            runtime_stats: empty_stats(started),
+            attention_request: None,
+        }
+    }
+
+    fn delegation_started_with(
+        parent_tool_use_id: &str,
+        task_id: &str,
+        child_conv: i32,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    ) -> AcpEvent {
+        AcpEvent::DelegationStarted {
+            parent_connection_id: "conn-test".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
+            child_connection_id: "child-conn-1".into(),
+            child_conversation_id: child_conv,
+            agent_type: AgentType::Codex,
+            task_id: task_id.into(),
+            started_at: runtime_stats.started_at,
+            runtime_stats,
+            attention_request: None,
         }
     }
 
     fn delegation_completed(parent_tool_use_id: &str, child_conv: i32) -> AcpEvent {
+        let started = dt("2026-07-17T10:00:00Z");
         AcpEvent::DelegationCompleted {
             parent_connection_id: "conn-test".into(),
             parent_tool_use_id: parent_tool_use_id.into(),
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_id: "task-1".into(),
+            runtime_stats: empty_stats(started),
             result: DelegationResultSummary::Ok {
                 duration_ms: 1,
                 text_preview: None,
             },
         }
+    }
+
+    fn delegation_completed_with(
+        parent_tool_use_id: &str,
+        task_id: &str,
+        child_conv: i32,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    ) -> AcpEvent {
+        AcpEvent::DelegationCompleted {
+            parent_connection_id: "conn-test".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
+            child_connection_id: "child-conn-1".into(),
+            child_conversation_id: child_conv,
+            agent_type: AgentType::Codex,
+            task_id: task_id.into(),
+            runtime_stats,
+            result: DelegationResultSummary::Ok {
+                duration_ms: 1,
+                text_preview: None,
+            },
+        }
+    }
+
+    #[test]
+    fn delegation_projection_events_replace_idempotently_and_snapshot_latest_state() {
+        let mut state = fresh_state();
+        let initial = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with(
+            "tool-1",
+            "task-1",
+            99,
+            initial.clone(),
+        ));
+
+        let mut changed = initial.clone();
+        changed.tool_call_count = 3;
+        let runtime_event = AcpEvent::DelegationRuntimeStatsChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            runtime_stats: changed.clone(),
+        };
+        state.apply_event(&runtime_event);
+        state.apply_event(&runtime_event);
+
+        let request = crate::acp::delegation::attention::AttentionRequestSummary {
+            request_id: "req-1".into(),
+            task_id: "task-1".into(),
+            message: "Choose A or B".into(),
+            created_at: dt("2026-07-17T10:01:00Z"),
+        };
+        let open = AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: Some(request.clone()),
+        };
+        state.apply_event(&open);
+        state.apply_event(&open);
+        let card = state.active_delegations.get("tool-1").unwrap();
+        assert_eq!(card.runtime_stats, changed);
+        assert_eq!(card.attention_request.as_ref().unwrap().request_id, "req-1");
+
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: None,
+        });
+        let snapshot = state.to_snapshot();
+        assert_eq!(snapshot.active_delegations[0].task_id, "task-1");
+        assert_eq!(snapshot.active_delegations[0].runtime_stats.tool_call_count, 3);
+        assert_eq!(snapshot.active_delegations[0].attention_request, None);
+
+        state.apply_event(&delegation_completed_with(
+            "tool-1",
+            "task-1",
+            99,
+            changed,
+        ));
+        assert!(state.active_delegations.is_empty());
+    }
+
+    #[test]
+    fn delegation_attention_changed_none_omits_field_on_wire_and_replays_as_clear() {
+        let clear = AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: None,
+        };
+        let json = serde_json::to_value(&clear).expect("serialize");
+        assert!(
+            json.get("attention_request").is_none(),
+            "optional clear must omit the field on the wire (Task 10 maps missing → null)"
+        );
+        let back: AcpEvent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            AcpEvent::DelegationAttentionChanged {
+                attention_request: None,
+                ..
+            } => {}
+            other => panic!("expected clear attention, got {other:?}"),
+        }
+
+        let mut state = fresh_state();
+        let started = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with("tool-1", "task-1", 1, started));
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: Some(
+                crate::acp::delegation::attention::AttentionRequestSummary {
+                    request_id: "req-1".into(),
+                    task_id: "task-1".into(),
+                    message: "q".into(),
+                    created_at: dt("2026-07-17T10:01:00Z"),
+                },
+            ),
+        });
+        state.apply_event(&back);
+        assert_eq!(
+            state
+                .active_delegations
+                .get("tool-1")
+                .unwrap()
+                .attention_request,
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_and_attention_events_ignore_mismatched_task_id() {
+        let mut state = fresh_state();
+        let started = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with("tool-1", "task-1", 1, started.clone()));
+        let mut other = started;
+        other.tool_call_count = 9;
+        state.apply_event(&AcpEvent::DelegationRuntimeStatsChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-other".into(),
+            runtime_stats: other,
+        });
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-other".into(),
+            attention_request: Some(
+                crate::acp::delegation::attention::AttentionRequestSummary {
+                    request_id: "x".into(),
+                    task_id: "task-other".into(),
+                    message: "no".into(),
+                    created_at: dt("2026-07-17T10:01:00Z"),
+                },
+            ),
+        });
+        let card = state.active_delegations.get("tool-1").unwrap();
+        assert_eq!(card.runtime_stats.tool_call_count, 0);
+        assert!(card.attention_request.is_none());
     }
 
     #[test]

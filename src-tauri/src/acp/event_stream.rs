@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::acp::delegation::attention::AttentionRequestSummary;
+use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
 use crate::acp::types::{AcpEvent, EventEnvelope, ToolCallImageInfo, UserMessageBlock};
 
 /// Capacity of the per-connection broadcast channel. Sized to absorb a brief
@@ -440,12 +442,104 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                     })
                     .sum::<usize>()
         }
+        // Enriched / replacement delegation projections can carry large
+        // path lists and 16 KiB attention messages — size structurally so
+        // oversized cards force snapshot fallback like image/tool events.
+        // Fields are spelled out (not `..`) so a newly-added large field
+        // forces this estimator to be revisited.
+        AcpEvent::DelegationStarted {
+            parent_connection_id,
+            parent_tool_use_id,
+            child_connection_id,
+            child_conversation_id: _,
+            agent_type: _,
+            task_id,
+            started_at: _,
+            runtime_stats,
+            attention_request,
+        } => {
+            256 + json_str_len(parent_connection_id)
+                + json_str_len(parent_tool_use_id)
+                + json_str_len(child_connection_id)
+                + json_str_len(task_id)
+                + runtime_stats_size(runtime_stats)
+                + attention_request
+                    .as_ref()
+                    .map(attention_summary_size)
+                    .unwrap_or(0)
+        }
+        AcpEvent::DelegationRuntimeStatsChanged {
+            parent_tool_use_id,
+            task_id,
+            runtime_stats,
+        } => {
+            128 + json_str_len(parent_tool_use_id)
+                + json_str_len(task_id)
+                + runtime_stats_size(runtime_stats)
+        }
+        AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id,
+            task_id,
+            attention_request,
+        } => {
+            128 + json_str_len(parent_tool_use_id)
+                + json_str_len(task_id)
+                + attention_request
+                    .as_ref()
+                    .map(attention_summary_size)
+                    .unwrap_or(0)
+        }
+        AcpEvent::DelegationCompleted {
+            parent_connection_id,
+            parent_tool_use_id,
+            child_connection_id,
+            child_conversation_id: _,
+            agent_type: _,
+            task_id,
+            runtime_stats,
+            result,
+        } => {
+            256 + json_str_len(parent_connection_id)
+                + json_str_len(parent_tool_use_id)
+                + json_str_len(child_connection_id)
+                + json_str_len(task_id)
+                + runtime_stats_size(runtime_stats)
+                + match result {
+                    crate::acp::types::DelegationResultSummary::Ok {
+                        duration_ms: _,
+                        text_preview,
+                    } => opt_str_size(text_preview),
+                    crate::acp::types::DelegationResultSummary::Err { error_code } => {
+                        json_str_len(error_code)
+                    }
+                }
+        }
         // Small, infrequent variants: an exact serialized length is cheap here
         // and preserves the prior threshold behavior; the 256 fallback only
         // guards the (practically impossible) serialization failure.
         other => serde_json::to_vec(other).map_or(256, |v| v.len()),
     };
     base + payload
+}
+
+/// Fixed overhead + escape-aware strings for an open attention summary.
+/// Constants cover property names, RFC3339 timestamp, commas, and braces.
+fn attention_summary_size(value: &AttentionRequestSummary) -> usize {
+    96 + json_str_len(&value.request_id)
+        + json_str_len(&value.task_id)
+        + json_str_len(&value.message)
+}
+
+/// Fixed overhead + escape-aware paths for a runtime stats rollup.
+/// Constants cover property names, two timestamps, max-width integers,
+/// booleans, option tags, commas, and braces; path helpers add exact
+/// escaped string size per touched file.
+fn runtime_stats_size(value: &DelegationRuntimeStats) -> usize {
+    384 + value
+        .touched_files
+        .iter()
+        .map(|file| 160 + json_str_len(&file.path))
+        .sum::<usize>()
 }
 
 /// Structural size for one parsed-transcript turn carried on
@@ -1143,5 +1237,155 @@ mod tests {
             let env = rx.try_recv().expect("event delivered");
             assert_eq!(env.seq, s);
         }
+    }
+
+    fn escape_heavy_path(i: usize) -> String {
+        format!("path/\"escape\\{i}/file\"with\\quotes.rs")
+    }
+
+    #[test]
+    fn estimate_never_undercounts_delegation_projection_events() {
+        use crate::acp::delegation::attention::AttentionRequestSummary;
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+        use crate::acp::types::DelegationResultSummary;
+        use crate::models::agent::AgentType;
+        use chrono::{DateTime, Utc};
+
+        let started: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut stats = DelegationRuntimeStats::empty(started);
+        for i in 0..200 {
+            stats.touched_files.push(DelegationTouchedFile {
+                path: escape_heavy_path(i),
+                outside_workspace: i % 7 == 0,
+                additions: Some(i as u64),
+                deletions: Some((i % 3) as u64),
+            });
+        }
+        stats.tool_call_count = 200;
+        stats.touched_files_truncated = true;
+        let attention = AttentionRequestSummary {
+            request_id: "req-1".into(),
+            task_id: "task-1".into(),
+            message: "m".repeat(16 * 1024),
+            created_at: started,
+        };
+
+        let cases: Vec<Arc<EventEnvelope>> = vec![
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "conn".into(),
+                payload: AcpEvent::DelegationStarted {
+                    parent_connection_id: "p".into(),
+                    parent_tool_use_id: "tool".into(),
+                    child_connection_id: "c".into(),
+                    child_conversation_id: 1,
+                    agent_type: AgentType::Codex,
+                    task_id: "task-1".into(),
+                    started_at: started,
+                    runtime_stats: stats.clone(),
+                    attention_request: Some(attention.clone()),
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "conn".into(),
+                payload: AcpEvent::DelegationRuntimeStatsChanged {
+                    parent_tool_use_id: "tool".into(),
+                    task_id: "task-1".into(),
+                    runtime_stats: stats.clone(),
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 3,
+                connection_id: "conn".into(),
+                payload: AcpEvent::DelegationAttentionChanged {
+                    parent_tool_use_id: "tool".into(),
+                    task_id: "task-1".into(),
+                    attention_request: Some(attention),
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 4,
+                connection_id: "conn".into(),
+                payload: AcpEvent::DelegationAttentionChanged {
+                    parent_tool_use_id: "tool".into(),
+                    task_id: "task-1".into(),
+                    attention_request: None,
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 5,
+                connection_id: "conn".into(),
+                payload: AcpEvent::DelegationCompleted {
+                    parent_connection_id: "p".into(),
+                    parent_tool_use_id: "tool".into(),
+                    child_connection_id: "c".into(),
+                    child_conversation_id: 1,
+                    agent_type: AgentType::Codex,
+                    task_id: "task-1".into(),
+                    runtime_stats: stats,
+                    result: DelegationResultSummary::Ok {
+                        duration_ms: 12,
+                        text_preview: Some("done".into()),
+                    },
+                },
+            }),
+        ];
+        for env in &cases {
+            assert_ge_serialized(env);
+        }
+    }
+
+    #[test]
+    fn oversized_runtime_projection_clears_recent_buffer_for_snapshot_fallback() {
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+        use chrono::{DateTime, Utc};
+
+        let started: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut stats = DelegationRuntimeStats::empty(started);
+        // Enough escape-heavy paths to exceed the 64 KiB per-event cap.
+        for i in 0..400 {
+            stats.touched_files.push(DelegationTouchedFile {
+                path: format!("\"\\\"path/with/lots/of/escapes/{i}/and/more/nested.segments.rs"),
+                outside_workspace: false,
+                additions: Some(1),
+                deletions: Some(1),
+            });
+        }
+        let env = Arc::new(EventEnvelope {
+            seq: 10,
+            connection_id: "conn".into(),
+            payload: AcpEvent::DelegationRuntimeStatsChanged {
+                parent_tool_use_id: "tool".into(),
+                task_id: "task-1".into(),
+                runtime_stats: stats,
+            },
+        });
+        assert!(
+            estimate_envelope_size(&env) > RECENT_EVENT_MAX_BYTES,
+            "oversized projection must trip the per-event cap"
+        );
+        let mut buf = RecentEventsBuffer::new();
+        // Seed a small prior event so we can observe the wholesale clear.
+        let prior = make_envelope(9, "prior");
+        let _ = buf.push(prior);
+        assert_eq!(buf.events.len(), 1);
+        let evicted = buf.push(env);
+        assert!(
+            evicted >= 1,
+            "oversized event must clear prior buffer entries for snapshot fallback"
+        );
+        assert!(
+            buf.events.is_empty(),
+            "oversized projection is omitted from recent replay"
+        );
     }
 }
