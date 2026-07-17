@@ -39,6 +39,8 @@ let eventDisposed = false
 let reconnectUnsub: (() => void) | null = null
 let focusListener: (() => void) | null = null
 let refreshInFlight: Promise<void> | null = null
+/** Bumped on dispose so in-flight initialize/bootstrap cannot re-apply. */
+let disposeGeneration = 0
 
 // Ref-counted bootstrap so AppWorkspaceProvider + future consumers share one
 // subscription; final release disposes listeners.
@@ -59,20 +61,10 @@ export const useDelegationProfileStore = create<DelegationProfileState>(
     initialize: async () => {
       if (initialized) return
       initialized = true
+      const generation = disposeGeneration
 
-      bootstrapInFlight = (async () => {
-        try {
-          const catalog = await getDelegationProfileCatalog()
-          get().applyCatalog(catalog)
-          set({ ready: true, error: null })
-        } catch (err: unknown) {
-          set({ ready: true, error: toErrorMessage(err) })
-        } finally {
-          bootstrapInFlight = null
-        }
-      })()
-      await bootstrapInFlight
-
+      // Install listeners before the bootstrap fetch so concurrent catalog
+      // events during cold start are not dropped (revision gate is order-safe).
       eventDisposed = false
       void subscribe<DelegationProfileCatalog>(
         DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
@@ -100,6 +92,20 @@ export const useDelegationProfileStore = create<DelegationProfileState>(
         onTransportReconnect(() => {
           void get().refresh()
         }) ?? null
+
+      bootstrapInFlight = (async () => {
+        try {
+          const catalog = await getDelegationProfileCatalog()
+          if (disposeGeneration !== generation) return
+          get().applyCatalog(catalog)
+        } catch (err: unknown) {
+          if (disposeGeneration !== generation) return
+          set({ ready: true, error: toErrorMessage(err) })
+        } finally {
+          bootstrapInFlight = null
+        }
+      })()
+      await bootstrapInFlight
     },
 
     refresh: async () => {
@@ -128,6 +134,7 @@ export const useDelegationProfileStore = create<DelegationProfileState>(
 )
 
 function disposeSharedSubscription(): void {
+  disposeGeneration += 1
   eventDisposed = true
   if (eventUnsub) {
     try {

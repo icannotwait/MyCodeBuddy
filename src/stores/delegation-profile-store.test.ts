@@ -52,6 +52,62 @@ describe("useDelegationProfileStore", () => {
     expect(useDelegationProfileStore.getState().catalog?.revision).toBe(1)
   })
 
+  it("subscribes before bootstrap fetch and applies mid-bootstrap catalog events", async () => {
+    let resolveBootstrap:
+      | ((catalog: {
+          profiles: []
+          delegation_enabled: boolean
+          revision: number
+        }) => void)
+      | undefined
+    mocks.getDelegationProfileCatalog.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveBootstrap = resolve
+        })
+    )
+
+    let eventHandler:
+      | ((catalog: {
+          profiles: []
+          delegation_enabled: boolean
+          revision: number
+        }) => void)
+      | undefined
+    mocks.subscribe.mockImplementation(async (_event, handler) => {
+      eventHandler = handler as typeof eventHandler
+      return () => {}
+    })
+
+    const initPromise = useDelegationProfileStore.getState().initialize()
+
+    await vi.waitFor(() => {
+      expect(mocks.subscribe).toHaveBeenCalled()
+      expect(eventHandler).toBeTypeOf("function")
+    })
+    expect(mocks.onReconnect).toHaveBeenCalled()
+
+    // Emit a catalog event while bootstrap is still pending.
+    eventHandler!({
+      profiles: [],
+      delegation_enabled: true,
+      revision: 3,
+    })
+    expect(useDelegationProfileStore.getState().catalog?.revision).toBe(3)
+
+    // Bootstrap returns a lower revision — revision gate must keep rev 3.
+    resolveBootstrap!({
+      profiles: [],
+      delegation_enabled: false,
+      revision: 1,
+    })
+    await initPromise
+
+    expect(useDelegationProfileStore.getState().catalog?.revision).toBe(3)
+    expect(useDelegationProfileStore.getState().ready).toBe(true)
+    expect(useDelegationProfileStore.getState().error).toBeNull()
+  })
+
   it("failed_bootstrap_is_ready_with_error_and_focus_refresh_recovers", async () => {
     mocks.getDelegationProfileCatalog.mockRejectedValueOnce(
       new Error("bootstrap boom")
