@@ -413,9 +413,22 @@ impl DelegationListener {
         }
 
         // 4) Publish host ready only after durable ack. Revoke race → fail closed.
-        if let Err(e) = self.leases.mark_ready(&token).await {
-            self.leases.mark_closed(&token).await;
-            return Err(std::io::Error::other(format!("mark_ready: {e}")));
+        //
+        // `AlreadyReady` is a successful secondary attach (e.g. CLI exec turns
+        // re-spawn the same codeg-mcp after a session-open prewarm already holds
+        // the exclusive ready lease). Ack was already written; do **not**
+        // mark_closed — that would tear down the primary holder's availability.
+        // Secondary instances return immediately without exclusive hold so they
+        // can serve MCP stdio tools for the agent turn.
+        match self.leases.mark_ready(&token).await {
+            Ok(()) => {}
+            Err(crate::acp::delegation::lease::ReadyLeaseError::AlreadyReady) => {
+                return Ok(());
+            }
+            Err(e) => {
+                self.leases.mark_closed(&token).await;
+                return Err(std::io::Error::other(format!("mark_ready: {e}")));
+            }
         }
 
         // Hold open: peer EOF or external revoke (availability → false).
@@ -2373,6 +2386,87 @@ mod tests {
         assert!(!*waiter.availability().borrow());
         // Second close is a no-op (idempotent).
         leases.mark_closed("ready-tok").await;
+        assert!(!*waiter.availability().borrow());
+    }
+
+    /// Second Ready on an already-ready token acks without closing the primary
+    /// hold (CLI exec re-spawn after session-open prewarm).
+    #[tokio::test]
+    async fn ready_lease_wire_secondary_already_ready_does_not_close_primary() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "dup-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("dup-tok").await;
+        let listener_primary = make_ready_lease_listener(tokens.clone(), Arc::clone(&leases));
+        let listener_secondary = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut primary_client, mut primary_server) = duplex(8 * 1024);
+        let primary_task = tokio::spawn(async move {
+            listener_primary.serve_one(&mut primary_server).await.unwrap();
+        });
+
+        write_frame(
+            &mut primary_client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "dup-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut primary_client).await.unwrap();
+        assert!(ack.ready);
+        waiter
+            .wait_ready(Duration::from_millis(200))
+            .await
+            .expect("primary ready");
+        assert!(*waiter.availability().borrow());
+
+        let (mut secondary_client, mut secondary_server) = duplex(8 * 1024);
+        let secondary_task = tokio::spawn(async move {
+            listener_secondary
+                .serve_one(&mut secondary_server)
+                .await
+                .unwrap();
+        });
+
+        write_frame(
+            &mut secondary_client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "dup-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let secondary_ack: CompanionReadyAck = read_frame(&mut secondary_client).await.unwrap();
+        assert!(secondary_ack.ready);
+        // Secondary ends without exclusive hold; connection may close after ack.
+        let _ = secondary_task.await;
+        drop(secondary_client);
+
+        // Primary hold still live — availability must stay true.
+        assert!(
+            *waiter.availability().borrow(),
+            "secondary AlreadyReady must not mark_closed the primary lease"
+        );
+
+        drop(primary_client);
+        primary_task.await.unwrap();
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
         assert!(!*waiter.availability().borrow());
     }
 
