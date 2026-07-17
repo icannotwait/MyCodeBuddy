@@ -10727,8 +10727,9 @@ mod tests {
     /// no-op and strand it on `rx.await` forever. The `send_gate` pins
     /// `handle_request` in exactly that window; we fire the failure, release the
     /// gate, and assert the request resolves as canceled (carrying the
-    /// terminal-error detail) with a single child disconnect and a clean
-    /// running→failed meta trail.
+    /// terminal-error detail) with a single child disconnect. Under the
+    /// `started_published` contract, pre-start never emits running meta — only
+    /// the terminal failed/canceled meta write is published.
     #[tokio::test]
     async fn child_failure_before_park_resolves_instead_of_hanging() {
         let mock = Arc::new(MockSpawner::new());
@@ -10786,17 +10787,14 @@ mod tests {
         assert_eq!(broker.early_cancel_count().await, 0);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-fast-fail"]);
 
-        // Meta trail: running (written pre-park) then failed/canceled (pickup).
+        // Terminal-only meta under started_published: no pre-start running write.
         let calls = writer.snapshot().await;
-        assert_eq!(calls.len(), 2);
-        let running = calls[0]
-            .meta
-            .get("codeg.delegation")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert_eq!(running.get("status").unwrap().as_str().unwrap(), "running");
-        let failed = calls[1]
+        assert_eq!(
+            calls.len(),
+            1,
+            "started_published contract: only terminal meta, no pre-start running"
+        );
+        let failed = calls[0]
             .meta
             .get("codeg.delegation")
             .unwrap()
@@ -10806,6 +10804,11 @@ mod tests {
         assert_eq!(
             failed.get("error_code").unwrap().as_str().unwrap(),
             "canceled"
+        );
+        assert_ne!(
+            failed.get("status").unwrap().as_str().unwrap(),
+            "running",
+            "no pre-start running meta is emitted before started_published"
         );
     }
 
@@ -10817,6 +10820,8 @@ mod tests {
     /// `TurnComplete` before the park. The `send_gate` pins `handle_request` in
     /// the reserve→park window; we resolve via the reserved `call_id` (the entry
     /// isn't parked yet) and assert the request returns Ok instead of hanging.
+    /// Under `started_published`, metadata is terminal-only (no pre-start
+    /// running meta).
     #[tokio::test]
     async fn completion_before_park_resolves_instead_of_hanging() {
         let mock = Arc::new(MockSpawner::new());
@@ -10881,17 +10886,14 @@ mod tests {
         assert_eq!(broker.early_complete_count().await, 0);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-fast-ok"]);
 
-        // Meta trail: running (written pre-park) then completed (pickup).
+        // Terminal-only meta under started_published: no pre-start running write.
         let calls = writer.snapshot().await;
-        assert_eq!(calls.len(), 2);
-        let running = calls[0]
-            .meta
-            .get("codeg.delegation")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert_eq!(running.get("status").unwrap().as_str().unwrap(), "running");
-        let completed = calls[1]
+        assert_eq!(
+            calls.len(),
+            1,
+            "started_published contract: only terminal meta, no pre-start running"
+        );
+        let completed = calls[0]
             .meta
             .get("codeg.delegation")
             .unwrap()
@@ -10900,6 +10902,11 @@ mod tests {
         assert_eq!(
             completed.get("status").unwrap().as_str().unwrap(),
             "completed"
+        );
+        assert_ne!(
+            completed.get("status").unwrap().as_str().unwrap(),
+            "running",
+            "no pre-start running meta is emitted before started_published"
         );
     }
 
@@ -11015,8 +11022,9 @@ mod tests {
 
     /// A parent cancel that lands in the reserve→park window (prompt already
     /// sent, entry not yet parked) must cancel AND disconnect the child and
-    /// resolve the request as canceled. Pinned with the send gate; also asserts
-    /// the running→failed/canceled meta trail.
+    /// resolve the request as canceled. Pinned with the send gate. Under the
+    /// `started_published` contract, only terminal failed/parent_canceled meta
+    /// is published — no pre-start running meta.
     #[tokio::test]
     async fn parent_cancel_in_reserve_park_window_tears_down_child() {
         let mock = Arc::new(MockSpawner::new());
@@ -11064,17 +11072,14 @@ mod tests {
         assert_eq!(broker.early_cancel_count().await, 0);
         assert_eq!(broker.pending_count().await, 0);
 
-        // Meta trail: running (pre-park) then failed/canceled (ParentCanceled).
+        // Terminal-only meta under started_published: no pre-start running write.
         let calls = writer.snapshot().await;
-        assert_eq!(calls.len(), 2);
-        let running = calls[0]
-            .meta
-            .get("codeg.delegation")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert_eq!(running.get("status").unwrap().as_str().unwrap(), "running");
-        let failed = calls[1]
+        assert_eq!(
+            calls.len(),
+            1,
+            "started_published contract: only terminal meta, no pre-start running"
+        );
+        let failed = calls[0]
             .meta
             .get("codeg.delegation")
             .unwrap()
@@ -11084,6 +11089,11 @@ mod tests {
         assert_eq!(
             failed.get("error_code").unwrap().as_str().unwrap(),
             "parent_canceled"
+        );
+        assert_ne!(
+            failed.get("status").unwrap().as_str().unwrap(),
+            "running",
+            "no pre-start running meta is emitted before started_published"
         );
     }
 
