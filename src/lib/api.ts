@@ -3359,10 +3359,6 @@ export async function setDelegationSettings(
   return getTransport().call("set_delegation_settings", { settings })
 }
 
-export async function getDelegationProfiles(): Promise<DelegationProfileDocument> {
-  return getTransport().call("get_delegation_profiles")
-}
-
 export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
   return getTransport().call("get_delegation_profile_catalog")
 }
@@ -3443,10 +3439,14 @@ export async function startReferenceSearch(
   request: StartReferenceSearchRequest,
   signal?: AbortSignal
 ): Promise<ReferenceSearchPage> {
-  return getTransport().call("start_reference_search", { ...request }, {
-    timeoutMs: 35_000,
-    signal,
-  })
+  return getTransport().call(
+    "start_reference_search",
+    { ...request },
+    {
+      timeoutMs: 35_000,
+      signal,
+    }
+  )
 }
 
 export async function nextReferenceSearchPage(
@@ -3473,18 +3473,26 @@ export async function validateReferenceCandidate(
   request: ValidateReferenceCandidateRequest,
   signal?: AbortSignal
 ): Promise<ReferenceCandidateValidation> {
-  return getTransport().call("validate_reference_candidate", { ...request }, {
-    signal,
-  })
+  return getTransport().call(
+    "validate_reference_candidate",
+    { ...request },
+    {
+      signal,
+    }
+  )
 }
 
 export async function matchReferenceRegex(
   request: MatchReferenceRegexRequest,
   signal?: AbortSignal
 ): Promise<ReferenceRegexMatch[]> {
-  return getTransport().call("match_reference_regex", { ...request }, {
-    signal,
-  })
+  return getTransport().call(
+    "match_reference_regex",
+    { ...request },
+    {
+      signal,
+    }
+  )
 }
 
 /**

@@ -2,12 +2,14 @@
 
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react"
 import { createPortal } from "react-dom"
 
@@ -15,23 +17,21 @@ import { cn } from "@/lib/utils"
 
 import { ReferenceIcon } from "../badges/reference-badge"
 import { middleTruncateReferenceText } from "../reference-display"
+import type {
+  ReferenceSearchController,
+  ReferenceGroupKind,
+} from "../reference-search-controller"
 import type { ReferenceAttrs, ReferenceKind } from "../types"
 import type { MentionRenderState } from "./mention-suggestion"
 import { placeMentionPopup } from "./popup-position"
-import type {
-  ReferenceSearch,
-  SuggestionGroup,
-  SuggestionPopupHandle,
-} from "./types"
-
-const FETCH_DEBOUNCE_MS = 150
+import type { SuggestionItem, SuggestionPopupHandle } from "./types"
 
 // Tab order in the panel: agent first (per product decision), then the rest in
 // their usual order. This is a *display* order; the search provider keeps its
 // own (file-first) group order, which other code/tests depend on. `skill` is
 // intentionally absent — skills, commands and experts are inserted via the `/`
 // and `$` triggers, not the `@` panel.
-const TAB_ORDER: readonly ReferenceKind[] = [
+const TAB_ORDER: readonly ReferenceGroupKind[] = [
   "agent",
   "file",
   "session",
@@ -48,6 +48,10 @@ const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
   commit: "Commits",
   skill: "Skills",
 }
+
+const DEFAULT_INVALID_PATTERN = "Invalid search pattern"
+const DEFAULT_SOURCE_ERROR = "Search failed"
+const DEFAULT_PROFILE_ERROR = "Could not load profiles"
 
 // Commit-synchronous in the browser so the panel is positioned before paint (no
 // flash at a stale spot); a no-op-safe passive effect during the static-export
@@ -67,11 +71,73 @@ export const MENTION_LISTBOX_ID = "mention-listbox"
 export const mentionOptionId = (kind: ReferenceKind, index: number) =>
   `mention-option-${kind}-${index}`
 
+/**
+ * Preserve selection by URI across rank/page updates. When the URI is gone,
+ * fall to the same index, then walk backward to the nearest selectable survivor.
+ */
+export function reconcileSelectedUri(
+  previousUri: string | null,
+  previousIndex: number,
+  nextItems: SuggestionItem[]
+): string | null {
+  if (
+    previousUri &&
+    nextItems.some(
+      (entry) => entry.reference.uri === previousUri && entry.selectable
+    )
+  ) {
+    return previousUri
+  }
+  const sameIndex = nextItems[previousIndex]
+  if (sameIndex?.selectable) return sameIndex.reference.uri
+  for (
+    let index = Math.min(previousIndex - 1, nextItems.length - 1);
+    index >= 0;
+    index--
+  ) {
+    if (nextItems[index].selectable) return nextItems[index].reference.uri
+  }
+  return null
+}
+
+function firstSelectableUri(items: SuggestionItem[]): string | null {
+  return items.find((entry) => entry.selectable)?.reference.uri ?? null
+}
+
+function indexOfUri(items: SuggestionItem[], uri: string | null): number {
+  if (!uri) return 0
+  const index = items.findIndex((entry) => entry.reference.uri === uri)
+  return index >= 0 ? index : 0
+}
+
+function visibleItemsForSelection(
+  items: SuggestionItem[],
+  selectedUri: string | null
+): SuggestionItem[] {
+  if (!selectedUri) return items
+  const selected = items.find((entry) => entry.reference.uri === selectedUri)
+  if (!selected) return items
+  // Controller already caps membership; if a future path reorders past a local
+  // display cap this keeps the active row visible by dropping the last other.
+  if (items.some((entry) => entry.reference.uri === selectedUri)) {
+    return items
+  }
+  return items
+}
+
+interface ConfirmationCapture {
+  controller: ReferenceSearchController
+  query: string
+  from: number
+  to: number
+  uri: string
+}
+
 export interface SuggestionPopupProps {
   /** Live trigger state (query/range/caret rect). */
   state: MentionRenderState
-  /** Resolves the query into grouped suggestions. Must be referentially stable. */
-  search: ReferenceSearch
+  /** Independent-source controller that owns search + confirmation. */
+  controller: ReferenceSearchController
   /** Insert the chosen reference, replacing the trigger range. */
   onSelect: (
     reference: ReferenceAttrs,
@@ -89,6 +155,12 @@ export interface SuggestionPopupProps {
   moreLabel?: string
   /** Localized per-kind tab labels (English fallbacks apply when omitted). */
   tabLabels?: Partial<Record<ReferenceKind, string>>
+  /** Optional invalid-regex chrome (Task 10 supplies localized values). */
+  invalidPatternLabel?: string
+  /** Optional per-group source failure chrome. */
+  sourceErrorLabel?: string
+  /** Optional profile-catalog failure chrome. */
+  profileErrorLabel?: string
   /**
    * Reports the active option's element id (or null when nothing is
    * selectable), so the host can mirror it onto the editor's
@@ -99,11 +171,8 @@ export interface SuggestionPopupProps {
 
 /**
  * The unified `@` panel: tabbed, keyboard-navigable suggestions positioned at
- * the caret. One tab per reference kind (agent first); only the active tab's
- * group is shown. Keys are forwarded from the suggestion plugin via the
- * imperative handle (the editor keeps DOM focus), so selection and the active
- * tab are tracked manually rather than relying on focus-based libraries — the
- * tab strip never takes focus (`tabIndex={-1}` + mousedown `preventDefault`).
+ * the caret. Selection is URI-stable across independent source pages and
+ * re-ranks; confirmation goes through {@link ReferenceSearchController}.
  */
 export const SuggestionPopup = forwardRef<
   SuggestionPopupHandle,
@@ -111,7 +180,7 @@ export const SuggestionPopup = forwardRef<
 >(function SuggestionPopup(
   {
     state,
-    search,
+    controller,
     onSelect,
     onClose,
     emptyLabel = "No matches",
@@ -120,64 +189,64 @@ export const SuggestionPopup = forwardRef<
     countLabel = (count) => `${count} results`,
     moreLabel = "More results — keep typing to filter",
     tabLabels = DEFAULT_TAB_LABELS,
+    invalidPatternLabel = DEFAULT_INVALID_PATTERN,
+    sourceErrorLabel = DEFAULT_SOURCE_ERROR,
+    profileErrorLabel = DEFAULT_PROFILE_ERROR,
     onActiveOptionChange,
   },
   ref
 ) {
-  // Results are tagged with the query they answer. While that tag doesn't match
-  // the live query (initial mount, or mid-debounce after the query changed) the
-  // panel is "stale": it shows loading and nothing is selectable, so Enter can
-  // never insert a row from a previous query.
-  const [result, setResult] = useState<{
-    // null until the first fetch resolves, so results read as "stale"
-    // (and the panel shows loading) before any search has answered.
-    query: string | null
-    groups: SuggestionGroup[]
-  }>({ query: null, groups: [] })
-  const [selectedIndex, setSelectedIndex] = useState(0)
+  const subscribe = useCallback(
+    (listener: () => void) => controller.subscribe(listener),
+    [controller]
+  )
+  const getSnapshot = useCallback(() => controller.getSnapshot(), [controller])
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+
+  const [selectedUri, setSelectedUri] = useState<string | null>(null)
   // The tab the user explicitly chose (via Tab/click), or null to auto-follow
-  // the first non-empty tab. Pinning survives subsequent keystrokes within this
-  // open session; reopening the panel remounts and resets it to null.
-  const [pinnedTab, setPinnedTab] = useState<ReferenceKind | null>(null)
+  // the first non-empty tab while no selectable selection anchors the current one.
+  const [pinnedTab, setPinnedTab] = useState<ReferenceGroupKind | null>(null)
+  const [confirmingUri, setConfirmingUri] = useState<string | null>(null)
   const [pos, setPos] = useState<{
     left: number
     top: number
     placement: "above" | "below"
   } | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
-  const stale = result.query !== state.query
+  const selectedIndexRef = useRef(0)
+  const autoTabRef = useRef<ReferenceGroupKind>(TAB_ORDER[0])
+  const captureRef = useRef<ConfirmationCapture | null>(null)
+  const confirmingUriRef = useRef<string | null>(null)
+  const stateRef = useRef(state)
+  const controllerRef = useRef(controller)
+  const onSelectRef = useRef(onSelect)
+  const onCloseRef = useRef(onClose)
 
-  // Debounced, abortable fetch on every query change. All state updates run
-  // inside the (async) timer callback, never synchronously in the effect body.
   useEffect(() => {
-    const abort = new AbortController()
-    let active = true
-    const timer = setTimeout(() => {
-      Promise.resolve(search(state.query, abort.signal))
-        .then((groups) => {
-          if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, groups })
-          setSelectedIndex(0)
-        })
-        .catch(() => {
-          if (!active || abort.signal.aborted) return
-          setResult({ query: state.query, groups: [] })
-          setSelectedIndex(0)
-        })
-    }, FETCH_DEBOUNCE_MS)
-    return () => {
-      active = false
-      abort.abort()
-      clearTimeout(timer)
-    }
-  }, [state.query, search])
+    stateRef.current = state
+    controllerRef.current = controller
+    onSelectRef.current = onSelect
+    onCloseRef.current = onClose
+  })
+
+  // Publish the exact query synchronously so bare `@` paints catalog rows
+  // before the first paint — no legacy aggregate debounce.
+  useIsomorphicLayoutEffect(() => {
+    controller.setQuery(state.query)
+  }, [controller, state.query])
 
   const groupByKind = useMemo(
-    () => new Map(result.groups.map((group) => [group.kind, group])),
-    [result.groups]
+    () =>
+      new Map(
+        (Object.keys(snapshot.groups) as ReferenceGroupKind[]).map((kind) => [
+          kind,
+          snapshot.groups[kind],
+        ])
+      ),
+    [snapshot.groups]
   )
-  // Auto-target the first non-empty tab (agent-first) until the user pins one,
-  // so a file/session/… query never strands the user on an empty agent tab.
+
   const firstNonEmpty = useMemo(
     () =>
       TAB_ORDER.find(
@@ -185,44 +254,70 @@ export const SuggestionPopup = forwardRef<
       ) ?? TAB_ORDER[0],
     [groupByKind]
   )
-  const activeTab = pinnedTab ?? firstNonEmpty
-  const activeGroup = useMemo(
-    () => (stale ? null : (groupByKind.get(activeTab) ?? null)),
-    [stale, groupByKind, activeTab]
-  )
-  // Only the active tab's fresh items are selectable; selection resets to 0 on
-  // each fetch and on every tab switch.
-  const flat = useMemo(
-    () => (stale || !activeGroup ? [] : activeGroup.items),
-    [stale, activeGroup]
-  )
 
-  // Scroll the active option into view (scoped to options so it never targets
-  // the active tab button, which also carries an active marker via class only).
+  // Auto-target the first non-empty tab until the user pins one, but never jump
+  // away from a group that still holds a selectable selection (R-selection).
+  const activeTab: ReferenceGroupKind = useMemo(() => {
+    if (pinnedTab) return pinnedTab
+    const current = autoTabRef.current
+    const currentItems = groupByKind.get(current)?.items ?? []
+    const hasSelectableSelection =
+      selectedUri != null &&
+      currentItems.some(
+        (entry) => entry.reference.uri === selectedUri && entry.selectable
+      )
+    if (hasSelectableSelection) return current
+    autoTabRef.current = firstNonEmpty
+    return firstNonEmpty
+  }, [pinnedTab, firstNonEmpty, groupByKind, selectedUri])
+
+  const activeGroup = groupByKind.get(activeTab) ?? null
+  const flat = useMemo(
+    () => visibleItemsForSelection(activeGroup?.items ?? [], selectedUri),
+    [activeGroup?.items, selectedUri]
+  )
+  const loading = Boolean(activeGroup?.loading) && flat.length === 0
+
+  // Reconcile URI selection whenever the active tab's items change.
+  useIsomorphicLayoutEffect(() => {
+    const previousUri = selectedUri
+    const previousIndex = selectedIndexRef.current
+    const next = reconcileSelectedUri(previousUri, previousIndex, flat)
+    selectedIndexRef.current = indexOfUri(flat, next)
+    if (next !== previousUri) {
+      setSelectedUri(next)
+    }
+  }, [flat, activeTab])
+
+  // Feed selection into the controller for cache pins + validation.
+  useEffect(() => {
+    controller.setSelectedUri(selectedUri)
+  }, [controller, selectedUri])
+
+  // Scroll the active option into view.
   useEffect(() => {
     listRef.current
       ?.querySelector('[role="option"][data-active="true"]')
       ?.scrollIntoView({ block: "nearest" })
-  }, [selectedIndex, activeTab])
+  }, [selectedUri, activeTab])
+
+  const selectedIndex = useMemo(
+    () => indexOfUri(flat, selectedUri),
+    [flat, selectedUri]
+  )
 
   // Mirror the active option's id to the host (→ editor `aria-activedescendant`).
-  // Null while nothing is selectable (loading / no matches in the active tab).
   useEffect(() => {
+    const active =
+      selectedUri &&
+      flat.some(
+        (entry) => entry.reference.uri === selectedUri && entry.selectable
+      )
     onActiveOptionChange?.(
-      stale || flat.length === 0
-        ? null
-        : mentionOptionId(activeTab, selectedIndex)
+      active ? mentionOptionId(activeTab, selectedIndex) : null
     )
-  }, [activeTab, selectedIndex, flat.length, stale, onActiveOptionChange])
+  }, [activeTab, selectedIndex, selectedUri, flat, onActiveOptionChange])
 
-  // Position the caret-anchored panel within the viewport. Measure the rendered
-  // panel (a `visibility:hidden` box still has layout), read the *live* caret
-  // rect, then clamp/flip via the pure helper. A layout effect runs before
-  // paint, so the panel never flashes at a wrong spot. `state` is a fresh object
-  // each keystroke and the height tracks `stale`/`flat.length`/`activeTab`, so
-  // this re-anchors as the caret moves, results load, and tabs switch; resize +
-  // capture-phase scroll listeners re-anchor on window resize, editor scroll, or
-  // page scroll while the panel is open.
   useIsomorphicLayoutEffect(() => {
     if (typeof window === "undefined") return
     const reposition = () => {
@@ -247,7 +342,117 @@ export const SuggestionPopup = forwardRef<
       window.removeEventListener("resize", reposition)
       window.removeEventListener("scroll", reposition, true)
     }
-  }, [state, stale, flat.length, activeTab])
+  }, [state, loading, flat.length, activeTab, snapshot.patternError])
+
+  // Invalidate in-flight confirmation when the owning controller/query/range
+  // identity changes (a settled old promise must not insert at a remapped range).
+  useEffect(() => {
+    const capture = captureRef.current
+    if (!capture) return
+    if (
+      capture.controller !== controller ||
+      capture.query !== state.query ||
+      capture.from !== state.range.from ||
+      capture.to !== state.range.to
+    ) {
+      captureRef.current = null
+    }
+  }, [controller, state.query, state.range.from, state.range.to])
+
+  useEffect(() => {
+    return () => {
+      captureRef.current = null
+      confirmingUriRef.current = null
+    }
+  }, [])
+
+  const selectCandidate = useCallback(
+    async (uri: string, range: { from: number; to: number }) => {
+      if (confirmingUriRef.current != null) return
+      const live = stateRef.current
+      const activeController = controllerRef.current
+      const target = flat.find((entry) => entry.reference.uri === uri)
+      if (!target?.selectable) return
+
+      const capture: ConfirmationCapture = {
+        controller: activeController,
+        query: live.query,
+        from: range.from,
+        to: range.to,
+        uri,
+      }
+      captureRef.current = capture
+      confirmingUriRef.current = uri
+      setConfirmingUri(uri)
+
+      let result: ReferenceAttrs | null = null
+      try {
+        result = await activeController.confirmCandidate(uri)
+      } catch {
+        result = null
+      }
+
+      // Clear confirming only when this exact attempt settles.
+      if (confirmingUriRef.current === uri) {
+        confirmingUriRef.current = null
+        setConfirmingUri(null)
+      }
+
+      // Drop if the capture was invalidated (controller/query/range remapped).
+      if (captureRef.current !== capture) return
+      captureRef.current = null
+
+      const current = stateRef.current
+      const currentController = controllerRef.current
+      if (
+        currentController !== capture.controller ||
+        current.query !== capture.query ||
+        current.range.from !== capture.from ||
+        current.range.to !== capture.to
+      ) {
+        return
+      }
+
+      if (result) {
+        onSelectRef.current(result, {
+          from: capture.from,
+          to: capture.to,
+        })
+      }
+      // Known-negative (null): keep picker open; snapshot reconcile moves
+      // selection to the nearest survivor.
+    },
+    [flat]
+  )
+
+  const moveSelection = useCallback(
+    (delta: number) => {
+      const selectable = flat
+        .map((entry, index) => ({ entry, index }))
+        .filter(({ entry }) => entry.selectable)
+      if (selectable.length === 0) return
+      const currentPos = selectable.findIndex(
+        ({ entry }) => entry.reference.uri === selectedUri
+      )
+      const from = currentPos >= 0 ? currentPos : 0
+      const next =
+        selectable[(from + delta + selectable.length) % selectable.length]
+      selectedIndexRef.current = next.index
+      setSelectedUri(next.entry.reference.uri)
+    },
+    [flat, selectedUri]
+  )
+
+  const switchTab = useCallback(
+    (kind: ReferenceGroupKind) => {
+      setPinnedTab(kind)
+      const items = groupByKind.get(kind)?.items ?? []
+      const uri = firstSelectableUri(items)
+      selectedIndexRef.current = indexOfUri(items, uri)
+      setSelectedUri(uri)
+    },
+    [groupByKind]
+  )
 
   useImperativeHandle(
     ref,
@@ -255,33 +460,25 @@ export const SuggestionPopup = forwardRef<
       onKeyDown: (event) => {
         switch (event.key) {
           case "ArrowDown":
-            if (flat.length > 0) {
-              setSelectedIndex((index) => (index + 1) % flat.length)
-            }
+            moveSelection(1)
             return true
           case "ArrowUp":
-            if (flat.length > 0) {
-              setSelectedIndex(
-                (index) => (index - 1 + flat.length) % flat.length
-              )
-            }
+            moveSelection(-1)
             return true
           case "Tab": {
-            // Tab / Shift+Tab move between tabs (pinning the choice); Enter still
-            // selects. Wraps around the five tabs.
             const dir = event.shiftKey ? -1 : 1
             const at = TAB_ORDER.indexOf(activeTab)
-            setPinnedTab(
+            const next =
               TAB_ORDER[(at + dir + TAB_ORDER.length) % TAB_ORDER.length]
-            )
-            setSelectedIndex(0)
+            switchTab(next)
             return true
           }
           case "Enter": {
-            const chosen = flat[selectedIndex]
-            if (chosen) onSelect(chosen.reference, state.range)
-            // No fresh row (still loading, or empty tab): consume without
-            // inserting or submitting. Escape dismisses the panel.
+            // Consume while confirming or empty so the editor never submits.
+            if (confirmingUriRef.current != null) return true
+            if (selectedUri) {
+              void selectCandidate(selectedUri, state.range)
+            }
             return true
           }
           case "Escape":
@@ -292,12 +489,21 @@ export const SuggestionPopup = forwardRef<
         }
       },
     }),
-    [flat, selectedIndex, activeTab, onSelect, onClose, state.range]
+    [
+      moveSelection,
+      activeTab,
+      switchTab,
+      selectedUri,
+      selectCandidate,
+      onClose,
+      state.range,
+    ]
   )
 
   const activeLabel = tabLabels[activeTab] ?? DEFAULT_TAB_LABELS[activeTab]
-  const truncated = !stale && activeGroup?.truncated === true
-  const liveStatus = stale
+  const truncated = activeGroup?.truncated === true
+  const groupError = activeGroup?.error
+  const liveStatus = loading
     ? loadingLabel
     : flat.length === 0
       ? `${activeLabel}: ${emptyLabel}`
@@ -320,14 +526,8 @@ export const SuggestionPopup = forwardRef<
       <div
         ref={listRef}
         data-testid="mention-popup"
-        // Cap to the viewport (minus the 8px×2 edge margin = 1rem) so the panel
-        // always fits on small windows; the tab strip stays pinned and only the
-        // option list scrolls. The positioner clamps placement, this bounds size.
         className="flex max-h-[min(18rem,calc(100dvh_-_1rem))] w-[52rem] max-w-[calc(100vw_-_1rem)] flex-col overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-lg"
       >
-        {/* Tab strip: pointer-/key-driven only (tabIndex=-1 keeps editor focus).
-            Each tab controls the single listbox below (no role=tabpanel, which
-            cannot legally wrap a listbox). */}
         <div
           role="tablist"
           aria-label={listboxLabel}
@@ -336,7 +536,7 @@ export const SuggestionPopup = forwardRef<
         >
           {TAB_ORDER.map((kind) => {
             const isActive = kind === activeTab
-            const count = stale ? 0 : (groupByKind.get(kind)?.items.length ?? 0)
+            const count = groupByKind.get(kind)?.items.length ?? 0
             return (
               <button
                 key={kind}
@@ -345,15 +545,8 @@ export const SuggestionPopup = forwardRef<
                 tabIndex={-1}
                 aria-selected={isActive}
                 aria-controls={MENTION_LISTBOX_ID}
-                // mousedown only prevents the focus shift (keeps the editor
-                // focused so aria-activedescendant stays valid); the switch runs
-                // on click so AT / synthetic activation (which fires click, not
-                // mousedown) works too.
                 onMouseDown={(event) => event.preventDefault()}
-                onClick={() => {
-                  setPinnedTab(kind)
-                  setSelectedIndex(0)
-                }}
+                onClick={() => switchTab(kind)}
                 className={cn(
                   "flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium",
                   isActive
@@ -362,7 +555,7 @@ export const SuggestionPopup = forwardRef<
                 )}
               >
                 <span>{tabLabels[kind] ?? DEFAULT_TAB_LABELS[kind]}</span>
-                {!stale && count > 0 && (
+                {count > 0 && (
                   <span className="rounded bg-muted px-1 text-[0.7rem] tabular-nums text-muted-foreground">
                     {count}
                   </span>
@@ -372,9 +565,22 @@ export const SuggestionPopup = forwardRef<
           })}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-1">
-          {/* Status text lives *outside* the listbox: a listbox may only own
-              options. (The sr-only live region below announces it to AT.) */}
-          {stale ? (
+          {snapshot.patternError && (
+            <div className="px-2 py-1 text-xs text-destructive">
+              {invalidPatternLabel}
+            </div>
+          )}
+          {groupError === "profile" && (
+            <div className="px-2 py-1 text-xs text-destructive">
+              {profileErrorLabel}
+            </div>
+          )}
+          {groupError === "source" && (
+            <div className="px-2 py-1 text-xs text-destructive">
+              {sourceErrorLabel}
+            </div>
+          )}
+          {loading ? (
             <div className="px-2 py-3 text-sm text-muted-foreground">
               {loadingLabel}
             </div>
@@ -383,62 +589,68 @@ export const SuggestionPopup = forwardRef<
               {emptyLabel}
             </div>
           ) : null}
-          {/* Always rendered (even empty) so the editor's `aria-controls` target
-              always resolves; holds only option children for the active tab. */}
           <div
             id={MENTION_LISTBOX_ID}
             role="listbox"
             aria-label={`${listboxLabel}: ${activeLabel}`}
           >
-            {!stale &&
-              activeGroup?.items.map((item, index) => {
-                const active = index === selectedIndex
-                const label = item.reference.label || item.reference.id
-                const displayLabel = middleTruncateReferenceText(label)
-                const displayDetail = item.detail
-                  ? middleTruncateReferenceText(item.detail)
-                  : null
-                return (
-                  <button
-                    key={`${activeGroup.kind}:${item.reference.id}`}
-                    type="button"
-                    id={mentionOptionId(activeGroup.kind, index)}
-                    role="option"
-                    aria-selected={active}
-                    data-active={active}
-                    className={cn(
-                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm",
-                      active
-                        ? "bg-accent text-accent-foreground"
-                        : "hover:bg-accent/50"
-                    )}
-                    onMouseDown={(event) => {
-                      // Keep editor focus; insert on click.
-                      event.preventDefault()
-                      onSelect(item.reference, state.range)
-                    }}
-                    onMouseEnter={() => setSelectedIndex(index)}
-                  >
-                    <ReferenceIcon data={item.reference} variant="option" />
-                    <span className="min-w-0 flex-1 truncate" title={label}>
-                      {displayLabel}
+            {flat.map((entry, index) => {
+              const active = entry.reference.uri === selectedUri
+              const disabled = !entry.selectable
+              const label = entry.reference.label || entry.reference.id
+              const displayLabel = middleTruncateReferenceText(label)
+              const displayDetail = entry.detail
+                ? middleTruncateReferenceText(entry.detail)
+                : null
+              return (
+                <button
+                  key={entry.reference.uri}
+                  type="button"
+                  id={mentionOptionId(activeTab, index)}
+                  role="option"
+                  aria-selected={active}
+                  aria-disabled={disabled || undefined}
+                  data-active={active}
+                  data-uri={entry.reference.uri}
+                  data-confirming={
+                    confirmingUri === entry.reference.uri || undefined
+                  }
+                  disabled={disabled}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm",
+                    disabled && "cursor-not-allowed opacity-50",
+                    active && !disabled
+                      ? "bg-accent text-accent-foreground"
+                      : !disabled && "hover:bg-accent/50"
+                  )}
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    if (disabled) return
+                    void selectCandidate(entry.reference.uri, state.range)
+                  }}
+                  onMouseEnter={() => {
+                    if (disabled) return
+                    selectedIndexRef.current = index
+                    setSelectedUri(entry.reference.uri)
+                  }}
+                >
+                  <ReferenceIcon data={entry.reference} variant="option" />
+                  <span className="min-w-0 flex-1 truncate" title={label}>
+                    {displayLabel}
+                  </span>
+                  {displayDetail && (
+                    <span
+                      className="max-w-[18rem] truncate text-xs text-muted-foreground"
+                      title={entry.detail ?? undefined}
+                    >
+                      {displayDetail}
                     </span>
-                    {displayDetail && (
-                      <span
-                        className="max-w-[18rem] truncate text-xs text-muted-foreground"
-                        title={item.detail ?? undefined}
-                      >
-                        {displayDetail}
-                      </span>
-                    )}
-                  </button>
-                )
-              })}
+                  )}
+                </button>
+              )
+            })}
           </div>
           {truncated && (
-            // aria-hidden: a visual "refine" affordance, not an option — keeps
-            // the listbox owning only options (the live region conveys
-            // truncation to AT). Never enters `flat`, so Enter can't select it.
             <div
               aria-hidden
               className="px-2 py-1 text-xs italic text-muted-foreground"
@@ -448,8 +660,6 @@ export const SuggestionPopup = forwardRef<
           )}
         </div>
       </div>
-      {/* Announce loading / active tab + result count / empty state to screen
-          readers; the listbox keeps no focus, so AT relies on this live region. */}
       <div role="status" aria-live="polite" className="sr-only">
         {liveStatus}
       </div>

@@ -1971,7 +1971,26 @@ export class ReferenceSearchController {
 
     const limit =
       kind === "agent" ? Number.POSITIVE_INFINITY : this.inputs.referenceLimit
-    const sliced = rows.slice(0, limit).map((r) => r.item)
+    // When rank truncation would hide the selected URI, reserve one visible
+    // slot for it and drop the lowest-ranked unselected item.
+    let chosen = rows
+    if (
+      Number.isFinite(limit) &&
+      rows.length > limit &&
+      this.selectedUri != null
+    ) {
+      const selectedAt = rows.findIndex(
+        (r) => r.item.reference.uri === this.selectedUri
+      )
+      if (selectedAt >= limit) {
+        chosen = [...rows.slice(0, limit - 1), rows[selectedAt]]
+      } else {
+        chosen = rows.slice(0, limit)
+      }
+    } else {
+      chosen = rows.slice(0, limit)
+    }
+    const sliced = chosen.map((r) => r.item)
     const localTruncated =
       kind !== "agent" && rows.length > this.inputs.referenceLimit
     return {

@@ -53,24 +53,13 @@ export interface MentionUiLabels {
   more: string
   /** Builds the live-region result-count announcement (supports plurals). */
   count: (count: number) => string
+  /** Invalid `re:` pattern (Task 10 supplies localized values). */
+  invalidPattern?: string
+  /** Per-group source failure. */
+  sourceError?: string
+  /** Profile-catalog failure (agent tab). */
+  profileError?: string
 }
-
-/**
- * Resolves the `@` query into grouped suggestions. Async so an implementation
- * can hit the file tree / conversations / git log / skills APIs. The optional
- * AbortSignal is aborted when a newer query supersedes this one.
- *
- * Phase 2 ships the panel against this interface; Phase 3 supplies the real
- * implementation (wired to the live data hooks) when the composer replaces the
- * textarea in message-input.
- *
- * Task 8 preserves this transitional aggregate contract; Task 9 removes it after
- * every composer migrates to {@link ReferenceSearchController}.
- */
-export type ReferenceSearch = (
-  query: string,
-  signal?: AbortSignal
-) => SuggestionGroup[] | Promise<SuggestionGroup[]>
 
 /** State the suggestion plugin pushes to React while the `@` panel is open. */
 export interface SuggestionState {

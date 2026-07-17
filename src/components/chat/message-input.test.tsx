@@ -64,8 +64,23 @@ vi.mock("@/hooks/use-enabled-skill-ids", () => ({
     supported: true,
   }),
 }))
+const referenceSearchHook = vi.hoisted(() => ({
+  options: null as null | {
+    folderId: number | null
+    defaultPath: string | null
+    enabled: boolean
+  },
+  mock: vi.fn(() => null),
+}))
 vi.mock("@/components/chat/composer/use-reference-search", () => ({
-  useReferenceSearch: () => async () => [],
+  useReferenceSearchController: (options: {
+    folderId: number | null
+    defaultPath: string | null
+    enabled: boolean
+  }) => {
+    referenceSearchHook.options = options
+    return referenceSearchHook.mock(options)
+  },
 }))
 vi.mock("@/components/chat/conversation-context-bar", () => ({
   ConversationContextBar: ({
@@ -143,7 +158,50 @@ function renderInput(
 }
 
 describe("MessageInput (RichComposer integration)", () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    referenceSearchHook.options = null
+    referenceSearchHook.mock.mockClear()
+  })
+
+  it("message_input_forwards_folder_scope_to_controller_hook", () => {
+    const { rerender } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          folderId={7}
+          defaultPath="C:/repo"
+          isActive
+        />
+      </NextIntlClientProvider>
+    )
+    expect(referenceSearchHook.options).toEqual(
+      expect.objectContaining({
+        folderId: 7,
+        defaultPath: "C:/repo",
+        enabled: true,
+      })
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          folderId={null}
+          isActive
+        />
+      </NextIntlClientProvider>
+    )
+    expect(referenceSearchHook.options).toEqual(
+      expect.objectContaining({
+        folderId: null,
+        defaultPath: null,
+        enabled: true,
+      })
+    )
+  })
 
   it("mounts and renders the rich-text composer surface", async () => {
     const { container } = renderInput({})
