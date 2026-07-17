@@ -380,25 +380,31 @@ pub async fn emit_with_state_gated<F>(
 where
     F: FnOnce(&SessionState) -> bool,
 {
-    let (envelope_arc, stream, evicted) = {
+    let (envelope_arc, completion, stream, evicted) = {
         let mut s = state.write().await;
         if !gate(&s) {
             return false;
         }
-        s.apply_event(&payload);
+        // Capture optional completion under the same write lock that mutates
+        // SessionState, then build exactly one public envelope for all
+        // transport/replay paths. Only the internal bus retains the sidecar.
+        let completion = match (&payload, s.apply_event(&payload)) {
+            (AcpEvent::TurnComplete { .. }, Some(snapshot)) => Some(Arc::new(snapshot)),
+            _ => None,
+        };
         s.event_seq += 1;
-        let envelope = Arc::new(EventEnvelope {
+        let public = Arc::new(EventEnvelope {
             seq: s.event_seq,
             connection_id: s.connection_id.clone(),
             payload,
         });
-        let evicted = s.push_recent_event(Arc::clone(&envelope));
-        (envelope, s.event_stream(), evicted)
+        let evicted = s.push_recent_event(Arc::clone(&public));
+        (public, completion, s.event_stream(), evicted)
     };
 
     // Per-connection broadcaster — primary delivery path for web/remote-
     // desktop transports (they use Subscribe-with-Snapshot attach for ACP
-    // events).
+    // events). Public envelope only — never the completion sidecar.
     stream.send(Arc::clone(&envelope_arc));
 
     // In-process consumers (lifecycle, pet, chat-channel). Typed envelope —
@@ -412,7 +418,7 @@ where
             // immediate per-envelope delivery even when the desktop queue
             // applies backpressure on the awaited delivery branch below.
             if let Some(bus) = app.try_state::<Arc<InternalEventBus>>() {
-                bus.send(Arc::clone(&envelope_arc));
+                bus.send_with_completion(Arc::clone(&envelope_arc), completion);
                 if evicted > 0 {
                     bus.metrics()
                         .ring_buffer_evict_count
@@ -449,13 +455,16 @@ where
             }
         }
         EventEmitter::WebOnly { bus, .. } => {
-            bus.send(Arc::clone(&envelope_arc));
+            bus.send_with_completion(Arc::clone(&envelope_arc), completion);
             if evicted > 0 {
                 bus.metrics()
                     .ring_buffer_evict_count
                     .fetch_add(evicted as u64, Ordering::Relaxed);
             }
         }
+        // Noop still publishes the ordinary public envelope to the private
+        // connection stream (above) but sends neither internal-bus nor
+        // transport delivery.
         EventEmitter::Noop => {}
     }
 
@@ -469,7 +478,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_state::ActiveTurnContext;
     use crate::db::entities::conversation::ConversationStatus;
+    use crate::models::system::AppLocale;
     use crate::models::AgentType;
     use serde::Serializer;
 
@@ -481,6 +492,183 @@ mod tests {
             "win-test".to_string(),
             None,
         )))
+    }
+
+    /// Real SessionState + private stream + InternalEventBus fixture for
+    /// event-owned completion sidecar tests.
+    struct CompletionFixture {
+        state: Arc<RwLock<SessionState>>,
+        emitter: EventEmitter,
+        bus: Arc<InternalEventBus>,
+    }
+
+    async fn completion_fixture() -> CompletionFixture {
+        let mut session = SessionState::new(
+            "conn-sidecar".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "win-sidecar".to_string(),
+            None,
+        );
+        session.conversation_id = Some(42);
+        let state = Arc::new(RwLock::new(session));
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::web_only(broadcaster, Arc::clone(&bus));
+        CompletionFixture {
+            state,
+            emitter,
+            bus,
+        }
+    }
+
+    impl CompletionFixture {
+        async fn private_stream(&self) -> tokio::sync::broadcast::Receiver<Arc<EventEnvelope>> {
+            self.state.read().await.event_stream().subscribe()
+        }
+
+        async fn emit_end_turn(&self, text: &str, token: &str, locale: AppLocale) {
+            {
+                let mut s = self.state.write().await;
+                s.active_turn = Some(ActiveTurnContext {
+                    token: token.to_string(),
+                    locale,
+                });
+                s.effective_locale = locale;
+            }
+            emit_with_state(
+                &self.state,
+                &self.emitter,
+                AcpEvent::ContentDelta {
+                    text: text.to_string(),
+                },
+            )
+            .await;
+            emit_with_state(
+                &self.state,
+                &self.emitter,
+                AcpEvent::TurnComplete {
+                    session_id: "sess-1".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                    mark_awaiting_reply: false,
+                },
+            )
+            .await;
+        }
+
+        async fn overwrite_live_state(&self, text: &str, token: &str, locale: AppLocale) {
+            let mut s = self.state.write().await;
+            s.last_assistant_text = Some(text.to_string());
+            s.active_turn = Some(ActiveTurnContext {
+                token: token.to_string(),
+                locale,
+            });
+            s.effective_locale = locale;
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_sidecar_is_internal_only_and_event_owned() {
+        let fixture = completion_fixture().await;
+        let mut stream = fixture.private_stream().await;
+        let mut bus = fixture.bus.subscribe();
+        fixture
+            .emit_end_turn("first answer", "token-1", AppLocale::Fr)
+            .await;
+        fixture
+            .overwrite_live_state("second answer", "token-2", AppLocale::Ja)
+            .await;
+
+        // Drain content delta then take TurnComplete.
+        let _delta = stream.recv().await.expect("public delta");
+        let public = stream.recv().await.expect("public event");
+        let _bus_delta = bus.recv().await.expect("internal delta");
+        let internal = bus.recv().await.expect("internal event");
+        assert_eq!(
+            internal.completion.as_ref().expect("sidecar").turn_token,
+            "token-1"
+        );
+        assert_eq!(
+            internal
+                .completion
+                .as_ref()
+                .expect("sidecar")
+                .final_text
+                .as_ref(),
+            "first answer"
+        );
+        assert_eq!(internal.event.seq, public.seq);
+        assert!(!serde_json::to_string(&public)
+            .expect("json")
+            .contains("token-1"));
+        assert!(!serde_json::to_string(&internal.event)
+            .expect("json")
+            .contains("token-1"));
+    }
+
+    #[tokio::test]
+    async fn two_queued_completions_keep_distinct_sidecars() {
+        let fixture = completion_fixture().await;
+        let mut bus = fixture.bus.subscribe();
+        fixture
+            .emit_end_turn("answer-one", "token-a", AppLocale::En)
+            .await;
+        fixture
+            .emit_end_turn("answer-two", "token-b", AppLocale::ZhCn)
+            .await;
+
+        // ContentDelta + TurnComplete for each turn.
+        let mut completions = Vec::new();
+        for _ in 0..4 {
+            let internal = bus.recv().await.expect("internal event");
+            if let Some(snap) = internal.completion.as_ref() {
+                completions.push((
+                    snap.turn_token.clone(),
+                    snap.final_text.as_ref().to_string(),
+                    snap.locale,
+                ));
+            }
+        }
+        assert_eq!(
+            completions,
+            vec![
+                ("token-a".into(), "answer-one".into(), AppLocale::En),
+                ("token-b".into(), "answer-two".into(), AppLocale::ZhCn),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_sidecar_never_enters_recent_event_replay() {
+        let fixture = completion_fixture().await;
+        fixture
+            .emit_end_turn("replay answer", "token-replay", AppLocale::De)
+            .await;
+
+        let recent = fixture
+            .state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("ring has events");
+        assert!(!recent.is_empty());
+        for envelope in &recent {
+            let json = serde_json::to_string(envelope).expect("json");
+            assert!(
+                !json.contains("token-replay"),
+                "replay ring must not carry completion token: {json}"
+            );
+            assert!(
+                !json.contains("final_text") && !json.contains("turn_token"),
+                "replay ring must not carry completion sidecar fields: {json}"
+            );
+            // Public envelope shape only — no InternalEventEnvelope wrapper keys.
+            let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+            assert!(value.get("completion").is_none());
+            assert!(value.get("event").is_none());
+        }
     }
 
     #[cfg(any(test, feature = "tauri-runtime"))]

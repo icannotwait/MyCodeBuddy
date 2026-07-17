@@ -1096,7 +1096,14 @@
     "restartRequired": "Enregistré. Redémarrez l’application pour appliquer la modification.",
     "restartNow": "Redémarrer maintenant",
     "restartFailed": "Échec du redémarrage : {message}",
-    "loadFailed": "Échec du chargement : {message}"
+    "loadFailed": "Échec du chargement : {message}",
+    "conversationExperienceTitle": "Expérience de conversation",
+    "conversationExperienceDescription": "Configurez les titres automatiques et le comportement de la recherche de références.",
+    "autoTitleAgent": "Agent de titre automatique",
+    "autoTitleOff": "Désactivé",
+    "autoTitleUnavailable": "{agent} (Indisponible)",
+    "autoTitleSaveFailed": "Impossible d'enregistrer l'agent de titre automatique : {message}",
+    "autoTitleLoading": "Chargement des paramètres de titre automatique..."
   },
   "LoginPage": {
     "documentTitle": "Connexion - DrawCode",

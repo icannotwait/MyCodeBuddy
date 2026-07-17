@@ -662,29 +662,37 @@ impl ConnectionManager {
         // safe-native fallback only for typed RouteSpecific bootstrap failures.
         // Child and Fatal never retry.
         let mut attempt_plan = route_plan;
+        // Internal title runs never carry Codeg MCP / delegation injection.
+        let skip_delegation_injection = launch_context.purpose == ConnectionPurpose::InternalTitle;
         // Authoritative route record after exclusivity validation (Task 13).
-        if let Some(inj) = self.delegation_snapshot() {
-            if let Err(e) = inj
-                .metrics
-                .validate_and_record_route(agent_type, &attempt_plan)
-            {
-                return Err(AcpError::protocol(format!(
-                    "managed plan violates exclusive route surfaces: {}",
-                    e.stable_code()
-                )));
+        if !skip_delegation_injection {
+            if let Some(inj) = self.delegation_snapshot() {
+                if let Err(e) = inj
+                    .metrics
+                    .validate_and_record_route(agent_type, &attempt_plan)
+                {
+                    return Err(AcpError::protocol(format!(
+                        "managed plan violates exclusive route surfaces: {}",
+                        e.stable_code()
+                    )));
+                }
+                let suppression =
+                    crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+                crate::acp::delegation::metrics::DelegationAuditRecord::route(
+                    "pending-spawn",
+                    None,
+                    agent_type,
+                    &attempt_plan,
+                    suppression,
+                )
+                .emit_route_resolved();
+            } else {
+                // Tests without injection still enforce exclusivity.
+                attempt_plan
+                    .assert_exclusive()
+                    .map_err(|e| AcpError::protocol(e.to_string()))?;
             }
-            let suppression =
-                crate::acp::connection::suppression_application_for_plan(&attempt_plan);
-            crate::acp::delegation::metrics::DelegationAuditRecord::route(
-                "pending-spawn",
-                None,
-                agent_type,
-                &attempt_plan,
-                suppression,
-            )
-            .emit_route_resolved();
         } else {
-            // Tests without injection still enforce exclusivity.
             attempt_plan
                 .assert_exclusive()
                 .map_err(|e| AcpError::protocol(e.to_string()))?;
@@ -702,6 +710,12 @@ impl ConnectionManager {
                 attempt,
                 attempt_plan.effective
             );
+
+            let injection = if skip_delegation_injection {
+                None
+            } else {
+                self.delegation_snapshot()
+            };
 
             let SpawnHandshake {
                 session_started_rx,
@@ -722,7 +736,7 @@ impl ConnectionManager {
                 self.connections.clone(),
                 preferred_mode_id.clone(),
                 preferred_config_values.clone(),
-                self.delegation_snapshot(),
+                injection,
                 launch_context.clone(),
             )
             .await
@@ -1495,6 +1509,19 @@ impl ConnectionManager {
         blocks: Vec<PromptInputBlock>,
         capture: Option<PromptCaptureContext>,
     ) -> Result<(), AcpError> {
+        // Ordinary DB-aware UI path never drives InternalTitle connections.
+        {
+            let state_arc = self
+                .get_state(conn_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let purpose = state_arc.read().await.purpose;
+            if purpose == ConnectionPurpose::InternalTitle {
+                return Err(AcpError::protocol(
+                    "send_prompt rejects InternalTitle purpose; use send_prompt_unlinked_internal",
+                ));
+            }
+        }
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
         // Non-linked UI sends: register mandatory routes + mark attention.
@@ -2783,6 +2810,29 @@ impl ConnectionManager {
             });
         }
         out
+    }
+
+    /// Snapshot `external_id` and subscribe to the private event stream under
+    /// one `SessionState` read lock so a concurrent `SessionStarted` cannot
+    /// land between the two observations.
+    pub async fn identity_and_subscribe(
+        &self,
+        conn_id: &str,
+    ) -> Result<
+        (
+            Option<String>,
+            tokio::sync::broadcast::Receiver<std::sync::Arc<crate::acp::types::EventEnvelope>>,
+        ),
+        AcpError,
+    > {
+        let state_arc = self
+            .get_state(conn_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        let state = state_arc.read().await;
+        let external_id = state.external_id.clone();
+        let rx = state.event_stream().subscribe();
+        Ok((external_id, rx))
     }
 
     /// Clone the `Arc<RwLock<SessionState>>` for a given connection id so the
@@ -4654,6 +4704,104 @@ mod tests {
         );
         assert!(s.turn_in_flight);
         assert_eq!(s.effective_locale, AppLocale::En);
+    }
+
+    #[tokio::test]
+    async fn ordinary_send_prompt_rejects_internal_title_purpose() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live(
+                "reject-internal-title",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("reject-internal-title").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        let err = mgr
+            .send_prompt(&db, "reject-internal-title", one_text_block(), None)
+            .await
+            .expect_err("ordinary send must reject InternalTitle");
+        assert!(
+            err.to_string().contains("InternalTitle")
+                || err.to_string().contains("send_prompt_unlinked_internal"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_and_subscribe_recovers_session_started_before_subscribe_for_internal_title() {
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live("id-sub-conn", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = mgr.get_state("id-sub-conn").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        // Apply SessionStarted before subscribe — snapshot branch must see it.
+        {
+            let state = mgr.get_state("id-sub-conn").await.unwrap();
+            emit_with_state(
+                &state,
+                &EventEmitter::Noop,
+                AcpEvent::SessionStarted {
+                    session_id: "ext-pre".into(),
+                },
+            )
+            .await;
+        }
+        let (id, _rx) = mgr
+            .identity_and_subscribe("id-sub-conn")
+            .await
+            .expect("identity");
+        assert_eq!(id.as_deref(), Some("ext-pre"));
+    }
+
+    #[tokio::test]
+    async fn noop_emitter_keeps_internal_title_events_off_transport_and_lifecycle_bus() {
+        // Noop has no ACP bus / transport target — do not use an unattached
+        // bus as "proof" of isolation (that bus was never on the emit path).
+        assert!(
+            EventEmitter::Noop.acp_event_bus().is_none(),
+            "EventEmitter::Noop must expose no ACP internal bus"
+        );
+
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live(
+                "noop-internal-title",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("noop-internal-title").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        let state = mgr.get_state("noop-internal-title").await.unwrap();
+        let (_id, mut private_rx) = mgr
+            .identity_and_subscribe("noop-internal-title")
+            .await
+            .expect("subscribe");
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::ContentDelta {
+                text: "title delta".into(),
+            },
+        )
+        .await;
+
+        // Private stream receives events for the title runner.
+        let first = private_rx.try_recv().expect("private ContentDelta");
+        assert!(matches!(first.payload, AcpEvent::ContentDelta { .. }));
     }
 
     #[tokio::test]

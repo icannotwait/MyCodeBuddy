@@ -1096,7 +1096,14 @@
     "restartRequired": "تم الحفظ. أعد تشغيل التطبيق ليصبح التغيير نافذًا.",
     "restartNow": "إعادة التشغيل الآن",
     "restartFailed": "فشل إعادة التشغيل: {message}",
-    "loadFailed": "فشل التحميل: {message}"
+    "loadFailed": "فشل التحميل: {message}",
+    "conversationExperienceTitle": "تجربة المحادثة",
+    "conversationExperienceDescription": "اضبط العناوين التلقائية وسلوك البحث عن المراجع.",
+    "autoTitleAgent": "وكيل العنوان التلقائي",
+    "autoTitleOff": "إيقاف",
+    "autoTitleUnavailable": "{agent} (غير متاح)",
+    "autoTitleSaveFailed": "تعذر حفظ وكيل العنوان التلقائي: {message}",
+    "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي..."
   },
   "LoginPage": {
     "documentTitle": "تسجيل الدخول - DrawCode",

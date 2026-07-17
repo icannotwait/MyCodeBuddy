@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::app_error::AppCommandError;
+use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
@@ -151,14 +152,78 @@ pub async fn save_opened_tabs(
     .await
 }
 
+/// Drop internal agent sessions before search / aggregation / import.
+pub fn filter_internal_summaries(
+    rows: Vec<(AgentType, ConversationSummary)>,
+    filter: &InternalSessionFilter,
+) -> Vec<(AgentType, ConversationSummary)> {
+    rows.into_iter()
+        .filter(|(agent_type, summary)| {
+            !filter.contains(
+                *agent_type,
+                Some(summary.id.as_str()),
+                summary.folder_path.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// Reject a raw conversation detail when the requested id or working dir is internal.
+pub fn reject_internal_detail(
+    agent_type: AgentType,
+    conversation_id: &str,
+    detail: ConversationDetail,
+    filter: &InternalSessionFilter,
+) -> Result<ConversationDetail, AppCommandError> {
+    let working_dir = detail.summary.folder_path.as_deref();
+    if filter.contains(agent_type, Some(conversation_id), working_dir)
+        || filter.contains(
+            detail.summary.agent_type,
+            Some(detail.summary.id.as_str()),
+            working_dir,
+        )
+    {
+        return Err(AppCommandError::not_found("Conversation not found")
+            .with_detail(conversation_id.to_owned()));
+    }
+    Ok(detail)
+}
+
+/// Cline/Gemini folder-conversation fallback: filter internals, then closest timestamp.
+pub fn select_folder_time_fallback(
+    rows: Vec<ConversationSummary>,
+    folder_path: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    filter: &InternalSessionFilter,
+) -> Option<ConversationSummary> {
+    let pairs: Vec<(AgentType, ConversationSummary)> =
+        rows.into_iter().map(|c| (c.agent_type, c)).collect();
+    let visible = filter_internal_summaries(pairs, filter);
+    visible
+        .into_iter()
+        .map(|(_, c)| c)
+        .filter(|c| {
+            c.folder_path
+                .as_ref()
+                .zip(folder_path)
+                .is_some_and(|(a, b)| path_eq_for_matching(a, b))
+        })
+        .min_by_key(|c| (c.started_at - started_at).num_seconds().unsigned_abs())
+        .filter(|c| {
+            let diff = (c.started_at - started_at).num_seconds().unsigned_abs();
+            diff < 300
+        })
+}
+
 /// Synchronous implementation shared by list_conversations, list_folders, and get_stats.
 fn list_conversations_sync(
     agent_type: Option<AgentType>,
     search: Option<String>,
     sort_by: Option<String>,
     folder_path: Option<String>,
+    filter: &InternalSessionFilter,
 ) -> Vec<ConversationSummary> {
-    let mut all_conversations = Vec::new();
+    let mut all_rows: Vec<(AgentType, ConversationSummary)> = Vec::new();
     let mut seen_keys = HashSet::new();
 
     let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
@@ -175,8 +240,8 @@ fn list_conversations_sync(
     ];
 
     for (at, parser) in &parsers {
-        if let Some(ref filter) = agent_type {
-            if filter != at {
+        if let Some(ref agent_filter) = agent_type {
+            if agent_filter != at {
                 continue;
             }
         }
@@ -186,7 +251,7 @@ fn list_conversations_sync(
                 for conversation in conversations {
                     let key = format!("{:?}-{}", conversation.agent_type, conversation.id);
                     if seen_keys.insert(key) {
-                        all_conversations.push(conversation);
+                        all_rows.push((*at, conversation));
                     }
                 }
             }
@@ -195,6 +260,13 @@ fn list_conversations_sync(
             }
         }
     }
+
+    // Exclude internal sessions before search / folder / aggregation.
+    let mut all_conversations: Vec<ConversationSummary> =
+        filter_internal_summaries(all_rows, filter)
+            .into_iter()
+            .map(|(_, summary)| summary)
+            .collect();
 
     // Apply search filter
     if let Some(ref query) = search {
@@ -245,15 +317,21 @@ fn list_conversations_sync(
     all_conversations
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn list_conversations(
+/// Parser-backed list core: shared discovery lease + filter before search/sort.
+pub async fn list_conversations_core(
+    registry: &InternalAgentSessionRegistry,
     agent_type: Option<AgentType>,
     search: Option<String>,
     sort_by: Option<String>,
     folder_path: Option<String>,
 ) -> Result<Vec<ConversationSummary>, AppCommandError> {
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     tokio::task::spawn_blocking(move || {
-        list_conversations_sync(agent_type, search, sort_by, folder_path)
+        let _guard = guard;
+        list_conversations_sync(agent_type, search, sort_by, folder_path, &filter)
     })
     .await
     .map_err(|e| {
@@ -262,12 +340,37 @@ pub async fn list_conversations(
     })
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn get_conversation(
+pub async fn list_conversations(
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+    agent_type: Option<AgentType>,
+    search: Option<String>,
+    sort_by: Option<String>,
+    folder_path: Option<String>,
+) -> Result<Vec<ConversationSummary>, AppCommandError> {
+    list_conversations_core(
+        registry.inner().as_ref(),
+        agent_type,
+        search,
+        sort_by,
+        folder_path,
+    )
+    .await
+}
+
+/// Parser-backed raw detail core: parse under shared lease, then reject internals.
+pub async fn get_conversation_core(
+    registry: &InternalAgentSessionRegistry,
     agent_type: AgentType,
     conversation_id: String,
 ) -> Result<ConversationDetail, AppCommandError> {
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     tokio::task::spawn_blocking(move || -> Result<ConversationDetail, AppCommandError> {
+        let _guard = guard;
         let parser: Box<dyn AgentParser> = match agent_type {
             AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
             AgentType::Codex => Box::new(CodexParser::new()),
@@ -281,9 +384,10 @@ pub async fn get_conversation(
             AgentType::Grok => Box::new(GrokParser::new()),
         };
 
-        parser
+        let detail = parser
             .get_conversation(&conversation_id)
-            .map_err(parse_error_to_app_error)
+            .map_err(parse_error_to_app_error)?;
+        reject_internal_detail(agent_type, &conversation_id, detail, &filter)
     })
     .await
     .map_err(|e| {
@@ -292,10 +396,26 @@ pub async fn get_conversation(
     })?
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn list_folders() -> Result<Vec<FolderInfo>, AppCommandError> {
+pub async fn get_conversation(
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+    agent_type: AgentType,
+    conversation_id: String,
+) -> Result<ConversationDetail, AppCommandError> {
+    get_conversation_core(registry.inner().as_ref(), agent_type, conversation_id).await
+}
+
+pub async fn list_folders_core(
+    registry: &InternalAgentSessionRegistry,
+) -> Result<Vec<FolderInfo>, AppCommandError> {
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     tokio::task::spawn_blocking(move || -> Result<Vec<FolderInfo>, AppCommandError> {
-        let all_conversations = list_conversations_sync(None, None, None, None);
+        let _guard = guard;
+        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
         Ok(compute_folders(&all_conversations))
     })
     .await
@@ -304,10 +424,24 @@ pub async fn list_folders() -> Result<Vec<FolderInfo>, AppCommandError> {
     })?
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn get_stats() -> Result<AgentStats, AppCommandError> {
+pub async fn list_folders(
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+) -> Result<Vec<FolderInfo>, AppCommandError> {
+    list_folders_core(registry.inner().as_ref()).await
+}
+
+pub async fn get_stats_core(
+    registry: &InternalAgentSessionRegistry,
+) -> Result<AgentStats, AppCommandError> {
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     tokio::task::spawn_blocking(move || -> Result<AgentStats, AppCommandError> {
-        let all_conversations = list_conversations_sync(None, None, None, None);
+        let _guard = guard;
+        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
         Ok(compute_stats(&all_conversations))
     })
     .await
@@ -317,10 +451,24 @@ pub async fn get_stats() -> Result<AgentStats, AppCommandError> {
     })?
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn get_sidebar_data() -> Result<SidebarData, AppCommandError> {
+pub async fn get_stats(
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+) -> Result<AgentStats, AppCommandError> {
+    get_stats_core(registry.inner().as_ref()).await
+}
+
+pub async fn get_sidebar_data_core(
+    registry: &InternalAgentSessionRegistry,
+) -> Result<SidebarData, AppCommandError> {
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     tokio::task::spawn_blocking(move || -> Result<SidebarData, AppCommandError> {
-        let all_conversations = list_conversations_sync(None, None, None, None);
+        let _guard = guard;
+        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
         let folders = compute_folders(&all_conversations);
         let stats = compute_stats(&all_conversations);
         Ok(SidebarData { folders, stats })
@@ -330,6 +478,14 @@ pub async fn get_sidebar_data() -> Result<SidebarData, AppCommandError> {
         AppCommandError::task_execution_failed("Failed to build sidebar data")
             .with_detail(e.to_string())
     })?
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_sidebar_data(
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+) -> Result<SidebarData, AppCommandError> {
+    get_sidebar_data_core(registry.inner().as_ref()).await
 }
 
 fn compute_folders(all_conversations: &[ConversationSummary]) -> Vec<FolderInfo> {
@@ -368,6 +524,7 @@ fn compute_folders(all_conversations: &[ConversationSummary]) -> Vec<FolderInfo>
 pub async fn import_local_conversations_core(
     conn: &sea_orm::DatabaseConnection,
     emitter: &EventEmitter,
+    registry: &InternalAgentSessionRegistry,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
     let folder = folder_service::get_folder_by_id(conn, folder_id)
@@ -379,7 +536,7 @@ pub async fn import_local_conversations_core(
         })?;
 
     let (result, updated_ids) =
-        import_service::import_local_conversations(conn, folder_id, &folder.path)
+        import_service::import_local_conversations(conn, registry, folder_id, &folder.path)
             .await
             .map_err(AppCommandError::from)?;
 
@@ -398,9 +555,16 @@ pub async fn import_local_conversations_core(
 pub async fn import_local_conversations(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
-    import_local_conversations_core(&db.conn, &EventEmitter::Tauri(app), folder_id).await
+    import_local_conversations_core(
+        &db.conn,
+        &EventEmitter::Tauri(app),
+        registry.inner().as_ref(),
+        folder_id,
+    )
+    .await
 }
 
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
@@ -572,6 +736,7 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
 /// already-happening per-turn parse rather than reading the file again.
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
+    registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
     let summary = conversation_service::get_by_id(conn, conversation_id)
@@ -590,7 +755,14 @@ pub async fn get_folder_conversation_core(
                     .flatten();
                 folder.map(|f| f.path)
             };
+            // Hold the shared discovery lease across the entire direct/fallback
+            // parser boundary so a concurrent register cannot race mid-recovery.
+            let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+                AppCommandError::database_error("Failed to acquire internal session filter")
+                    .with_detail(e.to_string())
+            })?;
             tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+                let _guard = guard;
                 let parser: Box<dyn AgentParser> = match at {
                     AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
                     AgentType::Codex => Box::new(CodexParser::new()),
@@ -604,13 +776,16 @@ pub async fn get_folder_conversation_core(
                     AgentType::Grok => Box::new(GrokParser::new()),
                 };
                 match parser.get_conversation(&eid) {
-                    Ok(d) => Ok((
-                        d.turns,
-                        d.session_stats,
-                        None,
-                        d.summary.title,
-                        d.transcript_watermark,
-                    )),
+                    Ok(d) => {
+                        let d = reject_internal_detail(at, &eid, d, &filter)?;
+                        Ok((
+                            d.turns,
+                            d.session_stats,
+                            None,
+                            d.summary.title,
+                            d.transcript_watermark,
+                        ))
+                    }
                     Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
                         // The external_id may no longer match any local file —
                         // e.g. an ACP session UUID (Cline) or a stale ID after
@@ -619,28 +794,17 @@ pub async fn get_folder_conversation_core(
                         // the parsed conversation list.
                         if matches!(at, AgentType::Cline | AgentType::Gemini) {
                             if let Ok(all) = parser.list_conversations() {
-                                // Filter by folder_path first, then find the closest
-                                // started_at match within 300 seconds of db_created_at.
-                                let matched = all
-                                    .into_iter()
-                                    .filter(|c| {
-                                        c.folder_path
-                                            .as_ref()
-                                            .zip(folder_path_for_fallback.as_ref())
-                                            .is_some_and(|(a, b)| path_eq_for_matching(a, b))
-                                    })
-                                    .min_by_key(|c| {
-                                        (c.started_at - db_created_at).num_seconds().unsigned_abs()
-                                    })
-                                    .filter(|c| {
-                                        let diff = (c.started_at - db_created_at)
-                                            .num_seconds()
-                                            .unsigned_abs();
-                                        diff < 300
-                                    });
+                                let matched = select_folder_time_fallback(
+                                    all,
+                                    folder_path_for_fallback.as_deref(),
+                                    db_created_at,
+                                    &filter,
+                                );
                                 if let Some(conv) = matched {
                                     let new_ext_id = conv.id.clone();
                                     if let Ok(d) = parser.get_conversation(&new_ext_id) {
+                                        let d =
+                                            reject_internal_detail(at, &new_ext_id, d, &filter)?;
                                         return Ok((
                                             d.turns,
                                             d.session_stats,
@@ -861,9 +1025,11 @@ pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
     emitter: &EventEmitter,
+    registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    let (mut detail, parsed_title) = get_folder_conversation_core(conn, conversation_id).await?;
+    let (mut detail, parsed_title) =
+        get_folder_conversation_core(conn, registry, conversation_id).await?;
 
     // Per-turn auto-title backfill. The parse `get_folder_conversation_core`
     // just did already produced the session-file title; adopt it (and broadcast
@@ -910,12 +1076,14 @@ pub async fn get_folder_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
     get_folder_conversation_with_live_core(
         &db.conn,
         &manager,
         &EventEmitter::Tauri(app),
+        registry.inner().as_ref(),
         conversation_id,
     )
     .await
@@ -1628,14 +1796,17 @@ pub async fn update_conversation_status(
 
 pub async fn update_conversation_title_core(
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
-    // Temporary discard until Task 8 wires coordinator cancellation.
-    conversation_service::update_title(conn, conversation_id, title)
+    let removed_job = conversation_service::update_title(conn, conversation_id, title)
         .await
-        .map_err(AppCommandError::from)
-        .map(|_| ())
+        .map_err(AppCommandError::from)?;
+    if removed_job {
+        coordinator.cancel_conversation(conversation_id).await;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1643,10 +1814,17 @@ pub async fn update_conversation_title_core(
 pub async fn update_conversation_title(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::auto_title::AutoTitleCoordinator>>,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
-    update_conversation_title_core(&db.conn, conversation_id, title).await?;
+    update_conversation_title_core(
+        &db.conn,
+        coordinator.inner().as_ref(),
+        conversation_id,
+        title,
+    )
+    .await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
     Ok(())
 }
@@ -1713,13 +1891,16 @@ pub async fn clear_awaiting_reply(
 
 pub async fn delete_conversation_core(
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
-    // Temporary discard until Task 8 wires coordinator cancellation.
-    conversation_service::soft_delete(conn, conversation_id)
+    let removed_job = conversation_service::soft_delete(conn, conversation_id)
         .await
-        .map_err(AppCommandError::from)
-        .map(|_| ())
+        .map_err(AppCommandError::from)?;
+    if removed_job {
+        coordinator.cancel_conversation(conversation_id).await;
+    }
+    Ok(())
 }
 
 /// When the deleted conversation was backed by a dedicated hidden chat folder,
@@ -1770,6 +1951,7 @@ pub async fn cleanup_chat_folder_for_deleted_conversation(
 pub async fn delete_conversation_with_cleanup_core(
     emitter: &EventEmitter,
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
     // Capture the backing folder AND parent before the soft-delete: a hidden
@@ -1781,7 +1963,7 @@ pub async fn delete_conversation_with_cleanup_core(
         .ok();
     let folder_id = pre.as_ref().map(|c| c.folder_id);
     let parent_id = pre.as_ref().and_then(|c| c.parent_id);
-    delete_conversation_core(conn, conversation_id).await?;
+    delete_conversation_core(conn, coordinator, conversation_id).await?;
     emit_conversation_deleted(emitter, conversation_id);
     // A removed delegation child drops its parent's child_count (→ 0 hides the
     // chevron). Re-emit the parent from the authoritative aggregate so every
@@ -1801,10 +1983,17 @@ pub async fn delete_conversation_with_cleanup_core(
 pub async fn delete_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::auto_title::AutoTitleCoordinator>>,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
     let emitter = EventEmitter::Tauri(app);
-    delete_conversation_with_cleanup_core(&emitter, &db.conn, conversation_id).await
+    delete_conversation_with_cleanup_core(
+        &emitter,
+        &db.conn,
+        coordinator.inner().as_ref(),
+        conversation_id,
+    )
+    .await
 }
 
 fn compute_stats(all_conversations: &[ConversationSummary]) -> AgentStats {
@@ -1852,10 +2041,207 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 
 #[cfg(test)]
 mod tests {
+    fn inert_title_coordinator(db: &crate::db::AppDatabase) -> std::sync::Arc<crate::auto_title::AutoTitleCoordinator> {
+        crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone())
+    }
+
     use super::*;
     use crate::acp::delegation::route::DelegationRoutePolicy;
     use crate::app_error::AppErrorCode;
+    use crate::auto_title::InternalSessionPurpose;
+    use crate::db::service::import_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Empty registry for pre-existing folder-conversation tests.
+    async fn inert_internal_session_registry(
+        db: &crate::db::AppDatabase,
+        data_dir: &std::path::Path,
+    ) -> Arc<InternalAgentSessionRegistry> {
+        InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir)
+            .expect("empty registry")
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Shared filter boundary: list / detail / stats / import use one filter.
+    // ──────────────────────────────────────────────────────────────────────
+
+    struct ParserExclusionFixture {
+        db: crate::db::AppDatabase,
+        _data_dir: TempDir,
+        registry: Arc<InternalAgentSessionRegistry>,
+        folder_id: i32,
+        normal: ConversationSummary,
+        hidden: ConversationSummary,
+    }
+
+    fn synthetic_summary(
+        id: &str,
+        agent: AgentType,
+        folder: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            agent_type: agent,
+            folder_path: Some(folder.to_string()),
+            folder_name: Some("proj".into()),
+            title: Some(id.to_string()),
+            started_at,
+            ended_at: None,
+            message_count: 2,
+            model: None,
+            git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
+        }
+    }
+
+    async fn parser_exclusion_fixture() -> ParserExclusionFixture {
+        let db = fresh_in_memory_db().await;
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry =
+            InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir.path())
+                .expect("registry");
+        registry
+            .register(AgentType::Codex, "hidden-id", InternalSessionPurpose::Title)
+            .await
+            .expect("register hidden");
+        let folder_path = "/tmp/codeg-parser-exclusion";
+        let folder_id = seed_folder(&db, folder_path).await;
+        let now = chrono::Utc::now();
+        let normal = synthetic_summary("normal-id", AgentType::Codex, folder_path, now);
+        let hidden = synthetic_summary(
+            "hidden-id",
+            AgentType::Codex,
+            folder_path,
+            now - chrono::Duration::seconds(10),
+        );
+        ParserExclusionFixture {
+            db,
+            _data_dir: data_dir,
+            registry,
+            folder_id,
+            normal,
+            hidden,
+        }
+    }
+
+    impl ParserExclusionFixture {
+        async fn filter(&self) -> InternalSessionFilter {
+            let (_, filter) = self.registry.shared_filter().await.expect("filter");
+            filter
+        }
+
+        fn raw_rows(&self) -> Vec<(AgentType, ConversationSummary)> {
+            vec![
+                (self.normal.agent_type, self.normal.clone()),
+                (self.hidden.agent_type, self.hidden.clone()),
+            ]
+        }
+
+        async fn list_raw(&self) -> Vec<ConversationSummary> {
+            let filter = self.filter().await;
+            filter_internal_summaries(self.raw_rows(), &filter)
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect()
+        }
+
+        async fn get_raw(&self, id: &str) -> Result<ConversationDetail, AppCommandError> {
+            let filter = self.filter().await;
+            let summary = if id == self.hidden.id {
+                self.hidden.clone()
+            } else {
+                self.normal.clone()
+            };
+            let detail = ConversationDetail {
+                summary,
+                turns: vec![],
+                session_stats: None,
+                transcript_watermark: None,
+            };
+            reject_internal_detail(AgentType::Codex, id, detail, &filter)
+        }
+
+        async fn stats(&self) -> AgentStats {
+            let listed = self.list_raw().await;
+            compute_stats(&listed)
+        }
+
+        async fn sidebar(&self) -> SidebarData {
+            let listed = self.list_raw().await;
+            SidebarData {
+                folders: compute_folders(&listed),
+                stats: compute_stats(&listed),
+            }
+        }
+
+        async fn folders(&self) -> Vec<FolderInfo> {
+            let listed = self.list_raw().await;
+            compute_folders(&listed)
+        }
+
+        /// Closer internal row must not win after filtering.
+        async fn fallback_pick(&self) -> Option<ConversationSummary> {
+            let filter = self.filter().await;
+            // hidden is 10s closer to target than a distant decoy would be;
+            // after exclusion the normal row (further) must win.
+            let target = self.hidden.started_at + chrono::Duration::seconds(1);
+            select_folder_time_fallback(
+                vec![self.hidden.clone(), self.normal.clone()],
+                self.normal.folder_path.as_deref(),
+                target,
+                &filter,
+            )
+        }
+
+        async fn import(&self) -> ImportResult {
+            let filter = self.filter().await;
+            let rows = filter_internal_summaries(self.raw_rows(), &filter);
+            let mut imported = 0u32;
+            let mut updated = 0u32;
+            let mut skipped = 0u32;
+            for (agent_type, summary) in &rows {
+                match import_service::import_one_for_test(
+                    &self.db.conn,
+                    self.folder_id,
+                    agent_type,
+                    summary,
+                )
+                .await
+                .expect("import_one")
+                {
+                    import_service::ImportOutcomeForTest::Imported => imported += 1,
+                    import_service::ImportOutcomeForTest::Updated(_) => updated += 1,
+                    import_service::ImportOutcomeForTest::Skipped => skipped += 1,
+                }
+            }
+            ImportResult {
+                imported,
+                updated,
+                skipped,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parser_lists_details_stats_and_import_share_one_filter() {
+        let fixture = parser_exclusion_fixture().await;
+        let listed = fixture.list_raw().await;
+        assert!(listed.iter().all(|row| row.id != "hidden-id"));
+        assert!(fixture.get_raw("hidden-id").await.is_err());
+        assert_eq!(fixture.stats().await.total_conversations, 1);
+        assert_eq!(fixture.import().await.imported, 1);
+
+        // Folder / sidebar / fallback share the same boundary.
+        assert_eq!(fixture.folders().await[0].conversation_count, 1);
+        assert_eq!(fixture.sidebar().await.stats.total_conversations, 1);
+        let pick = fixture.fallback_pick().await.expect("normal wins");
+        assert_eq!(pick.id, "normal-id");
+    }
 
     // ──────────────────────────────────────────────────────────────────────
     // Delegation meta injection for historical reload. Parsers always emit
@@ -2573,9 +2959,12 @@ mod tests {
         .expect("child");
         // Parent has no external_id → no JSONL → no turns to inject into.
         // The call must still succeed without error.
-        let (detail, _parsed_title) = get_folder_conversation_core(&db.conn, parent_id)
-            .await
-            .expect("load");
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+        let (detail, _parsed_title) =
+            get_folder_conversation_core(&db.conn, registry.as_ref(), parent_id)
+                .await
+                .expect("load");
         assert_eq!(detail.summary.id, parent_id);
         assert!(detail.turns.is_empty());
     }
@@ -2775,7 +3164,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -2868,7 +3257,7 @@ mod tests {
         )
         .await
         .expect("create");
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3036,7 +3425,7 @@ mod tests {
                 .expect("second conversation");
 
         // Deleting the first must NOT retire the folder — the second remains.
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete first");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3049,7 +3438,7 @@ mod tests {
         );
 
         // Deleting the last one retires the now-empty folder.
-        delete_conversation_core(&db.conn, second.id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), second.id)
             .await
             .expect("delete second");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3104,7 +3493,9 @@ mod tests {
     #[tokio::test]
     async fn get_folder_conversation_core_missing_id_errors() {
         let db = fresh_in_memory_db().await;
-        let err = get_folder_conversation_core(&db.conn, 999_999)
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+        let err = get_folder_conversation_core(&db.conn, registry.as_ref(), 999_999)
             .await
             .expect_err("missing conversation must error, not panic");
         let msg = format!("{err:?}");
@@ -3260,7 +3651,7 @@ mod tests {
 
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete");
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
@@ -3359,7 +3750,7 @@ mod tests {
         assert_eq!(saved.version, 1);
 
         // Server deletes c1 and atomically cleans its tab → v2 (only c2 remains).
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete c1");
         cleanup_tabs_for_deleted_conversation(&EventEmitter::Noop, &db.conn, c1).await;
@@ -3469,7 +3860,7 @@ mod tests {
 
         // c1 deleted with no persisted c1 tab → zero rows removed, but the
         // version barrier still advances (v1 → v2) and nothing is broadcast.
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete c1");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -3508,9 +3899,18 @@ mod tests {
     #[tokio::test]
     async fn import_local_conversations_core_missing_folder_errors() {
         let db = fresh_in_memory_db().await;
-        let err = import_local_conversations_core(&db.conn, &EventEmitter::Noop, 999_999)
-            .await
-            .expect_err("missing folder must surface as error");
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry =
+            InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir.path())
+                .expect("registry");
+        let err = import_local_conversations_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            registry.as_ref(),
+            999_999,
+        )
+        .await
+        .expect_err("missing folder must surface as error");
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("not found") || msg.to_lowercase().contains("999999"),
@@ -3544,7 +3944,7 @@ mod tests {
         let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
-        update_conversation_title_core(&db.conn, conv_id, "Renamed".into())
+        update_conversation_title_core(&db.conn, inert_title_coordinator(&db).as_ref(), conv_id, "Renamed".into())
             .await
             .expect("update");
         let summary = conversation_service::get_by_id(&db.conn, conv_id)
@@ -3560,7 +3960,7 @@ mod tests {
         let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
-        delete_conversation_core(&db.conn, conv_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), conv_id)
             .await
             .expect("delete");
         // After soft delete the row should no longer show up in list_all.
@@ -3764,7 +4164,9 @@ mod tests {
             .expect("CAS changed");
         let token = marked.awaiting_reply_token.clone().expect("token");
 
-        let (detail, _) = get_folder_conversation_core(&db.conn, id)
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+        let (detail, _) = get_folder_conversation_core(&db.conn, registry.as_ref(), id)
             .await
             .expect("get");
         assert_eq!(
@@ -3809,7 +4211,7 @@ mod tests {
         let id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
-        delete_conversation_core(&db.conn, id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), id)
             .await
             .expect("delete");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -3896,7 +4298,7 @@ mod tests {
         .expect("child");
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_with_cleanup_core(&emitter, &db.conn, child.id)
+        delete_conversation_with_cleanup_core(&emitter, &db.conn, inert_title_coordinator(&db).as_ref(), child.id)
             .await
             .expect("delete child");
         let mut saw_deleted = false;

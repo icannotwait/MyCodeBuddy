@@ -3,6 +3,8 @@ use sea_orm::{
     QueryFilter, Set,
 };
 
+use crate::auto_title::InternalAgentSessionRegistry;
+use crate::commands::conversations::filter_internal_summaries;
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -23,15 +25,21 @@ use crate::parsers::{path_eq_for_matching, AgentParser};
 /// `folder_path`. Returns the tally plus the ids of already-imported
 /// conversations whose title was refreshed, so the caller can broadcast a
 /// sidebar upsert for each without re-querying.
+///
+/// Holds the shared discovery lease across the full parser scan + filter so a
+/// concurrent internal registration cannot race into the import set.
 pub async fn import_local_conversations(
     conn: &DatabaseConnection,
+    registry: &InternalAgentSessionRegistry,
     folder_id: i32,
     folder_path: &str,
 ) -> Result<(ImportResult, Vec<i32>), DbError> {
     let path = folder_path.to_string();
+    let (guard, filter) = registry.shared_filter().await?;
 
     // Run parsers in blocking task since they do filesystem I/O
     let summaries = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
             (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
             (AgentType::Codex, Box::new(CodexParser::new())),
@@ -64,7 +72,8 @@ pub async fn import_local_conversations(
                 }
             }
         }
-        matched
+        // Exclude internal sessions before any DB import work.
+        filter_internal_summaries(matched, &filter)
     })
     .await
     .map_err(|e| DbError::Migration(e.to_string()))?;
@@ -97,7 +106,7 @@ pub async fn import_local_conversations(
 
 /// Outcome of reconciling a single parsed session against the DB.
 #[derive(Debug, PartialEq, Eq)]
-enum ImportOutcome {
+pub(crate) enum ImportOutcome {
     /// A new conversation row was inserted.
     Imported,
     /// An already-imported conversation had its auto-title refreshed; carries
@@ -108,6 +117,20 @@ enum ImportOutcome {
     Skipped,
 }
 
+/// Test-only aliases so conversation filter fixtures can exercise the same loop.
+#[cfg(test)]
+pub(crate) type ImportOutcomeForTest = ImportOutcome;
+
+#[cfg(test)]
+pub(crate) async fn import_one_for_test(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: &AgentType,
+    summary: &ConversationSummary,
+) -> Result<ImportOutcome, DbError> {
+    import_one(conn, folder_id, agent_type, summary).await
+}
+
 /// Insert a brand-new conversation, or — when it already exists — refresh its
 /// title from the freshly parsed session file so an AI-generated title that did
 /// not exist at first import is adopted. `refresh_auto_title` is a single
@@ -115,7 +138,7 @@ enum ImportOutcome {
 /// `updated_at`, so a re-import neither clobbers a manual rename nor reorders a
 /// recency-sorted sidebar. A missing/empty parsed title leaves the existing
 /// title intact rather than nulling it.
-async fn import_one(
+pub(crate) async fn import_one(
     conn: &DatabaseConnection,
     folder_id: i32,
     agent_type: &AgentType,
@@ -249,10 +272,14 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
         let at = AgentType::ClaudeCode;
 
-        let outcome =
-            import_one(&db.conn, folder, &at, &summary("raw-ext-1", Some("historical")))
-                .await
-                .expect("import");
+        let outcome = import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("raw-ext-1", Some("historical")),
+        )
+        .await
+        .expect("import");
         assert_eq!(outcome, ImportOutcome::Imported);
 
         let id = find_id(&db.conn, "raw-ext-1").await;

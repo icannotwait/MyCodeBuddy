@@ -1096,7 +1096,14 @@
     "restartRequired": "已保存，重启应用后生效。",
     "restartNow": "立即重启",
     "restartFailed": "重启失败：{message}",
-    "loadFailed": "加载失败：{message}"
+    "loadFailed": "加载失败：{message}",
+    "conversationExperienceTitle": "对话体验",
+    "conversationExperienceDescription": "配置自动标题和引用搜索行为。",
+    "autoTitleAgent": "自动标题智能体",
+    "autoTitleOff": "关闭",
+    "autoTitleUnavailable": "{agent}（不可用）",
+    "autoTitleSaveFailed": "保存自动标题智能体失败：{message}",
+    "autoTitleLoading": "正在加载自动标题设置..."
   },
   "LoginPage": {
     "documentTitle": "登录 - DrawCode",

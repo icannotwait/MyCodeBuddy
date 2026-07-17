@@ -90,6 +90,14 @@ pub fn build_router(
             post(handlers::feedback::set_feedback_settings),
         )
         .route(
+            "/get_conversation_experience_settings",
+            post(handlers::conversation_experience::get_conversation_experience_settings),
+        )
+        .route(
+            "/set_auto_title_agent",
+            post(handlers::conversation_experience::set_auto_title_agent),
+        )
+        .route(
             "/submit_session_feedback",
             post(handlers::feedback::submit_session_feedback),
         )

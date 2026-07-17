@@ -1096,7 +1096,14 @@
     "restartRequired": "Gespeichert. Starten Sie die App neu, damit die Änderung wirksam wird.",
     "restartNow": "Jetzt neu starten",
     "restartFailed": "Neustart fehlgeschlagen: {message}",
-    "loadFailed": "Laden fehlgeschlagen: {message}"
+    "loadFailed": "Laden fehlgeschlagen: {message}",
+    "conversationExperienceTitle": "Konversationserlebnis",
+    "conversationExperienceDescription": "Automatische Titel und das Verhalten der Referenzsuche konfigurieren.",
+    "autoTitleAgent": "Agent für automatische Titel",
+    "autoTitleOff": "Aus",
+    "autoTitleUnavailable": "{agent} (Nicht verfügbar)",
+    "autoTitleSaveFailed": "Agent für automatische Titel konnte nicht gespeichert werden: {message}",
+    "autoTitleLoading": "Einstellungen für automatische Titel werden geladen..."
   },
   "LoginPage": {
     "documentTitle": "Anmelden - DrawCode",

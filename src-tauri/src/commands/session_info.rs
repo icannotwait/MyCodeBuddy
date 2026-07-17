@@ -25,6 +25,7 @@ use crate::acp::session_info::{
     SessionMessageItem, SessionMessages, MAX_SESSION_MESSAGES,
 };
 use crate::app_error::AppCommandError;
+use crate::auto_title::InternalAgentSessionRegistry;
 use crate::commands::conversations::get_folder_conversation_core;
 use crate::db::service::{app_metadata_service, conversation_service, folder_service};
 use crate::db::AppDatabase;
@@ -74,15 +75,19 @@ const MAX_CONCURRENT_PARSES: usize = 4;
 /// transcript parses. Construct via [`DbSessionInfoLookup::new`].
 pub struct DbSessionInfoLookup {
     pub db: Arc<AppDatabase>,
+    /// Shared internal-session registry so transcript parses use the same
+    /// discovery lease / filter boundary as every other parser-backed path.
+    pub registry: Arc<InternalAgentSessionRegistry>,
     /// Limits concurrent `get_folder_conversation_core` parses (see
     /// [`MAX_CONCURRENT_PARSES`]).
     parse_limit: Arc<tokio::sync::Semaphore>,
 }
 
 impl DbSessionInfoLookup {
-    pub fn new(db: Arc<AppDatabase>) -> Self {
+    pub fn new(db: Arc<AppDatabase>, registry: Arc<InternalAgentSessionRegistry>) -> Self {
         Self {
             db,
+            registry,
             parse_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES)),
         }
     }
@@ -137,7 +142,10 @@ impl SessionInfoAccess for DbSessionInfoLookup {
         // degrade to metadata-only with an explanatory note rather than failing the
         // whole tool call.
         let conn_owned = self.db.conn.clone();
-        let parse = async move { get_folder_conversation_core(&conn_owned, session_id).await };
+        let registry = self.registry.clone();
+        let parse = async move {
+            get_folder_conversation_core(&conn_owned, registry.as_ref(), session_id).await
+        };
         match bounded_parse(self.parse_limit.clone(), PARSE_TIMEOUT, parse).await {
             ParseSlot::Ready(Ok((detail, parsed_title))) => {
                 if info.title.is_none() {
@@ -637,9 +645,16 @@ mod tests {
     #[tokio::test]
     async fn resolve_unknown_id_is_not_found() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        let lookup = DbSessionInfoLookup::new(Arc::new(AppDatabase {
-            conn: db.conn.clone(),
-        }));
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let registry =
+            InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir.path())
+                .expect("registry");
+        let lookup = DbSessionInfoLookup::new(
+            Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            }),
+            registry,
+        );
         let info = lookup.resolve(999_999, 10).await;
         assert!(!info.found);
         assert_eq!(info.session_id, 999_999);

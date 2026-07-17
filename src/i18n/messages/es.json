@@ -1096,7 +1096,14 @@
     "restartRequired": "Guardado. Reinicia la aplicación para aplicar el cambio.",
     "restartNow": "Reiniciar ahora",
     "restartFailed": "No se pudo reiniciar: {message}",
-    "loadFailed": "Error al cargar: {message}"
+    "loadFailed": "Error al cargar: {message}",
+    "conversationExperienceTitle": "Experiencia de conversación",
+    "conversationExperienceDescription": "Configura los títulos automáticos y el comportamiento de la búsqueda de referencias.",
+    "autoTitleAgent": "Agente de títulos automáticos",
+    "autoTitleOff": "Desactivado",
+    "autoTitleUnavailable": "{agent} (No disponible)",
+    "autoTitleSaveFailed": "No se pudo guardar el agente de títulos automáticos: {message}",
+    "autoTitleLoading": "Cargando la configuración de títulos automáticos..."
   },
   "LoginPage": {
     "documentTitle": "Iniciar sesión - DrawCode",

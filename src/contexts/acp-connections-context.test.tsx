@@ -134,6 +134,8 @@ vi.mock("@/lib/snapshot-denormalize", () => ({
   denormalizeSnapshot: h.denormalizeSnapshot,
 }))
 
+const acpPromptMock = vi.hoisted(() => vi.fn())
+
 vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
   acpFindConnectionForConversation: h.acpFindConnectionForConversation,
@@ -141,7 +143,7 @@ vi.mock("@/lib/api", () => ({
   acpDisconnect: h.acpDisconnect,
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
   acpGetDesktopDeliveryCapabilities: h.acpGetDesktopDeliveryCapabilities,
-  acpPrompt: vi.fn(),
+  acpPrompt: acpPromptMock,
   acpSetMode: vi.fn(),
   acpSetConfigOption: vi.fn(),
   acpCancel: vi.fn(),
@@ -2786,4 +2788,69 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       expect(framed.get("k1")).toEqual(single.get("k1"))
     }
   )
+})
+
+describe("send_prompt_forwards_prompt_context_to_api", () => {
+  beforeEach(() => {
+    acpPromptMock.mockReset()
+    acpPromptMock.mockResolvedValue(undefined)
+  })
+
+  it("forwards promptContext as the required sixth argument to acpPrompt", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }], {
+        folderId: 1,
+        conversationId: 2,
+        clientMessageId: "m1",
+        promptContext: {
+          visibleText: "README.md task",
+          locale: "zh_cn",
+        },
+      })
+    })
+
+    expect(acpPromptMock).toHaveBeenCalledWith(
+      "spawned-conn",
+      [{ type: "text", text: "wire" }],
+      1,
+      2,
+      "m1",
+      {
+        visibleText: "README.md task",
+        locale: "zh_cn",
+      }
+    )
+  })
+
+  it("supplies null context when an older direct caller omits promptContext", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }], {
+        folderId: 1,
+        conversationId: 2,
+        clientMessageId: "m1",
+      })
+    })
+
+    expect(acpPromptMock).toHaveBeenCalledWith(
+      "spawned-conn",
+      [{ type: "text", text: "wire" }],
+      1,
+      2,
+      "m1",
+      {
+        visibleText: null,
+        locale: null,
+      }
+    )
+  })
 })

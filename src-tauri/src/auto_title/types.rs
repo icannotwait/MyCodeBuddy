@@ -1,7 +1,26 @@
+use std::sync::Arc;
+
 use sea_orm::DatabaseConnection;
 
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
+
+/// Immutable, event-owned snapshot of a completed turn for lifecycle title work.
+/// Built under the SessionState lock at TurnComplete and never re-reads live state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnCompletionSnapshot {
+    pub conversation_id: i32,
+    pub turn_token: String,
+    pub locale: AppLocale,
+    pub final_text: Arc<str>,
+}
+
+/// Result of applying a usable completion to an auto-title job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionTransition {
+    pub usable_turn_seq: i32,
+    pub became_ready: bool,
+}
 
 /// Claim for a single automatic-title generation attempt. Task 8's coordinator
 /// builds this from a claimed `running` job; Task 3 only needs it as the
@@ -17,11 +36,57 @@ pub struct AutoTitleClaim {
     pub attempt_turn_seq: i32,
 }
 
+/// Runner input for one hidden title-generation attempt (Task 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTitleAttempt {
+    pub conversation_id: i32,
+    pub attempt: i32,
+    pub agent: AgentType,
+    pub locale: AppLocale,
+    pub first_user_text: String,
+    pub first_assistant_text: String,
+}
+
+/// Failure modes for an isolated title run. Cancellation and timeout are
+/// distinct so the coordinator can decide retry policy without re-parsing
+/// strings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AutoTitleRunError {
+    #[error("title run cancelled")]
+    Cancelled,
+    #[error("title agent unavailable or disabled")]
+    Unavailable,
+    #[error("title agent spawn failed: {0}")]
+    Spawn(String),
+    #[error("title agent identity wait failed: {0}")]
+    Identity(String),
+    #[error("internal session registry failed: {0}")]
+    Registry(String),
+    #[error("interactive permission or question on title run")]
+    Interactive,
+    #[error("title run timed out")]
+    Timeout,
+    #[error("title run stopped abnormally: {0}")]
+    AbnormalStop(String),
+    #[error("title run produced empty output")]
+    EmptyOutput,
+}
+
 /// Outcome of an atomic generated-title commit. Only [`Committed`] may trigger
 /// the post-commit conversation upsert once the coordinator lands in Task 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeTitleOutcome {
     Committed,
+    Cancelled,
+}
+
+/// Durable transition after a failed title attempt. `Ready` means attempt two
+/// can start immediately (a newer usable turn already exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureTransition {
+    Ready,
+    RetryWait,
+    Exhausted,
     Cancelled,
 }
 
@@ -43,7 +108,8 @@ pub struct ConnectionLaunchContext {
 
 impl Default for ConnectionLaunchContext {
     /// Test-only English user default. Production UI/automation roots must use
-    /// [`user_launch_context_from_db`]; chat channel is Task 4C2.
+    /// [`user_launch_context_from_db`]; chat roots/resume use
+    /// `channel_launch_context_from_db`.
     fn default() -> Self {
         Self {
             purpose: ConnectionPurpose::User,

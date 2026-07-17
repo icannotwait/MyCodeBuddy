@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::models::system::AppLocale;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Lang {
@@ -18,19 +20,41 @@ pub enum Lang {
 
 impl Lang {
     pub fn from_str_lossy(s: &str) -> Self {
+        Self::parse_strict(s).unwrap_or(Lang::En)
+    }
+
+    /// Strict channel-language parse. Unknown values return `None` so callers
+    /// can fall back to system language instead of silently defaulting to En.
+    pub fn parse_strict(s: &str) -> Option<Self> {
         match s {
-            "en" => Lang::En,
-            "zh-cn" | "zh-CN" | "zh_CN" => Lang::ZhCn,
-            "zh-tw" | "zh-TW" | "zh_TW" => Lang::ZhTw,
-            "ja" => Lang::Ja,
-            "ko" => Lang::Ko,
-            "es" => Lang::Es,
-            "de" => Lang::De,
-            "fr" => Lang::Fr,
-            "pt" => Lang::Pt,
-            "ar" => Lang::Ar,
-            _ => Lang::En,
+            "en" => Some(Lang::En),
+            "zh-cn" | "zh-CN" | "zh_CN" => Some(Lang::ZhCn),
+            "zh-tw" | "zh-TW" | "zh_TW" => Some(Lang::ZhTw),
+            "ja" => Some(Lang::Ja),
+            "ko" => Some(Lang::Ko),
+            "es" => Some(Lang::Es),
+            "de" => Some(Lang::De),
+            "fr" => Some(Lang::Fr),
+            "pt" => Some(Lang::Pt),
+            "ar" => Some(Lang::Ar),
+            _ => None,
         }
+    }
+}
+
+/// Exhaustive conversion from chat-channel [`Lang`] to system [`AppLocale`].
+pub fn lang_to_app_locale(lang: Lang) -> AppLocale {
+    match lang {
+        Lang::En => AppLocale::En,
+        Lang::ZhCn => AppLocale::ZhCn,
+        Lang::ZhTw => AppLocale::ZhTw,
+        Lang::Ja => AppLocale::Ja,
+        Lang::Ko => AppLocale::Ko,
+        Lang::Es => AppLocale::Es,
+        Lang::De => AppLocale::De,
+        Lang::Fr => AppLocale::Fr,
+        Lang::Pt => AppLocale::Pt,
+        Lang::Ar => AppLocale::Ar,
     }
 }
 

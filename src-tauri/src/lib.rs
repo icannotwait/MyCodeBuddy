@@ -321,6 +321,43 @@ mod tauri_app {
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
 
+                // One shared internal-session registry for Tauri commands and the
+                // embedded Axum AppState (cloned into both surfaces).
+                let internal_sessions = {
+                    let db = app.state::<db::AppDatabase>();
+                    tauri::async_runtime::block_on(
+                        crate::auto_title::InternalAgentSessionRegistry::load(
+                            db.conn.clone(),
+                            &effective_data_dir,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+                };
+                app.manage(internal_sessions.clone());
+
+                // Durable auto-title coordinator (shared with embedded Axum AppState).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    let title_db = std::sync::Arc::new(db::AppDatabase {
+                        conn: db.conn.clone(),
+                    });
+                    let cm = app.state::<ConnectionManager>().clone_ref();
+                    let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let coordinator = crate::auto_title::build_production_coordinator(
+                        title_db,
+                        cm,
+                        internal_sessions.clone(),
+                        effective_data_dir.clone(),
+                        emitter,
+                    );
+                    tauri::async_runtime::block_on(coordinator.recover_and_start())
+                        .map_err(|e| e.to_string())?;
+                    app.manage(coordinator);
+                    app.manage(std::sync::Arc::new(
+                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+                    ));
+                }
+
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
                 tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
@@ -624,6 +661,11 @@ mod tauri_app {
                                 std::sync::Arc::new(db::AppDatabase {
                                     conn: db_conn.clone(),
                                 }),
+                                app.state::<std::sync::Arc<
+                                    crate::auto_title::InternalAgentSessionRegistry,
+                                >>()
+                                .inner()
+                                .clone(),
                             ),
                         ),
                     );
@@ -1109,6 +1151,8 @@ mod tauri_app {
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,
+                crate::commands::conversation_experience::get_conversation_experience_settings,
+                crate::commands::conversation_experience::set_auto_title_agent,
                 question_commands::get_question_settings,
                 question_commands::set_question_settings,
                 session_info_commands::get_session_info_settings,

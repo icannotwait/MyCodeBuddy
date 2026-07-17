@@ -1,7 +1,9 @@
 //! In-process ACP event bus.
 //!
-//! Carries `Arc<EventEnvelope>` directly to back-end consumers (lifecycle,
-//! pet state mapper, chat-channel subscribers). Distinct from
+//! Carries `Arc<InternalEventEnvelope>` to back-end consumers (lifecycle,
+//! pet state mapper, chat-channel subscribers). The public `EventEnvelope`
+//! remains shared with private streams / replay / transport; only this bus
+//! may retain an optional completion sidecar. Distinct from
 //! `WebEventBroadcaster`, which carries `Arc<serde_json::Value>` for
 //! transport-bound JSON delivery to WS clients.
 //!
@@ -19,6 +21,7 @@
 //!    the global broadcaster, the per-connection stream is the sole path
 //!    and the dedup goes away.
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,21 +29,39 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::acp::types::EventEnvelope;
+use crate::auto_title::TurnCompletionSnapshot;
 
 /// Capacity of the broadcast channel. Sized to the same headroom as
 /// `WebEventBroadcaster` (4096) — they observe the same emit rate so the
 /// burst tolerance is identical.
 const BUS_CAPACITY: usize = 4096;
 
+/// Internal-only wrapper around the public event envelope. May carry an
+/// immutable turn-completion sidecar for lifecycle title work. Public
+/// transport paths never see this type.
+#[derive(Debug, Clone)]
+pub struct InternalEventEnvelope {
+    pub event: Arc<EventEnvelope>,
+    pub completion: Option<Arc<TurnCompletionSnapshot>>,
+}
+
+impl Deref for InternalEventEnvelope {
+    type Target = EventEnvelope;
+
+    fn deref(&self) -> &EventEnvelope {
+        self.event.as_ref()
+    }
+}
+
 /// Process-wide bus delivering ACP envelopes to in-process consumers.
 ///
 /// Subscribers (lifecycle / pet / chat-channel) call `subscribe()` once at
 /// startup and hold the receiver for the lifetime of the process.
-/// `emit_with_state` calls `send()` after the per-connection stream so the
-/// envelope arrives in lockstep with the WS attach delivery.
+/// `emit_with_state` calls `send_with_completion()` after the per-connection
+/// stream so the envelope arrives in lockstep with the WS attach delivery.
 #[derive(Debug)]
 pub struct InternalEventBus {
-    sender: broadcast::Sender<Arc<EventEnvelope>>,
+    sender: broadcast::Sender<Arc<InternalEventEnvelope>>,
     metrics: Arc<EventBusMetrics>,
 }
 
@@ -50,9 +71,19 @@ impl InternalEventBus {
         Self { sender, metrics }
     }
 
-    /// Broadcast `envelope` to every subscriber. No-op if there are none —
-    /// avoids `SendError` allocation on the hot emit path.
-    pub fn send(&self, envelope: Arc<EventEnvelope>) {
+    /// Broadcast a sidecar-free internal event. Used by direct producers and
+    /// tests that still push plain public envelopes onto the bus.
+    pub fn send(&self, event: Arc<EventEnvelope>) {
+        self.send_with_completion(event, None);
+    }
+
+    /// Broadcast a public envelope with an optional completion sidecar.
+    /// Used only by the shared event-bridge emit core.
+    pub fn send_with_completion(
+        &self,
+        event: Arc<EventEnvelope>,
+        completion: Option<Arc<TurnCompletionSnapshot>>,
+    ) {
         if self.sender.receiver_count() == 0 {
             return;
         }
@@ -61,7 +92,9 @@ impl InternalEventBus {
         // (a subscriber dropping between the check and the send) and a
         // dropped envelope in that exact window is benign — there's no one
         // to deliver to anyway.
-        let _ = self.sender.send(envelope);
+        let _ = self
+            .sender
+            .send(Arc::new(InternalEventEnvelope { event, completion }));
         self.metrics.emitted_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -69,7 +102,7 @@ impl InternalEventBus {
     /// `BUS_CAPACITY` events behind the slowest subscriber; if it falls
     /// further behind, the next `recv()` returns `RecvError::Lagged(n)`
     /// and bumps `lagged_count`.
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<EventEnvelope>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<InternalEventEnvelope>> {
         self.sender.subscribe()
     }
 

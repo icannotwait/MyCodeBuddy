@@ -1096,7 +1096,14 @@
     "restartRequired": "保存しました。再起動後に反映されます。",
     "restartNow": "今すぐ再起動",
     "restartFailed": "再起動に失敗しました: {message}",
-    "loadFailed": "読み込みに失敗しました: {message}"
+    "loadFailed": "読み込みに失敗しました: {message}",
+    "conversationExperienceTitle": "会話エクスペリエンス",
+    "conversationExperienceDescription": "自動タイトルと参照検索の動作を設定します。",
+    "autoTitleAgent": "自動タイトルエージェント",
+    "autoTitleOff": "オフ",
+    "autoTitleUnavailable": "{agent}（利用不可）",
+    "autoTitleSaveFailed": "自動タイトルエージェントを保存できませんでした: {message}",
+    "autoTitleLoading": "自動タイトル設定を読み込んでいます..."
   },
   "LoginPage": {
     "documentTitle": "ログイン - DrawCode",
