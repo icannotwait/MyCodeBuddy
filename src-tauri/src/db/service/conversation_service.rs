@@ -1,9 +1,10 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
+use crate::auto_title::{cancel_job, enroll_new_conversation};
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
@@ -125,6 +126,7 @@ async fn create_inner(
         ),
         None => (None, None, None),
     };
+    let txn = conn.begin().await?;
     let model = conversation::ActiveModel {
         id: NotSet,
         folder_id: Set(folder_id),
@@ -146,8 +148,12 @@ async fn create_inner(
         deleted_at: Set(None),
         pinned_at: Set(None),
         awaiting_reply_token: Set(None),
-    };
-    Ok(model.insert(conn).await?)
+    }
+    .insert(&txn)
+    .await?;
+    enroll_new_conversation(&txn, model.id, now).await?;
+    txn.commit().await?;
+    Ok(model)
 }
 
 /// Unconditional status write: sets `status`, clears `awaiting_reply_token`,
@@ -314,21 +320,33 @@ pub async fn clear_awaiting_reply(
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
 /// auto-title backfill ([`refresh_auto_title`]) leaves this row alone, so the
 /// user's hand-picked name survives every subsequent session-file parse.
+///
+/// Returns `true` when a pending auto-title job was removed and active work
+/// must be cancelled after commit (wired in Task 8).
 pub async fn update_title(
     conn: &DatabaseConnection,
     conversation_id: i32,
     title: String,
-) -> Result<(), DbError> {
-    let conv = conversation::Entity::find_by_id(conversation_id)
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
-    let mut active: conversation::ActiveModel = conv.into();
-    active.title = Set(Some(title));
-    active.title_locked = Set(true);
-    active.updated_at = Set(Utc::now());
-    active.update(conn).await?;
-    Ok(())
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let txn = conn.begin().await?;
+    let changed = conversation::Entity::update_many()
+        .col_expr(conversation::Column::Title, Expr::value(title))
+        .col_expr(conversation::Column::TitleLocked, Expr::value(true))
+        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .exec(&txn)
+        .await?;
+    if changed.rows_affected == 0 {
+        return Err(DbError::Migration(format!(
+            "Conversation not found: {conversation_id}"
+        )));
+    }
+    let removed = cancel_job(&txn, conversation_id).await?;
+    txn.commit().await?;
+    Ok(removed)
 }
 
 /// Auto-derive counterpart to [`update_title`]: write `title` ONLY when the row
@@ -359,6 +377,7 @@ pub async fn refresh_auto_title(
         .col_expr(conversation::Column::Title, Expr::value(title))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(conversation::Column::AutoTitleFinalized.eq(false))
         .filter(
             sea_orm::Condition::any()
                 .add(conversation::Column::Title.is_null())
@@ -422,16 +441,29 @@ pub async fn update_external_id(
     Ok(())
 }
 
-pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<(), DbError> {
-    let conv = conversation::Entity::find_by_id(conversation_id)
+/// Soft-delete a conversation. Returns `true` when a pending auto-title job
+/// was removed and active work must be cancelled after commit.
+pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let txn = conn.begin().await?;
+    let changed = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DeletedAt,
+            Expr::value(Some(Utc::now())),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null())
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
-    let mut active: conversation::ActiveModel = conv.into();
-    active.deleted_at = Set(Some(Utc::now()));
-    active.update(conn).await?;
-    Ok(())
+        .exec(&txn)
+        .await?;
+    if changed.rows_affected == 0 {
+        return Err(DbError::Migration(format!(
+            "Conversation not found: {conversation_id}"
+        )));
+    }
+    let removed = cancel_job(&txn, conversation_id).await?;
+    txn.commit().await?;
+    Ok(removed)
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
@@ -1222,6 +1254,56 @@ mod tests {
         .expect("delegate");
         assert_eq!(child.kind, ConversationKind::Delegate);
         assert_eq!(child.parent_id, Some(regular.id));
+    }
+
+    #[tokio::test]
+    async fn create_create_chat_and_delegation_enroll_exactly_one_job_when_enabled() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable");
+        let folder_id = seed_folder(&db, "/tmp/create-enroll").await;
+
+        let regular = create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("regular");
+        let chat = create_chat(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("chat");
+        let child = create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: regular.id,
+                parent_tool_use_id: "tu-enroll".into(),
+                delegation_call_id: "call-enroll".into(),
+            }),
+        )
+        .await
+        .expect("delegate");
+
+        for id in [regular.id, chat.id, child.id] {
+            assert_eq!(
+                auto_title_job::Entity::find_by_id(id)
+                    .all(&db.conn)
+                    .await
+                    .expect("jobs")
+                    .len(),
+                1,
+                "enabled create path must enroll exactly one job for {id}"
+            );
+        }
     }
 
     #[tokio::test]

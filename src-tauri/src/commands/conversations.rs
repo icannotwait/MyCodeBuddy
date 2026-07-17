@@ -1400,9 +1400,11 @@ pub async fn update_conversation_title_core(
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
+    // Temporary discard until Task 8 wires coordinator cancellation.
     conversation_service::update_title(conn, conversation_id, title)
         .await
         .map_err(AppCommandError::from)
+        .map(|_| ())
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1482,9 +1484,11 @@ pub async fn delete_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
+    // Temporary discard until Task 8 wires coordinator cancellation.
     conversation_service::soft_delete(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)
+        .map(|_| ())
 }
 
 /// When the deleted conversation was backed by a dedicated hidden chat folder,

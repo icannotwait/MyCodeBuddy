@@ -5,6 +5,7 @@ pub use acp::{
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
+pub mod auto_title;
 pub mod automation;
 pub mod chat_channel;
 pub mod commands;

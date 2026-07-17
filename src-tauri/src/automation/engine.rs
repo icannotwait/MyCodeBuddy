@@ -1015,6 +1015,51 @@ fn short_suffix(run_id: i32) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn automation_root_creation_enrolls_auto_title() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::models::agent::AgentType;
+
+        // Automation roots go through `create_conversation_core` only — enrollment
+        // must live in the shared create path, not a second call site here.
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder = seed_folder(&db, "/tmp/automation-title-enroll").await;
+
+        let conversation_id = create_conversation_core(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("automation root".into()),
+        )
+        .await
+        .expect("create_conversation_core");
+
+        let jobs = auto_title_job::Entity::find_by_id(conversation_id)
+            .all(&db.conn)
+            .await
+            .expect("jobs");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "automation root create must enroll exactly one auto-title job"
+        );
+        let total = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("all jobs");
+        assert_eq!(total.len(), 1);
+    }
+
     #[test]
     fn classify_stop_reason_maps_outcomes() {
         assert_eq!(classify_stop_reason("end_turn").1, "succeeded");

@@ -213,6 +213,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imported_raw_session_never_enrolls_auto_title() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
+        let at = AgentType::ClaudeCode;
+
+        let outcome =
+            import_one(&db.conn, folder, &at, &summary("raw-ext-1", Some("historical")))
+                .await
+                .expect("import");
+        assert_eq!(outcome, ImportOutcome::Imported);
+
+        let id = find_id(&db.conn, "raw-ext-1").await;
+        assert!(
+            auto_title_job::Entity::find_by_id(id)
+                .one(&db.conn)
+                .await
+                .expect("query job")
+                .is_none(),
+            "raw import must stay historical and never enroll an auto-title job"
+        );
+    }
+
+    #[tokio::test]
     async fn reimport_refreshes_a_changed_title() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-import").await;

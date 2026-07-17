@@ -1760,6 +1760,10 @@ impl ConnectionManager {
                     let folder_id = current.folder_id;
                     let agent_type_str = current.agent_type.clone();
                     let git_branch = current.git_branch.clone();
+                    // Capture before `into()` so the live row retains its guard
+                    // and the historical sibling copies the same finalized flag.
+                    // Fork never inserts a sibling auto-title job.
+                    let auto_title_finalized = current.auto_title_finalized;
                     // The sibling keeps the original's sidebar routing (a forked
                     // chat conversation must stay in the Chat group). `Delegate`
                     // is unreachable here — children are never forked from the
@@ -1780,6 +1784,7 @@ impl ConnectionManager {
                     }
                     active.external_id = Set(Some(forked_session_id));
                     active.updated_at = Set(now);
+                    // Model→ActiveModel conversion keeps auto_title_finalized.
                     active.update(txn).await?;
 
                     // INSERT sibling row preserving pre-fork (S1) history.
@@ -1789,7 +1794,7 @@ impl ConnectionManager {
                         folder_id: Set(folder_id),
                         title: Set(clean_title),
                         title_locked: Set(false),
-                        auto_title_finalized: Set(false),
+                        auto_title_finalized: Set(auto_title_finalized),
                         agent_type: Set(agent_type_str),
                         status: Set(ConversationStatus::PendingReview),
                         kind: Set(sibling_kind),
@@ -5424,6 +5429,96 @@ mod tests {
         assert_eq!(sibling.status, "pending_review");
         assert_eq!(sibling.folder_id, folder_id);
         assert_eq!(sibling.git_branch.as_deref(), Some("feature/x"));
+    }
+
+    #[tokio::test]
+    async fn fork_preserves_generated_title_guard_without_enrolling_sibling() {
+        use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
+        use crate::db::test_helpers;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-title-guard").await;
+
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("Generated Topic".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::update_external_id(&db.conn, pre.id, "session-S1".into())
+            .await
+            .unwrap();
+
+        // Live row already has a finalized generated title and a residual job.
+        let mut active: conversation::ActiveModel = conversation::Entity::find_by_id(pre.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        active.auto_title_finalized = Set(true);
+        active.update(&db.conn).await.unwrap();
+
+        let now = chrono::Utc::now();
+        auto_title_job::ActiveModel {
+            conversation_id: Set(pre.id),
+            state: Set(AutoTitleJobState::AwaitingTurn),
+            attempts: Set(0),
+            first_user_text: Set(None),
+            first_assistant_text: Set(None),
+            locale: Set(None),
+            usable_turn_seq: Set(0),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(None),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed job on live row");
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-guard", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(&db, "c-fork-guard", None, None)
+            .await
+            .expect("fork");
+        let _ = join.await;
+
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
+            .await
+            .unwrap();
+
+        assert!(
+            current.auto_title_finalized,
+            "live row must retain auto_title_finalized"
+        );
+        assert!(
+            sibling.auto_title_finalized,
+            "sibling must copy auto_title_finalized"
+        );
+        assert!(
+            auto_title_job::Entity::find_by_id(pre.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_some(),
+            "existing job stays on the live row"
+        );
+        assert!(
+            auto_title_job::Entity::find_by_id(result.sibling_conversation_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "sibling must not receive a new auto-title job"
+        );
     }
 
     #[tokio::test]
