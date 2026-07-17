@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::manager::ConnectionManager;
 use crate::auto_title::internal_sessions::InternalAgentSessionRegistry;
-use crate::auto_title::runner::{HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner};
+use crate::auto_title::runner::{
+    HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner,
+};
 use crate::auto_title::service::{
     claim_is_still_running, claim_next_ready, finalize_generated_title, record_attempt_failure,
     recover_interrupted_jobs,
@@ -19,8 +21,8 @@ use crate::auto_title::service::{
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
 };
-use crate::db::AppDatabase;
 use crate::db::error::DbError;
+use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 use std::path::PathBuf;
 
@@ -28,11 +30,11 @@ const MAX_CONCURRENT_ATTEMPTS: usize = 2;
 
 /// Process-local live coordinator used by lifecycle to wake ready jobs after
 /// commit without threading the Arc through every bus worker signature.
-static LIVE_COORDINATOR: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Weak<AutoTitleCoordinator>>>> =
-    std::sync::OnceLock::new();
+static LIVE_COORDINATOR: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Weak<AutoTitleCoordinator>>>,
+> = std::sync::OnceLock::new();
 
-fn live_slot(
-) -> &'static std::sync::Mutex<Option<std::sync::Weak<AutoTitleCoordinator>>> {
+fn live_slot() -> &'static std::sync::Mutex<Option<std::sync::Weak<AutoTitleCoordinator>>> {
     LIVE_COORDINATOR.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -71,6 +73,10 @@ pub struct AutoTitleCoordinator {
     active: Mutex<HashMap<i32, ActiveTitleAttempt>>,
     off_root: Mutex<CancellationToken>,
     started: AtomicBool,
+    /// True while a claim-error delayed wake is outstanding. Ordinary channel
+    /// hints coalesce and do not start another drain until the delayed wake
+    /// clears this flag immediately before the next claim attempt.
+    claim_error_retry_pending: AtomicBool,
     /// One-shot inject for claim DB errors (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     claim_error_once: Mutex<Option<DbError>>,
@@ -86,6 +92,12 @@ pub struct AutoTitleCoordinator {
     /// Inject failures into record_attempt_failure commits (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     fail_failure_commits: AtomicBool,
+    /// Remaining synthetic finalize DB failures before a real commit (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    finalize_fail_remaining: std::sync::atomic::AtomicU32,
+    /// When true, `FailureTransition::Ready` does not auto-notify (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    suppress_ready_notify: AtomicBool,
 }
 
 /// Build the production coordinator (hidden runner + manager driver) for
@@ -97,10 +109,9 @@ pub fn build_production_coordinator(
     data_dir: PathBuf,
     emitter: EventEmitter,
 ) -> Arc<AutoTitleCoordinator> {
-    let driver: Arc<dyn crate::auto_title::runner::TitleConnectionDriver> =
-        Arc::new(ManagerTitleConnectionDriver::new(Arc::new(
-            connection_manager.clone_ref(),
-        )));
+    let driver: Arc<dyn crate::auto_title::runner::TitleConnectionDriver> = Arc::new(
+        ManagerTitleConnectionDriver::new(Arc::new(connection_manager.clone_ref())),
+    );
     let runner: Arc<dyn TitleAgentRunner> = Arc::new(HiddenAgentRunner::new(
         Arc::clone(&db),
         driver,
@@ -125,6 +136,7 @@ impl AutoTitleCoordinator {
             active: Mutex::new(HashMap::new()),
             off_root: Mutex::new(CancellationToken::new()),
             started: AtomicBool::new(false),
+            claim_error_retry_pending: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             claim_error_once: Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
@@ -135,6 +147,10 @@ impl AutoTitleCoordinator {
             claim_calls: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             fail_failure_commits: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            finalize_fail_remaining: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            suppress_ready_notify: AtomicBool::new(false),
         })
     }
 
@@ -142,11 +158,7 @@ impl AutoTitleCoordinator {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_inert_for_test(conn: sea_orm::DatabaseConnection) -> Arc<Self> {
         let db = Arc::new(AppDatabase { conn });
-        Self::new(
-            db,
-            Arc::new(InertTitleAgentRunner),
-            EventEmitter::Noop,
-        )
+        Self::new(db, Arc::new(InertTitleAgentRunner), EventEmitter::Noop)
     }
 
     pub fn notify_ready(&self) {
@@ -247,8 +259,33 @@ impl AutoTitleCoordinator {
         let mut claim_error_backoff = ClaimErrorBackoff::default();
         loop {
             self.notify.notified().await;
+            // While a claim-error delayed wake is pending, ordinary channel
+            // hints coalesce and must not start another drain (or claim).
+            if self.claim_error_retry_pending.load(Ordering::SeqCst) {
+                continue;
+            }
             self.drain_ready(&mut claim_error_backoff).await;
         }
+    }
+
+    /// Schedule at most one outstanding delayed wake after a claim DB error.
+    fn schedule_unique_delayed_wake(self: &Arc<Self>, delay: Duration) {
+        if self
+            .claim_error_retry_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            // Clear before the next claim attempt so the delayed wake's
+            // notify_ready is allowed to drain.
+            this.claim_error_retry_pending
+                .store(false, Ordering::SeqCst);
+            this.notify_ready();
+        });
     }
 
     async fn drain_ready(self: &Arc<Self>, claim_error_backoff: &mut ClaimErrorBackoff) {
@@ -292,11 +329,7 @@ impl AutoTitleCoordinator {
                     tracing::warn!(%error, "ready title claim failed");
                     drop(permit);
                     let delay = claim_error_backoff.next_delay();
-                    let this = Arc::clone(self);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        this.notify_ready();
-                    });
+                    self.schedule_unique_delayed_wake(delay);
                     break;
                 }
             };
@@ -320,7 +353,13 @@ impl AutoTitleCoordinator {
                         this.unregister_active(claim.conversation_id, claim.attempt)
                             .await;
                         if transition == FailureTransition::Ready {
-                            this.notify_ready();
+                            #[cfg(any(test, feature = "test-utils"))]
+                            let suppress = this.suppress_ready_notify.load(Ordering::SeqCst);
+                            #[cfg(not(any(test, feature = "test-utils")))]
+                            let suppress = false;
+                            if !suppress {
+                                this.notify_ready();
+                            }
                         }
                     });
                     continue;
@@ -372,7 +411,13 @@ impl AutoTitleCoordinator {
             Err(_) => {
                 let transition = self.settle_attempt_failure_with_retry(&claim).await;
                 if transition == FailureTransition::Ready {
-                    self.notify_ready();
+                    #[cfg(any(test, feature = "test-utils"))]
+                    let suppress = self.suppress_ready_notify.load(Ordering::SeqCst);
+                    #[cfg(not(any(test, feature = "test-utils")))]
+                    let suppress = false;
+                    if !suppress {
+                        self.notify_ready();
+                    }
                 }
             }
         }
@@ -416,6 +461,28 @@ impl AutoTitleCoordinator {
     ) -> FinalizeTitleOutcome {
         let mut delay = Duration::from_millis(100);
         loop {
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                // Synthetic DB failures: retain runner output; never re-invoke model.
+                let remaining = self.finalize_fail_remaining.load(Ordering::SeqCst);
+                if remaining > 0 {
+                    self.finalize_fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                    tracing::warn!(
+                        conversation_id = claim.conversation_id,
+                        "title finalize failed (injected); retrying"
+                    );
+                    if !claim_is_still_running(&self.db.conn, claim)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return FinalizeTitleOutcome::Cancelled;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = next_backoff(delay);
+                    continue;
+                }
+            }
+
             match finalize_generated_title(&self.db.conn, claim, title).await {
                 Ok(outcome) => return outcome,
                 Err(error) => {
@@ -487,6 +554,16 @@ impl AutoTitleCoordinator {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_finalize_fail_remaining(&self, n: u32) {
+        self.finalize_fail_remaining.store(n, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_suppress_ready_notify(&self, suppress: bool) {
+        self.suppress_ready_notify.store(suppress, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn has_active_registration(&self, conversation_id: i32) -> bool {
         self.active.lock().await.contains_key(&conversation_id)
     }
@@ -498,6 +575,11 @@ impl AutoTitleCoordinator {
             .await
             .get(&conversation_id)
             .map(|a| a.attempt)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn claim_error_retry_is_pending(&self) -> bool {
+        self.claim_error_retry_pending.load(Ordering::SeqCst)
     }
 }
 
@@ -530,8 +612,9 @@ impl ClaimErrorBackoff {
     }
 }
 
+/// Test-only runner that panics if invoked. Used by inert AppState constructors.
 #[cfg(any(test, feature = "test-utils"))]
-struct InertTitleAgentRunner;
+pub struct InertTitleAgentRunner;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait::async_trait]
@@ -555,9 +638,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use chrono::Utc;
-    use sea_orm::{
-        ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
-    };
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
     use tokio::sync::Notify as TokioNotify;
     use tokio::time::{timeout, Duration as TokioDuration};
 
@@ -573,7 +654,10 @@ mod tests {
     enum ScriptedStep {
         Fail(AutoTitleRunError),
         Ok(String),
+        /// Wait for gate (or cancel); on gate → Ok.
         Block(Arc<TokioNotify>),
+        /// Wait for gate (or cancel); on gate → Fail.
+        FailWhenReleased(Arc<TokioNotify>),
     }
 
     struct FakeRunner {
@@ -602,6 +686,10 @@ mod tests {
             Self::new(vec![ScriptedStep::Fail(AutoTitleRunError::EmptyOutput)])
         }
 
+        fn succeed_once(title: impl Into<String>) -> Arc<Self> {
+            Self::new(vec![ScriptedStep::Ok(title.into())])
+        }
+
         fn blocked() -> (Arc<Self>, Arc<TokioNotify>) {
             let n = Arc::new(TokioNotify::new());
             (
@@ -614,12 +702,30 @@ mod tests {
             )
         }
 
+        /// Attempt one fails after release; attempt two blocks until cancelled.
+        fn first_fails_second_blocks() -> (Arc<Self>, Arc<TokioNotify>, Arc<TokioNotify>) {
+            let release_first = Arc::new(TokioNotify::new());
+            let second_block = Arc::new(TokioNotify::new());
+            (
+                Self::new(vec![
+                    ScriptedStep::FailWhenReleased(Arc::clone(&release_first)),
+                    ScriptedStep::Block(Arc::clone(&second_block)),
+                ]),
+                release_first,
+                second_block,
+            )
+        }
+
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
 
         async fn attempt_two_was_cancelled(&self) -> bool {
             self.cancelled_attempts.lock().await.contains(&2)
+        }
+
+        async fn attempt_was_cancelled(&self, attempt: i32) -> bool {
+            self.cancelled_attempts.lock().await.contains(&attempt)
         }
     }
 
@@ -645,6 +751,15 @@ mod tests {
                 ScriptedStep::Block(gate) => {
                     tokio::select! {
                         _ = gate.notified() => Ok("blocked-released".into()),
+                        _ = cancellation.cancelled() => {
+                            self.cancelled_attempts.lock().await.push(attempt.attempt);
+                            Err(AutoTitleRunError::Cancelled)
+                        }
+                    }
+                }
+                ScriptedStep::FailWhenReleased(gate) => {
+                    tokio::select! {
+                        _ = gate.notified() => Err(AutoTitleRunError::EmptyOutput),
                         _ = cancellation.cancelled() => {
                             self.cancelled_attempts.lock().await.push(attempt.attempt);
                             Err(AutoTitleRunError::Cancelled)
@@ -895,16 +1010,22 @@ mod tests {
         }
 
         async fn manual_rename(&self, conversation_id: i32, title: &str) {
-            let removed = conversation_service::update_title(
-                &self.db.conn,
-                conversation_id,
-                title.into(),
-            )
-            .await
-            .expect("rename");
+            let removed =
+                conversation_service::update_title(&self.db.conn, conversation_id, title.into())
+                    .await
+                    .expect("rename");
             if removed {
                 self.coordinator.cancel_conversation(conversation_id).await;
             }
+        }
+
+        async fn conversation_title(&self, conversation_id: i32) -> Option<String> {
+            use crate::db::entities::conversation;
+            conversation::Entity::find_by_id(conversation_id)
+                .one(&self.db.conn)
+                .await
+                .expect("conv")
+                .and_then(|c| c.title)
         }
     }
 
@@ -912,15 +1033,7 @@ mod tests {
     async fn first_failure_waits_for_next_turn_and_second_failure_deletes_job() {
         let fixture = coordinator_fixture(FakeRunner::fail_twice()).await;
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_job(
-            &fixture.db,
-            cid,
-            AutoTitleJobState::Ready,
-            0,
-            0,
-            1,
-        )
-        .await;
+        fixture.make_ready(cid, 1).await;
         fixture.coordinator.notify_ready();
         fixture
             .wait_for_state(cid, AutoTitleJobState::RetryWait)
@@ -936,17 +1049,11 @@ mod tests {
     async fn ready_jobs_wait_for_capacity_before_claiming() {
         let (runner, _release) = FakeRunner::blocked();
         let fixture = coordinator_fixture(runner).await;
-        let mut ids = Vec::new();
-        for _ in 0..3 {
-            let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
-            seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
-            ids.push(cid);
-        }
+        fixture.make_three_ready_jobs().await;
         fixture.coordinator.notify_ready();
         fixture.wait_for_running_count(2).await;
         assert_eq!(fixture.ready_count().await, 1);
         assert_eq!(fixture.unclaimed_ready_attempts().await, vec![0]);
-        let _ = ids;
     }
 
     #[tokio::test]
@@ -955,45 +1062,15 @@ mod tests {
         let c1 = seed_conversation(&fixture.db, fixture.folder_id).await;
         let c2 = seed_conversation(&fixture.db, fixture.folder_id).await;
         let c3 = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_job(
-            &fixture.db,
-            c1,
-            AutoTitleJobState::Running,
-            1,
-            1,
-            2,
-        )
-        .await;
-        seed_job(
-            &fixture.db,
-            c2,
-            AutoTitleJobState::Running,
-            1,
-            1,
-            1,
-        )
-        .await;
-        seed_job(
-            &fixture.db,
-            c3,
-            AutoTitleJobState::Running,
-            2,
-            2,
-            2,
-        )
-        .await;
+        seed_job(&fixture.db, c1, AutoTitleJobState::Running, 1, 1, 2).await;
+        seed_job(&fixture.db, c2, AutoTitleJobState::Running, 1, 1, 1).await;
+        seed_job(&fixture.db, c3, AutoTitleJobState::Running, 2, 2, 2).await;
 
         recover_interrupted_jobs(&fixture.db.conn)
             .await
             .expect("recover");
-        assert_eq!(
-            fixture.state(c1).await,
-            Some(AutoTitleJobState::Ready)
-        );
-        assert_eq!(
-            fixture.state(c2).await,
-            Some(AutoTitleJobState::RetryWait)
-        );
+        assert_eq!(fixture.state(c1).await, Some(AutoTitleJobState::Ready));
+        assert_eq!(fixture.state(c2).await, Some(AutoTitleJobState::RetryWait));
         assert_eq!(fixture.state(c3).await, None);
     }
 
@@ -1031,29 +1108,36 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_one_cleanup_cannot_unregister_attempt_two() {
-        // Claim-scoped unregister: a late attempt-1 cleanup must not drop attempt 2.
-        let fixture = recovery_fixture().await;
-        let off = fixture.coordinator.current_off_root().await;
-        let _c1 = fixture
-            .coordinator
-            .register_active(7, 1, off.child_token())
-            .await;
-        let c2 = fixture
-            .coordinator
-            .register_active(7, 2, off.child_token())
-            .await;
-        assert_eq!(fixture.coordinator.active_attempt(7).await, Some(2));
-
-        fixture.coordinator.unregister_active(7, 1).await;
-        assert_eq!(
-            fixture.coordinator.active_attempt(7).await,
-            Some(2),
-            "unregister of attempt 1 must not remove attempt 2"
-        );
-        assert!(!c2.is_cancelled());
-
-        fixture.coordinator.unregister_active(7, 2).await;
-        assert!(!fixture.coordinator.has_active_registration(7).await);
+        let (runner, release_first, _second_block) = FakeRunner::first_fails_second_blocks();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        fixture.make_ready(cid, 1).await;
+        fixture.coordinator.pause_attempt_cleanup(cid, 1).await;
+        // Hold Ready long enough to observe it; attempt two starts via explicit notify.
+        fixture.coordinator.set_suppress_ready_notify(true);
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+        // Bump usable_turn_seq while attempt one still holds the running claim.
+        fixture.complete_target_turn(cid, "turn-2").await;
+        release_first.notify_waiters();
+        fixture.wait_for_state(cid, AutoTitleJobState::Ready).await;
+        fixture.coordinator.set_suppress_ready_notify(false);
+        // Unrelated queue wake while attempt-one cleanup is held can claim attempt two.
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_active_attempt(cid, 2).await;
+        fixture.coordinator.release_attempt_cleanup(cid, 1).await;
+        fixture.manual_rename(cid, "Manual").await;
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_two_was_cancelled().await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("attempt two cancelled");
+        assert!(fixture.runner.attempt_two_was_cancelled().await);
     }
 
     #[tokio::test]
@@ -1067,21 +1151,290 @@ mod tests {
         fixture.manual_rename(cid, "Manual").await;
         timeout(TokioDuration::from_secs(2), async {
             loop {
-                if fixture.runner.attempt_two_was_cancelled().await
-                    || fixture.runner.call_count() >= 1
-                        && !fixture.coordinator.has_active_registration(cid).await
-                {
-                    // attempt 1 cancelled (stored as cancelled attempt id)
-                    let cancelled = fixture.runner.cancelled_attempts.lock().await.clone();
-                    if cancelled.contains(&1) {
-                        return;
-                    }
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
                 }
                 tokio::time::sleep(TokioDuration::from_millis(20)).await;
             }
         })
         .await
         .expect("rename cancels blocked runner");
+        assert!(fixture.state(cid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_usable_turn_while_attempt_one_runs_makes_failure_immediately_ready() {
+        let release = Arc::new(TokioNotify::new());
+        let runner = FakeRunner::new(vec![ScriptedStep::FailWhenReleased(Arc::clone(&release))]);
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        fixture.make_ready(cid, 1).await;
+        // Prevent immediate attempt-two claim so Ready is observable.
+        fixture.coordinator.set_suppress_ready_notify(true);
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+        // Newer usable turn while attempt one is still running.
+        fixture.complete_target_turn(cid, "turn-during-run").await;
+        release.notify_waiters();
+        fixture.wait_for_state(cid, AutoTitleJobState::Ready).await;
+        assert_eq!(fixture.attempts(cid).await, 1);
+        assert_eq!(fixture.runner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn database_commit_retry_reuses_one_runner_output() {
+        let fixture = coordinator_fixture(FakeRunner::succeed_once("Generated Title")).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.set_finalize_fail_remaining(2);
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_job_deleted(cid).await;
+        assert_eq!(fixture.runner.call_count(), 1);
+        assert_eq!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("Generated Title")
+        );
+        assert!(!fixture.coordinator.has_active_registration(cid).await);
+    }
+
+    #[tokio::test]
+    async fn disable_between_claim_and_registration_cancels_without_running() {
+        let fixture = coordinator_fixture(FakeRunner::fail_once()).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        let gate = fixture.coordinator.set_pre_register_gate(cid).await;
+        fixture.coordinator.notify_ready();
+        fixture
+            .wait_for_state(cid, AutoTitleJobState::Running)
+            .await;
+        // Off replaces the root after claim captured a child of the old root.
+        set_auto_title_agent_persisted_core(&fixture.db, None)
+            .await
+            .expect("off");
+        fixture.coordinator.cancel_all().await;
+        gate.notify_waiters();
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if !fixture.coordinator.has_active_registration(cid).await
+                    && fixture.runner.call_count() == 0
+                {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled before run");
+        assert_eq!(fixture.runner.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rename_between_claim_and_registration_cancels_without_running() {
+        let fixture = coordinator_fixture(FakeRunner::fail_once()).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        let gate = fixture.coordinator.set_pre_register_gate(cid).await;
+        fixture.coordinator.notify_ready();
+        fixture
+            .wait_for_state(cid, AutoTitleJobState::Running)
+            .await;
+        // Committed rename deletes the job before active registration.
+        crate::commands::conversations::update_conversation_title_core(
+            &fixture.db.conn,
+            fixture.coordinator.as_ref(),
+            cid,
+            "Manual".into(),
+        )
+        .await
+        .expect("rename");
+        gate.notify_waiters();
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if !fixture.coordinator.has_active_registration(cid).await
+                    && fixture.runner.call_count() == 0
+                {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled before run");
+        assert_eq!(fixture.runner.call_count(), 0);
+        assert!(fixture.state(cid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_database_error_does_not_terminate_notification_worker() {
+        let fixture = coordinator_fixture(FakeRunner::fail_once()).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        fixture.make_ready(cid, 1).await;
+
+        // Pause only after real DB I/O for fixture setup (pool timeouts use wall clock).
+        tokio::time::pause();
+
+        // recover_and_start already performed one empty drain (notify on start).
+        let baseline = fixture.coordinator.claim_call_count();
+        fixture
+            .coordinator
+            .inject_claim_error_once(DbError::Validation("injected claim error".into()))
+            .await;
+        fixture.coordinator.notify_ready();
+
+        // Wait until the injected claim error is observed.
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.coordinator.claim_call_count() > baseline
+                    && fixture.coordinator.claim_error_retry_is_pending()
+                {
+                    return;
+                }
+                tokio::time::advance(TokioDuration::from_millis(5)).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim error observed");
+        assert_eq!(fixture.runner.call_count(), 0);
+        let after_error = fixture.coordinator.claim_call_count();
+
+        // Ordinary wake hints during backoff must not multiply claim attempts.
+        for _ in 0..5 {
+            fixture.coordinator.notify_ready();
+            tokio::time::advance(TokioDuration::from_millis(5)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.coordinator.claim_call_count(), after_error);
+        assert_eq!(fixture.runner.call_count(), 0);
+        assert!(
+            fixture.coordinator.claim_error_retry_is_pending(),
+            "unique delayed wake must still be outstanding"
+        );
+
+        // Drive the 100ms delayed wake under virtual time, then resume so the
+        // subsequent claim/run uses normal wall-clock I/O.
+        tokio::time::advance(TokioDuration::from_millis(100)).await;
+        // Poll the delayed-wake task to clear pending + notify.
+        for _ in 0..32 {
+            if !fixture.coordinator.claim_error_retry_is_pending() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fixture.coordinator.claim_error_retry_is_pending(),
+            "delayed wake must clear pending before retry claim"
+        );
+        tokio::time::resume();
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.coordinator.claim_call_count() > after_error {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker retried claim after delayed wake");
+        fixture.wait_for_runner_calls(1).await;
+        assert_eq!(fixture.runner.call_count(), 1);
+        // No additional external notify_ready after the error path.
+    }
+
+    #[tokio::test]
+    async fn manual_rename_cancels_active_title() {
+        let (runner, _release) = FakeRunner::blocked();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+        crate::commands::conversations::update_conversation_title_core(
+            &fixture.db.conn,
+            fixture.coordinator.as_ref(),
+            cid,
+            "Manual Win".into(),
+        )
+        .await
+        .expect("rename core");
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("active title cancelled");
+        assert!(fixture.state(cid).await.is_none());
+        assert_eq!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("Manual Win")
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_titles_cancels_all_and_late_result_loses() {
+        let (runner, release) = FakeRunner::blocked();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+
+        // Post-commit Off side effect: delete durable work, then cancel live claims.
+        set_auto_title_agent_persisted_core(&fixture.db, None)
+            .await
+            .expect("off");
+        fixture.coordinator.cancel_all().await;
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("off cancels active");
+        // Late unblock cannot finalize: job gone, claim cancelled.
+        release.notify_waiters();
+        tokio::time::sleep(TokioDuration::from_millis(50)).await;
+        assert!(fixture.state(cid).await.is_none());
+        assert_ne!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("blocked-released")
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_cancels_active_title() {
+        let (runner, _release) = FakeRunner::blocked();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+        crate::commands::conversations::delete_conversation_core(
+            &fixture.db.conn,
+            fixture.coordinator.as_ref(),
+            cid,
+        )
+        .await
+        .expect("soft delete");
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("soft delete cancels");
         assert!(fixture.state(cid).await.is_none());
     }
 }

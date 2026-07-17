@@ -8,8 +8,8 @@ use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
 use crate::auto_title::{AutoTitleCoordinator, InternalAgentSessionRegistry};
-use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::chat_channel::manager::ChatChannelManager;
+use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
 use crate::pet_state_mapper::PetStateHandle;
@@ -307,8 +307,29 @@ impl AppState {
     ///
     /// `data_dir` is a temp directory; handlers that touch it must use
     /// `tempfile::tempdir()` and pass the resulting path in.
+    ///
+    /// Uses an inert title runner that panics if invoked. Prefer
+    /// [`Self::new_for_test_with_title_runner`] for deterministic Task 9
+    /// integration coverage.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(db: crate::db::AppDatabase, data_dir: PathBuf) -> Self {
+        // Ordinary tests never construct a production manager driver.
+        Self::new_for_test_with_title_runner(
+            db,
+            data_dir,
+            Arc::new(crate::auto_title::coordinator::InertTitleAgentRunner),
+        )
+    }
+
+    /// Test constructor that injects a deterministic [`crate::auto_title::TitleAgentRunner`].
+    /// Shares the same process-local [`ConversationExperienceMutationGate`] wiring
+    /// as desktop/server/embedded constructors (one gate per AppState).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test_with_title_runner(
+        db: crate::db::AppDatabase,
+        data_dir: PathBuf,
+        runner: Arc<dyn crate::auto_title::TitleAgentRunner>,
+    ) -> Self {
         use crate::acp::{EventBusMetrics, InternalEventBus};
         use crate::web::event_bridge::WebEventBroadcaster;
 
@@ -324,8 +345,12 @@ impl AppState {
         let internal_sessions =
             InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), &data_dir)
                 .expect("empty internal session registry for tests");
+        let title_db = Arc::new(crate::db::AppDatabase {
+            conn: db.conn.clone(),
+        });
+        // Never start the production notification worker from test constructors.
         let auto_title_coordinator =
-            AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+            AutoTitleCoordinator::new(title_db, runner, EventEmitter::Noop);
         let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
 
         Self {
