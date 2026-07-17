@@ -1,16 +1,18 @@
-//! Enrollment, job cancellation, generated-title finalization, and prompt capture.
+//! Enrollment, job cancellation, generated-title finalization, prompt capture,
+//! and durable usable-completion transitions.
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, QueryFilter, Set, TransactionTrait,
 };
 
 use crate::acp::types::PromptInputBlock;
 use crate::auto_title::context::{bound_context, project_visible_prompt};
 use crate::auto_title::types::{
-    app_locale_to_wire, AutoTitleClaim, CapturedPrompt, FinalizeTitleOutcome, PromptCaptureContext,
+    app_locale_to_wire, AutoTitleClaim, CapturedPrompt, CompletionTransition, FinalizeTitleOutcome,
+    PromptCaptureContext, TurnCompletionSnapshot,
 };
 use crate::commands::conversation_experience::load_auto_title_agent_from;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
@@ -145,13 +147,80 @@ pub async fn capture_prompt_context<C: ConnectionTrait>(
     })
 }
 
+/// Apply a usable turn completion to the auto-title job inside an open transaction.
+///
+/// Only `end_turn` with non-empty trimmed final text advances the job. Duplicate
+/// turn tokens are idempotent. Moves `awaiting_turn` / `retry_wait` → `ready`
+/// and writes write-once `first_assistant_text` through [`bound_context`].
+pub async fn apply_usable_completion(
+    txn: &DatabaseTransaction,
+    snapshot: &TurnCompletionSnapshot,
+    stop_reason: &str,
+) -> Result<CompletionTransition, DbError> {
+    let job = auto_title_job::Entity::find_by_id(snapshot.conversation_id)
+        .one(txn)
+        .await?;
+
+    let Some(job) = job else {
+        return Ok(CompletionTransition {
+            usable_turn_seq: 0,
+            became_ready: false,
+        });
+    };
+
+    let current_seq = job.usable_turn_seq;
+
+    if stop_reason != "end_turn" || snapshot.final_text.trim().is_empty() {
+        return Ok(CompletionTransition {
+            usable_turn_seq: current_seq,
+            became_ready: false,
+        });
+    }
+
+    if job.last_usable_turn_token.as_deref() == Some(snapshot.turn_token.as_str()) {
+        return Ok(CompletionTransition {
+            usable_turn_seq: current_seq,
+            became_ready: false,
+        });
+    }
+
+    let bounded = bound_context(snapshot.final_text.trim());
+    let new_seq = current_seq + 1;
+    let became_ready = matches!(
+        job.state,
+        AutoTitleJobState::AwaitingTurn | AutoTitleJobState::RetryWait
+    );
+
+    let mut active: auto_title_job::ActiveModel = job.clone().into();
+    active.usable_turn_seq = Set(new_seq);
+    active.last_usable_turn_token = Set(Some(snapshot.turn_token.clone()));
+    if job.first_assistant_text.is_none() {
+        active.first_assistant_text = Set(Some(bounded));
+    }
+    active.locale = Set(Some(app_locale_to_wire(snapshot.locale).to_string()));
+    if became_ready {
+        active.state = Set(AutoTitleJobState::Ready);
+    }
+    active.updated_at = Set(Utc::now());
+    active.update(txn).await?;
+
+    Ok(CompletionTransition {
+        usable_turn_seq: new_seq,
+        became_ready,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use std::sync::Arc;
+
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 
     use crate::acp::delegation::spawner::DelegationLink;
-    use crate::auto_title::types::{AutoTitleClaim, FinalizeTitleOutcome};
+    use crate::auto_title::types::{
+        AutoTitleClaim, CompletionTransition, FinalizeTitleOutcome, TurnCompletionSnapshot,
+    };
     use crate::commands::conversation_experience::{
         set_auto_title_agent_persisted_core, KEY_AUTO_TITLE_AGENT,
     };
@@ -582,5 +651,121 @@ mod tests {
             );
             assert_eq!(job.state, state);
         }
+    }
+
+    struct AwaitingJobFixture {
+        db: crate::db::AppDatabase,
+        conversation_id: i32,
+    }
+
+    async fn awaiting_job_fixture() -> AwaitingJobFixture {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-awaiting-job").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let job = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("enrolled job");
+        assert_eq!(job.state, AutoTitleJobState::AwaitingTurn);
+        AwaitingJobFixture {
+            db,
+            conversation_id: conversation.id,
+        }
+    }
+
+    impl AwaitingJobFixture {
+        fn snapshot(&self, token: &str, answer: &str) -> TurnCompletionSnapshot {
+            TurnCompletionSnapshot {
+                conversation_id: self.conversation_id,
+                turn_token: token.to_string(),
+                locale: AppLocale::En,
+                final_text: Arc::from(answer),
+            }
+        }
+
+        async fn apply_completion(
+            &self,
+            snapshot: &TurnCompletionSnapshot,
+        ) -> CompletionTransition {
+            let txn = self.db.conn.begin().await.expect("begin");
+            let result = apply_usable_completion(&txn, snapshot, "end_turn")
+                .await
+                .expect("apply");
+            txn.commit().await.expect("commit");
+            result
+        }
+
+        async fn apply_completion_with_reason(
+            &self,
+            snapshot: &TurnCompletionSnapshot,
+            stop_reason: &str,
+        ) -> CompletionTransition {
+            let txn = self.db.conn.begin().await.expect("begin");
+            let result = apply_usable_completion(&txn, snapshot, stop_reason)
+                .await
+                .expect("apply");
+            txn.commit().await.expect("commit");
+            result
+        }
+
+        async fn job(&self) -> auto_title_job::Model {
+            auto_title_job::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .unwrap()
+                .expect("job")
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_turn_token_changes_the_job_once() {
+        let fixture = awaiting_job_fixture().await;
+        let snapshot = fixture.snapshot("same-token", "answer");
+        let first = fixture.apply_completion(&snapshot).await;
+        let second = fixture.apply_completion(&snapshot).await;
+        assert_eq!(first.usable_turn_seq, 1);
+        assert_eq!(second.usable_turn_seq, 1);
+        assert!(!second.became_ready);
+        assert!(first.became_ready);
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::Ready);
+        assert_eq!(job.usable_turn_seq, 1);
+        assert_eq!(job.last_usable_turn_token.as_deref(), Some("same-token"));
+        assert_eq!(job.first_assistant_text.as_deref(), Some("answer"));
+    }
+
+    #[tokio::test]
+    async fn abnormal_and_empty_completions_leave_job_awaiting() {
+        let fixture = awaiting_job_fixture().await;
+
+        let refusal = fixture.snapshot("tok-refusal", "I refuse");
+        let r = fixture
+            .apply_completion_with_reason(&refusal, "refusal")
+            .await;
+        assert_eq!(r.usable_turn_seq, 0);
+        assert!(!r.became_ready);
+
+        let empty = fixture.snapshot("tok-empty", "   ");
+        let e = fixture.apply_completion(&empty).await;
+        assert_eq!(e.usable_turn_seq, 0);
+        assert!(!e.became_ready);
+
+        let cancelled = fixture.snapshot("tok-cancel", "partial");
+        let c = fixture
+            .apply_completion_with_reason(&cancelled, "cancelled")
+            .await;
+        assert_eq!(c.usable_turn_seq, 0);
+        assert!(!c.became_ready);
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::AwaitingTurn);
+        assert_eq!(job.usable_turn_seq, 0);
+        assert!(job.first_assistant_text.is_none());
+        assert!(job.last_usable_turn_token.is_none());
     }
 }

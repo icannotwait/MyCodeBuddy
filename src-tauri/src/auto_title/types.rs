@@ -1,7 +1,26 @@
+use std::sync::Arc;
+
 use sea_orm::DatabaseConnection;
 
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
+
+/// Immutable, event-owned snapshot of a completed turn for lifecycle title work.
+/// Built under the SessionState lock at TurnComplete and never re-reads live state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnCompletionSnapshot {
+    pub conversation_id: i32,
+    pub turn_token: String,
+    pub locale: AppLocale,
+    pub final_text: Arc<str>,
+}
+
+/// Result of applying a usable completion to an auto-title job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionTransition {
+    pub usable_turn_seq: i32,
+    pub became_ready: bool,
+}
 
 /// Claim for a single automatic-title generation attempt. Task 8's coordinator
 /// builds this from a claimed `running` job; Task 3 only needs it as the

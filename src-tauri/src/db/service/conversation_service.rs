@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use crate::acp::delegation::route::{is_managed_agent, DelegationRoutePolicy};
@@ -304,8 +304,8 @@ pub async fn update_status(
 /// successful write. Used by the lifecycle subscriber on disconnect/error so a
 /// concurrent user-driven `completed` (or a prior `pending_review` from
 /// `TurnComplete`) cannot be silently overwritten.
-pub async fn update_status_if_with_patch(
-    conn: &DatabaseConnection,
+pub async fn update_status_if_with_patch<C: ConnectionTrait>(
+    conn: &C,
     conversation_id: i32,
     expected: conversation::ConversationStatus,
     new_status: conversation::ConversationStatus,
@@ -329,8 +329,8 @@ pub async fn update_status_if_with_patch(
     Ok((result.rows_affected > 0).then(|| state_patch(conversation_id, new_status, None, now)))
 }
 
-pub async fn update_status_if(
-    conn: &DatabaseConnection,
+pub async fn update_status_if<C: ConnectionTrait>(
+    conn: &C,
     conversation_id: i32,
     expected: conversation::ConversationStatus,
     new_status: conversation::ConversationStatus,
@@ -348,8 +348,8 @@ pub async fn update_status_if(
 ///
 /// Token is minted only when `parent_id IS NULL` AND `mark_awaiting_reply`.
 /// Child and background transitions never receive a generation.
-pub async fn finish_end_turn_if_in_progress(
-    conn: &DatabaseConnection,
+pub async fn finish_end_turn_if_in_progress<C: ConnectionTrait>(
+    conn: &C,
     conversation_id: i32,
     mark_awaiting_reply: bool,
 ) -> Result<Option<ConversationStatePatch>, DbError> {

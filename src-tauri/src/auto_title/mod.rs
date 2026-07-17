@@ -9,10 +9,12 @@ pub mod types;
 
 pub use context::{bound_context, project_visible_prompt};
 pub use service::{
-    cancel_job, capture_prompt_context, enroll_new_conversation, finalize_generated_title,
+    apply_usable_completion, cancel_job, capture_prompt_context, enroll_new_conversation,
+    finalize_generated_title,
 };
 pub use types::{
     app_locale_to_wire, parse_supported_app_locale, prompt_capture_from_wire,
-    user_launch_context_from_db, AutoTitleClaim, CapturedPrompt, ConnectionLaunchContext,
-    ConnectionPurpose, FinalizeTitleOutcome, PromptCaptureContext,
+    user_launch_context_from_db, AutoTitleClaim, CapturedPrompt, CompletionTransition,
+    ConnectionLaunchContext, ConnectionPurpose, FinalizeTitleOutcome, PromptCaptureContext,
+    TurnCompletionSnapshot,
 };

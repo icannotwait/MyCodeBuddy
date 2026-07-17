@@ -18,7 +18,7 @@ use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
     PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
 };
-use crate::auto_title::ConnectionPurpose;
+use crate::auto_title::{ConnectionPurpose, TurnCompletionSnapshot};
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
 use crate::models::system::AppLocale;
@@ -603,7 +603,12 @@ impl SessionState {
 
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
-    pub fn apply_event(&mut self, payload: &AcpEvent) {
+    ///
+    /// Returns an event-owned [`TurnCompletionSnapshot`] only for `TurnComplete`
+    /// when both `conversation_id` and `active_turn` are present. Built after
+    /// assembling `last_assistant_text` and before clearing `active_turn`.
+    pub fn apply_event(&mut self, payload: &AcpEvent) -> Option<TurnCompletionSnapshot> {
+        let mut completion = None;
         match payload {
             AcpEvent::SessionStarted { session_id } => {
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
@@ -823,6 +828,25 @@ impl SessionState {
                         Some(assembled)
                     };
                 }
+                // Event-owned completion snapshot: capture under this lock after
+                // text assembly and before clearing active_turn so lifecycle
+                // never re-reads mutable SessionState for title context.
+                completion = match (self.conversation_id, self.active_turn.as_ref()) {
+                    (Some(conversation_id), Some(turn)) => {
+                        let final_text: Arc<str> = match &self.last_assistant_text {
+                            Some(text) => Arc::from(text.as_str()),
+                            None => Arc::from(""),
+                        };
+                        Some(TurnCompletionSnapshot {
+                            conversation_id,
+                            turn_token: turn.token.clone(),
+                            locale: turn.locale,
+                            final_text,
+                        })
+                    }
+                    _ => None,
+                };
+                self.active_turn = None;
                 self.live_message = None;
                 self.active_tool_calls.clear();
                 // The turn's user prompt is no longer "in flight" — the
@@ -1017,6 +1041,7 @@ impl SessionState {
             }
         }
         self.last_activity_at = Utc::now();
+        completion
     }
 
     /// Whether this connection has launched background work (async sub-agent /

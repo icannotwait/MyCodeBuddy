@@ -15,15 +15,16 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
-use crate::acp::internal_bus::InternalEventBus;
+use crate::acp::internal_bus::{InternalEventBus, InternalEventEnvelope};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+use crate::auto_title::{apply_usable_completion, TurnCompletionSnapshot};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -118,32 +119,32 @@ struct CachedConn {
 const HANDLE_EVENT_RETRY_BACKOFFS: &[Duration] =
     &[Duration::from_millis(100), Duration::from_millis(500)];
 
-/// Wrap `handle_event` with a small backoff retry. Most failures here
-/// are transient SQLite "database is locked" errors that clear within a
-/// few hundred milliseconds; without a retry the conversation row would
+/// Wrap `handle_internal_event` with a small backoff retry. Most failures
+/// here are transient SQLite "database is locked" errors that clear within
+/// a few hundred milliseconds; without a retry the conversation row would
 /// silently miss its `pending_review` write and the sidebar would stay
 /// stuck on `in_progress` until the next prompt's `in_progress` write.
 ///
 /// Final failure is logged at ERROR — this is the only signal the
 /// subscriber is dropping correctness on the floor, so it must be noisy.
-async fn handle_event_with_retry(
+async fn handle_internal_event_with_retry(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
-    envelope: &EventEnvelope,
+    internal: &InternalEventEnvelope,
     broker: Option<&Arc<DelegationBroker>>,
 ) {
-    match handle_event(db_conn, manager, envelope, broker).await {
+    match handle_internal_event(db_conn, manager, internal, broker).await {
         Ok(()) => return,
         Err(e) => {
             tracing::warn!(
                 "[lifecycle][WARN] handle_event failed (attempt 1, will retry) for {:?}: {e}",
-                envelope.payload
+                internal.payload
             );
         }
     }
     for (attempt, backoff) in HANDLE_EVENT_RETRY_BACKOFFS.iter().enumerate() {
         tokio::time::sleep(*backoff).await;
-        match handle_event(db_conn, manager, envelope, broker).await {
+        match handle_internal_event(db_conn, manager, internal, broker).await {
             Ok(()) => return,
             Err(e) => {
                 let attempt_num = attempt + 2;
@@ -157,11 +158,171 @@ async fn handle_event_with_retry(
                     } else {
                         ", will retry"
                     },
-                    envelope.payload
+                    internal.payload
                 );
             }
         }
     }
+}
+
+/// Production lifecycle entry for bus workers. Consumes the optional
+/// completion sidecar on `TurnComplete`; other events delegate to
+/// [`handle_event`].
+async fn handle_internal_event(
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    internal: &InternalEventEnvelope,
+    broker: Option<&Arc<DelegationBroker>>,
+) -> Result<(), DbError> {
+    match &internal.payload {
+        AcpEvent::TurnComplete {
+            stop_reason,
+            mark_awaiting_reply,
+            ..
+        } => {
+            handle_turn_complete_internal(
+                db_conn,
+                manager,
+                &internal.connection_id,
+                stop_reason,
+                *mark_awaiting_reply,
+                internal.completion.as_ref().map(Arc::clone),
+                broker,
+            )
+            .await
+        }
+        _ => handle_event(db_conn, manager, internal.event.as_ref(), broker).await,
+    }
+}
+
+/// Sidecar-aware TurnComplete path. When a completion snapshot is present,
+/// status CAS and usable-completion job updates share one transaction and
+/// never re-read mutable SessionState for assistant text / locale / token /
+/// conversation id. Without a sidecar, status still runs (for direct tests
+/// that still call [`handle_event`]); broker result text is empty.
+async fn handle_turn_complete_internal(
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    connection_id: &str,
+    stop_reason: &str,
+    mark_awaiting_reply: bool,
+    completion: Option<Arc<TurnCompletionSnapshot>>,
+    broker: Option<&Arc<DelegationBroker>>,
+) -> Result<(), DbError> {
+    let live = manager.get_state_and_emitter(connection_id).await;
+
+    let (conversation_id, broker_text) = if let Some(snapshot) = completion.as_ref() {
+        (
+            Some(snapshot.conversation_id),
+            Some(snapshot.final_text.clone()),
+        )
+    } else {
+        // Production emits always carry a sidecar when active_turn was set.
+        // Sidecar-free paths (direct unit tests via handle_event, or turns
+        // without active_turn) never fall back to mutable last_assistant_text.
+        let cid = match &live {
+            Some((state_arc, _)) => state_arc.read().await.conversation_id,
+            None => None,
+        };
+        (cid, None)
+    };
+
+    let Some(cid) = conversation_id else {
+        return Ok(());
+    };
+
+    match conversation_is_delegate(db_conn, cid).await {
+        Ok(true) => {
+            // Delegate ConversationStatus is broker-owned, but auto-title jobs
+            // still advance on usable completions from the event-owned sidecar.
+            if let Some(snapshot) = completion.as_ref() {
+                let txn = db_conn.begin().await?;
+                let _transition =
+                    apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+                txn.commit().await?;
+            }
+            if let Some(b) = broker {
+                // Empty broker text when no sidecar — never re-read SessionState.
+                let text = broker_text
+                    .as_ref()
+                    .map(|t| t.as_ref().to_string())
+                    .unwrap_or_default();
+                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
+                    .await;
+            }
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(
+                conversation_id = cid,
+                error = %e,
+                "[lifecycle] is_delegate probe failed; skipping generic \
+                 ConversationStatus write (fail-closed)"
+            );
+            if let Some(snapshot) = completion.as_ref() {
+                let txn = db_conn.begin().await?;
+                let _transition =
+                    apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+                txn.commit().await?;
+            }
+            if let Some(b) = broker {
+                let text = broker_text
+                    .as_ref()
+                    .map(|t| t.as_ref().to_string())
+                    .unwrap_or_default();
+                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
+                    .await;
+            }
+            return Ok(());
+        }
+    }
+
+    // One transaction: status transition + usable completion (when sidecar).
+    let txn = db_conn.begin().await?;
+    let cas_patch = match stop_reason {
+        "end_turn" => {
+            conversation_service::finish_end_turn_if_in_progress(&txn, cid, mark_awaiting_reply)
+                .await?
+        }
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+            conversation_service::update_status_if_with_patch(
+                &txn,
+                cid,
+                ConversationStatus::InProgress,
+                ConversationStatus::Cancelled,
+            )
+            .await?
+        }
+        _ => None,
+    };
+    if let Some(snapshot) = completion.as_ref() {
+        // `became_ready` is reserved for Task 8's coordinator after commit.
+        let _transition = apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+    }
+    txn.commit().await?;
+
+    if let Some(patch) = cas_patch {
+        let status = if stop_reason == "end_turn" {
+            ConversationStatus::PendingReview
+        } else {
+            ConversationStatus::Cancelled
+        };
+        if let Some((state_arc, emitter)) = live.as_ref() {
+            emit_with_state(
+                state_arc,
+                emitter,
+                AcpEvent::ConversationStatusChanged {
+                    conversation_id: cid,
+                    status,
+                },
+            )
+            .await;
+            crate::commands::conversations::emit_conversation_state(emitter, patch);
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn handle_event(
@@ -1347,7 +1508,7 @@ async fn connection_worker_loop(
     db: DatabaseConnection,
     manager: ConnectionManager,
     broker: Option<Arc<DelegationBroker>>,
-    mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
+    mut rx: mpsc::Receiver<Arc<InternalEventEnvelope>>,
 ) {
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
@@ -1364,8 +1525,8 @@ async fn connection_worker_loop(
     // aren't double-touched.
     let mut terminal_dispatched = false;
     while let Some(envelope_arc) = rx.recv().await {
-        let envelope: &EventEnvelope = envelope_arc.as_ref();
-        match &envelope.payload {
+        let internal: &InternalEventEnvelope = envelope_arc.as_ref();
+        match &internal.payload {
             AcpEvent::ConversationLinked {
                 conversation_id, ..
             } => {
@@ -1429,7 +1590,7 @@ async fn connection_worker_loop(
                 terminal_dispatched = true;
             }
             _ => {
-                handle_event_with_retry(&db, &manager, envelope, broker.as_ref()).await;
+                handle_internal_event_with_retry(&db, &manager, internal, broker.as_ref()).await;
             }
         }
     }
@@ -1466,7 +1627,7 @@ pub fn lifecycle_subscriber_task(
         // connection_id → worker mailbox. Workers are spawned lazily on the
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).
-        let mut workers: HashMap<String, mpsc::Sender<Arc<EventEnvelope>>> = HashMap::new();
+        let mut workers: HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>> = HashMap::new();
         loop {
             match rx.recv().await {
                 Ok(envelope_arc) => {
@@ -1478,7 +1639,11 @@ pub fn lifecycle_subscriber_task(
                     // why `ToolCall`/`ToolCallUpdate` no longer need to reach a
                     // worker at all. See `register_delegation_tool_call_from_event`.
                     if let Some(b) = broker.as_ref() {
-                        register_delegation_tool_call_from_event(b.as_ref(), &envelope_arc).await;
+                        register_delegation_tool_call_from_event(
+                            b.as_ref(),
+                            envelope_arc.event.as_ref(),
+                        )
+                        .await;
                     }
 
                     // Fast-path filter: skip events the worker would no-op.
@@ -1494,7 +1659,7 @@ pub fn lifecycle_subscriber_task(
 
                     let tx = workers.entry(conn_id.clone()).or_insert_with(|| {
                         let (tx, worker_rx) =
-                            mpsc::channel::<Arc<EventEnvelope>>(WORKER_QUEUE_CAPACITY);
+                            mpsc::channel::<Arc<InternalEventEnvelope>>(WORKER_QUEUE_CAPACITY);
                         let db_clone = db_conn.clone();
                         let mgr_clone = manager.clone_ref();
                         let broker_clone = broker.clone();
