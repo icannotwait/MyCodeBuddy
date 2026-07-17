@@ -714,9 +714,24 @@ fn truncate_on_char_boundary(s: &str, cap: usize) -> String {
     format!("{}{ELLIPSIS}", &s[..end])
 }
 
+/// True when an error code is a cancel (generic or parent-end cascade), not a
+/// failure. Parent-end codes settle via [`TerminalTaskWrite::canceled`] and must
+/// project to [`TaskStatus::Canceled`] in the completed cache so
+/// `get_tasks_status` / `classify_locked` match the durable store row.
+fn is_canceled_error_code(code: &str) -> bool {
+    if code == "canceled" {
+        return true;
+    }
+    matches!(
+        code,
+        "parent_canceled" | "parent_turn_failed" | "join_abandoned" | "parent_disconnected"
+    )
+}
+
 /// Derive the completed-cache fields (status / text / error_code / message)
-/// from a resolved [`DelegationOutcome`]. `Canceled`-coded errors map to
-/// [`TaskStatus::Canceled`]; every other error maps to [`TaskStatus::Failed`].
+/// from a resolved [`DelegationOutcome`]. Generic `"canceled"` and all four
+/// parent-end cascade codes map to [`TaskStatus::Canceled`]; every other error
+/// maps to [`TaskStatus::Failed`]. Error code/message are preserved unchanged.
 fn terminal_fields(
     outcome: &DelegationOutcome,
 ) -> (TaskStatus, Option<String>, Option<String>, Option<String>) {
@@ -728,7 +743,7 @@ fn terminal_fields(
             None,
         ),
         DelegationOutcome::Err { code, message, .. } => {
-            let status = if code == "canceled" {
+            let status = if is_canceled_error_code(code) {
                 TaskStatus::Canceled
             } else {
                 TaskStatus::Failed
@@ -5900,6 +5915,48 @@ mod tests {
             broker.cancel_parent_tree_for_test("parent", reason).await;
             let row = wait_for_terminal(&store, &task).await;
             assert_eq!(row.error_code.as_deref(), Some(expected));
+        }
+    }
+
+    /// Parent-end cascade must surface as Canceled on the public status poll
+    /// path (completed cache via `terminal_fields` / `classify_locked`), not
+    /// only on the durable mock store row. Covers generic-parent codes that
+    /// previously collapsed to Failed when != "canceled".
+    #[tokio::test]
+    async fn parent_end_cascade_status_poll_reports_canceled_with_stable_codes() {
+        for (reason, expected_code) in [
+            (ParentTurnEndReason::ParentCanceled, "parent_canceled"),
+            (ParentTurnEndReason::ParentTurnFailed, "parent_turn_failed"),
+            (ParentTurnEndReason::JoinAbandoned, "join_abandoned"),
+            (
+                ParentTurnEndReason::ParentDisconnected,
+                "parent_disconnected",
+            ),
+        ] {
+            let (broker, spawner, store, _attention) = coordination_broker().await;
+            let task = spawn_running(&broker, &spawner, "parent", 1, "child").await;
+            broker.cancel_parent_tree_for_test("parent", reason).await;
+            wait_for_terminal(&store, &task).await;
+
+            let reports = broker
+                .get_tasks_status(
+                    "parent",
+                    Some(1),
+                    std::slice::from_ref(&task),
+                    StatusWait::Snapshot,
+                )
+                .await;
+            assert_eq!(reports.len(), 1, "reason={expected_code}");
+            assert_eq!(
+                reports[0].status,
+                TaskStatus::Canceled,
+                "public status poll must report Canceled for {expected_code}, not Failed"
+            );
+            assert_eq!(
+                reports[0].error_code.as_deref(),
+                Some(expected_code),
+                "stable parent error_code must be preserved on status path"
+            );
         }
     }
 
