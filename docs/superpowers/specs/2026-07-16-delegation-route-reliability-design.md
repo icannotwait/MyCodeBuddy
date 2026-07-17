@@ -7,8 +7,9 @@ in
 `docs/superpowers/plans/2026-07-16-codex-harness-toolcall-subagent-latency.md`
 into a Codeg product-layer design for Codex, Grok, CodeBuddy, and Claude Code.
 
-The implementation plan has not been written yet. This document defines the
-behavioral contract that the plan must preserve.
+Implementation is governed by the plan at
+`docs/superpowers/plans/2026-07-16-delegation-route-reliability.md`. This
+document defines the behavioral contract that the plan must preserve.
 
 ## Problem
 
