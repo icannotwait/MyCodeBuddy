@@ -154,7 +154,11 @@ export function buildLiveToolGroupSummaries(
       if (isToolRunning(info.status)) runningCount += 1
       if (isToolError(info.status)) errorCount += 1
     }
-    const id = `tg:${snapshot.messageId}:${groupIndex++}`
+    // Stable id from first tool in the group (not positional groupIndex) so a
+    // preceding group becoming non-groupable does not renumber later groups.
+    const headId = toolCallIds[0] ?? `idx-${groupIndex}`
+    groupIndex += 1
+    const id = `tg:${snapshot.messageId}:${headId}`
     groups.set(id, {
       id,
       toolCallIds: Object.freeze([...toolCallIds]),
