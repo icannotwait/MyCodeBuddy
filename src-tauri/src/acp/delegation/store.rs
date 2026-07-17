@@ -321,7 +321,7 @@ fn parse_agent_type(s: &str) -> AgentType {
     }
 }
 
-fn is_transient_sqlite(msg: &str) -> bool {
+pub(super) fn is_transient_sqlite(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("database is locked")
         || lower.contains("database is busy")
