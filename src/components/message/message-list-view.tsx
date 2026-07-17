@@ -775,16 +775,18 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   isStreaming,
   historicalDelegations,
   historicalActivities,
-  storeActivities,
   historicalKey,
 }: {
   conversationId: number
   agentType: AgentType
   isStreaming: boolean
   historicalDelegations: DelegationCardSource[]
+  /**
+   * Store + full-session historical composition from the parent. Live
+   * projection always merges on top while streaming (never gated on store
+   * non-emptiness).
+   */
   historicalActivities: DelegationActivityView[]
-  /** Store-materialized activities (parent selector; stable empty ref). */
-  storeActivities: DelegationActivityView[]
   historicalKey: string
 }) {
   const snap = useLiveTranscriptConversation(
@@ -794,22 +796,18 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     if (!snap || !isStreaming) return EMPTY_DELEGATIONS
     return extractLiveDelegationSources(liveSnapshotToLiveMessage(snap))
   }, [snap, isStreaming])
-  // Live transcript projection only when the store has not yet materialized
-  // the in-flight turn. Dedupe with store is deterministic by task_id.
+  // Always project live natives while streaming; merge/dedupe with the
+  // parent store+historical set (deterministic by task_id / precedence rules).
   const liveActivities = useMemo(() => {
     if (!snap || !isStreaming) return EMPTY_ACTIVITIES
-    if (storeActivities.length > 0) return EMPTY_ACTIVITIES
     return projectNativeActivitiesFromTranscript(snap, agentType)
-  }, [snap, isStreaming, agentType, storeActivities])
+  }, [snap, isStreaming, agentType])
   const activities = useMemo(() => {
-    if (storeActivities.length > 0) {
-      return dedupeDelegationActivities(storeActivities, liveActivities)
-    }
     if (liveActivities.length > 0) {
-      return dedupeDelegationActivities(liveActivities, historicalActivities)
+      return dedupeDelegationActivities(historicalActivities, liveActivities)
     }
     return historicalActivities
-  }, [storeActivities, liveActivities, historicalActivities])
+  }, [liveActivities, historicalActivities])
   // Full-session historical rows + fresher live transcript rows for in-flight
   // turns (live wins on parentToolUseId).
   const delegations = useMemo(
@@ -1168,17 +1166,16 @@ export function MessageListView({
   }, [threadItems])
   // Store-backed activities (COMPLETE_TURN / SET_LIVE_MESSAGE / detail fetch).
   // Stable empty reference when absent — required for Zustand getSnapshot.
+  // Store is last-assistant-only by design; always merge with full-session
+  // historical derivation below (never short-circuit on store non-emptiness).
   const storeActivities = useConversationRuntimeStore((s) =>
     selectDelegationActivities(s, conversationId)
   )
-  // Fall back to walking adapted parts across the full session — including
-  // background-task-group polls so Claude TaskOutput/TaskStop still project
-  // after adapter grouping (I2). Prefer store when present to avoid independent
-  // duplicate derivation.
+  // Full-session walk of adapted parts — including background-task-group polls
+  // so Claude TaskOutput/TaskStop still project after adapter grouping (I2).
+  // Merge/dedupe with store materialization so prior-turn native rows survive
+  // when the store only holds the latest assistant turn.
   const sessionActivities = useMemo(() => {
-    if (storeActivities.length > 0) {
-      return storeActivities
-    }
     const tools: Array<{
       toolCallId: string
       toolName: string
@@ -1235,7 +1232,13 @@ export function MessageListView({
       }
     }
     const derived = deriveNativeActivitiesFromToolCalls(tools, agentType)
-    return derived.length === 0 ? EMPTY_ACTIVITIES : derived
+    if (storeActivities.length === 0) {
+      return derived.length === 0 ? EMPTY_ACTIVITIES : derived
+    }
+    if (derived.length === 0) {
+      return storeActivities
+    }
+    return dedupeDelegationActivities(storeActivities, derived)
   }, [threadItems, agentType, storeActivities])
   // Conversation-scoped so expand/collapse is retained across turns.
   const subAgentOverlayKey = `subagents-${conversationId}`
@@ -1457,7 +1460,6 @@ export function MessageListView({
             isStreaming={connStatus === "prompting"}
             historicalDelegations={allSessionDelegations}
             historicalActivities={sessionActivities}
-            storeActivities={storeActivities}
             historicalKey={subAgentOverlayKey}
           />
         ) : (

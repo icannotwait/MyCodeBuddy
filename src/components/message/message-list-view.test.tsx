@@ -165,8 +165,20 @@ vi.mock("@/components/chat/agent-plan-overlay", () => ({
   AgentPlanOverlay: () => null,
 }))
 
+const { subAgentOverlayPropsSpy } = vi.hoisted(() => ({
+  subAgentOverlayPropsSpy: vi.fn(),
+}))
+
 vi.mock("@/components/chat/sub-agent-overlay", () => ({
-  SubAgentOverlay: () => null,
+  SubAgentOverlay: (props: {
+    activities?: Array<{ task_id?: string; origin?: string }>
+    delegations?: Array<{ parentToolUseId: string }>
+    defaultExpanded?: boolean
+    overlayKey?: string | null
+  }) => {
+    subAgentOverlayPropsSpy(props)
+    return <div data-testid="sub-agent-overlay-capture" />
+  },
 }))
 
 vi.mock("@/contexts/session-stats-context", () => ({
@@ -196,6 +208,7 @@ vi.mock("@/lib/perf/streaming-perf-recorder", () => ({
 }))
 
 import { MessageListView } from "./message-list-view"
+import type { DelegationActivityView } from "@/lib/types"
 
 const CID = 501
 
@@ -226,12 +239,155 @@ function toolTurn(id: string, text: string): MessageTurn {
   }
 }
 
+/** Historical assistant turn that materializes a Codex native spawn activity. */
+function nativeSpawnAssistantTurn(
+  id: string,
+  toolCallId: string,
+  taskId: string,
+  timestamp = "2026-05-28T00:00:01.000Z"
+): MessageTurn {
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: toolCallId,
+        tool_name: "spawn_agent",
+        input_preview: JSON.stringify({
+          agent_type: "worker",
+          message: `work-${taskId}`,
+        }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        output_preview: JSON.stringify({ agent_id: taskId }),
+        is_error: false,
+      },
+    ],
+    timestamp,
+  }
+}
+
+/** Historical Codeg delegate_to_agent tool call on an assistant turn. */
+function codegDelegateAssistantTurn(
+  id: string,
+  toolCallId: string,
+  timestamp = "2026-05-28T00:00:01.000Z"
+): MessageTurn {
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: toolCallId,
+        tool_name: "delegate_to_agent",
+        input_preview: JSON.stringify({
+          agent_type: "codex",
+          task: `task-${toolCallId}`,
+        }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        output_preview: JSON.stringify({
+          task_id: `broker-${toolCallId}`,
+          status: "running",
+        }),
+        is_error: false,
+      },
+    ],
+    timestamp,
+  }
+}
+
+function nativeActivityView(
+  taskId: string,
+  overrides: Partial<DelegationActivityView> = {}
+): DelegationActivityView {
+  return {
+    origin: "native",
+    authoritative: false,
+    platform: "codex",
+    task_id: taskId,
+    operation: "spawn",
+    observed_status: "completed",
+    started_at: "2026-05-28T00:00:01.000Z",
+    updated_at: "2026-05-28T00:00:02.000Z",
+    ...overrides,
+  }
+}
+
+function setStoreActivities(activities: DelegationActivityView[]) {
+  useConversationRuntimeStore.setState((s) => {
+    const session = s.byConversationId.get(CID)
+    if (!session) return s
+    const next = new Map(s.byConversationId)
+    next.set(CID, { ...session, delegationActivities: activities })
+    return { byConversationId: next }
+  })
+}
+
+function lastOverlayProps(): {
+  activities?: Array<{ task_id?: string; origin?: string }>
+  delegations?: Array<{ parentToolUseId: string }>
+  defaultExpanded?: boolean
+  overlayKey?: string | null
+} {
+  const calls = subAgentOverlayPropsSpy.mock.calls
+  expect(calls.length).toBeGreaterThan(0)
+  return calls[calls.length - 1][0]
+}
+
+function activityTaskIds(
+  props: ReturnType<typeof lastOverlayProps>
+): string[] {
+  return (props.activities ?? [])
+    .map((a) => a.task_id)
+    .filter((id): id is string => typeof id === "string" && id.length > 0)
+}
+
 function liveMessage(text: string, id = "lm-1"): LiveMessage {
   return {
     id,
     role: "assistant",
     content: [{ type: "text", text }],
     startedAt: 1_700_000_000_000,
+  }
+}
+
+function liveNativeSpawnMessage(
+  taskId: string,
+  toolCallId = "live-spawn-1"
+): LiveMessage {
+  const output = JSON.stringify({ agent_id: taskId })
+  return {
+    id: "lm-native-spawn",
+    role: "assistant",
+    content: [
+      {
+        type: "tool_call",
+        info: {
+          tool_call_id: toolCallId,
+          title: "spawn_agent",
+          kind: "other",
+          status: "completed",
+          content: null,
+          raw_input: JSON.stringify({
+            agent_type: "worker",
+            message: `live-${taskId}`,
+          }),
+          raw_output_chunks: [output],
+          raw_output_total_bytes: output.length,
+          locations: null,
+          meta: null,
+          images: [],
+        },
+      },
+    ],
+    startedAt: Date.parse("2026-07-16T10:00:00Z"),
   }
 }
 
@@ -305,6 +461,7 @@ function seedHistory(
           dbConversationId: CID,
           activeTurnToken: null,
           pendingCleanup: false,
+          delegationActivities: [],
         },
       ],
     ]),
@@ -556,5 +713,98 @@ describe("MessageListView live footer isolation", () => {
       "data-autolink-local-paths",
       "false"
     )
+  })
+})
+
+describe("MessageListView sub-agent overlay composition", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    subAgentOverlayPropsSpy.mockClear()
+    enableIncremental()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("merges earlier historical native activities with non-empty latest-turn store materialization", () => {
+    // Store deliberately materializes only the latest assistant turn; the
+    // earlier native spawn must still reach overlay props via full-session
+    // derivation + dedupe (not a store non-empty short circuit).
+    seedHistory([
+      userTurn("u1", "first"),
+      nativeSpawnAssistantTurn("a1", "call-old", "task-older", "2026-05-28T00:00:01.000Z"),
+      userTurn("u2", "second"),
+      nativeSpawnAssistantTurn(
+        "a2",
+        "call-new",
+        "task-newer",
+        "2026-05-28T00:00:03.000Z"
+      ),
+    ])
+    setStoreActivities([
+      nativeActivityView("task-newer", {
+        started_at: "2026-05-28T00:00:03.000Z",
+        updated_at: "2026-05-28T00:00:04.000Z",
+      }),
+    ])
+
+    renderMessageList()
+
+    const props = lastOverlayProps()
+    const taskIds = activityTaskIds(props)
+    expect(taskIds).toEqual(
+      expect.arrayContaining(["task-older", "task-newer"])
+    )
+    expect(taskIds.filter((id) => id === "task-older")).toHaveLength(1)
+    expect(taskIds.filter((id) => id === "task-newer")).toHaveLength(1)
+  })
+
+  it("projects live native activities while a pre-existing store activity is present", () => {
+    seedHistory([
+      userTurn("u1", "prior"),
+      nativeSpawnAssistantTurn("a1", "call-store", "task-store"),
+    ])
+    // Pre-existing store materialization (e.g. prior COMPLETE_TURN). Live
+    // transcript holds a *new* native spawn; do not call setLiveMessage so the
+    // store is not rewritten to last-live-only before composition runs.
+    setStoreActivities([nativeActivityView("task-store")])
+
+    const live = liveNativeSpawnMessage("task-live", "live-spawn-1")
+    act(() => {
+      liveTranscriptStore.rebuild(CID, "c1", live, 1)
+    })
+
+    renderMessageList()
+
+    const props = lastOverlayProps()
+    const taskIds = activityTaskIds(props)
+    expect(taskIds).toEqual(
+      expect.arrayContaining(["task-store", "task-live"])
+    )
+    expect(taskIds.filter((id) => id === "task-store")).toHaveLength(1)
+    expect(taskIds.filter((id) => id === "task-live")).toHaveLength(1)
+  })
+
+  it("passes full-session Codeg delegations with conversation-scoped key and defaultExpanded", () => {
+    seedHistory([
+      userTurn("u1", "first"),
+      codegDelegateAssistantTurn("a1", "pt-older", "2026-05-28T00:00:01.000Z"),
+      userTurn("u2", "second"),
+      codegDelegateAssistantTurn("a2", "pt-newer", "2026-05-28T00:00:03.000Z"),
+    ])
+
+    renderMessageList()
+
+    const props = lastOverlayProps()
+    const parentIds = (props.delegations ?? []).map((d) => d.parentToolUseId)
+    expect(parentIds).toEqual(["pt-older", "pt-newer"])
+    expect(props.defaultExpanded).toBe(true)
+    expect(props.overlayKey).toBe(`subagents-${CID}`)
   })
 })
