@@ -45,6 +45,17 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
+/// Launch policy for `probe_agent_options`. Must stay in lockstep with that
+/// call site — the unit test exercises this helper as the production policy.
+/// Internal probes have no user/channel locale; connection launch falls back
+/// to effective English when `inherited_locale` is `None`.
+fn internal_probe_launch_context() -> ConnectionLaunchContext {
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::InternalProbe,
+        inherited_locale: None,
+    }
+}
+
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
 /// never land here: it would collide with a persisted transcript turn id and let
@@ -1375,11 +1386,12 @@ impl ConnectionManager {
 
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
-        // deadlock. The helper reserves channel capacity FIRST and only then
-        // sets the turn-in-flight gate, with no await before the infallible
-        // `permit.send`; so a failure (channel closed / process exited) happens
-        // at the reserve step, BEFORE the gate is set — there is nothing to roll
-        // back. On that failure we still flip the row to `Cancelled` so the UI
+        // deadlock. The helper reserves channel capacity FIRST; only after a
+        // successful reserve (and successful capture when applicable) does it
+        // set active_turn / turn_in_flight, with no await before the infallible
+        // `permit.send`. Failures at reserve or at capture therefore happen
+        // BEFORE the gate is set — there is nothing turn-related to roll back.
+        // On those failures we still flip the row to `Cancelled` so the UI
         // doesn't strand on `in_progress`: no `TurnComplete` will ever arrive
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
@@ -1979,7 +1991,7 @@ impl ConnectionManager {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
-                ConnectionLaunchContext::default(),
+                internal_probe_launch_context(),
             )
             .await?;
 
@@ -2899,6 +2911,15 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
+
+    #[test]
+    fn internal_probe_launch_context_tags_internal_probe_purpose() {
+        // Policy used by `probe_agent_options`: InternalProbe, no inherited
+        // locale (effective English via connection launch unwrap_or).
+        let ctx = internal_probe_launch_context();
+        assert_eq!(ctx.purpose, ConnectionPurpose::InternalProbe);
+        assert_eq!(ctx.inherited_locale, None);
+    }
 
     #[test]
     fn is_reserved_turn_id_matches_only_the_parser_namespace() {
