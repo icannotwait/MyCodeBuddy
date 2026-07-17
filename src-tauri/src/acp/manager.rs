@@ -3778,6 +3778,108 @@ mod tests {
         }
     }
 
+    /// Production boundary: child row exists after enqueue but
+    /// `delegation_started_at` is missing → fixed non-secret
+    /// `SpawnerError::Send` so the broker setup path can tear down without
+    /// publishing running meta / DelegationStarted.
+    #[tokio::test]
+    async fn accepted_delegation_timestamp_unavailable_when_row_missing_started_at() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink, SpawnerError};
+        use crate::db::test_helpers;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        let mgr = Arc::new(ConnectionManager::new());
+        let child_id = "deleg-child-ts-miss";
+        let child_workdir = PathBuf::from("/tmp/deleg-child-ts-miss");
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(child_workdir),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = ConnectionPurpose::Delegation;
+        }
+
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-ts-miss").await;
+        let parent_conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent conversation");
+
+        // Pre-create the durable child row the spawner will look up after
+        // enqueue, then clear started_at so the production mapping path fires.
+        let child_row = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_conversation.id,
+                parent_tool_use_id: "tu-ts-miss".into(),
+                delegation_call_id: "call-ts-miss".into(),
+            }),
+        )
+        .await
+        .expect("child row");
+        {
+            let model = conversation::Entity::find_by_id(child_row.id)
+                .one(&db.conn)
+                .await
+                .expect("load child")
+                .expect("child exists");
+            let mut active: conversation::ActiveModel = model.into();
+            active.delegation_started_at = Set(None);
+            active.update(&db.conn).await.expect("clear started_at");
+        }
+        // already_linked path reuses this row (no second create).
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(child_row.id);
+        }
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+        let err = spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                "task body for missing timestamp".into(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-ts-miss".into(),
+                    delegation_call_id: "call-ts-miss".into(),
+                },
+            )
+            .await
+            .expect_err("missing started_at must fail acceptance");
+        match err {
+            SpawnerError::Send {
+                message,
+                child_conversation_id,
+            } => {
+                assert_eq!(
+                    message, "accepted delegation timestamp unavailable",
+                    "fixed non-secret error only"
+                );
+                assert_eq!(child_conversation_id, Some(child_row.id));
+            }
+            other => panic!("expected SpawnerError::Send, got {other:?}"),
+        }
+        // Drain enqueue so the test connection stays tidy.
+        let _ = child_rx.try_recv();
+    }
+
     #[test]
     fn is_reserved_turn_id_matches_only_the_parser_namespace() {
         // Rejected: the parsers' `turn-<digits>` ids (an untrusted client id of

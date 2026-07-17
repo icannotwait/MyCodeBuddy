@@ -94,6 +94,13 @@ const RUNTIME_STATS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 /// `persist_lock` forever.
 const RUNTIME_STATS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Optional oneshot gate for deterministic runtime race tests. Production
+/// never installs these; when absent, honor is a no-op.
+struct RuntimeGate {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
 /// Shared live runtime projector + coalesced-write coordination for one task.
 /// One allocation is shared across setup / running / terminal paths.
 pub(crate) struct LiveRuntimeState {
@@ -101,10 +108,15 @@ pub(crate) struct LiveRuntimeState {
     dirty_version: AtomicU64,
     flush_scheduled: AtomicBool,
     coalesced_persistence_disabled: AtomicBool,
-    started_published: AtomicBool,
     terminal: AtomicBool,
     persist_lock: Mutex<()>,
     publication_lock: Mutex<()>,
+    /// After acquiring the projector lock and re-checking `terminal`, tests may
+    /// pin the event path here so terminal flush can race deterministically.
+    projector_gate: Mutex<Option<RuntimeGate>>,
+    /// After acquiring `publication_lock`, start and terminal publishers honor
+    /// this gate so start/terminal ordering tests can pin the critical section.
+    publication_gate: Mutex<Option<RuntimeGate>>,
 }
 
 impl LiveRuntimeState {
@@ -114,11 +126,48 @@ impl LiveRuntimeState {
             dirty_version: AtomicU64::new(0),
             flush_scheduled: AtomicBool::new(false),
             coalesced_persistence_disabled: AtomicBool::new(false),
-            started_published: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             persist_lock: Mutex::new(()),
             publication_lock: Mutex::new(()),
+            projector_gate: Mutex::new(None),
+            publication_gate: Mutex::new(None),
         }
+    }
+
+    async fn honor_gate(slot: &Mutex<Option<RuntimeGate>>) {
+        let gate = slot.lock().await.take();
+        if let Some(mut gate) = gate {
+            if let Some(tx) = gate.entered.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = gate.release.take() {
+                let _ = rx.await;
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn install_projector_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.projector_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn install_publication_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.publication_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
     }
 }
 
@@ -3200,45 +3249,6 @@ impl DelegationBroker {
         // report a real `duration_ms`.
         let started_at = Instant::now();
 
-        // --- Mark the parent's tool call as in-flight -------------------------
-        // The frontend's DelegationContext seeds its `parent_tool_use_id`-keyed
-        // binding map from this meta on snapshot replay, so a page refresh
-        // mid-delegation can reconstruct the child connection / conversation
-        // ids without depending on the live `delegation_started` event having
-        // been received.
-        self.write_meta_if_real(
-            &req.parent_connection_id,
-            &req.parent_tool_use_id,
-            build_delegation_meta(
-                "running",
-                Some(&child_connection_id),
-                Some(child_conversation_id),
-                None,
-                None,
-                // No meaningful elapsed yet — the child just started.
-                None,
-            ),
-        )
-        .await;
-        runtime
-            .started_published
-            .store(true, Ordering::Release);
-
-        // Announce the live delegation on the PARENT's event stream so the
-        // frontend `DelegationContext` binds the child inline and attaches its
-        // live sub-thread. Symmetric with the terminal `emit_completed_if_real`,
-        // and — unlike the removed child-stream emit in `send_prompt_linked` —
-        // delivered on a stream the parent is already attached to in web/server
-        // mode, carrying the real `parent_connection_id`.
-        self.emit_started_if_real(
-            &req.parent_connection_id,
-            &req.parent_tool_use_id,
-            &child_connection_id,
-            child_conversation_id,
-            req.agent_type,
-        )
-        .await;
-
         // --- Register pending, or resolve a terminal that beat us -------------
         // Under a single lock, decide this delegation's fate atomically against
         // everything a concurrent resolver may have recorded while we were
@@ -3388,9 +3398,46 @@ impl DelegationBroker {
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
             }
-            // Registered in `running` — fall through to the second pre-cancel
-            // check, then return the ack.
-            Disposition::Running => {}
+            // Registered in `running` — publish start under the same
+            // publication_lock / terminal protocol as terminal settlement, then
+            // fall through to the second pre-cancel check and return the ack.
+            Disposition::Running => {
+                // Dual-lock protocol: hold publication_lock for running meta +
+                // DelegationStarted; if a child terminal already won and set
+                // `terminal=true`, suppress start publication so it cannot land
+                // after terminal state. If start owns the lock first, it may
+                // finish; terminal publication waits and runs afterward.
+                let _publication = runtime.publication_lock.lock().await;
+                LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
+                if !runtime.terminal.load(Ordering::Acquire) {
+                    // Mark the parent's tool call as in-flight so the frontend
+                    // DelegationContext can rebind child ids on snapshot replay.
+                    self.write_meta_if_real(
+                        &req.parent_connection_id,
+                        &req.parent_tool_use_id,
+                        build_delegation_meta(
+                            "running",
+                            Some(&child_connection_id),
+                            Some(child_conversation_id),
+                            None,
+                            None,
+                            // No meaningful elapsed yet — the child just started.
+                            None,
+                        ),
+                    )
+                    .await;
+                    // Announce on the PARENT stream (symmetric with terminal
+                    // emit_completed_if_real).
+                    self.emit_started_if_real(
+                        &req.parent_connection_id,
+                        &req.parent_tool_use_id,
+                        &child_connection_id,
+                        child_conversation_id,
+                        req.agent_type,
+                    )
+                    .await;
+                }
+            }
         }
 
         // Second pre-cancel check: a `notifications/cancelled` may have landed
@@ -3502,6 +3549,7 @@ impl DelegationBroker {
                     if let Some(runtime) = ctx.runtime.as_ref() {
                         runtime.terminal.store(true, Ordering::Release);
                         let _publication = runtime.publication_lock.lock().await;
+                        LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
                         let _ = self
                             .close_task_attention(task_id, ctx.attention_resolution)
                             .await;
@@ -3615,6 +3663,7 @@ impl DelegationBroker {
                 if let Some(runtime) = ctx.runtime.as_ref() {
                     runtime.terminal.store(true, Ordering::Release);
                     let _publication = runtime.publication_lock.lock().await;
+                    LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
                     let _ = self
                         .flush_terminal_runtime(task_id, runtime, finished_at)
                         .await;
@@ -3776,6 +3825,10 @@ impl DelegationBroker {
             if identity.runtime.terminal.load(Ordering::Acquire) {
                 return;
             }
+            // Test gate: hold projector after the terminal re-check so a
+            // concurrent terminal flush waits on this lock while the event still
+            // owns the right to apply.
+            LiveRuntimeState::honor_gate(&identity.runtime.projector_gate).await;
             projector.apply(event)
         };
         if !changed {
@@ -6632,6 +6685,295 @@ mod tests {
                 .any(|c| c == "child-conn"),
             "child teardown must run"
         );
+    }
+
+    #[tokio::test]
+    async fn projector_lock_race_event_before_terminal_contributes_after_is_ignored() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        let runtime = broker
+            .coordination_for_test("child-conn")
+            .await
+            .expect("coordination identity")
+            .runtime;
+
+        // --- Event wins projector lock before terminal ---
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .install_projector_gate(entered_tx, release_rx)
+            .await;
+
+        let project = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .project_child_tool_event(
+                        "child-conn",
+                        &tool_call("tc-before", "read", "Read"),
+                    )
+                    .await;
+            }
+        });
+        entered_rx.await.expect("event should hold projector");
+
+        // Terminal sets terminal=true then waits on projector (held by event).
+        let settle = tokio::spawn({
+            let broker = broker.clone();
+            let task_id = task_id.clone();
+            async move {
+                broker
+                    .complete_call(&task_id, completed_outcome("race-done"))
+                    .await;
+            }
+        });
+        // Give terminal a chance to set the flag and block on projector.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            runtime.terminal.load(Ordering::Acquire),
+            "terminal must have set the flag while event holds projector"
+        );
+
+        // Event applies while holding the lock; terminal flush includes it.
+        release_tx.send(()).unwrap();
+        project.await.unwrap();
+        settle.await.unwrap();
+
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert_eq!(
+            stats.tool_call_count, 1,
+            "event that held projector before terminal must contribute"
+        );
+        assert!(stats.finished_at.is_some());
+
+        // --- Event after terminal=true is ignored (fresh task) ---
+        let task_id2 = spawn_running(&broker, &spawner, "parent", 11, "child-conn-2").await;
+        broker
+            .complete_call(&task_id2, completed_outcome("already-done"))
+            .await;
+        let writes_before = store.runtime_write_count(&task_id2).await;
+        broker
+            .project_child_tool_event("child-conn-2", &tool_call("tc-after", "edit", "Edit"))
+            .await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.runtime_write_count(&task_id2).await,
+            writes_before,
+            "post-terminal event must not dirty / re-persist runtime"
+        );
+        let stats2 = store.latest_runtime(&task_id2).await.unwrap();
+        assert_eq!(
+            stats2.tool_call_count, 0,
+            "event after terminal=true must not mutate final snapshot"
+        );
+        assert_eq!(stats2.edit_tool_call_count, 0);
+    }
+
+    #[tokio::test]
+    async fn start_publication_suppresses_when_terminal_holds_publication_lock() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Ok(accepted(22, dt("2026-07-17T12:00:00Z"))))
+            .await;
+        let send_release = spawner.install_send_gate().await;
+        let store = Arc::new(MockTaskStore::accept_any_running_loadable(22));
+        let meta = Arc::new(MockMetaWriter::new());
+        let events = Arc::new(MockEventEmitter::new());
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            meta.clone() as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>);
+        enable_delegation(&broker).await;
+
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+        let runtime = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .runtime;
+        let task_id = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .task_id;
+
+        // Pin start inside publication_lock after Running registration.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .install_publication_gate(entered_tx, release_rx)
+            .await;
+        send_release.send(()).unwrap();
+        entered_rx
+            .await
+            .expect("start should hold publication_lock");
+
+        // Terminal wins the flag while start holds the publication lock, then
+        // blocks on the same lock. On release, start must suppress.
+        let settle = tokio::spawn({
+            let broker = broker.clone();
+            let task_id = task_id.clone();
+            async move {
+                broker
+                    .complete_call(&task_id, completed_outcome("terminal-first"))
+                    .await;
+            }
+        });
+        for _ in 0..20 {
+            if runtime.terminal.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            runtime.terminal.load(Ordering::Acquire),
+            "terminal must set the flag while start holds publication_lock"
+        );
+        assert_eq!(
+            events.started_count().await,
+            0,
+            "DelegationStarted must not publish while gated"
+        );
+
+        release_tx.send(()).unwrap();
+        let report = start.await.unwrap();
+        settle.await.unwrap();
+
+        // Running ack or setup-window terminal report are both fine; start
+        // publication must stay suppressed.
+        assert_eq!(events.started_count().await, 0);
+        let metas = meta.snapshot().await;
+        assert!(
+            metas.iter().all(|m| {
+                m.meta
+                    .get("codeg.delegation")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|s| s.as_str())
+                    != Some("running")
+            }),
+            "running meta must not publish after terminal won"
+        );
+        // Terminal settlement still completes.
+        assert_eq!(
+            store.load(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        let _ = report;
+    }
+
+    #[tokio::test]
+    async fn start_publication_completes_before_terminal_when_start_owns_lock() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Ok(accepted(22, dt("2026-07-17T12:30:00Z"))))
+            .await;
+        let send_release = spawner.install_send_gate().await;
+        let store = Arc::new(MockTaskStore::accept_any_running_loadable(22));
+        let meta = Arc::new(MockMetaWriter::new());
+        let events = Arc::new(MockEventEmitter::new());
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            meta.clone() as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>);
+        enable_delegation(&broker).await;
+
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+        let runtime = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .runtime;
+        let task_id = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .task_id;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .install_publication_gate(entered_tx, release_rx)
+            .await;
+        send_release.send(()).unwrap();
+        entered_rx
+            .await
+            .expect("start should hold publication_lock");
+
+        // Start still holds the lock with terminal=false — release lets start
+        // finish publication, then a subsequent terminal must run after.
+        release_tx.send(()).unwrap();
+        let report = start.await.unwrap();
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_eq!(events.started_count().await, 1);
+        assert!(
+            meta.snapshot().await.iter().any(|m| {
+                m.meta
+                    .get("codeg.delegation")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|s| s.as_str())
+                    == Some("running")
+            }),
+            "start must publish running meta when it owns the lock first"
+        );
+
+        broker
+            .complete_call(&task_id, completed_outcome("after-start"))
+            .await;
+        assert_eq!(
+            store.load(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        // Terminal event is a separate completed emit; started remains 1.
+        assert_eq!(events.started_count().await, 1);
+        assert_eq!(events.count().await, 1);
     }
 
     // -- Task 7: join-only parent-turn ownership + stable cascade codes ----
@@ -10580,10 +10922,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
 
-        // `started` fires during setup, BEFORE the task parks — so it is already
-        // recorded by the time a pending entry is visible, and it must not be
-        // conflated with the (not-yet-emitted) terminal.
-        let started = emitter.started_snapshot().await;
+        // `started` fires after Running registration under publication_lock,
+        // before handle_request parks. A pending entry can appear slightly
+        // before the emit finishes, so wait for the start event.
+        let started = loop {
+            let snap = emitter.started_snapshot().await;
+            if !snap.is_empty() {
+                break snap;
+            }
+            tokio::task::yield_now().await;
+        };
         assert_eq!(started.len(), 1, "exactly one DelegationStarted per task");
         let s = &started[0];
         assert_eq!(s.parent_connection_id, "parent-conn");
