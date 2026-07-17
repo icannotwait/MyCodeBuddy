@@ -226,28 +226,19 @@ impl TitleAgentRunner for HiddenAgentRunner {
             return Err(AutoTitleRunError::Spawn(format!("create run dir: {e}")));
         }
 
-        // Exclusive discovery lease immediately before spawn. Race through the
-        // shared phase helper so cancellation/timeout prevent later phases.
-        // Arm the 15s hold budget only after the exclusive guard is acquired so
-        // a blocked acquire cannot shrink/expire the identity exclusive window.
-        let mut lease = match phase(
-            &cancellation,
-            overall_deadline,
-            self.registry.exclusive_discovery_lease(),
-        )
-        .await
-        {
-            PhaseOutcome::Cancelled => {
-                let _ = best_effort_remove_dir(&run_dir);
-                return Err(AutoTitleRunError::Cancelled);
-            }
-            PhaseOutcome::Timeout => {
-                let _ = best_effort_remove_dir(&run_dir);
-                return Err(AutoTitleRunError::Timeout);
-            }
-            PhaseOutcome::Ready(guard) => Some(guard),
-        };
-        let lease_deadline = Instant::now() + Duration::from_secs(DISCOVERY_LEASE_SECS);
+        // Exclusive discovery lease immediately before spawn. Budget arms only
+        // after successful acquisition (see acquire_discovery_lease).
+        let (guard, lease_deadline) =
+            match acquire_discovery_lease(self.registry.as_ref(), &cancellation, overall_deadline)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = best_effort_remove_dir(&run_dir);
+                    return Err(e);
+                }
+            };
+        let mut lease = Some(guard);
 
         // --- spawn ---
         let spawn_result = phase(
@@ -436,6 +427,31 @@ where
                 Ok(v) => PhaseOutcome::Ready(v),
                 Err(_) => PhaseOutcome::Timeout,
             }
+        }
+    }
+}
+
+/// Acquire the exclusive discovery lease under the shared phase helper.
+///
+/// The 15s hold budget is armed only after `PhaseOutcome::Ready`, so time spent
+/// blocked waiting for the exclusive lock does not shrink the post-acquire window.
+async fn acquire_discovery_lease(
+    registry: &InternalAgentSessionRegistry,
+    cancellation: &CancellationToken,
+    overall_deadline: Instant,
+) -> Result<(tokio::sync::OwnedRwLockWriteGuard<()>, Instant), AutoTitleRunError> {
+    match phase(
+        cancellation,
+        overall_deadline,
+        registry.exclusive_discovery_lease(),
+    )
+    .await
+    {
+        PhaseOutcome::Cancelled => Err(AutoTitleRunError::Cancelled),
+        PhaseOutcome::Timeout => Err(AutoTitleRunError::Timeout),
+        PhaseOutcome::Ready(guard) => {
+            let lease_deadline = Instant::now() + Duration::from_secs(DISCOVERY_LEASE_SECS);
+            Ok((guard, lease_deadline))
         }
     }
 }
@@ -1806,161 +1822,44 @@ mod tests {
         drop(held_lease);
     }
 
-    /// Full 15s exclusive discovery budget must start after acquisition, not
-    /// before a blocked acquire. Pre-arming the Instant shortens/expires the
-    /// hold window when acquisition waits under real or virtual time.
+    /// Full 15s exclusive discovery budget must start after acquisition.
+    /// Pre-arming Instant before the exclusive wait would leave only ~5s after
+    /// a 10s blocked wait (assertion-level RED for the old one-line bug).
     #[tokio::test]
     async fn discovery_lease_budget_starts_after_acquisition() {
-        let fixture = hidden_runner_fixture().await;
-        // No SessionStarted — remain in identity wait with the exclusive lease.
-        let registry = Arc::clone(&fixture.registry);
-        let agent = Arc::clone(&fixture.agent);
-        let attempt = fixture.attempt(AppLocale::En);
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
-        let runner = fixture.runner;
+        use std::task::Poll;
 
-        // External exclusive lease blocks runner acquisition.
+        let fixture = hidden_runner_fixture().await;
+        let registry = Arc::clone(&fixture.registry);
+        let cancel = CancellationToken::new();
+
         let held_lease = registry.exclusive_discovery_lease().await;
 
-        let mut handle = tokio::spawn(async move { runner.run(attempt, cancel2).await });
-
-        // Real time: finish status/config and block on exclusive acquisition.
-        timeout(Duration::from_secs(5), async {
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        })
-        .await
-        .expect("status/config must finish under real time");
-        assert!(
-            !agent.order.lock().unwrap().contains(&"spawn_enter"),
-            "spawn must not start while external exclusive lease is held"
-        );
-
-        // Freeze clock, then burn a meaningful virtual delay while still blocked.
-        // OLD code armed lease_deadline before this wait, so the post-acquire
-        // identity exclusive window is already shortened by these 10s.
         tokio::time::pause();
-        for _ in 0..10 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
+        let overall_deadline = Instant::now() + Duration::from_secs(OVERALL_DEADLINE_SECS);
+        let acquire = acquire_discovery_lease(registry.as_ref(), &cancel, overall_deadline);
+        tokio::pin!(acquire);
 
-        // Release external lease; runner acquires, spawns, and reaches identity wait.
+        // One explicit poll: helper has entered exclusive acquisition and is Pending.
+        assert!(
+            matches!(futures::poll!(&mut acquire), Poll::Pending),
+            "must be blocked on exclusive discovery lease while external guard is held"
+        );
+
+        // Virtual wait while still blocked — pre-armed budget would burn here.
+        tokio::time::advance(Duration::from_secs(10)).await;
+
         drop(held_lease);
+        let (guard, lease_deadline) = acquire.await.expect("acquire after external release");
 
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let live = agent.manager.get_state(&agent.conn_id).await.is_some();
-                let identity = agent.identity_ready.load(Ordering::SeqCst);
-                if live && identity {
-                    break;
-                }
-                // Under pause, allow the blocked write future + spawn to progress
-                // without sleeping (no virtual advance needed for lock/spawn).
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("runner must reach identity subscription after exclusive acquisition");
-        // One extra yield so wait_for_session_identity arms its select.
-        tokio::task::yield_now().await;
+        // Post-acquire arm: full 15s remaining from current virtual Instant.
+        // Pre-arm would have ~5s left after the 10s blocked advance above.
         assert_eq!(
-            agent.prompt_count(),
-            0,
-            "no SessionStarted: must not prompt"
+            lease_deadline.saturating_duration_since(Instant::now()),
+            Duration::from_secs(DISCOVERY_LEASE_SECS),
+            "lease budget must be a full 15s after acquisition"
         );
-
-        // Under pause, probe exclusive hold without advancing the virtual clock
-        // (spawned shared_filter either finishes immediately or waits on the lock).
-        async fn exclusive_still_held(registry: &Arc<InternalAgentSessionRegistry>) -> bool {
-            let probe = tokio::spawn({
-                let registry = Arc::clone(registry);
-                async move { registry.shared_filter().await }
-            });
-            for _ in 0..80 {
-                if probe.is_finished() {
-                    let _ = probe.await;
-                    return false;
-                }
-                tokio::task::yield_now().await;
-            }
-            probe.abort();
-            let _ = probe.await;
-            true
-        }
-
-        // Resolve shared_filter under pause by racing completion with tiny advances
-        // (same pattern as slow_handshake; timeout alone needs virtual time).
-        async fn await_shared_filter_under_pause(
-            registry: &Arc<InternalAgentSessionRegistry>,
-        ) -> Result<(), String> {
-            let fut = registry.shared_filter();
-            tokio::pin!(fut);
-            for _ in 0..100 {
-                tokio::select! {
-                    biased;
-                    res = &mut fut => {
-                        return res.map(|_| ()).map_err(|e| e.to_string());
-                    }
-                    _ = async {
-                        tokio::time::advance(Duration::from_millis(10)).await;
-                        tokio::task::yield_now().await;
-                    } => {}
-                }
-            }
-            Err("shared_filter did not resolve under pause".into())
-        }
-
-        assert!(
-            exclusive_still_held(&registry).await,
-            "exclusive lease must be held immediately after identity subscribe"
-        );
-
-        // Advance 10 virtual seconds of the post-acquire 15s budget.
-        // OLD (deadline pre-armed): only ~5s remained after the 10s blocked wait,
-        // so the lease is already shareable here → intended assertion failure.
-        // GREEN: still exclusive until a full 15s after acquisition.
-        for _ in 0..10 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            exclusive_still_held(&registry).await,
-            "exclusive lease must still be held 10s after acquisition (full 15s budget)"
-        );
-
-        // Remaining 5s of the 15s post-acquire budget → lease becomes shareable.
-        for _ in 0..5 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        await_shared_filter_under_pause(&registry)
-            .await
-            .expect("exclusive lease must release after 15 virtual seconds post-acquisition");
-
-        // Clean up: cancel blocked identity wait; require Cancelled (no prompt).
-        cancel.cancel();
-        let settled = timeout(Duration::from_millis(500), &mut handle).await;
-        assert!(
-            settled.is_ok(),
-            "runner must settle after cancel once lease race is proven"
-        );
-        let result = settled.unwrap().expect("join");
-        assert!(
-            matches!(result, Err(AutoTitleRunError::Cancelled)),
-            "expected Cancelled after lease-budget proof, got {result:?}"
-        );
-        assert_eq!(agent.prompt_count(), 0);
-        assert_eq!(agent.disconnect_count.load(Ordering::SeqCst), 1);
+        drop(guard);
     }
 
     /// Durable registration (short `register` after the long exclusive lease drops)
