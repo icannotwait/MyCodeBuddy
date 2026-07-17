@@ -986,7 +986,7 @@
       "remoteUnavailable": "{versionText}。遠端版本暫不可用。",
       "latest": "{versionText}。已是最新版本。",
       "bundled": "內建版本：{version}",
-      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 MyCodeBuddy。"
+      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 DrawCode。"
     },
     "cline": {
       "configDescription": "配置 Cline API 提供商和憑證。設定將儲存到 ~/.cline/data/。"
@@ -1097,8 +1097,8 @@
     "loadFailed": "載入失敗：{message}"
   },
   "LoginPage": {
-    "documentTitle": "登入 - codeg",
-    "brand": "Codeg",
+    "documentTitle": "登入 - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "輸入存取 Token 以連接到桌面端",
     "tokenPlaceholder": "Access Token",
     "connect": "連接",
@@ -2071,6 +2071,9 @@
         "connectFailedTitle": "{agent} 連線失敗",
         "toolFallbackTitle": "工具",
         "eventErrorTitle": "Agent 錯誤",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} 已完成回應",
         "notificationError": "{agent} 錯誤：{message}",
         "claudeApiRetry": {
@@ -2806,11 +2809,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "切換只會改變這裡顯示與開啟的位址；服務會監聽所有網路介面，每個位址都可存取。",
     "sectionTitle": "Web 服務",
-    "sectionDescription": "啟用後可透過瀏覽器遠端存取 Codeg",
+    "sectionDescription": "啟用後可透過瀏覽器遠端存取 DrawCode",
     "port": "連接埠",
     "status": "狀態",
     "autoStart": "自動啟動",
-    "autoStartHint": "Codeg 啟動時自動開啟 Web 服務",
+    "autoStartHint": "DrawCode 啟動時自動開啟 Web 服務",
     "running": "執行中",
     "stopped": "已停止",
     "processing": "處理中...",
@@ -2825,7 +2828,7 @@
     "copy": "複製",
     "qrcode": "QR 碼",
     "qrcodeTitle": "掃碼開啟",
-    "qrcodeHint": "用手機掃描，在瀏覽器中開啟 Codeg",
+    "qrcodeHint": "用手機掃描，在瀏覽器中開啟 DrawCode",
     "addressLabel": "存取位址",
     "tokenLabel": "存取 Token",
     "tokenHint": "Web 用戶端首次存取時需輸入此 Token",
@@ -2833,7 +2836,7 @@
     "regenerate": "重新產生",
     "stalePortOccupiedTitle": "連接埠 {port} 已被其他行程佔用",
     "stalePortUnknownTitle": "連接埠 {port} 狀態不明",
-    "stalePortHint": "在連接埠釋放前 Codeg 無法繫結。可以更換上方的連接埠，或結束佔用該連接埠的行程。",
+    "stalePortHint": "在連接埠釋放前 DrawCode 無法繫結。可以更換上方的連接埠，或結束佔用該連接埠的行程。",
     "errors": {
       "alreadyRunning": "Web 服務已在執行",
       "invalidAddress": "主機或連接埠格式無效",
@@ -3133,7 +3136,7 @@
   },
   "ScienceSettings": {
     "title": "科學研究技能",
-    "description": "為你的 AI 編碼智能體啟用精選的科學研究技能：假設生成、實驗設計、統計、視覺化、批判性評估與文獻檢索。MyCodeBuddy 管理中央副本，並將每個技能連結到你選擇的智能體。",
+    "description": "為你的 AI 編碼智能體啟用精選的科學研究技能：假設生成、實驗設計、統計、視覺化、批判性評估與文獻檢索。DrawCode 管理中央副本，並將每個技能連結到你選擇的智能體。",
     "loading": "正在載入科學研究技能…",
     "emptySkills": "沒有可用的科學研究技能。請檢查應用程式日誌。",
     "searchPlaceholder": "依名稱、ID 或描述搜尋科學研究技能",

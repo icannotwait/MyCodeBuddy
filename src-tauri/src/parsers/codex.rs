@@ -426,6 +426,149 @@ fn value_to_preview(value: Option<&serde_json::Value>) -> Option<String> {
     serde_json::to_string(v).ok()
 }
 
+/// Codeg MCP tools that own dedicated cards in the parent timeline. Codex
+/// records them as `event_msg.mcp_tool_call_end` (with the real tool name) and
+/// often also as a shadow `custom_tool_call` named `exec` / `wait` whose call_id
+/// does **not** match — history must reconstruct from the MCP event, then drop
+/// the shadow so the user does not see a raw "exec" shell card instead of a
+/// sub-agent / status card.
+fn is_codeg_mcp_history_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "delegate_to_agent" | "get_delegation_status" | "cancel_delegation"
+    )
+}
+
+/// Whether a model-facing tool name is a known Codex-side shadow for MCP
+/// execute/wait (paired with `mcp_tool_call_end` in the same turn).
+fn is_mcp_shadow_tool_name(name: &str) -> bool {
+    matches!(name, "exec" | "wait")
+}
+
+/// Pull CallToolResult body out of Codex's `{ "Ok": {...} } | { "Err": ... }`
+/// envelope. Returns `(body, is_error)`.
+fn extract_mcp_call_tool_result(result: &serde_json::Value) -> (serde_json::Value, bool) {
+    if let Some(ok) = result.get("Ok") {
+        let is_error = ok
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return (ok.clone(), is_error);
+    }
+    if let Some(err) = result.get("Err") {
+        let text = if let Some(s) = err.as_str() {
+            s.to_string()
+        } else {
+            err.to_string()
+        };
+        return (
+            serde_json::json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": true,
+            }),
+            true,
+        );
+    }
+    // Already a bare CallToolResult (or unknown shape) — pass through.
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    (result.clone(), is_error)
+}
+
+/// Build `meta["codeg.delegation"]` for a history `delegate_to_agent` tool use
+/// so the card can rebind child conversation id without a live binding.
+fn delegation_meta_from_structured(
+    structured: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let sc = structured?.as_object()?;
+    let status = sc.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let wire_status = match status {
+        "completed" | "ok" => "completed",
+        "failed" | "err" | "canceled" | "cancelled" => "failed",
+        "pending" => "pending",
+        _ => "running",
+    };
+    let mut inner = serde_json::Map::new();
+    inner.insert(
+        "status".into(),
+        serde_json::Value::String(wire_status.into()),
+    );
+    if let Some(id) = sc.get("child_conversation_id").and_then(|v| v.as_i64()) {
+        inner.insert(
+            "child_conversation_id".into(),
+            serde_json::Value::Number(id.into()),
+        );
+    }
+    if let Some(cid) = sc.get("child_connection_id").and_then(|v| v.as_str()) {
+        inner.insert(
+            "child_connection_id".into(),
+            serde_json::Value::String(cid.into()),
+        );
+    }
+    if let Some(code) = sc.get("error_code").and_then(|v| v.as_str()) {
+        inner.insert("error_code".into(), serde_json::Value::String(code.into()));
+    }
+    Some(serde_json::json!({ "codeg.delegation": inner }))
+}
+
+/// Patch a previously-emitted `delegate_to_agent` tool use/result when a later
+/// `get_delegation_status` reports a terminal (or updated) task state for the
+/// same `task_id` — history would otherwise freeze every card on the launch ack.
+fn patch_delegation_blocks_for_task(
+    messages: &mut [UnifiedMessage],
+    tool_use_id: &str,
+    task_report: &serde_json::Value,
+) {
+    let status = task_report
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
+    let is_error = matches!(
+        status,
+        "failed" | "err" | "canceled" | "cancelled"
+    );
+    let message = task_report
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| task_report.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let output_body = serde_json::json!({
+        "content": [{ "type": "text", "text": message }],
+        "structuredContent": task_report,
+        "isError": is_error,
+    });
+    let output_preview = serde_json::to_string(&output_body).ok();
+    let meta = delegation_meta_from_structured(Some(task_report));
+
+    for msg in messages.iter_mut().rev() {
+        for block in msg.content.iter_mut() {
+            match block {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    meta: block_meta,
+                    ..
+                } if id == tool_use_id => {
+                    if meta.is_some() {
+                        *block_meta = meta.clone();
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview: out,
+                    is_error: err_flag,
+                    ..
+                } if id == tool_use_id => {
+                    *out = output_preview.clone();
+                    *err_flag = is_error;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn is_failed_status(status: &str) -> bool {
     let status = status.trim();
     status.eq_ignore_ascii_case("error")
@@ -937,6 +1080,19 @@ impl CodexParser {
         // and as `response_item.image_generation_call`, sharing the same call_id/id.
         // Emit at most one ContentBlock::Image per id to avoid duplicate display.
         let mut emitted_image_ids: HashSet<String> = HashSet::new();
+        // Shadow `exec`/`wait` custom_tool_calls that wrap codeg-mcp tools: buffer
+        // until output (or suppress when an MCP end for the real tool arrives in
+        // between). Keyed by model call_id (`call_…`), not the MCP `exec-…` id.
+        let mut buffered_shadow_tools: HashMap<
+            String,
+            (String, Option<String>, DateTime<Utc>),
+        > = HashMap::new();
+        // Open shadow call_ids in open order — most recent is suppressed when MCP ends.
+        let mut open_shadow_call_ids: Vec<String> = Vec::new();
+        let mut suppressed_shadow_call_ids: HashSet<String> = HashSet::new();
+        // `task_id` → parent `delegate_to_agent` tool_use_id so later status polls
+        // can refresh the card past the launch ack.
+        let mut task_id_to_delegate_tool_use: HashMap<String, String> = HashMap::new();
         // Streaming reasoning buffer. Codex emits one `event_msg.agent_reasoning`
         // per reasoning section, then groups the same sections into a single
         // `response_item.reasoning.summary`. We buffer the per-section events and
@@ -1352,6 +1508,130 @@ impl CodexParser {
                                     }
                                 }
                             }
+                            "mcp_tool_call_end" => {
+                                // Reconstruct Codeg MCP tools (delegate_to_agent, …)
+                                // that Codex only records here — not as custom_tool_call
+                                // with the real tool name (shadow is often `exec`/`wait`).
+                                let invocation = payload.get("invocation");
+                                let tool_name = invocation
+                                    .and_then(|i| i.get("tool"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
+                                if !is_codeg_mcp_history_tool(tool_name) {
+                                    continue;
+                                }
+
+                                let mcp_call_id = payload
+                                    .get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| {
+                                        format!("mcp-{}-{}", tool_name, messages.len())
+                                    });
+
+                                // Suppress the nearest open model-facing shadow call
+                                // (`exec`/`wait`) so it does not also render.
+                                if let Some(shadow_id) = open_shadow_call_ids.pop() {
+                                    suppressed_shadow_call_ids.insert(shadow_id.clone());
+                                    buffered_shadow_tools.remove(&shadow_id);
+                                }
+
+                                let args = invocation.and_then(|i| i.get("arguments")).cloned();
+                                let input_preview = args.as_ref().and_then(|a| {
+                                    if a.is_null() {
+                                        None
+                                    } else {
+                                        serde_json::to_string(a).ok()
+                                    }
+                                });
+
+                                let result_val = payload
+                                    .get("result")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let (call_tool_result, is_error) =
+                                    extract_mcp_call_tool_result(&result_val);
+                                let structured = call_tool_result.get("structuredContent").cloned();
+                                let output_preview =
+                                    serde_json::to_string(&call_tool_result).ok();
+
+                                let meta = if tool_name == "delegate_to_agent" {
+                                    delegation_meta_from_structured(structured.as_ref())
+                                } else {
+                                    None
+                                };
+
+                                if tool_name == "delegate_to_agent" {
+                                    if let Some(task_id) = structured
+                                        .as_ref()
+                                        .and_then(|sc| sc.get("task_id"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        task_id_to_delegate_tool_use
+                                            .insert(task_id.to_string(), mcp_call_id.clone());
+                                    }
+                                }
+
+                                // Refresh parent delegate cards when status polls
+                                // carry a newer task report for a known task_id.
+                                if tool_name == "get_delegation_status" {
+                                    if let Some(tasks) = structured
+                                        .as_ref()
+                                        .and_then(|sc| sc.get("tasks"))
+                                        .and_then(|t| t.as_array())
+                                    {
+                                        for task in tasks {
+                                            let Some(tid) =
+                                                task.get("task_id").and_then(|v| v.as_str())
+                                            else {
+                                                continue;
+                                            };
+                                            if let Some(parent_id) =
+                                                task_id_to_delegate_tool_use.get(tid)
+                                            {
+                                                patch_delegation_blocks_for_task(
+                                                    &mut messages,
+                                                    parent_id,
+                                                    task,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                messages.push(UnifiedMessage {
+                                    id: format!("tool-{}", messages.len()),
+                                    role: MessageRole::Assistant,
+                                    content: vec![ContentBlock::ToolUse {
+                                        tool_use_id: Some(mcp_call_id.clone()),
+                                        tool_name: tool_name.to_string(),
+                                        input_preview,
+                                        meta,
+                                    }],
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: Some(timestamp),
+                                });
+                                messages.push(UnifiedMessage {
+                                    id: format!("tool-result-{}", messages.len()),
+                                    role: MessageRole::Tool,
+                                    content: vec![ContentBlock::ToolResult {
+                                        tool_use_id: Some(mcp_call_id),
+                                        output_preview,
+                                        is_error,
+                                        agent_stats: None,
+                                        images: Vec::new(),
+                                    }],
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: Some(timestamp),
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -1522,6 +1802,23 @@ impl CodexParser {
                                                     .or_else(|| payload.get("input")),
                                             )
                                         };
+                                        // Buffer Codex MCP shadows (`exec`/`wait`) until
+                                        // output: if an `mcp_tool_call_end` for a codeg
+                                        // tool arrives first, the shadow is suppressed.
+                                        if is_mcp_shadow_tool_name(raw_tool_name) {
+                                            if let Some(ref id) = tool_use_id {
+                                                buffered_shadow_tools.insert(
+                                                    id.clone(),
+                                                    (
+                                                        raw_tool_name.to_string(),
+                                                        input_preview,
+                                                        timestamp,
+                                                    ),
+                                                );
+                                                open_shadow_call_ids.push(id.clone());
+                                            }
+                                            continue;
+                                        }
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
@@ -1547,6 +1844,38 @@ impl CodexParser {
                                     .or_else(|| payload.get("id"))
                                     .and_then(|id| id.as_str())
                                     .map(|s| s.to_string());
+
+                                // Drop MCP shadow pairs already covered by
+                                // `mcp_tool_call_end` (delegate_to_agent cards).
+                                if let Some(ref id) = tool_use_id {
+                                    open_shadow_call_ids.retain(|x| x != id);
+                                    if suppressed_shadow_call_ids.remove(id) {
+                                        buffered_shadow_tools.remove(id);
+                                        continue;
+                                    }
+                                    if let Some((shadow_name, input_preview, call_ts)) =
+                                        buffered_shadow_tools.remove(id)
+                                    {
+                                        // Real exec/wait (no MCP reconstruction) —
+                                        // emit the buffered ToolUse, then fall through
+                                        // to normal ToolResult handling below.
+                                        messages.push(UnifiedMessage {
+                                            id: format!("tool-{}", messages.len()),
+                                            role: MessageRole::Assistant,
+                                            content: vec![ContentBlock::ToolUse {
+                                                tool_use_id: Some(id.clone()),
+                                                tool_name: shadow_name,
+                                                input_preview,
+                                                meta: None,
+                                            }],
+                                            timestamp: call_ts,
+                                            usage: None,
+                                            duration_ms: None,
+                                            model: None,
+                                            completed_at: Some(call_ts),
+                                        });
+                                    }
+                                }
 
                                 let is_spawn = tool_use_id
                                     .as_ref()
@@ -4407,6 +4736,222 @@ mod tests {
             .expect("spawn_e result block present");
         assert_eq!(output.as_deref(), Some("BOOM_TOKEN"), "errored result kept");
         assert!(is_error, "errored no-wait close → execution capsule failed");
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Codeg MCP `delegate_to_agent` is recorded as `event_msg.mcp_tool_call_end`
+    /// (real tool name + structured ack) while the model-facing call is often a
+    /// shadow `custom_tool_call` named `exec`. History must surface a
+    /// `delegate_to_agent` card (with child id / task meta) and drop the shadow.
+    #[test]
+    fn codeg_mcp_delegate_to_agent_reconstructed_from_mcp_tool_call_end() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-16T10:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"mcp-del","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-16T10:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"run task 1"}]
+                }),
+            ),
+            // Shadow model-facing call (wrong name, different call_id).
+            rollout_line(
+                "2026-07-16T10:00:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_shadow_exec",
+                    "name":"exec",
+                    "input":"const prompt = `implement task 1`",
+                    "status":"completed",
+                }),
+            ),
+            // Real MCP completion with Codeg tool + structured ack.
+            rollout_line(
+                "2026-07-16T10:00:03Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-delegate-1",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"delegate_to_agent",
+                        "arguments":{
+                            "agent_type":"grok",
+                            "task":"implement task 1"
+                        }
+                    },
+                    "duration":{"secs":0,"nanos":1},
+                    "result":{
+                        "Ok":{
+                            "content":[{
+                                "type":"text",
+                                "text":"Delegation successful. task_id=task-abc. Call get_delegation_status…"
+                            }],
+                            "structuredContent":{
+                                "agent_type":"grok",
+                                "child_conversation_id":112,
+                                "message":"Delegation successful. task_id=task-abc.",
+                                "status":"running",
+                                "task_id":"task-abc"
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            rollout_line(
+                "2026-07-16T10:00:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_shadow_exec",
+                    "output":[
+                        {"type":"input_text","text":"Script completed\n"},
+                        {"type":"input_text","text":"Delegation successful. task_id=task-abc."}
+                    ]
+                }),
+            ),
+            // Later status poll upgrades the card past the launch ack.
+            rollout_line(
+                "2026-07-16T10:00:05Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-status-1",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"get_delegation_status",
+                        "arguments":{"task_ids":["task-abc"],"wait_ms":1000}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"{\"tasks\":[…]}"}],
+                            "structuredContent":{
+                                "tasks":[{
+                                    "agent_type":"grok",
+                                    "child_conversation_id":112,
+                                    "message":"All tests pass.",
+                                    "status":"completed",
+                                    "task_id":"task-abc",
+                                    "text":"All tests pass."
+                                }]
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            // Unrelated real shell exec must still appear.
+            rollout_line(
+                "2026-07-16T10:00:06Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_real_shell",
+                    "name":"exec",
+                    "input":"echo hello",
+                    "status":"completed",
+                }),
+            ),
+            rollout_line(
+                "2026-07-16T10:00:07Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_real_shell",
+                    "output":"hello\n"
+                }),
+            ),
+        ];
+
+        let path = write_temp_rollout("mcp-del", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "mcp-del")
+            .expect("parse ok");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+
+        let delegate_uses: Vec<_> = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { tool_name, .. } if tool_name == "delegate_to_agent"
+                )
+            })
+            .collect();
+        assert_eq!(
+            delegate_uses.len(),
+            1,
+            "exactly one delegate_to_agent tool use from mcp_tool_call_end"
+        );
+
+        match delegate_uses[0] {
+            ContentBlock::ToolUse {
+                tool_use_id,
+                input_preview,
+                meta,
+                ..
+            } => {
+                assert_eq!(tool_use_id.as_deref(), Some("exec-mcp-delegate-1"));
+                let input = input_preview.as_deref().expect("input present");
+                assert!(
+                    input.contains("implement task 1") && input.contains("grok"),
+                    "input should carry task + agent_type: {input}"
+                );
+                let meta = meta.as_ref().expect("codeg.delegation meta");
+                let status = meta
+                    .pointer("/codeg.delegation/status")
+                    .and_then(|v| v.as_str());
+                // Status poll should have upgraded running → completed.
+                assert_eq!(status, Some("completed"));
+                let child = meta
+                    .pointer("/codeg.delegation/child_conversation_id")
+                    .and_then(|v| v.as_i64());
+                assert_eq!(child, Some(112));
+            }
+            _ => unreachable!(),
+        }
+
+        // Shadow exec for the MCP call is gone; real shell exec remains.
+        let exec_names: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_name,
+                    tool_use_id: Some(id),
+                    ..
+                } if tool_name == "exec" => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !exec_names.contains(&"call_shadow_exec"),
+            "MCP shadow exec must be suppressed"
+        );
+        assert!(
+            exec_names.contains(&"call_real_shell"),
+            "unrelated shell exec must still render"
+        );
+
+        let status_uses = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { tool_name, .. }
+                        if tool_name == "get_delegation_status"
+                )
+            })
+            .count();
+        assert_eq!(status_uses, 1, "status poll also surfaces as its own card");
 
         let _ = fs::remove_file(path);
     }

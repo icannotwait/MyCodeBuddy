@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{sleep_until, Instant};
 
 use crate::acp::internal_bus::EventBusMetrics;
 use crate::acp::streaming_performance::{
@@ -520,9 +520,7 @@ impl DesktopAcpDelivery {
     ) -> Arc<Self> {
         let flags = flags.normalized();
         if flags.desktop_acp_event_batching {
-            let sink: Arc<dyn DesktopBatchSink> = Arc::new(TauriBatchSink {
-                app: app.clone(),
-            });
+            let sink: Arc<dyn DesktopBatchSink> = Arc::new(TauriBatchSink { app: app.clone() });
             let batcher = Arc::new(DesktopAcpEventBatcher::start(sink, Arc::clone(&metrics)));
             return Arc::new(Self {
                 mode: DesktopDeliveryMode::Batched,
@@ -623,7 +621,11 @@ impl DesktopAcpDelivery {
             DesktopDeliveryMode::Legacy => {
                 #[cfg(feature = "tauri-runtime")]
                 {
-                    emit_legacy(&self.app, envelope.as_ref(), Some(Arc::clone(&self.metrics)));
+                    emit_legacy(
+                        &self.app,
+                        envelope.as_ref(),
+                        Some(Arc::clone(&self.metrics)),
+                    );
                     Ok(())
                 }
                 #[cfg(not(feature = "tauri-runtime"))]
@@ -663,21 +665,18 @@ pub fn emit_legacy(
 ) {
     use tauri::Emitter;
     if let Some(ref m) = metrics {
-        m.desktop_emit_attempt_count
-            .fetch_add(1, Ordering::Relaxed);
+        m.desktop_emit_attempt_count.fetch_add(1, Ordering::Relaxed);
     }
     match app.emit(EVENT_LEGACY, envelope) {
         Ok(()) => {
             if let Some(m) = metrics {
-                m.desktop_legacy_emit_count
-                    .fetch_add(1, Ordering::Relaxed);
+                m.desktop_legacy_emit_count.fetch_add(1, Ordering::Relaxed);
             }
         }
         Err(error) => {
             tracing::error!("[ACP] desktop legacy emit failed: {error}");
             if let Some(m) = metrics {
-                m.desktop_emit_failure_count
-                    .fetch_add(1, Ordering::Relaxed);
+                m.desktop_emit_failure_count.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -693,9 +692,7 @@ struct TauriBatchSink {
 impl DesktopBatchSink for TauriBatchSink {
     async fn emit_batch(&self, batch: &DesktopAcpEventBatch) -> Result<(), String> {
         use tauri::Emitter;
-        self.app
-            .emit(EVENT_BATCH, batch)
-            .map_err(|e| e.to_string())
+        self.app.emit(EVENT_BATCH, batch).map_err(|e| e.to_string())
     }
 
     async fn emit_failure(&self, failure: &DesktopDeliveryFailure) -> Result<(), String> {
@@ -773,10 +770,7 @@ mod tests {
         fn with_sink(sink: RecordingSink) -> Self {
             let sink = Arc::new(sink);
             let metrics = Arc::new(EventBusMetrics::default());
-            let batcher = Arc::new(DesktopAcpEventBatcher::start(
-                sink.clone(),
-                metrics.clone(),
-            ));
+            let batcher = Arc::new(DesktopAcpEventBatcher::start(sink.clone(), metrics.clone()));
             Self {
                 batcher,
                 sink,
@@ -1016,17 +1010,11 @@ mod tests {
     async fn full_queue_applies_backpressure_without_loss() {
         let harness = BatcherHarness::with_blocked_sink();
         for seq in 1..=MAX_BATCH_EVENTS as u64 {
-            harness
-                .enqueue(content_for("c1", seq, 1))
-                .await
-                .unwrap();
+            harness.enqueue(content_for("c1", seq, 1)).await.unwrap();
         }
         harness.wait_until_sink_blocked().await;
         for seq in (MAX_BATCH_EVENTS as u64 + 1)..=(MAX_BATCH_EVENTS + QUEUE_CAPACITY) as u64 {
-            harness
-                .enqueue(content_for("c1", seq, 1))
-                .await
-                .unwrap();
+            harness.enqueue(content_for("c1", seq, 1)).await.unwrap();
         }
         let blocked = tokio::spawn({
             let harness = harness.clone();
@@ -1136,7 +1124,9 @@ mod tests {
                 Arc::new(EventEnvelope {
                     seq: 7,
                     connection_id: "c1".into(),
-                    payload: AcpEvent::ContentDelta { text: "secret".into() },
+                    payload: AcpEvent::ContentDelta {
+                        text: "secret".into(),
+                    },
                 }),
                 1,
             )
@@ -1245,10 +1235,7 @@ mod tests {
             deferred_streaming_rich_content: true,
         };
         // Startup fallback / legacy mode forces batching off and dependents off.
-        let caps = DesktopAcpDelivery::capabilities_for(
-            DesktopDeliveryMode::Legacy,
-            requested,
-        );
+        let caps = DesktopAcpDelivery::capabilities_for(DesktopDeliveryMode::Legacy, requested);
         assert_eq!(caps.mode, DesktopDeliveryMode::Legacy);
         assert!(!caps.flags.desktop_acp_event_batching);
         assert!(!caps.flags.incremental_live_transcript);
@@ -1273,14 +1260,18 @@ mod tests {
     }
 
     #[test]
-    fn from_env_flags_default_complete_path_after_p3() {
+    fn from_env_flags_default_legacy_until_p4_gates() {
         let flags = StreamingPerformanceFlags::from_lookup(|_| None);
         assert_eq!(flags, StreamingPerformanceFlags::phase_default());
-        assert!(flags.desktop_acp_event_batching);
-        assert!(flags.incremental_live_transcript);
-        assert!(flags.deferred_streaming_rich_content);
-        let caps =
-            DesktopAcpDelivery::capabilities_for(DesktopDeliveryMode::Batched, flags);
+        assert_eq!(flags, StreamingPerformanceFlags::legacy());
+        assert!(!flags.desktop_acp_event_batching);
+        // Explicit opt-in still yields batched capabilities.
+        let opted = StreamingPerformanceFlags {
+            desktop_acp_event_batching: true,
+            incremental_live_transcript: true,
+            deferred_streaming_rich_content: true,
+        };
+        let caps = DesktopAcpDelivery::capabilities_for(DesktopDeliveryMode::Batched, opted);
         assert_eq!(caps.mode, DesktopDeliveryMode::Batched);
     }
 }

@@ -98,12 +98,16 @@ function VirtualizedMessageThreadImpl<T>({
     useStickToBottomContext()
   const virtualizerHandleRef = useRef<VirtualizerHandle>(null)
   const footerShellRef = useRef<HTMLDivElement | null>(null)
-  const coordinatorRef = useRef<LiveFooterScrollCoordinator | null>(null)
   const scrollToBottomRef = useRef(scrollToBottom)
   const stopScrollRef = useRef(stopScroll)
   scrollToBottomRef.current = scrollToBottom
   stopScrollRef.current = stopScroll
   const hasFooter = footer != null
+  // Seed follow intent once when footer appears (not on every re-render).
+  const initialFollowRef = useRef(true)
+  if (!hasFooter) {
+    initialFollowRef.current = true
+  }
 
   const scrollToIndex = useCallback<MessageScrollContextValue["scrollToIndex"]>(
     (index, opts) => {
@@ -113,19 +117,19 @@ function VirtualizedMessageThreadImpl<T>({
     []
   )
 
-  // Create during render only (idempotent ref assign) so child layout effects
-  // on the same commit can scheduleFollow. Never dispose during render —
-  // concurrent renders that drop the footer would tear down the committed
-  // coordinator while old listeners still hold it.
-  if (hasFooter && !coordinatorRef.current) {
+  // Render-local coordinator owned by the committed Context value — no shared
+  // ref written during speculative renders. Depend only on `hasFooter` so
+  // isAtBottom churn does not recreate the coordinator every frame.
+  const footerCoordinator = useMemo<LiveFooterScrollCoordinator | null>(() => {
+    if (!hasFooter) return null
     const el = scrollRef.current
     const initiallyFollowing =
       typeof isAtBottom === "boolean"
         ? isAtBottom
         : el
           ? isAtBottomElement(el)
-          : true
-    coordinatorRef.current = createLiveFooterScrollCoordinator({
+          : initialFollowRef.current
+    return createLiveFooterScrollCoordinator({
       scrollToBottom: (opts) => {
         void scrollToBottomRef.current(opts)
       },
@@ -134,44 +138,42 @@ function VirtualizedMessageThreadImpl<T>({
       },
       initiallyFollowing,
     })
-  }
-
-  // Dispose only after commit when the footer is gone (or on unmount).
-  useLayoutEffect(() => {
-    if (hasFooter) return
-    if (coordinatorRef.current) {
-      coordinatorRef.current.dispose()
-      coordinatorRef.current = null
-    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- seed isAtBottom only when footer mounts
   }, [hasFooter])
+
+  // Dispose the committed coordinator when it is replaced or unmounted.
+  useLayoutEffect(() => {
+    return () => {
+      footerCoordinator?.dispose()
+    }
+  }, [footerCoordinator])
 
   // Escape / re-entry listeners on the scroll viewport.
   useEffect(() => {
-    if (!hasFooter) return
-    const coordinator = coordinatorRef.current
+    if (!footerCoordinator) return
     const el = scrollRef.current
-    if (!coordinator || !el) return
+    if (!el) return
 
     const onWheel = () => {
-      coordinator.cancelForUserInput()
+      footerCoordinator.cancelForUserInput()
     }
     const onTouchStart = () => {
-      coordinator.cancelForUserInput()
+      footerCoordinator.cancelForUserInput()
     }
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0 || e.ctrlKey) return
       const target = e.target as HTMLElement | null
       if (target?.closest(SCROLL_FOLLOW_INTERACTIVE_SELECTOR)) return
-      coordinator.cancelForUserInput()
+      footerCoordinator.cancelForUserInput()
     }
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "PageUp" || e.key === "Home" || e.key === "ArrowUp") {
-        coordinator.cancelForUserInput()
+        footerCoordinator.cancelForUserInput()
       }
     }
     const onScroll = () => {
       if (isAtBottomElement(el)) {
-        coordinator.markAtBottom()
+        footerCoordinator.markAtBottom()
       }
     }
 
@@ -188,44 +190,35 @@ function VirtualizedMessageThreadImpl<T>({
       el.removeEventListener("keydown", onKeyDown)
       el.removeEventListener("scroll", onScroll)
     }
-  }, [hasFooter, scrollRef])
-
-  // Dispose on unmount.
-  useEffect(() => {
-    return () => {
-      coordinatorRef.current?.dispose()
-      coordinatorRef.current = null
-    }
-  }, [])
+  }, [footerCoordinator, scrollRef])
 
   // Single schedule-owner split:
   // - LiveTranscriptRow (footer) owns publication follow via lastAppliedSeq.
   // - This shell owns only non-seq height growth (tool expand / sealed block)
   //   through one ResizeObserver so we never dual-schedule the same seq.
   useEffect(() => {
-    if (!hasFooter) return
+    if (!footerCoordinator) return
     const shell = footerShellRef.current
-    const coordinator = coordinatorRef.current
-    if (!shell || !coordinator) return
+    if (!shell) return
     if (typeof ResizeObserver !== "function") return
 
     let resizeVersion = 0
     const observer = new ResizeObserver(() => {
       resizeVersion += 1
-      coordinator.scheduleFollow(resizeVersion)
+      footerCoordinator.scheduleFollow(resizeVersion)
     })
     observer.observe(shell)
     return () => observer.disconnect()
-  }, [hasFooter, footer])
+  }, [footerCoordinator, footer])
 
+  // Coordinator is a stable field on the context value for this footer epoch —
+  // children read it during the same commit without a shared mutable ref.
   const scrollContextValue = useMemo<MessageScrollContextValue>(
     () => ({
       scrollToIndex,
-      get footerScroll() {
-        return coordinatorRef.current ?? undefined
-      },
+      footerScroll: footerCoordinator ?? undefined,
     }),
-    [scrollToIndex]
+    [scrollToIndex, footerCoordinator]
   )
 
   // Mirror the (stable) scroll handle into the caller-owned ref so a sibling

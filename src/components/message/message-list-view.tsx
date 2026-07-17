@@ -201,7 +201,7 @@ type ThreadRenderItem =
 const getThreadItemKey = (item: ThreadRenderItem) => item.key
 
 // Stable empty reference so the SubAgentOverlay memo can bail out when there
-// are no delegations in the last reply.
+// are no delegations in the conversation.
 const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 
 // Stable empty reference so the navigator memo / equality checks don't churn
@@ -253,14 +253,6 @@ function collectDelegationSources(
       collectDelegationSources(part.items, out)
     }
   }
-}
-
-function extractDelegationSources(
-  parts: AdaptedContentPart[]
-): DelegationCardSource[] {
-  const out: DelegationCardSource[] = []
-  collectDelegationSources(parts, out)
-  return out
 }
 
 const CollapsibleSystemMessage = memo(function CollapsibleSystemMessage({
@@ -736,9 +728,46 @@ const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
 })
 
 /**
- * Sub-agent overlay: prefers live-transcript delegations while streaming so
- * historical row adaptation is not required. Native activity is derived
- * alongside and never replaces original tool rendering.
+ * Merge live-transcript delegation rows into the full historical list.
+ * Live rows win on `parentToolUseId` (fresher status/output while streaming);
+ * live-only ids (not yet adapted into history) are appended in order.
+ */
+function mergeLiveAndHistoricalDelegations(
+  historical: DelegationCardSource[],
+  live: DelegationCardSource[]
+): DelegationCardSource[] {
+  if (live.length === 0) return historical
+  if (historical.length === 0) return live
+
+  const liveById = new Map(
+    live.map((source) => [source.parentToolUseId, source])
+  )
+  const seen = new Set<string>()
+  const merged: DelegationCardSource[] = []
+
+  for (const source of historical) {
+    const liveSource = liveById.get(source.parentToolUseId)
+    if (liveSource) {
+      merged.push(liveSource)
+      seen.add(source.parentToolUseId)
+    } else {
+      merged.push(source)
+      seen.add(source.parentToolUseId)
+    }
+  }
+  for (const source of live) {
+    if (!seen.has(source.parentToolUseId)) {
+      merged.push(source)
+    }
+  }
+  return merged
+}
+
+/**
+ * Sub-agent overlay: full conversation history, with live-transcript rows
+ * preferred for the in-flight turn so status updates without waiting on
+ * historical adaptation. Native activity is derived alongside and never
+ * replaces original tool rendering.
  */
 const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   conversationId,
@@ -781,20 +810,22 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     }
     return historicalActivities
   }, [storeActivities, liveActivities, historicalActivities])
-  const delegations =
-    liveDelegations.length > 0 ? liveDelegations : historicalDelegations
-  const overlayKey =
-    liveDelegations.length > 0 ||
-    liveActivities.length > 0 ||
-    (isStreaming && storeActivities.length > 0)
-      ? `subagents-live-${snap?.messageId ?? conversationId}`
-      : historicalKey
+  // Full-session historical rows + fresher live transcript rows for in-flight
+  // turns (live wins on parentToolUseId).
+  const delegations = useMemo(
+    () =>
+      mergeLiveAndHistoricalDelegations(historicalDelegations, liveDelegations),
+    [historicalDelegations, liveDelegations]
+  )
+  // Conversation-scoped key so expand/collapse survives new turns and the
+  // live↔historical handoff (unlike a per-message key which remounts the panel).
   return (
     <SubAgentOverlay
-      key={overlayKey}
+      key={historicalKey}
       delegations={delegations}
       activities={activities}
-      overlayKey={overlayKey}
+      overlayKey={historicalKey}
+      defaultExpanded
     />
   )
 })
@@ -1121,42 +1152,33 @@ export function MessageListView({
       ? `plan-${liveMessage.id}`
       : `plan-history-${conversationId}`
 
-  // Sub-agents delegated in the LAST agent reply. Scan the merged timeline
-  // backward for the most recent assistant turn (the live streaming turn is
-  // merged in too, so this covers both live and historical), and pull its
-  // `delegate_to_agent` tool calls. The overlay shows only while the last reply
-  // carries delegation cards — a newer non-delegating reply clears it.
-  const lastAssistantGroup = useMemo(() => {
-    let group: ResolvedMessageGroup | null = null
-    for (let i = threadItems.length - 1; i >= 0; i -= 1) {
-      const item = threadItems[i]
+  // All sub-agents delegated across the conversation (every assistant turn).
+  // Timeline order is preserved so older delegations stay above newer ones.
+  // The live streaming path merges fresher transcript rows on top of this list
+  // (see `LiveAwareSubAgentOverlay`); a non-delegating later reply no longer
+  // clears earlier history.
+  const allSessionDelegations = useMemo(() => {
+    const out: DelegationCardSource[] = []
+    for (const item of threadItems) {
       if (item.kind === "turn" && item.group.role === "assistant") {
-        group = item.group
-        break
+        collectDelegationSources(item.group.parts, out)
       }
     }
-    return group
+    return out.length > 0 ? out : EMPTY_DELEGATIONS
   }, [threadItems])
-  const lastAssistantDelegations = useMemo(
-    () =>
-      lastAssistantGroup
-        ? extractDelegationSources(lastAssistantGroup.parts)
-        : EMPTY_DELEGATIONS,
-    [lastAssistantGroup]
-  )
   // Store-backed activities (COMPLETE_TURN / SET_LIVE_MESSAGE / detail fetch).
   // Stable empty reference when absent — required for Zustand getSnapshot.
   const storeActivities = useConversationRuntimeStore((s) =>
     selectDelegationActivities(s, conversationId)
   )
-  // Fall back to walking adapted parts — including background-task-group polls
-  // so Claude TaskOutput/TaskStop still project after adapter grouping (I2).
-  // Prefer store when present to avoid independent duplicate derivation.
-  const lastAssistantActivities = useMemo(() => {
+  // Fall back to walking adapted parts across the full session — including
+  // background-task-group polls so Claude TaskOutput/TaskStop still project
+  // after adapter grouping (I2). Prefer store when present to avoid independent
+  // duplicate derivation.
+  const sessionActivities = useMemo(() => {
     if (storeActivities.length > 0) {
       return storeActivities
     }
-    if (!lastAssistantGroup) return EMPTY_ACTIVITIES
     const tools: Array<{
       toolCallId: string
       toolName: string
@@ -1207,13 +1229,16 @@ export function MessageListView({
         }
       }
     }
-    walk(lastAssistantGroup.parts)
+    for (const item of threadItems) {
+      if (item.kind === "turn" && item.group.role === "assistant") {
+        walk(item.group.parts)
+      }
+    }
     const derived = deriveNativeActivitiesFromToolCalls(tools, agentType)
     return derived.length === 0 ? EMPTY_ACTIVITIES : derived
-  }, [lastAssistantGroup, agentType, storeActivities])
-  const subAgentOverlayKey = lastAssistantGroup
-    ? `subagents-${lastAssistantGroup.id}`
-    : `subagents-history-${conversationId}`
+  }, [threadItems, agentType, storeActivities])
+  // Conversation-scoped so expand/collapse is retained across turns.
+  const subAgentOverlayKey = `subagents-${conversationId}`
 
   // --- Message navigator panel ------------------------------------------------
   // Lifted scroll handle so the panel (which lives in the overlay stack, outside
@@ -1430,17 +1455,18 @@ export function MessageListView({
             conversationId={conversationId}
             agentType={agentType}
             isStreaming={connStatus === "prompting"}
-            historicalDelegations={lastAssistantDelegations}
-            historicalActivities={lastAssistantActivities}
+            historicalDelegations={allSessionDelegations}
+            historicalActivities={sessionActivities}
             storeActivities={storeActivities}
             historicalKey={subAgentOverlayKey}
           />
         ) : (
           <SubAgentOverlay
             key={subAgentOverlayKey}
-            delegations={lastAssistantDelegations}
-            activities={lastAssistantActivities}
+            delegations={allSessionDelegations}
+            activities={sessionActivities}
             overlayKey={subAgentOverlayKey}
+            defaultExpanded
           />
         )}
       </div>

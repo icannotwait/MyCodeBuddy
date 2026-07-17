@@ -1514,7 +1514,16 @@ pub async fn resize_pet_panel(app: AppHandle, height: f64) -> Result<(), AppComm
     let panel_h = height.clamp(PET_PANEL_MIN_HEIGHT, max_h);
 
     let (panel_x, panel_y) = compute_pet_panel_origin(
-        px, py, pw, ph, mon_x, mon_y, mon_w, mon_h, PET_PANEL_WIDTH, panel_h,
+        px,
+        py,
+        pw,
+        ph,
+        mon_x,
+        mon_y,
+        mon_w,
+        mon_h,
+        PET_PANEL_WIDTH,
+        panel_h,
     );
 
     // Size before reposition so the re-anchor uses the final height. Errors are
@@ -1546,9 +1555,7 @@ pub async fn focus_conversation(
         "agent": agent,
     });
     app.emit_to("main", "workspace://focus-conversation", payload)
-        .map_err(|e| {
-            AppCommandError::window("Failed to signal main window", e.to_string())
-        })?;
+        .map_err(|e| AppCommandError::window("Failed to signal main window", e.to_string()))?;
     Ok(())
 }
 
@@ -1809,43 +1816,43 @@ fn tray_labels_for(locale: crate::models::system::AppLocale) -> TrayLabels {
     match locale {
         AppLocale::ZhCn => TrayLabels {
             show_workspace: "显示工作台",
-            quit: "退出 Codeg",
+            quit: "退出 DrawCode",
         },
         AppLocale::ZhTw => TrayLabels {
             show_workspace: "顯示工作臺",
-            quit: "退出 Codeg",
+            quit: "退出 DrawCode",
         },
         AppLocale::Ja => TrayLabels {
             show_workspace: "ワークスペースを表示",
-            quit: "Codeg を終了",
+            quit: "DrawCode を終了",
         },
         AppLocale::Ko => TrayLabels {
             show_workspace: "워크스페이스 표시",
-            quit: "Codeg 종료",
+            quit: "DrawCode 종료",
         },
         AppLocale::Es => TrayLabels {
             show_workspace: "Mostrar el área de trabajo",
-            quit: "Salir de Codeg",
+            quit: "Salir de DrawCode",
         },
         AppLocale::De => TrayLabels {
             show_workspace: "Arbeitsbereich anzeigen",
-            quit: "Codeg beenden",
+            quit: "DrawCode beenden",
         },
         AppLocale::Fr => TrayLabels {
             show_workspace: "Afficher l'espace de travail",
-            quit: "Quitter Codeg",
+            quit: "Quitter DrawCode",
         },
         AppLocale::Pt => TrayLabels {
             show_workspace: "Mostrar área de trabalho",
-            quit: "Sair do Codeg",
+            quit: "Sair do DrawCode",
         },
         AppLocale::Ar => TrayLabels {
             show_workspace: "إظهار مساحة العمل",
-            quit: "إنهاء Codeg",
+            quit: "إنهاء DrawCode",
         },
         AppLocale::En => TrayLabels {
             show_workspace: "Show Workspace",
-            quit: "Quit Codeg",
+            quit: "Quit DrawCode",
         },
     }
 }
@@ -1878,7 +1885,7 @@ pub fn install_tray_icon(
         .build()?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
-        .tooltip("Codeg")
+        .tooltip("DrawCode")
         .menu(&menu)
         // `false` is required for `on_tray_icon_event::Click` to fire on
         // every platform we ship: the default `true` causes the OS to
@@ -2003,7 +2010,11 @@ mod pet_panel_geometry_tests {
     fn places_above_and_aligns_right_edge() {
         // Pet low on screen: the panel sits above it, gap included.
         let (x, y) = origin(1000.0, 900.0, 380.0);
-        assert_eq!(y, 900.0 - 380.0 - PET_PANEL_GAP, "panel bottom hugs pet top");
+        assert_eq!(
+            y,
+            900.0 - 380.0 - PET_PANEL_GAP,
+            "panel bottom hugs pet top"
+        );
         // Right edges align: panel_x = pet_right - panel_w.
         assert_eq!(x, (1000.0 + PET_W) - PET_PANEL_WIDTH);
     }

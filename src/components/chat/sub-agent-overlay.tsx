@@ -1,7 +1,7 @@
 "use client"
 
 /**
- * Inline-start overlay listing the sub-agents delegated in the LAST agent reply.
+ * Inline-start overlay listing sub-agents delegated across the conversation.
  *
  * Mirrors `AgentPlanOverlay` (the "计划任务" panel): collapses to a bullet chip,
  * expands to a card, remembers collapse state per `overlayKey`, and renders
@@ -16,6 +16,9 @@
  *
  * Native rows are informational only (`authoritative=false`): origin label +
  * timestamps, no Broker cancel action, no session dialog unless Codeg-backed.
+ *
+ * Defaults to expanded so historical sub-agents are visible without an extra
+ * click; the parent supplies the full conversation's delegation list.
  */
 
 import { memo, useMemo, useState } from "react"
@@ -35,7 +38,7 @@ import {
 import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
 
 interface SubAgentOverlayProps {
-  /** The `delegate_to_agent` tool calls in the last assistant reply. */
+  /** All `delegate_to_agent` tool calls in this conversation (timeline order). */
   delegations: DelegationCardSource[]
   /**
    * Read-only activity projection (Codeg + native). Native rows are
@@ -43,11 +46,11 @@ interface SubAgentOverlayProps {
    * `delegations` drive the overlay (legacy Codeg path).
    */
   activities?: DelegationActivityView[]
-  /** Stable key for the current "last assistant reply": collapse/expand state
-   *  is remembered per key (and the parent also remounts via `key` on change,
-   *  resetting state across conversations/messages). */
+  /** Stable key for collapse/expand state (typically per-conversation). The
+   *  parent also remounts via `key` on conversation change so state resets
+   *  across sessions but is retained while browsing the same thread. */
   overlayKey?: string | null
-  /** Collapsed by default, matching the plan overlay. */
+  /** Expanded by default so the full sub-agent history is visible. */
   defaultExpanded?: boolean
 }
 
@@ -84,7 +87,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   delegations,
   activities = [],
   overlayKey,
-  defaultExpanded = false,
+  defaultExpanded = true,
 }: SubAgentOverlayProps) {
   const t = useTranslations("Folder.chat.subAgentOverlay")
   const stateKey = overlayKey ?? "__subagents__default__"

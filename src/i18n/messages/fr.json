@@ -986,7 +986,7 @@
       "remoteUnavailable": "{versionText}. La version distante est actuellement indisponible.",
       "latest": "{versionText}. Déjà à jour.",
       "bundled": "Intégré : {version}",
-      "bundledMissing": "L’adaptateur intégré est manquant. Réinstallez ou mettez à jour MyCodeBuddy."
+      "bundledMissing": "L’adaptateur intégré est manquant. Réinstallez ou mettez à jour DrawCode."
     },
     "cline": {
       "configDescription": "Configurez le fournisseur API et les identifiants Cline. Les paramètres sont enregistrés dans ~/.cline/data/."
@@ -1097,8 +1097,8 @@
     "loadFailed": "Échec du chargement : {message}"
   },
   "LoginPage": {
-    "documentTitle": "Connexion - codeg",
-    "brand": "Codeg",
+    "documentTitle": "Connexion - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "Saisissez votre jeton d'accès pour vous connecter à l'application de bureau",
     "tokenPlaceholder": "Jeton d'accès",
     "connect": "Se connecter",
@@ -2071,6 +2071,9 @@
         "connectFailedTitle": "Échec de la connexion de {agent}",
         "toolFallbackTitle": "Outil",
         "eventErrorTitle": "Erreur de l'agent",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} a terminé de répondre",
         "notificationError": "{agent} erreur : {message}",
         "claudeApiRetry": {
@@ -2806,11 +2809,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "Changer ne modifie que l'adresse affichée et ouverte ici ; le service écoute sur toutes les interfaces et reste accessible à chaque adresse.",
     "sectionTitle": "Service Web",
-    "sectionDescription": "Activer pour accéder à Codeg à distance via le navigateur",
+    "sectionDescription": "Activer pour accéder à DrawCode à distance via le navigateur",
     "port": "Port",
     "status": "Statut",
     "autoStart": "Démarrage auto",
-    "autoStartHint": "Démarrer le service Web au lancement de Codeg",
+    "autoStartHint": "Démarrer le service Web au lancement de DrawCode",
     "running": "En cours",
     "stopped": "Arrêté",
     "processing": "Traitement...",
@@ -2825,7 +2828,7 @@
     "copy": "Copier",
     "qrcode": "Code QR",
     "qrcodeTitle": "Scanner pour ouvrir",
-    "qrcodeHint": "Scannez avec votre téléphone pour ouvrir Codeg dans un navigateur",
+    "qrcodeHint": "Scannez avec votre téléphone pour ouvrir DrawCode dans un navigateur",
     "addressLabel": "Adresse d'accès",
     "tokenLabel": "Token d'accès",
     "tokenHint": "Entrez ce token lors du premier accès au client Web",
@@ -2833,7 +2836,7 @@
     "regenerate": "Régénérer",
     "stalePortOccupiedTitle": "Le port {port} est utilisé par un autre processus",
     "stalePortUnknownTitle": "L'état du port {port} est indéterminé",
-    "stalePortHint": "Codeg ne peut pas s'attacher tant que le port n'est pas libéré. Changez de port ci-dessus, ou fermez le processus qui le retient.",
+    "stalePortHint": "DrawCode ne peut pas s'attacher tant que le port n'est pas libéré. Changez de port ci-dessus, ou fermez le processus qui le retient.",
     "errors": {
       "alreadyRunning": "Le service Web est déjà en cours d'exécution",
       "invalidAddress": "Format d'hôte ou de port non valide",
@@ -3097,7 +3100,7 @@
     "searchPlaceholder": "Rechercher des experts par nom, ID ou description",
     "enableForAgents": "Activer pour les agents",
     "noAgents": "Aucun agent ACP détecté.",
-    "copyModeWarning": "Copié (non lié). Réactivez après les mises à jour de codeg pour obtenir la dernière version.",
+    "copyModeWarning": "Copié (non lié). Réactivez après les mises à jour de DrawCode pour obtenir la dernière version.",
     "previewTitle": "Aperçu de SKILL.md",
     "categories": {
       "discovery": "Découverte et conception",
@@ -3133,7 +3136,7 @@
   },
   "ScienceSettings": {
     "title": "Compétences de recherche scientifique",
-    "description": "Activez des compétences de recherche scientifique sélectionnées pour vos agents de codage IA : génération d'hypothèses, plan d'expérience, statistiques, visualisation, évaluation critique et recherche bibliographique. MyCodeBuddy gère une copie centrale et relie chaque compétence aux agents que vous choisissez.",
+    "description": "Activez des compétences de recherche scientifique sélectionnées pour vos agents de codage IA : génération d'hypothèses, plan d'expérience, statistiques, visualisation, évaluation critique et recherche bibliographique. DrawCode gère une copie centrale et relie chaque compétence aux agents que vous choisissez.",
     "loading": "Chargement des compétences scientifiques…",
     "emptySkills": "Aucune compétence scientifique disponible. Consultez les journaux de l'application.",
     "searchPlaceholder": "Rechercher des compétences scientifiques par nom, id ou description",
@@ -3477,7 +3480,7 @@
         "incompatible": "Incompatible",
         "createdAt": "Créée : {value}",
         "appVersion": "Version de l'app : {value}",
-        "incompatibleHint": "Cette sauvegarde a été créée par une version plus récente de codeg et ne peut pas être restaurée."
+        "incompatibleHint": "Cette sauvegarde a été créée par une version plus récente de DrawCode et ne peut pas être restaurée."
       },
       "replaceWarning": "La restauration remplace toutes les données codeg actuelles (base de données et téléversements). Vos données actuelles sont d'abord sauvegardées en instantané pour pouvoir être récupérées.",
       "keyringNote": "Les jetons GitHub/chat du bureau sont dans le trousseau du système et ne sont pas inclus ; ressaisissez-les après la restauration.",
@@ -3513,7 +3516,7 @@
       "error": {
         "badPassphrase": "Phrase secrète incorrecte ou sauvegarde corrompue.",
         "corrupted": "L'archive de sauvegarde est corrompue.",
-        "unknownFormat": "Ce fichier n'est pas une sauvegarde codeg reconnue.",
+        "unknownFormat": "Ce fichier n'est pas une sauvegarde DrawCode reconnue.",
         "newerVersion": "Cette sauvegarde a été créée par codeg {backupVersion}, plus récent que cette version ({appVersion}).",
         "alreadyPending": "Une restauration est déjà préparée. Redémarrez pour l'appliquer avant d'en préparer une autre."
       }

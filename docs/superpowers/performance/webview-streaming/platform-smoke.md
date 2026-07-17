@@ -64,9 +64,19 @@ When a macOS host is available, record: 1,223 events + checksum; no capability c
 
 Same recording checklist as macOS when a host becomes available.
 
-### Cross-platform default caveat
+### Default flags (safe until gates complete)
 
-Flags default **on** after Windows absolute gates. Until macOS/Linux smoke rows above are filled, treat other platforms as **best-effort** and keep env opt-out ready. Integrity sampling was corrected to frontend-accepted events + text hash (see failure matrix); re-run fixture medians after that fix before citing new evidence.
+Phase defaults are **legacy / all off**. Enable for measurement:
+
+```text
+CODEG_DESKTOP_ACP_EVENT_BATCHING=1
+CODEG_INCREMENTAL_LIVE_TRANSCRIPT=1
+CODEG_DEFERRED_STREAMING_RICH_CONTENT=1
+```
+
+Do not re-enable production defaults until macOS/Linux smoke rows are filled,
+integrity re-runs under connection-bound sampling pass, and a real multi-turn
+soak is recorded.
 
 ---
 

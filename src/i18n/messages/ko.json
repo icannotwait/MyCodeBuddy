@@ -780,7 +780,7 @@
     },
     "hermes": {
       "configManagement": "Hermes 구성",
-      "configDescription": "Hermes는 자격 증명을 ~/.hermes/.env에, 설정을 ~/.hermes/config.yaml에 직접 관리합니다. 공급자를 선택한 다음 API 키와 모델을 설정하세요. codeg가 두 파일을 모두 작성해 줍니다.",
+      "configDescription": "Hermes는 자격 증명을 ~/.hermes/.env에, 설정을 ~/.hermes/config.yaml에 직접 관리합니다. 공급자를 선택한 다음 API 키와 모델을 설정하세요. DrawCode가 두 파일을 모두 작성해 줍니다.",
       "providerLabel": "공급자",
       "providerHint": "공급자에 따라 Hermes가 사용하는 API 키 변수와 model.provider가 결정됩니다. OAuth 공급자는 아래 터미널 설정을 통해 구성합니다.",
       "groupApiKey": "API 키 제공자",
@@ -986,7 +986,7 @@
       "remoteUnavailable": "{versionText}. 현재 원격 버전을 사용할 수 없습니다.",
       "latest": "{versionText}. 이미 최신입니다.",
       "bundled": "내장 버전: {version}",
-      "bundledMissing": "내장 어댑터가 없습니다. MyCodeBuddy를 다시 설치하거나 업데이트하세요."
+      "bundledMissing": "내장 어댑터가 없습니다. DrawCode를 다시 설치하거나 업데이트하세요."
     },
     "cline": {
       "configDescription": "Cline API 제공자와 자격 증명을 구성합니다. 설정은 ~/.cline/data/에 저장됩니다."
@@ -1058,7 +1058,7 @@
       "installing": "설치 중…",
       "recheck": "다시 확인",
       "trustTitle": "열린 작업 공간 자동 신뢰",
-      "trustDescription": "codeg가 pi를 폴더에 연결할 때 해당 폴더를 신뢰됨으로 표시하여 pi가 별도 확인 없이 프로젝트의 로컬 설정과 스킬을 로드하도록 합니다.",
+      "trustDescription": "DrawCode가 pi를 폴더에 연결할 때 해당 폴더를 신뢰됨으로 표시하여 pi가 별도 확인 없이 프로젝트의 로컬 설정과 스킬을 로드하도록 합니다.",
       "trustHint": "여기서 여는 폴더만 신뢰되며 전체 컴퓨터는 신뢰되지 않습니다. 또한 설정 로드에만 영향을 주며 pi가 실행할 수 있는 작업에는 영향을 주지 않습니다.",
       "configDirSkillsNote": "사용자 지정 구성 디렉터리를 설정하면 설정에서 관리하는 스킬, 전문가, 오피스 도구가 이 pi에 적용되지 않습니다. 해당 폴더에서 스킬을 직접 관리하세요."
     }
@@ -1097,8 +1097,8 @@
     "loadFailed": "불러오기 실패: {message}"
   },
   "LoginPage": {
-    "documentTitle": "로그인 - codeg",
-    "brand": "Codeg",
+    "documentTitle": "로그인 - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "데스크톱 앱에 연결하려면 액세스 토큰을 입력하세요",
     "tokenPlaceholder": "액세스 토큰",
     "connect": "연결",
@@ -2071,6 +2071,9 @@
         "connectFailedTitle": "{agent} 연결 실패",
         "toolFallbackTitle": "도구",
         "eventErrorTitle": "에이전트 오류",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} 응답이 완료되었습니다",
         "notificationError": "{agent} 오류: {message}",
         "claudeApiRetry": {
@@ -2806,11 +2809,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "전환해도 여기에 표시되고 열리는 주소만 바뀝니다. 서비스는 모든 인터페이스에서 수신하며 어떤 주소로도 접속할 수 있습니다.",
     "sectionTitle": "웹 서비스",
-    "sectionDescription": "활성화하면 브라우저를 통해 Codeg에 원격으로 접속할 수 있습니다",
+    "sectionDescription": "활성화하면 브라우저를 통해 DrawCode에 원격으로 접속할 수 있습니다",
     "port": "포트",
     "status": "상태",
     "autoStart": "자동 시작",
-    "autoStartHint": "Codeg가 시작될 때 웹 서비스를 시작합니다",
+    "autoStartHint": "DrawCode가 시작될 때 웹 서비스를 시작합니다",
     "running": "실행 중",
     "stopped": "중지됨",
     "processing": "처리 중...",
@@ -2825,7 +2828,7 @@
     "copy": "복사",
     "qrcode": "QR 코드",
     "qrcodeTitle": "스캔하여 열기",
-    "qrcodeHint": "휴대폰으로 스캔하여 브라우저에서 Codeg를 엽니다",
+    "qrcodeHint": "휴대폰으로 스캔하여 브라우저에서 DrawCode를 엽니다",
     "addressLabel": "접속 주소",
     "tokenLabel": "접속 토큰",
     "tokenHint": "웹 클라이언트 첫 접속 시 이 토큰을 입력하세요",
@@ -2833,7 +2836,7 @@
     "regenerate": "재생성",
     "stalePortOccupiedTitle": "포트 {port}이(가) 다른 프로세스에 의해 사용 중입니다",
     "stalePortUnknownTitle": "포트 {port}의 상태를 확인할 수 없습니다",
-    "stalePortHint": "포트가 해제될 때까지 Codeg은 바인딩할 수 없습니다. 위의 포트를 변경하거나 사용 중인 프로세스를 종료하세요.",
+    "stalePortHint": "포트가 해제될 때까지 DrawCode은 바인딩할 수 없습니다. 위의 포트를 변경하거나 사용 중인 프로세스를 종료하세요.",
     "errors": {
       "alreadyRunning": "웹 서비스가 이미 실행 중입니다",
       "invalidAddress": "호스트 또는 포트 형식이 올바르지 않습니다",
@@ -3067,7 +3070,7 @@
     },
     "confirm": {
       "disableTitle": "이 링크를 비활성화할까요?",
-      "disableBody": "codeg가 관리하는 스킬 링크 {count}개를 제거합니다. 사용자 지정 디렉터리를 차지한 스킬은 그대로 유지됩니다. 언제든지 다시 활성화할 수 있습니다.",
+      "disableBody": "DrawCode가 관리하는 스킬 링크 {count}개를 제거합니다. 사용자 지정 디렉터리를 차지한 스킬은 그대로 유지됩니다. 언제든지 다시 활성화할 수 있습니다.",
       "cancel": "취소",
       "confirm": "비활성화"
     },
@@ -3088,7 +3091,7 @@
   },
   "ExpertsSettings": {
     "title": "전문가 스킬",
-    "description": "AI 코딩 에이전트를 위해 엄선되고 실전 검증된 스킬 워크플로를 활성화하세요. 각 전문가는 superpowers 프로젝트의 독립 실행형 스킬이며 — codeg가 중앙 복사본을 관리하고 선택한 에이전트에 연결합니다.",
+    "description": "AI 코딩 에이전트를 위해 엄선되고 실전 검증된 스킬 워크플로를 활성화하세요. 각 전문가는 superpowers 프로젝트의 독립 실행형 스킬이며 — DrawCode가 중앙 복사본을 관리하고 선택한 에이전트에 연결합니다.",
     "loading": "전문가 로딩 중…",
     "loadingContent": "콘텐츠 로딩 중…",
     "emptyExperts": "사용 가능한 전문가가 없습니다. 애플리케이션 로그를 확인하세요.",
@@ -3133,7 +3136,7 @@
   },
   "ScienceSettings": {
     "title": "과학 연구 스킬",
-    "description": "AI 코딩 에이전트를 위한 엄선된 과학 연구 스킬(가설 생성, 실험 설계, 통계, 시각화, 비판적 평가, 문헌 검색)을 활성화합니다. MyCodeBuddy가 중앙 복사본을 관리하고 선택한 에이전트에 각 스킬을 연결합니다.",
+    "description": "AI 코딩 에이전트를 위한 엄선된 과학 연구 스킬(가설 생성, 실험 설계, 통계, 시각화, 비판적 평가, 문헌 검색)을 활성화합니다. DrawCode가 중앙 복사본을 관리하고 선택한 에이전트에 각 스킬을 연결합니다.",
     "loading": "과학 연구 스킬 불러오는 중…",
     "emptySkills": "사용 가능한 과학 연구 스킬이 없습니다. 애플리케이션 로그를 확인하세요.",
     "searchPlaceholder": "이름, ID 또는 설명으로 과학 연구 스킬 검색",
@@ -3227,7 +3230,7 @@
   },
   "SkillPacksSettings": {
     "title": "스킬 팩",
-    "description": "codeg가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
+    "description": "DrawCode가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
     "tabs": {
       "experts": "전문가",
       "science": "과학 연구",

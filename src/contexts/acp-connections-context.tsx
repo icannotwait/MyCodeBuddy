@@ -669,6 +669,12 @@ export function __resetWritableConnectionsCloneCount(): void {
 }
 
 /** @internal */
+/** @internal Clear durable desktop delivery failure (tests / HMR). */
+export function __resetDesktopDeliveryFailedForTests(): void {
+  if (process.env.NODE_ENV !== "test") return
+  writeDesktopDeliveryFailed(false)
+}
+
 export function __resetStreamingConfigForProviderTests(): void {
   __resetStreamingPerformanceConfigForTests()
 }
@@ -2526,7 +2532,7 @@ function prepareMappedEnvelope(
         if (settled && settled.length > 0) {
           const agentLabel = AGENT_LABELS[agentType]
           const fn = env.folderName
-          const title = fn ? `${fn} - MyCodeBuddy` : "MyCodeBuddy"
+          const title = fn ? `${fn} - DrawCode` : "DrawCode"
           for (const item of settled) {
             const body =
               item.summary ??
@@ -2563,7 +2569,7 @@ function prepareMappedEnvelope(
       const agentLabel = AGENT_LABELS[snapshot.agentType]
       const fn = env.folderName
       afterCommit.push(() => {
-        const title = fn ? `${fn} - Codeg` : "Codeg"
+        const title = fn ? `${fn} - DrawCode` : "DrawCode"
         sendSystemNotification(
           title,
           `${agentLabel}: ${env.tChat("permissionDialog.subtitle")}`
@@ -2718,7 +2724,7 @@ function prepareMappedEnvelope(
       const agentLabel = AGENT_LABELS[snapshot.agentType]
       const fn = env.folderName
       afterCommit.push(() => {
-        const title = fn ? `${fn} - Codeg` : "Codeg"
+        const title = fn ? `${fn} - DrawCode` : "DrawCode"
         sendSystemNotification(
           title,
           env.t("notificationTurnComplete", { agent: agentLabel })
@@ -2781,7 +2787,7 @@ function prepareMappedEnvelope(
       afterCommit.push(() => {
         env.pushAlert("error", env.t("eventErrorTitle"), localizedMessage)
         const fn = env.folderName
-        const title = fn ? `${fn} - Codeg` : "Codeg"
+        const title = fn ? `${fn} - DrawCode` : "DrawCode"
         sendSystemNotification(
           title,
           env.t("notificationError", {
@@ -3018,6 +3024,84 @@ const LEGACY_DISABLED_CAPABILITIES: DesktopDeliveryCapabilities = {
   },
   perf_replay_available: false,
   failure_event: "acp://delivery-failed",
+}
+
+/** sessionStorage key — survives Provider remount / soft WebView reload. */
+const DESKTOP_DELIVERY_FAILED_STORAGE_KEY = "codeg.desktopAcpDeliveryFailed"
+
+function readDesktopDeliveryFailed(): boolean {
+  if (typeof sessionStorage === "undefined") return false
+  try {
+    return sessionStorage.getItem(DESKTOP_DELIVERY_FAILED_STORAGE_KEY) === "1"
+  } catch {
+    return false
+  }
+}
+
+function writeDesktopDeliveryFailed(failed: boolean): void {
+  if (typeof sessionStorage === "undefined") return
+  try {
+    if (failed) {
+      sessionStorage.setItem(DESKTOP_DELIVERY_FAILED_STORAGE_KEY, "1")
+    } else {
+      sessionStorage.removeItem(DESKTOP_DELIVERY_FAILED_STORAGE_KEY)
+    }
+  } catch {
+    // Private mode / quota — in-memory ref still holds process-local state.
+  }
+}
+
+/** Join assistant text blocks from a live message for integrity hashing. */
+function extractLiveAssistantText(
+  liveMessage: LiveMessage | null | undefined
+): string {
+  if (!liveMessage) return ""
+  let text = ""
+  for (const block of liveMessage.content) {
+    if (block.type === "text") text += block.text
+  }
+  return text
+}
+
+/**
+ * Project only events the canonical reducer would accept into the live
+ * transcript. Walks applyEvents with the same prompting-window rules as
+ * `applyStreamingAction` / turn_complete status flip — never whole-frame.
+ */
+export function selectTranscriptApplyEvents(
+  events: readonly EventEnvelope[],
+  initialStatus: ConnectionState["status"]
+): EventEnvelope[] {
+  let status = initialStatus
+  const out: EventEnvelope[] = []
+  for (const event of events) {
+    if (event.type === "status_changed") {
+      out.push(event)
+      status = event.status
+      continue
+    }
+    if (event.type === "turn_complete") {
+      // Always project so the sink can mark completing; status leaves prompting
+      // after this event (matches prepareMappedEnvelope STATUS_CHANGED).
+      out.push(event)
+      status = "connected"
+      continue
+    }
+    // Content that the out-of-turn guard drops when not prompting.
+    if (
+      event.type === "content_delta" ||
+      event.type === "thinking" ||
+      event.type === "tool_call" ||
+      event.type === "tool_call_update" ||
+      event.type === "plan_update"
+    ) {
+      if (status === "prompting") out.push(event)
+      continue
+    }
+    // Permissions / config / other wire events are not projected by the
+    // live-transcript projector path; skip.
+  }
+  return out
 }
 
 // ── Ref-based store (replaces useReducer + Context) ──
@@ -3395,10 +3479,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Activity tracking (no re-renders)
   const lastActivityRef = useRef(new Map<string, number>())
   const pendingUnmappedEventsRef = useRef(new Map<string, EventEnvelope[]>())
-  const listenerReadyRef = useRef(false)
-  const listenerReadyWaitersRef = useRef<Array<() => void>>([])
+  /**
+   * Desktop/attach listener lifecycle.
+   * - idle/starting: connect() may wait
+   * - ready: only phase that resolves waiters
+   * - failed: rejects waiters (capability/subscribe/runtime)
+   * - cancelled: effect cleanup; rejects waiters so connect never hangs
+   */
+  type ListenerPhase = "idle" | "starting" | "ready" | "failed" | "cancelled"
+  const listenerPhaseRef = useRef<ListenerPhase>("idle")
+  const listenerInitErrorRef = useRef<Error | null>(null)
+  const listenerReadyWaitersRef = useRef<
+    Array<{ resolve: () => void; reject: (err: Error) => void }>
+  >([])
   const eventIngestorRef = useRef<EventIngestor | null>(null)
-  const desktopDeliveryFailedRef = useRef(false)
+  // Process + session durable: survives Provider remount / WebView soft reload
+  // until the app process is fully restarted (batcher is not rebuilt).
+  const desktopDeliveryFailedRef = useRef(readDesktopDeliveryFailed())
   // Set of refs (not callbacks) so unmount cleanup matches the original
   // registration even when caller-side handler identity changes per render.
   // Populated by the `useAcpEvent` hook; read by the primary event path
@@ -3486,30 +3583,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       if (!sinks.transcript) return
       if (connectionFrame) {
-        // Match the canonical out-of-turn guard: only project streaming content
-        // when this connection was or is prompting for the frame. Otherwise
-        // background wire updates would graft onto the previous live reply.
-        const previousStatus = previous.get(key)?.status
-        const allowStreamingContent =
-          previousStatus === "prompting" || nextConn.status === "prompting"
-        const publishFrame = allowStreamingContent
-          ? connectionFrame
-          : {
-              ...connectionFrame,
-              applyEvents: connectionFrame.applyEvents.filter(
-                (event) =>
-                  event.type === "turn_complete" ||
-                  event.type === "status_changed"
-              ),
-            }
-        // Always publish (even filtered) so turn_complete can mark completing
-        // when liveMessage is unchanged.
-        if (
-          allowStreamingContent ||
-          publishFrame.applyEvents.length > 0 ||
-          liveChanged
-        ) {
-          sinks.transcript.publish(publishFrame, nextConn.liveMessage)
+        // Per-event filter matching canonical out-of-turn transitions — not
+        // whole-frame before/after status (mixed turn_complete+delta frames).
+        const previousStatus = previous.get(key)?.status ?? nextConn.status
+        const projectedEvents = selectTranscriptApplyEvents(
+          connectionFrame.applyEvents,
+          previousStatus
+        )
+        if (projectedEvents.length > 0 || liveChanged) {
+          sinks.transcript.publish(
+            projectedEvents.length === connectionFrame.applyEvents.length
+              ? connectionFrame
+              : { ...connectionFrame, applyEvents: projectedEvents },
+            nextConn.liveMessage
+          )
         }
       } else if (liveChanged) {
         // Snapshot hydrate / non-frame dispatches: full rebuild at cursor.
@@ -3544,17 +3631,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         next !== previous
       )
       if (streamingPerfRecorder.isActive()) {
-        // Count raw accepted envelopes (pre-compaction) so integrity matches
-        // fixture event counts, not compacted applyEvents.
+        // Only the fixture target connection — never all connections.
+        // Count seq-accepted rawEvents (pre-compaction); text hash is taken
+        // from final canonical liveMessage after quiet, not raw deltas here.
+        const targetId = streamingPerfRecorder.getTargetConnectionId()
         let accepted = 0
         let firstSeq = 0
         let lastSeq = 0
         for (const connFrame of frame.connections) {
+          if (targetId && connFrame.connectionId !== targetId) continue
           accepted += connFrame.rawEvents.length
           for (const event of connFrame.rawEvents) {
-            if (event.type === "content_delta" && event.text) {
-              streamingPerfRecorder.appendFrontendText(event.text)
-            }
             if (firstSeq === 0 || event.seq < firstSeq) firstSeq = event.seq
             if (event.seq > lastSeq) lastSeq = event.seq
           }
@@ -3739,17 +3826,52 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [dispatch]
   )
 
-  const resolveListenerReadyWaiters = useCallback(() => {
-    if (listenerReadyWaitersRef.current.length === 0) return
-    const waiters = listenerReadyWaitersRef.current
-    listenerReadyWaitersRef.current = []
-    for (const resolve of waiters) resolve()
-  }, [])
+  const settleListenerWaiters = useCallback(
+    (outcome: "ready" | "failed" | "cancelled", error?: Error) => {
+      if (outcome === "ready") {
+        listenerPhaseRef.current = "ready"
+        listenerInitErrorRef.current = null
+      } else if (outcome === "failed") {
+        listenerPhaseRef.current = "failed"
+        listenerInitErrorRef.current =
+          error ?? new Error("Desktop ACP event listener failed")
+      } else {
+        listenerPhaseRef.current = "cancelled"
+        listenerInitErrorRef.current =
+          error ?? new Error("Desktop ACP event listener was cancelled")
+      }
+      const waiters = listenerReadyWaitersRef.current
+      listenerReadyWaitersRef.current = []
+      if (outcome === "ready") {
+        for (const w of waiters) w.resolve()
+      } else {
+        const err =
+          listenerInitErrorRef.current ??
+          new Error("Desktop ACP event listener unavailable")
+        for (const w of waiters) w.reject(err)
+      }
+    },
+    []
+  )
 
   const waitForListenerReady = useCallback(async () => {
-    if (listenerReadyRef.current) return
-    await new Promise<void>((resolve) => {
-      listenerReadyWaitersRef.current.push(resolve)
+    const phase = listenerPhaseRef.current
+    if (phase === "ready") return
+    if (phase === "failed") {
+      throw (
+        listenerInitErrorRef.current ??
+        new Error("Desktop ACP event listener failed")
+      )
+    }
+    if (phase === "cancelled") {
+      throw (
+        listenerInitErrorRef.current ??
+        new Error("Desktop ACP event listener was cancelled")
+      )
+    }
+    // idle | starting — wait for settle (ready resolves; failed/cancelled reject)
+    await new Promise<void>((resolve, reject) => {
+      listenerReadyWaitersRef.current.push({ resolve, reject })
     })
   }, [])
 
@@ -3792,7 +3914,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const handleSequenceGap = useCallback(
     (gap: SequenceGap) => {
-      if (streamingPerfRecorder.isActive()) {
+      if (
+        streamingPerfRecorder.isActive() &&
+        streamingPerfRecorder.matchesTargetConnection(gap.connectionId)
+      ) {
         streamingPerfRecorder.markFrontendSequenceGap()
       }
       const ingestor = eventIngestorRef.current
@@ -3843,8 +3968,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const handleDesktopDeliveryFailure = useCallback(
     (failure: DesktopDeliveryFailure) => {
+      // Terminal for this process: batcher is not rebuilt. Persist so Provider
+      // remount / soft WebView reload cannot pretend delivery is live again.
       desktopDeliveryFailedRef.current = true
-      listenerReadyRef.current = false
+      writeDesktopDeliveryFailed(true)
+      const failErr = new Error(
+        "Desktop ACP event delivery failed; restart the application"
+      )
+      settleListenerWaiters("failed", failErr)
       const ingestor = eventIngestorRef.current
       // Commit any contiguous pending work before tearing the ingestor down so
       // a successfully emitted but unflushed batch is not silently discarded.
@@ -3859,6 +3990,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       ingestor?.dispose()
       eventIngestorRef.current = null
 
+      const failMessage = t("desktopDeliveryFailedRestart")
       for (const range of failure.affected) {
         const contextKey = reverseMapRef.current.get(range.connection_id)
         if (!contextKey) continue
@@ -3877,13 +4009,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               patch.activeDelegations,
               patch.eventSeq
             )
-            // Surface terminal delivery failure on the connection so the UI
-            // cannot treat the session as still streamable.
+            // Snapshot is a best-effort final view — the producer may still
+            // advance SessionState after this; UI must not accept new prompts.
             dispatch({
               type: "ERROR",
               contextKey,
-              message:
-                "Desktop event delivery failed. Reload the conversation to continue.",
+              message: failMessage,
             })
           } catch (err) {
             console.warn(
@@ -3897,13 +4028,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })()
       }
 
-      pushAlertRef.current(
-        "error",
-        t("eventErrorTitle"),
-        "Desktop event delivery failed. Reload the conversation to continue."
-      )
+      pushAlertRef.current("error", t("eventErrorTitle"), failMessage)
     },
-    [dispatch, t]
+    [dispatch, settleListenerWaiters, t]
   )
 
   // Push envelopes into the frame ingestor. Optional flush for connect-time
@@ -4077,6 +4204,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         onGap: (gap) => {
           handleSequenceGap(gap)
         },
+        onDuplicate: (info) => {
+          if (
+            streamingPerfRecorder.isActive() &&
+            streamingPerfRecorder.matchesTargetConnection(info.connectionId)
+          ) {
+            streamingPerfRecorder.markFrontendDuplicate()
+          }
+        },
         onUnmapped: (event) => {
           bufferUnmappedEvent(event)
         },
@@ -4085,10 +4220,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       })
 
     const start = async () => {
+      listenerPhaseRef.current = "starting"
+      listenerInitErrorRef.current = null
+
+      // Re-read durable flag (Provider remount after soft reload).
+      if (readDesktopDeliveryFailed()) {
+        desktopDeliveryFailedRef.current = true
+      }
+
       if (desktopDeliveryFailedRef.current) {
         // Terminal failure: do not re-subscribe (no hot-switch / no legacy).
-        // Stay not-ready so waiters and prompts cannot treat delivery as live.
-        listenerReadyRef.current = false
+        settleListenerWaiters(
+          "failed",
+          new Error("Desktop ACP delivery previously failed; restart the app")
+        )
         return
       }
 
@@ -4101,23 +4246,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         } catch {
           // Already initialized in this process (HMR / remount).
         }
-        if (cancelled) return
+        if (cancelled) {
+          settleListenerWaiters("cancelled")
+          return
+        }
         const ingestor = buildIngestor()
         eventIngestorRef.current = ingestor
-        listenerReadyRef.current = true
-        resolveListenerReadyWaiters()
+        settleListenerWaiters("ready")
         return
       }
 
       // Desktop firehose path.
-      // Never invent a delivery mode: if capability query fails we stay not-ready
+      // Never invent a delivery mode: if capability query fails we fail closed
       // rather than assume legacy while the backend may be emitting batches.
-      listenerReadyRef.current = false
-      if (desktopDeliveryFailedRef.current) {
-        // Terminal delivery failure for this process — do not re-subscribe.
-        return
-      }
-
       let capabilities: DesktopDeliveryCapabilities | null = null
       if (getTransport().isDesktop()) {
         const maxAttempts = 3
@@ -4137,19 +4278,26 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         if (!capabilities) {
           console.error(
-            "[acp-context] desktop delivery capabilities unavailable; leaving listener not-ready"
+            "[acp-context] desktop delivery capabilities unavailable; listener failed"
+          )
+          const err = new Error(
+            "Could not negotiate desktop event delivery. Restart the app."
           )
           pushAlertRef.current(
             "error",
             t("eventErrorTitle"),
-            "Could not negotiate desktop event delivery. Restart the app."
+            t("desktopDeliveryNegotiateFailed")
           )
+          if (!cancelled) settleListenerWaiters("failed", err)
           return
         }
       } else {
         capabilities = LEGACY_DISABLED_CAPABILITIES
       }
-      if (cancelled) return
+      if (cancelled) {
+        settleListenerWaiters("cancelled")
+        return
+      }
       try {
         capabilities = initializeStreamingPerformanceConfig(capabilities)
       } catch {
@@ -4157,7 +4305,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         capabilities =
           getStreamingPerformanceConfig() ?? LEGACY_DISABLED_CAPABILITIES
       }
-      if (cancelled) return
+      if (cancelled) {
+        settleListenerWaiters("cancelled")
+        return
+      }
 
       const ingestor = buildIngestor()
       eventIngestorRef.current = ingestor
@@ -4188,27 +4339,39 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         pushAlertRef.current(
           "error",
           t("eventErrorTitle"),
-          "Failed to subscribe to desktop ACP events. Restart the app."
+          t("desktopDeliverySubscribeFailed")
         )
-        // Stay not-ready — never mark ready without an active subscription.
+        if (!cancelled) {
+          settleListenerWaiters(
+            "failed",
+            err instanceof Error
+              ? err
+              : new Error("Failed to subscribe to desktop ACP events")
+          )
+        }
         return
       }
 
       if (cancelled) {
         unsubDesktop?.()
         ingestor.dispose()
+        eventIngestorRef.current = null
+        settleListenerWaiters("cancelled")
         return
       }
-      listenerReadyRef.current = true
-      resolveListenerReadyWaiters()
+      settleListenerWaiters("ready")
     }
 
     void start()
 
     return () => {
       cancelled = true
-      listenerReadyRef.current = false
-      resolveListenerReadyWaiters()
+      // Reject waiters — never resolve when the listener is already torn down.
+      if (listenerPhaseRef.current !== "ready") {
+        settleListenerWaiters("cancelled")
+      } else {
+        listenerPhaseRef.current = "cancelled"
+      }
       unsubDesktop?.()
       eventIngestorRef.current?.dispose()
       eventIngestorRef.current = null
@@ -4218,7 +4381,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     commitEventFrame,
     handleDesktopDeliveryFailure,
     handleSequenceGap,
-    resolveListenerReadyWaiters,
+    settleListenerWaiters,
+    t,
   ])
 
   // ── Backend keepalive timer ──
@@ -4994,15 +5158,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clientMessageId?: string | null
       }
     ) => {
-      if (desktopDeliveryFailedRef.current) {
+      if (desktopDeliveryFailedRef.current || readDesktopDeliveryFailed()) {
         throw new Error(
-          "Desktop ACP delivery failed; reload the conversation before sending"
+          "Desktop ACP delivery failed; restart the application before sending"
         )
       }
       if (
         getTransport().isDesktop() &&
         getEventStream() === null &&
-        !listenerReadyRef.current
+        listenerPhaseRef.current !== "ready"
       ) {
         throw new Error(
           "Desktop ACP event listener is not ready; cannot send prompt"
@@ -5378,6 +5542,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             rateProfile,
             expectedEvents: GROK_RICH_V1_EXPECTED_EVENTS,
             expectedTextSha256: GROK_RICH_V1_EXPECTED_TEXT_SHA256,
+            targetConnectionId: conn.connectionId,
           })
           streamingPerfRecorder.setEnvironment(environment)
 
@@ -5395,10 +5560,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             await waitTwoRafs()
 
             const metricsAfter = await acpGetEventMetrics()
-            // Frontend-committed counts and text digest only — never trust
-            // backend emit counters or the fixture's self-reported checksum.
+            // Frontend-committed counts for the target connection only.
+            // Text digest from final canonical liveMessage (not raw deltas).
             const appliedEvents =
               streamingPerfRecorder.getFrontendAcceptedEvents()
+            const finalConn = storeRef.current.connections.get(activeKey)
+            const finalText = extractLiveAssistantText(finalConn?.liveMessage)
+            streamingPerfRecorder.setFrontendText(finalText)
             const finalTextSha256 =
               await streamingPerfRecorder.computeFrontendTextSha256()
             const integrityOk =

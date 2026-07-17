@@ -13,6 +13,12 @@ export interface EventIngestorDeps {
   readCursor(contextKey: string): number
   commit(frame: AcceptedEventFrame): void
   onGap(gap: SequenceGap): void
+  /** Duplicate / already-applied seq (seq ≤ provisional cursor). */
+  onDuplicate?(info: {
+    connectionId: string
+    contextKey: string
+    seq: number
+  }): void
   onUnmapped(event: EventEnvelope): void
   scheduleFrame(callback: FrameRequestCallback): number
   cancelFrame(handle: number): void
@@ -205,7 +211,12 @@ export class EventIngestor {
       }
 
       if (event.seq <= state.provisional) {
-        // Duplicate / already applied — drop.
+        // Duplicate / already applied — drop (report for integrity).
+        this.deps.onDuplicate?.({
+          connectionId,
+          contextKey: state.contextKey,
+          seq: event.seq,
+        })
         continue
       }
 
