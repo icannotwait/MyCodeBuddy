@@ -22,3 +22,77 @@ pub enum FinalizeTitleOutcome {
     Committed,
     Cancelled,
 }
+
+/// Why a connection was launched. Title capture bypasses internal purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPurpose {
+    User,
+    Delegation,
+    InternalProbe,
+    InternalTitle,
+}
+
+/// Launch-time purpose and optional inherited locale for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionLaunchContext {
+    pub purpose: ConnectionPurpose,
+    pub inherited_locale: Option<AppLocale>,
+}
+
+/// Optional explicit visible text and locale supplied by a prompt producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptCaptureContext {
+    pub visible_text: Option<String>,
+    pub locale: Option<AppLocale>,
+}
+
+impl PromptCaptureContext {
+    pub fn new(visible_text: Option<String>, locale: Option<AppLocale>) -> Self {
+        Self {
+            visible_text,
+            locale,
+        }
+    }
+}
+
+/// Normalized visible prompt text and resolved locale after capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedPrompt {
+    pub visible_text: String,
+    pub locale: AppLocale,
+}
+
+/// Lossy parser for the ten supported snake-case wire locale identifiers.
+/// Unknown, empty, and mixed-case values return `None` so callers can fall back.
+pub fn parse_supported_app_locale(value: Option<&str>) -> Option<AppLocale> {
+    match value? {
+        "en" => Some(AppLocale::En),
+        "zh_cn" => Some(AppLocale::ZhCn),
+        "zh_tw" => Some(AppLocale::ZhTw),
+        "ja" => Some(AppLocale::Ja),
+        "ko" => Some(AppLocale::Ko),
+        "es" => Some(AppLocale::Es),
+        "de" => Some(AppLocale::De),
+        "fr" => Some(AppLocale::Fr),
+        "pt" => Some(AppLocale::Pt),
+        "ar" => Some(AppLocale::Ar),
+        _ => None,
+    }
+}
+
+/// Persist locale as the same snake-case wire identifier accepted by
+/// [`parse_supported_app_locale`].
+pub fn app_locale_to_wire(locale: AppLocale) -> &'static str {
+    match locale {
+        AppLocale::En => "en",
+        AppLocale::ZhCn => "zh_cn",
+        AppLocale::ZhTw => "zh_tw",
+        AppLocale::Ja => "ja",
+        AppLocale::Ko => "ko",
+        AppLocale::Es => "es",
+        AppLocale::De => "de",
+        AppLocale::Fr => "fr",
+        AppLocale::Pt => "pt",
+        AppLocale::Ar => "ar",
+    }
+}

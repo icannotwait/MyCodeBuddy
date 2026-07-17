@@ -1,4 +1,4 @@
-//! Enrollment, job cancellation, and generated-title finalization.
+//! Enrollment, job cancellation, generated-title finalization, and prompt capture.
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
@@ -7,11 +7,16 @@ use sea_orm::{
     Set, TransactionTrait,
 };
 
-use crate::auto_title::types::{AutoTitleClaim, FinalizeTitleOutcome};
+use crate::acp::types::PromptInputBlock;
+use crate::auto_title::context::{bound_context, project_visible_prompt};
+use crate::auto_title::types::{
+    app_locale_to_wire, AutoTitleClaim, CapturedPrompt, FinalizeTitleOutcome, PromptCaptureContext,
+};
 use crate::commands::conversation_experience::load_auto_title_agent_from;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
+use crate::models::system::AppLocale;
 
 /// Enroll a newly created conversation for automatic titles when the setting
 /// is On. Reads the agent through [`load_auto_title_agent_from`] so the Off
@@ -99,6 +104,45 @@ pub async fn finalize_generated_title(
 
     txn.commit().await?;
     Ok(FinalizeTitleOutcome::Committed)
+}
+
+/// Capture bounded visible prompt context for an accepted linked prompt.
+///
+/// - `Some(visible_text)` (including empty) is authoritative and never falls
+///   back to wire blocks; `None`/absent uses the privacy-safe projection.
+/// - Locale prefers an explicit capture locale, else `fallback_locale`.
+/// - When a job row still exists, updates locale on every call and writes
+///   `first_user_text` only while it is still null (any surviving job state).
+pub async fn capture_prompt_context<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+    blocks: &[PromptInputBlock],
+    capture: Option<&PromptCaptureContext>,
+    fallback_locale: AppLocale,
+) -> Result<CapturedPrompt, DbError> {
+    let raw_visible = match capture.and_then(|c| c.visible_text.as_ref()) {
+        Some(text) => text.clone(),
+        None => project_visible_prompt(blocks),
+    };
+    let visible_text = bound_context(&raw_visible);
+    let locale = capture.and_then(|c| c.locale).unwrap_or(fallback_locale);
+
+    if let Some(job) = auto_title_job::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    {
+        let mut active: auto_title_job::ActiveModel = job.clone().into();
+        if job.first_user_text.is_none() {
+            active.first_user_text = Set(Some(visible_text.clone()));
+        }
+        active.locale = Set(Some(app_locale_to_wire(locale).to_string()));
+        active.update(conn).await?;
+    }
+
+    Ok(CapturedPrompt {
+        visible_text,
+        locale,
+    })
 }
 
 #[cfg(test)]
@@ -195,15 +239,9 @@ mod tests {
     async fn manual_rename_and_generated_commit_have_atomic_precedence() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let folder = crate::db::test_helpers::seed_folder(&db, "/tmp/title-precedence").await;
-        let conversation = create(
-            &db.conn,
-            folder,
-            AgentType::ClaudeCode,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
         seed_running_job(&db.conn, conversation.id, 1).await;
         assert!(update_title(&db.conn, conversation.id, "Manual".into())
             .await
@@ -359,12 +397,190 @@ mod tests {
         assert!(saved.auto_title_finalized);
         assert!(!saved.title_locked);
         assert_eq!(saved.updated_at, before.updated_at);
-        assert!(
-            auto_title_job::Entity::find_by_id(conversation.id)
+        assert!(auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn seed_job_in_state(
+        conn: &DatabaseConnection,
+        conversation_id: i32,
+        state: AutoTitleJobState,
+        first_user_text: Option<&str>,
+        locale: Option<&str>,
+    ) {
+        let now = Utc::now();
+        auto_title_job::ActiveModel {
+            conversation_id: Set(conversation_id),
+            state: Set(state),
+            attempts: Set(0),
+            first_user_text: Set(first_user_text.map(|s| s.to_string())),
+            first_assistant_text: Set(None),
+            locale: Set(locale.map(|s| s.to_string())),
+            usable_turn_seq: Set(0),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(None),
+            updated_at: Set(now),
+        }
+        .insert(conn)
+        .await
+        .expect("seed job");
+    }
+
+    #[tokio::test]
+    async fn explicit_some_empty_visible_text_is_authoritative() {
+        use crate::acp::types::PromptInputBlock;
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-empty-auth").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+
+        let wire_blocks = vec![PromptInputBlock::Text {
+            text: "wire-fallback-must-not-win".into(),
+        }];
+        let capture = PromptCaptureContext::new(Some(String::new()), Some(AppLocale::ZhCn));
+        let captured = capture_prompt_context(
+            &db.conn,
+            conversation.id,
+            &wire_blocks,
+            Some(&capture),
+            AppLocale::En,
+        )
+        .await
+        .expect("capture");
+
+        assert_eq!(
+            captured.visible_text, "",
+            "Some(\"\") must not fall back to wire blocks"
+        );
+        assert_eq!(captured.locale, AppLocale::ZhCn);
+
+        let job = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(job.first_user_text.as_deref(), Some(""));
+        assert_eq!(job.locale.as_deref(), Some("zh_cn"));
+    }
+
+    #[tokio::test]
+    async fn first_user_text_is_write_once_across_subsequent_captures() {
+        use crate::acp::types::PromptInputBlock;
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-write-once").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+
+        let first = PromptCaptureContext::new(Some("first task".into()), Some(AppLocale::En));
+        capture_prompt_context(&db.conn, conversation.id, &[], Some(&first), AppLocale::En)
+            .await
+            .expect("first capture");
+
+        let second = PromptCaptureContext::new(Some("second task".into()), Some(AppLocale::Ja));
+        let blocks = vec![PromptInputBlock::Text {
+            text: "ignored wire".into(),
+        }];
+        capture_prompt_context(
+            &db.conn,
+            conversation.id,
+            &blocks,
+            Some(&second),
+            AppLocale::En,
+        )
+        .await
+        .expect("second capture");
+
+        let job = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(job.first_user_text.as_deref(), Some("first task"));
+        assert_eq!(
+            job.locale.as_deref(),
+            Some("ja"),
+            "locale still refreshes while first text stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_refreshes_for_every_surviving_job_state() {
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let db = fresh_in_memory_db().await;
+        // Leave auto-title Off so create() does not enroll; seed precise states.
+        let folder = seed_folder(&db, "/tmp/title-locale-refresh").await;
+
+        let states = [
+            AutoTitleJobState::AwaitingTurn,
+            AutoTitleJobState::Ready,
+            AutoTitleJobState::Running,
+            AutoTitleJobState::RetryWait,
+        ];
+
+        for (idx, state) in states.into_iter().enumerate() {
+            let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create");
+            assert!(
+                auto_title_job::Entity::find_by_id(conversation.id)
+                    .one(&db.conn)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "Off setting must not enroll"
+            );
+
+            seed_job_in_state(
+                &db.conn,
+                conversation.id,
+                state.clone(),
+                Some("original"),
+                Some("en"),
+            )
+            .await;
+
+            let capture = PromptCaptureContext::new(Some("later".into()), Some(AppLocale::ZhTw));
+            capture_prompt_context(
+                &db.conn,
+                conversation.id,
+                &[],
+                Some(&capture),
+                AppLocale::En,
+            )
+            .await
+            .expect("capture");
+
+            let job = auto_title_job::Entity::find_by_id(conversation.id)
                 .one(&db.conn)
                 .await
                 .unwrap()
-                .is_none()
-        );
+                .expect("job");
+            assert_eq!(
+                job.first_user_text.as_deref(),
+                Some("original"),
+                "state {state:?} idx {idx}: first text write-once"
+            );
+            assert_eq!(
+                job.locale.as_deref(),
+                Some("zh_tw"),
+                "state {state:?} idx {idx}: locale must refresh"
+            );
+            assert_eq!(job.state, state);
+        }
     }
 }
