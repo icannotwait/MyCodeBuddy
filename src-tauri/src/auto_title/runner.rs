@@ -1237,26 +1237,55 @@ mod tests {
             fixture
                 .agent
                 .emit_session_started_before_subscription("internal-1");
-            assert!(fixture
+            let err = fixture
                 .runner
                 .run(fixture.attempt(AppLocale::En), CancellationToken::new())
                 .await
-                .is_err());
+                .expect_err("scenario must fail the attempt");
+            match scenario {
+                Scenario::Permission | Scenario::Question => {
+                    assert!(
+                        matches!(err, AutoTitleRunError::Interactive),
+                        "{scenario:?} must classify as Interactive, got {err:?}"
+                    );
+                }
+                Scenario::Refusal | Scenario::Disconnect => {
+                    assert!(
+                        matches!(err, AutoTitleRunError::AbnormalStop(_)),
+                        "{scenario:?} must classify as AbnormalStop, got {err:?}"
+                    );
+                }
+                Scenario::MalformedOutput => {
+                    assert!(
+                        matches!(err, AutoTitleRunError::EmptyOutput),
+                        "{scenario:?} must classify as EmptyOutput, got {err:?}"
+                    );
+                }
+                Scenario::Happy | Scenario::RegistryFailure => unreachable!(),
+            }
             assert!(fixture.was_disconnected());
         }
         let registry_failure = hidden_runner_fixture_for(Scenario::RegistryFailure).await;
         registry_failure
             .agent
             .emit_session_started_before_subscription("internal-1");
-        assert!(registry_failure
+        let reg_err = registry_failure
             .runner
             .run(
                 registry_failure.attempt(AppLocale::En),
-                CancellationToken::new()
+                CancellationToken::new(),
             )
             .await
-            .is_err());
-        assert_eq!(registry_failure.prompt_count(), 0);
+            .expect_err("registry failure must fail");
+        assert!(
+            matches!(reg_err, AutoTitleRunError::Registry(_)),
+            "registry failure must classify as Registry, got {reg_err:?}"
+        );
+        assert_eq!(
+            registry_failure.prompt_count(),
+            0,
+            "registry failure must suppress the title prompt"
+        );
         assert!(registry_failure.was_disconnected());
     }
 
