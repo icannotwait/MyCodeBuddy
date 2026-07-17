@@ -11,23 +11,34 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         AppErrorCode::InvalidInput
         | AppErrorCode::TerminalShellUnavailable
         | AppErrorCode::TerminalShellUnsupported
-        | AppErrorCode::RouteUnavailable => StatusCode::BAD_REQUEST,
+        | AppErrorCode::RouteUnavailable
+        | AppErrorCode::InvalidPattern
+        | AppErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress
-        | AppErrorCode::SessionRouteConflict => StatusCode::CONFLICT,
+        | AppErrorCode::SessionRouteConflict
+        | AppErrorCode::Cancelled
+        | AppErrorCode::StaleStart
+        | AppErrorCode::StalePage
+        | AppErrorCode::LimitEpochChanged
+        | AppErrorCode::SourceEpochChanged => StatusCode::CONFLICT,
         AppErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
         AppErrorCode::ConfigurationMissing
         | AppErrorCode::ConfigurationInvalid
         | AppErrorCode::DependencyMissing
         | AppErrorCode::NotAGitRepository
         | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
+        AppErrorCode::JobExpired => StatusCode::GONE,
+        AppErrorCode::SourceTimeout => StatusCode::REQUEST_TIMEOUT,
+        AppErrorCode::RegistryOverloaded => StatusCode::TOO_MANY_REQUESTS,
         AppErrorCode::NetworkError
         | AppErrorCode::DatabaseError
         | AppErrorCode::IoError
         | AppErrorCode::ExternalCommandFailed
         | AppErrorCode::WindowOperationFailed
-        | AppErrorCode::TaskExecutionFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        | AppErrorCode::TaskExecutionFailed
+        | AppErrorCode::SourceFailed => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

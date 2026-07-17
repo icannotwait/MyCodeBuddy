@@ -23,6 +23,7 @@ pub mod pet;
 pub mod project_boot;
 pub mod question;
 pub mod quick_messages;
+pub mod reference_search;
 #[cfg(feature = "tauri-runtime")]
 pub mod remote_proxy;
 #[cfg(feature = "tauri-runtime")]
