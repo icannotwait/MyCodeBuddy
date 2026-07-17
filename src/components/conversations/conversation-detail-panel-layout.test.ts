@@ -25,6 +25,28 @@ const conversationShellSource = readFileSync(
   "utf8"
 )
 
+describe("ConversationDetailPanel draft route override create wiring", () => {
+  it("passes draft delegationRouteOverride as the last arg to first createConversation", () => {
+    // Exact production call site (not just a nearby comment).
+    expect(source).toMatch(
+      /createConversation\(\s*folderId,\s*selectedAgent,\s*title,\s*sendOwnTab\?\.delegationRouteOverride \?\? null\s*\)/
+    )
+  })
+
+  it("passes draft delegationRouteOverride as the last arg to first createChatConversation", () => {
+    expect(source).toMatch(
+      /createChatConversation\(\s*selectedAgent,\s*title,\s*chatExistingDir,\s*sendOwnTab\?\.delegationRouteOverride \?\? null\s*\)/
+    )
+  })
+
+  it("threads the same override into connect lifecycle (conversationId + route)", () => {
+    expect(source).toContain(
+      "delegationRouteOverride: ownTab?.delegationRouteOverride ?? undefined"
+    )
+    expect(source).toContain("conversationId: dbConversationId ?? undefined")
+  })
+})
+
 describe("ConversationDetailPanel new conversation layout", () => {
   it("keeps the new-conversation input in the welcome panel with the original scroll layout", () => {
     expect(source).toContain(

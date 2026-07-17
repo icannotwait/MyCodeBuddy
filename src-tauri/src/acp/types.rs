@@ -337,6 +337,21 @@ pub enum AcpEvent {
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
     SessionConfigStale { stale: bool, kind: ConfigStaleKind },
+    /// Post-ready companion lease closed: Codeg delegation is no longer
+    /// available. Does **not** change route plan, suppression, fingerprint,
+    /// process lifetime, or Broker tasks — only the mutable availability bit.
+    DelegationAvailabilityChanged { available: bool },
+    /// Soft-supervisor observation transition for a still-running Broker task.
+    /// Updates the existing active-delegation card only — never creates,
+    /// removes, or completes a task.
+    DelegationObservationChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        observation: crate::acp::delegation::types::TaskObservation,
+        last_agent_activity_at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_since: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,
@@ -365,6 +380,8 @@ pub enum ConfigStaleKind {
     ModelProvider,
     /// Global terminal shell selection changed after this connection spawned.
     TerminalShell,
+    /// Managed delegation route preference drifted from the launch-time plan.
+    DelegationRoute,
 }
 
 /// A block of the user's submitted prompt, broadcast via [`AcpEvent::UserMessage`]

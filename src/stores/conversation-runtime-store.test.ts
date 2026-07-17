@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest"
-import type { LiveMessage } from "@/contexts/acp-connections-context"
+import type {
+  LiveContentBlock,
+  LiveMessage,
+  ToolCallInfo,
+} from "@/contexts/acp-connections-context"
 import type {
   DbConversationDetail,
   MessageTurn,
@@ -7,7 +11,9 @@ import type {
 } from "@/lib/types"
 import type { BackgroundOverlayEntry } from "@/stores/conversation-runtime-store"
 import {
+  buildStreamingTurnsFromLiveMessage,
   resetConversationRuntimeStore,
+  selectDelegationActivities,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
   useConversationRuntimeStore,
@@ -581,5 +587,225 @@ describe("selectTimelineTurns compatibility", () => {
     )
     expect(historical.every((e) => e.phase !== "streaming")).toBe(true)
     expect(historical.map((e) => e.turn.id)).toContain(`live-${CID}-lm-dup`)
+  })
+})
+
+function codexSpawnToolBlock(): LiveContentBlock {
+  const info: ToolCallInfo = {
+    tool_call_id: "spawn-call-1",
+    title: "spawn_agent",
+    kind: "other",
+    status: "completed",
+    content: null,
+    raw_input: JSON.stringify({
+      agent_type: "worker",
+      message: "investigate flaky test",
+    }),
+    raw_output_chunks: [JSON.stringify({ agent_id: "agent-native-1" })],
+    raw_output_total_bytes: 0,
+    locations: null,
+    meta: null,
+    images: [],
+  }
+  info.raw_output_total_bytes = info.raw_output_chunks.join("").length
+  return { type: "tool_call", info }
+}
+
+function buildRuntimeFromBlocks(blocks: LiveContentBlock[]) {
+  const live: LiveMessage = {
+    id: "msg-native",
+    role: "assistant",
+    content: blocks,
+    startedAt: Date.parse("2026-07-16T10:00:00Z"),
+  }
+  return buildStreamingTurnsFromLiveMessage(CID, live, { agentType: "codex" })
+}
+
+describe("buildStreamingTurnsFromLiveMessage — native activity projection", () => {
+  it("keeps the original native tool call while adding one activity view", () => {
+    const result = buildRuntimeFromBlocks([codexSpawnToolBlock()])
+    // Runtime MessageTurn blocks use ContentBlock shape (`tool_use`).
+    // Activity is derived alongside — the source tool block is never removed.
+    const toolBlocks = result.turns.flatMap((turn) =>
+      turn.blocks.filter((b) => b.type === "tool_use")
+    )
+    expect(toolBlocks).toHaveLength(1)
+    expect(toolBlocks[0]).toMatchObject({
+      type: "tool_use",
+      tool_name: expect.stringMatching(/spawn_agent|agent|collab/i),
+    })
+    expect(result.delegationActivities).toHaveLength(1)
+    expect(result.delegationActivities[0]).toMatchObject({
+      origin: "native",
+      authoritative: false,
+      platform: "codex",
+      operation: "spawn",
+      task_id: "agent-native-1",
+    })
+  })
+
+  it("projects ambiguous Agent only with correct agentType hint", () => {
+    const agentBlock: LiveContentBlock = {
+      type: "tool_call",
+      info: {
+        tool_call_id: "agent-call-1",
+        title: "Agent",
+        kind: "other",
+        status: "in_progress",
+        content: null,
+        raw_input: JSON.stringify({
+          subagent_type: "Explore",
+          description: "scan",
+        }),
+        raw_output_chunks: [],
+        raw_output_total_bytes: 0,
+        locations: null,
+        meta: null,
+        images: [],
+      },
+    }
+    const live: LiveMessage = {
+      id: "msg-agent",
+      role: "assistant",
+      content: [agentBlock],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    const withClaude = buildStreamingTurnsFromLiveMessage(CID, live, {
+      agentType: "claude_code",
+    })
+    expect(withClaude.delegationActivities).toHaveLength(1)
+    expect(withClaude.delegationActivities[0]).toMatchObject({
+      platform: "claude_code",
+      operation: "spawn",
+    })
+
+    const withBuddy = buildStreamingTurnsFromLiveMessage(CID, live, {
+      agentType: "code_buddy",
+    })
+    expect(withBuddy.delegationActivities).toHaveLength(1)
+    expect(withBuddy.delegationActivities[0]).toMatchObject({
+      platform: "code_buddy",
+      operation: "spawn",
+    })
+
+    const withoutHint = buildStreamingTurnsFromLiveMessage(CID, live)
+    expect(withoutHint.delegationActivities).toHaveLength(0)
+  })
+})
+
+describe("runtime store — production agentType + delegationActivities", () => {
+  afterEach(() => {
+    resetConversationRuntimeStore()
+  })
+
+  it("COMPLETE_TURN persists delegationActivities with session agentType", () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.fetchDetail(CID)
+    // Seed detail so agentType resolves to claude_code.
+    useConversationRuntimeStore.setState((s) => {
+      const session = s.byConversationId.get(CID)!
+      const next = new Map(s.byConversationId)
+      next.set(CID, {
+        ...session,
+        detail: detailWithTurns([], {
+          summary: {
+            ...detailWithTurns([]).summary,
+            agent_type: "claude_code",
+          },
+        }),
+        detailLoading: false,
+      })
+      return { byConversationId: next }
+    })
+
+    const live: LiveMessage = {
+      id: "lm-agent",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "a1",
+            title: "Agent",
+            kind: "other",
+            status: "completed",
+            content: null,
+            raw_input: JSON.stringify({
+              subagent_type: "Explore",
+              description: "x",
+            }),
+            raw_output_chunks: [JSON.stringify({ task_id: "task-from-agent" })],
+            raw_output_total_bytes: 0,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    // Fix raw_output_total_bytes
+    const block = live.content[0]
+    if (block.type === "tool_call") {
+      block.info.raw_output_total_bytes =
+        block.info.raw_output_chunks.join("").length
+    }
+
+    actions.setLiveMessage(CID, live, true)
+    const mid = selectDelegationActivities(
+      useConversationRuntimeStore.getState(),
+      CID
+    )
+    expect(mid).toHaveLength(1)
+    expect(mid[0]).toMatchObject({
+      platform: "claude_code",
+      operation: "spawn",
+      authoritative: false,
+    })
+
+    actions.completeTurn(CID, live)
+    const after = selectDelegationActivities(
+      useConversationRuntimeStore.getState(),
+      CID
+    )
+    expect(after).toHaveLength(1)
+    expect(after[0]?.platform).toBe("claude_code")
+    // Live cleared but activities remain for overlay consumers.
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.liveMessage
+    ).toBeNull()
+  })
+
+  it("does not project Agent without session agentType", () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    // No detail → no agentType → Agent is ambiguous.
+    const live: LiveMessage = {
+      id: "lm-nohint",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "a1",
+            title: "Agent",
+            kind: "other",
+            status: "in_progress",
+            content: null,
+            raw_input: JSON.stringify({ description: "x" }),
+            raw_output_chunks: [],
+            raw_output_total_bytes: 0,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    actions.setLiveMessage(CID, live, true)
+    expect(
+      selectDelegationActivities(useConversationRuntimeStore.getState(), CID)
+    ).toHaveLength(0)
   })
 })

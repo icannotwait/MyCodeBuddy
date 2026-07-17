@@ -34,12 +34,35 @@ pub struct DelegationLink {
 pub enum SpawnerError {
     #[error("spawn failed: {0}")]
     Spawn(String),
-    #[error("send prompt failed: {0}")]
-    Send(String),
+    /// Prompt enqueue failed. When the linked child row was already created,
+    /// `child_conversation_id` carries its id so the broker can settle that
+    /// row `failed/spawn_failed` before reporting.
+    #[error("send failed: {message}")]
+    Send {
+        message: String,
+        child_conversation_id: Option<i32>,
+    },
     #[error("disconnect failed: {0}")]
     Disconnect(String),
     #[error("cancel failed: {0}")]
     Cancel(String),
+}
+
+impl SpawnerError {
+    /// Convenience constructor for a send failure with no child row yet.
+    pub fn send(message: impl Into<String>) -> Self {
+        Self::Send {
+            message: message.into(),
+            child_conversation_id: None,
+        }
+    }
+
+    pub fn send_with_child(message: impl Into<String>, child_conversation_id: i32) -> Self {
+        Self::Send {
+            message: message.into(),
+            child_conversation_id: Some(child_conversation_id),
+        }
+    }
 }
 
 /// Capabilities the delegation broker needs from whatever owns the ACP
@@ -225,7 +248,7 @@ pub mod mock {
                 .lock()
                 .await
                 .pop_front()
-                .unwrap_or_else(|| Err(SpawnerError::Send("no queued send result".into())))
+                .unwrap_or_else(|| Err(SpawnerError::send("no queued send result")))
         }
 
         async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {

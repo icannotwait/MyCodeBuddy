@@ -94,7 +94,7 @@ export function DelegationStatusRow({
   const expandable = results.some((r) => r != null && r.trim() !== "")
 
   const isError = badge.status === "err"
-  const isRunning = badge.status === "running"
+  const isRunning = badge.status === "running" || badge.status === "active"
   const duration =
     report.durationMs != null ? formatDuration(report.durationMs) : null
 

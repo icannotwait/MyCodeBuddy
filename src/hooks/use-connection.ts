@@ -16,6 +16,8 @@ import type {
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  DelegationRoutePolicy,
+  DelegationRouteSnapshot,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   QuestionAnswer,
@@ -80,11 +82,17 @@ export interface UseConnectionReturn {
    *  transient "syncing results" state so the gap after the running count
    *  disappears isn't a blank void. */
   backgroundSettleSyncingSince: number | null
+  /**
+   * Authoritative route snapshot from the backend. `null` until hydrate or
+   * when the server omitted the field. Never derived from live settings.
+   */
+  delegationRoute: DelegationRouteSnapshot | null
   connect: (
     agentType: AgentType,
     workingDir?: string,
     sessionId?: string,
-    conversationId?: number
+    conversationId?: number,
+    delegationRouteOverride?: DelegationRoutePolicy | null
   ) => Promise<void>
   disconnect: () => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
@@ -223,20 +231,23 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const backgroundOutstanding = connection?.backgroundOutstanding ?? 0
   const backgroundSettleSyncingSince =
     connection?.backgroundSettleSyncingSince ?? null
+  const delegationRoute = connection?.delegationRoute ?? null
 
   const connect = useCallback(
     (
       agentType: AgentType,
       workingDir?: string,
       sessionId?: string,
-      conversationId?: number
+      conversationId?: number,
+      delegationRouteOverride?: DelegationRoutePolicy | null
     ) =>
       actions.connect(
         contextKey,
         agentType,
         workingDir,
         sessionId,
-        conversationId
+        conversationId,
+        delegationRouteOverride
       ),
     [actions, contextKey]
   )
@@ -324,6 +335,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       isDelegationChild,
       backgroundOutstanding,
       backgroundSettleSyncingSince,
+      delegationRoute,
       connect,
       disconnect,
       reapplyConfig,
@@ -362,6 +374,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       isDelegationChild,
       backgroundOutstanding,
       backgroundSettleSyncingSince,
+      delegationRoute,
       connect,
       disconnect,
       reapplyConfig,

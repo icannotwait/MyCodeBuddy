@@ -562,7 +562,16 @@
       "noConfigAvailable": "该智能体没有可配置项。",
       "modeLabel": "模式",
       "agentDefaultHint": "智能体默认：{value}",
-      "defaultOptionLabel": "默认（{value}）"
+      "defaultOptionLabel": "默认（{value}）",
+      "routePolicy": "默认路由",
+      "routePolicyHint": "会话未设置覆盖时，受管智能体使用此路由。",
+      "routeEffectiveNative": "委托已关闭 — 有效路由为 Native。",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "软看门狗（秒）",
+      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。不会取消或切换路由。"
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -2272,7 +2281,10 @@
       "subAgentOverlay": {
         "title": "子智能体",
         "collapsedSummary": "子智能体 {count}",
-        "collapseAria": "折叠子智能体"
+        "collapseAria": "折叠子智能体",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "计划任务",
@@ -2417,7 +2429,10 @@
             "child_empty": "子代理无响应",
             "child_unknown": "子代理未知错误",
             "unknown": "未知任务"
-          }
+          },
+          "active": "活动中",
+          "waitingInput": "等待输入",
+          "stalled": "近期无智能体活动"
         }
       },
       "contentParts": {
@@ -2616,7 +2631,8 @@
         "dismiss": "忽略",
         "reconnectFailed": "重连会话失败",
         "applied": "新配置已应用",
-        "terminalShellTitle": "终端 Shell 已更新"
+        "terminalShellTitle": "终端 Shell 已更新",
+        "delegationRouteTitle": "委托路由已更新"
       },
       "collabAgent": {
         "title": "子智能体",
@@ -2643,6 +2659,30 @@
         "cardCompleted": "后台任务已完成",
         "cardFinishedWithStatus": "后台任务已结束（{status}）",
         "cardResultPending": "结果尚未返回"
+      },
+      "delegationRoute": {
+        "menuLabel": "委托路由",
+        "inheritGlobal": "继承全局",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg（继承）",
+        "updateFailed": "更新路由失败"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "已回退到 Native（{reason}）。重新连接以重试 Codeg。",
+        "delegationUnavailable": "Codeg 路由已生效，但委托不可用。",
+        "reconnect": "重新连接",
+        "reconnecting": "正在重新连接…",
+        "reconnected": "已重新连接",
+        "reconnectFailed": "重新连接失败",
+        "reason": {
+          "native_suppression_unsupported": "不支持原生抑制",
+          "native_suppression_invalid": "原生抑制无效",
+          "companion_binary_unavailable": "伴生二进制不可用",
+          "agent_mcp_unsupported": "智能体不支持 MCP",
+          "companion_initialization_failed": "伴生进程初始化失败",
+          "unknown": "已降级"
+        }
       }
     },
     "diffPreview": {

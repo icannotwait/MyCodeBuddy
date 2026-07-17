@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use codeg_lib::acp::delegation::broker::{
     ConversationDepthLookup, DelegationBroker, DelegationConfig,
 };
+use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
     DelegationListener, ParentSessionLookup, TokenEntry, TokenRegistry,
 };
@@ -160,6 +161,7 @@ async fn end_to_end_uds_happy_path() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
@@ -275,6 +277,7 @@ async fn end_to_end_uds_batch_status() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
@@ -361,6 +364,7 @@ async fn end_to_end_uds_invalid_token_rejected() {
     let listener = DelegationListener::new(
         broker,
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
@@ -426,6 +430,7 @@ async fn end_to_end_uds_ask_question_round_trip() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         questions.clone() as Arc<dyn SessionQuestionAccess>,
@@ -536,7 +541,9 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
                 .await
         }
         async fn cancel_questions_by_parent(&self, parent_connection_id: &str) {
-            self.inner.cancel_questions_by_parent(parent_connection_id).await
+            self.inner
+                .cancel_questions_by_parent(parent_connection_id)
+                .await
         }
     }
 
@@ -564,6 +571,7 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens.clone(),
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         questions as Arc<dyn SessionQuestionAccess>,

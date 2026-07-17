@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::EntityTrait;
+use sea_orm::{EntityTrait};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -26,16 +26,14 @@ use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
 use crate::commands::acp::verify_agent_installed;
-use crate::commands::conversations::{
-    create_conversation_core, emit_conversation_state, emit_conversation_upsert,
-};
+use crate::commands::conversations::{create_conversation_core, emit_conversation_state, emit_conversation_upsert};
 use crate::commands::folders::{
     emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
     git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
-use crate::db::service::automation_service;
 use crate::db::service::conversation_service;
+use crate::db::service::automation_service;
 use crate::db::AppDatabase;
 use crate::models::{
     AgentType, AutomationConfig, AutomationInfo, AutomationRunStatus, IsolationMode,
@@ -73,6 +71,9 @@ pub struct AutomationEngine {
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    /// Shared live delegation runtime (enabled / route_policy / stall).
+    /// Row-less automation roots resolve routes from `runtime.snapshot()`.
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
     /// Live automation runs: `connection_id -> (run_id, automation_id)`. The only
     /// way `TurnComplete` (keyed by connection_id) maps back to a run. Lost on
     /// restart — which is why boot reconcile + the conversation-status backstop
@@ -118,6 +119,7 @@ pub fn build_engine(
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
 ) -> Option<Arc<AutomationEngine>> {
     let engine_lock = match acquire_engine_ownership(&data_dir) {
         Ownership::Exclusive(file) => file,
@@ -144,6 +146,7 @@ pub fn build_engine(
         emitter,
         bus,
         data_dir,
+        runtime,
         index: Arc::new(Mutex::new(HashMap::new())),
         automation_locks: Arc::new(Mutex::new(HashMap::new())),
         root_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -225,9 +228,7 @@ pub async fn run_automation_engine(engine: Arc<AutomationEngine>) {
     // holding the exclusive data-dir lock (see `build_engine`), so a process
     // sharing the data dir never reaches this point against another's live runs.
     match automation_service::boot_reconcile_interrupted(&engine.db.conn).await {
-        Ok(n) if n > 0 => {
-            tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)")
-        }
+        Ok(n) if n > 0 => tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)"),
         Ok(_) => {}
         Err(e) => tracing::warn!("[automation] boot reconcile error: {e}"),
     }
@@ -314,21 +315,16 @@ impl AutomationEngine {
             .await
             .map_err(|e| e.to_string())?
         {
-            let _ = automation_service::record_skipped_run(
-                &self.db.conn,
-                automation_id,
-                trigger,
-                scheduled_for,
-            )
-            .await;
+            let _ =
+                automation_service::record_skipped_run(&self.db.conn, automation_id, trigger, scheduled_for)
+                    .await;
             self.emit(AutomationChange::Upsert { id: automation_id });
             return Err("previous run still active".to_string());
         }
 
-        let run =
-            automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
-                .await
-                .map_err(|e| e.to_string())?;
+        let run = automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
+            .await
+            .map_err(|e| e.to_string())?;
         // Broadcast the running row immediately so every client sees it the
         // instant it exists — `launch` can take seconds (worktree add + agent
         // spawn) before it re-emits RunStarted with the live "View conversation"
@@ -390,11 +386,15 @@ impl AutomationEngine {
 
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
+        // Automation is a row-less root: resolve against the shared live runtime.
+        let runtime = self.runtime.snapshot();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
             &self.data_dir,
+            crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+            &runtime,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -444,8 +444,14 @@ impl AutomationEngine {
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
         let conversation_id =
-            match create_conversation_core(&self.db.conn, cwd.folder_id, agent_type, Some(title))
-                .await
+            match create_conversation_core(
+                &self.db.conn,
+                cwd.folder_id,
+                agent_type,
+                Some(title),
+                None,
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {
@@ -499,12 +505,14 @@ impl AutomationEngine {
 
         match self
             .manager
-            .send_prompt_linked_background(
+            .send_prompt_linked_with_message_id(
                 &self.db,
                 &conn_id,
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
+                None,
+                None,
             )
             .await
         {
@@ -1028,10 +1036,7 @@ mod tests {
     fn worktree_names_carry_ids() {
         assert_eq!(basename("/home/me/repo"), "repo");
         assert_eq!(basename("/home/me/repo/"), "repo");
-        assert_eq!(
-            sibling_path("/home/me/repo", "repo-automation-3-run-7"),
-            "/home/me/repo-automation-3-run-7"
-        );
+        assert_eq!(sibling_path("/home/me/repo", "repo-automation-3-run-7"), "/home/me/repo-automation-3-run-7");
     }
 
     #[test]

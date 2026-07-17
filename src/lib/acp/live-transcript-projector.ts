@@ -14,13 +14,19 @@ import type {
   ToolCallImage,
   ToolCallMeta,
 } from "@/contexts/acp-connections-context"
-import type { EventEnvelope, PlanEntryInfo } from "@/lib/types"
+import type {
+  AgentType,
+  DelegationActivityView,
+  EventEnvelope,
+  PlanEntryInfo,
+} from "@/lib/types"
 import {
   appendStreamingMarkdown,
   createIncrementalStreamBlocks,
   sealStreamingMarkdownBoundary,
   type IncrementalStreamBlocks,
 } from "@/lib/markdown/incremental-stream-blocks"
+import { deriveNativeActivitiesFromToolCalls } from "@/lib/delegation-activity"
 
 /** Cross-task live segment (UI projection only). */
 export type LiveTranscriptSegment =
@@ -827,3 +833,35 @@ export function applyEventsToCanonicalLiveMessage(
 }
 
 export type { ToolCallImage }
+
+/**
+ * Project native read-only activity views from a live transcript snapshot.
+ *
+ * Pure derivation: does not mutate `snap.tools` or consume tool segments.
+ * Original tool name / raw input / output / status / meta remain on the
+ * snapshot for normal tool rendering.
+ */
+export function projectNativeActivitiesFromTranscript(
+  snap: LiveTranscriptSnapshot,
+  platform?: AgentType | null
+): DelegationActivityView[] {
+  const at = new Date(snap.startedAt).toISOString()
+  const tools = [...snap.tools.values()].map((info) => {
+    const output =
+      info.raw_output_chunks.length > 0
+        ? info.raw_output_chunks.join("")
+        : (info.content ?? null)
+    return {
+      toolCallId: info.tool_call_id,
+      toolName: (info.title ?? "").trim() || info.kind || "tool",
+      input: info.raw_input ?? null,
+      output,
+      status: info.status ?? null,
+      at,
+      meta: info.meta ?? null,
+    }
+  })
+  // Tool-call projection + explicit Claude marker / CodeBuddy subAgent envelopes
+  // (deriveNativeActivitiesFromToolCalls merges both; original tools unchanged).
+  return deriveNativeActivitiesFromToolCalls(tools, platform)
+}

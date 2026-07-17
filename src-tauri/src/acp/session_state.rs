@@ -8,6 +8,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::route::{
+    DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
+};
 use crate::acp::event_stream::{ConnectionEventStream, RecentEventsBuffer};
 use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::question::PendingQuestionState;
@@ -17,6 +20,46 @@ use crate::acp::types::{
 };
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
+
+/// Immutable route plan plus the one mutable post-ready availability bit.
+/// Carried on live snapshots so attach payloads have one stable shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRouteSnapshot {
+    pub requested: DelegationRoutePolicy,
+    pub effective: DelegationRoutePolicy,
+    pub source: DelegationRouteSource,
+    pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<RouteDegradedReason>,
+    pub delegation_available: bool,
+}
+
+impl DelegationRouteSnapshot {
+    /// Build from an immutable launch plan. Availability starts false until
+    /// the authenticated ready lease succeeds (Codeg) or stays false (native).
+    pub fn from_plan(plan: &DelegationRoutePlan, delegation_available: bool) -> Self {
+        Self {
+            requested: plan.requested,
+            effective: plan.effective,
+            source: plan.source,
+            managed: plan.managed,
+            degraded_reason: plan.degraded_reason,
+            delegation_available,
+        }
+    }
+}
+
+/// Serde default for mixed-version clients: unmanaged native, unavailable.
+pub fn legacy_unmanaged_route_snapshot() -> DelegationRouteSnapshot {
+    DelegationRouteSnapshot {
+        requested: DelegationRoutePolicy::Native,
+        effective: DelegationRoutePolicy::Native,
+        source: DelegationRouteSource::FeatureDisabled,
+        managed: false,
+        degraded_reason: None,
+        delegation_available: false,
+    }
+}
 
 /// 当前 streaming 中的 turn 的累积内容。turn 完成后清空。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +231,14 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Soft-watchdog health for this still-running card. Absent until the
+    /// supervisor publishes; cleared only when the card is removed on complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::acp::delegation::types::TaskObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_activity_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
 /// The in-flight user prompt for the current turn. Captured from
@@ -312,7 +363,19 @@ pub struct SessionState {
 
     // 事件锚点
     pub event_seq: u64,
+    /// Idle-sweep / general liveness timestamp. Bumped on every emit and
+    /// frontend keepalive. **Not** the soft-watchdog agent activity clock.
     pub last_activity_at: DateTime<Utc>,
+
+    /// Soft-watchdog agent activity clock. Advanced only by normalized Agent
+    /// transcript/thinking, tool start/update/progress, and plan activity (or
+    /// first successful child prompt enqueue). Independent of `last_activity_at`.
+    pub last_agent_activity_at: DateTime<Utc>,
+
+    /// Optional wake handle for the soft supervisor. Default is noop so unit
+    /// tests that never install a wake stay silent. Not serialized / not on
+    /// wire snapshots.
+    pub(crate) supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
 
     /// Per-connection event broadcaster used by the WS attach protocol.
     /// New subscribers register receivers here while holding the SessionState
@@ -390,6 +453,11 @@ pub struct SessionState {
     /// Which settings surface drifted, for the banner's wording. `Some` iff
     /// `config_stale`; reset to `None` when staleness clears.
     pub config_stale_kind: Option<ConfigStaleKind>,
+
+    /// Managed route snapshot: immutable plan fields + mutable
+    /// `delegation_available`. New sessions always supply a real plan-derived
+    /// value; wire default for legacy payloads is unmanaged native unavailable.
+    pub delegation_route: DelegationRouteSnapshot,
 }
 
 impl SessionState {
@@ -430,6 +498,8 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_agent_activity_at: Utc::now(),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
@@ -440,7 +510,28 @@ impl SessionState {
             turn_in_flight: false,
             config_stale: false,
             config_stale_kind: None,
+            // Placeholder until spawn installs the real plan snapshot; tests
+            // that never set a plan still deserialize/serialize as legacy default.
+            delegation_route: legacy_unmanaged_route_snapshot(),
         }
+    }
+
+    /// Mark real agent-side progress for the soft watchdog. Does **not** touch
+    /// `last_activity_at` (idle sweep). Wakes the supervisor when a handle is set.
+    pub fn mark_agent_activity(&mut self, at: DateTime<Utc>) {
+        self.last_agent_activity_at = at;
+        self.supervisor_wake.notify();
+    }
+
+    /// Install the plan-derived route snapshot (availability still false until
+    /// ready lease / native path marks connected without delegation).
+    pub fn set_route_plan_snapshot(&mut self, plan: &DelegationRoutePlan) {
+        self.delegation_route = DelegationRouteSnapshot::from_plan(plan, false);
+    }
+
+    /// Post-ready availability flip only — never mutates plan fields.
+    pub fn set_delegation_available(&mut self, available: bool) {
+        self.delegation_route.delegation_available = available;
     }
 
     /// Clone the broadcaster handle so attach handlers and subscriber tasks
@@ -527,6 +618,9 @@ impl SessionState {
             AcpEvent::SessionConfigStale { stale, kind } => {
                 self.config_stale = *stale;
                 self.config_stale_kind = if *stale { Some(*kind) } else { None };
+            }
+            AcpEvent::DelegationAvailabilityChanged { available } => {
+                self.delegation_route.delegation_available = *available;
             }
             AcpEvent::PromptCapabilities {
                 prompt_capabilities,
@@ -628,6 +722,8 @@ impl SessionState {
                     options: options.clone(),
                     created_at: Utc::now(),
                 });
+                // Waiting-input observation changes — wake soft supervisor.
+                self.supervisor_wake.notify();
             }
             AcpEvent::PermissionResolved { request_id } => {
                 // Drop the snapshot's pending_permission iff the resolved
@@ -640,6 +736,7 @@ impl SessionState {
                     Some(p) if p.request_id == *request_id,
                 ) {
                     self.pending_permission = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::QuestionRequest {
@@ -651,6 +748,7 @@ impl SessionState {
                     questions: questions.clone(),
                     created_at: Utc::now(),
                 });
+                self.supervisor_wake.notify();
             }
             AcpEvent::QuestionResolved { question_id } => {
                 // Mirror `PermissionResolved`: only clear when the resolved id
@@ -661,6 +759,7 @@ impl SessionState {
                     Some(p) if p.question_id == *question_id,
                 ) {
                     self.pending_question = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::TurnComplete { .. } => {
@@ -714,12 +813,17 @@ impl SessionState {
                 // turn completes; clearing it would drop the running binding from
                 // the snapshot the instant the parent turn ends (the original
                 // web-only bug). It's removed per-entry by `DelegationCompleted`.
+                let had_waiting =
+                    self.pending_permission.is_some() || self.pending_question.is_some();
                 self.pending_permission = None;
                 // A blocked `ask_user_question` can't outlive its turn: if the
                 // turn ends (cancel / stop) the card is moot. The backend's
                 // answer one-shot is cleaned via the listener's peer-close race;
                 // this just keeps the snapshot honest.
                 self.pending_question = None;
+                if had_waiting {
+                    self.supervisor_wake.notify();
+                }
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
@@ -741,7 +845,10 @@ impl SessionState {
                 // window before this next prompt arrives.
                 self.feedback.clear();
                 // A new user turn supersedes any stale pending question.
-                self.pending_question = None;
+                if self.pending_question.is_some() {
+                    self.pending_question = None;
+                    self.supervisor_wake.notify();
+                }
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -810,8 +917,26 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        observation: None,
+                        last_agent_activity_at: None,
+                        stalled_since: None,
                     },
                 );
+            }
+            AcpEvent::DelegationObservationChanged {
+                parent_tool_use_id,
+                observation,
+                last_agent_activity_at,
+                stalled_since,
+                ..
+            } => {
+                // Observe-only: update an existing card. Never insert, remove,
+                // or synthesize Completion from a health transition.
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    card.observation = Some(*observation);
+                    card.last_agent_activity_at = Some(*last_agent_activity_at);
+                    card.stalled_since = *stalled_since;
+                }
             }
             AcpEvent::DelegationCompleted {
                 parent_tool_use_id, ..
@@ -1172,6 +1297,7 @@ impl SessionState {
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
+            delegation_route: self.delegation_route.clone(),
             event_seq: self.event_seq,
         }
     }
@@ -1263,6 +1389,10 @@ pub struct LiveSessionSnapshot {
     /// byte-identical with the pre-feature wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_stale_kind: Option<ConfigStaleKind>,
+    /// Managed route + availability (see [`DelegationRouteSnapshot`]).
+    /// Default preserves mixed-version clients and Rust deserialization tests.
+    #[serde(default = "legacy_unmanaged_route_snapshot")]
+    pub delegation_route: DelegationRouteSnapshot,
     pub event_seq: u64,
 }
 
@@ -1369,6 +1499,121 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    fn codeg_plan(agent_type: AgentType) -> crate::acp::delegation::route::DelegationRoutePlan {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let _ = agent_type;
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "task10-route".into(),
+        }
+    }
+
+    fn state_with_route(
+        plan: crate::acp::delegation::route::DelegationRoutePlan,
+    ) -> SessionState {
+        let mut s = fresh_state();
+        s.agent_type = AgentType::Codex;
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        s
+    }
+
+    #[test]
+    fn snapshot_keeps_route_immutable_while_availability_changes() {
+        let mut state = state_with_route(codeg_plan(AgentType::Codex));
+        let original = state.to_snapshot().delegation_route;
+        state.apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+        let changed = state.to_snapshot().delegation_route;
+        assert_eq!(original.requested, changed.requested);
+        assert_eq!(original.effective, changed.effective);
+        assert_eq!(original.source, changed.source);
+        assert!(!changed.delegation_available);
+    }
+
+    #[test]
+    fn observation_changed_updates_active_card_without_completing() {
+        let mut s = fresh_state();
+        s.apply_event(&delegation_started("pt-1", 99));
+        assert!(s.active_delegations.contains_key("pt-1"));
+        let at = Utc::now();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "pt-1".into(),
+            task_id: "task-1".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Stalled,
+            last_agent_activity_at: at,
+            stalled_since: Some(at + chrono::Duration::seconds(300)),
+        });
+        let card = s.active_delegations.get("pt-1").expect("card remains");
+        assert_eq!(
+            card.observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        assert_eq!(card.last_agent_activity_at, Some(at));
+        assert!(card.stalled_since.is_some());
+        // Snapshot recovers observation + route availability bit together.
+        let snap = s.to_snapshot();
+        assert_eq!(snap.active_delegations.len(), 1);
+        assert_eq!(
+            snap.active_delegations[0].observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        // Never synthesizes completion.
+        assert!(s.active_delegations.contains_key("pt-1"));
+    }
+
+    #[test]
+    fn observation_changed_unknown_tool_use_does_not_create_card() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "ghost".into(),
+            task_id: "t".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Active,
+            last_agent_activity_at: Utc::now(),
+            stalled_since: None,
+        });
+        assert!(s.active_delegations.is_empty());
+    }
+
+    #[test]
+    fn delegation_route_snapshot_round_trips_on_live_snapshot() {
+        let mut s = state_with_route(codeg_plan(AgentType::Codex));
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert!(snap.delegation_route.delegation_available);
+        let json = serde_json::to_value(&snap).unwrap();
+        let back: LiveSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.delegation_route, snap.delegation_route);
+    }
+
+    #[test]
+    fn mark_agent_activity_does_not_advance_idle_sweep_timestamp() {
+        let mut s = fresh_state();
+        let idle_before = s.last_activity_at;
+        let agent_before = s.last_agent_activity_at;
+        // Ensure a distinct later instant for agent activity.
+        let later = agent_before + chrono::Duration::seconds(42);
+        s.mark_agent_activity(later);
+        assert_eq!(
+            s.last_agent_activity_at, later,
+            "agent activity clock advances"
+        );
+        assert_eq!(
+            s.last_activity_at, idle_before,
+            "idle-sweep last_activity_at must stay unchanged"
+        );
     }
 
     #[test]
@@ -3109,5 +3354,73 @@ mod tests {
             !empty.contains("\"feedback\":"),
             "no-feedback snapshot must omit the notes array"
         );
+    }
+
+    #[test]
+    fn live_session_snapshot_legacy_default_is_unmanaged_native_unavailable() {
+        // Missing delegation_route field deserializes to legacy default.
+        let json = r#"{
+            "connection_id": "c1",
+            "conversation_id": null,
+            "folder_id": null,
+            "status": "connecting",
+            "external_id": null,
+            "live_message": null,
+            "active_tool_calls": [],
+            "pending_permission": null,
+            "modes": null,
+            "current_mode": null,
+            "config_options": null,
+            "prompt_capabilities": null,
+            "usage": null,
+            "fork_supported": false,
+            "available_commands": [],
+            "selectors_ready": false,
+            "event_seq": 0
+        }"#;
+        let snap: LiveSessionSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snap.delegation_route, legacy_unmanaged_route_snapshot());
+        assert!(!snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            crate::acp::delegation::route::DelegationRoutePolicy::Native
+        );
+        assert!(!snap.delegation_route.delegation_available);
+    }
+
+    #[test]
+    fn new_session_state_supplies_real_plan_snapshot_not_only_legacy_default() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "snap-test".into(),
+        };
+        let mut s = fresh_state();
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            DelegationRoutePolicy::Codeg
+        );
+        assert!(snap.delegation_route.delegation_available);
+        // Wire uses snake_case; no secret token fields.
+        let json = serde_json::to_value(&snap).unwrap();
+        let route = &json["delegation_route"];
+        assert_eq!(route["effective"], "codeg");
+        assert_eq!(route["requested"], "codeg");
+        assert_eq!(route["source"], "global_default");
+        assert!(route.get("token").is_none());
     }
 }

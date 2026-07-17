@@ -4,6 +4,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
+use crate::acp::delegation::route::{is_managed_agent, DelegationRoutePolicy};
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
@@ -36,6 +37,7 @@ fn state_patch(
     }
 }
 
+
 pub async fn create(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -43,14 +45,37 @@ pub async fn create(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create`] but persists a root session route override in the same
+/// INSERT. Rejects a non-null override for unmanaged Agent types.
+pub async fn create_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Regular,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Regular,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -66,14 +91,36 @@ pub async fn create_chat(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_chat_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create_chat`] but persists a route override in the same INSERT.
+pub async fn create_chat_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Chat,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Chat,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -83,7 +130,8 @@ pub async fn create_chat(
 /// `parent_id` / `parent_tool_use_id` / `delegation_call_id` so the lifecycle
 /// subscriber and frontend can rebuild the parent ↔ child binding without
 /// inspecting the live broker state. `kind` follows the invariant
-/// `delegate ⟺ parent_id set`.
+/// `delegate ⟺ parent_id set`. Broker children always store a null route
+/// override (connection origin forces Codeg later).
 pub async fn create_with_delegation(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -98,9 +146,27 @@ pub async fn create_with_delegation(
         ConversationKind::Regular
     };
     create_inner(
-        conn, folder_id, agent_type, title, git_branch, delegation, kind,
+        conn,
+        folder_id,
+        agent_type,
+        title,
+        git_branch,
+        CreateInnerOptions {
+            delegation,
+            kind,
+            delegation_route_override: None,
+        },
     )
     .await
+}
+
+/// Private options for [`create_inner`]: kind, optional broker linkage, and
+/// optional managed route override. Bundled so the private insert helper stays
+/// under the clippy argument threshold.
+struct CreateInnerOptions {
+    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+    kind: ConversationKind,
+    delegation_route_override: Option<DelegationRoutePolicy>,
 }
 
 async fn create_inner(
@@ -109,22 +175,40 @@ async fn create_inner(
     agent_type: AgentType,
     title: Option<String>,
     git_branch: Option<String>,
-    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
-    kind: ConversationKind,
+    options: CreateInnerOptions,
 ) -> Result<conversation::Model, DbError> {
+    let CreateInnerOptions {
+        delegation,
+        kind,
+        delegation_route_override,
+    } = options;
     let at_str = serde_json::to_value(agent_type)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     let now = Utc::now();
-    let (parent_id, parent_tool_use_id, delegation_call_id) = match delegation {
+    let (parent_id, parent_tool_use_id, delegation_call_id, task_fields) = match delegation {
         Some(link) => (
             Some(link.parent_conversation_id),
             Some(link.parent_tool_use_id),
             Some(link.delegation_call_id),
+            // Accepted boundary: linked delegate rows are born running. Normal
+            // root/chat rows keep all four task fields null.
+            (
+                Some(conversation::DelegationTaskStatus::Running),
+                None::<String>,
+                Some(now),
+                None,
+            ),
         ),
-        None => (None, None, None),
+        None => (None, None, None, (None, None, None, None)),
     };
+    let (
+        delegation_task_status,
+        delegation_error_code,
+        delegation_started_at,
+        delegation_finished_at,
+    ) = task_fields;
     let model = conversation::ActiveModel {
         id: NotSet,
         folder_id: Set(folder_id),
@@ -139,6 +223,11 @@ async fn create_inner(
         parent_id: Set(parent_id),
         parent_tool_use_id: Set(parent_tool_use_id),
         delegation_call_id: Set(delegation_call_id),
+        delegation_route_override: Set(route_policy_to_storage(delegation_route_override)),
+        delegation_task_status: Set(delegation_task_status),
+        delegation_error_code: Set(delegation_error_code),
+        delegation_started_at: Set(delegation_started_at),
+        delegation_finished_at: Set(delegation_finished_at),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
@@ -147,6 +236,29 @@ async fn create_inner(
         awaiting_reply_token: Set(None),
     };
     Ok(model.insert(conn).await?)
+}
+
+fn route_policy_to_storage(policy: Option<DelegationRoutePolicy>) -> Option<String> {
+    policy.map(|p| match p {
+        DelegationRoutePolicy::Codeg => "codeg".to_string(),
+        DelegationRoutePolicy::Native => "native".to_string(),
+    })
+}
+
+/// Map a stored route override string to the typed policy. Malformed legacy
+/// values log and become `None` — never panic.
+fn parse_route_override(raw: Option<String>) -> Option<DelegationRoutePolicy> {
+    match raw.as_deref() {
+        None => None,
+        Some("codeg") => Some(DelegationRoutePolicy::Codeg),
+        Some("native") => Some(DelegationRoutePolicy::Native),
+        Some(other) => {
+            tracing::warn!(
+                "[conversation_service] malformed delegation_route_override {other:?}, treating as None"
+            );
+            None
+        }
+    }
 }
 
 /// Unconditional status write: sets `status`, clears `awaiting_reply_token`,
@@ -309,6 +421,7 @@ pub async fn clear_awaiting_reply(
         changed,
     })
 }
+
 
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
 /// auto-title backfill ([`refresh_auto_title`]) leaves this row alone, so the
@@ -475,6 +588,11 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         parent_id: r.parent_id,
         parent_tool_use_id: r.parent_tool_use_id,
         delegation_call_id: r.delegation_call_id,
+        delegation_route_override: parse_route_override(r.delegation_route_override),
+        delegation_task_status: r.delegation_task_status,
+        delegation_error_code: r.delegation_error_code,
+        delegation_started_at: r.delegation_started_at,
+        delegation_finished_at: r.delegation_finished_at,
     }
 }
 
@@ -1280,7 +1398,6 @@ mod tests {
             .expect("duplicate finish");
         assert!(duplicate.is_none(), "duplicate end_turn must lose the CAS");
     }
-
     #[tokio::test]
     async fn awaiting_reply_background_root_and_child_never_get_a_generation() {
         let db = fresh_in_memory_db().await;
@@ -1303,7 +1420,6 @@ mod tests {
         assert!(child_patch.awaiting_reply_token.is_none());
         assert_ne!(parent_id, child_id);
     }
-
     #[tokio::test]
     async fn awaiting_reply_terminal_status_wins_over_delayed_end_turn() {
         let db = fresh_in_memory_db().await;
@@ -1327,7 +1443,6 @@ mod tests {
         assert_eq!(current.status, "completed");
         assert!(current.awaiting_reply_token.is_none());
     }
-
     #[tokio::test]
     async fn awaiting_reply_stale_clear_cannot_remove_a_newer_generation() {
         let db = fresh_in_memory_db().await;
@@ -1364,7 +1479,6 @@ mod tests {
             Some(token_b.as_str())
         );
     }
-
     #[tokio::test]
     async fn awaiting_reply_matching_clear_preserves_status_and_updated_at() {
         let db = fresh_in_memory_db().await;
@@ -1386,7 +1500,6 @@ mod tests {
         assert!(cleared.patch.awaiting_reply_token.is_none());
         assert_eq!(cleared.patch.updated_at, before.updated_at);
     }
-
     #[tokio::test]
     async fn awaiting_reply_metadata_preserves_token_but_manual_status_clears_it() {
         let db = fresh_in_memory_db().await;

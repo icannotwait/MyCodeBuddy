@@ -35,6 +35,7 @@ use codeg_lib::acp::delegation::companion::{
     JsonRpcResponse, LineAction, SpawnResult,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
+use codeg_lib::acp::delegation::transport::client_establish_ready_lease;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -146,11 +147,34 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let features = CompanionFeatures::parse(args.features.as_deref());
     let ctx = CompanionContext {
         parent_connection_id: args.parent_connection_id,
-        socket_path: args.socket_path,
-        token: args.token,
-        features: CompanionFeatures::parse(args.features.as_deref()),
+        socket_path: args.socket_path.clone(),
+        token: args.token.clone(),
+        features,
+    };
+
+    // When delegation is enabled, establish the authenticated ready lease
+    // BEFORE serving stdio tools. Failure exits non-zero so the agent never
+    // sees a half-ready companion.
+    let _ready_hold = if features.delegation {
+        match client_establish_ready_lease(&args.socket_path, &args.token).await {
+            Ok(hold) => {
+                // Keep the socket open in the background until peer close /
+                // process exit; dropping it on shutdown marks the lease closed.
+                let hold_task = tokio::spawn(async move {
+                    hold.wait_until_closed().await;
+                });
+                Some(hold_task)
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "codeg-mcp: ready lease failed: {e}");
+                return ExitCode::from(3);
+            }
+        }
+    } else {
+        None
     };
 
     let stdin = tokio::io::stdin();

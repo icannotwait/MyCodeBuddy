@@ -40,6 +40,10 @@ pub fn build_router(
             "/debug/event_metrics",
             get(handlers::event_metrics::get_event_metrics),
         )
+        .route(
+            "/debug/delegation_metrics",
+            get(handlers::delegation_metrics::get_delegation_metrics),
+        )
         // ─── Conversations ───
         .route(
             "/list_conversations",
@@ -138,6 +142,14 @@ pub fn build_router(
         .route(
             "/create_chat_dir",
             post(handlers::conversations::create_chat_dir),
+        )
+        .route(
+            "/set_conversation_delegation_route",
+            post(handlers::conversations::set_conversation_delegation_route),
+        )
+        .route(
+            "/set_draft_delegation_route_preference",
+            post(handlers::conversations::set_draft_delegation_route_preference),
         )
         .route(
             "/update_conversation_status",
@@ -1059,7 +1071,10 @@ pub fn build_router(
             "/automation_list",
             post(handlers::automation::automation_list),
         )
-        .route("/automation_get", post(handlers::automation::automation_get))
+        .route(
+            "/automation_get",
+            post(handlers::automation::automation_get),
+        )
         .route(
             "/automation_runs",
             post(handlers::automation::automation_runs),

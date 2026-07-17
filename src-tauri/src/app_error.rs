@@ -96,6 +96,11 @@ pub enum AppErrorCode {
     /// Selected terminal shell is not a supported dialect for ACP execution.
     /// Connection preflight only — maps to HTTP 400.
     TerminalShellUnsupported,
+    /// Managed Codeg route could not be established (child never falls back).
+    RouteUnavailable,
+    /// Session-id reuse found an existing connection with an incompatible route.
+    /// `detail` carries the existing connection id.
+    SessionRouteConflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]

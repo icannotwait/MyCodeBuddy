@@ -10,9 +10,12 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
         AppErrorCode::InvalidInput
         | AppErrorCode::TerminalShellUnavailable
-        | AppErrorCode::TerminalShellUnsupported => StatusCode::BAD_REQUEST,
+        | AppErrorCode::TerminalShellUnsupported
+        | AppErrorCode::RouteUnavailable => StatusCode::BAD_REQUEST,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
-        AppErrorCode::AlreadyExists | AppErrorCode::TurnInProgress => StatusCode::CONFLICT,
+        AppErrorCode::AlreadyExists
+        | AppErrorCode::TurnInProgress
+        | AppErrorCode::SessionRouteConflict => StatusCode::CONFLICT,
         AppErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
         AppErrorCode::ConfigurationMissing
         | AppErrorCode::ConfigurationInvalid

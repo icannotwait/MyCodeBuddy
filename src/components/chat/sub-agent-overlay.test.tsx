@@ -229,4 +229,67 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByTestId("sub-agent-row")).toBeInTheDocument()
     expect(screen.queryByText(/^#/)).not.toBeInTheDocument()
   })
+
+  it("renders no cancel action for native activity", () => {
+    const nativeRunningActivity =
+      (): import("@/lib/types").DelegationActivityView => ({
+        origin: "native",
+        authoritative: false,
+        platform: "codex",
+        operation: "spawn",
+        observed_status: "running",
+        task_id: "agent-native-1",
+        started_at: "2026-07-16T10:00:00Z",
+        updated_at: "2026-07-16T10:00:00Z",
+      })
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[nativeRunningActivity()]}
+        overlayKey="k-native"
+        defaultExpanded
+      />
+    )
+    expect(screen.getByTestId("sub-agent-origin-native")).toBeInTheDocument()
+    const row = screen.getByTestId("sub-agent-row")
+    expect(row).toHaveAttribute("data-origin", "native")
+    expect(row).toHaveAttribute("data-authoritative", "false")
+    // Native row is an informational div, not a button / dialog trigger.
+    expect(row.tagName.toLowerCase()).toBe("div")
+    expect(row.closest("button")).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /cancel/i })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("groups Codeg and native activity with origin labels", () => {
+    const delegations = [
+      source("pt-1", { agent_type: "codex", task: "Codeg child work" }),
+    ]
+    const native: import("@/lib/types").DelegationActivityView = {
+      origin: "native",
+      authoritative: false,
+      platform: "grok",
+      operation: "spawn",
+      observed_status: "running",
+      started_at: "2026-07-16T10:00:00Z",
+      updated_at: "2026-07-16T10:00:00Z",
+    }
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={delegations}
+        activities={[native]}
+        overlayKey="k-mixed"
+        defaultExpanded
+      />
+    )
+    expect(screen.getByTestId("sub-agent-origin-codeg")).toBeInTheDocument()
+    expect(screen.getByTestId("sub-agent-origin-native")).toBeInTheDocument()
+    expect(screen.getByText("Codeg")).toBeInTheDocument()
+    expect(screen.getByText("Native")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /cancel/i })
+    ).not.toBeInTheDocument()
+  })
 })

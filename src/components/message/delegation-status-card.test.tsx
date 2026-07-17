@@ -371,6 +371,32 @@ describe("DelegationStatusCard", () => {
     )
   })
 
+  it.each([
+    ["active", "Active"],
+    ["waiting_input", "Waiting for input"],
+    ["stalled", "No recent agent activity"],
+  ] as const)("renders running/%s distinctly", (observation, label) => {
+    renderWithIntl(
+      <DelegationStatusCard
+        kind="status"
+        input={JSON.stringify({ task_id: "abc12345" })}
+        output={envelope({
+          status: "running",
+          task_id: "abc12345",
+          observation,
+          message: "Running.",
+        })}
+        state="output-available"
+      />
+    )
+    expect(screen.getByText(label)).toBeInTheDocument()
+    if (observation === "stalled") {
+      expect(screen.getByTestId("delegation-status-card")).not.toHaveClass(
+        "bg-destructive/5"
+      )
+    }
+  })
+
   it("links the disclosure button to its panel via aria-controls when expanded", () => {
     renderWithIntl(
       <DelegationStatusCard

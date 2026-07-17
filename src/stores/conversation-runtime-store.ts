@@ -15,7 +15,9 @@ import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-r
 import { liveTranscriptStore } from "@/stores/live-transcript-store"
 import type {
   AgentExecutionStats,
+  AgentType,
   DbConversationDetail,
+  DelegationActivityView,
   MessageTurn,
   PlanEntryInfo,
   SessionStats,
@@ -30,6 +32,10 @@ import { COLLAB_AGENT_TOOL_NAME, mergeCollabOp } from "@/lib/collab-tool"
 import { collapseLiveCollabBlocks } from "@/lib/collab-collapse"
 import { kimiTodoWriteEntries } from "@/lib/plan-parse"
 import { toErrorMessage } from "@/lib/app-error"
+import {
+  deriveNativeActivitiesFromToolCalls,
+  type ToolFieldForActivity,
+} from "@/lib/delegation-activity"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -52,6 +58,9 @@ import { toErrorMessage } from "@/lib/app-error"
 export type ConversationSyncState = "idle" | "awaiting_persist"
 
 export type ConversationTimelinePhase = "persisted" | "optimistic" | "streaming"
+
+/** Stable empty list for Zustand selectors when no activities exist. */
+export const EMPTY_DELEGATION_ACTIVITIES: DelegationActivityView[] = []
 
 export interface ConversationTimelineTurn {
   key: string
@@ -152,6 +161,13 @@ export interface ConversationRuntimeSession {
 
   // Session-level stats (token usage, context window, etc.)
   sessionStats: SessionStats | null
+
+  /**
+   * Read-only native/Codeg activity projection for the latest assistant
+   * materialization (live stream and COMPLETE_TURN). Never replaces tool
+   * blocks; consumed by the sub-agent overlay when present.
+   */
+  delegationActivities: DelegationActivityView[]
 
   // Cleanup
   pendingCleanup: boolean
@@ -430,13 +446,77 @@ function createEmptySession(
     liveOwnsActiveTurn: false,
     delegationKickoffText: null,
     sessionStats: null,
+    delegationActivities: EMPTY_DELEGATION_ACTIVITIES,
     pendingCleanup: false,
   }
+}
+
+/** Resolve session agent type from loaded detail (conversation summary). */
+function resolveSessionAgentType(
+  session: ConversationRuntimeSession | null | undefined
+): AgentType | null {
+  return session?.detail?.summary.agent_type ?? null
+}
+
+/**
+ * Derive native activities from the last assistant turn's content blocks
+ * (historical / promoted local turns). Uses tool_use + paired tool_result.
+ */
+function deriveActivitiesFromAssistantTurns(
+  turns: ReadonlyArray<MessageTurn>,
+  agentType: AgentType | null
+): DelegationActivityView[] {
+  let lastAssistant: MessageTurn | null = null
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    if (turns[i].role === "assistant") {
+      lastAssistant = turns[i]
+      break
+    }
+  }
+  if (!lastAssistant) return []
+
+  const resultById = new Map<
+    string,
+    { output: string | null; status: string | null }
+  >()
+  for (const block of lastAssistant.blocks) {
+    if (block.type === "tool_result" && block.tool_use_id) {
+      resultById.set(block.tool_use_id, {
+        output: block.output_preview ?? null,
+        status: block.is_error ? "failed" : "completed",
+      })
+    }
+  }
+
+  const tools: ToolFieldForActivity[] = []
+  const at = lastAssistant.timestamp
+  for (const block of lastAssistant.blocks) {
+    if (block.type !== "tool_use") continue
+    const id = block.tool_use_id ?? `anon-${tools.length}`
+    const result = block.tool_use_id
+      ? resultById.get(block.tool_use_id)
+      : undefined
+    tools.push({
+      toolCallId: id,
+      toolName: block.tool_name,
+      input: block.input_preview ?? null,
+      output: result?.output ?? null,
+      status: result?.status ?? "in_progress",
+      at,
+      meta: block.meta ?? null,
+    })
+  }
+  return deriveNativeActivitiesFromToolCalls(tools, agentType)
 }
 
 interface BuiltStreamingTurns {
   turns: MessageTurn[]
   inProgressToolCallIds: Set<string>
+  /**
+   * Read-only native/Codeg activity projection derived alongside tool blocks.
+   * Never replaces or filters the original `tool_call` content.
+   */
+  delegationActivities: DelegationActivityView[]
 }
 
 // Cache joined chunk output keyed by chunks-array identity. The ACP reducer
@@ -651,7 +731,8 @@ function resolveLiveToolInput(
 
 export function buildStreamingTurnsFromLiveMessage(
   conversationId: number,
-  liveMessage: LiveMessage
+  liveMessage: LiveMessage,
+  options?: { agentType?: AgentType | null }
 ): BuiltStreamingTurns {
   // Consolidate codex collab capsules first (spawn execution + per-wait result,
   // close folded in) so live matches the history reconstruction. No-op when the
@@ -1001,7 +1082,70 @@ export function buildStreamingTurnsFromLiveMessage(
       timestamp,
     }))
 
-  return { turns, inProgressToolCallIds }
+  // Derive native activity alongside tool blocks — never filter/replace them.
+  // Use the pre-collapse tool stream so Codex collab ops keep their native
+  // names (`spawn_agent` / `wait_agent` / …) rather than the collapsed
+  // collab capsule title. Source tool blocks in `turns` remain unchanged.
+  const activityToolInputs: Array<{
+    toolCallId: string
+    toolName: string
+    input?: string | null
+    output?: string | null
+    status?: string | null
+    at?: string
+  }> = []
+  for (const block of liveMessage.content) {
+    if (block.type !== "tool_call") continue
+    const resolvedOutput =
+      block.info.raw_output_chunks.length > 0
+        ? getJoinedChunks(block.info.raw_output_chunks)
+        : (block.info.content ?? null)
+    // Prefer ACP title (spawn_agent / TaskOutput / …) so native mapping
+    // sees the platform tool identity before freeform name collapse.
+    const title = block.info.title?.trim() || ""
+    const inferred = inferLiveToolName({
+      title: block.info.title,
+      kind: block.info.kind,
+      rawInput: block.info.raw_input,
+      meta: block.info.meta,
+    })
+    activityToolInputs.push({
+      toolCallId: block.info.tool_call_id,
+      toolName: title || inferred,
+      input: block.info.raw_input ?? null,
+      output: resolvedOutput,
+      status: block.info.status ?? null,
+      at: timestamp,
+    })
+  }
+  const delegationActivities = deriveNativeActivitiesFromToolCalls(
+    activityToolInputs,
+    options?.agentType ?? null
+  )
+
+  return { turns, inProgressToolCallIds, delegationActivities }
+}
+
+/**
+ * Build streaming turns with session agentType resolved from detail when the
+ * caller does not pass an explicit hint.
+ */
+function buildStreamingTurnsForSession(
+  session: ConversationRuntimeSession,
+  liveMessage: LiveMessage,
+  agentTypeOverride?: AgentType | null
+): BuiltStreamingTurns {
+  const agentType =
+    agentTypeOverride !== undefined
+      ? agentTypeOverride
+      : resolveSessionAgentType(session)
+  return buildStreamingTurnsFromLiveMessage(
+    session.conversationId,
+    liveMessage,
+    {
+      agentType,
+    }
+  )
 }
 
 function upsertExternalIdIndex(
@@ -1174,7 +1318,7 @@ function reducer(
           ? current.backgroundTurns
           : retainedBackground
 
-      const nextSession: ConversationRuntimeSession = {
+      const nextSessionBase: ConversationRuntimeSession = {
         ...current,
         detail: action.detail,
         detailLoading: false,
@@ -1187,6 +1331,34 @@ function reducer(
             ? {}
             : { localTurns: [] }
           : { localTurns: [], optimisticTurns: [], liveMessage: null }),
+      }
+      // When live buffers are cleared, re-derive activities from the last
+      // assistant turn in detail (+ any remaining localTurns). While live is
+      // preserved, keep existing store activities (live path owns them).
+      const agentType = action.detail.summary.agent_type
+      let delegationActivities = nextSessionBase.delegationActivities
+      if (!isActivelyInteracting || !keepAllLiveBuffers) {
+        const sourceTurns = [
+          ...action.detail.turns,
+          ...nextSessionBase.localTurns,
+        ]
+        delegationActivities = deriveActivitiesFromAssistantTurns(
+          sourceTurns,
+          agentType
+        )
+      } else if (
+        nextSessionBase.liveMessage &&
+        nextSessionBase.delegationActivities.length === 0
+      ) {
+        delegationActivities = buildStreamingTurnsForSession(
+          nextSessionBase,
+          nextSessionBase.liveMessage,
+          agentType
+        ).delegationActivities
+      }
+      const nextSession: ConversationRuntimeSession = {
+        ...nextSessionBase,
+        delegationActivities,
       }
 
       const nextByConversationId = new Map(state.byConversationId)
@@ -1255,13 +1427,16 @@ function reducer(
           ? action.liveMessage
           : current.liveMessage
 
-      // Convert liveMessage to completed MessageTurns (split into rounds)
-      const streamingTurns = sourceLiveMessage
-        ? buildStreamingTurnsFromLiveMessage(
-            current.conversationId,
-            sourceLiveMessage
-          ).turns
-        : []
+      // Convert liveMessage to completed MessageTurns (split into rounds).
+      // Always pass session agentType so Agent/Task disambiguates correctly.
+      const built = sourceLiveMessage
+        ? buildStreamingTurnsForSession(current, sourceLiveMessage)
+        : null
+      const streamingTurns = built?.turns ?? []
+      const delegationActivities =
+        built && built.delegationActivities.length > 0
+          ? built.delegationActivities
+          : EMPTY_DELEGATION_ACTIVITIES
 
       // Promote: optimisticTurns + streamingTurns → localTurns. Dedup by turn
       // id (keep the latest copy) so a re-promotion of an already-promoted turn
@@ -1292,6 +1467,8 @@ function reducer(
         liveMessage: null,
         syncState: "idle",
         activeTurnToken: null,
+        // Persist projected activities for overlay consumers (I3).
+        delegationActivities,
       }))
     }
 
@@ -1469,9 +1646,25 @@ function reducer(
         return state
       }
 
+      // Materialize live native activities with session agentType so Agent/Task
+      // disambiguates during streaming; original tool blocks stay on liveMessage.
+      let delegationActivities = session.delegationActivities
+      if (action.liveMessage) {
+        const next = buildStreamingTurnsForSession(
+          session,
+          action.liveMessage
+        ).delegationActivities
+        delegationActivities =
+          next.length > 0 ? next : EMPTY_DELEGATION_ACTIVITIES
+      } else if (!action.liveMessage && session.liveMessage) {
+        // Live cleared without COMPLETE_TURN: keep last materialization.
+        delegationActivities = session.delegationActivities
+      }
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...session,
         liveMessage: action.liveMessage,
+        delegationActivities,
       }))
     }
 
@@ -2023,9 +2216,16 @@ function computeHistoricalTimeline(
 function appendCanonicalStreamingTurns(
   historical: ConversationTimelineTurn[],
   conversationId: number,
-  liveMessage: LiveMessage
+  liveMessage: LiveMessage,
+  agentType?: AgentType | null
 ): ConversationTimelineTurn[] {
-  const built = buildStreamingTurnsFromLiveMessage(conversationId, liveMessage)
+  const built = buildStreamingTurnsFromLiveMessage(
+    conversationId,
+    liveMessage,
+    {
+      agentType: agentType ?? null,
+    }
+  )
   const result = historical.slice()
   for (const [index, turn] of built.turns.entries()) {
     result.push({
@@ -2053,7 +2253,8 @@ function computeTimeline(
   return appendCanonicalStreamingTurns(
     historical,
     conversationId,
-    session.liveMessage
+    session.liveMessage,
+    resolveSessionAgentType(session)
   )
 }
 
@@ -2449,6 +2650,23 @@ export function selectTimelineTurns(
   conversationId: number
 ): ConversationTimelineTurn[] {
   return computeTimeline(state, conversationId)
+}
+
+/**
+ * Public selector for store-backed read-only delegation activities.
+ * Updated on SET_LIVE_MESSAGE, COMPLETE_TURN, and settled FETCH_DETAIL_SUCCESS.
+ * Always returns a stable empty reference when absent (avoids getSnapshot loops).
+ */
+export function selectDelegationActivities(
+  state: { byConversationId: Map<number, ConversationRuntimeSession> },
+  conversationId: number
+): DelegationActivityView[] {
+  const activities =
+    state.byConversationId.get(conversationId)?.delegationActivities
+  if (!activities || activities.length === 0) {
+    return EMPTY_DELEGATION_ACTIVITIES
+  }
+  return activities
 }
 
 /** Stable action bundle — reference never changes (reducer merges only the

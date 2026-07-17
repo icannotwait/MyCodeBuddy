@@ -4,14 +4,16 @@
 //! follows the convention documented at
 //! [`crate::acp::session_state::ToolCallState::meta`].
 //!
-//! The broker calls this at three lifecycle points:
+//! The broker calls this at three lifecycle points (always **after** the
+//! durable store CAS in `settle_task` has elected a winner — losers must not
+//! write a second terminal meta):
 //!
 //! 1. After `send_prompt_linked_for_delegation` returns Ok — sets
 //!    `status: "running"` with the child's connection / conversation ids.
-//! 2. In `complete_call` — sets `status: "completed"` (ok branch) or
-//!    `status: "failed"` + `error_code` (err branch).
-//! 3. In `cancel_by_parent` / `cancel_by_child_connection` — sets
-//!    `status: "failed"` + `error_code: "canceled"`.
+//! 2. On durable terminal win (completion) — sets `status: "completed"` (ok)
+//!    or `status: "failed"` + `error_code` (err).
+//! 3. On durable terminal win (cancel) — sets `status: "failed"` +
+//!    `error_code: "canceled"`.
 //!
 //! Writes are skipped when the broker is operating on a synthetic
 //! `parent_tool_use_id` (the `"delegation-*"` UUID fallback) because

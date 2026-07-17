@@ -16,10 +16,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    CompanionReadyAck,
 };
 use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
@@ -33,7 +35,6 @@ use serde_json::Value;
 /// keeps running past this; the LLM simply re-issues the wait. An explicit
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
-
 
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
@@ -73,16 +74,27 @@ impl TokenRegistry {
     }
 
     /// Drop every token whose `parent_connection_id` matches. Used on parent
-    /// connection teardown so a leaked token can't be reused.
-    pub async fn revoke_by_parent(&self, parent_connection_id: &str) {
+    /// connection teardown so a leaked token can't be reused. Returns the
+    /// revoked token strings so callers can also revoke ready leases.
+    pub async fn revoke_by_parent(&self, parent_connection_id: &str) -> Vec<String> {
         let mut map = self.inner.write().await;
-        map.retain(|_, entry| entry.parent_connection_id != parent_connection_id);
+        let mut revoked = Vec::new();
+        map.retain(|token, entry| {
+            if entry.parent_connection_id == parent_connection_id {
+                revoked.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        revoked
     }
 }
 
 pub struct DelegationListener {
     pub broker: Arc<DelegationBroker>,
     pub tokens: Arc<TokenRegistry>,
+    pub leases: Arc<CompanionLeaseRegistry>,
     pub parent_lookup: Arc<dyn ParentSessionLookup>,
     /// Pulls pending live-feedback notes for the `check_user_feedback` tool.
     /// Shares the same `tokens` registry and parent-connection scoping as the
@@ -95,6 +107,8 @@ pub struct DelegationListener {
     /// other arms this is NOT parent-scoped — it looks any non-deleted session up
     /// by its codeg conversation id (still token-gated against an invalid caller).
     pub session_info: Arc<dyn SessionInfoAccess>,
+    /// Process-local reliability metrics (wait peer-close, cancel classes).
+    pub metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
 }
 
 impl DelegationListener {
@@ -102,18 +116,22 @@ impl DelegationListener {
     pub fn new(
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
         parent_lookup: Arc<dyn ParentSessionLookup>,
         feedback: Arc<dyn SessionFeedbackAccess>,
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
     ) -> Arc<Self> {
+        let metrics = broker.metrics();
         Arc::new(Self {
             broker,
             tokens,
+            leases,
             parent_lookup,
             feedback,
             questions,
             session_info,
+            metrics,
         })
     }
 
@@ -189,7 +207,13 @@ impl DelegationListener {
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let msg: BrokerMessage = read_frame(conn).await?;
+        // Ready lease is a long-lived hold: authenticate → mark ready → ack →
+        // select peer-EOF vs revoke, then mark closed exactly once.
+        if let BrokerMessage::Ready(req) = msg {
+            return self.serve_ready_lease(conn, req.token).await;
+        }
         let resp = match msg {
+            BrokerMessage::Ready(_) => unreachable!("handled above"),
             BrokerMessage::Call(req) => report_response(self.process(req).await)?,
             BrokerMessage::Status(req) => {
                 // A status long-poll — especially `wait_ms = 0` (block until
@@ -201,13 +225,40 @@ impl DelegationListener {
                 // abandoning the wait is safe and there's nothing to cancel
                 // broker-side. The companion never writes a second frame on
                 // this socket, so the probe read only resolves on EOF/error.
+                use crate::acp::delegation::metrics::{
+                    DelegationAuditRecord, WaitModeLabel, WaitReturnReason,
+                };
+                let wait_mode = match req.wait_ms {
+                    None => WaitModeLabel::Snapshot,
+                    Some(0) => WaitModeLabel::Terminal,
+                    Some(_) => WaitModeLabel::Supervised,
+                };
+                let requested_wait_ms = req.wait_ms.map(|ms| ms.min(STATUS_WAIT_MAX_MS));
+                let wait_started = std::time::Instant::now();
                 let status_fut = self.process_status(req);
                 tokio::pin!(status_fut);
                 let mut probe = [0u8; 1];
                 let reports = tokio::select! {
                     biased;
                     reports = &mut status_fut => reports,
-                    _ = conn.read(&mut probe) => return Ok(()),
+                    _ = conn.read(&mut probe) => {
+                        // Peer closed before broker returned: record once,
+                        // no task mutation, abandon wait.
+                        let wall = wait_started.elapsed();
+                        self.metrics.record_wait(
+                            wait_mode,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        );
+                        DelegationAuditRecord::wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        )
+                        .emit_wait();
+                        return Ok(());
+                    },
                 };
                 reports_response(reports)?
             }
@@ -224,10 +275,7 @@ impl DelegationListener {
                         write_frame(conn, &feedback_response(&[])?).await?;
                     }
                     Some(parent_conn_id) => {
-                        let pending = self
-                            .feedback
-                            .read_pending_feedback(&parent_conn_id)
-                            .await;
+                        let pending = self.feedback.read_pending_feedback(&parent_conn_id).await;
                         // Read-only: the response carries the note ids
                         // (`_commit_ids`); delivery is committed LATER, by the
                         // companion's `CommitFeedback` once it actually returns
@@ -324,6 +372,72 @@ impl DelegationListener {
         Ok(())
     }
 
+    /// Authenticated two-frame ready lease.
+    ///
+    /// Order: validate/reserve token → write `{"ready":true}` ack → publish
+    /// host readiness via [`CompanionLeaseRegistry::mark_ready`]. Readiness is
+    /// never published until the ack write succeeds, so a dead companion cannot
+    /// make the host `wait_ready` / Connected / `RouteBootstrapOutcome::Ready`.
+    ///
+    /// On ack write failure the lease is revoked so the waiter fails closed
+    /// immediately (not merely availability=false after a false ready). If
+    /// revoke races between ack and mark_ready, mark_ready fails and the hold
+    /// is not entered.
+    async fn serve_ready_lease<C>(&self, conn: &mut C, token: String) -> std::io::Result<()>
+    where
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
+        // 1) Authenticate first — never publish ready for an unknown/revoked token.
+        if self.tokens.lookup(&token).await.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid ready-lease token",
+            ));
+        }
+        // 2) Reserve: host must have registered the lease before companion Ready.
+        let mut availability = self
+            .leases
+            .subscribe_availability(&token)
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "ready lease not registered")
+            })?;
+
+        // 3) Write ack only after authentication/reserve. Host readiness is
+        //    published only after this write succeeds.
+        if let Err(e) = write_frame(conn, &CompanionReadyAck { ready: true }).await {
+            // Fail closed: never mark_ready; drop the lease so wait_ready sees
+            // Closed immediately (ready_tx dropped) and cannot return Ready.
+            self.leases.revoke(&token).await;
+            return Err(e);
+        }
+
+        // 4) Publish host ready only after durable ack. Revoke race → fail closed.
+        if let Err(e) = self.leases.mark_ready(&token).await {
+            self.leases.mark_closed(&token).await;
+            return Err(std::io::Error::other(format!("mark_ready: {e}")));
+        }
+
+        // Hold open: peer EOF or external revoke (availability → false).
+        let mut probe = [0u8; 1];
+        tokio::select! {
+            biased;
+            _ = conn.read(&mut probe) => {}
+            _ = async {
+                loop {
+                    if !*availability.borrow() {
+                        break;
+                    }
+                    if availability.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        self.leases.mark_closed(&token).await;
+        Ok(())
+    }
+
     /// Validate the token, resolve the caller's parent connection/conversation,
     /// and query the status of every requested task id (optionally blocking per
     /// the wire `wait_ms`: omitted → immediate snapshot, explicit `0` → block
@@ -340,13 +454,15 @@ impl DelegationListener {
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
             .await;
-        // Map the wire `wait_ms` to a wait mode: omitted → immediate poll, an
-        // explicit `0` → block with no timeout (long-running children), any
-        // positive value → bounded long-poll clamped to the hard ceiling.
+        // Map the wire `wait_ms` to a wait mode: omitted → snapshot (never park),
+        // explicit `0` → terminal-only (no timeout), positive → supervised with
+        // hard ceiling.
         let wait = match req.wait_ms {
-            None => StatusWait::Immediate,
-            Some(0) => StatusWait::Infinite,
-            Some(ms) => StatusWait::Bounded(ms.min(STATUS_WAIT_MAX_MS)),
+            None => StatusWait::Snapshot,
+            Some(0) => StatusWait::Terminal,
+            Some(ms) => {
+                StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
+            }
         };
         self.broker
             .get_tasks_status(
@@ -368,6 +484,14 @@ impl DelegationListener {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             return unknown_report(&req.task_id);
         };
+        // Explicit task cancel (distinct from MCP request cancel).
+        self.metrics.record_explicit_cancel(req.reason);
+        crate::acp::delegation::metrics::DelegationAuditRecord::cancel(
+            &entry.parent_connection_id,
+            &req.task_id,
+            req.reason,
+        )
+        .emit_cancel();
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
@@ -417,6 +541,8 @@ impl DelegationListener {
         let Some(_entry) = self.tokens.lookup(&cancel.token).await else {
             return;
         };
+        // MCP tools/call cancellation — not an explicit cancel_delegation.
+        self.metrics.record_mcp_request_cancel();
         let reason = cancel
             .reason
             .unwrap_or_else(|| "mcp client canceled".into());
@@ -614,6 +740,9 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
         error_code: Some("canceled".into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -628,6 +757,9 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
         error_code: Some(error_code.into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -643,6 +775,9 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some("unknown task id".into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -656,6 +791,9 @@ fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some(crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -731,10 +869,7 @@ mod tests {
     }
     #[async_trait]
     impl SessionFeedbackAccess for StubFeedback {
-        async fn read_pending_feedback(
-            &self,
-            parent_connection_id: &str,
-        ) -> Vec<PendingFeedback> {
+        async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
             *self.read_conn.lock().await = Some(parent_connection_id.to_string());
             self.items.lock().await.clone()
         }
@@ -754,9 +889,7 @@ mod tests {
     #[derive(Default)]
     struct StubQuestion {
         pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
-        registered: tokio::sync::Mutex<
-            Vec<(String, Vec<crate::acp::question::QuestionSpec>)>,
-        >,
+        registered: tokio::sync::Mutex<Vec<(String, Vec<crate::acp::question::QuestionSpec>)>>,
         canceled: tokio::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
@@ -849,6 +982,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(parent_conversation)),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -869,6 +1003,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             feedback,
             Arc::new(StubQuestion::default()),
@@ -890,6 +1025,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             questions,
@@ -910,6 +1046,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -1449,6 +1586,139 @@ mod tests {
         assert_eq!(broker.pending_count().await, 1);
     }
 
+    /// Explicit cancel counters are **authenticated request-attempt** metrics
+    /// (after token validation, Timeout excluded), not "successful running→
+    /// settling transition only". Successful terminal cancels are already
+    /// counted separately via `record_terminal(Canceled)`. MCP tools/call
+    /// cancel is a distinct counter at the same attempt boundary. An asymmetric
+    /// "success-only explicit vs attempt MCP" contract would contradict the
+    /// brief's separation of the two cancel surfaces and the terminal counter.
+    #[tokio::test]
+    async fn explicit_cancel_metrics_are_authenticated_request_attempts() {
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_metrics(metrics.clone()),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+
+        // 1) Unknown task + valid token still counts as explicit cancel request.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "authenticated cancel_delegation attempt counts even when task is unknown"
+        );
+
+        // 2) Timeout is non-canceling and must not increment.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::Timeout,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "Timeout must remain non-canceling for metrics"
+        );
+
+        // 3) Invalid token does not count.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "bad".into(),
+                task_id: "x".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "invalid token must not count as explicit cancel"
+        );
+
+        // 4) MCP request cancel is a separate authenticated-attempt counter.
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::Cancel(BrokerCancelRequest {
+                token: "tok".into(),
+                external_handle: "no-such-handle".into(),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(metrics.snapshot().mcp_request_cancel_count, 1);
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "MCP cancel must not bleed into explicit cancel counters"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_message_routed_to_broker() {
         let mock = Arc::new(MockSpawner::new());
@@ -1682,7 +1952,10 @@ mod tests {
         let commit_ids = resp.outcome["_commit_ids"].as_array().unwrap();
         assert_eq!(commit_ids, &vec!["f1", "f2"]);
         // Read was scoped to the token's parent connection id.
-        assert_eq!(feedback.read_conn.lock().await.as_deref(), Some("parent-conn"));
+        assert_eq!(
+            feedback.read_conn.lock().await.as_deref(),
+            Some("parent-conn")
+        );
         // The Feedback arm is READ-ONLY — it does NOT commit (delivery is
         // committed later, by the companion's CommitFeedback).
         assert!(feedback.committed.lock().await.is_empty());
@@ -2000,7 +2273,10 @@ mod tests {
             .await
             .expect("serve_one must return after peer close");
         result.unwrap().unwrap();
-        assert_eq!(questions.canceled.lock().await.as_slice(), &["q-1".to_string()]);
+        assert_eq!(
+            questions.canceled.lock().await.as_slice(),
+            &["q-1".to_string()]
+        );
     }
 
     /// An invalid token never registers a question and returns a `declined`
@@ -2008,7 +2284,8 @@ mod tests {
     #[tokio::test]
     async fn ask_invalid_token_declined() {
         let questions = Arc::new(StubQuestion::default());
-        let listener = make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
+        let listener =
+            make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
         let (mut client, mut server) = duplex(8 * 1024);
         let server_task = tokio::spawn(async move {
             listener.serve_one(&mut server).await.unwrap();
@@ -2022,4 +2299,311 @@ mod tests {
         assert!(questions.registered.lock().await.is_empty());
     }
 
+    // ─── Task 7: ready-lease wire protocol (duplex / serve_one) ───────────
+
+    fn make_ready_lease_listener(
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            leases,
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        )
+    }
+
+    /// Valid token: Ready → ack → hold → peer EOF → closed exactly once.
+    #[tokio::test]
+    async fn ready_lease_wire_valid_token_acks_hold_then_closed_once_on_eof() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "ready-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("ready-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "ready-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter
+            .wait_ready(Duration::from_millis(200))
+            .await
+            .expect("host must observe ready after authenticated ack");
+        assert!(*waiter.availability().borrow());
+
+        // Peer EOF ends the hold; closed exactly once.
+        drop(client);
+        server_task.await.unwrap();
+        // Availability may already be false (mark_closed ran); if still true, wait once.
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
+        assert!(!*waiter.availability().borrow());
+        // Second close is a no-op (idempotent).
+        leases.mark_closed("ready-tok").await;
+        assert!(!*waiter.availability().borrow());
+    }
+
+    /// Valid token held, then revoke → closed once; host never sees re-ready.
+    #[tokio::test]
+    async fn ready_lease_wire_revoke_while_held_closes_once() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "revoke-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("revoke-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "revoke-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter.wait_ready(Duration::from_millis(200)).await.unwrap();
+
+        leases.revoke("revoke-tok").await;
+        server_task.await.unwrap();
+        assert!(!*waiter.availability().borrow());
+        // Keep client open until server exits so revoke path is exercised.
+        drop(client);
+    }
+
+    /// Invalid token never becomes ready on the registry watch.
+    #[tokio::test]
+    async fn ready_lease_wire_invalid_token_never_ready() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        // Register a different token so the lease slot exists for a good token only.
+        let mut good_waiter = leases.register("good-tok").await;
+        let mut bad_slot = leases.register("bad-tok").await;
+        // Only "good-tok" is in the token registry.
+        tokens
+            .register(
+                "good-tok".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "bad-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let serve_result = server_task.await.unwrap();
+        assert!(serve_result.is_err(), "invalid token must fail serve_one");
+        // Neither slot becomes ready.
+        assert!(good_waiter
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(bad_slot
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(!*good_waiter.availability().borrow());
+        assert!(!*bad_slot.availability().borrow());
+        drop(client);
+    }
+
+    /// Scripted ack write failure must leave the host waiter unable to become
+    /// Ready (not only availability=false). Valid path covered separately.
+    #[tokio::test]
+    async fn ready_lease_ack_write_failure_never_ready() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::io::Cursor;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        /// Readable Ready frame, then fail the first write (ack).
+        struct ReadyThenFailAckWrite {
+            read_buf: Cursor<Vec<u8>>,
+            wrote: bool,
+        }
+
+        impl AsyncRead for ReadyThenFailAckWrite {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let mut tmp = vec![0u8; buf.remaining()];
+                match std::io::Read::read(&mut self.read_buf, &mut tmp) {
+                    Ok(0) => Poll::Ready(Ok(())),
+                    Ok(n) => {
+                        buf.put_slice(&tmp[..n]);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+        }
+
+        impl AsyncWrite for ReadyThenFailAckWrite {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if !self.wrote {
+                    self.wrote = true;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected ack write failure",
+                    )));
+                }
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "already failed",
+                )))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Encode a real Ready frame into the scripted stream's read buffer.
+        let mut encode = Vec::new();
+        {
+            use tokio::io::AsyncWriteExt;
+            let (mut w, mut r) = duplex(4 * 1024);
+            write_frame(
+                &mut w,
+                &BrokerMessage::Ready(CompanionReadyRequest {
+                    token: "fail-ack".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            w.shutdown().await.unwrap();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut encode)
+                .await
+                .unwrap();
+        }
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "fail-ack".into(),
+                TokenEntry {
+                    parent_connection_id: "parent".into(),
+                    working_dir: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+        let mut waiter = leases.register("fail-ack").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let mut conn = ReadyThenFailAckWrite {
+            read_buf: Cursor::new(encode),
+            wrote: false,
+        };
+        let result = listener.serve_one(&mut conn).await;
+        assert!(
+            result.is_err(),
+            "ack write failure must surface via serve_one"
+        );
+
+        // Host bootstrap must not observe Ready (Connected / RouteBootstrap Ready
+        // depend on wait_ready succeeding). Fail closed — not merely availability.
+        let wait = waiter
+            .wait_ready(std::time::Duration::from_millis(80))
+            .await;
+        assert!(
+            wait.is_err(),
+            "ack write failure must not make wait_ready Ready; got {wait:?}"
+        );
+        assert!(
+            !*waiter.availability().borrow(),
+            "ack write failure must leave availability false"
+        );
+        // A later mark_ready must not resurrect a failed handshake slot if revoked.
+        assert!(
+            leases.mark_ready("fail-ack").await.is_err(),
+            "failed ack path should revoke/forget lease so host cannot mark ready later"
+        );
+    }
 }

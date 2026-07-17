@@ -5881,10 +5881,15 @@ pub async fn acp_connect(
     agent_type: AgentType,
     working_dir: Option<String>,
     session_id: Option<String>,
+    conversation_id: Option<i32>,
+    delegation_route_override: Option<
+        crate::acp::delegation::route::DelegationRoutePolicy,
+    >,
     preferred_mode_id: Option<String>,
     preferred_config_values: Option<BTreeMap<String, String>>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
+    runtime: State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
     app_handle: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<String, AcpError> {
@@ -5898,11 +5903,17 @@ pub async fn acp_connect(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let runtime_snap = runtime.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         &db,
         agent_type,
         session_id.as_deref(),
         &app_data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(
+            conversation_id,
+            delegation_route_override,
+        ),
+        &runtime_snap,
     )
     .await?;
 
@@ -5989,6 +6000,7 @@ pub async fn acp_describe_agent_options_core(
     data_dir: &Path,
     agent_type: AgentType,
     working_dir: Option<String>,
+    runtime: &crate::commands::delegation::DelegationRuntimeSnapshot,
 ) -> Result<crate::acp::types::AgentOptionsSnapshot, AcpError> {
     verify_agent_installed(agent_type).await?;
     // Build the same launch inputs delegation/acp_connect would build so
@@ -5996,9 +6008,15 @@ pub async fn acp_describe_agent_options_core(
     // Without this, the settings UI could show options that the agent
     // never advertises in production (settings override an API URL,
     // model_provider injects a different model list, etc.).
-    let launch_inputs =
-        crate::acp::terminal_context::build_acp_launch_inputs(db, agent_type, None, data_dir)
-            .await?;
+    let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+        db,
+        agent_type,
+        None,
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+        runtime,
+    )
+    .await?;
     manager
         .probe_agent_options(agent_type, working_dir, launch_inputs)
         .await
@@ -6011,6 +6029,7 @@ pub async fn acp_describe_agent_options(
     working_dir: Option<String>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
+    runtime: State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
     app_handle: tauri::AppHandle,
 ) -> Result<crate::acp::types::AgentOptionsSnapshot, AcpError> {
     let app_data_dir = app_handle
@@ -6018,7 +6037,16 @@ pub async fn acp_describe_agent_options(
         .app_data_dir()
         .map(|p| crate::paths::resolve_effective_data_dir(&p))
         .unwrap_or_else(|_| PathBuf::from("."));
-    acp_describe_agent_options_core(&manager, &db, &app_data_dir, agent_type, working_dir).await
+    let runtime_snap = runtime.snapshot();
+    acp_describe_agent_options_core(
+        &manager,
+        &db,
+        &app_data_dir,
+        agent_type,
+        working_dir,
+        &runtime_snap,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

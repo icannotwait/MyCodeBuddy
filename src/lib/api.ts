@@ -15,6 +15,7 @@ import type {
   AgentType,
   AgentDelegationDefaults,
   DelegationProfileDocument,
+  DelegationRoutePolicy,
   AgentOptionsSnapshot,
   Automation,
   AutomationRun,
@@ -159,7 +160,9 @@ export async function acpConnect(
   workingDir?: string,
   sessionId?: string,
   preferredModeId?: string | null,
-  preferredConfigValues?: Record<string, string> | null
+  preferredConfigValues?: Record<string, string> | null,
+  conversationId?: number | null,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<string> {
   return getTransport().call("acp_connect", {
     agentType,
@@ -167,6 +170,8 @@ export async function acpConnect(
     sessionId: sessionId ?? null,
     preferredModeId: preferredModeId ?? null,
     preferredConfigValues: preferredConfigValues ?? null,
+    conversationId: conversationId ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
   })
 }
 
@@ -1947,12 +1952,14 @@ export async function createHyperframesProject(params: {
 export async function createConversation(
   folderId: number,
   agentType: AgentType,
-  title?: string
+  title?: string,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<number> {
   return getTransport().call("create_conversation", {
     folderId,
     agentType,
     title: title ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
   })
 }
 
@@ -1967,12 +1974,39 @@ export async function createChatConversation(
   title?: string,
   // Reuse a scratch dir already minted by `createChatDir` (eager connect) so the
   // ACP cwd never moves across the first send; omit to let the backend mint one.
-  existingDir?: string
+  existingDir?: string,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<CreateChatConversationResult> {
   return getTransport().call("create_chat_conversation", {
     agentType,
     title: title ?? null,
     existingDir: existingDir ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
+  })
+}
+
+/** Persist a root-only session route override (`null` = inherit global). */
+export async function setConversationDelegationRoute(
+  conversationId: number,
+  routeOverride: DelegationRoutePolicy | null
+): Promise<DbConversationSummary> {
+  return getTransport().call("set_conversation_delegation_route", {
+    conversationId,
+    routeOverride,
+  })
+}
+
+/**
+ * Mark a row-less connected draft's observed route preference stale without
+ * mutating the running process. The next explicit reconnect applies it.
+ */
+export async function setDraftDelegationRoutePreference(
+  connectionId: string,
+  routeOverride: DelegationRoutePolicy | null
+): Promise<void> {
+  return getTransport().call("set_draft_delegation_route_preference", {
+    connectionId,
+    routeOverride,
   })
 }
 
@@ -3279,6 +3313,10 @@ export async function deleteModelProvider(id: number): Promise<void> {
 export interface DelegationSettings {
   enabled: boolean
   depth_limit: number
+  /** Global default managed route when a root has no session override. */
+  route_policy?: DelegationRoutePolicy
+  /** Soft-watchdog stall threshold in seconds (clamped 60..=3600). */
+  stalled_after_seconds?: number
   /** Per-parent byte budget (in MB) for the broker's in-memory cache of
    * completed sub-agent result text. `0` = unlimited. */
   completed_cache_max_mb: number

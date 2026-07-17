@@ -11,9 +11,9 @@ use sacp::schema::{
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
     TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
     ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
@@ -38,7 +38,6 @@ use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
 use crate::acp::terminal_context::{terminal_metadata, TerminalPromptContext};
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
-use crate::terminal::shell::ResolvedShellSpec;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
@@ -48,6 +47,7 @@ use crate::acp::types::{
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
+use crate::terminal::shell::ResolvedShellSpec;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
@@ -245,12 +245,13 @@ impl Drop for ConnectionCleanupGuard {
 }
 
 /// Per-component config fingerprint captured at spawn and compared after
-/// settings saves. Agent config and terminal shell are tracked independently
-/// so one surface can stay stale while the other is reverted.
+/// settings saves. Agent config, terminal shell, and delegation route are
+/// tracked independently so one surface can stay stale while another reverts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfigFingerprint {
     pub agent_config: String,
     pub terminal_shell: String,
+    pub delegation_route: String,
 }
 
 /// Latest settings values observed by staleness refresh (not necessarily the
@@ -267,10 +268,12 @@ pub struct ConnectionObservedConfig {
 pub fn matching_config_pair(
     agent_config: impl Into<String>,
     terminal_shell: impl Into<String>,
+    delegation_route: impl Into<String>,
 ) -> (ConnectionConfigFingerprint, ConnectionObservedConfig) {
     let fingerprint = ConnectionConfigFingerprint {
         agent_config: agent_config.into(),
         terminal_shell: terminal_shell.into(),
+        delegation_route: delegation_route.into(),
     };
     let observed = ConnectionObservedConfig {
         fingerprint: fingerprint.clone(),
@@ -286,6 +289,10 @@ pub struct AgentConnection {
     pub status: ConnectionStatus,
     pub owner_window_label: String,
     pub cmd_tx: mpsc::Sender<ConnectionCommand>,
+    /// Abort handle for the connection background task. Used by
+    /// `teardown_unexposed_attempt` to terminate before `run_conversation_loop`
+    /// starts (where a queued `Disconnect` would never drain).
+    pub task_abort: Option<tokio::task::AbortHandle>,
     /// 后端权威的会话状态。所有 `emit_with_state` 写入此状态并自增 seq。
     /// 使用 `Arc<RwLock<_>>` 让 spawn 出的连接 task 与外部 snapshot 读取共享。
     pub state: Arc<RwLock<SessionState>>,
@@ -308,12 +315,26 @@ pub struct AgentConnection {
     /// Most recent settings values seen by staleness refresh. Starts equal to
     /// `spawn_config`. Tracks "did anything change since we last looked" so a
     /// second real change re-emits `SessionConfigStale` while a no-op save
-    /// stays silent. Agent and shell components update independently.
+    /// stays silent. Agent, shell, and route components update independently.
     pub observed_config: ConnectionObservedConfig,
     /// Immutable terminal shell snapshot captured when this connection's
     /// process was spawned. Never re-read from settings after launch; reuse
     /// and reconnect keep this value for the connection's lifetime.
     pub terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
+    /// Immutable managed-route plan resolved once before process launch.
+    /// Settings/override changes never mutate this; they only refresh
+    /// `observed_config.fingerprint.delegation_route`.
+    pub route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    /// Connection origin used at launch (root vs forced Codeg child).
+    pub origin: crate::acp::delegation::route::DelegationConnectionOrigin,
+    /// Session route preference used for comparison re-resolution.
+    /// For persisted roots this mirrors the launch-time override; for
+    /// row-less drafts it may be updated by
+    /// `set_draft_delegation_route_preference` without touching `route_plan`.
+    pub route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    /// Exact capability snapshot used when resolving `route_plan` at launch.
+    /// Stale comparison re-resolves with these facts only — never optimistic.
+    pub route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot,
 }
 
 impl AgentConnection {
@@ -405,6 +426,126 @@ fn pi_launch_preflight(runtime_env: &BTreeMap<String, String>) -> Option<String>
     })
 }
 
+/// Single application point for process-scoped route suppression (Codex env,
+/// Grok/CodeBuddy argv). Call with the **complete** env and agent argv after
+/// base flags/subcommand/registry args are assembled, and before
+/// `AcpAgent::from_args`. Consumes `plan.native_suppression` only — never
+/// resolves policy. Idempotent.
+fn apply_process_route(
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    agent_type: AgentType,
+    env: &mut BTreeMap<String, String>,
+    argv: &mut Vec<String>,
+) -> Result<(), AcpError> {
+    apply_route_environment(agent_type, plan, env)?;
+    apply_route_argv(agent_type, plan, argv);
+    Ok(())
+}
+
+/// Classify suppression application for audit (no env values / secrets).
+pub(crate) fn suppression_application_for_plan(
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+) -> crate::acp::delegation::metrics::SuppressionApplication {
+    use crate::acp::delegation::metrics::SuppressionApplication;
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+    match &plan.native_suppression {
+        NativeSuppressionPlan::None => SuppressionApplication::NotApplicable,
+        _ => SuppressionApplication::Applied,
+    }
+}
+
+/// Codex Codeg only: set/override `CODEX_ACP_MULTI_AGENT=0`.
+/// Native, unmanaged, and non-Codex plans leave the key byte-for-byte untouched
+/// (including user values `0`/`1` and absence).
+fn apply_route_environment(
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), AcpError> {
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    if agent_type == AgentType::Codex
+        && matches!(
+            plan.native_suppression,
+            NativeSuppressionPlan::CodexMultiAgentFalse
+        )
+    {
+        env.insert("CODEX_ACP_MULTI_AGENT".into(), "0".into());
+    }
+    Ok(())
+}
+
+/// Route-scoped argv tokens for Grok (`--no-subagents`) and CodeBuddy
+/// (`--disallowedTools` union). Operates on the **complete** agent argv
+/// (command + base flags + registry/subcommand args). Idempotent; never drops
+/// or reorders unrelated tokens. No-ops for other agents / native plans.
+fn apply_route_argv(
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    argv: &mut Vec<String>,
+) {
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    match (&plan.native_suppression, agent_type) {
+        (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
+            // Structured insert: after root flags, before `agent stdio`.
+            if argv.iter().any(|a| a == "--no-subagents") {
+                return;
+            }
+            let insert_at = argv
+                .windows(2)
+                .position(|w| w[0] == "agent" && w[1] == "stdio")
+                .unwrap_or(argv.len());
+            argv.insert(insert_at, "--no-subagents".into());
+        }
+        (NativeSuppressionPlan::CodeBuddyDisallowedTools { tools }, AgentType::CodeBuddy) => {
+            apply_codebuddy_disallowed_tools(argv, tools);
+        }
+        _ => {}
+    }
+}
+
+/// Form one stable de-duplicated `--disallowedTools` union in `argv`, inserting
+/// Codeg denial tools once while preserving existing user denies (including
+/// `TaskOutput` / `TaskStop`). Emits before any trailing `--acp` token when
+/// present; otherwise appends at the end.
+fn apply_codebuddy_disallowed_tools(argv: &mut Vec<String>, suppress_tools: &[String]) {
+    let mut existing: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--disallowedTools" {
+            argv.remove(i);
+            while i < argv.len() && !argv[i].starts_with('-') {
+                existing.push(argv.remove(i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut union = existing;
+    for tool in suppress_tools {
+        if !union.iter().any(|t| t == tool) {
+            union.push(tool.clone());
+        }
+    }
+    if union.is_empty() {
+        return;
+    }
+
+    // Prefer immediately before `--acp` when that flag is present.
+    let insert_at = argv.iter().position(|a| a == "--acp").unwrap_or(argv.len());
+    let mut insert = Vec::with_capacity(1 + union.len());
+    insert.push("--disallowedTools".to_string());
+    insert.extend(union);
+    for (offset, tok) in insert.into_iter().enumerate() {
+        argv.insert(insert_at + offset, tok);
+    }
+}
+
+/// Base Npx launch args only (route-independent). Grok root flags and
+/// registry/subcommand tokens; **no** route suppression. Callers must build
+/// the complete argv then apply route once via [`apply_process_route`].
 fn append_npx_launch_args(
     parts: &mut Vec<String>,
     agent_type: AgentType,
@@ -414,6 +555,7 @@ fn append_npx_launch_args(
     if agent_type == AgentType::Grok {
         // Grok's native ask_user_question waits outside Codeg's QuestionRequest
         // flow. Remove it so structured questions use codeg-mcp instead.
+        // Independent of route: resolves a different Codeg question-tool collision.
         for arg in [
             "--no-auto-update",
             "--disallowed-tools",
@@ -434,6 +576,7 @@ async fn build_agent(
     agent_type: AgentType,
     runtime_env: &BTreeMap<String, String>,
     cwd: &Path,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<AcpAgent, AcpError> {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
@@ -473,11 +616,11 @@ async fn build_agent(
             // CODEX_ACP_USE_CLI). Never overwrites an explicit user value;
             // fails with SdkNotInstalled if host Codex is missing.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in &merged_env {
-                parts.push(format!("{k}={v}"));
-            }
-            parts.push(
+            let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
+            // Build complete agent argv first (command + base flags + registry
+            // args), then apply route exactly once over real env + argv.
+            let mut argv: Vec<String> = Vec::new();
+            argv.push(
                 crate::commands::acp::resolve_npx_command(cmd)
                     .await
                     .map(|p| p.to_string_lossy().to_string())
@@ -499,9 +642,14 @@ async fn build_agent(
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
+            // Route tokens (`--no-subagents`, CodeBuddy `--disallowedTools`) are
+            // applied once by `apply_process_route` on this complete argv.
             let grok_always_approve =
                 agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve();
-            append_npx_launch_args(&mut parts, agent_type, args, grok_always_approve);
+            append_npx_launch_args(&mut argv, agent_type, args, grok_always_approve);
+            apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
+            let mut parts: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
             let agent_name = meta.name.to_string();
             AcpAgent::from_args(&refs)
@@ -537,16 +685,19 @@ async fn build_agent(
                             meta.name
                         ))
                     })?;
-            let merged_env = apply_codex_cli_path_env(
-                agent_type,
-                merge_agent_env(env, runtime_env),
-            )?;
-            let mut parts: Vec<String> = merged_env
+            let merged_env =
+                apply_codex_cli_path_env(agent_type, merge_agent_env(env, runtime_env))?;
+            let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
+            // Bundled: complete argv first, then one route application (env + argv).
+            let mut argv: Vec<String> = Vec::new();
+            argv.push(binary_path.to_string_lossy().to_string());
+            argv.extend(args.iter().map(|arg| (*arg).to_string()));
+            apply_process_route(plan, agent_type, &mut env_map, &mut argv)?;
+            let mut parts: Vec<String> = env_map
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
-            parts.push(binary_path.to_string_lossy().to_string());
-            parts.extend(args.iter().map(|arg| (*arg).to_string()));
+            parts.extend(argv);
             let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
             let agent_name = meta.name.to_string();
             tracing::info!(
@@ -726,7 +877,8 @@ async fn build_agent(
                 // than provisioned through uvx.
                 tracing::warn!(
                     "[ACP][{}] uvx unavailable; falling back to system command {:?}",
-                    meta.name, sys_path
+                    meta.name,
+                    sys_path
                 );
                 // `system_cmd` is a complete launch recipe for the PATH binary;
                 // the uvx entry-script `args` don't necessarily apply to it
@@ -792,13 +944,17 @@ pub async fn spawn_agent_connection(
     session_id: Option<String>,
     runtime_env: BTreeMap<String, String>,
     terminal_shell: crate::terminal::shell::ResolvedShellSnapshot,
+    route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    origin: crate::acp::delegation::route::DelegationConnectionOrigin,
+    route_preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot,
     owner_window_label: String,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
-) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
+) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
@@ -809,12 +965,20 @@ pub async fn spawn_agent_connection(
         owner_window_label.clone(),
         None, // folder_id 由后续 prompt handler 在首次 send 时绑定 (Phase 2)
     );
+    // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
+    initial_state.set_route_plan_snapshot(&route_plan);
+    // Soft-supervisor wake (noop when injection lacks a handle).
+    if let Some(inj) = delegation_injection.as_ref() {
+        initial_state.supervisor_wake = inj.supervisor_wake.clone();
+    }
 
     // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
     // first event (StatusChanged{Connecting} below) doesn't race with the
     // installer. The receiver is returned to `spawn_agent`, which holds the
     // per-session dedup lock until this rx fires (or times out / aborts).
     let session_started_rx = initial_state.install_session_started_signal();
+    let (route_bootstrap_tx, route_bootstrap_rx) =
+        tokio::sync::oneshot::channel::<RouteBootstrapOutcome>();
 
     let session_state = Arc::new(RwLock::new(initial_state));
 
@@ -840,7 +1004,7 @@ pub async fn spawn_agent_connection(
     // agree. Computed here because `working_dir` is moved into run_connection
     // below.
     let launch_cwd = resolve_working_dir(working_dir.as_deref());
-    let agent = build_agent(agent_type, &runtime_env, &launch_cwd).await?;
+    let agent = build_agent(agent_type, &runtime_env, &launch_cwd, &route_plan).await?;
 
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
@@ -851,8 +1015,7 @@ pub async fn spawn_agent_connection(
     //
     // `runtime_env` may already carry SHELL / CODEG_TERMINAL_* declarations
     // and API keys; `build_terminal_base_env` keeps only GIT_CONFIG_* here.
-    let mut terminal_base_env =
-        crate::acp::terminal_context::build_terminal_base_env(&runtime_env);
+    let mut terminal_base_env = crate::acp::terminal_context::build_terminal_base_env(&runtime_env);
     // Also surface a codeg-installed OfficeCLI on the terminal's PATH: agents run
     // office skills' `officecli …` through this `terminal/create` tool, not as a
     // child of the agent process, so the agent-env injection alone wouldn't reach
@@ -874,6 +1037,7 @@ pub async fn spawn_agent_connection(
     let (spawn_config, observed_config) = matching_config_pair(
         crate::commands::acp::fingerprint_config(agent_type, &runtime_env),
         terminal_shell.selection_key.clone(),
+        route_plan.fingerprint.clone(),
     );
 
     // Insert the entry BEFORE spawning the background task so that a
@@ -882,21 +1046,26 @@ pub async fn spawn_agent_connection(
     connections.lock().await.insert(
         connection_id.clone(),
         AgentConnection {
-            id: connection_id,
+            id: connection_id.clone(),
             agent_type,
             status: ConnectionStatus::Connecting,
             owner_window_label,
             cmd_tx,
+            task_abort: None,
             state: Arc::clone(&session_state),
             emitter: emitter.clone(),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             spawn_config,
             observed_config,
             terminal_shell: terminal_shell.clone(),
+            route_plan: route_plan.clone(),
+            origin,
+            route_preference,
+            route_capability,
         },
     );
 
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         // RAII guard: runs on normal exit AND on panic unwinding, so a
         // panic inside `run_connection` can't leak a stale map entry.
         let _cleanup = ConnectionCleanupGuard {
@@ -905,6 +1074,8 @@ pub async fn spawn_agent_connection(
         };
 
         let delegation_for_cleanup = delegation_injection.clone();
+        // run_connection reports bootstrap via oneshot; map AcpError paths to
+        // typed outcomes for the manager's single-attempt fallback policy.
         let result = run_connection(
             agent,
             conn_id.clone(),
@@ -919,19 +1090,21 @@ pub async fn spawn_agent_connection(
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
+            route_plan,
+            route_bootstrap_tx,
         )
         .await;
 
-        // Revoke the per-launch token + cascade cancel any still-pending
-        // delegations AND questions owned by this parent connection. All are
-        // best-effort: a missing token entry is a no-op, and both
-        // `cancel_by_parent` calls are safe on an empty pending map.
+        // Revoke the per-launch token + ready lease + cascade cancel any
+        // still-pending delegations AND questions owned by this parent.
+        // All are best-effort: a missing token entry is a no-op.
         if let Some(inj) = delegation_for_cleanup {
             let token = {
                 let snap = state_clone.read().await;
                 snap.delegation_token.clone()
             };
             if let Some(tok) = token {
+                inj.leases.revoke(&tok).await;
                 inj.tokens.revoke(&tok).await;
             }
             inj.broker.cancel_by_parent(&conn_id).await;
@@ -985,7 +1158,19 @@ pub async fn spawn_agent_connection(
         // the manager map. Same drop semantics apply on panic unwinding.
     });
 
-    Ok(session_started_rx)
+    // Install abort handle so unexposed teardown can terminate before the
+    // conversation loop (Disconnect would never drain there).
+    {
+        let mut map = connections.lock().await;
+        if let Some(conn) = map.get_mut(&connection_id) {
+            conn.task_abort = Some(join_handle.abort_handle());
+        }
+    }
+
+    Ok(SpawnHandshake {
+        session_started_rx,
+        route_bootstrap_rx,
+    })
 }
 
 /// Shared state for pending permission responders.
@@ -1541,13 +1726,12 @@ fn sync_file_system_outside_access(
     agent_type: AgentType,
     mode_id: Option<&str>,
 ) {
-    let allow = if agent_type == AgentType::Grok
-        && crate::commands::acp::grok_launch_always_approve()
-    {
-        true
-    } else {
-        mode_id.is_some_and(mode_allows_outside_workspace)
-    };
+    let allow =
+        if agent_type == AgentType::Grok && crate::commands::acp::grok_launch_always_approve() {
+            true
+        } else {
+            mode_id.is_some_and(mode_allows_outside_workspace)
+        };
     file_system_runtime.set_allow_outside_workspace(allow);
 }
 
@@ -1572,15 +1756,91 @@ fn claude_raw_sdk_session_meta(
     Some(meta)
 }
 
-/// Merge Claude raw-SDK meta (when applicable) with the connection's
-/// authoritative terminal snapshot and any adapter contributions.
+/// Pure deep-merge of Claude Code route suppression into ACP `_meta`.
+///
+/// Validates `claudeCode` / `options` / `disallowedTools` object/array shapes.
+/// Malformed shapes return `RouteUnavailable { NativeSuppressionInvalid }`
+/// before any session request is sent. On Codeg, appends missing `Agent`/`Task`
+/// (from the plan) exactly once. On native / non-Claude plans, returns input
+/// metadata serde-value-equivalent (no Codeg deny injection).
+fn merge_claude_route_meta(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+) -> Result<serde_json::Map<String, serde_json::Value>, AcpError> {
+    use crate::acp::delegation::route::{NativeSuppressionPlan, RouteDegradedReason};
+
+    let suppress_tools = match &plan.native_suppression {
+        NativeSuppressionPlan::ClaudeDisallowedTools { tools } => tools.as_slice(),
+        _ => return Ok(meta),
+    };
+
+    // Validate shapes even when we will merge (and when empty map has no claudeCode yet).
+    if let Some(claude_val) = meta.get("claudeCode") {
+        if !claude_val.is_object() {
+            return Err(AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            });
+        }
+        let claude = claude_val.as_object().expect("checked is_object");
+        if let Some(options_val) = claude.get("options") {
+            if !options_val.is_object() {
+                return Err(AcpError::RouteUnavailable {
+                    reason: RouteDegradedReason::NativeSuppressionInvalid,
+                });
+            }
+            if let Some(tools_val) = options_val.get("disallowedTools") {
+                if !tools_val.is_array() {
+                    return Err(AcpError::RouteUnavailable {
+                        reason: RouteDegradedReason::NativeSuppressionInvalid,
+                    });
+                }
+            }
+        }
+    }
+
+    let claude = meta
+        .entry("claudeCode".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let claude_obj = claude.as_object_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    let options = claude_obj
+        .entry("options".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let options_obj = options.as_object_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    let tools_val = options_obj
+        .entry("disallowedTools".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let tools_arr = tools_val.as_array_mut().ok_or(AcpError::RouteUnavailable {
+        reason: RouteDegradedReason::NativeSuppressionInvalid,
+    })?;
+
+    for tool in suppress_tools {
+        let already = tools_arr.iter().any(|v| v.as_str() == Some(tool.as_str()));
+        if !already {
+            tools_arr.push(serde_json::Value::String(tool.clone()));
+        }
+    }
+
+    Ok(meta)
+}
+
+/// Merge Claude raw-SDK meta, route suppression, terminal snapshot, and adapter
+/// contributions. Consumes the immutable `route_plan` only for
+/// `native_suppression` (Claude deny list).
 fn session_request_meta(
     agent_type: AgentType,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
 ) -> Result<Meta, AcpError> {
     let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
-    terminal_metadata(existing, spec, adapter)
+    let with_route = merge_claude_route_meta(existing, route_plan)?;
+    terminal_metadata(with_route, spec, adapter)
 }
 
 /// Build the ACP `initialize` request, declaring client capabilities and the
@@ -1607,8 +1867,9 @@ fn build_new_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<NewSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = NewSessionRequest::new(cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -1623,8 +1884,9 @@ fn build_load_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<LoadSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -1644,8 +1906,9 @@ fn build_resume_session_request(
     mcp_servers: Vec<McpServer>,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Result<ResumeSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
     let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -1667,14 +1930,12 @@ async fn send_resume_session(
     cx: &ConnectionTo<Agent>,
     req: ResumeSessionRequest,
 ) -> Result<ResumeSessionResponse, sacp::Error> {
-    let untyped_req = UntypedMessage::new("session/resume", req).map_err(|e| {
-        sacp::util::internal_error(format!("Failed to build resume request: {e}"))
-    })?;
+    let untyped_req = UntypedMessage::new("session/resume", req)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to build resume request: {e}")))?;
 
     let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
-    serde_json::from_value(raw_response).map_err(|e| {
-        sacp::util::internal_error(format!("Failed to parse resume response: {e}"))
-    })
+    serde_json::from_value(raw_response)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to parse resume response: {e}")))
 }
 
 /// Whether MCP servers forwarded over the ACP wire (`session/new.mcpServers`)
@@ -1686,7 +1947,7 @@ async fn send_resume_session(
 /// (`feedback_tool_available`, a registered delegation token pi can never use).
 /// `supports_mcp` stays `true` for pi (session/new tolerates the field), so this
 /// is a separate, narrower gate. Gate codeg-mcp injection on it.
-fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
+pub(crate) fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
     !matches!(agent_type, AgentType::Pi)
 }
 
@@ -1744,14 +2005,17 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
 pub struct DelegationInjection {
     pub broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
     pub tokens: Arc<crate::acp::delegation::listener::TokenRegistry>,
+    /// Authenticated ready-lease registry. Lease waiters are registered at
+    /// MCP injection when the immutable plan exposes Codeg delegation.
+    pub leases: Arc<crate::acp::delegation::lease::CompanionLeaseRegistry>,
     pub socket_path: PathBuf,
     /// Hot-swappable "is live-feedback enabled?" flag. Read at injection time
-    /// alongside the broker's delegation flag so `codeg-mcp` is injected when
-    /// EITHER feature is on, and the companion is told which tool groups to
-    /// expose. Shares the same `tokens` registry and UDS socket as delegation.
+    /// so `codeg-mcp` is injected when feedback (or ask/sessions) is on even
+    /// when the plan omits Codeg delegation. Shares the same `tokens` registry
+    /// and UDS socket as the ready lease.
     pub feedback: crate::acp::feedback::FeedbackRuntimeConfig,
     /// Hot-swappable "is ask-user-question enabled?" flag. Read at injection
-    /// time alongside delegation + feedback so `codeg-mcp` is injected when ANY
+    /// time alongside feedback/sessions so `codeg-mcp` is injected when ANY
     /// of the three is on, and the companion's `--features` lists `ask` to expose
     /// the `ask_user_question` tool.
     pub ask: crate::acp::question::QuestionRuntimeConfig,
@@ -1766,6 +2030,37 @@ pub struct DelegationInjection {
     /// the delegation `broker.cancel_by_parent` cleanup. Shares the same backing
     /// `ConnectionManager` as the listener's question lookup.
     pub questions: Arc<dyn crate::acp::question::SessionQuestionAccess>,
+    /// Soft-supervisor wake handle. Cloned onto each `SessionState` at spawn so
+    /// agent activity and permission/question changes can nudge the supervisor.
+    /// Default `noop` until bootstrap installs a live channel.
+    pub supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
+    /// Process-local reliability metrics (route validation at launch).
+    pub metrics: std::sync::Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+}
+
+/// Typed bootstrap outcome from the connection task to the manager.
+/// Only `RouteSpecific` may trigger a root safe-native fallback.
+#[derive(Debug)]
+pub enum RouteBootstrapOutcome {
+    Ready,
+    RouteSpecific(crate::acp::delegation::route::RouteDegradedReason),
+    Fatal(AcpError),
+}
+
+impl RouteBootstrapOutcome {
+    pub fn into_acp_error(self) -> AcpError {
+        match self {
+            Self::Ready => AcpError::Protocol("unexpected Ready as error".into()),
+            Self::RouteSpecific(reason) => AcpError::RouteUnavailable { reason },
+            Self::Fatal(error) => error,
+        }
+    }
+}
+
+/// Handles returned by [`spawn_agent_connection`] for dedup + route readiness.
+pub struct SpawnHandshake {
+    pub session_started_rx: tokio::sync::oneshot::Receiver<()>,
+    pub route_bootstrap_rx: tokio::sync::oneshot::Receiver<RouteBootstrapOutcome>,
 }
 
 /// Locate the `codeg-mcp` companion binary across the supported deployment
@@ -1789,7 +2084,7 @@ pub struct DelegationInjection {
 /// injection — never paper over with a phantom path, because that fails
 /// inside the agent's MCP spawn loop and may take the entire ACP session
 /// down on stricter agents.
-fn locate_codeg_mcp_binary() -> Option<PathBuf> {
+pub(crate) fn locate_codeg_mcp_binary() -> Option<PathBuf> {
     let filename = if cfg!(windows) {
         "codeg-mcp.exe"
     } else {
@@ -1878,11 +2173,14 @@ fn companion_features_arg(
 }
 
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
-/// stash for revocation, plus whether the `check_user_feedback` tool was exposed
-/// to this agent (so the session can gate submit + UI on its real capability).
+/// stash for revocation, whether feedback was exposed, and an optional ready
+/// lease waiter (required only when the plan exposes Codeg delegation).
 struct CompanionInjection {
     token: String,
     feedback_available: bool,
+    /// Present when `plan.expose_codeg_delegation` — manager/connection wait
+    /// on this before emitting Connected.
+    delegation_lease: Option<crate::acp::delegation::lease::CompanionLeaseWaiter>,
 }
 
 async fn inject_codeg_mcp(
@@ -1890,12 +2188,12 @@ async fn inject_codeg_mcp(
     injection: &DelegationInjection,
     parent_connection_id: &str,
     working_dir: &Path,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Option<CompanionInjection> {
-    // codeg-mcp carries BOTH the delegation tools and the live-feedback tool.
-    // Inject it when EITHER feature is enabled; the `--features` arg tells the
-    // companion which tool groups to expose so a disabled feature's tools never
-    // surface to the LLM. (Historically this was gated on delegation alone.)
-    let delegation_enabled = injection.broker.config_snapshot().await.enabled;
+    // Feature list follows the immutable launch plan for Codeg delegation —
+    // never the live Broker settings toggle. Feedback/ask/sessions remain
+    // independent launch-time snapshots of their runtime configs.
+    let delegation_enabled = plan.expose_codeg_delegation;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
@@ -1926,6 +2224,13 @@ async fn inject_codeg_mcp(
             },
         )
         .await;
+    // Register the ready lease BEFORE exposing the MCP entry so a fast
+    // companion cannot race mark_ready against an unregistered token.
+    let delegation_lease = if plan.expose_codeg_delegation {
+        Some(injection.leases.register(token.clone()).await)
+    } else {
+        None
+    };
     let mut server = McpServerStdio::new("codeg-mcp", binary_path);
     server = server.args(vec![
         "--parent-connection-id".to_string(),
@@ -1948,6 +2253,7 @@ async fn inject_codeg_mcp(
     Some(CompanionInjection {
         token,
         feedback_available: feedback_enabled,
+        delegation_lease,
     })
 }
 
@@ -2047,6 +2353,133 @@ fn canonical_spec_to_mcp_server(name: &str, spec: &serde_json::Value) -> Result<
     }
 }
 
+/// Emit the single post-ready companion-unavailable surface: availability event
+/// plus secret-free `delegation_unavailable` audit. Does not touch route fields.
+async fn emit_post_ready_unavailable(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    connection_id: &str,
+    conversation_id: Option<i32>,
+    agent_type: AgentType,
+) {
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::DelegationAvailabilityChanged { available: false },
+    )
+    .await;
+    crate::acp::delegation::metrics::DelegationAuditRecord::availability(
+        connection_id,
+        conversation_id,
+        agent_type,
+    )
+    .emit_availability();
+}
+
+/// After ACP session/new|load|resume succeeds: wait for Codeg ready lease when
+/// required, emit Connected, signal bootstrap Ready, and monitor post-ready
+/// availability (false → one `DelegationAvailabilityChanged` only + one
+/// `delegation_unavailable` audit). Never mutates immutable route fields.
+async fn finish_route_ready(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    pending_lease: &mut Option<crate::acp::delegation::lease::CompanionLeaseWaiter>,
+    route_bootstrap_tx: &Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
+    >,
+) -> Result<(), sacp::Error> {
+    use crate::acp::delegation::lease::ready_lease_timeout;
+    use crate::acp::delegation::route::RouteDegradedReason;
+
+    if route_plan.expose_codeg_delegation {
+        let Some(mut waiter) = pending_lease.take() else {
+            let mut guard = route_bootstrap_tx.lock().await;
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(RouteBootstrapOutcome::RouteSpecific(
+                    RouteDegradedReason::CompanionInitializationFailed,
+                ));
+            }
+            return Err(sacp::util::internal_error(
+                "codeg delegation ready lease missing",
+            ));
+        };
+        if waiter.wait_ready(ready_lease_timeout()).await.is_err() {
+            let mut guard = route_bootstrap_tx.lock().await;
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(RouteBootstrapOutcome::RouteSpecific(
+                    RouteDegradedReason::CompanionInitializationFailed,
+                ));
+            }
+            return Err(sacp::util::internal_error(
+                "codeg delegation ready lease failed",
+            ));
+        }
+        {
+            let mut s = state.write().await;
+            s.set_delegation_available(true);
+        }
+        // Post-ready close: flip availability only; one event; no route change.
+        // Check current value first so a close that races before the monitor
+        // starts still emits exactly once (watch::changed misses past values).
+        let mut availability = waiter.availability();
+        let state_m = Arc::clone(state);
+        let emitter_m = emitter.clone();
+        // Capture ids for the availability audit before the monitor task;
+        // route plan fields stay immutable. Metrics Arc is not recreated here —
+        // availability is an audit-only surface (no counter); injection metrics
+        // remain the single process-wide instance elsewhere.
+        let (audit_connection_id, audit_conversation_id, audit_agent_type) = {
+            let s = state.read().await;
+            (s.connection_id.clone(), s.conversation_id, s.agent_type)
+        };
+        tokio::spawn(async move {
+            loop {
+                if !*availability.borrow() {
+                    emit_post_ready_unavailable(
+                        &state_m,
+                        &emitter_m,
+                        &audit_connection_id,
+                        audit_conversation_id,
+                        audit_agent_type,
+                    )
+                    .await;
+                    break;
+                }
+                if availability.changed().await.is_err() {
+                    // Sender dropped while still true — treat as unavailable.
+                    if *availability.borrow() {
+                        emit_post_ready_unavailable(
+                            &state_m,
+                            &emitter_m,
+                            &audit_connection_id,
+                            audit_conversation_id,
+                            audit_agent_type,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::StatusChanged {
+            status: ConnectionStatus::Connected,
+        },
+    )
+    .await;
+
+    let mut guard = route_bootstrap_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(RouteBootstrapOutcome::Ready);
+    }
+    Ok(())
+}
+
 /// The main ACP connection loop.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
@@ -2073,7 +2506,11 @@ async fn run_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    route_bootstrap_tx: tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
 ) -> Result<(), AcpError> {
+    // Shared so nested session paths can complete bootstrap exactly once.
+    let route_bootstrap_tx = Arc::new(tokio::sync::Mutex::new(Some(route_bootstrap_tx)));
     let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // `terminal_base_env` already filtered to just the credential helper
     // keys upstream — see `spawn_agent_connection` for the rationale and
@@ -2138,7 +2575,7 @@ async fn run_connection(
         Arc::clone(&prompt_ledger),
     );
 
-    Client
+    let connect_with_result = Client
         .builder()
         .name("codeg")
         .on_receive_request(
@@ -2248,7 +2685,9 @@ async fn run_connection(
             },
             on_receive_request!(),
         )
-        .connect_with(agent, async move |cx| -> Result<(), sacp::Error> {
+        .connect_with(agent, {
+            let route_bootstrap_tx = Arc::clone(&route_bootstrap_tx);
+            async move |cx| -> Result<(), sacp::Error> {
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
@@ -2380,15 +2819,17 @@ async fn run_connection(
             // filter needed. The returned token is stashed on the session
             // state so connection teardown can revoke it. Skipped entirely
             // for agents that don't accept MCP over the wire (above).
-            let delegate_injection = if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
-                if let Some(inj) = delegation_injection.as_ref() {
-                    inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd).await
+            let mut delegate_injection =
+                if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
+                    if let Some(inj) = delegation_injection.as_ref() {
+                        inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd, &route_plan)
+                            .await
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             if let Some(ref injected) = delegate_injection {
                 let mut s = state.write().await;
                 s.delegation_token = Some(injected.token.clone());
@@ -2396,6 +2837,10 @@ async fn run_connection(
                 // authoritative gate for submit + UI, fixed at launch.
                 s.feedback_tool_available = injected.feedback_available;
             }
+            // Take the lease waiter out so we can wait on it after ACP session.
+            let mut pending_lease = delegate_injection
+                .as_mut()
+                .and_then(|i| i.delegation_lease.take());
 
             // Emit fork support capability
             emit_with_state(
@@ -2407,18 +2852,10 @@ async fn run_connection(
             )
             .await;
 
-            // Emit connected status early so the frontend can show cached
-            // selectors and enable sending while the session initialises.
-            // Prompts sent before run_conversation_loop are buffered in
-            // the cmd_rx channel and processed as soon as the loop starts.
-            emit_with_state(
-                &state,
-                &emitter_clone,
-                AcpEvent::StatusChanged {
-                    status: ConnectionStatus::Connected,
-                },
-            )
-            .await;
+            // Connected is deferred until ACP session succeeds AND (for Codeg
+            // delegation routes) the authenticated ready lease is ready.
+            // Prompts sent before run_conversation_loop are still buffered in
+            // cmd_rx and processed as soon as the loop starts.
 
             if let Some(sid) = session_id {
                 // Prefer session/resume when the agent advertises the
@@ -2429,15 +2866,22 @@ async fn run_connection(
                 // we fall through to the session/load block below, so the
                 // effective chain is resume → load → new.
                 if supports_resume {
-                    let resume_req = build_resume_session_request(
+                    let resume_req = match build_resume_session_request(
                         agent_type,
                         SessionId::new(sid.clone()),
                         &cwd,
                         mcp_servers.clone(),
                         &terminal_shell.spec,
                         adapter_for(agent_type),
-                    )
-                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                        &route_plan,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(
+                                bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await
+                            );
+                        }
+                    };
                     match send_resume_session(&cx, resume_req).await {
                         Ok(resume_resp) => {
                             let initial_config_options = resume_resp.config_options.clone();
@@ -2480,6 +2924,14 @@ async fn run_connection(
                             )
                             .await;
                             emit_selectors_ready(&state, &emitter_clone).await;
+                            finish_route_ready(
+                                &state,
+                                &emitter_clone,
+                                &route_plan,
+                                &mut pending_lease,
+                                &route_bootstrap_tx,
+                            )
+                            .await?;
 
                             let loop_result = run_conversation_loop(
                                 &mut session,
@@ -2494,6 +2946,7 @@ async fn run_connection(
                                 &cwd_string,
                                 supports_fork,
                                 &terminal_shell.spec,
+                                &route_plan,
                                 &prompt_ledger,
                                 &terminal_prompt_context,
                                 delegation_injection.as_ref(),
@@ -2518,6 +2971,7 @@ async fn run_connection(
                                 &cwd,
                                 &cwd_string,
                                 &terminal_shell.spec,
+                                &route_plan,
                                 &prompt_ledger,
                                 &terminal_prompt_context,
                                 delegation_injection.as_ref(),
@@ -2547,15 +3001,20 @@ async fn run_connection(
                 }
 
                 // Load existing session via session/load
-                let load_req = build_load_session_request(
+                let load_req = match build_load_session_request(
                     agent_type,
                     SessionId::new(sid.clone()),
                     &cwd,
                     mcp_servers.clone(),
                     &terminal_shell.spec,
                     adapter_for(agent_type),
-                )
-                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                    &route_plan,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Err(bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await);
+                    }
+                };
                 let load_result = cx.send_request_to(Agent, load_req).block_task().await;
 
                 match load_result {
@@ -2616,7 +3075,12 @@ async fn run_connection(
                                     })
                                     .await
                                     .otherwise(async |dispatch| {
-                                        maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                        // Historical replay: never counts as
+                                        // agent activity for the soft watchdog.
+                                        let _ = maybe_emit_claude_sdk_ext_notification(
+                                            &st, &h, dispatch,
+                                        )
+                                        .await;
                                         Ok(())
                                     })
                                     .await;
@@ -2649,6 +3113,14 @@ async fn run_connection(
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
+                        finish_route_ready(
+                            &state,
+                            &emitter_clone,
+                            &route_plan,
+                            &mut pending_lease,
+                            &route_bootstrap_tx,
+                        )
+                        .await?;
 
                         let loop_result = run_conversation_loop(
                             &mut session,
@@ -2663,6 +3135,7 @@ async fn run_connection(
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -2683,6 +3156,7 @@ async fn run_connection(
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -2753,18 +3227,23 @@ async fn run_connection(
                             )
                             .await;
                         }
+                        let new_session_req = match build_new_session_request(
+                            agent_type,
+                            &cwd,
+                            mcp_servers.clone(),
+                            &terminal_shell.spec,
+                            adapter_for(agent_type),
+                            &route_plan,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Err(
+                                    bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await
+                                );
+                            }
+                        };
                         let new_resp = cx
-                            .send_request_to(
-                                Agent,
-                                build_new_session_request(
-                                    agent_type,
-                                    &cwd,
-                                    mcp_servers.clone(),
-                                    &terminal_shell.spec,
-                                    adapter_for(agent_type),
-                                )
-                                .map_err(|e| sacp::util::internal_error(e.to_string()))?,
-                            )
+                            .send_request_to(Agent, new_session_req)
                             .block_task()
                             .await?;
                         let fallback_sid = new_resp.session_id.0.to_string();
@@ -2798,6 +3277,14 @@ async fn run_connection(
                         )
                         .await;
                         emit_selectors_ready(&state, &emitter_clone).await;
+                        finish_route_ready(
+                            &state,
+                            &emitter_clone,
+                            &route_plan,
+                            &mut pending_lease,
+                            &route_bootstrap_tx,
+                        )
+                        .await?;
 
                         let loop_result = run_conversation_loop(
                             &mut session,
@@ -2812,6 +3299,7 @@ async fn run_connection(
                             &cwd_string,
                             supports_fork,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -2834,6 +3322,7 @@ async fn run_connection(
                             &cwd,
                             &cwd_string,
                             &terminal_shell.spec,
+                            &route_plan,
                             &prompt_ledger,
                             &terminal_prompt_context,
                             delegation_injection.as_ref(),
@@ -2843,18 +3332,21 @@ async fn run_connection(
                 }
             } else {
                 // Create new session
+                let new_session_req = match build_new_session_request(
+                    agent_type,
+                    &cwd,
+                    mcp_servers.clone(),
+                    &terminal_shell.spec,
+                    adapter_for(agent_type),
+                    &route_plan,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Err(bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await);
+                    }
+                };
                 let new_resp = cx
-                    .send_request_to(
-                        Agent,
-                        build_new_session_request(
-                            agent_type,
-                            &cwd,
-                            mcp_servers.clone(),
-                            &terminal_shell.spec,
-                            adapter_for(agent_type),
-                        )
-                        .map_err(|e| sacp::util::internal_error(e.to_string()))?,
-                    )
+                    .send_request_to(Agent, new_session_req)
                     .block_task()
                     .await?;
                 let sid = new_resp.session_id.0.to_string();
@@ -2888,6 +3380,14 @@ async fn run_connection(
                 )
                 .await;
                 emit_selectors_ready(&state, &emitter_clone).await;
+                finish_route_ready(
+                    &state,
+                    &emitter_clone,
+                    &route_plan,
+                    &mut pending_lease,
+                    &route_bootstrap_tx,
+                )
+                .await?;
 
                 let loop_result = run_conversation_loop(
                     &mut session,
@@ -2902,6 +3402,7 @@ async fn run_connection(
                     &cwd_string,
                     supports_fork,
                     &terminal_shell.spec,
+                    &route_plan,
                     &prompt_ledger,
                     &terminal_prompt_context,
                     delegation_injection.as_ref(),
@@ -2922,22 +3423,93 @@ async fn run_connection(
                     &cwd,
                     &cwd_string,
                     &terminal_shell.spec,
+                    &route_plan,
                     &prompt_ledger,
                     &terminal_prompt_context,
                     delegation_injection.as_ref(),
                 )
                 .await
             }
-        })
-        .await
-        .map_err(|e| {
-            let raw = e.to_string();
-            if raw.contains(INIT_TIMEOUT_SENTINEL) {
-                AcpError::InitializeTimeout
-            } else {
-                AcpError::protocol(raw)
-            }
-        })
+        }})
+        .await;
+    match connect_with_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let acp_err = classify_connect_error_residual(&e.to_string());
+            // Deterministic awaited send: never try_lock-suppress the outcome.
+            // If a typed path already took the sender (suppression preflight /
+            // finish_route_ready), this is a no-op.
+            send_bootstrap_outcome_once(
+                &route_bootstrap_tx,
+                bootstrap_outcome_from_acp_error(&acp_err),
+            )
+            .await;
+            Err(acp_err)
+        }
+    }
+}
+
+/// Typed mapping from [`AcpError`] to bootstrap outcome. **No string parsing.**
+/// Only `NativeSuppressionInvalid` and `CompanionInitializationFailed` yield
+/// [`RouteBootstrapOutcome::RouteSpecific`]; auth/provider/SDK/process/generic
+/// ACP errors (and any other `RouteUnavailable` reason) are `Fatal`.
+fn bootstrap_outcome_from_acp_error(err: &AcpError) -> RouteBootstrapOutcome {
+    use crate::acp::delegation::route::RouteDegradedReason;
+    match err {
+        AcpError::RouteUnavailable { reason }
+            if matches!(
+                reason,
+                RouteDegradedReason::NativeSuppressionInvalid
+                    | RouteDegradedReason::CompanionInitializationFailed
+            ) =>
+        {
+            RouteBootstrapOutcome::RouteSpecific(*reason)
+        }
+        AcpError::InitializeTimeout => RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout),
+        AcpError::SdkNotInstalled(m) => {
+            RouteBootstrapOutcome::Fatal(AcpError::SdkNotInstalled(m.clone()))
+        }
+        AcpError::RouteUnavailable { reason } => {
+            RouteBootstrapOutcome::Fatal(AcpError::RouteUnavailable { reason: *reason })
+        }
+        other => RouteBootstrapOutcome::Fatal(AcpError::protocol(other.to_string())),
+    }
+}
+
+/// Send bootstrap outcome exactly once (first caller wins). Uses awaited lock.
+async fn send_bootstrap_outcome_once(
+    route_bootstrap_tx: &Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
+    >,
+    outcome: RouteBootstrapOutcome,
+) {
+    let mut guard = route_bootstrap_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(outcome);
+    }
+}
+
+/// Bridge a typed [`AcpError`] across the sacp boundary: publish the typed
+/// bootstrap outcome first, then convert to a display-only sacp error.
+async fn bridge_acp_err_for_bootstrap(
+    e: AcpError,
+    route_bootstrap_tx: &Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
+    >,
+) -> sacp::Error {
+    send_bootstrap_outcome_once(route_bootstrap_tx, bootstrap_outcome_from_acp_error(&e)).await;
+    sacp::util::internal_error(e.to_string())
+}
+
+/// Residual sacp-string classification for errors that never had a typed
+/// [`AcpError`] side channel. Recovers **only** the initialize-timeout
+/// sentinel. Deliberately does **not** parse `RouteUnavailable` / ready-lease
+/// display strings — those must arrive via typed bootstrap side channels.
+fn classify_connect_error_residual(raw: &str) -> AcpError {
+    if raw.contains(INIT_TIMEOUT_SENTINEL) {
+        return AcpError::InitializeTimeout;
+    }
+    AcpError::protocol(raw)
 }
 
 /// Store the permission responder and emit event to frontend.
@@ -3019,12 +3591,7 @@ async fn emit_cancelled_permission_events(
     request_ids: impl IntoIterator<Item = String>,
 ) {
     for request_id in request_ids {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::PermissionResolved { request_id },
-        )
-        .await;
+        emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
     }
 }
 
@@ -3173,7 +3740,9 @@ async fn apply_preferred_session_options(
             )
             .await
             {
-                tracing::error!("[ACP] failed to apply preferred mode '{pref_mode}' on connect: {e}");
+                tracing::error!(
+                    "[ACP] failed to apply preferred mode '{pref_mode}' on connect: {e}"
+                );
             }
         } else {
             // Preferred mode already active — still align the client FS sandbox.
@@ -3733,7 +4302,8 @@ async fn poll_tracked_terminal_tool_calls(
                 Err(err) => {
                     tracing::error!(
                         "[ACP] Failed to poll terminal output for tool call {}: {:?}",
-                        tool_call_id, err
+                        tool_call_id,
+                        err
                     );
                     continue;
                 }
@@ -3842,6 +4412,8 @@ async fn handle_fork_or_exit(
     cwd_string: &str,
     // Immutable connection shell snapshot — never re-read from settings.
     shell_spec: &ResolvedShellSpec,
+    // Same immutable launch route plan as the original session loop.
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
@@ -3866,7 +4438,8 @@ async fn handle_fork_or_exit(
 
     tracing::info!(
         "[ACP] Fork transition: attaching to forked session {} (original: {})",
-        new_sid, fork_info.original_session_id
+        new_sid,
+        fork_info.original_session_id
     );
 
     // Reply protocol-level result to manager.fork_session, which will combine
@@ -3929,6 +4502,7 @@ async fn handle_fork_or_exit(
         cwd_string,
         true, // fork already succeeded on this process
         shell_spec,
+        route_plan,
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
@@ -3951,6 +4525,7 @@ async fn handle_fork_or_exit(
         _cwd,
         cwd_string,
         shell_spec,
+        route_plan,
         prompt_ledger,
         terminal_prompt_context,
         delegation_injection,
@@ -4010,8 +4585,7 @@ fn classify_session_load_failure(
     //                          "The Claude Agent process exited unexpectedly…"
     //  - "session has ended" → SESSION_ENDED_MESSAGE
     //  - "Session not found" → a plain Error rethrown as an Internal error
-    const UNRECOVERABLE: &[&str] =
-        &["process exited", "session has ended", "Session not found"];
+    const UNRECOVERABLE: &[&str] = &["process exited", "session has ended", "Session not found"];
     if UNRECOVERABLE.iter().any(|s| message.contains(s)) {
         return Some("session_unavailable");
     }
@@ -4034,6 +4608,22 @@ fn is_agent_output_update(update: &SessionUpdate) -> bool {
             | SessionUpdate::AgentThoughtChunk(_)
             | SessionUpdate::ToolCall(_)
             | SessionUpdate::ToolCallUpdate(_)
+    )
+}
+
+/// Soft-watchdog activity classifier. True only for Agent transcript /
+/// thinking chunks, tool start/update/progress, and plan activity.
+/// User/frontend keepalive, commands, usage, status, and session-info noise
+/// do **not** count. Distinct from [`is_agent_output_update`] (which excludes
+/// `Plan` for silent-EndTurn detection).
+pub(crate) fn advances_agent_activity(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
     )
 }
 
@@ -4103,6 +4693,9 @@ async fn run_conversation_loop<'a>(
     supports_fork: bool,
     // Immutable connection shell snapshot for `session/fork` metadata.
     shell_spec: &ResolvedShellSpec,
+    // Immutable launch route plan — fork reuses the same Claude deny merge as
+    // new/load/resume; never re-resolves policy.
+    route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
@@ -4142,13 +4735,25 @@ async fn run_conversation_loop<'a>(
                             let _ = MatchDispatch::new(dispatch)
                                 .if_notification(
                                     async |notif: SessionNotification| {
+                                        // Soft-watchdog: mark agent activity at
+                                        // the inbound boundary, before conversion.
+                                        if advances_agent_activity(&notif.update) {
+                                            st.write().await.mark_agent_activity(chrono::Utc::now());
+                                        }
                                         emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
                                         Ok(())
                                     },
                                 )
                                 .await
                                 .otherwise(async |dispatch| {
-                                    maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                    if maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch)
+                                        .await
+                                    {
+                                        // Only when a normalizer advanced
+                                        // transcript/tool state (currently never
+                                        // for api_retry-only envelopes).
+                                        st.write().await.mark_agent_activity(chrono::Utc::now());
+                                    }
                                     Ok(())
                                 })
                                 .await;
@@ -4297,6 +4902,13 @@ async fn run_conversation_loop<'a>(
                                                 if is_agent_output_update(&notif.update) {
                                                     turn_had_agent_output = true;
                                                 }
+                                                // Soft-watchdog: mark at inbound
+                                                // boundary before event conversion.
+                                                if advances_agent_activity(&notif.update) {
+                                                    st.write()
+                                                        .await
+                                                        .mark_agent_activity(chrono::Utc::now());
+                                                }
                                                 emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
                                                 if should_poll_now {
                                                     poll_tracked_terminal_tool_calls(
@@ -4313,7 +4925,15 @@ async fn run_conversation_loop<'a>(
                                         )
                                         .await
                                         .otherwise(async |dispatch| {
-                                            maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch).await;
+                                            if maybe_emit_claude_sdk_ext_notification(
+                                                &st, &h, dispatch,
+                                            )
+                                            .await
+                                            {
+                                                st.write()
+                                                    .await
+                                                    .mark_agent_activity(chrono::Utc::now());
+                                            }
                                             Ok(())
                                         })
                                         .await
@@ -4771,12 +5391,15 @@ async fn run_conversation_loop<'a>(
                 let sid = session.session_id().clone();
                 tracing::info!(
                     "[ACP] Sending session/fork for session_id={} cwd={}",
-                    sid.0, cwd
+                    sid.0,
+                    cwd
                 );
-                // Build from the connection snapshot only — never re-read
-                // global terminal settings during fork.
-                let terminal_meta = match terminal_metadata(
-                    Meta::default(),
+                // Same immutable route plan + shell snapshot as new/load/resume
+                // (Codeg Claude re-asserts Agent/Task deny; native unchanged).
+                // Never re-read global terminal settings during fork.
+                let terminal_meta = match session_request_meta(
+                    agent_type,
+                    route_plan,
                     shell_spec,
                     adapter_for(agent_type),
                 ) {
@@ -4786,8 +5409,7 @@ async fn run_conversation_loop<'a>(
                         continue;
                     }
                 };
-                let result =
-                    crate::acp::fork::fork_session(&cx, &sid, cwd, terminal_meta).await;
+                let result = crate::acp::fork::fork_session(&cx, &sid, cwd, terminal_meta).await;
                 match result {
                     Ok(fork_response) => {
                         tracing::info!(
@@ -4823,10 +5445,7 @@ async fn run_conversation_loop<'a>(
 /// (doubling the event) and the hunkless full-file `--- /+++` blob stays in the
 /// tool `output`, where `extractEditLineChangeStats` mis-counts it as full-file
 /// +/- totals in the card header even though the body shows the compact diff.
-fn serialize_tool_call_content(
-    content: &[ToolCallContent],
-    include_diffs: bool,
-) -> Option<String> {
+fn serialize_tool_call_content(content: &[ToolCallContent], include_diffs: bool) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for item in content {
         match item {
@@ -4954,10 +5573,7 @@ fn build_new_file_diff(path: &str, new_text: &str) -> String {
     // it keeps the trailing empty segment from a final newline, so the `+N`
     // count and the trailing `+` addition line match exactly.
     let lines: Vec<&str> = new_text.split('\n').collect();
-    let mut out = format!(
-        "--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@",
-        lines.len()
-    );
+    let mut out = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@", lines.len());
     for line in lines {
         out.push('\n');
         out.push('+');
@@ -5205,7 +5821,10 @@ fn is_subagent_invocation(agent_type: AgentType, raw_input: &Option<String>) -> 
 /// historical unwrap in `parsers/codebuddy.rs`. `raw_input` is left untouched
 /// (the cards peel `params` themselves, and that keeps `inferFromInput` from
 /// misclassifying `cancel_delegation`'s `{task_id}` as a generic task).
-fn codebuddy_deferred_tool_name(agent_type: AgentType, raw_input: &Option<String>) -> Option<String> {
+fn codebuddy_deferred_tool_name(
+    agent_type: AgentType,
+    raw_input: &Option<String>,
+) -> Option<String> {
     if agent_type != AgentType::CodeBuddy {
         return None;
     }
@@ -5273,7 +5892,11 @@ fn codebuddy_meta_marks_subagent(
     if meta.get("codebuddy.ai/toolName").and_then(|v| v.as_str()) == Some("Agent") {
         return true;
     }
-    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
+    if meta
+        .get("codebuddy.ai/isSubagent")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         return true;
     }
     meta.get("codebuddy.ai/subagentType")
@@ -5314,7 +5937,11 @@ fn codebuddy_chunk_marks_subagent(
     let Some(meta) = meta else {
         return false;
     };
-    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
+    if meta
+        .get("codebuddy.ai/isSubagent")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         return true;
     }
     meta.get("codebuddy.ai/parentToolCallId")
@@ -5538,18 +6165,25 @@ fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpE
     })
 }
 
+/// Emit adapter-specific raw SDK notifications. Returns `true` only when a
+/// normalizer advanced the same live transcript / tool state that the soft
+/// watchdog treats as agent activity. Claude `api_retry` system messages are
+/// UI status only and return `false`.
 async fn maybe_emit_claude_sdk_ext_notification(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     dispatch: Dispatch,
-) {
+) -> bool {
     let Dispatch::Notification(notification) = dispatch else {
-        return;
+        return false;
     };
 
     if let Some(event) = map_claude_sdk_ext_notification(&notification) {
+        // api_retry → ClaudeSdkMessage does not advance transcript/tool state.
         emit_with_state(state, emitter, event).await;
+        return false;
     }
+    false
 }
 
 /// Fix null fields in `usage_update` notifications that would otherwise fail deserialization.
@@ -5666,9 +6300,8 @@ async fn emit_conversation_update(
             } else {
                 None
             };
-            let content =
-                serialize_tool_call_content(&tc.content, synthesized_edit.is_none())
-                    .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
+            let content = serialize_tool_call_content(&tc.content, synthesized_edit.is_none())
+                .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
             let images = extract_tool_call_images(&tc.content);
             let raw_input = synthesized_edit
                 .or(own_raw_input)
@@ -5698,7 +6331,8 @@ async fn emit_conversation_update(
             // `meta_marks_background` keeps a concurrent sub-agent out of the
             // suppression window (see fn docs).
             let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tc.meta.as_ref());
-            let meta_marks_background = codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
+            let meta_marks_background =
+                codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
             let meta = tc.meta.map(serde_json::Value::Object);
             let status = format!("{:?}", tc.status).to_lowercase();
             raw_output_cache.remove_if_final(&tool_call_id, Some(status.as_str()));
@@ -5778,9 +6412,7 @@ async fn emit_conversation_update(
                 Some((_, inner)) => {
                     json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
                 }
-                None => {
-                    json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty())
-                }
+                None => json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty()),
             };
             let synthesized_edit = if own_raw_input.is_none() {
                 tcu.fields
@@ -5833,7 +6465,8 @@ async fn emit_conversation_update(
                 .filter(|l| !l.is_empty())
                 .and_then(|l| serde_json::to_value(l).ok());
             let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tcu.meta.as_ref());
-            let meta_marks_background = codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
+            let meta_marks_background =
+                codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
             let meta = tcu.meta.clone().map(serde_json::Value::Object);
             let status = tcu.fields.status.map(|s| format!("{:?}", s).to_lowercase());
             raw_output_cache.remove_if_final(&tool_call_id, status.as_deref());
@@ -6009,6 +6642,91 @@ mod tests {
     use sacp::schema::Diff;
     use std::sync::Arc;
 
+    fn agent_text_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("agent_message_chunk")
+    }
+
+    fn agent_thought_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("agent_thought_chunk")
+    }
+
+    fn tool_start_update(tool_id: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_id,
+            "title": "run",
+            "kind": "execute",
+            "status": "pending"
+        }))
+        .expect("tool_call")
+    }
+
+    fn tool_progress_update(tool_id: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_id,
+            "status": "in_progress"
+        }))
+        .expect("tool_call_update")
+    }
+
+    fn plan_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [{
+                "content": "step",
+                "priority": "medium",
+                "status": "pending"
+            }]
+        }))
+        .expect("plan")
+    }
+
+    fn available_commands_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": []
+        }))
+        .expect("available_commands_update")
+    }
+
+    fn usage_update() -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "used": 1,
+            "size": 100
+        }))
+        .expect("usage_update")
+    }
+
+    fn user_message_update(text: &str) -> SessionUpdate {
+        serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": text}
+        }))
+        .expect("user_message_chunk")
+    }
+
+    #[test]
+    fn agent_activity_classifier_excludes_ui_and_status_noise() {
+        assert!(advances_agent_activity(&agent_text_update("x")));
+        assert!(advances_agent_activity(&agent_thought_update("x")));
+        assert!(advances_agent_activity(&tool_start_update("tool-1")));
+        assert!(advances_agent_activity(&tool_progress_update("tool-1")));
+        assert!(advances_agent_activity(&plan_update()));
+        assert!(!advances_agent_activity(&available_commands_update()));
+        assert!(!advances_agent_activity(&usage_update()));
+        assert!(!advances_agent_activity(&user_message_update("keepalive")));
+    }
+
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {
         let mut d = Diff::new(path, new);
         if let Some(o) = old {
@@ -6017,8 +6735,67 @@ mod tests {
         ToolCallContent::Diff(d)
     }
 
+    use crate::acp::delegation::route::{
+        DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
+        RouteDegradedReason, ROUTE_ADAPTER_CONTRACT_VERSION,
+    };
+
+    fn codeg_plan(agent_type: AgentType) -> DelegationRoutePlan {
+        let native_suppression = match agent_type {
+            AgentType::Codex => NativeSuppressionPlan::CodexMultiAgentFalse,
+            AgentType::Grok => NativeSuppressionPlan::GrokNoSubagents,
+            AgentType::CodeBuddy => NativeSuppressionPlan::CodeBuddyDisallowedTools {
+                tools: vec!["Agent".into(), "Task".into()],
+            },
+            AgentType::ClaudeCode => NativeSuppressionPlan::ClaudeDisallowedTools {
+                tools: vec!["Agent".into(), "Task".into()],
+            },
+            _ => NativeSuppressionPlan::None,
+        };
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: format!("test-codeg-{agent_type:?}"),
+        }
+    }
+
+    fn native_plan(agent_type: AgentType) -> DelegationRoutePlan {
+        let _ = agent_type;
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Native,
+            effective: DelegationRoutePolicy::Native,
+            source: DelegationRouteSource::SessionOverride,
+            native_suppression: NativeSuppressionPlan::None,
+            expose_codeg_delegation: false,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: format!("test-native-{agent_type:?}"),
+        }
+    }
+
+    /// Build base Npx argv then apply the immutable route plan once — mirrors
+    /// production `build_agent` for Npx agents.
+    fn apply_base_npx_then_route(
+        parts: &mut Vec<String>,
+        agent_type: AgentType,
+        args: &[&str],
+        grok_always_approve: bool,
+        plan: &DelegationRoutePlan,
+    ) {
+        append_npx_launch_args(parts, agent_type, args, grok_always_approve);
+        apply_process_route(plan, agent_type, &mut BTreeMap::new(), parts).unwrap();
+    }
+
     #[test]
     fn grok_npx_launch_args_disable_native_question_before_subcommand() {
+        // Base args only (append_npx is route-independent): question deny remains.
         let mut without_auto_approve = vec!["grok".to_string()];
         append_npx_launch_args(
             &mut without_auto_approve,
@@ -6064,6 +6841,704 @@ mod tests {
         let mut parts = vec!["codex-acp".to_string()];
         append_npx_launch_args(&mut parts, AgentType::Codex, &["serve"], true);
         assert_eq!(parts, vec!["codex-acp", "serve"]);
+    }
+
+    #[test]
+    fn managed_process_adapters_suppress_only_on_codeg_route() {
+        let codeg_grok = codeg_plan(AgentType::Grok);
+        let mut grok = vec!["grok".to_string()];
+        apply_base_npx_then_route(
+            &mut grok,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            false,
+            &codeg_grok,
+        );
+        assert_eq!(
+            grok,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        // always-approve stays between question deny and --no-subagents.
+        let mut grok_approve = vec!["grok".to_string()];
+        apply_base_npx_then_route(
+            &mut grok_approve,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            true,
+            &codeg_plan(AgentType::Grok),
+        );
+        assert_eq!(
+            grok_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--always-approve",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        let mut codebuddy = vec!["codebuddy".to_string()];
+        apply_base_npx_then_route(
+            &mut codebuddy,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &codeg_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(
+            codebuddy,
+            vec!["codebuddy", "--disallowedTools", "Agent", "Task", "--acp"]
+        );
+
+        // Stable de-duplicated union preserves user denies (TaskOutput/TaskStop)
+        // and does not double-add Agent/Task.
+        let mut codebuddy_union = vec![
+            "codebuddy".to_string(),
+            "--disallowedTools".to_string(),
+            "Bash".to_string(),
+            "TaskOutput".to_string(),
+            "Task".to_string(),
+            "TaskStop".to_string(),
+        ];
+        apply_base_npx_then_route(
+            &mut codebuddy_union,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &codeg_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(
+            codebuddy_union,
+            vec![
+                "codebuddy",
+                "--disallowedTools",
+                "Bash",
+                "TaskOutput",
+                "Task",
+                "TaskStop",
+                "Agent",
+                "--acp",
+            ]
+        );
+
+        let mut native_grok = vec!["grok".to_string()];
+        apply_base_npx_then_route(
+            &mut native_grok,
+            AgentType::Grok,
+            &["agent", "stdio"],
+            false,
+            &native_plan(AgentType::Grok),
+        );
+        assert!(!native_grok.contains(&"--no-subagents".to_string()));
+        // ask_user_question deny is independent of route.
+        assert!(native_grok.contains(&"ask_user_question".to_string()));
+
+        let mut native_cb = vec!["codebuddy".to_string()];
+        apply_base_npx_then_route(
+            &mut native_cb,
+            AgentType::CodeBuddy,
+            &["--acp"],
+            false,
+            &native_plan(AgentType::CodeBuddy),
+        );
+        assert_eq!(native_cb, vec!["codebuddy", "--acp"]);
+        assert!(!native_cb.iter().any(|a| a == "--disallowedTools"));
+    }
+
+    #[test]
+    fn codex_env_and_claude_meta_are_additive_and_route_scoped() {
+        // Codex Codeg: set/override CODEX_ACP_MULTI_AGENT=0; leave unrelated keys.
+        // Exercise `apply_process_route` (env + argv) as the process-level entry.
+        let mut codeg_env = BTreeMap::from([
+            ("KEEP".into(), "yes".into()),
+            ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
+        ]);
+        let mut codeg_argv = Vec::new();
+        apply_process_route(
+            &codeg_plan(AgentType::Codex),
+            AgentType::Codex,
+            &mut codeg_env,
+            &mut codeg_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            codeg_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(codeg_env.get("KEEP").map(String::as_str), Some("yes"));
+        assert!(codeg_argv.is_empty());
+
+        // Native preserves user env byte-for-byte (fresh maps; no cross-route reuse).
+        for user_val in ["1", "0"] {
+            let mut native_env = BTreeMap::from([
+                ("KEEP".into(), "yes".into()),
+                ("CODEX_ACP_MULTI_AGENT".into(), user_val.into()),
+            ]);
+            apply_route_environment(
+                AgentType::Codex,
+                &native_plan(AgentType::Codex),
+                &mut native_env,
+            )
+            .unwrap();
+            assert_eq!(
+                native_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
+                Some(user_val)
+            );
+            assert_eq!(native_env.get("KEEP").map(String::as_str), Some("yes"));
+        }
+
+        // Non-Codex plan never touches CODEX_ACP_MULTI_AGENT.
+        let mut grok_env = BTreeMap::from([("CODEX_ACP_MULTI_AGENT".into(), "1".into())]);
+        apply_route_environment(AgentType::Grok, &codeg_plan(AgentType::Grok), &mut grok_env)
+            .unwrap();
+        assert_eq!(
+            grok_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
+            Some("1")
+        );
+
+        let existing = serde_json::json!({
+            "claudeCode": {
+                "emitRawSDKMessages": true,
+                "options": { "disallowedTools": ["Bash"] }
+            },
+            "adapter": { "keep": true }
+        });
+        let merged = merge_claude_route_meta(
+            existing.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Bash", "Agent", "Task"])
+        );
+        assert_eq!(merged["claudeCode"]["emitRawSDKMessages"], true);
+        assert_eq!(merged["adapter"]["keep"], true);
+
+        // Existing Agent/Task are not duplicated; TaskOutput/TaskStop preserved.
+        let with_partial = serde_json::json!({
+            "claudeCode": {
+                "options": {
+                    "disallowedTools": ["Agent", "TaskOutput", "TaskStop"]
+                }
+            }
+        });
+        let merged_partial = merge_claude_route_meta(
+            with_partial.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(
+            merged_partial["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Agent", "TaskOutput", "TaskStop", "Task"])
+        );
+
+        // Native: serde-value equivalent to input (no Codeg deny injection).
+        let native_input = serde_json::json!({
+            "claudeCode": {
+                "emitRawSDKMessages": true,
+                "options": { "disallowedTools": ["Bash"] }
+            },
+            "adapter": { "keep": true }
+        });
+        let native_merged = merge_claude_route_meta(
+            native_input.as_object().unwrap().clone(),
+            &native_plan(AgentType::ClaudeCode),
+        )
+        .unwrap();
+        assert_eq!(serde_json::Value::Object(native_merged), native_input);
+
+        // Malformed shapes → RouteUnavailable NativeSuppressionInvalid.
+        let bad_claude = serde_json::json!({ "claudeCode": "not-an-object" });
+        let err = merge_claude_route_meta(
+            bad_claude.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+
+        let bad_options = serde_json::json!({
+            "claudeCode": { "options": [] }
+        });
+        let err = merge_claude_route_meta(
+            bad_options.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+
+        let bad_tools = serde_json::json!({
+            "claudeCode": {
+                "options": { "disallowedTools": "Agent" }
+            }
+        });
+        let err = merge_claude_route_meta(
+            bad_tools.as_object().unwrap().clone(),
+            &codeg_plan(AgentType::ClaudeCode),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid
+            }
+        ));
+    }
+
+    /// Typed side channel only: display-string recovery must not mint RouteSpecific.
+    #[test]
+    fn bootstrap_outcome_typed_only_no_substring_fallback() {
+        use crate::acp::delegation::route::RouteDegradedReason;
+
+        // Exact typed mapping for the two allowed RouteSpecific reasons.
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            }),
+            RouteBootstrapOutcome::RouteSpecific(RouteDegradedReason::NativeSuppressionInvalid)
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::CompanionInitializationFailed,
+            }),
+            RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed
+            )
+        ));
+
+        // Auth/provider/SDK/process/generic stay Fatal.
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::SdkNotInstalled("missing".into())),
+            RouteBootstrapOutcome::Fatal(AcpError::SdkNotInstalled(_))
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::InitializeTimeout),
+            RouteBootstrapOutcome::Fatal(AcpError::InitializeTimeout)
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::ProcessExited),
+            RouteBootstrapOutcome::Fatal(AcpError::Protocol(_))
+        ));
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&AcpError::protocol("auth failed")),
+            RouteBootstrapOutcome::Fatal(AcpError::Protocol(_))
+        ));
+
+        // Residual classifier: init-timeout sentinel only — never parse
+        // "delegation route unavailable: NativeSuppressionInvalid" display text.
+        assert!(matches!(
+            classify_connect_error_residual(INIT_TIMEOUT_SENTINEL),
+            AcpError::InitializeTimeout
+        ));
+        let spoof = "delegation route unavailable: NativeSuppressionInvalid";
+        assert!(
+            matches!(
+                classify_connect_error_residual(spoof),
+                AcpError::Protocol(_)
+            ),
+            "substring fallback must not recover NativeSuppressionInvalid"
+        );
+        let spoof2 = "codeg delegation ready lease failed";
+        assert!(
+            matches!(
+                classify_connect_error_residual(spoof2),
+                AcpError::Protocol(_)
+            ),
+            "substring fallback must not recover CompanionInitializationFailed"
+        );
+        // Spoofed residual → Fatal, not RouteSpecific.
+        let residual = classify_connect_error_residual(spoof);
+        assert!(matches!(
+            bootstrap_outcome_from_acp_error(&residual),
+            RouteBootstrapOutcome::Fatal(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_acp_err_sends_typed_native_suppression_once() {
+        use crate::acp::delegation::route::RouteDegradedReason;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let sacp_err = bridge_acp_err_for_bootstrap(
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            },
+            &slot,
+        )
+        .await;
+        // Display may still include the error text (sacp boundary), but bootstrap
+        // outcome is typed and already consumed.
+        assert!(!sacp_err.to_string().is_empty());
+        assert!(slot.lock().await.is_none(), "sender must be taken");
+        match rx.await.unwrap() {
+            RouteBootstrapOutcome::RouteSpecific(RouteDegradedReason::NativeSuppressionInvalid) => {
+            }
+            other => panic!("expected typed RouteSpecific, got {other:?}"),
+        }
+        // Second bridge does not panic / double-send.
+        let _ = bridge_acp_err_for_bootstrap(
+            AcpError::RouteUnavailable {
+                reason: RouteDegradedReason::NativeSuppressionInvalid,
+            },
+            &slot,
+        )
+        .await;
+    }
+
+    #[test]
+    fn session_request_meta_claude_deny_list_matches_new_load_resume() {
+        let plan = codeg_plan(AgentType::ClaudeCode);
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::ClaudeCode);
+
+        let new_req = build_new_session_request(
+            AgentType::ClaudeCode,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let load_req = build_load_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-load".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let resume_req = build_resume_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("sess-resume".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+
+        let expected = serde_json::json!(["Agent", "Task"]);
+        for (label, meta) in [
+            ("new", new_req.meta.as_ref()),
+            ("load", load_req.meta.as_ref()),
+            ("resume", resume_req.meta.as_ref()),
+        ] {
+            let tools = meta
+                .expect(label)
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .cloned()
+                .expect("disallowedTools present");
+            assert_eq!(tools, expected, "{label} deny list");
+            assert_eq!(
+                meta.unwrap()
+                    .get("claudeCode")
+                    .and_then(|c| c.get("emitRawSDKMessages"))
+                    .and_then(|v| v.as_bool()),
+                Some(true),
+                "{label} emitRawSDKMessages"
+            );
+            assert!(
+                meta.unwrap().contains_key("codeg.dev/terminal"),
+                "{label} terminal meta"
+            );
+        }
+    }
+
+    /// Complete base argv (as production builds before `AcpAgent::from_args`)
+    /// must receive structured route insertion via `apply_process_route` only:
+    /// Grok `--no-subagents` before `agent stdio`, CodeBuddy deny union before
+    /// `--acp`. Second application is a no-op (idempotent).
+    #[test]
+    fn apply_process_route_on_complete_argv_is_ordered_and_idempotent() {
+        // Grok: base root flags + subcommand already present (single application point).
+        let mut grok_argv = vec![
+            "grok".to_string(),
+            "--no-auto-update".to_string(),
+            "--disallowed-tools".to_string(),
+            "ask_user_question".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ];
+        let mut env = BTreeMap::new();
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut env,
+            &mut grok_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_argv,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+        let grok_once = grok_argv.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut env,
+            &mut grok_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_argv, grok_once,
+            "Grok apply_process_route is idempotent"
+        );
+
+        // always-approve stays between question deny and --no-subagents.
+        let mut grok_approve = vec![
+            "grok".to_string(),
+            "--no-auto-update".to_string(),
+            "--disallowed-tools".to_string(),
+            "ask_user_question".to_string(),
+            "--always-approve".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ];
+        apply_process_route(
+            &codeg_plan(AgentType::Grok),
+            AgentType::Grok,
+            &mut BTreeMap::new(),
+            &mut grok_approve,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_approve,
+            vec![
+                "grok",
+                "--no-auto-update",
+                "--disallowed-tools",
+                "ask_user_question",
+                "--always-approve",
+                "--no-subagents",
+                "agent",
+                "stdio",
+            ]
+        );
+
+        // CodeBuddy: complete argv already includes --acp; union before it.
+        let mut cb_argv = vec!["codebuddy".to_string(), "--acp".to_string()];
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            cb_argv,
+            vec!["codebuddy", "--disallowedTools", "Agent", "Task", "--acp"]
+        );
+        let cb_once = cb_argv.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_argv,
+        )
+        .unwrap();
+        assert_eq!(
+            cb_argv, cb_once,
+            "CodeBuddy apply_process_route is idempotent"
+        );
+
+        // Pre-existing denies union without reordering unrelated tokens.
+        let mut cb_union = vec![
+            "codebuddy".to_string(),
+            "--disallowedTools".to_string(),
+            "Bash".to_string(),
+            "TaskOutput".to_string(),
+            "Task".to_string(),
+            "TaskStop".to_string(),
+            "--acp".to_string(),
+        ];
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_union,
+        )
+        .unwrap();
+        assert_eq!(
+            cb_union,
+            vec![
+                "codebuddy",
+                "--disallowedTools",
+                "Bash",
+                "TaskOutput",
+                "Task",
+                "TaskStop",
+                "Agent",
+                "--acp",
+            ]
+        );
+        let cb_union_once = cb_union.clone();
+        apply_process_route(
+            &codeg_plan(AgentType::CodeBuddy),
+            AgentType::CodeBuddy,
+            &mut BTreeMap::new(),
+            &mut cb_union,
+        )
+        .unwrap();
+        assert_eq!(cb_union, cb_union_once);
+    }
+
+    /// Native CodeBuddy must be a strict no-op on the complete argv, including
+    /// pre-seeded `--disallowedTools` in any supported position.
+    #[test]
+    fn native_codebuddy_preserves_preseeded_disallowed_tools() {
+        let cases = [
+            vec![
+                "codebuddy".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+                "--acp".to_string(),
+            ],
+            vec![
+                "codebuddy".to_string(),
+                "--acp".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+            ],
+            vec![
+                "codebuddy".to_string(),
+                "--some-other-flag".to_string(),
+                "--disallowedTools".to_string(),
+                "Bash".to_string(),
+                "TaskOutput".to_string(),
+                "TaskStop".to_string(),
+                "--acp".to_string(),
+            ],
+        ];
+        for original in cases {
+            let mut argv = original.clone();
+            apply_process_route(
+                &native_plan(AgentType::CodeBuddy),
+                AgentType::CodeBuddy,
+                &mut BTreeMap::new(),
+                &mut argv,
+            )
+            .unwrap();
+            assert_eq!(
+                argv, original,
+                "native CodeBuddy must not mutate preseeded denies"
+            );
+        }
+    }
+
+    /// Fork must re-assert the same Claude Codeg Agent/Task deny list as
+    /// new/load/resume (via `session_request_meta` / deep merge). Native is
+    /// unchanged (no Codeg deny injection).
+    #[test]
+    fn claude_fork_meta_reasserts_codeg_agent_task_deny() {
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::ClaudeCode);
+
+        let codeg_meta = session_request_meta(
+            AgentType::ClaudeCode,
+            &codeg_plan(AgentType::ClaudeCode),
+            &spec,
+            adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            codeg_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .cloned()
+                .expect("Codeg fork meta must include disallowedTools"),
+            serde_json::json!(["Agent", "Task"])
+        );
+        assert_eq!(
+            codeg_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("emitRawSDKMessages"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            codeg_meta.contains_key("codeg.dev/terminal"),
+            "fork meta preserves terminal snapshot"
+        );
+        // Adapter keys from terminal_metadata path stay intact (no clobber).
+        let fork_req = crate::acp::fork::build_fork_session_request(
+            SessionId::new("s-fork-route"),
+            "/tmp/codeg",
+            codeg_meta.clone(),
+        );
+        let fork_val = serde_json::to_value(fork_req).unwrap();
+        assert_eq!(
+            fork_val["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!(["Agent", "Task"])
+        );
+        assert!(fork_val["_meta"].get("codeg.dev/terminal").is_some());
+
+        let native_meta = session_request_meta(
+            AgentType::ClaudeCode,
+            &native_plan(AgentType::ClaudeCode),
+            &spec,
+            adapter,
+        )
+        .unwrap();
+        assert!(
+            native_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("options"))
+                .and_then(|o| o.get("disallowedTools"))
+                .is_none(),
+            "native Claude fork meta must not inject Codeg denies"
+        );
+        assert_eq!(
+            native_meta
+                .get("claudeCode")
+                .and_then(|c| c.get("emitRawSDKMessages"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(native_meta.contains_key("codeg.dev/terminal"));
     }
 
     #[tokio::test]
@@ -6401,8 +7876,10 @@ mod tests {
             true,
         );
         // Exactly one PATH-ish key, the original casing preserved, value prepended.
-        let path_keys: Vec<&String> =
-            env.keys().filter(|k| k.eq_ignore_ascii_case("PATH")).collect();
+        let path_keys: Vec<&String> = env
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
         assert_eq!(path_keys.len(), 1, "{env:?}");
         assert_eq!(
             env.get("Path").unwrap(),
@@ -6413,9 +7890,17 @@ mod tests {
     #[test]
     fn prepend_path_windows_seeds_from_fallback_with_semicolon() {
         let mut env = BTreeMap::new();
-        prepend_dir_to_path_env(&mut env, r"C:\OfficeCLI", r"C:\Windows;C:\Windows\System32", true);
+        prepend_dir_to_path_env(
+            &mut env,
+            r"C:\OfficeCLI",
+            r"C:\Windows;C:\Windows\System32",
+            true,
+        );
         // No prior key → default `Path` casing on Windows.
-        assert_eq!(env.get("Path").unwrap(), r"C:\OfficeCLI;C:\Windows;C:\Windows\System32");
+        assert_eq!(
+            env.get("Path").unwrap(),
+            r"C:\OfficeCLI;C:\Windows;C:\Windows\System32"
+        );
     }
 
     #[test]
@@ -6428,9 +7913,15 @@ mod tests {
         env.insert("PATH".to_string(), r"C:\a".to_string());
         env.insert("Path".to_string(), r"C:\b".to_string());
         prepend_dir_to_path_env(&mut env, r"C:\OfficeCLI", "ignored-fallback", true);
-        let path_keys: Vec<&String> =
-            env.keys().filter(|k| k.eq_ignore_ascii_case("PATH")).collect();
-        assert_eq!(path_keys.len(), 1, "exactly one PATH-ish key must remain: {env:?}");
+        let path_keys: Vec<&String> = env
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(
+            path_keys.len(),
+            1,
+            "exactly one PATH-ish key must remain: {env:?}"
+        );
         assert_eq!(env.get("Path").unwrap(), r"C:\OfficeCLI;C:\b");
     }
 
@@ -6516,6 +8007,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
 
@@ -6527,6 +8019,13 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+        // Native plan: no Codeg-injected deny list.
+        assert!(req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("claudeCode"))
+            .and_then(|c| c.get("options"))
+            .is_none());
     }
 
     #[test]
@@ -6539,6 +8038,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
 
@@ -6558,6 +8058,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
 
@@ -6581,6 +8082,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
 
@@ -6600,14 +8102,9 @@ mod tests {
     #[test]
     fn initialize_contains_terminal_metadata() {
         let spec = test_pwsh_spec();
-        let request =
-            build_initialize_request(&spec, adapter_for(AgentType::Codex)).unwrap();
+        let request = build_initialize_request(&spec, adapter_for(AgentType::Codex)).unwrap();
         let value = serde_json::to_value(request).unwrap();
-        assert_codeg_terminal_meta(
-            &value,
-            "powershell",
-            &spec.executable.to_string_lossy(),
-        );
+        assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
     }
 
     #[test]
@@ -6618,6 +8115,7 @@ mod tests {
             Vec::new(),
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
@@ -6635,14 +8133,11 @@ mod tests {
             Vec::new(),
             &spec,
             adapter_for(AgentType::Codex),
+            &native_plan(AgentType::Codex),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
-        assert_codeg_terminal_meta(
-            &value,
-            "powershell",
-            &spec.executable.to_string_lossy(),
-        );
+        assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
     }
 
     #[test]
@@ -6655,6 +8150,7 @@ mod tests {
             Vec::new(),
             &spec,
             adapter_for(AgentType::ClaudeCode),
+            &native_plan(AgentType::ClaudeCode),
         )
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
@@ -6667,10 +8163,7 @@ mod tests {
     struct ConflictingTerminalAdapter;
 
     impl AcpTerminalAdapter for ConflictingTerminalAdapter {
-        fn agent_metadata(
-            &self,
-            _shell: &ResolvedShellSpec,
-        ) -> Result<Meta, AcpError> {
+        fn agent_metadata(&self, _shell: &ResolvedShellSpec) -> Result<Meta, AcpError> {
             let mut meta = Meta::default();
             meta.insert(
                 "codeg.dev/terminal".into(),
@@ -6681,10 +8174,7 @@ mod tests {
                     "commandMode": "adapter-lies",
                 }),
             );
-            meta.insert(
-                "adapterExtra".into(),
-                serde_json::json!({"ok": true}),
-            );
+            meta.insert("adapterExtra".into(), serde_json::json!({"ok": true}));
             Ok(meta)
         }
     }
@@ -6692,15 +8182,10 @@ mod tests {
     #[test]
     fn terminal_metadata_overwrites_adapter_collision() {
         let spec = test_pwsh_spec();
-        let request =
-            build_initialize_request(&spec, &ConflictingTerminalAdapter).unwrap();
+        let request = build_initialize_request(&spec, &ConflictingTerminalAdapter).unwrap();
         let value = serde_json::to_value(request).unwrap();
         // Codeg snapshot wins on the reserved namespace.
-        assert_codeg_terminal_meta(
-            &value,
-            "powershell",
-            &spec.executable.to_string_lossy(),
-        );
+        assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
         // Non-colliding adapter keys are still merged in.
         assert_eq!(value["_meta"]["adapterExtra"]["ok"], true);
     }
@@ -6764,10 +8249,12 @@ mod tests {
 
         // A different data.code, or no data at all, must NOT be swallowed —
         // those fall through to the generic error path.
-        let other = sacp::Error::new(-32603, "boom")
-            .data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
+        let other =
+            sacp::Error::new(-32603, "boom").data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
         assert!(!is_grok_incompatible_agent_switch(&other));
-        assert!(!is_grok_incompatible_agent_switch(&sacp::Error::internal_error()));
+        assert!(!is_grok_incompatible_agent_switch(
+            &sacp::Error::internal_error()
+        ));
     }
 
     #[test]
@@ -6797,10 +8284,19 @@ mod tests {
         // Both models appear (agent-type filtering is deliberately NOT applied —
         // cross-type switches are handled gracefully at set time instead).
         assert_eq!(sel.options.len(), 2);
-        assert_eq!(sel.current_value, "grok-4.5", "the `selected` model is current");
-        assert!(sel.options.iter().any(|o| o.value == "grok-composer-2.5-fast"));
+        assert_eq!(
+            sel.current_value, "grok-4.5",
+            "the `selected` model is current"
+        );
+        assert!(sel
+            .options
+            .iter()
+            .any(|o| o.value == "grok-composer-2.5-fast"));
         // The "mode" (effort) entries are excluded from the composer.
-        assert!(sel.options.iter().all(|o| o.value != "high" && o.value != "low"));
+        assert!(sel
+            .options
+            .iter()
+            .all(|o| o.value != "high" && o.value != "low"));
     }
 
     #[test]
@@ -6893,9 +8389,7 @@ mod tests {
         let errors: Vec<(Option<String>, bool)> = events
             .iter()
             .filter_map(|e| match &e.payload {
-                AcpEvent::Error {
-                    code, terminal, ..
-                } => Some((code.clone(), *terminal)),
+                AcpEvent::Error { code, terminal, .. } => Some((code.clone(), *terminal)),
                 _ => None,
             })
             .collect();
@@ -7106,10 +8600,10 @@ mod tests {
         // Missing tool_input.
         assert!(unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "x"}))).is_none());
         // Empty tool_name.
-        assert!(
-            unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "", "tool_input": {}})))
-                .is_none()
-        );
+        assert!(unwrap_grok_use_tool(Some(
+            &serde_json::json!({"tool_name": "", "tool_input": {}})
+        ))
+        .is_none());
         // Absent / non-object.
         assert!(unwrap_grok_use_tool(None).is_none());
         assert!(unwrap_grok_use_tool(Some(&serde_json::json!("s"))).is_none());
@@ -7684,10 +9178,7 @@ mod tests {
         // returns false. Regression guard against any future "optimisation"
         // that conflates the substring check with the field check.
         let input = Some(r#"{"description":"use subagent_type=foo"}"#.to_string());
-        assert!(!is_subagent_invocation(
-            AgentType::OpenCode,
-            &input
-        ));
+        assert!(!is_subagent_invocation(AgentType::OpenCode, &input));
     }
 
     #[test]
@@ -7734,7 +9225,8 @@ mod tests {
             "not json",
         ] {
             assert!(
-                codebuddy_deferred_tool_name(AgentType::CodeBuddy, &Some(raw.to_string())).is_none(),
+                codebuddy_deferred_tool_name(AgentType::CodeBuddy, &Some(raw.to_string()))
+                    .is_none(),
                 "expected None for raw_input={raw}"
             );
         }
@@ -7794,28 +9286,56 @@ mod tests {
         );
         // Initial event carrying the subagent marker → "agent", recorded.
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &subagent, "tc1", false, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &subagent,
+                "tc1",
+                false,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("agent")
         );
         // The bug: a later status-only update lost the marker (raw_input None).
         // The override must be RE-ASSERTED, not downgraded to the event's title.
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &None, "tc1", true, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &None,
+                "tc1",
+                true,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("agent"),
             "a status-only update must not downgrade the Agent card mid-stream"
         );
         // Even an update whose raw_input looks like a different tool keeps it.
         let bash = Some(r#"{"command":"ls"}"#.to_string());
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &bash, "tc1", true, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &bash,
+                "tc1",
+                true,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("agent")
         );
         // A never-classified tool call returns None → caller uses its own title.
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &None, "tc2", true, false, &mut overrides),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &None,
+                "tc2",
+                true,
+                false,
+                &mut overrides
+            ),
             None
         );
         // Deferred MCP tool: inner name recorded, then re-asserted on a bare update.
@@ -7824,18 +9344,39 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &deferred, "tc3", false, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &deferred,
+                "tc3",
+                false,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("mcp__codeg-mcp__delegate_to_agent")
         );
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &None, "tc3", true, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &None,
+                "tc3",
+                true,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("mcp__codeg-mcp__delegate_to_agent")
         );
         // Non-CodeBuddy agent with no prior classification: never rewritten.
         assert_eq!(
-            resolve_rewritten_title(AgentType::OpenCode, &None, "tc9", true, false, &mut overrides),
+            resolve_rewritten_title(
+                AgentType::OpenCode,
+                &None,
+                "tc9",
+                true,
+                false,
+                &mut overrides
+            ),
             None
         );
     }
@@ -7879,15 +9420,29 @@ mod tests {
         // Frame 1: `raw_input` has NO `subagent_type` yet, but `_meta` already
         // marks it (the early, reliable signal). Title must already be "agent".
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &None, "tc1", false, true, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &None,
+                "tc1",
+                false,
+                true,
+                &mut overrides
+            )
+            .as_deref(),
             Some("agent")
         );
         // Later sparse frames carry NEITHER signal — the override is re-asserted,
         // so the pill never flickers back to a generic tool mid-stream.
         assert_eq!(
-            resolve_rewritten_title(AgentType::CodeBuddy, &None, "tc1", true, false, &mut overrides)
-                .as_deref(),
+            resolve_rewritten_title(
+                AgentType::CodeBuddy,
+                &None,
+                "tc1",
+                true,
+                false,
+                &mut overrides
+            )
+            .as_deref(),
             Some("agent"),
             "meta-classified Agent pill must stay 'agent' across signal-less frames"
         );
@@ -7917,7 +9472,7 @@ mod tests {
         let mut open: HashSet<String> = HashSet::new();
         let mut closed: HashSet<String> = HashSet::new();
         let fg = false; // foreground (not background)
-        // A non-final foreground agent frame opens the window.
+                        // A non-final foreground agent frame opens the window.
         track_subagent_window(
             AgentType::CodeBuddy,
             true,
@@ -8018,7 +9573,11 @@ mod tests {
         // the parent model is suspended — so every chunk in the window is the
         // sub-agent's, never main-agent output (background sub-agents, which could
         // interleave main output, are excluded from the window upstream).
-        assert!(should_suppress_subagent_chunk(AgentType::CodeBuddy, true, None));
+        assert!(should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            true,
+            None
+        ));
         // Window closed and no chunk meta → emit (e.g. main-agent text before the
         // sub-agent opens or after it closes).
         assert!(!should_suppress_subagent_chunk(
@@ -8038,7 +9597,11 @@ mod tests {
             ));
         }
         // Other agents never suppress, even inside a (spurious) open window.
-        assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::OpenCode,
+            true,
+            None
+        ));
     }
 
     #[test]
@@ -8110,20 +9673,26 @@ mod tests {
         let injection = DelegationInjection {
             broker,
             tokens: Arc::new(TokenRegistry::default()),
+            leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: std::path::PathBuf::from("/tmp/codeg-mcp.sock"),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
         };
 
         let mut servers: Vec<McpServer> = Vec::new();
+        // Plan does not expose delegation; feedback/ask/sessions off → skip.
+        let plan = native_plan(AgentType::Codex);
         let result = inject_codeg_mcp(
             &mut servers,
             &injection,
             "parent-conn",
             std::path::Path::new("/tmp"),
+            &plan,
         )
         .await;
 
@@ -8147,6 +9716,88 @@ mod tests {
     // enabled groups so the companion hides the rest. Crucially, feedback alone
     // must still inject the companion (the historical delegation-only gate would
     // have skipped it).
+
+    /// Post-ready unavailability helper carries the stable audit code without
+    /// inventing a second metrics Arc or mutating route plan fields.
+    #[tokio::test]
+    async fn post_ready_unavailable_audit_stable_code_no_route_mutation() {
+        use crate::acp::delegation::metrics::{DelegationAuditRecord, DELEGATION_UNAVAILABLE_CODE};
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        use crate::acp::session_state::SessionState;
+        use crate::web::event_bridge::EventEmitter;
+
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "test-ready-avail".into(),
+        };
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            "conn-avail-test".into(),
+            AgentType::Codex,
+            None,
+            "win".into(),
+            None,
+        )));
+        {
+            let mut s = state.write().await;
+            s.set_route_plan_snapshot(&plan);
+            s.set_delegation_available(true);
+            s.conversation_id = Some(7);
+        }
+        let route_before = state.read().await.delegation_route.clone();
+        assert!(route_before.delegation_available);
+        assert_eq!(route_before.effective, DelegationRoutePolicy::Codeg);
+        assert!(route_before.degraded_reason.is_none());
+
+        // Reuse audit constructor (same as finish_route_ready monitor path).
+        let audit =
+            DelegationAuditRecord::availability("conn-avail-test", Some(7), AgentType::Codex);
+        assert_eq!(audit.stable_code(), Some(DELEGATION_UNAVAILABLE_CODE));
+        emit_post_ready_unavailable(
+            &state,
+            &EventEmitter::Noop,
+            "conn-avail-test",
+            Some(7),
+            AgentType::Codex,
+        )
+        .await;
+
+        let after = state.read().await.delegation_route.clone();
+        assert!(!after.delegation_available, "availability must flip false");
+        assert_eq!(
+            after.effective, route_before.effective,
+            "immutable route fields must not change"
+        );
+        assert_eq!(after.requested, route_before.requested);
+        assert_eq!(after.source, route_before.source);
+        assert_eq!(after.managed, route_before.managed);
+        assert_eq!(after.degraded_reason, route_before.degraded_reason);
+    }
+
+    #[test]
+    fn companion_features_follow_plan_not_live_broker_route_setting() {
+        // Plan-driven feature helper: expose_codeg_delegation maps to the
+        // first bool of companion_features_arg — never a live Broker re-read.
+        assert_eq!(
+            companion_features_arg(true, true, false, false),
+            Some("delegation,feedback".into())
+        );
+        assert_eq!(
+            companion_features_arg(false, true, false, false),
+            Some("feedback".into())
+        );
+        assert_eq!(companion_features_arg(false, false, false, false), None);
+    }
+
     #[test]
     fn companion_features_arg_inject_skip_decision() {
         // All off → no companion at all.

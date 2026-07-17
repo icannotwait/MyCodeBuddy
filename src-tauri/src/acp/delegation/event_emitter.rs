@@ -31,10 +31,13 @@
 //! broker's meta write.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
+use crate::acp::delegation::types::TaskObservation;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
+use crate::db::entities::conversation::ConversationStatus;
 use crate::models::AgentType;
 use crate::web::event_bridge::emit_with_state;
 
@@ -70,6 +73,28 @@ pub trait DelegationEventEmitter: Send + Sync {
         agent_type: AgentType,
         result: DelegationResultSummary,
     );
+
+    /// Publish `AcpEvent::ConversationStatusChanged` for the child conversation
+    /// after a winning durable CAS so live sidebars match persisted status.
+    /// Losers must not call this (one emit per terminal winner).
+    async fn emit_conversation_status_changed(
+        &self,
+        parent_connection_id: &str,
+        conversation_id: i32,
+        status: ConversationStatus,
+    );
+
+    /// Publish `AcpEvent::DelegationObservationChanged` when soft-supervisor
+    /// health transitions. Observe-only — never completes or cancels a task.
+    async fn emit_observation_changed(
+        &self,
+        parent_connection_id: &str,
+        parent_tool_use_id: &str,
+        task_id: &str,
+        observation: TaskObservation,
+        last_agent_activity_at: DateTime<Utc>,
+        stalled_since: Option<DateTime<Utc>>,
+    );
 }
 
 /// Default emitter used when the broker is constructed via the short-form
@@ -100,6 +125,25 @@ impl DelegationEventEmitter for NoopEventEmitter {
         _child_conversation_id: i32,
         _agent_type: AgentType,
         _result: DelegationResultSummary,
+    ) {
+    }
+
+    async fn emit_conversation_status_changed(
+        &self,
+        _parent_connection_id: &str,
+        _conversation_id: i32,
+        _status: ConversationStatus,
+    ) {
+    }
+
+    async fn emit_observation_changed(
+        &self,
+        _parent_connection_id: &str,
+        _parent_tool_use_id: &str,
+        _task_id: &str,
+        _observation: TaskObservation,
+        _last_agent_activity_at: DateTime<Utc>,
+        _stalled_since: Option<DateTime<Utc>>,
     ) {
     }
 }
@@ -178,6 +222,60 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
         )
         .await;
     }
+
+    async fn emit_conversation_status_changed(
+        &self,
+        parent_connection_id: &str,
+        conversation_id: i32,
+        status: ConversationStatus,
+    ) {
+        let Some((state_arc, emitter)) = self
+            .manager
+            .get_state_and_emitter(parent_connection_id)
+            .await
+        else {
+            return;
+        };
+        emit_with_state(
+            &state_arc,
+            &emitter,
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status,
+            },
+        )
+        .await;
+    }
+
+    async fn emit_observation_changed(
+        &self,
+        parent_connection_id: &str,
+        parent_tool_use_id: &str,
+        task_id: &str,
+        observation: TaskObservation,
+        last_agent_activity_at: DateTime<Utc>,
+        stalled_since: Option<DateTime<Utc>>,
+    ) {
+        let Some((state_arc, emitter)) = self
+            .manager
+            .get_state_and_emitter(parent_connection_id)
+            .await
+        else {
+            return;
+        };
+        emit_with_state(
+            &state_arc,
+            &emitter,
+            AcpEvent::DelegationObservationChanged {
+                parent_tool_use_id: parent_tool_use_id.to_string(),
+                task_id: task_id.to_string(),
+                observation,
+                last_agent_activity_at,
+                stalled_since,
+            },
+        )
+        .await;
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -193,6 +291,8 @@ pub mod mock {
     pub struct MockEventEmitter {
         pub calls: Mutex<Vec<EmitCall>>,
         pub started_calls: Mutex<Vec<EmitStartedCall>>,
+        pub status_changed_calls: Mutex<Vec<StatusChangedCall>>,
+        pub observation_calls: Mutex<Vec<ObservationChangedCall>>,
     }
 
     #[derive(Debug, Clone)]
@@ -214,6 +314,23 @@ pub mod mock {
         pub agent_type: AgentType,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct StatusChangedCall {
+        pub parent_connection_id: String,
+        pub conversation_id: i32,
+        pub status: ConversationStatus,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ObservationChangedCall {
+        pub parent_connection_id: String,
+        pub parent_tool_use_id: String,
+        pub task_id: String,
+        pub observation: TaskObservation,
+        pub last_agent_activity_at: DateTime<Utc>,
+        pub stalled_since: Option<DateTime<Utc>>,
+    }
+
     impl MockEventEmitter {
         pub fn new() -> Self {
             Self::default()
@@ -233,6 +350,22 @@ pub mod mock {
 
         pub async fn started_count(&self) -> usize {
             self.started_calls.lock().await.len()
+        }
+
+        pub async fn status_changed_snapshot(&self) -> Vec<StatusChangedCall> {
+            self.status_changed_calls.lock().await.clone()
+        }
+
+        pub async fn status_changed_count(&self) -> usize {
+            self.status_changed_calls.lock().await.len()
+        }
+
+        pub async fn observation_snapshot(&self) -> Vec<ObservationChangedCall> {
+            self.observation_calls.lock().await.clone()
+        }
+
+        pub async fn observation_count(&self) -> usize {
+            self.observation_calls.lock().await.len()
         }
     }
 
@@ -272,6 +405,44 @@ pub mod mock {
                 agent_type,
                 result,
             });
+        }
+
+        async fn emit_conversation_status_changed(
+            &self,
+            parent_connection_id: &str,
+            conversation_id: i32,
+            status: ConversationStatus,
+        ) {
+            self.status_changed_calls
+                .lock()
+                .await
+                .push(StatusChangedCall {
+                    parent_connection_id: parent_connection_id.to_string(),
+                    conversation_id,
+                    status,
+                });
+        }
+
+        async fn emit_observation_changed(
+            &self,
+            parent_connection_id: &str,
+            parent_tool_use_id: &str,
+            task_id: &str,
+            observation: TaskObservation,
+            last_agent_activity_at: DateTime<Utc>,
+            stalled_since: Option<DateTime<Utc>>,
+        ) {
+            self.observation_calls
+                .lock()
+                .await
+                .push(ObservationChangedCall {
+                    parent_connection_id: parent_connection_id.to_string(),
+                    parent_tool_use_id: parent_tool_use_id.to_string(),
+                    task_id: task_id.to_string(),
+                    observation,
+                    last_agent_activity_at,
+                    stalled_since,
+                });
         }
     }
 }

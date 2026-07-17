@@ -562,7 +562,16 @@
       "noConfigAvailable": "このエージェントには設定可能な項目がありません。",
       "modeLabel": "モード",
       "agentDefaultHint": "エージェント既定: {value}",
-      "defaultOptionLabel": "既定（{value}）"
+      "defaultOptionLabel": "既定（{value}）",
+      "routePolicy": "デフォルトルート",
+      "routePolicyHint": "会話に上書きがない場合、管理対象エージェントはこのルートを使います。",
+      "routeEffectiveNative": "委任がオフです — 有効ルートは Native です。",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "ソフトウォッチドッグ（秒）",
+      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。キャンセルやルート変更はしません。"
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",
@@ -2272,7 +2281,10 @@
       "subAgentOverlay": {
         "title": "サブエージェント",
         "collapsedSummary": "サブエージェント {count}",
-        "collapseAria": "サブエージェントを折りたたむ"
+        "collapseAria": "サブエージェントを折りたたむ",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "エージェントプラン",
@@ -2417,7 +2429,10 @@
             "child_empty": "サブエージェント応答なし",
             "child_unknown": "サブエージェント: エラー",
             "unknown": "不明なタスク"
-          }
+          },
+          "active": "アクティブ",
+          "waitingInput": "入力待ち",
+          "stalled": "最近のエージェント活動なし"
         }
       },
       "contentParts": {
@@ -2616,7 +2631,8 @@
         "dismiss": "閉じる",
         "reconnectFailed": "セッションの再接続に失敗しました",
         "applied": "新しい設定を適用しました",
-        "terminalShellTitle": "ターミナルシェルが更新されました"
+        "terminalShellTitle": "ターミナルシェルが更新されました",
+        "delegationRouteTitle": "委任ルートが更新されました"
       },
       "collabAgent": {
         "title": "サブエージェント",
@@ -2643,6 +2659,30 @@
         "cardCompleted": "バックグラウンドタスクが完了しました",
         "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
         "cardResultPending": "結果はまだ返っていません"
+      },
+      "delegationRoute": {
+        "menuLabel": "委任ルート",
+        "inheritGlobal": "グローバルを継承",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg（継承）",
+        "updateFailed": "ルートの更新に失敗しました"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Native にフォールバックしました（{reason}）。再接続して Codeg を再試行してください。",
+        "delegationUnavailable": "Codeg ルートは有効ですが委任を利用できません。",
+        "reconnect": "再接続",
+        "reconnecting": "再接続中…",
+        "reconnected": "再接続しました",
+        "reconnectFailed": "再接続に失敗しました",
+        "reason": {
+          "native_suppression_unsupported": "ネイティブ抑制非対応",
+          "native_suppression_invalid": "ネイティブ抑制が無効",
+          "companion_binary_unavailable": "コンパニオンバイナリ不可",
+          "agent_mcp_unsupported": "エージェントが MCP 非対応",
+          "companion_initialization_failed": "コンパニオン初期化失敗",
+          "unknown": "低下"
+        }
       }
     },
     "diffPreview": {

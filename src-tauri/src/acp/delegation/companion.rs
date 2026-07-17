@@ -1844,9 +1844,11 @@ mod tests {
                     "task_ids",
                     "wait_ms",
                     "immediate snapshot",
-                    "wait_ms=0 waits without timeout",
-                    "60000",
-                    "any requested task is terminal",
+                    "positive wait (max 60000 ms)",
+                    "terminal, stalled, waiting_input, or its deadline",
+                    "wait_ms=0 waits only for a terminal result without a timeout",
+                    "running result at a bounded deadline is not a failure",
+                    "after stalled/waiting_input",
                     "call again for unfinished tasks",
                     "input order with each task_id",
                     "running, completed, failed, canceled, or unknown",
@@ -2049,6 +2051,39 @@ mod tests {
         .to_string();
         let resp = unwrap_respond(dispatch_with_features(FEEDBACK_ONLY, &line).await);
         assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    /// tools/list and tools/call independently gate disabled delegation.
+    #[tokio::test]
+    async fn disabled_feature_absent_from_list_and_rejected_on_direct_call() {
+        let names = list_tool_names(
+            dispatch_with_features(
+                FEEDBACK_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("delegat")),
+            "disabled delegation tools must not appear in tools/list: {names:?}"
+        );
+        for tool in [
+            "delegate_to_agent",
+            "get_delegation_status",
+            "cancel_delegation",
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                "params": { "name": tool, "arguments": {} }
+            })
+            .to_string();
+            let resp = unwrap_respond(dispatch_with_features(FEEDBACK_ONLY, &line).await);
+            assert_eq!(
+                resp.error.as_ref().map(|e| e.code),
+                Some(-32602),
+                "direct call to disabled {tool} must be rejected"
+            );
+        }
     }
 
     // -- ask_user_question feature gating + validation + rendering ----------
@@ -2493,6 +2528,9 @@ mod tests {
         );
         server.abort();
         // Crucially: no commit was sent for a cancelled (undelivered) check.
-        assert!(!*saw_commit.lock().await, "a cancelled check must not commit");
+        assert!(
+            !*saw_commit.lock().await,
+            "a cancelled check must not commit"
+        );
     }
 }

@@ -15,8 +15,8 @@ use crate::parsers::gemini::GeminiParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
-use crate::parsers::pi::PiParser;
 use crate::parsers::opencode::OpenCodeParser;
+use crate::parsers::pi::PiParser;
 use crate::parsers::{path_eq_for_matching, AgentParser, ParseError};
 use crate::web::event_bridge::{
     emit_event, ConversationChange, EventEmitter, TabsChanged, CONVERSATION_CHANGED_EVENT,
@@ -580,92 +580,93 @@ pub async fn get_folder_conversation_core(
 
     let (mut turns, session_stats, resolved_ext_id, parsed_title, transcript_watermark) =
         if let Some(ref ext_id) = summary.external_id {
-        let at = summary.agent_type;
-        let eid = ext_id.clone();
-        let db_created_at = summary.created_at;
-        let folder_path_for_fallback = {
-            let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
-                .await
-                .ok()
-                .flatten();
-            folder.map(|f| f.path)
-        };
-        tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
-            let parser: Box<dyn AgentParser> = match at {
-                AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-                AgentType::Codex => Box::new(CodexParser::new()),
-                AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-                AgentType::Gemini => Box::new(GeminiParser::new()),
-                AgentType::Cline => Box::new(ClineParser::new()),
-                AgentType::Hermes => Box::new(HermesParser::new()),
-                AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-                AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-                AgentType::Pi => Box::new(PiParser::new()),
-                AgentType::Grok => Box::new(GrokParser::new()),
+            let at = summary.agent_type;
+            let eid = ext_id.clone();
+            let db_created_at = summary.created_at;
+            let folder_path_for_fallback = {
+                let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
+                    .await
+                    .ok()
+                    .flatten();
+                folder.map(|f| f.path)
             };
-            match parser.get_conversation(&eid) {
-                Ok(d) => Ok((
-                    d.turns,
-                    d.session_stats,
-                    None,
-                    d.summary.title,
-                    d.transcript_watermark,
-                )),
-                Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
-                    // The external_id may no longer match any local file —
-                    // e.g. an ACP session UUID (Cline) or a stale ID after
-                    // session/new fallback overwrote the original (Gemini CLI).
-                    // Fall back to matching by folder_path and started_at from
-                    // the parsed conversation list.
-                    if matches!(at, AgentType::Cline | AgentType::Gemini) {
-                        if let Ok(all) = parser.list_conversations() {
-                            // Filter by folder_path first, then find the closest
-                            // started_at match within 300 seconds of db_created_at.
-                            let matched = all
-                                .into_iter()
-                                .filter(|c| {
-                                    c.folder_path
-                                        .as_ref()
-                                        .zip(folder_path_for_fallback.as_ref())
-                                        .is_some_and(|(a, b)| path_eq_for_matching(a, b))
-                                })
-                                .min_by_key(|c| {
-                                    (c.started_at - db_created_at).num_seconds().unsigned_abs()
-                                })
-                                .filter(|c| {
-                                    let diff =
-                                        (c.started_at - db_created_at).num_seconds().unsigned_abs();
-                                    diff < 300
-                                });
-                            if let Some(conv) = matched {
-                                let new_ext_id = conv.id.clone();
-                                if let Ok(d) = parser.get_conversation(&new_ext_id) {
-                                    return Ok((
-                                        d.turns,
-                                        d.session_stats,
-                                        Some(new_ext_id),
-                                        d.summary.title,
-                                        d.transcript_watermark,
-                                    ));
+            tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+                let parser: Box<dyn AgentParser> = match at {
+                    AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
+                    AgentType::Codex => Box::new(CodexParser::new()),
+                    AgentType::OpenCode => Box::new(OpenCodeParser::new()),
+                    AgentType::Gemini => Box::new(GeminiParser::new()),
+                    AgentType::Cline => Box::new(ClineParser::new()),
+                    AgentType::Hermes => Box::new(HermesParser::new()),
+                    AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
+                    AgentType::KimiCode => Box::new(KimiCodeParser::new()),
+                    AgentType::Pi => Box::new(PiParser::new()),
+                    AgentType::Grok => Box::new(GrokParser::new()),
+                };
+                match parser.get_conversation(&eid) {
+                    Ok(d) => Ok((
+                        d.turns,
+                        d.session_stats,
+                        None,
+                        d.summary.title,
+                        d.transcript_watermark,
+                    )),
+                    Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
+                        // The external_id may no longer match any local file —
+                        // e.g. an ACP session UUID (Cline) or a stale ID after
+                        // session/new fallback overwrote the original (Gemini CLI).
+                        // Fall back to matching by folder_path and started_at from
+                        // the parsed conversation list.
+                        if matches!(at, AgentType::Cline | AgentType::Gemini) {
+                            if let Ok(all) = parser.list_conversations() {
+                                // Filter by folder_path first, then find the closest
+                                // started_at match within 300 seconds of db_created_at.
+                                let matched = all
+                                    .into_iter()
+                                    .filter(|c| {
+                                        c.folder_path
+                                            .as_ref()
+                                            .zip(folder_path_for_fallback.as_ref())
+                                            .is_some_and(|(a, b)| path_eq_for_matching(a, b))
+                                    })
+                                    .min_by_key(|c| {
+                                        (c.started_at - db_created_at).num_seconds().unsigned_abs()
+                                    })
+                                    .filter(|c| {
+                                        let diff = (c.started_at - db_created_at)
+                                            .num_seconds()
+                                            .unsigned_abs();
+                                        diff < 300
+                                    });
+                                if let Some(conv) = matched {
+                                    let new_ext_id = conv.id.clone();
+                                    if let Ok(d) = parser.get_conversation(&new_ext_id) {
+                                        return Ok((
+                                            d.turns,
+                                            d.session_stats,
+                                            Some(new_ext_id),
+                                            d.summary.title,
+                                            d.transcript_watermark,
+                                        ));
+                                    }
                                 }
                             }
                         }
+                        Ok((vec![], None, None, None, None))
                     }
-                    Ok((vec![], None, None, None, None))
+                    Err(e) => Err(parse_error_to_app_error(e)),
                 }
-                Err(e) => Err(parse_error_to_app_error(e)),
-            }
-        })
-        .await
-        .map_err(|e| {
-            AppCommandError::task_execution_failed(
-                "Failed to read conversation turns from session file",
-            )
-            .with_detail(e.to_string())
-        })??
-    } else {
-        (vec![], None, None, None, None)
-    };
+            })
+            .await
+            .map_err(|e| {
+                AppCommandError::task_execution_failed(
+                    "Failed to read conversation turns from session file",
+                )
+                .with_detail(e.to_string())
+            })??
+        } else {
+            (vec![], None, None, None, None)
+        };
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
@@ -1032,12 +1033,26 @@ pub(crate) async fn cleanup_tabs_for_deleted_conversation(
 
 /// Core logic for creating a conversation with git branch detection.
 /// Shared by both the Tauri command and the web handler.
+///
+/// `delegation_route_override` is persisted on the same INSERT. A non-null
+/// value is rejected for unmanaged Agent types
+/// ([`crate::acp::delegation::route::is_managed_agent`]).
 pub async fn create_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     folder_id: i32,
     agent_type: AgentType,
     title: Option<String>,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<i32, AppCommandError> {
+    if delegation_route_override.is_some()
+        && !crate::acp::delegation::route::is_managed_agent(agent_type)
+    {
+        return Err(AppCommandError::configuration_invalid(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)",
+        ));
+    }
+
     let git_branch = if let Some(folder) = folder_service::get_folder_by_id(conn, folder_id)
         .await
         .map_err(AppCommandError::from)?
@@ -1047,9 +1062,16 @@ pub async fn create_conversation_core(
         None
     };
 
-    let model = conversation_service::create(conn, folder_id, agent_type, title, git_branch)
-        .await
-        .map_err(AppCommandError::from)?;
+    let model = conversation_service::create_with_route_override(
+        conn,
+        folder_id,
+        agent_type,
+        title,
+        git_branch,
+        delegation_route_override,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
     Ok(model.id)
 }
 
@@ -1061,8 +1083,16 @@ pub async fn create_conversation(
     folder_id: i32,
     agent_type: AgentType,
     title: Option<String>,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<i32, AppCommandError> {
-    let id = create_conversation_core(&db.conn, folder_id, agent_type, title).await?;
+    let id = create_conversation_core(
+        &db.conn,
+        folder_id,
+        agent_type,
+        title,
+        delegation_route_override,
+    )
+    .await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, id).await;
     Ok(id)
 }
@@ -1264,7 +1294,17 @@ pub async fn create_chat_conversation_core(
     agent_type: AgentType,
     title: Option<String>,
     existing_dir: Option<&str>,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<CreateChatConversationResult, AppCommandError> {
+    if delegation_route_override.is_some()
+        && !crate::acp::delegation::route::is_managed_agent(agent_type)
+    {
+        return Err(AppCommandError::configuration_invalid(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)",
+        ));
+    }
+
     let path = match existing_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(AppCommandError::io)?;
@@ -1284,19 +1324,27 @@ pub async fn create_chat_conversation_core(
     // soft-deleting the just-created hidden folder — otherwise it would linger as
     // an orphan (active, conversation-less, never reached by the delete path) and
     // pollute the active-folder scope.
-    let model =
-        match conversation_service::create_chat(conn, folder.id, agent_type, title, None).await {
-            Ok(model) => model,
-            Err(create_err) => {
-                if let Err(cleanup_err) = folder_service::remove_folder(conn, &folder.path).await {
-                    tracing::error!(
-                        "[conversations] failed to clean up orphan chat folder {} after conversation create error: {cleanup_err}",
-                        folder.id
-                    );
-                }
-                return Err(AppCommandError::from(create_err));
+    let model = match conversation_service::create_chat_with_route_override(
+        conn,
+        folder.id,
+        agent_type,
+        title,
+        None,
+        delegation_route_override,
+    )
+    .await
+    {
+        Ok(model) => model,
+        Err(create_err) => {
+            if let Err(cleanup_err) = folder_service::remove_folder(conn, &folder.path).await {
+                tracing::error!(
+                    "[conversations] failed to clean up orphan chat folder {} after conversation create error: {cleanup_err}",
+                    folder.id
+                );
             }
-        };
+            return Err(AppCommandError::from(create_err));
+        }
+    };
 
     Ok(CreateChatConversationResult {
         conversation_id: model.id,
@@ -1313,6 +1361,7 @@ pub async fn create_chat_conversation(
     agent_type: AgentType,
     title: Option<String>,
     existing_dir: Option<String>,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 ) -> Result<CreateChatConversationResult, AppCommandError> {
     use tauri::Manager;
     let data_dir = app
@@ -1326,10 +1375,134 @@ pub async fn create_chat_conversation(
         agent_type,
         title,
         existing_dir.as_deref(),
+        delegation_route_override,
     )
     .await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, result.conversation_id).await;
     Ok(result)
+}
+
+/// Persist a root-only session route override. Rejects parented rows, Delegate
+/// kind, and unmanaged Agent types — including when clearing with `None`.
+pub async fn set_conversation_delegation_route_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+) -> Result<DbConversationSummary, AppCommandError> {
+    use crate::acp::delegation::route::is_managed_agent;
+    use crate::db::error::DbError;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let conv = conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await
+        .map_err(|e| AppCommandError::db(DbError::Database(e)))?
+        .ok_or_else(|| {
+            AppCommandError::not_found(format!("Conversation not found: {conversation_id}"))
+        })?;
+
+    if conv.parent_id.is_some() || conv.kind == conversation::ConversationKind::Delegate {
+        return Err(AppCommandError::configuration_invalid(
+            "delegation_route_override is only allowed on root (non-delegate) conversations",
+        ));
+    }
+
+    let agent_type = match serde_json::from_value::<AgentType>(serde_json::Value::String(
+        conv.agent_type.clone(),
+    )) {
+        Ok(at) => at,
+        Err(_) => {
+            return Err(AppCommandError::configuration_invalid(format!(
+                "unknown agent_type {:?} cannot own a route override",
+                conv.agent_type
+            )));
+        }
+    };
+    if !is_managed_agent(agent_type) {
+        return Err(AppCommandError::configuration_invalid(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)",
+        ));
+    }
+
+    let stored = route_override.map(|p| match p {
+        crate::acp::delegation::route::DelegationRoutePolicy::Codeg => "codeg".to_string(),
+        crate::acp::delegation::route::DelegationRoutePolicy::Native => "native".to_string(),
+    });
+    let mut active: conversation::ActiveModel = conv.into();
+    active.delegation_route_override = Set(stored);
+    active.updated_at = Set(chrono::Utc::now());
+    active
+        .update(conn)
+        .await
+        .map_err(|e| AppCommandError::db(DbError::Database(e)))?;
+
+    conversation_service::get_by_id(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_conversation_delegation_route(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    runtime: tauri::State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
+    conversation_id: i32,
+    route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+) -> Result<DbConversationSummary, AppCommandError> {
+    let summary =
+        set_conversation_delegation_route_core(&db.conn, conversation_id, route_override).await?;
+    let snap = runtime.snapshot();
+    // Update stored preference on bound connections then recompute observed route.
+    {
+        let mut map = manager.connections.lock().await;
+        for conn in map.values_mut() {
+            let bound = conn
+                .state
+                .try_read()
+                .ok()
+                .and_then(|s| s.conversation_id)
+                == Some(conversation_id);
+            if bound {
+                conn.route_preference = route_override;
+            }
+        }
+    }
+    manager
+        .refresh_delegation_route_staleness_for_conversation(
+            conversation_id,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await;
+    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    Ok(summary)
+}
+
+/// Update the observed route preference for a row-less connected draft.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_draft_delegation_route_preference(
+    manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    runtime: tauri::State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
+    connection_id: String,
+    route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+) -> Result<(), AppCommandError> {
+    let snap = runtime.snapshot();
+    manager
+        .set_draft_delegation_route_preference(
+            &connection_id,
+            route_override,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await
+        .map_err(|e| {
+            e.shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+        })
 }
 
 /// Eagerly create a chat-mode scratch directory (no DB rows) and return its
@@ -1338,7 +1511,9 @@ pub async fn create_chat_conversation(
 /// conversation are still created lazily on first send (reusing this dir).
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn create_chat_dir(app: tauri::AppHandle) -> Result<CreateChatDirResult, AppCommandError> {
+pub async fn create_chat_dir(
+    app: tauri::AppHandle,
+) -> Result<CreateChatDirResult, AppCommandError> {
     use tauri::Manager;
     let data_dir = app
         .path()
@@ -1618,6 +1793,8 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::delegation::route::DelegationRoutePolicy;
+    use crate::app_error::AppErrorCode;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1649,7 +1826,97 @@ mod tests {
             parent_id: Some(1),
             parent_tool_use_id: Some(parent_tool_use_id.into()),
             delegation_call_id: Some("call-1".into()),
+            delegation_route_override: None,
+            delegation_task_status: None,
+            delegation_error_code: None,
+            delegation_started_at: None,
+            delegation_finished_at: None,
         }
+    }
+
+    async fn make_parent_and_delegate(db: &crate::db::AppDatabase) -> (i32, i32, i32) {
+        let folder_id = seed_folder(db, "/tmp/codeg-route-override").await;
+        let parent = create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("child".into()),
+            None,
+            Some(crate::acp::delegation::spawner::DelegationLink {
+                parent_conversation_id: parent,
+                parent_tool_use_id: "tu-route".into(),
+                delegation_call_id: "call-route".into(),
+            }),
+        )
+        .await
+        .expect("child")
+        .id;
+        (folder_id, parent, child)
+    }
+
+    #[tokio::test]
+    async fn root_override_persists_and_child_override_is_rejected() {
+        let db = fresh_in_memory_db().await;
+        let (folder_id, parent, child) = make_parent_and_delegate(&db).await;
+        let root = set_conversation_delegation_route_core(
+            &db.conn,
+            parent,
+            Some(DelegationRoutePolicy::Native),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            root.delegation_route_override,
+            Some(DelegationRoutePolicy::Native)
+        );
+
+        let err = set_conversation_delegation_route_core(
+            &db.conn,
+            child,
+            Some(DelegationRoutePolicy::Native),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+
+        let unmanaged =
+            create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
+                .await
+                .unwrap();
+        let err = set_conversation_delegation_route_core(
+            &db.conn,
+            unmanaged,
+            Some(DelegationRoutePolicy::Codeg),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+
+        let created = create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            Some(DelegationRoutePolicy::Codeg),
+        )
+        .await
+        .unwrap();
+        let row = conversation_service::get_by_id(&db.conn, created)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.delegation_route_override,
+            Some(DelegationRoutePolicy::Codeg)
+        );
     }
 
     fn tool_use_turn(tool_use_id: Option<&str>, tool_name: &str) -> MessageTurn {
@@ -1742,11 +2009,21 @@ mod tests {
             assistant_text_turn("turn-1", "reply", at(-29), true),
             user_text_turn("turn-2", "hello", at(1)),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(stamped.as_deref(), Some("msg-live"), "reports the stamped id");
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            stamped.as_deref(),
+            Some("msg-live"),
+            "reports the stamped id"
+        );
         assert_eq!(turns[2].id, "msg-live");
-        assert_eq!(turns[0].id, "turn-0", "earlier identical-position turn intact");
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "earlier identical-position turn intact"
+        );
         assert_eq!(turns[1].id, "turn-1");
     }
 
@@ -1765,11 +2042,18 @@ mod tests {
             user_text_turn("turn-0", "hello", at(1)),
             assistant_text_turn("turn-1", "partial...", at(2), true),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
         assert_eq!(turns[0].id, "msg-live");
-        assert_eq!(turns.len(), 2, "the partial reply is preserved (not dropped)");
+        assert_eq!(
+            turns.len(),
+            2,
+            "the partial reply is preserved (not dropped)"
+        );
         assert_eq!(turns[1].id, "turn-1", "the partial reply is untouched");
     }
 
@@ -1800,10 +2084,16 @@ mod tests {
             assistant_text_turn("turn-1", "reply", at(-29), true),
             user_text_turn("turn-2", "hello", at(1)),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("turn-0", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("turn-0", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None, "colliding broadcast id → no stamp");
-        assert_eq!(turns[2].id, "turn-2", "the in-flight prompt keeps its parser id");
+        assert_eq!(
+            turns[2].id, "turn-2",
+            "the in-flight prompt keeps its parser id"
+        );
         assert_eq!(turns[0].id, "turn-0", "the colliding turn is untouched");
     }
 
@@ -1818,9 +2108,16 @@ mod tests {
             user_text_turn("turn-2", "ok", at(1)),
             assistant_text_turn("turn-3", "b", at(2), false),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0");
-        assert_eq!(turns[2].id, "turn-2", "non-matching tail user turn untouched");
+        assert_eq!(
+            turns[2].id, "turn-2",
+            "non-matching tail user turn untouched"
+        );
     }
 
     #[test]
@@ -1832,7 +2129,11 @@ mod tests {
             assistant_text_turn("turn-1", "a", at(2), false),
             assistant_text_turn("turn-2", "b", at(3), false),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "left untouched");
     }
 
@@ -1852,30 +2153,43 @@ mod tests {
             model: None,
             completed_at: None,
         };
-        let pending_image = |message_id: &str, data: &str| {
-            crate::acp::session_state::PendingUserMessage {
+        let pending_image =
+            |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
                 message_id: message_id.into(),
                 blocks: vec![crate::acp::types::UserMessageBlock::Image {
                     data: data.into(),
                     mime_type: "image/png".into(),
                 }],
-            }
-        };
+            };
 
         let mut turns = vec![image_turn("turn-0", "AAAA")];
-        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "AAAA"), Some(turn_started()));
-        assert_eq!(turns[0].id, "msg-live", "uri difference is ignored, data matches");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_image("msg-live", "AAAA"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "msg-live",
+            "uri difference is ignored, data matches"
+        );
 
         let mut turns = vec![image_turn("turn-0", "AAAA")];
-        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "BBBB"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_image("msg-live", "BBBB"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "different image bytes → no stamp");
     }
 
     #[test]
     fn empty_turns_is_a_noop() {
         let mut turns: Vec<MessageTurn> = vec![];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None);
         assert!(turns.is_empty());
     }
@@ -1893,7 +2207,11 @@ mod tests {
             user_text_turn("turn-0", "continue", at(-60)),
             assistant_text_turn("turn-1", "done", at(-58), true),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "continue"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "older identical prompt → untouched");
     }
 
@@ -1912,8 +2230,15 @@ mod tests {
         // backend broadcasts `UserMessage` before issuing the agent request), so
         // a turn exactly at the start qualifies — the boundary is inclusive.
         let mut turns = vec![user_text_turn("turn-0", "hello", at(0))];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(turns[0].id, "msg-live", "persisted exactly at the start is in-flight");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "msg-live",
+            "persisted exactly at the start is in-flight"
+        );
     }
 
     #[test]
@@ -1921,8 +2246,15 @@ mod tests {
         // Strict gate, no backward tolerance: a turn even one second before the
         // start belongs to an earlier turn, never the in-flight prompt.
         let mut turns = vec![user_text_turn("turn-0", "hello", at(-1))];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(turns[0].id, "turn-0", "one second before the start is not in-flight");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "one second before the start is not in-flight"
+        );
     }
 
     #[test]
@@ -1938,10 +2270,19 @@ mod tests {
             user_text_turn("turn-0", "continue", at(-1)),
             assistant_text_turn("turn-1", "done", at(0), true),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
-        assert_eq!(stamped, None, "fast prior identical prompt → nothing reported");
-        assert_eq!(turns[0].id, "turn-0", "fast prior identical prompt → untouched");
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "continue"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            stamped, None,
+            "fast prior identical prompt → nothing reported"
+        );
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "fast prior identical prompt → untouched"
+        );
         assert_eq!(turns.len(), 2, "the prior completed reply is preserved");
     }
 
@@ -2148,6 +2489,7 @@ mod tests {
             folder_id,
             AgentType::ClaudeCode,
             Some("parent".into()),
+            None,
         )
         .await
         .expect("parent");
@@ -2185,6 +2527,7 @@ mod tests {
             folder_id,
             AgentType::ClaudeCode,
             Some("hello".into()),
+            None,
         )
         .await
         .expect("create");
@@ -2203,7 +2546,7 @@ mod tests {
         // Use a tempdir that's guaranteed not a git repo (no .git).
         let temp = tempfile::tempdir().expect("tempdir");
         let folder_id = seed_folder(&db, &temp.path().to_string_lossy()).await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create succeeds even without git");
         let summary = conversation_service::get_by_id(&db.conn, id)
@@ -2222,7 +2565,8 @@ mod tests {
         // so creating a conversation against an unknown folder_id should not
         // panic. detect_git_branch is skipped because folder lookup returns None.
         let db = fresh_in_memory_db().await;
-        let result = create_conversation_core(&db.conn, 999_999, AgentType::Gemini, None).await;
+        let result =
+            create_conversation_core(&db.conn, 999_999, AgentType::Gemini, None, None).await;
         // Behavior contract: either success (current FK-loose behavior) or a
         // database error — never panic. Accept both.
         match result {
@@ -2248,6 +2592,7 @@ mod tests {
             data_dir.path(),
             AgentType::ClaudeCode,
             Some("hello chat".into()),
+            None,
             None,
         )
         .await
@@ -2284,10 +2629,9 @@ mod tests {
         assert!(summary.git_branch.is_none());
 
         // It surfaces in the default sidebar query (active-folder scope).
-        let rows =
-            list_all_conversations_core(&db.conn, None, None, None, None, None, false)
-                .await
-                .expect("list");
+        let rows = list_all_conversations_core(&db.conn, None, None, None, None, None, false)
+            .await
+            .expect("list");
         assert!(rows.iter().any(|c| c.id == result.conversation_id));
     }
 
@@ -2323,6 +2667,7 @@ mod tests {
             AgentType::ClaudeCode,
             None,
             Some(prepared.as_str()),
+            None,
         )
         .await
         .expect("create chat conversation reusing dir");
@@ -2351,10 +2696,16 @@ mod tests {
     async fn cleanup_chat_folder_soft_deletes_hidden_folder() {
         let db = fresh_in_memory_db().await;
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let res =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create");
+        let res = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create");
 
         // Before cleanup the hidden folder is active.
         assert!(folder_service::get_folder_by_id(&db.conn, res.folder_id)
@@ -2415,10 +2766,16 @@ mod tests {
     async fn gc_spares_live_chat_dir() {
         let db = fresh_in_memory_db().await;
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let res =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create");
+        let res = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create");
 
         let removed = gc_orphan_chat_dirs_core_with_threshold(
             &db.conn,
@@ -2439,10 +2796,16 @@ mod tests {
     async fn gc_reclaims_soft_deleted_chat_dir() {
         let db = fresh_in_memory_db().await;
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let res =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create");
+        let res = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create");
         delete_conversation_core(&db.conn, res.conversation_id)
             .await
             .expect("delete conversation");
@@ -2480,7 +2843,10 @@ mod tests {
         .await
         .expect("gc");
 
-        assert_eq!(removed, 0, "a fresh dir below the staleness threshold is spared");
+        assert_eq!(
+            removed, 0,
+            "a fresh dir below the staleness threshold is spared"
+        );
         assert!(
             std::path::Path::new(&fresh).is_dir(),
             "fresh dir retained (anti-race)"
@@ -2510,10 +2876,16 @@ mod tests {
         // A live chat conversation — its scratch path is recorded in the DB via
         // the real create path (`add_chat_folder`), the exact string the GC
         // compares against ...
-        let live =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create live");
+        let live = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create live");
         // ... alongside an unbound orphan dir in the same `chat-sessions` tree
         // (same day → same date bucket).
         let orphan = create_chat_dir_core(data_dir.path()).expect("orphan dir");
@@ -2550,23 +2922,26 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let real = tempfile::tempdir().expect("tempdir");
         // DB records the live path under the REAL data_dir spelling.
-        let live =
-            create_chat_conversation_core(&db.conn, real.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create live");
+        let live = create_chat_conversation_core(
+            &db.conn,
+            real.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create live");
         // A second spelling of the same storage: a symlink pointing at it.
         let link_parent = tempfile::tempdir().expect("link parent");
         let link = link_parent.path().join("data-link");
         symlink(real.path(), &link).expect("symlink");
 
         // GC runs under the symlinked spelling; the live dir must still be spared.
-        let removed = gc_orphan_chat_dirs_core_with_threshold(
-            &db.conn,
-            &link,
-            std::time::Duration::ZERO,
-        )
-        .await
-        .expect("gc");
+        let removed =
+            gc_orphan_chat_dirs_core_with_threshold(&db.conn, &link, std::time::Duration::ZERO)
+                .await
+                .expect("gc");
 
         assert_eq!(
             removed, 0,
@@ -2582,10 +2957,16 @@ mod tests {
     async fn cleanup_chat_folder_keeps_folder_with_remaining_conversations() {
         let db = fresh_in_memory_db().await;
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let res =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("create");
+        let res = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create");
         // Simulate a second conversation that happens to share the hidden folder.
         let second =
             conversation_service::create(&db.conn, res.folder_id, AgentType::Codex, None, None)
@@ -2624,11 +3005,17 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let data_dir = tempfile::tempdir().expect("tempdir");
         let normal_id = seed_folder(&db, "/tmp/codeg-chat-list-test").await;
-        let chat_id =
-            create_chat_conversation_core(&db.conn, data_dir.path(), AgentType::Codex, None, None)
-                .await
-                .expect("chat")
-                .folder_id;
+        let chat_id = create_chat_conversation_core(
+            &db.conn,
+            data_dir.path(),
+            AgentType::Codex,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("chat")
+        .folder_id;
 
         // Folder history excludes the hidden chat folder, keeps the normal one.
         let history = folder_service::list_folders(&db.conn).await.unwrap();
@@ -2705,10 +3092,10 @@ mod tests {
     async fn save_opened_tabs_core_persists_only_conversation_tabs_and_bumps_version() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tabs-test").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
-        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("c2");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -2750,7 +3137,7 @@ mod tests {
     async fn save_opened_tabs_core_rejects_stale_version_without_emitting() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tabs-stale").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
 
@@ -2796,7 +3183,7 @@ mod tests {
     async fn cleanup_tabs_for_deleted_conversation_removes_tab_and_emits() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tab-conv-del").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
         save_opened_tabs_core(
@@ -2811,7 +3198,9 @@ mod tests {
 
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_core(&db.conn, c1).await.expect("delete");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete");
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
 
         let snap = list_opened_tabs_core(&db.conn).await.expect("list");
@@ -2826,10 +3215,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_tabs_for_deleted_conversation_bumps_barrier_without_emitting_when_no_open_tab() {
+    async fn cleanup_tabs_for_deleted_conversation_bumps_barrier_without_emitting_when_no_open_tab()
+    {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tab-conv-del-noop").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
         let before = list_opened_tabs_core(&db.conn).await.expect("list").version;
@@ -2852,7 +3242,7 @@ mod tests {
     async fn remove_folder_from_workspace_cleans_tabs_and_emits() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-folder-remove-tabs").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
         save_opened_tabs_core(
@@ -2884,10 +3274,10 @@ mod tests {
     async fn stale_save_after_conversation_cleanup_is_rejected_no_resurrection() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tab-cleanup-race").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
-        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("c2");
 
@@ -2907,7 +3297,9 @@ mod tests {
         assert_eq!(saved.version, 1);
 
         // Server deletes c1 and atomically cleans its tab → v2 (only c2 remains).
-        delete_conversation_core(&db.conn, c1).await.expect("delete c1");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete c1");
         cleanup_tabs_for_deleted_conversation(&EventEmitter::Noop, &db.conn, c1).await;
 
         // A client still on the pre-cleanup version re-saves the OLD set (with c1
@@ -2940,7 +3332,7 @@ mod tests {
     async fn stale_save_after_folder_removal_is_rejected_no_resurrection() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-folder-remove-race").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
         let saved = save_opened_tabs_core(
@@ -2973,7 +3365,10 @@ mod tests {
         )
         .await
         .expect("stale save returns Ok");
-        assert!(!stale.accepted, "save on the pre-removal version must be rejected");
+        assert!(
+            !stale.accepted,
+            "save on the pre-removal version must be rejected"
+        );
 
         let snap = list_opened_tabs_core(&db.conn).await.expect("list");
         assert!(
@@ -2991,10 +3386,10 @@ mod tests {
         // so a tab for the soft-deleted conversation is never persisted.
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tab-zero-row-race").await;
-        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("c1");
-        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let c2 = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("c2");
 
@@ -3012,11 +3407,16 @@ mod tests {
 
         // c1 deleted with no persisted c1 tab → zero rows removed, but the
         // version barrier still advances (v1 → v2) and nothing is broadcast.
-        delete_conversation_core(&db.conn, c1).await.expect("delete c1");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete c1");
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
-        assert!(rx.try_recv().is_err(), "zero-row cleanup must not broadcast");
+        assert!(
+            rx.try_recv().is_err(),
+            "zero-row cleanup must not broadcast"
+        );
 
         // A's debounced save (built on v1, still including the now-deleted c1) is
         // rejected by the barrier — c1 must not be persisted as a ghost.
@@ -3060,9 +3460,10 @@ mod tests {
     async fn update_conversation_status_core_invalid_string_errors() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-status-test").await;
-        let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
-            .await
-            .expect("create");
+        let conv_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create");
         let err =
             update_conversation_status_core(&db.conn, conv_id, "not-a-real-status".to_string())
                 .await
@@ -3078,7 +3479,7 @@ mod tests {
     async fn update_conversation_title_core_roundtrip() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-title-test").await;
-        let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None)
+        let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
         update_conversation_title_core(&db.conn, conv_id, "Renamed".into())
@@ -3094,7 +3495,7 @@ mod tests {
     async fn delete_conversation_core_soft_deletes() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-delete-test").await;
-        let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
         delete_conversation_core(&db.conn, conv_id)
@@ -3118,7 +3519,7 @@ mod tests {
     async fn list_child_conversations_core_returns_empty_for_no_parent() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-list-children-empty").await;
-        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create parent");
         let rows = list_child_conversations_core(&db.conn, parent_id)
@@ -3134,9 +3535,10 @@ mod tests {
 
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-list-children-match").await;
-        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
-            .await
-            .expect("create parent");
+        let parent_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create parent");
 
         // Two delegation children — both should come back, newest-first.
         let mut child_ids = Vec::new();
@@ -3159,7 +3561,7 @@ mod tests {
             child_ids.push(child.id);
         }
         // Sibling root conversation that must NOT appear.
-        let _other = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None)
+        let _other = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("unrelated root");
 
@@ -3198,7 +3600,7 @@ mod tests {
     async fn emit_conversation_upsert_broadcasts_full_root_summary() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-sync-upsert").await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("create");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -3251,7 +3653,7 @@ mod tests {
     async fn clear_awaiting_reply_core_emits_state_only_when_changed() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-clear-awaiting").await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
         let before = conversation_service::finish_end_turn_if_in_progress(&db.conn, id, true)
@@ -3291,7 +3693,7 @@ mod tests {
     async fn get_folder_conversation_does_not_clear_awaiting_reply() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-getter-awaiting").await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
         let marked = conversation_service::finish_end_turn_if_in_progress(&db.conn, id, true)
@@ -3323,7 +3725,7 @@ mod tests {
     async fn emit_conversation_upsert_carries_new_status_after_update() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-sync-status").await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
         update_conversation_status_core(&db.conn, id, "pending_review".to_string())
@@ -3342,7 +3744,7 @@ mod tests {
         // races a delete emits nothing instead of re-inserting a tombstone.
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-sync-deleted-silent").await;
-        let id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None)
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
         delete_conversation_core(&db.conn, id)
@@ -3367,9 +3769,10 @@ mod tests {
         use crate::acp::delegation::spawner::DelegationLink;
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-sync-child-broadcast").await;
-        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
-            .await
-            .expect("parent");
+        let parent_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent");
         let child = conversation_service::create_with_delegation(
             &db.conn,
             folder_id,
@@ -3411,9 +3814,10 @@ mod tests {
         use crate::acp::delegation::spawner::DelegationLink;
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-delete-child-reemit").await;
-        let parent_id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
-            .await
-            .expect("parent");
+        let parent_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent");
         let child = conversation_service::create_with_delegation(
             &db.conn,
             folder_id,

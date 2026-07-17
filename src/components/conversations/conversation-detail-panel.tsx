@@ -22,7 +22,11 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { useAcpActions, useAcpEvent } from "@/contexts/acp-connections-context"
+import {
+  useAcpActions,
+  useAcpEvent,
+  useConnectionStore,
+} from "@/contexts/acp-connections-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
@@ -34,6 +38,8 @@ import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
+import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice"
+import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
 import { FeedbackDialog } from "@/components/chat/feedback-dialog"
@@ -505,6 +511,8 @@ const ConversationTabView = memo(function ConversationTabView({
     // Drives cross-client viewer discovery: when another client is already
     // live on this conversation, attach to its connection instead of spawning.
     conversationId: dbConversationId ?? undefined,
+    // Memory-only draft override (and reapply after bind uses conversation row).
+    delegationRouteOverride: ownTab?.delegationRouteOverride ?? undefined,
   })
   const { status: connStatus, sessionId: connSessionId } = conn
   const messageQueue = useMessageQueue()
@@ -950,7 +958,8 @@ const ConversationTabView = memo(function ConversationTabView({
             const res = await createChatConversation(
               selectedAgent,
               title,
-              chatExistingDir
+              chatExistingDir,
+              sendOwnTab?.delegationRouteOverride ?? null
             )
             newConversationId = res.conversationId
             sendFolderId = res.folderId
@@ -984,7 +993,8 @@ const ConversationTabView = memo(function ConversationTabView({
             newConversationId = await createConversation(
               folderId,
               selectedAgent,
-              title
+              title,
+              sendOwnTab?.delegationRouteOverride ?? null
             )
             dbConvIdRef.current = newConversationId
             // Set external ID on the stable virtual session (no migration needed —
@@ -1422,6 +1432,7 @@ const ConversationTabView = memo(function ConversationTabView({
           <BackgroundTasksChip contextKey={tabId} />
         </>
       }
+      routeNotice={<DelegationRouteNotice contextKey={tabId} />}
       status={connStatus}
       promptCapabilities={conn.promptCapabilities}
       defaultPath={workingDirForConnection}
@@ -1622,8 +1633,14 @@ export function ConversationDetailPanel() {
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const isTileMode = useTabStore((s) => s.isTileMode)
-  const { openNewConversationTab, closeTab, switchTab, onPreviewTabReplaced } =
-    useTabActions()
+  const {
+    openNewConversationTab,
+    closeTab,
+    switchTab,
+    onPreviewTabReplaced,
+    setDraftDelegationRoute,
+  } = useTabActions()
+  const { getConnection } = useConnectionStore()
   const newConversation = useMemo(() => {
     const activeTab = tabs.find((tab) => tab.id === activeTabId)
     if (!activeTab || activeTab.conversationId != null) return null
@@ -1866,6 +1883,15 @@ export function ConversationDetailPanel() {
     conversations
   )
 
+  const activeRouteMenuTab = useMemo(
+    () => tabs.find((tab) => tab.id === activeTabId) ?? null,
+    [tabs, activeTabId]
+  )
+  const activeRouteConnectionId =
+    activeRouteMenuTab != null
+      ? (getConnection(activeRouteMenuTab.id)?.connectionId ?? null)
+      : null
+
   const getExportData = useCallback(() => {
     if (!activeConversationTab?.conversationId) return null
     const session = getRuntimeSession(activeConversationTab.conversationId)
@@ -2079,6 +2105,22 @@ export function ConversationDetailPanel() {
             <Info className="h-4 w-4" />
             {tDetails("menuLabel")}
           </ContextMenuItem>
+          {activeRouteMenuTab ? (
+            <DelegationRouteMenu
+              agentType={activeRouteMenuTab.agentType}
+              conversationId={activeRouteMenuTab.conversationId}
+              parentId={activeSessionSummary?.parent_id}
+              connectionId={activeRouteConnectionId}
+              value={
+                activeRouteMenuTab.conversationId != null
+                  ? (activeSessionSummary?.delegation_route_override ?? null)
+                  : (activeRouteMenuTab.delegationRouteOverride ?? null)
+              }
+              onDraftChange={(v) =>
+                setDraftDelegationRoute(activeRouteMenuTab.id, v)
+              }
+            />
+          ) : null}
           <ContextMenuSeparator />
           <ContextMenuItem
             disabled={!activeTabId}

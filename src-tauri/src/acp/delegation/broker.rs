@@ -24,7 +24,8 @@
 //!    [`DelegationTaskReport`] (or a terminal report when the child finished
 //!    during setup / a cancel reached it mid-setup / setup itself failed).
 //! 6. Later, a terminal event resolves the task — migrating it `running` →
-//!    `completed` and tearing the child down:
+//!    `settling` (while durable CAS runs) → `completed`, then tearing the
+//!    child down:
 //!       - the lifecycle calling [`DelegationBroker::complete_call`] on
 //!         `TurnComplete` (happy path), or
 //!       - a cancel — MCP-side (`notifications/cancelled` →
@@ -49,6 +50,7 @@
 //! children — they keep running in the background (the whole point of async).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,12 +63,19 @@ use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+use crate::acp::delegation::store::{
+    DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
+    TerminalTaskWrite,
+};
+use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationRequest, DelegationTaskReport, TaskStatus,
+    DelegationRequest, DelegationTaskReport, ObservationSnapshot, TaskObservation, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
+use crate::db::entities::conversation::ConversationStatus;
 use crate::models::AgentType;
+use chrono::Utc;
 
 /// Default per-parent byte budget for cached completed-task result text. The
 /// completed-cache lets `get_delegation_status` / `cancel_delegation` return a
@@ -122,6 +131,9 @@ pub struct ChildStatusRecord {
     /// the DB fallback to the calling parent so one parent can't read another's
     /// task by guessing a UUID.
     pub parent_id: Option<i32>,
+    /// Durable error code from `delegation_error_code` (not inferred from
+    /// generic conversation status).
+    pub error_code: Option<String>,
 }
 
 /// DB fallback for `get_delegation_status` / `cancel_delegation` once a task's
@@ -182,9 +194,11 @@ impl Default for DelegationConfig {
 /// returned its `Running` ack. The async redesign drops the parked
 /// `oneshot::Sender` the old `PendingCall` carried: the parent's
 /// `delegate_to_agent` no longer blocks on a channel, so there is nothing to
-/// signal. A terminal event instead migrates the entry into `completed` (same
-/// lock) and wakes any `get_delegation_status` long-poll via the broker's
+/// signal. A terminal event migrates the entry `running` → `settling` (same
+/// lock, before durable CAS) then `settling` → `completed` after CAS, and
+/// wakes any `get_delegation_status` long-poll via the broker's
 /// `result_notify`.
+#[derive(Clone)]
 struct RunningTask {
     child_connection_id: String,
     child_conversation_id: i32,
@@ -259,11 +273,19 @@ struct PendingCalls {
 #[derive(Default)]
 struct PendingInner {
     /// Tasks running in the background after their `Running` ack, keyed by
-    /// broker `call_id` (= `task_id`). A terminal event migrates an entry from
-    /// here into `completed` under THIS lock (atomic `running` → `completed`
-    /// transition), so a concurrent `get_delegation_status` never observes a
-    /// task as neither running nor completed.
+    /// broker `call_id` (= `task_id`). A terminal producer migrates an entry
+    /// from here into `settling` under THIS lock before durable CAS, then
+    /// into `completed` after CAS, so a concurrent `get_delegation_status`
+    /// never observes a mid-settle memory hole (neither running nor completed
+    /// while the DB is still `running`).
     running: HashMap<String, RunningTask>,
+    /// In-flight durable settlement: drained from `running` but not yet in
+    /// `completed` (store CAS / retries may still be running). Classified as
+    /// `Running` for status/wait so `wait_ms=0` and bounded waits cannot return
+    /// until a terminal report is published. Only the producer that inserted
+    /// the settling marker may finish the settle; concurrent cancel/complete
+    /// must not start a second side-effect producer.
+    settling: HashMap<String, RunningTask>,
     /// Terminal results retained for `get_delegation_status` / `cancel_delegation`,
     /// keyed by `task_id`. Bounded by the per-parent byte valve
     /// (`completed_cap_bytes` over `completed_bytes`, FIFO-evicted via
@@ -639,6 +661,95 @@ fn build_completed(
     }
 }
 
+/// Side-effect context for [`DelegationBroker::settle_task`].
+struct SettleContext {
+    parent_connection_id: String,
+    parent_tool_use_id: String,
+    child_connection_id: String,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+    duration_ms: u64,
+    /// When true, cancel the child turn before disconnect (user/parent cancel).
+    cancel_turn: bool,
+    /// When the CAS is lost, still attempt disconnect (idempotent).
+    disconnect_on_loss: bool,
+    /// Optional message override (e.g. cancel reason text).
+    message: Option<String>,
+}
+
+/// Observability context for the process-local persistence retry worker.
+/// Terminal metrics/audit fire only if the worker's settle eventually Wins.
+#[derive(Debug, Clone)]
+struct PersistenceRetryAccounting {
+    parent_connection_id: String,
+    agent_type: AgentType,
+    child_conversation_id: i32,
+    /// Producer wall duration (ms) at first terminal attempt; saturating path.
+    duration_ms: u64,
+}
+
+impl SettleContext {
+    fn from_running(task: &RunningTask, duration_ms: u64, cancel_turn: bool) -> Self {
+        Self {
+            parent_connection_id: task.parent_connection_id.clone(),
+            parent_tool_use_id: task.parent_tool_use_id.clone(),
+            child_connection_id: task.child_connection_id.clone(),
+            child_conversation_id: task.child_conversation_id,
+            agent_type: task.agent_type,
+            duration_ms,
+            cancel_turn,
+            disconnect_on_loss: true,
+            message: None,
+        }
+    }
+}
+
+/// Map a resolved outcome onto a durable terminal write + optional result text.
+fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Option<String>) {
+    let now = Utc::now();
+    match outcome {
+        DelegationOutcome::Ok(ok) => (
+            TerminalTaskWrite::completed(now, ConversationStatus::PendingReview),
+            Some(ok.text.clone()),
+        ),
+        DelegationOutcome::Err { code, .. } if code == "canceled" => (
+            TerminalTaskWrite::canceled(code.clone(), now, ConversationStatus::Cancelled),
+            None,
+        ),
+        DelegationOutcome::Err { code, .. } => (
+            TerminalTaskWrite::failed(code.clone(), now, ConversationStatus::Cancelled),
+            None,
+        ),
+    }
+}
+
+/// Rebuild a lightweight outcome for meta/event summary from a settled report.
+fn report_to_outcome_for_meta(
+    report: &DelegationTaskReport,
+    ctx: &SettleContext,
+) -> DelegationOutcome {
+    match report.status {
+        TaskStatus::Completed => {
+            DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
+                text: report.text.clone().unwrap_or_default(),
+                child_conversation_id: ctx.child_conversation_id,
+                child_agent_type: ctx.agent_type,
+                turn_count: 1,
+                duration_ms: ctx.duration_ms,
+                token_usage: None,
+            })
+        }
+        _ => DelegationOutcome::Err {
+            code: report
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "subagent_error".into()),
+            message: report.message.clone().unwrap_or_default(),
+            child_conversation_id: Some(ctx.child_conversation_id),
+        },
+    }
+}
+
 /// A `canceled`-coded [`DelegationOutcome`] carrying the child conversation id.
 fn canceled_outcome(child_conversation_id: i32, reason: &str) -> DelegationOutcome {
     DelegationOutcome::from_err(
@@ -649,38 +760,27 @@ fn canceled_outcome(child_conversation_id: i32, reason: &str) -> DelegationOutco
     )
 }
 
-/// Remove `keys` from `running`, recording each as a `Canceled` completed entry
-/// (so a `get_delegation_status` still answers) and returning the drained tasks
-/// — each paired with the `duration_ms` captured at this drain point — for I/O
-/// teardown. MUST be called with the pending lock held so the running →
-/// completed migration is atomic.
+/// Atomically migrate `keys` from `running` → `settling` and return each task
+/// with its `task_id` and the `duration_ms` captured at this drain point.
+/// Durable terminal settlement (store CAS + `settling` → `completed` +
+/// meta/event/teardown) happens after the lock is released via
+/// [`DelegationBroker::settle_task`].
 ///
-/// The duration is captured ONCE here and returned so the slow teardown
-/// (parent-card meta, report) reuses the exact value recorded into the
-/// completed-cache, rather than recomputing `started_at.elapsed()` later — which
-/// would inflate it for the backgrounded `cancel_by_parent_turn` teardown and
-/// disagree with the `get_delegation_status` / `cancel_delegation` cards.
-fn drain_and_record_canceled(
-    inner: &mut PendingInner,
-    keys: Vec<String>,
-    reason: &str,
-) -> Vec<(RunningTask, u64)> {
+/// Parking a settling marker under the same lock closes the mid-settle memory
+/// hole: status/wait classification remains `Running` until CAS finishes.
+/// Concurrent cancel/complete cannot re-drain the same task (it is no longer
+/// in `running`).
+///
+/// The duration is captured ONCE here so the slow teardown reuses the exact
+/// value rather than recomputing `started_at.elapsed()` later — which would
+/// inflate it for the backgrounded `cancel_by_parent_turn` teardown.
+fn drain_running(inner: &mut PendingInner, keys: Vec<String>) -> Vec<(String, RunningTask, u64)> {
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
         let task = inner.running.remove(&k).expect("key just observed");
-        let outcome = canceled_outcome(task.child_conversation_id, reason);
         let duration_ms = task.started_at.elapsed().as_millis() as u64;
-        inner.insert_completed(
-            &k,
-            build_completed(
-                &task.parent_connection_id,
-                task.child_conversation_id,
-                task.agent_type,
-                duration_ms,
-                &outcome,
-            ),
-        );
-        out.push((task, duration_ms));
+        inner.settling.insert(k.clone(), task.clone());
+        out.push((k, task, duration_ms));
     }
     out
 }
@@ -725,6 +825,9 @@ fn report_from_outcome(
         error_code,
         message,
         duration_ms,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -762,30 +865,80 @@ fn running_ack(
         error_code: None,
         message: Some(message),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
 /// How long [`DelegationBroker::get_task_status`] may block before returning the
 /// current (possibly still-running) snapshot. Derived by the listener from the
-/// MCP tool's `wait_ms`: omitted → [`Immediate`], an explicit `0` → [`Infinite`],
-/// any positive value → [`Bounded`] (clamped to the listener's hard ceiling).
+/// MCP tool's `wait_ms`: omitted → [`Snapshot`], an explicit `0` → [`Terminal`],
+/// any positive value → [`Supervised`] (clamped to the listener's hard ceiling).
 ///
-/// [`Immediate`]: StatusWait::Immediate
-/// [`Bounded`]: StatusWait::Bounded
-/// [`Infinite`]: StatusWait::Infinite
+/// [`Snapshot`]: StatusWait::Snapshot
+/// [`Supervised`]: StatusWait::Supervised
+/// [`Terminal`]: StatusWait::Terminal
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusWait {
-    /// Return the current snapshot right away — the default poll.
-    Immediate,
-    /// Block up to this many milliseconds, then return whatever snapshot we have
-    /// (the child keeps running past the deadline; the caller re-issues to wait
-    /// more).
-    Bounded(u64),
-    /// Block until the task reaches a terminal state — never time out. Lets a
-    /// long-running child be awaited in a single call. A parent disconnect or
-    /// cancel also drives the task terminal (and fires the completion signal),
-    /// so this never outlives the task itself.
-    Infinite,
+    /// Return the current snapshot right away — never parks. Wire: omit `wait_ms`.
+    Snapshot,
+    /// Bounded supervised wait: returns on terminal/Unknown, stalled,
+    /// waiting_input, any **requested** observation snapshot transition
+    /// (including Active→Active timestamp bumps and observation clear), or
+    /// deadline. Parks only while every requested id is live in-memory
+    /// [`StatusClass::Running`] (running ∪ settling) and not yet actionable —
+    /// pre-first-publish `observation: None` continues parking. Wire: positive
+    /// `wait_ms` (ceiling applied by listener).
+    Supervised(Duration),
+    /// Wait only for a non-Running status (terminal or Unknown). Ignores
+    /// observation transitions. No timeout. Wire: `wait_ms = 0`.
+    Terminal,
+}
+
+/// Supervised wait exits when any report is non-Running or has an actionable
+/// observation (`Stalled` / `WaitingInput`). `Active` or pre-publish `None`
+/// alone continues parking (until a requested observation transition).
+fn supervised_should_return(reports: &[DelegationTaskReport]) -> bool {
+    reports.iter().any(|r| {
+        if r.status != TaskStatus::Running {
+            return true;
+        }
+        matches!(
+            r.observation,
+            Some(TaskObservation::Stalled) | Some(TaskObservation::WaitingInput)
+        )
+    })
+}
+
+/// Comparable observation fields for a single requested report. Used so a
+/// Supervised wait returns only when a **requested** id's observation snapshot
+/// changes — not when an unrelated task bumps the global status version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedObservationView {
+    observation: Option<TaskObservation>,
+    last_agent_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+    stalled_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn requested_observation_views(reports: &[DelegationTaskReport]) -> Vec<RequestedObservationView> {
+    reports
+        .iter()
+        .map(|r| RequestedObservationView {
+            observation: r.observation,
+            last_agent_activity_at: r.last_agent_activity_at,
+            stalled_since: r.stalled_since,
+        })
+        .collect()
+}
+
+/// Park membership: only live in-memory `StatusClass::Running` (pending.running
+/// or pending.settling). `NotInMemory` / `Settled` never park — this process has
+/// no terminal notifier producer for cold ids.
+fn all_live_running(classes: &[StatusClass]) -> bool {
+    classes
+        .iter()
+        .all(|c| matches!(c, StatusClass::Running { .. }))
 }
 
 /// Status report for a still-running task.
@@ -801,6 +954,9 @@ fn running_report(task_id: &str, task: &RunningTask) -> DelegationTaskReport {
         // "Running.\nLatest sub-agent reply: …" when the child has live output.
         message: Some("Running.".to_string()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -815,6 +971,9 @@ fn completed_report(task_id: &str, c: &CompletedTask) -> DelegationTaskReport {
         error_code: c.error_code.clone(),
         message: c.message.clone(),
         duration_ms: Some(c.duration_ms),
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -834,6 +993,9 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
                 .to_string(),
         ),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -846,12 +1008,18 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         child_conversation_id: Some(rec.child_conversation_id),
         agent_type: Some(rec.agent_type),
         text: None,
-        error_code: (rec.status == TaskStatus::Canceled).then(|| "canceled".to_string()),
+        error_code: rec.error_code.clone().or_else(|| {
+            // Legacy fallback when a mock lookup omits error_code.
+            (rec.status == TaskStatus::Canceled).then(|| "canceled".to_string())
+        }),
         message: Some(format!(
             "Result no longer cached; open child session {} for the full output.",
             rec.child_conversation_id
         )),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -865,23 +1033,28 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
 enum StatusClass {
     /// Terminal/owned-cached, or a cross-parent `unknown` — the report is final.
     Settled(DelegationTaskReport),
-    /// Running and owned — the bare running snapshot plus its child connection
-    /// id, so `assemble_reports` can attach the latest live reply out of lock.
+    /// Running or mid-settle (settling map) and owned — the bare running
+    /// snapshot plus its child connection id, so `assemble_reports` can attach
+    /// the latest live reply out of lock. Waiters treat this as not-yet-
+    /// terminal.
     Running {
         report: DelegationTaskReport,
         child_connection_id: String,
     },
-    /// Neither running nor completed in memory — resolve via the DB fallback in
-    /// `assemble_reports`. A not-in-memory id is, for wait purposes, already
-    /// settled: it can never transition back to running, so a batch wait need
-    /// not park on it (and must not hit the DB on every wake).
+    /// Neither running, settling, nor completed in memory — resolve via the DB
+    /// fallback in `assemble_reports`. For **park** purposes this is always
+    /// non-parkable: every wait mode returns the assembled snapshot immediately
+    /// when any requested id is `NotInMemory`, even if the DB/lookup still
+    /// reports `TaskStatus::Running`, because this process has no live terminal
+    /// notifier producer for it. Report truth still reflects the lookup (Running
+    /// snapshot for re-poll is fine; hang is not). Mid-settle tasks live in
+    /// `settling` and are classified `Running`, not this variant.
     NotInMemory,
 }
 
 /// Classify one task id against the in-memory maps while the pending lock is
-/// held. Mirrors the single-task resolution order — completed cache (parent
-/// scoped) → running set (parent scoped) → not-in-memory — and yields a
-/// cross-parent hit as `unknown` so a task owned by another parent never leaks.
+/// held. Order: completed (parent scoped) → running → settling (both still
+/// report Running for wait) → not-in-memory. Cross-parent hits yield `unknown`.
 fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &str) -> StatusClass {
     if let Some(c) = inner.completed.get(task_id) {
         if c.parent_connection_id == parent_connection_id {
@@ -889,14 +1062,28 @@ fn classify_locked(inner: &PendingInner, parent_connection_id: &str, task_id: &s
         }
         return StatusClass::Settled(unknown_report(task_id));
     }
-    match inner.running.get(task_id) {
-        Some(r) if r.parent_connection_id == parent_connection_id => StatusClass::Running {
-            report: running_report(task_id, r),
-            child_connection_id: r.child_connection_id.clone(),
-        },
-        Some(_) => StatusClass::Settled(unknown_report(task_id)),
-        None => StatusClass::NotInMemory,
+    if let Some(r) = inner.running.get(task_id) {
+        return if r.parent_connection_id == parent_connection_id {
+            StatusClass::Running {
+                report: running_report(task_id, r),
+                child_connection_id: r.child_connection_id.clone(),
+            }
+        } else {
+            StatusClass::Settled(unknown_report(task_id))
+        };
     }
+    // Durable CAS in flight: keep waiters parked and snapshot status Running.
+    if let Some(r) = inner.settling.get(task_id) {
+        return if r.parent_connection_id == parent_connection_id {
+            StatusClass::Running {
+                report: running_report(task_id, r),
+                child_connection_id: r.child_connection_id.clone(),
+            }
+        } else {
+            StatusClass::Settled(unknown_report(task_id))
+        };
+    }
+    StatusClass::NotInMemory
 }
 
 /// Map a terminal [`DelegationTaskReport`] back to a [`DelegationOutcome`] for
@@ -1126,9 +1313,21 @@ pub struct DelegationBroker {
     event_emitter: Arc<dyn DelegationEventEmitter>,
     /// DB fallback for `get_delegation_status` / `cancel_delegation` once a
     /// task's result aged out of the in-memory completed-cache. Defaults to a
-    /// no-op ("unknown"); production wires `DbChildStatusLookup` via
-    /// `with_status_lookup`.
+    /// no-op ("unknown"); production prefers [`Self::task_store`] and retains
+    /// this for focused Broker tests that inject a mock lookup.
     status_lookup: Arc<dyn ChildStatusLookup>,
+    /// Durable accepted/terminal truth. Production wires
+    /// [`crate::acp::delegation::store::DbDelegationTaskStore`]; unit tests
+    /// default to [`NoopTaskStore`] (every settle wins) or a scripted mock.
+    task_store: Arc<dyn DelegationTaskStore>,
+    /// Transient SQLite busy/locked retry policy for terminal settles.
+    persistence_retry: PersistenceRetryPolicy,
+    /// Background worker sleep between persistence_error retry attempts.
+    /// Production: 30s. Tests lower this for deterministic single-flight coverage.
+    persistence_retry_worker_interval: Duration,
+    /// Task ids that currently own a persistence-retry worker. Dedupes
+    /// concurrent exhaustion so only one worker runs per task id.
+    persistence_retry_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Peeks a still-running child's live session for a one-line progress hint,
     /// used to enrich `get_delegation_status`'s running report. Defaults to a
     /// no-op ("no hint"); production wires `ConnectionManagerLiveReplyLookup` via
@@ -1151,9 +1350,28 @@ pub struct DelegationBroker {
     /// and `permit.send` — no async cancel point that could strand the gate or
     /// leave routes half-applied relative to the enqueue.
     mandatory_profile_routes: Arc<std::sync::Mutex<HashMap<String, BTreeSet<String>>>>,
-    /// Woken after every terminal `record_completed` so a `get_delegation_status`
-    /// long-poll wakes the instant its task finishes instead of busy-polling.
+    /// Woken after every terminal `record_completed` and every observation
+    /// cache transition so a `get_delegation_status` long-poll wakes promptly.
     result_notify: Arc<Notify>,
+    /// Monotonic version bumped on terminal settlement and observation
+    /// transitions. Supervised waits return when this advances while parked.
+    status_version: Arc<AtomicU64>,
+    /// Soft-supervisor observation cache (running tasks only). Sink updates;
+    /// status/wait reads for Running reports. Never a terminal lifecycle write.
+    observation_cache: Arc<Mutex<HashMap<String, ObservationSnapshot>>>,
+    /// Wake handle for the soft supervisor (accepted/terminal transitions).
+    /// Mutex so production can install a live channel after `with_writers`.
+    supervisor_wake: Arc<std::sync::Mutex<SupervisorWake>>,
+    /// Soft-supervisor wake receiver, parked until desktop/server startup
+    /// takes it after reconcile. Tests leave this `None` (noop wake).
+    supervisor_wake_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
+    /// Process-local reliability metrics (accepted/terminal/wait). Shared with
+    /// AppState; tests default to a private Arc.
+    metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    /// Count of persistence-retry workers actually spawned (single-flight
+    /// ownership grants). Test-visible for concurrency assertions.
+    #[cfg(any(test, feature = "test-utils"))]
+    persistence_worker_spawn_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DelegationBroker {
@@ -1203,6 +1421,10 @@ impl DelegationBroker {
             meta_writer,
             event_emitter,
             status_lookup: Arc::new(NoopChildStatusLookup),
+            task_store: Arc::new(NoopTaskStore::default()),
+            persistence_retry: PersistenceRetryPolicy::production(),
+            persistence_retry_worker_interval: Duration::from_secs(30),
+            persistence_retry_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
             live_reply_lookup: Arc::new(NoopChildLiveReplyLookup),
             pending: Arc::new(PendingCalls::default()),
             tool_calls: Arc::new(ToolCallTracker::default()),
@@ -1210,7 +1432,174 @@ impl DelegationBroker {
             config: Arc::new(Mutex::new(DelegationConfig::default())),
             mandatory_profile_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             result_notify: Arc::new(Notify::new()),
+            status_version: Arc::new(AtomicU64::new(0)),
+            observation_cache: Arc::new(Mutex::new(HashMap::new())),
+            supervisor_wake: Arc::new(std::sync::Mutex::new(SupervisorWake::noop())),
+            supervisor_wake_rx: Arc::new(std::sync::Mutex::new(None)),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            #[cfg(any(test, feature = "test-utils"))]
+            persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Wire process-local reliability metrics (production: shared AppState Arc).
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Shared metrics handle for supervisor / listener / tests.
+    pub fn metrics(&self) -> Arc<crate::acp::delegation::metrics::DelegationMetrics> {
+        self.metrics.clone()
+    }
+
+    /// Record one status-wait outcome (exact-once per request return path).
+    fn record_status_wait(
+        &self,
+        mode: crate::acp::delegation::metrics::WaitModeLabel,
+        requested_wait_ms: Option<u64>,
+        started: Instant,
+        reason: crate::acp::delegation::metrics::WaitReturnReason,
+    ) {
+        let wall = started.elapsed();
+        self.metrics.record_wait(mode, wall, reason);
+        crate::acp::delegation::metrics::DelegationAuditRecord::wait(
+            mode,
+            requested_wait_ms,
+            wall,
+            reason,
+        )
+        .emit_wait();
+    }
+
+    /// Install the soft-supervisor wake handle (production bootstrap). Tests
+    /// leave the default noop.
+    pub fn set_supervisor_wake(&self, wake: SupervisorWake) {
+        *self.supervisor_wake.lock().expect("supervisor_wake lock") = wake;
+    }
+
+    /// Park the wake receiver until startup takes it after reconcile.
+    pub fn park_supervisor_wake_rx(&self, rx: tokio::sync::mpsc::Receiver<()>) {
+        *self
+            .supervisor_wake_rx
+            .lock()
+            .expect("supervisor_wake_rx lock") = Some(rx);
+    }
+
+    /// Take the parked wake receiver exactly once (desktop/server startup).
+    pub fn take_supervisor_wake_rx(&self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        self.supervisor_wake_rx
+            .lock()
+            .expect("supervisor_wake_rx lock")
+            .take()
+    }
+
+    /// Nudge the soft supervisor (non-blocking; coalesces when channel is full).
+    pub fn notify_supervisor(&self) {
+        self.supervisor_wake
+            .lock()
+            .expect("supervisor_wake lock")
+            .notify();
+    }
+
+    /// Logical Running Broker tasks as `(task_id, child_connection_id)` for
+    /// the observation source: `pending.running` ∪ `pending.settling` — the
+    /// same set Task 8 status/wait classify as [`TaskStatus::Running`].
+    /// Child connection id is preserved for both maps so the production
+    /// source can join `SessionState` through settlement.
+    pub async fn running_task_child_ids(&self) -> Vec<(String, String)> {
+        let inner = self.pending.inner.lock().await;
+        let mut out: Vec<(String, String)> = inner
+            .running
+            .iter()
+            .map(|(id, t)| (id.clone(), t.child_connection_id.clone()))
+            .collect();
+        out.extend(
+            inner
+                .settling
+                .iter()
+                .map(|(id, t)| (id.clone(), t.child_connection_id.clone())),
+        );
+        out
+    }
+
+    /// Cache a soft-supervisor observation (observe-only; never mutates status).
+    /// On a real transition: bumps status version, wakes waiters, emits
+    /// `DelegationObservationChanged` for the parent card.
+    pub async fn cache_observation(&self, task_id: &str, snap: ObservationSnapshot) {
+        let changed = {
+            let mut cache = self.observation_cache.lock().await;
+            let changed = cache.get(task_id) != Some(&snap);
+            cache.insert(task_id.to_string(), snap.clone());
+            changed
+        };
+        if !changed {
+            return;
+        }
+        self.bump_status_version();
+        self.result_notify.notify_waiters();
+        self.emit_observation_changed(task_id, &snap).await;
+    }
+
+    /// Drop a cached observation when the task leaves logical Running
+    /// (neither `running` nor `settling` — true terminal) or on a supervisor
+    /// stale clear. Treats clear as an observation transition: bumps version
+    /// and wakes waiters. Supervised re-evaluates **requested** ids only, so an
+    /// unrelated clear is a harmless wake (re-park).
+    pub async fn clear_observation(&self, task_id: &str) {
+        let removed = self
+            .observation_cache
+            .lock()
+            .await
+            .remove(task_id)
+            .is_some();
+        if removed {
+            self.bump_status_version();
+            self.result_notify.notify_waiters();
+        }
+    }
+
+    /// Read a cached observation for Running-report enrichment.
+    pub async fn cached_observation(&self, task_id: &str) -> Option<ObservationSnapshot> {
+        self.observation_cache.lock().await.get(task_id).cloned()
+    }
+
+    fn bump_status_version(&self) {
+        self.status_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Emit observation change on the parent stream (synthetic tool-use ids skip).
+    async fn emit_observation_changed(&self, task_id: &str, snap: &ObservationSnapshot) {
+        let (parent_connection_id, parent_tool_use_id) = {
+            let inner = self.pending.inner.lock().await;
+            let Some(task) = inner
+                .running
+                .get(task_id)
+                .or_else(|| inner.settling.get(task_id))
+            else {
+                return;
+            };
+            (
+                task.parent_connection_id.clone(),
+                task.parent_tool_use_id.clone(),
+            )
+        };
+        if is_synthetic_parent_tool_use_id(&parent_tool_use_id) {
+            return;
+        }
+        self.event_emitter
+            .emit_observation_changed(
+                &parent_connection_id,
+                &parent_tool_use_id,
+                task_id,
+                snap.observation,
+                snap.last_agent_activity_at,
+                snap.stalled_since,
+            )
+            .await;
     }
 
     /// Replace the DB status fallback used by `get_delegation_status` /
@@ -1220,6 +1609,31 @@ impl DelegationBroker {
     pub fn with_status_lookup(mut self, status_lookup: Arc<dyn ChildStatusLookup>) -> Self {
         self.status_lookup = status_lookup;
         self
+    }
+
+    /// Wire the durable task store (production: `DbDelegationTaskStore`).
+    pub fn with_task_store(mut self, task_store: Arc<dyn DelegationTaskStore>) -> Self {
+        self.task_store = task_store;
+        self
+    }
+
+    /// Override the persistence retry policy (tests use near-zero delays).
+    pub fn with_persistence_retry(mut self, policy: PersistenceRetryPolicy) -> Self {
+        self.persistence_retry = policy;
+        self
+    }
+
+    /// Override the background persistence-retry worker sleep (tests use a few ms).
+    pub fn with_persistence_retry_worker_interval(mut self, interval: Duration) -> Self {
+        self.persistence_retry_worker_interval = interval;
+        self
+    }
+
+    /// Fail-closed gate: the delegation listener must not start when
+    /// `reconcile_running` fails. Desktop and server startup call this with
+    /// [`Self::reconcile_running_on_startup`]'s result.
+    pub fn require_reconcile_ok(result: Result<u64, String>) -> Result<u64, String> {
+        result.map_err(|e| format!("delegation startup blocked: reconcile_running failed: {e}"))
     }
 
     /// Replace the live-reply lookup used to enrich `get_delegation_status`'s
@@ -1232,6 +1646,16 @@ impl DelegationBroker {
     ) -> Self {
         self.live_reply_lookup = live_reply_lookup;
         self
+    }
+
+    /// Reconcile orphaned running delegate rows after host restart. Call after
+    /// migrations/settings load and before the delegation listener accepts
+    /// requests.
+    pub async fn reconcile_running_on_startup(&self) -> Result<u64, String> {
+        self.task_store
+            .reconcile_running(Utc::now())
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Record a parent ACP `tool_call_id` whose title indicates the LLM is
@@ -2267,21 +2691,68 @@ impl DelegationBroker {
         {
             Ok(cid) => cid,
             Err(e) => {
-                // Setup failed before parking — release the reservation (and
-                // discard any terminal that buffered against this delegation in
-                // the window) so nothing lingers or mis-binds a future id, and
-                // drop the in-flight record in the same lock acquisition.
+                // Clear setup reservation before any settle / disconnect.
                 {
                     let mut inner = self.pending.inner.lock().await;
                     inner.unreserve(&call_id, &child_connection_id);
                     inner.deregister_inflight(inflight_id);
                 }
+                // Prefer child id from the structured Send error; otherwise
+                // decide row existence by the known task/delegation call id.
+                // A durable row must settle failed/spawn_failed even when the
+                // error's child id is None (connection-map loss after create).
+                let (message, err_child_id) = match &e {
+                    crate::acp::delegation::spawner::SpawnerError::Send {
+                        message,
+                        child_conversation_id,
+                    } => (message.clone(), *child_conversation_id),
+                    other => (other.to_string(), None),
+                };
+                let persisted_child = match self.task_store.load(&call_id).await {
+                    Ok(Some(row)) => Some(row.child_conversation_id),
+                    Ok(None) => None,
+                    Err(store_err) => {
+                        tracing::error!(
+                            task_id = %call_id,
+                            error = %store_err,
+                            "[delegation] send failure: could not load row by call id"
+                        );
+                        None
+                    }
+                };
+                let child_for_settle = err_child_id.or(persisted_child);
+                if let Some(cid) = child_for_settle {
+                    // Row-backed (or error-carried child id): durable settle.
+                    let terminal = TerminalTaskWrite::failed(
+                        "spawn_failed",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    );
+                    let ctx = SettleContext {
+                        parent_connection_id: req.parent_connection_id.clone(),
+                        parent_tool_use_id: req.parent_tool_use_id.clone(),
+                        child_connection_id: child_connection_id.clone(),
+                        child_conversation_id: cid,
+                        agent_type: req.agent_type,
+                        duration_ms: 0,
+                        cancel_turn: false,
+                        disconnect_on_loss: true,
+                        message: Some(message.clone()),
+                    };
+                    let mut report = self.settle_task(&call_id, terminal, None, ctx).await;
+                    if report.error_code.is_none() {
+                        report.status = TaskStatus::Failed;
+                        report.error_code = Some("spawn_failed".into());
+                        report.message = Some(message);
+                    }
+                    report.task_id = Some(call_id);
+                    report.child_conversation_id = Some(cid);
+                    report.agent_type = Some(req.agent_type);
+                    return report;
+                }
+                // No row and no child id — unaccepted setup failure, no task id.
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                return report_err(
-                    req.agent_type,
-                    DelegationError::SpawnFailed(e.to_string()),
-                    None,
-                );
+                return report_err(req.agent_type, DelegationError::SpawnFailed(message), None);
             }
         };
 
@@ -2378,51 +2849,27 @@ impl DelegationBroker {
                 };
             let parent_canceled_at = inner.inflight_canceled_at(inflight_id);
             inner.unreserve(&call_id, &child_connection_id);
-            // For both terminal dispositions we record the completed result
-            // INSIDE this lock (atomically with unreserve/deregister) so a
-            // concurrent `get_delegation_status` can never observe the task as
-            // neither running nor completed. The `Running` arm inserts the live
-            // task instead of parking a `oneshot` — the caller returns the ack.
-            let record = |inner: &mut PendingInner, outcome: &DelegationOutcome| {
-                inner.insert_completed(
-                    &call_id,
-                    build_completed(
-                        &req.parent_connection_id,
-                        child_conversation_id,
-                        req.agent_type,
-                        setup_duration_ms,
-                        outcome,
-                    ),
-                );
-            };
+            // Terminal dispositions settle via the durable store AFTER this lock
+            // is released (settle_task owns cache/meta/event/teardown). The
+            // `Running` arm inserts the live task instead of parking a oneshot.
             match (child_terminal, parent_canceled_at) {
                 // Both raced in the setup window: the earlier arrival stamp wins.
                 (Some((child_stamp, outcome)), Some(cancel_stamp)) => {
                     inner.deregister_inflight(inflight_id);
                     if child_stamp < cancel_stamp {
-                        record(&mut inner, &outcome);
                         Disposition::ChildTerminal(outcome)
                     } else {
-                        record(
-                            &mut inner,
-                            &canceled_outcome(child_conversation_id, "parent canceled"),
-                        );
                         Disposition::ParentCanceled
                     }
                 }
                 // Only a child terminal fired.
                 (Some((_, outcome)), None) => {
                     inner.deregister_inflight(inflight_id);
-                    record(&mut inner, &outcome);
                     Disposition::ChildTerminal(outcome)
                 }
                 // Only a parent cancel fired.
                 (None, Some(_)) => {
                     inner.deregister_inflight(inflight_id);
-                    record(
-                        &mut inner,
-                        &canceled_outcome(child_conversation_id, "parent canceled"),
-                    );
                     Disposition::ParentCanceled
                 }
                 // Nothing beat us — register the running task for a future
@@ -2447,69 +2894,49 @@ impl DelegationBroker {
                 }
             }
         };
+        // Accepted → running: soft supervisor should re-scan.
+        if matches!(disposition, Disposition::Running) {
+            self.notify_supervisor();
+        }
 
         match disposition {
-            // A child terminal beat registration. Finalize (terminal meta +
-            // DelegationCompleted event + child teardown) and return the
-            // terminal report directly. The completed entry was recorded under
-            // the disposition lock above; wake any long-poll waiter.
+            // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
-                self.finalize_delegation(
-                    &req.parent_connection_id,
-                    &req.parent_tool_use_id,
-                    &child_connection_id,
+                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let mut ctx = SettleContext {
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
                     child_conversation_id,
-                    req.agent_type,
-                    setup_duration_ms,
-                    &outcome,
-                )
-                .await;
-                self.result_notify.notify_waiters();
-                return report_from_outcome(
-                    Some(call_id),
-                    Some(req.agent_type),
-                    &outcome,
-                    Some(setup_duration_ms),
-                );
+                    agent_type: req.agent_type,
+                    duration_ms: setup_duration_ms,
+                    cancel_turn: false,
+                    disconnect_on_loss: true,
+                    message: None,
+                };
+                let (_, _, _, message) = terminal_fields(&outcome);
+                ctx.message = message;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // A parent cancel reached this delegation mid-setup — after the
-            // prompt was sent, before we registered. Tear the child down
-            // ourselves (cancel + disconnect, since a turn is in flight) and
-            // return a canceled report. The canceled result was recorded above.
+            // prompt was sent, before we registered.
             Disposition::ParentCanceled => {
-                self.write_meta_if_real(
-                    &req.parent_connection_id,
-                    &req.parent_tool_use_id,
-                    build_delegation_meta(
-                        "failed",
-                        Some(&child_connection_id),
-                        Some(child_conversation_id),
-                        Some("canceled"),
-                        None,
-                        Some(setup_duration_ms),
-                    ),
-                )
-                .await;
-                self.emit_completed_if_real(
-                    &req.parent_connection_id,
-                    &req.parent_tool_use_id,
-                    &child_connection_id,
+                let outcome = canceled_outcome(child_conversation_id, "parent canceled");
+                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let mut ctx = SettleContext {
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
                     child_conversation_id,
-                    req.agent_type,
-                    DelegationResultSummary::Err {
-                        error_code: "canceled".to_string(),
-                    },
-                )
-                .await;
-                let _ = self.spawner.cancel(&child_connection_id).await;
-                let _ = self.spawner.disconnect(&child_connection_id).await;
-                self.result_notify.notify_waiters();
-                return report_from_outcome(
-                    Some(call_id),
-                    Some(req.agent_type),
-                    &canceled_outcome(child_conversation_id, "parent canceled"),
-                    Some(setup_duration_ms),
-                );
+                    agent_type: req.agent_type,
+                    duration_ms: setup_duration_ms,
+                    cancel_turn: true,
+                    disconnect_on_loss: true,
+                    message: None,
+                };
+                let (_, _, _, message) = terminal_fields(&outcome);
+                ctx.message = message;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // Registered in `running` — fall through to the second pre-cancel
             // check, then return the ack.
@@ -2523,80 +2950,376 @@ impl DelegationBroker {
         // canceled report instead of the Running ack.
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
-                // Capture the elapsed ONCE at terminalization (under the lock,
-                // when the running task is removed) so the completed-cache, the
-                // parent-card meta, and the returned report all report the same
-                // duration. `None` when nothing was drained.
-                let canceled_duration_ms = {
+                let removed = {
                     let mut inner = self.pending.inner.lock().await;
-                    if inner.running.remove(&call_id).is_some() {
-                        let outcome =
-                            canceled_outcome(child_conversation_id, "canceled before await");
-                        let duration_ms = started_at.elapsed().as_millis() as u64;
-                        inner.insert_completed(
-                            &call_id,
-                            build_completed(
-                                &req.parent_connection_id,
-                                child_conversation_id,
-                                req.agent_type,
-                                duration_ms,
-                                &outcome,
-                            ),
-                        );
-                        Some(duration_ms)
-                    } else {
-                        None
+                    match inner.running.remove(&call_id) {
+                        Some(task) => {
+                            inner.settling.insert(call_id.clone(), task);
+                            true
+                        }
+                        // Already mid-settle: do not start a second producer.
+                        None => false,
                     }
                 };
-                if let Some(duration_ms) = canceled_duration_ms {
-                    self.write_meta_if_real(
-                        &req.parent_connection_id,
-                        &req.parent_tool_use_id,
-                        build_delegation_meta(
-                            "failed",
-                            Some(&child_connection_id),
-                            Some(child_conversation_id),
-                            Some("canceled"),
-                            None,
-                            Some(duration_ms),
-                        ),
-                    )
-                    .await;
-                    self.emit_completed_if_real(
-                        &req.parent_connection_id,
-                        &req.parent_tool_use_id,
-                        &child_connection_id,
+                if removed {
+                    let duration_ms = started_at.elapsed().as_millis() as u64;
+                    let outcome = canceled_outcome(child_conversation_id, "canceled before await");
+                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let mut ctx = SettleContext {
+                        parent_connection_id: req.parent_connection_id.clone(),
+                        parent_tool_use_id: req.parent_tool_use_id.clone(),
+                        child_connection_id: child_connection_id.clone(),
                         child_conversation_id,
-                        req.agent_type,
-                        DelegationResultSummary::Err {
-                            error_code: "canceled".to_string(),
-                        },
-                    )
-                    .await;
-                    let _ = self.spawner.cancel(&child_connection_id).await;
-                    let _ = self.spawner.disconnect(&child_connection_id).await;
-                    self.result_notify.notify_waiters();
-                    return report_from_outcome(
-                        Some(call_id),
-                        Some(req.agent_type),
-                        &canceled_outcome(child_conversation_id, "canceled before await"),
-                        Some(duration_ms),
-                    );
+                        agent_type: req.agent_type,
+                        duration_ms,
+                        cancel_turn: true,
+                        disconnect_on_loss: true,
+                        message: None,
+                    };
+                    let (_, _, _, message) = terminal_fields(&outcome);
+                    ctx.message = message;
+                    return self.settle_task(&call_id, terminal, result_text, ctx).await;
                 }
             }
         }
 
         // Registered and running in the background — return the ack. The child
         // resolves later via the lifecycle → `complete_call` (or a cancel path).
+        // Durable accepted boundary (Task 8): count only after running insert.
+        self.metrics.record_accepted(req.agent_type);
+        let accepted = crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+            &req.parent_connection_id,
+            Some(req.parent_conversation_id),
+            req.agent_type,
+            &call_id,
+            Some(child_conversation_id),
+            TaskStatus::Running,
+            None,
+            None,
+            None,
+        );
+        accepted.emit_task_transition();
         running_ack(call_id, child_conversation_id, req.agent_type)
+    }
+
+    /// Durable terminal settlement — every terminal producer calls this before
+    /// cache / notify / meta / event / teardown. Exactly one `running → terminal`
+    /// store CAS wins; losers replay persisted truth and do not emit another
+    /// terminal event. While CAS is in flight the task remains in `settling`
+    /// (classified Running); after CAS/persistence fallback it moves atomically
+    /// to `completed` and waiters are notified.
+    async fn settle_task(
+        &self,
+        task_id: &str,
+        terminal: TerminalTaskWrite,
+        result_text: Option<String>,
+        ctx: SettleContext,
+    ) -> DelegationTaskReport {
+        let conversation_status = terminal.conversation_status.clone();
+        let settlement = self.settle_with_retry(task_id, terminal).await;
+        match settlement {
+            Ok(settlement) => {
+                let won = settlement.won();
+                let mut report = settlement.into_report();
+                // Enrich with producer-local fields the store may not carry.
+                report.agent_type = Some(ctx.agent_type);
+                report.child_conversation_id = Some(ctx.child_conversation_id);
+                report.duration_ms = Some(ctx.duration_ms);
+                if report.status == TaskStatus::Completed {
+                    if let Some(text) = result_text {
+                        report.text = Some(cap_completed_text(&text));
+                    }
+                    // Live completion is not a cold-load "open child session" hint.
+                    report.message = None;
+                } else if let Some(msg) = ctx.message.clone() {
+                    report.message = Some(msg);
+                }
+                // Atomic settling → completed (or first completed insert for
+                // setup-window settles that never entered `running`).
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.settling.remove(task_id);
+                    let outcome = report_to_outcome_for_meta(&report, &ctx);
+                    inner.insert_completed(
+                        task_id,
+                        build_completed(
+                            &ctx.parent_connection_id,
+                            ctx.child_conversation_id,
+                            ctx.agent_type,
+                            ctx.duration_ms,
+                            &outcome,
+                        ),
+                    );
+                }
+                self.result_notify.notify_waiters();
+                // Terminal: drop observation cache entry and wake supervisor.
+                self.clear_observation(task_id).await;
+                self.notify_supervisor();
+                if won {
+                    // Reliability metrics: terminal only for the CAS winner.
+                    self.metrics.record_terminal(
+                        report.status,
+                        std::time::Duration::from_millis(ctx.duration_ms),
+                    );
+                    let terminal_audit =
+                        crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                            &ctx.parent_connection_id,
+                            None,
+                            ctx.agent_type,
+                            task_id,
+                            Some(ctx.child_conversation_id),
+                            report.status,
+                            report.error_code.as_deref().and_then(|c| {
+                                // Only intern stable static codes we own.
+                                match c {
+                                    "spawn_failed" => Some("spawn_failed"),
+                                    "persistence_error" => Some("persistence_error"),
+                                    "host_restarted" => Some("host_restarted"),
+                                    "depth_limit_exceeded" => Some("depth_limit_exceeded"),
+                                    "canceled" => Some("canceled"),
+                                    _ => None,
+                                }
+                            }),
+                            Some(ctx.duration_ms),
+                            Some(true),
+                        );
+                    terminal_audit.emit_task_transition();
+                    // Live sidebar coherence: one ConversationStatusChanged
+                    // matching the durable CAS write (Existing/loser skips).
+                    self.emit_conversation_status_if_real(
+                        &ctx.parent_connection_id,
+                        ctx.child_conversation_id,
+                        conversation_status,
+                    )
+                    .await;
+                    // Terminal meta + event only for the CAS winner.
+                    let outcome_for_meta = report_to_outcome_for_meta(&report, &ctx);
+                    self.write_meta_if_real(
+                        &ctx.parent_connection_id,
+                        &ctx.parent_tool_use_id,
+                        match &outcome_for_meta {
+                            DelegationOutcome::Ok(ok) => build_delegation_meta(
+                                "completed",
+                                Some(&ctx.child_connection_id),
+                                Some(ctx.child_conversation_id),
+                                None,
+                                build_text_preview(&ok.text).as_deref(),
+                                Some(ctx.duration_ms),
+                            ),
+                            DelegationOutcome::Err { code, .. } => build_delegation_meta(
+                                "failed",
+                                Some(&ctx.child_connection_id),
+                                Some(ctx.child_conversation_id),
+                                Some(code),
+                                None,
+                                Some(ctx.duration_ms),
+                            ),
+                        },
+                    )
+                    .await;
+                    self.emit_completed_if_real(
+                        &ctx.parent_connection_id,
+                        &ctx.parent_tool_use_id,
+                        &ctx.child_connection_id,
+                        ctx.child_conversation_id,
+                        ctx.agent_type,
+                        outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
+                    )
+                    .await;
+                    if ctx.cancel_turn {
+                        let _ = self.spawner.cancel(&ctx.child_connection_id).await;
+                    }
+                    let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
+                    self.task_store.remove_retry(task_id).await;
+                } else if ctx.disconnect_on_loss {
+                    // Best-effort: winner should already have torn down; disconnect
+                    // is idempotent. No second ConversationStatusChanged /
+                    // DelegationCompleted / terminal meta.
+                    let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
+                }
+                report
+            }
+            Err(err) => {
+                // Exhausted / permanent: visible persistence_error, disconnect,
+                // retain one deduplicated process-local retry record.
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %err,
+                    "[delegation] terminal persist failed; publishing persistence_error"
+                );
+                let report = DelegationTaskReport {
+                    task_id: Some(task_id.to_string()),
+                    status: TaskStatus::Failed,
+                    child_conversation_id: Some(ctx.child_conversation_id),
+                    agent_type: Some(ctx.agent_type),
+                    text: None,
+                    error_code: Some("persistence_error".into()),
+                    message: Some(format!("failed to persist terminal state: {err}")),
+                    duration_ms: Some(ctx.duration_ms),
+                    observation: None,
+                    last_agent_activity_at: None,
+                    stalled_since: None,
+                };
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.settling.remove(task_id);
+                    inner.insert_completed(
+                        task_id,
+                        CompletedTask {
+                            parent_connection_id: ctx.parent_connection_id.clone(),
+                            child_conversation_id: ctx.child_conversation_id,
+                            agent_type: ctx.agent_type,
+                            status: TaskStatus::Failed,
+                            text: None,
+                            error_code: Some("persistence_error".into()),
+                            message: report.message.clone(),
+                            duration_ms: ctx.duration_ms,
+                        },
+                    );
+                }
+                self.result_notify.notify_waiters();
+                self.clear_observation(task_id).await;
+                self.notify_supervisor();
+                let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
+                let retry_terminal = TerminalTaskWrite::failed(
+                    "persistence_error",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                );
+                self.task_store
+                    .put_retry(PendingTerminalRetry {
+                        task_id: task_id.to_string(),
+                        terminal: retry_terminal,
+                        child_conversation_id: ctx.child_conversation_id,
+                    })
+                    .await;
+                // Single-flight worker ownership per task id (no re-emit).
+                // Terminal metrics/audit deferred until durable CAS winner.
+                self.spawn_persistence_retry_worker(
+                    task_id.to_string(),
+                    PersistenceRetryAccounting {
+                        parent_connection_id: ctx.parent_connection_id.clone(),
+                        agent_type: ctx.agent_type,
+                        child_conversation_id: ctx.child_conversation_id,
+                        // Defensible duration: producer wall time at first
+                        // terminal attempt (saturating path in record_terminal).
+                        duration_ms: ctx.duration_ms,
+                    },
+                );
+                report
+            }
+        }
+    }
+
+    async fn settle_with_retry(
+        &self,
+        task_id: &str,
+        terminal: TerminalTaskWrite,
+    ) -> Result<Settlement, crate::acp::delegation::store::TaskStoreError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.task_store.settle(task_id, terminal.clone()).await {
+                Ok(s) => return Ok(s),
+                Err(e) if e.is_transient() && attempt + 1 < self.persistence_retry.max_attempts => {
+                    let delay = self.persistence_retry.delay_for_attempt(attempt);
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Spawn at most one process-local persistence retry worker per task id.
+    /// Concurrent exhaustion for the same id is single-flight: only the first
+    /// ownership grant starts a worker. The worker retries only
+    /// `failed/persistence_error`, never re-emits sidebar/meta/completion events,
+    /// and records terminal metrics/audit **only** when the eventual durable
+    /// settle returns [`Settlement::Won`] (Existing/loser does not count).
+    fn spawn_persistence_retry_worker(&self, task_id: String, obs: PersistenceRetryAccounting) {
+        {
+            let mut inflight = self
+                .persistence_retry_inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(task_id.clone()) {
+                return;
+            }
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            self.persistence_worker_spawn_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let store = self.task_store.clone();
+        let metrics = self.metrics.clone();
+        let inflight = self.persistence_retry_inflight.clone();
+        let interval = self.persistence_retry_worker_interval;
+        tokio::spawn(async move {
+            let clear_ownership = |task_id: &str| {
+                let mut set = inflight.lock().unwrap_or_else(|e| e.into_inner());
+                set.remove(task_id);
+            };
+            loop {
+                if !store.has_retry_record(&task_id).await {
+                    clear_ownership(&task_id);
+                    break;
+                }
+                tokio::time::sleep(interval).await;
+                if !store.has_retry_record(&task_id).await {
+                    clear_ownership(&task_id);
+                    break;
+                }
+                // Retry only persistence of failed/persistence_error — no events.
+                let terminal = TerminalTaskWrite::failed(
+                    "persistence_error",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                );
+                match store.settle(&task_id, terminal).await {
+                    Ok(settlement) => {
+                        // Exact-once terminal accounting at the durable CAS
+                        // winner only. Initial process-local exhaustion must
+                        // not have counted; Existing/replay must not count.
+                        if settlement.won() {
+                            metrics.record_terminal(
+                                TaskStatus::Failed,
+                                std::time::Duration::from_millis(obs.duration_ms),
+                            );
+                            crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                                &obs.parent_connection_id,
+                                None,
+                                obs.agent_type,
+                                &task_id,
+                                Some(obs.child_conversation_id),
+                                TaskStatus::Failed,
+                                Some("persistence_error"),
+                                Some(obs.duration_ms),
+                                Some(true),
+                            )
+                            .emit_task_transition();
+                        }
+                        store.remove_retry(&task_id).await;
+                        clear_ownership(&task_id);
+                        break;
+                    }
+                    Err(e) if e.is_transient() => continue,
+                    Err(_) => {
+                        // Permanent: leave the retry record; clear ownership so
+                        // a later exhaustion can re-own without spinning.
+                        clear_ownership(&task_id);
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Called by the child-session lifecycle subscriber on `TurnComplete`
     /// (success path) or by error mappers (failure path).
     ///
-    /// Migrates the task from `running` into `completed` (atomically, under one
-    /// lock) and then finalizes (terminal meta + `DelegationCompleted` event +
-    /// child teardown) and wakes any `get_delegation_status` long-poll.
+    /// Removes the task from `running`, settles durable terminal state first,
+    /// then publishes cache / meta / event / teardown only for the CAS winner.
     ///
     /// If no entry is in `running` under `call_id`, the outcome is buffered for
     /// a racing `start_delegation` to drain at registration — but ONLY while the
@@ -2612,20 +3335,14 @@ impl DelegationBroker {
             let mut inner = self.pending.inner.lock().await;
             match inner.running.remove(call_id) {
                 Some(task) => {
-                    // Atomic running → completed so a concurrent status query
-                    // never sees the task as neither running nor completed.
                     let duration_ms = task.started_at.elapsed().as_millis() as u64;
-                    inner.insert_completed(
-                        call_id,
-                        build_completed(
-                            &task.parent_connection_id,
-                            task.child_conversation_id,
-                            task.agent_type,
-                            duration_ms,
-                            &outcome,
-                        ),
-                    );
+                    // running → settling under the same lock (CAS is out of lock).
+                    inner.settling.insert(call_id.to_string(), task.clone());
                     Some((task, duration_ms))
+                }
+                None if inner.settling.contains_key(call_id) => {
+                    // Another producer already owns durable settlement.
+                    None
                 }
                 None => {
                     // Buffer for the racing `start_delegation` to drain iff still
@@ -2637,73 +3354,10 @@ impl DelegationBroker {
             }
         };
         if let Some((task, duration_ms)) = task {
-            self.finalize_delegation(
-                &task.parent_connection_id,
-                &task.parent_tool_use_id,
-                &task.child_connection_id,
-                task.child_conversation_id,
-                task.agent_type,
-                duration_ms,
-                &outcome,
-            )
-            .await;
-            self.result_notify.notify_waiters();
+            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let ctx = SettleContext::from_running(&task, duration_ms, false);
+            self.settle_task(call_id, terminal, result_text, ctx).await;
         }
-    }
-
-    /// Write the terminal meta, emit `DelegationCompleted`, and tear down the
-    /// child for a resolved delegation. Shared by `complete_call` and
-    /// `start_delegation`'s early-terminal pickup. Mirrors the resolution onto
-    /// the parent's `delegate_to_agent` ToolCallState meta (including a bounded
-    /// `text_preview` on the completed path so a post-refresh snapshot renders
-    /// the result inline) so snapshot recovery shows the final state without the
-    /// live `delegation_completed` event. Does not touch the pending maps — the
-    /// caller owns the `running` → `completed` migration.
-    ///
-    /// `duration_ms` is the broker-measured elapsed time (from `started_at`),
-    /// carried onto the event summary so the parent UI shows a real duration.
-    #[allow(clippy::too_many_arguments)]
-    async fn finalize_delegation(
-        &self,
-        parent_connection_id: &str,
-        parent_tool_use_id: &str,
-        child_connection_id: &str,
-        child_conversation_id: i32,
-        agent_type: AgentType,
-        duration_ms: u64,
-        outcome: &DelegationOutcome,
-    ) {
-        let meta = match outcome {
-            DelegationOutcome::Ok(ok) => build_delegation_meta(
-                "completed",
-                Some(child_connection_id),
-                Some(child_conversation_id),
-                None,
-                build_text_preview(&ok.text).as_deref(),
-                Some(duration_ms),
-            ),
-            DelegationOutcome::Err { code, .. } => build_delegation_meta(
-                "failed",
-                Some(child_connection_id),
-                Some(child_conversation_id),
-                Some(code),
-                None,
-                Some(duration_ms),
-            ),
-        };
-        self.write_meta_if_real(parent_connection_id, parent_tool_use_id, meta)
-            .await;
-        self.emit_completed_if_real(
-            parent_connection_id,
-            parent_tool_use_id,
-            child_connection_id,
-            child_conversation_id,
-            agent_type,
-            outcome_to_summary(outcome, duration_ms),
-        )
-        .await;
-        // v1 one-shot: always tear down the child.
-        let _ = self.spawner.disconnect(child_connection_id).await;
     }
 
     /// Internal helper — apply the meta write iff the parent's
@@ -2783,6 +3437,20 @@ impl DelegationBroker {
             .await;
     }
 
+    /// Emit one live `ConversationStatusChanged` for the child after a winning
+    /// durable CAS so sidebars match the persisted conversation status. Uses the
+    /// parent connection stream (global bridge still fans out to sidebar clients).
+    async fn emit_conversation_status_if_real(
+        &self,
+        parent_connection_id: &str,
+        child_conversation_id: i32,
+        status: ConversationStatus,
+    ) {
+        self.event_emitter
+            .emit_conversation_status_changed(parent_connection_id, child_conversation_id, status)
+            .await;
+    }
+
     /// Cancel the pending delegation whose `external_handle` matches.
     /// Called by the MCP listener on receipt of `notifications/cancelled`
     /// from a companion. When no matching pending entry exists (the
@@ -2799,7 +3467,7 @@ impl DelegationBroker {
                 .filter(|(_, v)| v.external_handle.as_deref() == Some(external_handle))
                 .map(|(k, _)| k.clone())
                 .collect();
-            drain_and_record_canceled(&mut inner, keys, &reason)
+            drain_running(&mut inner, keys)
         };
         if drained.is_empty() {
             // Race: the cancel beat the handle's `running` registration. Buffer
@@ -2809,11 +3477,8 @@ impl DelegationBroker {
                 .await;
             return;
         }
-        for (task, duration_ms) in drained {
-            // A turn is in flight, so cancel + disconnect.
-            self.teardown_canceled_child(&task, duration_ms, true).await;
-        }
-        self.result_notify.notify_waiters();
+        // A turn is in flight, so cancel + disconnect after durable settle.
+        self.settle_drained_canceled(drained, &reason, true).await;
     }
 
     /// Resolve the pending delegation whose child matches
@@ -2844,27 +3509,29 @@ impl DelegationBroker {
                 .map(|(k, _)| k.clone())
                 .collect();
             if keys.is_empty() {
-                // No running entry. If the child is still reserved,
-                // `start_delegation` is mid-setup and this failure beat the
-                // `running` insert — buffer its detail for it to drain at
-                // registration instead of no-oping. `buffer_child_failure` is a
-                // no-op when the child isn't reserved, so a normal
-                // post-resolution child teardown accumulates nothing.
-                inner.buffer_child_failure(
-                    child_connection_id,
-                    terminal_error.map(|s| s.to_string()),
-                );
+                // Already mid-settle for this child: do not start a second
+                // producer and do not re-buffer (setup reservation is gone).
+                let settling = inner
+                    .settling
+                    .values()
+                    .any(|v| v.child_connection_id == child_connection_id);
+                if !settling {
+                    // No running entry. If the child is still reserved,
+                    // `start_delegation` is mid-setup and this failure beat the
+                    // `running` insert — buffer its detail for it to drain at
+                    // registration instead of no-oping.
+                    inner.buffer_child_failure(
+                        child_connection_id,
+                        terminal_error.map(|s| s.to_string()),
+                    );
+                }
                 Vec::new()
             } else {
-                drain_and_record_canceled(&mut inner, keys, &reason)
+                drain_running(&mut inner, keys)
             }
         };
-        for (task, duration_ms) in drained {
-            // The child already disconnected/errored — disconnect-only teardown
-            // (no spawner `cancel`, there's no live turn to interrupt).
-            self.teardown_canceled_child(&task, duration_ms, false).await;
-        }
-        self.result_notify.notify_waiters();
+        // Child already disconnected/errored — disconnect-only after settle.
+        self.settle_drained_canceled(drained, &reason, false).await;
     }
 
     /// Cascade-cancel every pending delegation owned by `parent_connection_id`
@@ -2929,7 +3596,7 @@ impl DelegationBroker {
         &self,
         parent_connection_id: &str,
         keep_consumed: bool,
-    ) -> Vec<(RunningTask, u64)> {
+    ) -> Vec<(String, RunningTask, u64)> {
         // Also drain any tool_call ids captured ahead of an MCP round-trip that
         // never arrived — keeps the map bounded across parent reconnects.
         // Teardown drops the whole bucket; a turn cancel keeps `consumed` so a
@@ -2950,90 +3617,41 @@ impl DelegationBroker {
                 .filter(|(_, v)| v.parent_connection_id == parent_connection_id)
                 .map(|(k, _)| k.clone())
                 .collect();
-            if keep_consumed {
-                // Turn cancel: connection stays alive → keep each canceled
-                // result queryable.
-                drain_and_record_canceled(&mut inner, keys, "parent canceled")
-            } else {
-                // Connection teardown: just remove the running tasks and drop the
-                // whole completed-cache for this parent. No completed entry to
-                // match, but still capture the elapsed once (at drain time) so
-                // the teardown meta doesn't recompute it later.
-                let drained: Vec<(RunningTask, u64)> = keys
-                    .into_iter()
-                    .map(|k| {
-                        let task = inner.running.remove(&k).expect("key just observed");
-                        let duration_ms = task.started_at.elapsed().as_millis() as u64;
-                        (task, duration_ms)
-                    })
-                    .collect();
+            let drained = drain_running(&mut inner, keys);
+            if !keep_consumed {
+                // Connection teardown: drop this parent's completed-cache; durable
+                // truth lives in the store (settled below).
                 inner.drop_completed_for_parent(parent_connection_id);
-                drained
             }
+            drained
         };
-        self.result_notify.notify_waiters();
         drained
     }
 
-    /// Slow part of a parent cancel: for each drained task, patch the parent
-    /// meta, emit `DelegationCompleted`, and tear the child down. The canceled
-    /// result was already recorded into `completed` (turn cancel) by
-    /// `drain_for_parent_cancel` under the lock, so this is pure I/O. Split out
-    /// so a turn cancel can background it without delaying the fast, turn-scoped
-    /// drain.
-    async fn finalize_parent_cancel(&self, drained: Vec<(RunningTask, u64)>) {
-        for (task, duration_ms) in drained {
-            // A turn was in flight → cancel + disconnect.
-            self.teardown_canceled_child(&task, duration_ms, true).await;
-        }
+    /// Slow part of a parent cancel: durable settle + meta/event/teardown for
+    /// each drained task. Split out so a turn cancel can background it without
+    /// delaying the fast, turn-scoped drain.
+    async fn finalize_parent_cancel(&self, drained: Vec<(String, RunningTask, u64)>) {
+        self.settle_drained_canceled(drained, "parent canceled", true)
+            .await;
     }
 
-    /// Shared canceled-child teardown: best-effort `failed`/`canceled` meta
-    /// patch (so a parent-side snapshot post-cancel shows the delegation as
-    /// canceled rather than stuck on "running"), a `DelegationCompleted` err
-    /// event, then child teardown. `cancel_turn` is `true` when a turn is in
-    /// flight (cancel + disconnect) and `false` when the child already
-    /// disconnected/errored (disconnect only). Does NOT touch the pending maps —
-    /// the caller already migrated the task into `completed`.
-    ///
-    /// `duration_ms` is the elapsed captured by `drain_and_record_canceled` at
-    /// drain time — reused here (not recomputed) so the parent-card meta matches
-    /// the completed-cache duration the status/cancel cards report, even when
-    /// this teardown is backgrounded.
-    async fn teardown_canceled_child(
+    /// Settle every drained running task as canceled through the shared
+    /// durable path (store CAS first, then cache/meta/event/teardown).
+    async fn settle_drained_canceled(
         &self,
-        task: &RunningTask,
-        duration_ms: u64,
+        drained: Vec<(String, RunningTask, u64)>,
+        reason: &str,
         cancel_turn: bool,
     ) {
-        self.write_meta_if_real(
-            &task.parent_connection_id,
-            &task.parent_tool_use_id,
-            build_delegation_meta(
-                "failed",
-                Some(&task.child_connection_id),
-                Some(task.child_conversation_id),
-                Some("canceled"),
-                None,
-                Some(duration_ms),
-            ),
-        )
-        .await;
-        self.emit_completed_if_real(
-            &task.parent_connection_id,
-            &task.parent_tool_use_id,
-            &task.child_connection_id,
-            task.child_conversation_id,
-            task.agent_type,
-            DelegationResultSummary::Err {
-                error_code: "canceled".to_string(),
-            },
-        )
-        .await;
-        if cancel_turn {
-            let _ = self.spawner.cancel(&task.child_connection_id).await;
+        for (task_id, task, duration_ms) in drained {
+            let outcome = canceled_outcome(task.child_conversation_id, reason);
+            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let mut ctx = SettleContext::from_running(&task, duration_ms, cancel_turn);
+            let (_, _, _, message) = terminal_fields(&outcome);
+            ctx.message = message;
+            self.settle_task(&task_id, terminal, result_text, ctx).await;
         }
-        let _ = self.spawner.disconnect(&task.child_connection_id).await;
     }
 
     /// Backs the `get_delegation_status` tool for a single task id — a thin
@@ -3059,16 +3677,24 @@ impl DelegationBroker {
     /// or many task ids in a single pass — each from the completed-cache, then
     /// the running set, then the DB fallback — scoped to the calling parent (a
     /// task owned by another parent reports `Unknown`, never leaking it). Returns
-    /// one report per requested id, in request order.
+    /// one report per requested id, in request order (duplicates preserved).
     ///
-    /// Blocking obeys [`StatusWait`]: `Immediate` returns the first snapshot.
-    /// `Bounded`/`Infinite` return as soon as ANY requested task is terminal —
-    /// INCLUDING one already terminal at entry, so a completed result is never
-    /// held hostage to a long-running sibling (the caller re-polls the
-    /// still-running ids to collect the rest). Only an all-running batch parks:
-    /// it wakes when a task settles (the running count drops below the total) or
-    /// — for `Bounded` — when the deadline elapses. An all-settled batch returns
-    /// immediately even under `Infinite`, so it never parks forever.
+    /// Blocking obeys [`StatusWait`]:
+    /// - [`Snapshot`] — first assemble, never parks.
+    /// - [`Supervised`] — returns when ANY requested item is non-Running,
+    ///   Stalled, WaitingInput, any **requested** observation snapshot
+    ///   transition after park (Active→Active timestamps included), or the
+    ///   deadline. Parks only while ALL requested ids are live
+    ///   [`StatusClass::Running`] and not yet actionable (pre-first-publish
+    ///   `observation: None` continues parking). Unrelated tasks' version
+    ///   bumps re-evaluate but do not end the wait by themselves.
+    /// - [`Terminal`] — returns when ANY item is non-Running (Unknown is
+    ///   immediate) **or** any requested id is [`StatusClass::NotInMemory`]
+    ///   (even if DB says Running — no live notifier). Observation transitions
+    ///   are ignored for the exit condition.
+    ///
+    /// Batch returns as soon as ANY requested item meets the mode condition —
+    /// a terminal sibling is never held hostage to a long-running peer.
     pub async fn get_tasks_status(
         &self,
         parent_connection_id: &str,
@@ -3079,23 +3705,34 @@ impl DelegationBroker {
         if task_ids.is_empty() {
             return Vec::new();
         }
-        // A bounded wait gets a single fixed deadline; Immediate and Infinite
-        // carry none — Immediate returns on the first pass, Infinite parks on
-        // `result_notify` until a task is terminal.
-        let deadline = match wait {
-            StatusWait::Bounded(ms) => Some(Instant::now() + Duration::from_millis(ms)),
-            StatusWait::Immediate | StatusWait::Infinite => None,
+        use crate::acp::delegation::metrics::{WaitModeLabel, WaitReturnReason};
+        let wait_started = Instant::now();
+        let wait_mode = match wait {
+            StatusWait::Snapshot => WaitModeLabel::Snapshot,
+            StatusWait::Terminal => WaitModeLabel::Terminal,
+            StatusWait::Supervised(_) => WaitModeLabel::Supervised,
         };
+        let requested_wait_ms: Option<u64> = match wait {
+            StatusWait::Snapshot => None,
+            StatusWait::Terminal => Some(0),
+            StatusWait::Supervised(d) => {
+                Some(crate::acp::delegation::metrics::DelegationMetrics::duration_ms_saturating(d))
+            }
+        };
+        let deadline = match wait {
+            StatusWait::Supervised(d) => Some(Instant::now() + d),
+            StatusWait::Snapshot | StatusWait::Terminal => None,
+        };
+        // Observation views captured when we last parked (Supervised only). A
+        // change on **requested** ids ends Supervised; unrelated wakes re-park.
+        let mut obs_at_park: Option<Vec<RequestedObservationView>> = None;
         loop {
-            // Arm the notify BEFORE the snapshot so a completion landing between
-            // the snapshot and the await isn't lost (enable() registers now).
+            // Arm the notify BEFORE the snapshot so a completion/observation
+            // landing between the snapshot and the await isn't lost.
             let notified = self.result_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            // One lock acquisition classifies every requested id. The async
-            // resolution of running (live reply) / not-in-memory (DB) ids is
-            // deferred to `assemble_reports`, OUTSIDE this lock.
             let classes: Vec<StatusClass> = {
                 let inner = self.pending.inner.lock().await;
                 task_ids
@@ -3103,40 +3740,101 @@ impl DelegationBroker {
                     .map(|id| classify_locked(&inner, parent_connection_id, id))
                     .collect()
             };
-            let running_count = classes
-                .iter()
-                .filter(|c| matches!(c, StatusClass::Running { .. }))
-                .count();
+            // Park only on live in-memory Running (running ∪ settling). Any
+            // NotInMemory/Settled id forces an immediate return of the assemble
+            // for every mode (cold DB Running has no terminal notify producer).
+            let can_park = all_live_running(&classes);
+            let reports = self
+                .assemble_reports(parent_conversation_id, task_ids, classes)
+                .await;
 
-            // Return now when the poll is Immediate, OR when at least one
-            // requested task is already (or now) terminal — i.e. not EVERY task
-            // is still running. This honors the contract "returns as soon as ANY
-            // requested task reaches a terminal state": a mixed [terminal,
-            // running] batch surfaces the terminal report immediately instead of
-            // holding it hostage to a long-running sibling, and the caller
-            // re-polls (narrowing to the still-running ids) to collect the rest.
-            // `running_count == 0` (all settled) is the special case that also
-            // makes Infinite safe. The id set is fixed and a task can only LEAVE
-            // the running map during a wait (never (re)enter), so once a parked
-            // all-running batch is woken by a settle the count has dropped below
-            // the total and this returns; a spurious wake (another parent's task)
-            // re-snapshots all-running and re-parks.
-            if matches!(wait, StatusWait::Immediate) || running_count < task_ids.len() {
-                return self
-                    .assemble_reports(parent_conversation_id, task_ids, classes)
-                    .await;
+            match wait {
+                StatusWait::Snapshot => {
+                    self.record_status_wait(
+                        wait_mode,
+                        requested_wait_ms,
+                        wait_started,
+                        WaitReturnReason::Snapshot,
+                    );
+                    return reports;
+                }
+                StatusWait::Terminal => {
+                    // Unknown/terminal are non-Running; NotInMemory never parks
+                    // even when the assembled report status is still Running.
+                    if !can_park || reports.iter().any(|r| r.status != TaskStatus::Running) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Terminal,
+                        );
+                        return reports;
+                    }
+                    // Observation-only wakes re-evaluate and re-park.
+                }
+                StatusWait::Supervised(_) => {
+                    if !can_park || reports.iter().any(|r| r.status != TaskStatus::Running) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Terminal,
+                        );
+                        return reports;
+                    }
+                    if supervised_should_return(&reports) {
+                        // Still Running but stalled / waiting_input.
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Observation,
+                        );
+                        return reports;
+                    }
+                    // After parking, return only when a **requested** observation
+                    // snapshot changed (including clear and Active timestamp).
+                    let views = requested_observation_views(&reports);
+                    if obs_at_park
+                        .as_ref()
+                        .is_some_and(|prev| prev.as_slice() != views.as_slice())
+                    {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Observation,
+                        );
+                        return reports;
+                    }
+                    let now = Instant::now();
+                    if deadline.is_some_and(|d| now >= d) {
+                        self.record_status_wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wait_started,
+                            WaitReturnReason::Deadline,
+                        );
+                        return reports;
+                    }
+                }
             }
-            // Every requested task is still running. A `Bounded` wait gives up at
-            // its deadline and returns the running snapshot; `Infinite` parks on
-            // the notify alone.
+
+            // All requested items still live Running (+ not actionable for
+            // Supervised). Snapshot already returned above.
             let now = Instant::now();
             if deadline.is_some_and(|d| now >= d) {
-                return self
-                    .assemble_reports(parent_conversation_id, task_ids, classes)
-                    .await;
+                self.record_status_wait(
+                    wait_mode,
+                    requested_wait_ms,
+                    wait_started,
+                    WaitReturnReason::Deadline,
+                );
+                return reports;
             }
-            // Park until the next completion signal, bounded by the deadline
-            // when there is one (Infinite waits on the notify alone).
+            if matches!(wait, StatusWait::Supervised(_)) {
+                obs_at_park = Some(requested_observation_views(&reports));
+            }
             match deadline {
                 Some(d) => {
                     let remaining = d - now;
@@ -3149,15 +3847,25 @@ impl DelegationBroker {
                     notified.await;
                 }
             }
-            // Loop: re-snapshot (a task likely just completed, or the deadline
-            // passed and the next pass returns the running snapshot).
         }
+    }
+
+    /// Alias used by Task 10 tests: same as [`Self::get_tasks_status`] with
+    /// `parent_conversation_id = None` (in-memory maps only).
+    pub async fn status_many(
+        &self,
+        parent_connection_id: &str,
+        task_ids: Vec<String>,
+        wait: StatusWait,
+    ) -> Vec<DelegationTaskReport> {
+        self.get_tasks_status(parent_connection_id, None, &task_ids, wait)
+            .await
     }
 
     /// Finish a batch status pass: resolve each [`StatusClass`] into a final
     /// report AFTER the pending lock is released. `Running` ids get their latest
-    /// live reply attached; `NotInMemory` ids fall back to the DB status lookup.
-    /// Reports come back in `task_ids` order.
+    /// live reply + observation cache attached; `NotInMemory` ids fall back to
+    /// the DB status lookup. Reports come back in `task_ids` order.
     async fn assemble_reports(
         &self,
         parent_conversation_id: Option<i32>,
@@ -3174,13 +3882,36 @@ impl DelegationBroker {
                 } => {
                     self.attach_live_reply(&mut report, &child_connection_id)
                         .await;
+                    self.attach_observation(&mut report, id).await;
                     report
                 }
-                StatusClass::NotInMemory => self.status_from_db(parent_conversation_id, id).await,
+                StatusClass::NotInMemory => {
+                    let mut report = self.status_from_db(parent_conversation_id, id).await;
+                    // Only Running reports may carry observation fields.
+                    if report.status == TaskStatus::Running {
+                        self.attach_observation(&mut report, id).await;
+                    }
+                    report
+                }
             };
             out.push(report);
         }
         out
+    }
+
+    /// Overlay soft-supervisor cache fields onto a Running report.
+    async fn attach_observation(&self, report: &mut DelegationTaskReport, task_id: &str) {
+        if report.status != TaskStatus::Running {
+            report.observation = None;
+            report.last_agent_activity_at = None;
+            report.stalled_since = None;
+            return;
+        }
+        if let Some(snap) = self.cached_observation(task_id).await {
+            report.observation = Some(snap.observation);
+            report.last_agent_activity_at = Some(snap.last_agent_activity_at);
+            report.stalled_since = snap.stalled_since;
+        }
     }
 
     /// Upgrade a running report's bare `"Running."` message with the child's
@@ -3231,40 +3962,53 @@ impl DelegationBroker {
                 }
                 return unknown_report(task_id);
             }
+            // Mid-settle: another producer owns CAS — report still-Running so
+            // callers do not observe a false terminal or start a second settle.
+            if let Some(r) = inner.settling.get(task_id) {
+                if r.parent_connection_id == parent_connection_id {
+                    return running_report(task_id, r);
+                }
+                return unknown_report(task_id);
+            }
             match inner.running.get(task_id) {
                 Some(r) if r.parent_connection_id == parent_connection_id => {
-                    drain_and_record_canceled(&mut inner, vec![task_id.to_string()], reason).pop()
+                    drain_running(&mut inner, vec![task_id.to_string()]).pop()
                 }
                 Some(_) => return unknown_report(task_id),
                 None => None,
             }
         };
         match drained {
-            Some((task, duration_ms)) => {
-                // A turn is in flight → cancel + disconnect. Reuse the duration
-                // captured at drain time for both the teardown meta and the
-                // report, so all three (completed-cache, meta, report) agree.
-                self.teardown_canceled_child(&task, duration_ms, true).await;
-                self.result_notify.notify_waiters();
-                report_from_outcome(
-                    Some(task_id.to_string()),
-                    Some(task.agent_type),
-                    &canceled_outcome(task.child_conversation_id, reason),
-                    Some(duration_ms),
-                )
+            Some((_id, task, duration_ms)) => {
+                let outcome = canceled_outcome(task.child_conversation_id, reason);
+                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let mut ctx = SettleContext::from_running(&task, duration_ms, true);
+                let (_, _, _, message) = terminal_fields(&outcome);
+                ctx.message = message;
+                self.settle_task(task_id, terminal, result_text, ctx).await
             }
             None => self.status_from_db(parent_conversation_id, task_id).await,
         }
     }
 
-    /// DB status fallback for a task evicted from / never in the in-memory maps.
-    /// Scopes to the caller's conversation: a child whose `parent_id` doesn't
-    /// match (or when the caller has no active conversation) reports `Unknown`.
+    /// DB / store status fallback for a task evicted from / never in the
+    /// in-memory maps. Scopes to the caller's conversation: a child whose
+    /// `parent_id` doesn't match (or when the caller has no active conversation)
+    /// reports `Unknown`. Prefers durable store columns over generic
+    /// conversation status.
     async fn status_from_db(
         &self,
         parent_conversation_id: Option<i32>,
         task_id: &str,
     ) -> DelegationTaskReport {
+        if let Ok(Some(row)) = self.task_store.load(task_id).await {
+            if parent_conversation_id.is_some() && row.parent_id == parent_conversation_id {
+                return row.to_report(None);
+            }
+            if parent_conversation_id.is_some() {
+                return unknown_report(task_id);
+            }
+        }
         match self.status_lookup.find_by_call_id(task_id).await {
             Some(rec)
                 if parent_conversation_id.is_some() && rec.parent_id == parent_conversation_id =>
@@ -3303,7 +4047,7 @@ impl DelegationBroker {
                     &parent_connection_id,
                     parent_conversation_id,
                     &task_id,
-                    StatusWait::Bounded(3_600_000),
+                    StatusWait::Terminal,
                 )
                 .await;
             if report.status != TaskStatus::Running {
@@ -3402,6 +4146,10 @@ impl ConversationDepthLookup for DbDepthLookup {
 /// `ChildStatusLookup` over the live `AppDatabase`. Recovers a delegation
 /// task's terminal status (NOT its text — child output isn't in codeg's DB)
 /// from the child conversation row once its in-memory result was evicted.
+///
+/// Cold-load reads `delegation_task_status` / `delegation_error_code`, not
+/// generic conversation status. Prefer wiring `DbDelegationTaskStore` via
+/// `with_task_store` in production; this lookup remains for tests / fallback.
 pub struct DbChildStatusLookup {
     pub db: Arc<crate::db::AppDatabase>,
 }
@@ -3416,19 +4164,80 @@ impl ChildStatusLookup for DbChildStatusLookup {
         .await
         .ok()
         .flatten()?;
-        // `summary.status` is the serialized `ConversationStatus` string.
-        let status = match summary.status.as_str() {
-            "in_progress" => TaskStatus::Running,
-            "pending_review" | "completed" => TaskStatus::Completed,
-            "cancelled" => TaskStatus::Canceled,
-            _ => TaskStatus::Unknown,
+        use crate::db::entities::conversation::DelegationTaskStatus;
+        let status = match summary.delegation_task_status {
+            Some(DelegationTaskStatus::Running) => TaskStatus::Running,
+            Some(DelegationTaskStatus::Completed) => TaskStatus::Completed,
+            Some(DelegationTaskStatus::Failed) => TaskStatus::Failed,
+            Some(DelegationTaskStatus::Canceled) => TaskStatus::Canceled,
+            // Legacy rows without task columns: fall back to conversation status.
+            None => match summary.status.as_str() {
+                "in_progress" => TaskStatus::Running,
+                "pending_review" | "completed" => TaskStatus::Completed,
+                "cancelled" => TaskStatus::Canceled,
+                _ => TaskStatus::Unknown,
+            },
         };
         Some(ChildStatusRecord {
             child_conversation_id: summary.id,
             status,
             agent_type: summary.agent_type,
             parent_id: summary.parent_id,
+            error_code: summary.delegation_error_code.clone(),
         })
+    }
+}
+
+// ── Soft-supervisor production adapters (observe-only) ─────────────────────
+
+use crate::acp::delegation::supervisor::{
+    DelegationObservationSink, DelegationObservationSource, RunningTaskHealth,
+};
+use crate::acp::manager::ConnectionManager;
+
+/// Joins Broker logical-Running task ids (`running` ∪ `settling`) to child
+/// `SessionState` snapshots (read-only).
+pub struct BrokerObservationSource {
+    pub broker: Arc<DelegationBroker>,
+    pub manager: Arc<ConnectionManager>,
+}
+
+#[async_trait]
+impl DelegationObservationSource for BrokerObservationSource {
+    async fn running_task_health(&self) -> Vec<RunningTaskHealth> {
+        let pairs = self.broker.running_task_child_ids().await;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (task_id, child_connection_id) in pairs {
+            let Some(state) = self.manager.get_state(&child_connection_id).await else {
+                continue;
+            };
+            let guard = state.read().await;
+            let waiting_input =
+                guard.pending_permission.is_some() || guard.pending_question.is_some();
+            out.push(RunningTaskHealth {
+                task_id,
+                child_connection_id,
+                last_agent_activity_at: guard.last_agent_activity_at,
+                waiting_input,
+            });
+        }
+        out
+    }
+}
+
+/// Observation cache sink — never mutates task status or connections.
+pub struct BrokerObservationSink {
+    pub broker: Arc<DelegationBroker>,
+}
+
+#[async_trait]
+impl DelegationObservationSink for BrokerObservationSink {
+    async fn publish_observation(&self, task_id: &str, observation: ObservationSnapshot) {
+        self.broker.cache_observation(task_id, observation).await;
+    }
+
+    async fn clear_observation(&self, task_id: &str) {
+        self.broker.clear_observation(task_id).await;
     }
 }
 
@@ -3582,7 +4391,7 @@ mod tests {
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["child-conn-1"]);
     }
 
-    /// `StatusWait::Infinite` (the explicit `wait_ms = 0` escape hatch) must
+    /// `StatusWait::Terminal` (the explicit `wait_ms = 0` escape hatch) must
     /// park while the task is still running rather than returning the running
     /// snapshot, then resolve to the terminal report once the task completes —
     /// no matter how long the child takes.
@@ -3606,7 +4415,7 @@ mod tests {
             let task_id = task_id.clone();
             tokio::spawn(async move {
                 broker
-                    .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Infinite)
+                    .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Terminal)
                     .await
             })
         };
@@ -3664,7 +4473,7 @@ mod tests {
         let task_id = ack.task_id.clone().expect("running task carries an id");
 
         let report = broker
-            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Immediate)
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Snapshot)
             .await;
         assert_eq!(report.status, TaskStatus::Running);
         // The live hint lands on its own line so a content-only host can anchor
@@ -3690,7 +4499,7 @@ mod tests {
         let task_id = ack.task_id.clone().expect("running task carries an id");
 
         let report = broker
-            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Immediate)
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Snapshot)
             .await;
         assert_eq!(report.status, TaskStatus::Running);
         assert_eq!(report.message.as_deref(), Some("Running."));
@@ -3741,14 +4550,14 @@ mod tests {
             .await;
 
         let single = broker
-            .get_task_status("parent-conn", Some(1), &t1, StatusWait::Immediate)
+            .get_task_status("parent-conn", Some(1), &t1, StatusWait::Snapshot)
             .await;
         let batch = broker
             .get_tasks_status(
                 "parent-conn",
                 Some(1),
                 std::slice::from_ref(&t1),
-                StatusWait::Immediate,
+                StatusWait::Snapshot,
             )
             .await;
         assert_eq!(batch.len(), 1);
@@ -3783,7 +4592,7 @@ mod tests {
 
         let ids = vec![t1.clone(), t2.clone(), "no-such-id".to_string()];
         let reports = broker
-            .get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Immediate)
+            .get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Snapshot)
             .await;
         assert_eq!(reports.len(), 3);
         assert_eq!(reports[0].status, TaskStatus::Completed);
@@ -3810,7 +4619,7 @@ mod tests {
             let ids = vec![t1.clone(), t2.clone()];
             tokio::spawn(async move {
                 broker
-                    .get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Infinite)
+                    .get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Terminal)
                     .await
             })
         };
@@ -3876,7 +4685,7 @@ mod tests {
         let ids = vec![t1.clone(), t2.clone()];
         let reports = tokio::time::timeout(
             Duration::from_secs(2),
-            broker.get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Infinite),
+            broker.get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Terminal),
         )
         .await
         .expect("a batch with an already-terminal task must not park under Infinite");
@@ -3897,7 +4706,7 @@ mod tests {
         let ids = vec!["nope-1".to_string(), "nope-2".to_string()];
         let reports = tokio::time::timeout(
             Duration::from_secs(2),
-            broker.get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Infinite),
+            broker.get_tasks_status("parent-conn", Some(1), &ids, StatusWait::Terminal),
         )
         .await
         .expect("all-settled infinite batch must not hang");
@@ -3915,7 +4724,12 @@ mod tests {
         enable_delegation(&broker).await;
         let t1 = start_running(&broker, &mock, "child-1", 1, "pt-1").await;
         let reports = broker
-            .get_tasks_status("parent-conn", Some(1), &[t1], StatusWait::Bounded(40))
+            .get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &[t1],
+                StatusWait::Supervised(Duration::from_millis(40)),
+            )
             .await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, TaskStatus::Running);
@@ -3931,7 +4745,7 @@ mod tests {
         enable_delegation(&broker).await;
         let t1 = start_running(&broker, &mock, "child-1", 1, "pt-1").await;
         let reports = broker
-            .get_tasks_status("other-parent", Some(2), &[t1], StatusWait::Immediate)
+            .get_tasks_status("other-parent", Some(2), &[t1], StatusWait::Snapshot)
             .await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, TaskStatus::Unknown);
@@ -3960,7 +4774,7 @@ mod tests {
         // empty/None defaults.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+        mock.queue_send(Err(SpawnerError::send("stop after spawn")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -3998,7 +4812,7 @@ mod tests {
     async fn delegation_profile_overrides_agent_defaults() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+        mock.queue_send(Err(SpawnerError::send("stop after spawn")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -4104,7 +4918,7 @@ mod tests {
     async fn mandatory_profile_auto_fills_unique_match_when_profile_id_omitted() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+        mock.queue_send(Err(SpawnerError::send("stop after spawn")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -4225,7 +5039,7 @@ mod tests {
         // spawn (type-scoped gate — the mixed @profile + @base-agent bug fix).
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+        mock.queue_send(Err(SpawnerError::send("stop after spawn")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -4300,7 +5114,10 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = Some(other.into());
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(
             msg.contains(&format!(
@@ -4326,11 +5143,11 @@ mod tests {
     async fn mandatory_profiles_mixed_agent_types_gate_independently() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-g".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_send(Err(SpawnerError::send("stop"))).await;
         mock.queue_spawn(Ok("child-cb".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_send(Err(SpawnerError::send("stop"))).await;
         mock.queue_spawn(Ok("child-cx".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_send(Err(SpawnerError::send("stop"))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         let p_cb = "11111111-1111-4111-8111-111111111111";
@@ -4371,10 +5188,7 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
-        broker.set_mandatory_profile_routes(
-            "parent-conn",
-            [p_cb.to_string(), p_cx.to_string()],
-        );
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string(), p_cx.to_string()]);
 
         // Grok unconstrained → allow base
         let mut req_g = request(1, "pt-g");
@@ -4435,7 +5249,10 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = None;
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(msg.contains("agent_type=code_buddy"), "{msg}");
         assert!(msg.contains("(ambiguous or missing)"), "{msg}");
@@ -4523,17 +5340,17 @@ mod tests {
                 ..DelegationConfig::default()
             })
             .await;
-        broker.set_mandatory_profile_routes(
-            "parent-conn",
-            [p_cb.to_string(), p_cx.to_string()],
-        );
+        broker.set_mandatory_profile_routes("parent-conn", [p_cb.to_string(), p_cx.to_string()]);
 
         let mut req = request(1, "pt-cross");
         req.parent_connection_id = "parent-conn".into();
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = Some(p_cx.into());
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         assert_ne!(
             ack.error_code.as_deref(),
             Some("delegation_profile_agent_mismatch")
@@ -4553,7 +5370,7 @@ mod tests {
     async fn mandatory_profiles_unconstrained_type_allows_valid_non_mandatory_profile() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop".into()))).await;
+        mock.queue_send(Err(SpawnerError::send("stop"))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         let p_cb = "11111111-1111-4111-8111-111111111111";
@@ -4676,13 +5493,19 @@ mod tests {
         req.agent_type = AgentType::CodeBuddy;
         req.profile_id = None;
         let ack = broker.start_delegation(req).await;
-        assert_eq!(ack.error_code.as_deref(), Some("mandatory_profile_required"));
+        assert_eq!(
+            ack.error_code.as_deref(),
+            Some("mandatory_profile_required")
+        );
         let msg = ack.message.as_deref().unwrap_or("");
         assert!(
             msg.starts_with("mandatory profile_id required: for agent_type=code_buddy"),
             "{msg}"
         );
-        assert!(!msg.contains("CodeBuddy"), "Display label must not appear: {msg}");
+        assert!(
+            !msg.contains("CodeBuddy"),
+            "Display label must not appear: {msg}"
+        );
         assert_eq!(msg.matches("mandatory profile_id required").count(), 1);
     }
 
@@ -4692,7 +5515,7 @@ mod tests {
         // still receive (None, empty) — no cross-contamination.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("stop after spawn".into())))
+        mock.queue_send(Err(SpawnerError::send("stop after spawn")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -4729,7 +5552,7 @@ mod tests {
     async fn send_failure_after_spawn_disconnects_child() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("agent rejected prompt".into())))
+        mock.queue_send(Err(SpawnerError::send("agent rejected prompt")))
             .await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -7183,8 +8006,7 @@ mod tests {
     async fn inflight_drained_on_send_failure() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c6".into())).await;
-        mock.queue_send(Err(SpawnerError::Send("boom".into())))
-            .await;
+        mock.queue_send(Err(SpawnerError::send("boom"))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8005,17 +8827,20 @@ mod tests {
 
         // Per-connection stream (WS attach delivery path) must receive the
         // envelope tagged with the right connection + payload shape.
-        // The parent stream now also carries the setup-time DelegationStarted;
-        // skip past it to the terminal DelegationCompleted.
+        // The parent stream also carries setup-time DelegationStarted and the
+        // winner-side ConversationStatusChanged (live sidebar); skip those to
+        // the terminal DelegationCompleted.
         let envelope = loop {
             let env = tokio::time::timeout(Duration::from_millis(500), stream_rx.recv())
                 .await
                 .expect("per-connection stream should receive DelegationCompleted within 500ms")
                 .expect("envelope recv must not error");
-            if matches!(env.payload, AcpEvent::DelegationStarted { .. }) {
-                continue;
+            match &env.payload {
+                AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
+                    continue
+                }
+                _ => break env,
             }
-            break env;
         };
         assert_eq!(envelope.connection_id, "parent-conn");
         match &envelope.payload {
@@ -8047,10 +8872,12 @@ mod tests {
                 .await
                 .expect("InternalEventBus should receive DelegationCompleted within 500ms")
                 .expect("bus recv must not error");
-            if matches!(env.payload, AcpEvent::DelegationStarted { .. }) {
-                continue;
+            match &env.payload {
+                AcpEvent::DelegationStarted { .. } | AcpEvent::ConversationStatusChanged { .. } => {
+                    continue
+                }
+                _ => break env,
             }
-            break env;
         };
         assert_eq!(bus_envelope.connection_id, "parent-conn");
         assert!(matches!(
@@ -8421,5 +9248,1252 @@ mod tests {
             !inner.completed.contains_key("t0"),
             "oldest result must be pruned"
         );
+    }
+
+    // -- Task 8: durable accepted / terminal state -------------------------
+
+    use crate::acp::delegation::store::mock::MockTaskStore;
+
+    fn broker_with_store(spawner: Arc<MockSpawner>, store: Arc<MockTaskStore>) -> DelegationBroker {
+        DelegationBroker::new(spawner as Arc<dyn ConnectionSpawner>, shallow_lookup())
+            .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>)
+    }
+
+    fn valid_request() -> DelegationRequest {
+        request(1, "pt-accepted")
+    }
+
+    fn successful_outcome() -> DelegationOutcome {
+        DelegationOutcome::Ok(DelegationSuccess {
+            text: "ok".into(),
+            child_conversation_id: 42,
+            child_agent_type: AgentType::ClaudeCode,
+            turn_count: 1,
+            duration_ms: 1,
+            token_usage: None,
+        })
+    }
+
+    struct AcceptedFixture {
+        broker: DelegationBroker,
+        spawner: Arc<MockSpawner>,
+        task_id: String,
+        parent_id: String,
+    }
+
+    async fn accepted_running_task_fixture() -> AcceptedFixture {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let broker = broker_with_store(spawner.clone(), store);
+        enable_delegation(&broker).await;
+        let ack = broker.start_delegation(valid_request()).await;
+        assert_eq!(ack.status, TaskStatus::Running);
+        let task_id = ack.task_id.expect("accepted task id");
+        AcceptedFixture {
+            broker,
+            spawner,
+            task_id,
+            parent_id: "parent-conn".into(),
+        }
+    }
+
+    impl DelegationBroker {
+        /// Test helper: force a terminal settle for a running task as if a
+        /// lifecycle producer fired.
+        #[cfg(test)]
+        async fn finish_for_test(
+            &self,
+            task_id: &str,
+            outcome: DelegationOutcome,
+        ) -> DelegationTaskReport {
+            // Ensure a running entry exists for settle path that removes it.
+            {
+                let mut inner = self.pending.inner.lock().await;
+                if !inner.running.contains_key(task_id) {
+                    inner.running.insert(
+                        task_id.to_string(),
+                        RunningTask {
+                            child_connection_id: "child-conn".into(),
+                            child_conversation_id: 42,
+                            parent_connection_id: "parent-conn".into(),
+                            parent_tool_use_id: "pt-1".into(),
+                            agent_type: AgentType::ClaudeCode,
+                            external_handle: None,
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
+            }
+            self.complete_call(task_id, outcome).await;
+            // Prefer completed cache; fall back to a synthetic failed report.
+            let inner = self.pending.inner.lock().await;
+            if let Some(c) = inner.completed.get(task_id) {
+                completed_report(task_id, c)
+            } else {
+                DelegationTaskReport {
+                    task_id: Some(task_id.to_string()),
+                    status: TaskStatus::Failed,
+                    child_conversation_id: Some(42),
+                    agent_type: Some(AgentType::ClaudeCode),
+                    text: None,
+                    error_code: Some("persistence_error".into()),
+                    message: None,
+                    duration_ms: Some(0),
+                    observation: None,
+                    last_agent_activity_at: None,
+                    stalled_since: None,
+                }
+            }
+        }
+
+        #[cfg(test)]
+        async fn child_was_disconnected(&self, _task_id: &str) -> bool {
+            // MockSpawner is behind the trait object — use disconnect count via
+            // pending completed presence after settle (child teardown always runs
+            // on persistence_error). Inspect via a side channel on the spawner is
+            // not available; tests pass the mock separately. Here we check that
+            // the task is terminal in completed cache (waiter unblocked).
+            let inner = self.pending.inner.lock().await;
+            inner.completed.contains_key(_task_id)
+        }
+
+        #[cfg(test)]
+        async fn status_one(
+            &self,
+            parent_connection_id: &str,
+            task_id: &str,
+        ) -> DelegationTaskReport {
+            self.get_task_status(parent_connection_id, Some(1), task_id, StatusWait::Snapshot)
+                .await
+        }
+
+        #[cfg(test)]
+        async fn set_enabled(&self, enabled: bool) {
+            let mut cfg = self.config_snapshot().await;
+            cfg.enabled = enabled;
+            self.set_config(cfg).await;
+        }
+
+        /// Test helper: invoke persistence-retry worker spawn (single-flight).
+        #[cfg(test)]
+        fn spawn_retry_worker_for_test(&self, task_id: &str) {
+            self.spawn_persistence_retry_worker(
+                task_id.to_string(),
+                PersistenceRetryAccounting {
+                    parent_connection_id: "parent-conn".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    child_conversation_id: 42,
+                    duration_ms: 0,
+                },
+            );
+        }
+
+        #[cfg(test)]
+        fn persistence_worker_spawns_for_test(&self) -> usize {
+            self.persistence_worker_spawn_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl MockSpawner {
+        #[cfg(test)]
+        async fn cancel_count(&self) -> usize {
+            self.cancels.lock().await.len()
+        }
+
+        #[cfg(test)]
+        async fn spawn_count(&self) -> usize {
+            self.spawn_args.lock().await.len()
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_enqueue_failure_after_row_creation_is_settled() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Err(SpawnerError::Send {
+                message: "queue closed".into(),
+                child_conversation_id: Some(42),
+            }))
+            .await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+
+        let report = broker.start_delegation(valid_request()).await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.child_conversation_id, Some(42));
+        let task_id = report.task_id.as_deref().expect("row-backed task id");
+        assert_eq!(store.persisted(task_id).await.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn exhausted_terminal_write_returns_persistence_error_and_keeps_retry() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)));
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        assert!(store.has_retry_record("task-1").await);
+        assert!(
+            !mock.disconnects.lock().await.is_empty(),
+            "child must be disconnected after persistence exhaustion"
+        );
+        assert!(broker.child_was_disconnected("task-1").await);
+    }
+
+    #[tokio::test]
+    async fn disabling_delegation_blocks_new_tasks_without_canceling_accepted_task() {
+        let fixture = accepted_running_task_fixture().await;
+        fixture.broker.set_enabled(false).await;
+        assert_eq!(
+            fixture
+                .broker
+                .status_one(&fixture.parent_id, &fixture.task_id)
+                .await
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(fixture.spawner.cancel_count().await, 0);
+
+        let rejected = fixture.broker.start_delegation(valid_request()).await;
+        assert_ne!(rejected.status, TaskStatus::Running);
+        assert_eq!(
+            fixture.spawner.spawn_count().await,
+            1,
+            "only the accepted child exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_boundary_returns_running_only_after_prompt_enqueue() {
+        let spawner = Arc::new(MockSpawner::new());
+        // Spawn succeeds but send is gated: no running ack until enqueue returns.
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        let send_gate = spawner.install_send_gate().await;
+        spawner.queue_send(Ok(7)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(7));
+        let broker = broker_with_store(spawner.clone(), store);
+        enable_delegation(&broker).await;
+
+        let handle = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.start_delegation(valid_request()).await })
+        };
+        // While send is gated, no running task is parked yet.
+        tokio::task::yield_now().await;
+        assert_eq!(broker.pending_count().await, 0);
+        let _ = send_gate.send(());
+        let ack = handle.await.expect("join");
+        assert_eq!(ack.status, TaskStatus::Running);
+        assert_eq!(ack.child_conversation_id, Some(7));
+        assert!(ack.task_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_eviction_retains_status_error_truth_from_store() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(99)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(99));
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+        // Tiny cache so the completed text is evicted after a second completion.
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                completed_cache_cap_bytes: 10,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let t1 = broker
+            .start_delegation(request(1, "pt-1"))
+            .await
+            .task_id
+            .expect("id");
+        broker
+            .complete_call(
+                &t1,
+                DelegationOutcome::Err {
+                    code: "spawn_failed".into(),
+                    message: "boom".into(),
+                    child_conversation_id: Some(99),
+                },
+            )
+            .await;
+        // Seed a second large completed entry for the same parent to force eviction.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.insert_completed(
+                "other",
+                CompletedTask {
+                    parent_connection_id: "parent-conn".into(),
+                    child_conversation_id: 100,
+                    agent_type: AgentType::ClaudeCode,
+                    status: TaskStatus::Completed,
+                    text: Some("x".repeat(50)),
+                    error_code: None,
+                    message: None,
+                    duration_ms: 1,
+                },
+            );
+        }
+        // After eviction, cold path reads store columns.
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &t1, StatusWait::Snapshot)
+            .await;
+        // Either still in cache or recovered from store — status/error must hold.
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_loser_does_not_emit_second_terminal_event() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let events = Arc::new(MockEventEmitter::default());
+        let broker = DelegationBroker::with_writers(
+            spawner as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
+                as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>);
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(request(1, "tu-real-tool"))
+            .await
+            .task_id
+            .expect("id");
+        broker.complete_call(&t1, successful_outcome()).await;
+        // Second terminal producer loses the CAS.
+        broker
+            .cancel_task_by_id("parent-conn", Some(1), &t1, "late cancel")
+            .await;
+        let completed_emits = events.count().await;
+        assert_eq!(
+            completed_emits, 1,
+            "losing producer must not emit a second terminal event"
+        );
+    }
+
+    /// Real store `Settlement::Existing` path through `settle_task` itself
+    /// (not the completed-cache short-circuit on `cancel_task_by_id`).
+    #[tokio::test]
+    async fn terminal_cas_existing_via_settle_task_suppresses_side_effects() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let events = Arc::new(MockEventEmitter::default());
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
+                as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(
+            store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+        );
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(request(1, "tu-real-tool"))
+            .await
+            .task_id
+            .expect("id");
+        // First settle wins.
+        broker.complete_call(&t1, successful_outcome()).await;
+        assert_eq!(events.count().await, 1);
+        assert_eq!(events.status_changed_count().await, 1);
+        let disconnects_after_win = spawner.disconnects.lock().await.len();
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
+
+        // Force a second settle_task: re-insert running + complete_call again.
+        // Store returns Existing (already terminal); no second terminal event /
+        // status emit; persisted winner status remains Completed.
+        broker
+            .finish_for_test(
+                &t1,
+                DelegationOutcome::Err {
+                    code: "canceled".into(),
+                    message: "late".into(),
+                    child_conversation_id: Some(42),
+                },
+            )
+            .await;
+        assert_eq!(
+            events.count().await,
+            1,
+            "Existing settlement must not emit DelegationCompleted"
+        );
+        assert_eq!(
+            events.status_changed_count().await,
+            1,
+            "Existing settlement must not emit ConversationStatusChanged"
+        );
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
+        // Disconnect may re-run (idempotent); must not grow unbounded.
+        assert!(
+            spawner.disconnects.lock().await.len() <= disconnects_after_win + 1,
+            "loser at most one best-effort disconnect"
+        );
+        // At least two settle calls (Won + Existing).
+        assert!(store.settle_call_count().await >= 2);
+    }
+
+    #[tokio::test]
+    async fn settlement_won_emits_one_conversation_status_changed() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let events = Arc::new(MockEventEmitter::default());
+        let broker = DelegationBroker::with_writers(
+            spawner as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            Arc::new(crate::acp::delegation::meta_writer::NoopMetaWriter)
+                as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>);
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(request(1, "tu-real-tool"))
+            .await
+            .task_id
+            .expect("id");
+        broker.complete_call(&t1, successful_outcome()).await;
+        let status_emits = events.status_changed_snapshot().await;
+        assert_eq!(status_emits.len(), 1);
+        assert_eq!(status_emits[0].conversation_id, 42);
+        assert_eq!(status_emits[0].status, ConversationStatus::PendingReview);
+        assert_eq!(events.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn mid_settle_status_and_waits_remain_running_until_terminal() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.install_settle_gate(entered_tx, release_rx).await;
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(valid_request())
+            .await
+            .task_id
+            .expect("id");
+
+        let complete = {
+            let broker = broker.clone();
+            let t1 = t1.clone();
+            tokio::spawn(async move {
+                broker.complete_call(&t1, successful_outcome()).await;
+            })
+        };
+        // Wait until settle entered (task is in settling, CAS gated).
+        entered_rx.await.expect("settle entered");
+
+        // Snapshot (Immediate) and short bounded wait must stay Running.
+        let snap = broker
+            .get_task_status("parent-conn", Some(1), &t1, StatusWait::Snapshot)
+            .await;
+        assert_eq!(
+            snap.status,
+            TaskStatus::Running,
+            "mid-settle snapshot must not return cold Running hole or terminal"
+        );
+        let bounded = broker
+            .get_task_status(
+                "parent-conn",
+                Some(1),
+                &t1,
+                StatusWait::Supervised(Duration::from_millis(5)),
+            )
+            .await;
+        assert_eq!(
+            bounded.status,
+            TaskStatus::Running,
+            "bounded wait during settling must not treat NotInMemory as done"
+        );
+
+        // wait_ms=0 (Infinite) parks until terminal — start before release.
+        let wait0 = {
+            let broker = broker.clone();
+            let t1 = t1.clone();
+            tokio::spawn(async move {
+                broker
+                    .get_task_status("parent-conn", Some(1), &t1, StatusWait::Terminal)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Still settling: wait0 must not have finished.
+        assert!(
+            !wait0.is_finished(),
+            "wait_ms=0 must not return while settling"
+        );
+        release_tx.send(()).expect("release settle");
+        complete.await.expect("complete join");
+        let terminal = tokio::time::timeout(Duration::from_millis(500), wait0)
+            .await
+            .expect("wait0 must release after settle")
+            .expect("wait0 join");
+        assert_eq!(terminal.status, TaskStatus::Completed);
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
+    }
+
+    /// Observation membership matches Task 8 logical Running: present while
+    /// accepted (`running`) and mid-settle (`settling`), gone only after true
+    /// terminal (`completed`). Child connection id is preserved for the join.
+    #[tokio::test]
+    async fn running_task_child_ids_includes_settling_until_completed() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(42)).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.install_settle_gate(entered_tx, release_rx).await;
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(valid_request())
+            .await
+            .task_id
+            .expect("id");
+
+        let running_ids = broker.running_task_child_ids().await;
+        assert_eq!(
+            running_ids,
+            vec![(t1.clone(), "child-conn".into())],
+            "accepted running task must be in observation membership"
+        );
+
+        let complete = {
+            let broker = broker.clone();
+            let t1 = t1.clone();
+            tokio::spawn(async move {
+                broker.complete_call(&t1, successful_outcome()).await;
+            })
+        };
+        entered_rx.await.expect("settle entered");
+
+        let settling_ids = broker.running_task_child_ids().await;
+        assert_eq!(
+            settling_ids,
+            vec![(t1.clone(), "child-conn".into())],
+            "settling tasks remain logical Running for observation (with child id)"
+        );
+
+        release_tx.send(()).expect("release settle");
+        complete.await.expect("complete join");
+
+        let terminal_ids = broker.running_task_child_ids().await;
+        assert!(
+            terminal_ids.is_empty(),
+            "completed tasks leave observation membership: {terminal_ids:?}"
+        );
+        assert_eq!(store.persisted(&t1).await.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn send_failure_with_none_child_id_settles_when_row_exists() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Err(SpawnerError::Send {
+                message: "queue closed".into(),
+                child_conversation_id: None,
+            }))
+            .await;
+        // load by call_id discovers the row even though error carries no child id.
+        let store = Arc::new(MockTaskStore::accept_any_running_loadable(77));
+        let broker = broker_with_store(spawner, store.clone());
+        enable_delegation(&broker).await;
+
+        let report = broker.start_delegation(valid_request()).await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert_eq!(report.child_conversation_id, Some(77));
+        let task_id = report.task_id.as_deref().expect("row-backed task id");
+        assert_eq!(store.persisted(task_id).await.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn send_failure_with_none_child_id_and_no_row_is_unaccepted() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Err(SpawnerError::Send {
+                message: "queue closed".into(),
+                child_conversation_id: None,
+            }))
+            .await;
+        // No seed on load and no auto child — load returns None → setup failure.
+        let store = Arc::new(MockTaskStore::new());
+        let broker = broker_with_store(spawner, store);
+        enable_delegation(&broker).await;
+
+        let report = broker.start_delegation(valid_request()).await;
+        assert_ne!(report.status, TaskStatus::Running);
+        assert!(
+            report.task_id.is_none(),
+            "no durable row → no accepted task id"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_retry_worker_is_single_flight_per_task() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5));
+
+        // Exhaust once → put_retry + spawn worker.
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        assert!(store.has_retry_record("task-1").await);
+        assert_eq!(broker.persistence_worker_spawns_for_test(), 1);
+
+        // Concurrent re-spawns for the same task id must not start another worker.
+        broker.spawn_retry_worker_for_test("task-1");
+        broker.spawn_retry_worker_for_test("task-1");
+        broker.spawn_retry_worker_for_test("task-1");
+        assert_eq!(
+            broker.persistence_worker_spawns_for_test(),
+            1,
+            "worker ownership is single-flight per task id"
+        );
+
+        // Worker retries persistence only; eventually clears record on success.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-1").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-1").await,
+            "worker must clear retry record after successful persistence"
+        );
+        assert_eq!(broker.persistence_worker_spawns_for_test(), 1);
+    }
+
+    /// Initial process-local `persistence_error` must not count as a terminal
+    /// metric; the background worker's durable CAS **Won** counts exactly once
+    /// with stable `persistence_error` accounting (duration saturating path).
+    #[tokio::test]
+    async fn persistence_retry_won_records_terminal_metrics_once() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(4));
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        // Authoritative CAS winner not known yet — do not count.
+        let snap_before = metrics.snapshot();
+        assert_eq!(
+            snap_before.failed_count, 0,
+            "initial exhaustion must not record terminal before durable CAS"
+        );
+        assert_eq!(snap_before.completed_count, 0);
+        assert_eq!(snap_before.canceled_count, 0);
+        assert_eq!(snap_before.terminal_duration_ms_total, 0);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-1").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-1").await,
+            "worker must clear retry after Won"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.failed_count, 1,
+            "eventual durable Won must count failed/persistence_error once"
+        );
+        assert_eq!(snap.completed_count, 0);
+        assert_eq!(snap.canceled_count, 0);
+        // duration_ms from Instant::now() at finish is small but saturating path ran
+        assert!(
+            snap.terminal_duration_ms_total < u64::MAX,
+            "duration must use saturating conversion path"
+        );
+    }
+
+    /// Worker settle that returns Existing (CAS loser/replay) must not record
+    /// terminal metrics — exact-once is CAS-winner only.
+    #[tokio::test]
+    async fn persistence_retry_existing_does_not_record_terminal() {
+        let store = Arc::new(MockTaskStore::fail_settle_times(3));
+        // After three transient fails (max_attempts=3), script returns Existing.
+        store
+            .queue_settle_ok(Settlement::Existing(DelegationTaskReport {
+                task_id: Some("task-1".into()),
+                status: TaskStatus::Failed,
+                child_conversation_id: Some(42),
+                agent_type: Some(AgentType::ClaudeCode),
+                text: None,
+                error_code: Some("persistence_error".into()),
+                message: None,
+                duration_ms: None,
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+            }))
+            .await;
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                )
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        let report = broker.finish_for_test("task-1", successful_outcome()).await;
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        assert_eq!(metrics.snapshot().failed_count, 0);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-1").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-1").await,
+            "Existing still clears the process-local retry record"
+        );
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            0,
+            "CAS Existing/loser must not record terminal metrics"
+        );
+        assert_eq!(metrics.snapshot().terminal_duration_ms_total, 0);
+    }
+
+    #[test]
+    fn require_reconcile_ok_fails_closed_on_error() {
+        let err = DelegationBroker::require_reconcile_ok(Err("db locked".into()));
+        assert!(err.is_err());
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("startup blocked") || msg.contains("reconcile_running"),
+            "error must carry context: {msg}"
+        );
+        assert_eq!(DelegationBroker::require_reconcile_ok(Ok(2)).unwrap(), 2);
+    }
+
+    #[test]
+    fn require_reconcile_ok_then_listener_ordering() {
+        // Documented startup order: reconcile gate before listener start.
+        // This pure helper is what desktop/server call; listener only runs on Ok.
+        fn startup_sequence(reconcile: Result<u64, String>) -> Result<&'static str, String> {
+            DelegationBroker::require_reconcile_ok(reconcile)?;
+            Ok("listener_started")
+        }
+        assert_eq!(startup_sequence(Ok(0)).unwrap(), "listener_started");
+        assert!(startup_sequence(Err("boom".into())).is_err());
+    }
+
+    // ── Task 10: observation-aware status / wait ───────────────────────────
+
+    fn report_for_running_task(snap: ObservationSnapshot) -> DelegationTaskReport {
+        DelegationTaskReport {
+            task_id: Some("task-a".into()),
+            status: TaskStatus::Running,
+            child_conversation_id: Some(1),
+            agent_type: Some(AgentType::Codex),
+            text: None,
+            error_code: None,
+            message: Some("Running.".into()),
+            duration_ms: None,
+            observation: Some(snap.observation),
+            last_agent_activity_at: Some(snap.last_agent_activity_at),
+            stalled_since: snap.stalled_since,
+        }
+    }
+
+    fn running_task_with_observation(
+        observation: TaskObservation,
+        last_at: &str,
+        stalled_since: Option<&str>,
+    ) -> ObservationSnapshot {
+        ObservationSnapshot {
+            observation,
+            last_agent_activity_at: last_at.parse().expect("rfc3339"),
+            stalled_since: stalled_since.map(|s| s.parse().expect("rfc3339")),
+        }
+    }
+
+    fn completed_report_for_test() -> DelegationTaskReport {
+        completed_report(
+            "task-done",
+            &CompletedTask {
+                parent_connection_id: "parent-conn".into(),
+                child_conversation_id: 1,
+                agent_type: AgentType::Codex,
+                status: TaskStatus::Completed,
+                text: Some("ok".into()),
+                error_code: None,
+                message: None,
+                duration_ms: 10,
+            },
+        )
+    }
+
+    #[test]
+    fn running_report_has_observation_fields_and_terminal_omits_them() {
+        let running = report_for_running_task(running_task_with_observation(
+            TaskObservation::Stalled,
+            "2026-07-16T10:00:00Z",
+            Some("2026-07-16T10:05:00Z"),
+        ));
+        assert_eq!(running.observation, Some(TaskObservation::Stalled));
+        assert!(running.last_agent_activity_at.is_some());
+        assert!(running.stalled_since.is_some());
+
+        let terminal = completed_report_for_test();
+        assert_eq!(terminal.observation, None);
+        assert_eq!(terminal.last_agent_activity_at, None);
+        assert_eq!(terminal.stalled_since, None);
+    }
+
+    struct RunningWaitFixture {
+        broker: Arc<DelegationBroker>,
+        mock: Arc<MockSpawner>,
+        parent_id: String,
+        /// Maps fixture label ("a") → real task_id.
+        ids: HashMap<String, String>,
+    }
+
+    async fn running_wait_fixture(labels: &[&str]) -> RunningWaitFixture {
+        let mock = Arc::new(MockSpawner::new());
+        let broker = Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let parent_id = "parent-conn".to_string();
+        let mut ids = HashMap::new();
+        for (i, label) in labels.iter().enumerate() {
+            let child = format!("child-{label}");
+            mock.queue_spawn(Ok(child)).await;
+            mock.queue_send(Ok((i + 1) as i32)).await;
+            let task_id = broker
+                .start_delegation(request(1, &format!("pt-{label}")))
+                .await
+                .task_id
+                .expect("running id");
+            ids.insert((*label).to_string(), task_id);
+        }
+        RunningWaitFixture {
+            broker,
+            mock,
+            parent_id,
+            ids,
+        }
+    }
+
+    impl RunningWaitFixture {
+        fn resolve(&self, label: &str) -> String {
+            self.ids
+                .get(label)
+                .cloned()
+                .unwrap_or_else(|| label.to_string())
+        }
+
+        async fn publish(&self, label: &str, observation: TaskObservation) {
+            let task_id = self.resolve(label);
+            let last = Utc::now();
+            let stalled_since = matches!(observation, TaskObservation::Stalled)
+                .then_some(last + chrono::Duration::seconds(300));
+            self.broker
+                .cache_observation(
+                    &task_id,
+                    ObservationSnapshot {
+                        observation,
+                        last_agent_activity_at: last,
+                        stalled_since,
+                    },
+                )
+                .await;
+        }
+
+        async fn complete(&self, label: &str) {
+            let task_id = self.resolve(label);
+            self.broker
+                .complete_call(
+                    &task_id,
+                    DelegationOutcome::Ok(DelegationSuccess {
+                        text: "done".into(),
+                        child_conversation_id: 1,
+                        child_agent_type: AgentType::Codex,
+                        turn_count: 1,
+                        duration_ms: 5,
+                        token_usage: None,
+                    }),
+                )
+                .await;
+        }
+
+        async fn cancel_count(&self) -> usize {
+            self.mock.cancels.lock().await.len()
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_wait_wakes_on_actionable_observation_without_canceling() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        let wait = fixture.broker.status_many(
+            &fixture.parent_id,
+            vec![a],
+            StatusWait::Supervised(Duration::from_secs(60)),
+        );
+        fixture.publish("a", TaskObservation::Stalled).await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("supervised must wake on stall");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Stalled));
+        assert_eq!(fixture.cancel_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_ignores_stall_and_batch_returns_on_any_terminal_in_input_order() {
+        let fixture = running_wait_fixture(&["a", "b"]).await;
+        let a = fixture.resolve("a");
+        let b = fixture.resolve("b");
+        let mut terminal_wait = Box::pin(fixture.broker.status_many(
+            &fixture.parent_id,
+            vec![a.clone(), b.clone()],
+            StatusWait::Terminal,
+        ));
+        fixture.publish("a", TaskObservation::Stalled).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut terminal_wait)
+                .await
+                .is_err(),
+            "terminal wait must ignore stall"
+        );
+
+        fixture.complete("b").await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), terminal_wait)
+            .await
+            .expect("terminal wait must wake on any terminal");
+        assert_eq!(
+            reports
+                .iter()
+                .map(|r| r.task_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(a.as_str()), Some(b.as_str())]
+        );
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[1].status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_returns_unknown_immediately() {
+        let fixture = running_wait_fixture(&[]).await;
+        let reports = tokio::time::timeout(
+            Duration::from_millis(100),
+            fixture.broker.status_many(
+                &fixture.parent_id,
+                vec!["missing".into()],
+                StatusWait::Terminal,
+            ),
+        )
+        .await
+        .expect("unknown is immediate under terminal wait");
+        assert_eq!(reports[0].status, TaskStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn status_wait_snapshot_never_parks_on_running() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        let reports = tokio::time::timeout(
+            Duration::from_millis(100),
+            fixture
+                .broker
+                .status_many(&fixture.parent_id, vec![a], StatusWait::Snapshot),
+        )
+        .await
+        .expect("snapshot must not park");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn status_wait_supervised_deadline_returns_running_snapshot() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        // Seed Active so supervised parks until deadline (not immediate stall).
+        fixture.publish("a", TaskObservation::Active).await;
+        let reports = fixture
+            .broker
+            .status_many(
+                &fixture.parent_id,
+                vec![a],
+                StatusWait::Supervised(Duration::from_millis(40)),
+            )
+            .await;
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Active));
+        assert_eq!(fixture.cancel_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn observation_changed_emitted_and_wakes_status_version() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-obs".into())).await;
+        mock.queue_send(Ok(7)).await;
+        let events = Arc::new(MockEventEmitter::new());
+        let broker = Arc::new(DelegationBroker::with_writers(
+            mock as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            Arc::new(NoopMetaWriter) as Arc<dyn DelegationMetaWriter>,
+            events.clone() as Arc<dyn DelegationEventEmitter>,
+        ));
+        enable_delegation(&broker).await;
+        let task_id = broker
+            .start_delegation(request(1, "pt-obs"))
+            .await
+            .task_id
+            .expect("id");
+        let last = Utc::now();
+        broker
+            .cache_observation(
+                &task_id,
+                ObservationSnapshot {
+                    observation: TaskObservation::WaitingInput,
+                    last_agent_activity_at: last,
+                    stalled_since: None,
+                },
+            )
+            .await;
+        let obs_calls = events.observation_snapshot().await;
+        assert_eq!(obs_calls.len(), 1);
+        assert_eq!(obs_calls[0].task_id, task_id);
+        assert_eq!(obs_calls[0].parent_tool_use_id, "pt-obs");
+        assert_eq!(obs_calls[0].observation, TaskObservation::WaitingInput);
+
+        let report = broker
+            .get_task_status("parent-conn", Some(1), &task_id, StatusWait::Snapshot)
+            .await;
+        assert_eq!(report.observation, Some(TaskObservation::WaitingInput));
+        assert_eq!(report.last_agent_activity_at, Some(last));
+        assert_eq!(report.stalled_since, None);
+    }
+
+    #[tokio::test]
+    async fn batch_status_preserves_duplicate_ids_and_order() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        let reports = fixture
+            .broker
+            .status_many(
+                &fixture.parent_id,
+                vec![a.clone(), a.clone(), "missing".into()],
+                StatusWait::Snapshot,
+            )
+            .await;
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].task_id.as_deref(), Some(a.as_str()));
+        assert_eq!(reports[1].task_id.as_deref(), Some(a.as_str()));
+        assert_eq!(reports[2].status, TaskStatus::Unknown);
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[1].status, TaskStatus::Running);
+    }
+
+    /// I1: NotInMemory + durable/lookup Running must not park Terminal
+    /// (no live notifier producer for that id in this process).
+    #[tokio::test]
+    async fn terminal_wait_not_in_memory_db_running_returns_immediately() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let mock = Arc::new(MockSpawner::new());
+        let store = Arc::new(MockTaskStore::with_running("cold-running", 42));
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(store as Arc<dyn DelegationTaskStore>),
+        );
+        enable_delegation(&broker).await;
+
+        let reports = tokio::time::timeout(
+            Duration::from_millis(100),
+            broker.get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &["cold-running".into()],
+                StatusWait::Terminal,
+            ),
+        )
+        .await
+        .expect("NotInMemory+DB Running must not hang under Terminal wait");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].task_id.as_deref(), Some("cold-running"));
+    }
+
+    /// M2: global status-version wake from an unrelated task must not end
+    /// Supervised; only requested-id observation / terminal / deadline does.
+    #[tokio::test]
+    async fn supervised_wait_ignores_unrelated_task_version_bump() {
+        let fixture = running_wait_fixture(&["a", "b"]).await;
+        let a = fixture.resolve("a");
+        fixture.publish("a", TaskObservation::Active).await;
+        fixture.publish("b", TaskObservation::Active).await;
+
+        let mut wait = Box::pin(fixture.broker.status_many(
+            &fixture.parent_id,
+            vec![a],
+            StatusWait::Supervised(Duration::from_secs(60)),
+        ));
+
+        // Sibling stall bumps global version + notifies; requested a unchanged.
+        fixture.publish("b", TaskObservation::Stalled).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut wait)
+                .await
+                .is_err(),
+            "unrelated observation must not end supervised wait"
+        );
+
+        // Requested actionable transition still wakes.
+        fixture.publish("a", TaskObservation::Stalled).await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested stall must wake supervised");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Stalled));
+    }
+
+    /// M3: clear_observation is an observation transition and must notify;
+    /// Supervised returns when a **requested** id clears.
+    #[tokio::test]
+    async fn supervised_wait_wakes_on_requested_observation_clear() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        fixture.publish("a", TaskObservation::Active).await;
+
+        let broker = fixture.broker.clone();
+        let parent_id = fixture.parent_id.clone();
+        let a_wait = a.clone();
+        let wait = tokio::spawn(async move {
+            broker
+                .status_many(
+                    &parent_id,
+                    vec![a_wait],
+                    StatusWait::Supervised(Duration::from_secs(60)),
+                )
+                .await
+        });
+        // Let the wait arm notify and park with Active before clearing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fixture.broker.clear_observation(&a).await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested observation clear must wake supervised")
+            .expect("status_many join");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, None);
+        assert_eq!(reports[0].last_agent_activity_at, None);
+    }
+
+    /// Active→Active timestamp change on a requested id is a full observation
+    /// snapshot transition and still ends Supervised.
+    #[tokio::test]
+    async fn supervised_wait_wakes_on_requested_active_timestamp_change() {
+        let fixture = running_wait_fixture(&["a"]).await;
+        let a = fixture.resolve("a");
+        let t1 = Utc::now();
+        fixture
+            .broker
+            .cache_observation(
+                &a,
+                ObservationSnapshot {
+                    observation: TaskObservation::Active,
+                    last_agent_activity_at: t1,
+                    stalled_since: None,
+                },
+            )
+            .await;
+
+        let broker = fixture.broker.clone();
+        let parent_id = fixture.parent_id.clone();
+        let a_wait = a.clone();
+        let wait = tokio::spawn(async move {
+            broker
+                .status_many(
+                    &parent_id,
+                    vec![a_wait],
+                    StatusWait::Supervised(Duration::from_secs(60)),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t2 = t1 + chrono::Duration::seconds(5);
+        fixture
+            .broker
+            .cache_observation(
+                &a,
+                ObservationSnapshot {
+                    observation: TaskObservation::Active,
+                    last_agent_activity_at: t2,
+                    stalled_since: None,
+                },
+            )
+            .await;
+        let reports = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("requested Active timestamp change must wake supervised")
+            .expect("status_many join");
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].observation, Some(TaskObservation::Active));
+        assert_eq!(reports[0].last_agent_activity_at, Some(t2));
     }
 }

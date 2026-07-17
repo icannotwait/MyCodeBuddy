@@ -75,6 +75,8 @@ import type {
   ConfigStaleKind,
   ConnectionStatus,
   ConversationConnectionInfo,
+  DelegationRoutePolicy,
+  DelegationRouteSnapshot,
   EventEnvelope,
   PlanEntryInfo,
   PermissionOptionInfo,
@@ -325,6 +327,22 @@ export interface ConnectionState {
    * the snapshot — dismissal is per-client UI state.
    */
   configStaleDismissed: boolean
+  /**
+   * Authoritative route snapshot from the backend (HYDRATE / availability
+   * events). Optional so older direct test fixtures remain valid; production
+   * constructors set it explicitly (`null` until snapshot arrives).
+   */
+  delegationRoute?: DelegationRouteSnapshot | null
+  /**
+   * Conversation id used for the winning connect request (viewer discovery +
+   * reapply). Optional for older fixtures.
+   */
+  conversationId?: number | null
+  /**
+   * Route override supplied at connect time (reused by reapplyConfig). Optional
+   * for older fixtures.
+   */
+  delegationRouteOverride?: DelegationRoutePolicy | null
 }
 
 type ConnectRequest = {
@@ -332,17 +350,19 @@ type ConnectRequest = {
   workingDir?: string
   sessionId?: string
   // Persisted conversation id (when known) — drives the cross-client viewer
-  // discovery gate in connect(). Not part of `sameConnectRequest` equality
-  // (sessionId already distinguishes), but carried so a re-fired pending
-  // request still runs discovery.
+  // discovery gate in connect() and is sent to acpConnect.
   conversationId?: number
+  // Draft/session route override for managed agents (null = inherit global).
+  delegationRouteOverride?: DelegationRoutePolicy | null
 }
 
 function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
   return (
     a.agentType === b.agentType &&
     (a.workingDir ?? null) === (b.workingDir ?? null) &&
-    (a.sessionId ?? null) === (b.sessionId ?? null)
+    (a.sessionId ?? null) === (b.sessionId ?? null) &&
+    (a.conversationId ?? null) === (b.conversationId ?? null) &&
+    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null)
   )
 }
 
@@ -358,6 +378,13 @@ type Action =
       // Set when attaching to a connection another client owns (viewer).
       // Defaults to false (owner) when omitted.
       isViewer?: boolean
+      conversationId?: number | null
+      delegationRouteOverride?: DelegationRoutePolicy | null
+    }
+  | {
+      type: "DELEGATION_ROUTE_AVAILABILITY"
+      contextKey: string
+      available: boolean
     }
   | {
       type: "HYDRATE_FROM_SNAPSHOT"
@@ -1249,6 +1276,9 @@ function reduceSingleAction(
         backgroundOutstanding: 0,
         backgroundSettleSyncingSince: null,
         outOfTurnToolCalls: null,
+        delegationRoute: null,
+        conversationId: action.conversationId ?? null,
+        delegationRouteOverride: action.delegationRouteOverride ?? null,
       })
       return next
     }
@@ -1306,6 +1336,9 @@ function reduceSingleAction(
         backgroundOutstanding: 0,
         backgroundSettleSyncingSince: null,
         outOfTurnToolCalls: null,
+        delegationRoute: null,
+        conversationId: null,
+        delegationRouteOverride: null,
       })
       return next
     }
@@ -1411,7 +1444,26 @@ function reduceSingleAction(
         // recovers the pending-background count the one-shot events won't
         // replay for it (sweep exemption + chip).
         backgroundOutstanding: action.patch.backgroundOutstanding,
+        // Authoritative route snapshot — never derived from live settings.
+        delegationRoute: action.patch.delegationRoute,
         lastAppliedSeq: action.patch.eventSeq,
+      })
+      return next
+    }
+
+    case "DELEGATION_ROUTE_AVAILABILITY": {
+      const conn = state.get(action.contextKey)
+      if (!conn?.delegationRoute) return state
+      if (conn.delegationRoute.delegation_available === action.available) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        delegationRoute: {
+          ...conn.delegationRoute,
+          delegation_available: action.available,
+        },
       })
       return next
     }
@@ -2582,6 +2634,13 @@ function prepareMappedEnvelope(
         kind: e.kind,
       })
       break
+    case "delegation_availability_changed":
+      actions.push({
+        type: "DELEGATION_ROUTE_AVAILABILITY",
+        contextKey,
+        available: e.available,
+      })
+      break
     case "selectors_ready": {
       actions.push({ type: "SELECTORS_READY", contextKey })
       const agentType = snapshot.agentType
@@ -2855,7 +2914,10 @@ function onlyCursorChanged(
       after.backgroundSettleSyncingSince &&
     before.outOfTurnToolCalls === after.outOfTurnToolCalls &&
     before.isViewer === after.isViewer &&
-    before.isDelegationChild === after.isDelegationChild
+    before.isDelegationChild === after.isDelegationChild &&
+    before.delegationRoute === after.delegationRoute &&
+    before.conversationId === after.conversationId &&
+    before.delegationRouteOverride === after.delegationRouteOverride
   )
 }
 
@@ -3028,7 +3090,8 @@ export interface AcpActionsValue {
     agentType: AgentType,
     workingDir?: string,
     sessionId?: string,
-    conversationId?: number
+    conversationId?: number,
+    delegationRouteOverride?: DelegationRoutePolicy | null
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
@@ -4399,13 +4462,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       agentType: AgentType,
       workingDir?: string,
       sessionId?: string,
-      conversationId?: number
+      conversationId?: number,
+      delegationRouteOverride?: DelegationRoutePolicy | null
     ) => {
       const request: ConnectRequest = {
         agentType,
         workingDir,
         sessionId,
         conversationId,
+        delegationRouteOverride,
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
@@ -4619,13 +4684,37 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
-        const connectionId = await acpConnect(
-          agentType,
-          workingDir,
-          sessionId,
-          savedPrefs.modeId,
-          savedPrefs.configValues
-        )
+        let connectionId: string
+        try {
+          connectionId = await acpConnect(
+            agentType,
+            workingDir,
+            sessionId,
+            savedPrefs.modeId,
+            savedPrefs.configValues,
+            conversationId,
+            delegationRouteOverride
+          )
+        } catch (spawnErr) {
+          // Session route conflict: another live connection already owns this
+          // conversation under a different route. Attach as viewer/current —
+          // keep its snapshot route; never disconnect except explicit reapply.
+          const appErr = extractAppCommandError(spawnErr)
+          if (
+            appErr?.code === "session_route_conflict" &&
+            typeof appErr.detail === "string" &&
+            appErr.detail.length > 0
+          ) {
+            await connectAsViewer(
+              contextKey,
+              appErr.detail,
+              agentType,
+              nextWorkingDir
+            )
+            return
+          }
+          throw spawnErr
+        }
 
         // If disconnect was requested while connect was in flight,
         // tear down immediately instead of registering the connection.
@@ -4646,6 +4735,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           connectionId,
           agentType,
           workingDir: nextWorkingDir,
+          conversationId: conversationId ?? null,
+          delegationRouteOverride: delegationRouteOverride ?? null,
         })
 
         // Subscribe-with-Snapshot path. When the active transport supports
@@ -4772,7 +4863,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   pendingRequest.agentType,
                   pendingRequest.workingDir,
                   pendingRequest.sessionId,
-                  pendingRequest.conversationId
+                  pendingRequest.conversationId,
+                  pendingRequest.delegationRouteOverride
                 )
                 .catch(() => {})
             })
@@ -4843,13 +4935,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (!conn || conn.isViewer || conn.isDelegationChild) return false
       // Capture identity BEFORE teardown. `sessionId` is what makes the new
       // process resume this conversation (session/load) rather than start fresh.
-      const { agentType, workingDir, sessionId } = conn
+      // conversationId + route override are also reused so reconnect keeps the
+      // same route plan inputs the user last chose.
+      const {
+        agentType,
+        workingDir,
+        sessionId,
+        conversationId: boundConversationId,
+        delegationRouteOverride: boundRouteOverride,
+      } = conn
       await disconnect(contextKey)
       await connect(
         contextKey,
         agentType,
         workingDir ?? undefined,
-        sessionId ?? undefined
+        sessionId ?? undefined,
+        boundConversationId ?? undefined,
+        boundRouteOverride
       )
       return true
     },

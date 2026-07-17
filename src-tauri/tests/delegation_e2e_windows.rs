@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use codeg_lib::acp::delegation::broker::{
     ConversationDepthLookup, DelegationBroker, DelegationConfig,
 };
+use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
     DelegationListener, ParentSessionLookup, TokenEntry, TokenRegistry,
 };
@@ -167,6 +168,7 @@ async fn end_to_end_named_pipe_happy_path() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
@@ -268,6 +270,7 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,

@@ -34,9 +34,14 @@ pub async fn set_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationSettingsParams>,
 ) -> Result<Json<DelegationSettings>, AppCommandError> {
-    let saved =
-        set_delegation_settings_core(&state.db.conn, &state.delegation_broker, params.settings)
-            .await?;
+    let saved = set_delegation_settings_core(
+        &state.db.conn,
+        &state.delegation_broker,
+        &state.delegation_runtime_settings,
+        &state.connection_manager,
+        params.settings,
+    )
+    .await?;
     Ok(Json(saved))
 }
 
@@ -69,7 +74,13 @@ pub async fn set_delegation_bundle(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationBundleParams>,
 ) -> Result<Json<DelegationBundle>, AppCommandError> {
-    let saved =
-        set_delegation_bundle_core(&state.db.conn, &state.delegation_broker, params.bundle).await?;
+    let saved = set_delegation_bundle_core(
+        &state.db.conn,
+        &state.delegation_broker,
+        &state.delegation_runtime_settings,
+        &state.connection_manager,
+        params.bundle,
+    )
+    .await?;
     Ok(Json(saved))
 }

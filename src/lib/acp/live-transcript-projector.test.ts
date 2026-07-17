@@ -10,6 +10,7 @@ import {
   applyLiveTranscriptEvents,
   liveTranscriptToCanonicalMessage,
   projectLiveSnapshot,
+  projectNativeActivitiesFromTranscript,
 } from "./live-transcript-projector"
 
 function liveMessageWithText(
@@ -422,4 +423,60 @@ describe("live-transcript-projector", () => {
       )
     }
   )
+
+  it("retains original tool fields while projecting native activity alongside", () => {
+    let projection = projectLiveSnapshot(
+      10,
+      "c1",
+      {
+        id: "native-1",
+        role: "assistant",
+        content: [],
+        startedAt: 100,
+      },
+      0
+    )
+    projection = applyLiveTranscriptEvents(projection, [
+      toolCreate("c1", 1, "spawn-1", {
+        title: "spawn_agent",
+        kind: "other",
+        status: "in_progress",
+        raw_input: JSON.stringify({
+          agent_type: "worker",
+          message: "investigate",
+        }),
+        meta: { note: "keep-me" },
+      }),
+      toolUpdate("c1", 2, "spawn-1", "completed", {
+        raw_output: JSON.stringify({ agent_id: "agent-99" }),
+      }),
+    ])
+
+    const tool = projection.tools.get("spawn-1")
+    expect(tool).toBeDefined()
+    expect(tool?.title).toBe("spawn_agent")
+    expect(tool?.raw_input).toContain("investigate")
+    expect(tool?.raw_output_chunks.join("")).toContain("agent-99")
+    expect(tool?.status).toBe("completed")
+    expect(tool?.meta).toMatchObject({ note: "keep-me" })
+    // Tool segment still present — activity projection does not consume it.
+    expect(
+      [...projection.segments.values()].some(
+        (s) => s.type === "tool" && s.toolCallId === "spawn-1"
+      )
+    ).toBe(true)
+
+    const activities = projectNativeActivitiesFromTranscript(
+      projection,
+      "codex"
+    )
+    expect(activities).toHaveLength(1)
+    expect(activities[0]).toMatchObject({
+      origin: "native",
+      authoritative: false,
+      platform: "codex",
+      operation: "spawn",
+      task_id: "agent-99",
+    })
+  })
 })

@@ -10,6 +10,7 @@ import {
   useState,
 } from "react"
 import {
+  selectDelegationActivities,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
   useConversationRuntimeStore,
@@ -53,6 +54,12 @@ import {
 } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
+import {
+  dedupeDelegationActivities,
+  deriveNativeActivitiesFromToolCalls,
+} from "@/lib/delegation-activity"
+import type { DelegationActivityView } from "@/lib/types"
+import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
   MessageThread,
   MessageThreadScrollButton,
@@ -680,6 +687,8 @@ function extractLiveDelegationSources(
   return liveSources
 }
 
+const EMPTY_ACTIVITIES: DelegationActivityView[] = []
+
 /** Narrow-subscription live stats — parent list does not re-render per token. */
 const LiveTurnStatsFromTranscript = memo(function LiveTurnStatsFromTranscript({
   conversationId,
@@ -728,17 +737,25 @@ const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
 
 /**
  * Sub-agent overlay: prefers live-transcript delegations while streaming so
- * historical row adaptation is not required.
+ * historical row adaptation is not required. Native activity is derived
+ * alongside and never replaces original tool rendering.
  */
 const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   conversationId,
+  agentType,
   isStreaming,
   historicalDelegations,
+  historicalActivities,
+  storeActivities,
   historicalKey,
 }: {
   conversationId: number
+  agentType: AgentType
   isStreaming: boolean
   historicalDelegations: DelegationCardSource[]
+  historicalActivities: DelegationActivityView[]
+  /** Store-materialized activities (parent selector; stable empty ref). */
+  storeActivities: DelegationActivityView[]
   historicalKey: string
 }) {
   const snap = useLiveTranscriptConversation(
@@ -748,16 +765,35 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     if (!snap || !isStreaming) return EMPTY_DELEGATIONS
     return extractLiveDelegationSources(liveSnapshotToLiveMessage(snap))
   }, [snap, isStreaming])
+  // Live transcript projection only when the store has not yet materialized
+  // the in-flight turn. Dedupe with store is deterministic by task_id.
+  const liveActivities = useMemo(() => {
+    if (!snap || !isStreaming) return EMPTY_ACTIVITIES
+    if (storeActivities.length > 0) return EMPTY_ACTIVITIES
+    return projectNativeActivitiesFromTranscript(snap, agentType)
+  }, [snap, isStreaming, agentType, storeActivities])
+  const activities = useMemo(() => {
+    if (storeActivities.length > 0) {
+      return dedupeDelegationActivities(storeActivities, liveActivities)
+    }
+    if (liveActivities.length > 0) {
+      return dedupeDelegationActivities(liveActivities, historicalActivities)
+    }
+    return historicalActivities
+  }, [storeActivities, liveActivities, historicalActivities])
   const delegations =
     liveDelegations.length > 0 ? liveDelegations : historicalDelegations
   const overlayKey =
-    liveDelegations.length > 0
+    liveDelegations.length > 0 ||
+    liveActivities.length > 0 ||
+    (isStreaming && storeActivities.length > 0)
       ? `subagents-live-${snap?.messageId ?? conversationId}`
       : historicalKey
   return (
     <SubAgentOverlay
       key={overlayKey}
       delegations={delegations}
+      activities={activities}
       overlayKey={overlayKey}
     />
   )
@@ -1108,6 +1144,73 @@ export function MessageListView({
         : EMPTY_DELEGATIONS,
     [lastAssistantGroup]
   )
+  // Store-backed activities (COMPLETE_TURN / SET_LIVE_MESSAGE / detail fetch).
+  // Stable empty reference when absent — required for Zustand getSnapshot.
+  const storeActivities = useConversationRuntimeStore((s) =>
+    selectDelegationActivities(s, conversationId)
+  )
+  // Fall back to walking adapted parts — including background-task-group polls
+  // so Claude TaskOutput/TaskStop still project after adapter grouping (I2).
+  // Prefer store when present to avoid independent duplicate derivation.
+  const lastAssistantActivities = useMemo(() => {
+    if (storeActivities.length > 0) {
+      return storeActivities
+    }
+    if (!lastAssistantGroup) return EMPTY_ACTIVITIES
+    const tools: Array<{
+      toolCallId: string
+      toolName: string
+      input?: string | null
+      output?: string | null
+      status?: string | null
+      meta?: Record<string, unknown> | null
+    }> = []
+    const walk = (parts: AdaptedContentPart[]) => {
+      for (const part of parts) {
+        if (part.type === "tool-call" && part.toolCallId) {
+          tools.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            input: part.input ?? null,
+            output: part.output ?? part.errorText ?? null,
+            status:
+              part.state === "output-error"
+                ? "failed"
+                : part.state === "output-available"
+                  ? "completed"
+                  : "in_progress",
+            meta: part.meta ?? null,
+          })
+        } else if (part.type === "tool-group") {
+          walk(part.items)
+        } else if (part.type === "goal-run") {
+          walk(part.items)
+        } else if (part.type === "background-task-group") {
+          // Historical Claude TaskOutput/TaskStop are grouped; walk polls
+          // without flattening/replacing the original background-task card.
+          for (const poll of part.polls) {
+            if (!poll.toolCallId) continue
+            tools.push({
+              toolCallId: poll.toolCallId,
+              toolName: poll.toolName,
+              input: poll.input ?? null,
+              output: poll.output ?? poll.errorText ?? null,
+              status:
+                poll.state === "output-error"
+                  ? "failed"
+                  : poll.state === "output-available"
+                    ? "completed"
+                    : "in_progress",
+              meta: poll.meta ?? null,
+            })
+          }
+        }
+      }
+    }
+    walk(lastAssistantGroup.parts)
+    const derived = deriveNativeActivitiesFromToolCalls(tools, agentType)
+    return derived.length === 0 ? EMPTY_ACTIVITIES : derived
+  }, [lastAssistantGroup, agentType, storeActivities])
   const subAgentOverlayKey = lastAssistantGroup
     ? `subagents-${lastAssistantGroup.id}`
     : `subagents-history-${conversationId}`
@@ -1325,14 +1428,18 @@ export function MessageListView({
         {useIncrementalLive ? (
           <LiveAwareSubAgentOverlay
             conversationId={conversationId}
+            agentType={agentType}
             isStreaming={connStatus === "prompting"}
             historicalDelegations={lastAssistantDelegations}
+            historicalActivities={lastAssistantActivities}
+            storeActivities={storeActivities}
             historicalKey={subAgentOverlayKey}
           />
         ) : (
           <SubAgentOverlay
             key={subAgentOverlayKey}
             delegations={lastAssistantDelegations}
+            activities={lastAssistantActivities}
             overlayKey={subAgentOverlayKey}
           />
         )}

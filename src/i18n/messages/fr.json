@@ -562,7 +562,16 @@
       "noConfigAvailable": "Cet agent n’a aucune option configurable.",
       "modeLabel": "Mode",
       "agentDefaultHint": "Valeur par défaut de l’agent : {value}",
-      "defaultOptionLabel": "Par défaut ({value})"
+      "defaultOptionLabel": "Par défaut ({value})",
+      "routePolicy": "Route par défaut",
+      "routePolicyHint": "Les agents gérés utilisent cette route lorsqu’une conversation n’a pas de surcharge.",
+      "routeEffectiveNative": "La délégation est désactivée — la route effective est Native.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "Watchdog soft (secondes)",
+      "softWatchdogHint": "Seuil d’inactivité en observation seule ({min}–{max}). N’annule ni ne change la route."
     },
     "actions": {
       "dragSort": "Glisser pour réordonner",
@@ -2272,7 +2281,10 @@
       "subAgentOverlay": {
         "title": "Sous-agents",
         "collapsedSummary": "Sous-agents {count}",
-        "collapseAria": "Réduire les sous-agents"
+        "collapseAria": "Réduire les sous-agents",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "Plan de l'agent",
@@ -2417,7 +2429,10 @@
             "child_empty": "sous-agent sans sortie",
             "child_unknown": "sous-agent : erreur",
             "unknown": "tâche inconnue"
-          }
+          },
+          "active": "Actif",
+          "waitingInput": "En attente d’entrée",
+          "stalled": "Aucune activité récente de l’agent"
         }
       },
       "contentParts": {
@@ -2616,7 +2631,8 @@
         "dismiss": "Ignorer",
         "reconnectFailed": "Échec de la reconnexion de la session",
         "applied": "Nouvelle configuration appliquée",
-        "terminalShellTitle": "Shell du terminal mis à jour"
+        "terminalShellTitle": "Shell du terminal mis à jour",
+        "delegationRouteTitle": "Route de délégation mise à jour"
       },
       "collabAgent": {
         "title": "Sous-agent",
@@ -2643,6 +2659,30 @@
         "cardCompleted": "Tâche en arrière-plan terminée",
         "cardFinishedWithStatus": "Tâche en arrière-plan terminée ({status})",
         "cardResultPending": "Résultat pas encore reçu"
+      },
+      "delegationRoute": {
+        "menuLabel": "Route de délégation",
+        "inheritGlobal": "Hériter du global",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg (hérité)",
+        "updateFailed": "Échec de la mise à jour de la route"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Repli sur Native ({reason}). Reconnectez-vous pour réessayer Codeg.",
+        "delegationUnavailable": "La route Codeg est active mais la délégation est indisponible.",
+        "reconnect": "Reconnecter",
+        "reconnecting": "Reconnexion…",
+        "reconnected": "Reconnecté",
+        "reconnectFailed": "Échec de la reconnexion",
+        "reason": {
+          "native_suppression_unsupported": "suppression native non prise en charge",
+          "native_suppression_invalid": "suppression native invalide",
+          "companion_binary_unavailable": "binaire compagnon indisponible",
+          "agent_mcp_unsupported": "MCP de l’agent non pris en charge",
+          "companion_initialization_failed": "échec d’initialisation du compagnon",
+          "unknown": "dégradé"
+        }
       }
     },
     "diffPreview": {

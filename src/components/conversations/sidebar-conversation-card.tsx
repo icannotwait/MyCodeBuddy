@@ -51,6 +51,7 @@ import { Input } from "@/components/ui/input"
 import { ConversationStatusDot } from "./conversation-status-dot"
 import { SessionDetailsDialog } from "./session-details-dialog"
 import { AgentIcon } from "@/components/agent-icon"
+import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 
 /**
  * Horizontal indent added per delegation-nesting level. Chosen so a child's
@@ -543,6 +544,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
             <Info className="h-4 w-4" />
             {tDetails("menuLabel")}
           </ContextMenuItem>
+          <DelegationRouteMenu
+            agentType={conversation.agent_type}
+            conversationId={conversation.id}
+            parentId={conversation.parent_id}
+            value={conversation.delegation_route_override ?? null}
+          />
           <ContextMenuSeparator />
           <ContextMenuSub>
             <ContextMenuSubTrigger>

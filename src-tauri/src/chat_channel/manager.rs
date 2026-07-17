@@ -225,6 +225,7 @@ impl ChatChannelManager {
         db_conn: DatabaseConnection,
         conn_mgr: ConnectionManager,
         emitter: EventEmitter,
+        runtime_ctx: super::command_dispatcher::ChatCommandRuntimeContext,
     ) {
         // Store broadcaster for status event emission
         *self.inner.broadcaster.lock().await = Some(broadcaster.clone());
@@ -267,6 +268,7 @@ impl ChatChannelManager {
                 conn_mgr,
                 emitter,
                 bridge,
+                runtime_ctx,
             );
         } else {
             tracing::warn!("[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started");
