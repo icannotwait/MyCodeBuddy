@@ -252,7 +252,9 @@ mod tests {
     use crate::db::entities::internal_agent_session::{self, InternalAgentSessionPurpose};
     use crate::db::test_helpers::fresh_in_memory_db;
     use crate::db::AppDatabase;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Statement,
+    };
     use tempfile::TempDir;
 
     pub struct RegistryFixture {
@@ -444,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_exclusion_survives_when_row_already_present() {
+    async fn in_memory_exclusion_visible_after_successful_register_and_reload() {
         let fixture = registry_fixture().await;
         fixture
             .registry
@@ -459,5 +461,43 @@ mod tests {
                 .expect("reload");
         let (_, after) = restarted.shared_filter().await.expect("filter");
         assert!(after.contains(AgentType::Grok, Some("persist-me"), None));
+    }
+
+    /// Spec: leave in-memory exclusion in place if persistence fails so discovery
+    /// still hides the session; runner sees Err and sends no prompt.
+    #[tokio::test]
+    async fn in_memory_exclusion_survives_persistence_failure() {
+        let fixture = registry_fixture().await;
+
+        // Deterministic real DB failure after registry construction: drop the
+        // persistence table through the same connection the registry uses.
+        fixture
+            .db
+            .conn
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "DROP TABLE internal_agent_sessions".to_owned(),
+            ))
+            .await
+            .expect("drop internal_agent_sessions for forced persistence failure");
+
+        let result = fixture
+            .registry
+            .register(
+                AgentType::Codex,
+                "db-fail-id",
+                InternalSessionPurpose::Title,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "register must surface the persistence error; got {result:?}"
+        );
+
+        let (_, filter) = fixture.registry.shared_filter().await.expect("filter");
+        assert!(
+            filter.contains(AgentType::Codex, Some("db-fail-id"), None),
+            "in-memory exclusion must remain after persistence failure"
+        );
     }
 }
