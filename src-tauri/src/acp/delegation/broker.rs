@@ -7315,6 +7315,9 @@ mod tests {
         broker
             .project_child_tool_event("child-conn", &tool_call("tc-pre", "read", "Read"))
             .await;
+        let publisher_returned = broker.result_notify.notified();
+        tokio::pin!(publisher_returned);
+        publisher_returned.as_mut().enable();
         let decision = tokio::spawn({
             let broker = broker.clone();
             async move {
@@ -7324,6 +7327,7 @@ mod tests {
             }
         });
         let open = wait_for_open_request(&attention, &task_id).await;
+        within(publisher_returned).await;
 
         // The real publisher observes started_published=false, so neither
         // projection can leak before the enriched start publishes.
