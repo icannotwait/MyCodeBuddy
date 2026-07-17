@@ -426,8 +426,9 @@ impl AutomationEngine {
         }
 
         // Fresh connection (session_id=None), owner-labelled "automation".
-        // Load persisted system language so title capture inherits the UI locale.
-        let launch_context = crate::auto_title::user_launch_context_from_db(&self.db.conn).await;
+        // System language + display_text capture for title admission.
+        let (launch_context, capture) =
+            automation_root_title_admission(&self.db.conn, &cfg.display_text).await;
         let conn_id = self
             .manager
             .spawn_agent(
@@ -500,12 +501,6 @@ impl AutomationEngine {
             return Ok(());
         }
 
-        // Exact user-visible automation task text drives first_user_text;
-        // locale comes from the connection's inherited system language.
-        let capture = Some(crate::auto_title::PromptCaptureContext::new(
-            Some(cfg.display_text.clone()),
-            None,
-        ));
         match self
             .manager
             .send_prompt_linked_background(
@@ -1001,6 +996,25 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Title-admission inputs for automation roots: system-language User launch
+/// context plus authoritative `display_text` capture (locale inherits from the
+/// connection). Shared by production `launch` and its focused behavior test.
+async fn automation_root_title_admission(
+    conn: &sea_orm::DatabaseConnection,
+    display_text: &str,
+) -> (
+    crate::auto_title::ConnectionLaunchContext,
+    Option<crate::auto_title::PromptCaptureContext>,
+) {
+    (
+        crate::auto_title::user_launch_context_from_db(conn).await,
+        Some(crate::auto_title::PromptCaptureContext::new(
+            Some(display_text.to_string()),
+            None,
+        )),
+    )
+}
+
 fn basename(path: &str) -> &str {
     path.trim_end_matches('/')
         .rsplit('/')
@@ -1077,7 +1091,6 @@ mod tests {
     async fn automation_root_captures_visible_task_and_system_locale() {
         use crate::acp::manager::ConnectionManager;
         use crate::acp::types::PromptInputBlock;
-        use crate::auto_title::{user_launch_context_from_db, PromptCaptureContext};
         use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
         use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
         use crate::db::entities::auto_title_job;
@@ -1109,12 +1122,18 @@ mod tests {
         .await
         .expect("persist language");
 
-        let launch = user_launch_context_from_db(&db.conn).await;
-        assert_eq!(launch.purpose, crate::auto_title::ConnectionPurpose::User);
-        assert_eq!(launch.inherited_locale, Some(AppLocale::Ko));
-
         let folder_id = seed_folder(&db, "/tmp/automation-title-capture").await;
         let display_text = "nightly review task".to_string();
+        // Production admission helper — must load system language + capture
+        // display_text (not English default / wire-block fallback).
+        let (launch, capture) = automation_root_title_admission(&db.conn, &display_text).await;
+        assert_eq!(launch.purpose, crate::auto_title::ConnectionPurpose::User);
+        assert_eq!(
+            launch.inherited_locale,
+            Some(AppLocale::Ko),
+            "automation root must inherit persisted system language, not English default"
+        );
+
         let conversation_id = create_conversation_core(
             &db.conn,
             folder_id,
@@ -1143,9 +1162,6 @@ mod tests {
             s.folder_id = Some(folder_id);
         }
 
-        // Same capture policy as production: display_text authoritative, locale
-        // from inherited connection locale (None explicit).
-        let capture = Some(PromptCaptureContext::new(Some(display_text.clone()), None));
         mgr.send_prompt_linked_background(
             &db,
             conn_id,
