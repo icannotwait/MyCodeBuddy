@@ -32,3 +32,30 @@ fn managed_platforms_never_resolve_a_mixed_creation_route() {
         }
     }
 }
+
+/// Regression: automation launch must use the explicit background prompt path.
+///
+/// `send_prompt_linked_with_message_id(..., delegation=None, ...)` sets
+/// `mark_awaiting_reply = true` for roots. Background automation roots are not
+/// awaiting-reply eligible, so the engine must call
+/// `send_prompt_linked_background` (which hard-codes `mark_awaiting_reply=false`).
+/// Source contract: the launch call site is not injectable without a larger
+/// harness.
+#[test]
+fn automation_engine_uses_background_prompt_path_not_generic_with_message_id() {
+    let engine_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/automation/engine.rs"
+    ));
+
+    assert!(
+        engine_src.contains("send_prompt_linked_background("),
+        "automation engine launch must call send_prompt_linked_background \
+         (mark_awaiting_reply=false for background roots)"
+    );
+    assert!(
+        !engine_src.contains("send_prompt_linked_with_message_id("),
+        "automation engine launch must not call send_prompt_linked_with_message_id \
+         (delegation=None would mark roots awaiting-reply eligible)"
+    );
+}

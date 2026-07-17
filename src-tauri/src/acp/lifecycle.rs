@@ -3427,8 +3427,8 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
-                        mark_awaiting_reply: false,
-        },
+                mark_awaiting_reply: false,
+            },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
@@ -3480,8 +3480,8 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
-                        mark_awaiting_reply: false,
-        },
+                mark_awaiting_reply: false,
+            },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
@@ -3525,8 +3525,8 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
-                        mark_awaiting_reply: false,
-        },
+                mark_awaiting_reply: false,
+            },
         };
         // Must not error out of handle_event, and must not resurrect status.
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();

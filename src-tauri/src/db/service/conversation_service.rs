@@ -37,7 +37,6 @@ fn state_patch(
     }
 }
 
-
 pub async fn create(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -421,7 +420,6 @@ pub async fn clear_awaiting_reply(
         changed,
     })
 }
-
 
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
 /// auto-title backfill ([`refresh_auto_title`]) leaves this row alone, so the
@@ -1398,6 +1396,7 @@ mod tests {
             .expect("duplicate finish");
         assert!(duplicate.is_none(), "duplicate end_turn must lose the CAS");
     }
+
     #[tokio::test]
     async fn awaiting_reply_background_root_and_child_never_get_a_generation() {
         let db = fresh_in_memory_db().await;
@@ -1420,6 +1419,7 @@ mod tests {
         assert!(child_patch.awaiting_reply_token.is_none());
         assert_ne!(parent_id, child_id);
     }
+
     #[tokio::test]
     async fn awaiting_reply_terminal_status_wins_over_delayed_end_turn() {
         let db = fresh_in_memory_db().await;
@@ -1443,6 +1443,7 @@ mod tests {
         assert_eq!(current.status, "completed");
         assert!(current.awaiting_reply_token.is_none());
     }
+
     #[tokio::test]
     async fn awaiting_reply_stale_clear_cannot_remove_a_newer_generation() {
         let db = fresh_in_memory_db().await;
@@ -1479,6 +1480,7 @@ mod tests {
             Some(token_b.as_str())
         );
     }
+
     #[tokio::test]
     async fn awaiting_reply_matching_clear_preserves_status_and_updated_at() {
         let db = fresh_in_memory_db().await;
@@ -1500,6 +1502,7 @@ mod tests {
         assert!(cleared.patch.awaiting_reply_token.is_none());
         assert_eq!(cleared.patch.updated_at, before.updated_at);
     }
+
     #[tokio::test]
     async fn awaiting_reply_metadata_preserves_token_but_manual_status_clears_it() {
         let db = fresh_in_memory_db().await;

@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::{EntityTrait};
+use sea_orm::EntityTrait;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -26,14 +26,16 @@ use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
 use crate::commands::acp::verify_agent_installed;
-use crate::commands::conversations::{create_conversation_core, emit_conversation_state, emit_conversation_upsert};
+use crate::commands::conversations::{
+    create_conversation_core, emit_conversation_state, emit_conversation_upsert,
+};
 use crate::commands::folders::{
     emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
     git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
-use crate::db::service::conversation_service;
 use crate::db::service::automation_service;
+use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::{
     AgentType, AutomationConfig, AutomationInfo, AutomationRunStatus, IsolationMode,
@@ -228,7 +230,9 @@ pub async fn run_automation_engine(engine: Arc<AutomationEngine>) {
     // holding the exclusive data-dir lock (see `build_engine`), so a process
     // sharing the data dir never reaches this point against another's live runs.
     match automation_service::boot_reconcile_interrupted(&engine.db.conn).await {
-        Ok(n) if n > 0 => tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)"),
+        Ok(n) if n > 0 => {
+            tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)")
+        }
         Ok(_) => {}
         Err(e) => tracing::warn!("[automation] boot reconcile error: {e}"),
     }
@@ -315,16 +319,21 @@ impl AutomationEngine {
             .await
             .map_err(|e| e.to_string())?
         {
-            let _ =
-                automation_service::record_skipped_run(&self.db.conn, automation_id, trigger, scheduled_for)
-                    .await;
+            let _ = automation_service::record_skipped_run(
+                &self.db.conn,
+                automation_id,
+                trigger,
+                scheduled_for,
+            )
+            .await;
             self.emit(AutomationChange::Upsert { id: automation_id });
             return Err("previous run still active".to_string());
         }
 
-        let run = automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
-            .await
-            .map_err(|e| e.to_string())?;
+        let run =
+            automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
+                .await
+                .map_err(|e| e.to_string())?;
         // Broadcast the running row immediately so every client sees it the
         // instant it exists — `launch` can take seconds (worktree add + agent
         // spawn) before it re-emits RunStarted with the live "View conversation"
@@ -505,14 +514,12 @@ impl AutomationEngine {
 
         match self
             .manager
-            .send_prompt_linked_with_message_id(
+            .send_prompt_linked_background(
                 &self.db,
                 &conn_id,
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
-                None,
-                None,
             )
             .await
         {
@@ -1036,7 +1043,10 @@ mod tests {
     fn worktree_names_carry_ids() {
         assert_eq!(basename("/home/me/repo"), "repo");
         assert_eq!(basename("/home/me/repo/"), "repo");
-        assert_eq!(sibling_path("/home/me/repo", "repo-automation-3-run-7"), "/home/me/repo-automation-3-run-7");
+        assert_eq!(
+            sibling_path("/home/me/repo", "repo-automation-3-run-7"),
+            "/home/me/repo-automation-3-run-7"
+        );
     }
 
     #[test]
