@@ -226,9 +226,26 @@ impl TitleAgentRunner for HiddenAgentRunner {
             return Err(AutoTitleRunError::Spawn(format!("create run dir: {e}")));
         }
 
-        // Exclusive discovery lease immediately before spawn.
+        // Exclusive discovery lease immediately before spawn. Race through the
+        // shared phase helper so cancellation/timeout prevent later phases.
         let lease_deadline = Instant::now() + Duration::from_secs(DISCOVERY_LEASE_SECS);
-        let mut lease = Some(self.registry.exclusive_discovery_lease().await);
+        let mut lease = match phase(
+            &cancellation,
+            overall_deadline,
+            self.registry.exclusive_discovery_lease(),
+        )
+        .await
+        {
+            PhaseOutcome::Cancelled => {
+                let _ = best_effort_remove_dir(&run_dir);
+                return Err(AutoTitleRunError::Cancelled);
+            }
+            PhaseOutcome::Timeout => {
+                let _ = best_effort_remove_dir(&run_dir);
+                return Err(AutoTitleRunError::Timeout);
+            }
+            PhaseOutcome::Ready(guard) => Some(guard),
+        };
 
         // --- spawn ---
         let spawn_result = phase(
@@ -1671,6 +1688,70 @@ mod tests {
             let shared = timeout(Duration::from_millis(200), registry.shared_filter()).await;
             assert!(shared.is_ok(), "lease released after cancel at {phase:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_blocked_discovery_lease_acquisition() {
+        let fixture = hidden_runner_fixture().await;
+        let cancel = CancellationToken::new();
+        let agent = Arc::clone(&fixture.agent);
+        let registry = Arc::clone(&fixture.registry);
+        let attempt = fixture.attempt(AppLocale::En);
+        let cancel2 = cancel.clone();
+        let runner = fixture.runner;
+
+        // Hold exclusive discovery lease so runner blocks before spawn.
+        let held_lease = registry.exclusive_discovery_lease().await;
+
+        let mut handle = tokio::spawn(async move { runner.run(attempt, cancel2).await });
+
+        // Yield enough for status/config to finish and reach lease acquisition.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Prove fake spawn has not started while the external lease is held.
+        assert!(
+            !agent.order.lock().unwrap().contains(&"spawn_enter"),
+            "spawn must not start while discovery lease is blocked"
+        );
+        assert_eq!(agent.prompt_count(), 0);
+        assert_eq!(agent.disconnect_count.load(Ordering::SeqCst), 0);
+        assert!(
+            agent.manager.get_state("title-conn-1").await.is_none(),
+            "no manager entry before spawn while discovery lease is blocked"
+        );
+
+        // Cancel while the external held lease is still held.
+        cancel.cancel();
+
+        // Bounded wait: OLD code hangs on uncancelable exclusive_discovery_lease
+        // and fails this assertion rather than hanging the suite indefinitely.
+        let settled = timeout(Duration::from_millis(500), &mut handle).await;
+        assert!(
+            settled.is_ok(),
+            "runner must settle on cancellation while discovery lease is blocked"
+        );
+        let result = settled.unwrap().expect("join");
+        assert!(
+            matches!(result, Err(AutoTitleRunError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+
+        assert_eq!(agent.prompt_count(), 0);
+        assert_eq!(agent.disconnect_count.load(Ordering::SeqCst), 0);
+        assert!(
+            !agent.order.lock().unwrap().contains(&"spawn_enter"),
+            "spawn must not run after cancellation during lease wait"
+        );
+        assert!(
+            agent.manager.get_state("title-conn-1").await.is_none(),
+            "no manager entry after cancelled lease acquisition"
+        );
+
+        // Release the held lease only after cancellation result assertions.
+        drop(held_lease);
     }
 
     #[tokio::test]
