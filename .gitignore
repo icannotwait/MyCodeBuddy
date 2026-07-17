@@ -48,6 +48,9 @@ updater-signing.password
 local-build.env
 GITHUB_SECRETS.md
 
+# Local linked worktrees
+.worktrees/
+
 # Agent
 .claude
 .docs
