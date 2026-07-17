@@ -28,6 +28,7 @@ import {
   catalogSearchFields,
   type CatalogSearchEntry,
 } from "./suggestion/adapters"
+import type { ReferenceAttrs } from "./types"
 import { DEFAULT_GROUP_LABELS } from "./use-reference-search"
 
 // ── Deferred helpers ────────────────────────────────────────────────────────
@@ -1413,5 +1414,95 @@ describe("ReferenceSearchController", () => {
     sourceApi.validation.reject(appError("source_failed"))
     const result = await confirm
     expect(result?.uri).toBe("codeg://session/7")
+  })
+
+  it("cold_confirm_times_out_after_one_second_and_returns_cached_reference", async () => {
+    vi.useFakeTimers()
+    try {
+      cache.mergeCandidate(
+        { backend: BACKEND, source: "conversation" },
+        sessionCandidate("7", "alpha")
+      )
+      const controller = createController(catalogFixture())
+      controller.setQuery("alpha")
+      await flushMicrotasks()
+      // No setSelectedUri — cold confirm starts validation and must still bound.
+      expect(validateCalls.length).toBe(0)
+
+      const confirm = controller.confirmCandidate("codeg://session/7")
+      await flushMicrotasks()
+      expect(validateCalls.length).toBe(1)
+
+      // Still pending before the one-second bound.
+      let settled: ReferenceAttrs | null | undefined
+      void confirm.then((value) => {
+        settled = value
+      })
+      await vi.advanceTimersByTimeAsync(999)
+      await flushMicrotasks()
+      expect(settled).toBeUndefined()
+
+      await vi.advanceTimersByTimeAsync(1)
+      await flushMicrotasks()
+      const result = await confirm
+      expect(result?.uri).toBe("codeg://session/7")
+      expect(result?.label).toBe("alpha")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("late_negative_after_confirm_timeout_does_not_evict_or_mutate", async () => {
+    vi.useFakeTimers()
+    try {
+      const bucket: ReferenceCacheBucketKey = {
+        backend: BACKEND,
+        source: "conversation",
+      }
+      cache.mergeCandidate(bucket, sessionCandidate("7", "alpha"))
+      const controller = createController(catalogFixture())
+      controller.setQuery("alpha")
+      await flushMicrotasks()
+      // In-flight validation from selection, then confirm reuses it under timeout.
+      controller.setSelectedUri("codeg://session/7")
+      await flushMicrotasks()
+      expect(validateCalls.length).toBe(1)
+      const validationRequestId = (
+        validateCalls[0] as { validationRequestId: string }
+      ).validationRequestId
+
+      const confirm = controller.confirmCandidate("codeg://session/7")
+      await flushMicrotasks()
+      // Reuse in-flight — no second validate call.
+      expect(validateCalls.length).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      await flushMicrotasks()
+      const result = await confirm
+      expect(result?.uri).toBe("codeg://session/7")
+
+      // Late not_found for the timed-out request must not evict cache/membership.
+      sourceApi.validation.resolve({
+        status: "not_found",
+        validationRequestId,
+      })
+      await flushMicrotasks(10)
+
+      expect(cache.has(bucket, "codeg://session/7")).toBe(true)
+      expect(
+        controller
+          .getSnapshot()
+          .groups.session.items.map((item) => item.reference.uri)
+      ).toContain("codeg://session/7")
+      expect(
+        controller
+          .getSnapshot()
+          .groups.session.items.find(
+            (item) => item.reference.uri === "codeg://session/7"
+          )?.freshness
+      ).not.toBe("validating")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

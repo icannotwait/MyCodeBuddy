@@ -517,6 +517,7 @@ export class ReferenceSearchController {
       return { ...entry.item.reference }
     }
 
+    // Always bound confirm waits (in-flight reuse and cold begin) to one second.
     if (
       this.validation &&
       this.validation.selectedUri === uri &&
@@ -525,7 +526,10 @@ export class ReferenceSearchController {
       return await this.withTimeout(this.validation.promise, CONFIRM_TIMEOUT_MS)
     }
 
-    return await this.beginValidation(uri, group, entry)
+    return await this.withTimeout(
+      this.beginValidation(uri, group, entry),
+      CONFIRM_TIMEOUT_MS
+    )
   }
 
   close(): void {
@@ -2164,23 +2168,39 @@ export class ReferenceSearchController {
     }
   }
 
-  private async withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  private async withTimeout(
+    promise: Promise<ReferenceAttrs | null>,
+    ms: number
+  ): Promise<ReferenceAttrs | null> {
     let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
     try {
       return await Promise.race([
         promise,
-        new Promise<T>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("confirm timeout")), ms)
+        new Promise<ReferenceAttrs | null>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true
+            reject(new Error("confirm timeout"))
+          }, ms)
         }),
       ])
     } catch {
-      // On timeout fall through to cached reference if still present.
+      if (!timedOut) {
+        // Validation promise should absorb transport errors; treat any other
+        // rejection as a non-insertable failure (not a timeout fallback).
+        return null
+      }
+      // Design: invalidate the validation request ID (abort when supported)
+      // so a late negative cannot mutate cache/membership after timeout insert.
       const uri = this.validation?.selectedUri
+      this.invalidateValidation()
+      this.clearValidatingMarks()
+      this.publish()
       if (uri) {
         const located = this.locateMembership(uri)
-        if (located) return { ...located.entry.item.reference } as T
+        if (located) return { ...located.entry.item.reference }
       }
-      return null as T
+      return null
     } finally {
       if (timer) clearTimeout(timer)
     }
