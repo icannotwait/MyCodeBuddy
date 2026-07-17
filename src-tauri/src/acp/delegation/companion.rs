@@ -46,12 +46,12 @@ use tokio::sync::{oneshot, Mutex};
 use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_feedback_round_trip, client_parent_decision_round_trip, client_reply_delegation_round_trip,
-    client_round_trip, client_session_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerFeedbackRequest, BrokerParentDecisionRequest, BrokerReplyDelegationRequest, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionRole,
+    client_feedback_round_trip, client_parent_decision_round_trip,
+    client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerParentDecisionRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::parse_questions;
@@ -198,9 +198,7 @@ impl CompanionFeatures {
             "check_user_feedback" => self.feedback,
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
-            "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => {
-                self.delegation
-            }
+            "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
             _ => false,
         }
     }
@@ -230,9 +228,7 @@ impl CompanionContext {
                     && self.features.coordination_v1
                     && self.role == CompanionRole::DelegationChild
             }
-            "reply_to_delegation" => {
-                self.features.delegation && self.features.coordination_v1
-            }
+            "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -656,7 +652,14 @@ async fn build_tools_call_spawn(
             // socket (listener drops only the waiter) without Broker task cancel.
             let round_trip =
                 Box::pin(async move { client_parent_decision_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_parent_decision_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_parent_decision_result,
+            )
+            .await
         }
         "reply_to_delegation" => {
             let args = match parse_reply_args(&arguments) {
@@ -670,8 +673,14 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_reply_delegation_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_reply_delegation_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_reply_delegation_result,
+            )
+            .await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -1062,10 +1071,7 @@ fn exact_object<'a>(
     let object = value
         .as_object()
         .ok_or_else(|| "arguments must be an object".to_string())?;
-    if object
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err("arguments contain unexpected keys".into());
     }
     Ok(object)
@@ -2179,9 +2185,9 @@ mod tests {
         sessions: false,
     };
 
-    // Two coordination tools add ~1.2 KiB; keep Grok stdio tools/list under
-    // a still-safe budget for hosts that serialize the full list in one line.
-    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 9_000;
+    // Grok stdio hosts serialize the full tools/list in one line; stay at or
+    // under this budget (including the trailing newline).
+    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 7_680;
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
         let resp = unwrap_respond(action);
@@ -2390,16 +2396,15 @@ mod tests {
                 &[
                     "direct parent",
                     "blocking decision",
-                    "cannot continue safely",
-                    "do not use it for progress, logs, warnings",
+                    "blocks until reply or closure",
+                    "not for progress, logs, or warnings",
                 ],
             ),
             (
                 "reply_to_delegation",
                 &[
-                    "open direct-child decision",
-                    "attention_requests",
-                    "first durable reply wins",
+                    "open direct-child join decision",
+                    "first reply wins",
                     "idempotent",
                 ],
             ),
@@ -3089,9 +3094,8 @@ mod tests {
             } else {
                 json!({"request_id":"r1","reply":"A"})
             };
-            let response = unwrap_respond(
-                dispatch_with_context(legacy_root(), &call(8, name, args)).await,
-            );
+            let response =
+                unwrap_respond(dispatch_with_context(legacy_root(), &call(8, name, args)).await);
             assert_eq!(response.error.unwrap().code, -32602);
         }
     }
@@ -3125,13 +3129,14 @@ mod tests {
         assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024)})).is_ok());
         assert!(parse_parent_decision_args(&json!({"message":"界".repeat(6000)})).is_err());
         assert!(parse_parent_decision_args(&json!({"message":"  "})).is_err());
-        assert!(parse_parent_decision_args(
-            &json!({"message":"choose", "task_id":"foreign"})
-        )
-        .is_err());
+        assert!(
+            parse_parent_decision_args(&json!({"message":"choose", "task_id":"foreign"})).is_err()
+        );
         assert!(parse_reply_args(&json!({"request_id":"r1", "reply":"A", "parent_id":1})).is_err());
         assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024 + 1)})).is_err());
-        assert!(parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024)})).is_ok());
+        assert!(
+            parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024)})).is_ok()
+        );
         assert!(
             parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024 + 1)}))
                 .is_err()

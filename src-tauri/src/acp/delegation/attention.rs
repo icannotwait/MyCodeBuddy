@@ -7,7 +7,6 @@
 //! Database failures stay as [`AttentionStoreError::Database`] and are never
 //! downgraded to a public missing outcome.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,7 +16,6 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::acp::delegation::store::is_transient_sqlite;
 use crate::db::entities::conversation::{self, DelegationTaskStatus};
@@ -147,7 +145,7 @@ pub enum AttentionStoreError {
 /// only uses whitespace checks for the blank check so exact nonblank bytes
 /// that pass are the exact bytes returned later.
 pub fn validate_attention_payload(text: &str) -> Result<(), AttentionStoreError> {
-    if text.as_bytes().len() > ATTENTION_PAYLOAD_MAX_BYTES {
+    if text.len() > ATTENTION_PAYLOAD_MAX_BYTES {
         return Err(AttentionStoreError::PayloadTooLarge);
     }
     if text.trim().is_empty() {
@@ -648,6 +646,10 @@ impl DelegationAttentionStore for NoopDelegationAttentionStore {
 /// semantics as the SQLite implementation (for focused Broker unit tests).
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock {
+    use std::collections::HashMap;
+
+    use tokio::sync::Mutex;
+
     use super::*;
 
     #[derive(Debug, Default)]

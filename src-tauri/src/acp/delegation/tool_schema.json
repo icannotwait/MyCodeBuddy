@@ -170,7 +170,7 @@
   },
   {
     "name": "request_parent_decision",
-    "description": "Ask this Codeg delegation task's direct parent for one blocking decision. Use only when the task cannot continue safely without a parent-owned choice. This call blocks until the parent replies or the task/parent closes. Do not use it for progress, logs, warnings, or questions you can resolve yourself.",
+    "description": "Ask the direct parent for a blocking decision. Blocks until reply or closure; not for progress, logs, or warnings.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -179,14 +179,14 @@
         "message": {
           "type": "string",
           "minLength": 1,
-          "description": "Self-contained decision needed from the direct parent; maximum 16 KiB UTF-8."
+          "description": "Decision needed; max 16 KiB UTF-8."
         }
       }
     }
   },
   {
     "name": "reply_to_delegation",
-    "description": "Reply to an open direct-child decision request returned by get_delegation_status Join. The first durable reply wins; repeating the identical reply is idempotent and a conflicting replacement is rejected.",
+    "description": "Reply to an open direct-child Join decision. First reply wins; same reply is idempotent.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -195,12 +195,12 @@
         "request_id": {
           "type": "string",
           "minLength": 1,
-          "description": "Request id returned in Join attention_requests."
+          "description": "Open Join attention request id."
         },
         "reply": {
           "type": "string",
           "minLength": 1,
-          "description": "Decision returned to the blocked child; maximum 16 KiB UTF-8."
+          "description": "Decision; max 16 KiB UTF-8."
         }
       }
     }

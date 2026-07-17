@@ -799,7 +799,7 @@ fn canonical_tool_name(state: &ToolProjectionState) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    let normalized = raw.to_ascii_lowercase().replace('-', "_").replace(' ', "_");
+    let normalized = raw.to_ascii_lowercase().replace(['-', ' '], "_");
     normalized
         .rsplit("__")
         .next()
