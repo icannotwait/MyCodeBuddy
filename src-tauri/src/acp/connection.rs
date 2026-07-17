@@ -8173,9 +8173,15 @@ mod tests {
         let adapter = adapter_for(AgentType::Grok);
         let plan = native_plan(AgentType::Grok);
 
-        let new_req =
-            build_new_session_request(AgentType::Grok, &cwd, Vec::new(), &spec, adapter, &plan)
-                .unwrap();
+        let new_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
         let load_req = build_load_session_request(
             AgentType::Grok,
             SessionId::new("sess-load".to_string()),

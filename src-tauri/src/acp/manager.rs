@@ -4757,13 +4757,12 @@ mod tests {
 
     #[tokio::test]
     async fn noop_emitter_keeps_internal_title_events_off_transport_and_lifecycle_bus() {
-        use crate::acp::internal_bus::{EventBusMetrics, InternalEventBus};
-
-        // A live bus that is NOT wired into EventEmitter::Noop — proves Noop
-        // never reaches lifecycle consumers even when a bus exists in-process.
-        let metrics = Arc::new(EventBusMetrics::default());
-        let bus = Arc::new(InternalEventBus::new(metrics));
-        let mut lifecycle_rx = bus.subscribe();
+        // Noop has no ACP bus / transport target — do not use an unattached
+        // bus as "proof" of isolation (that bus was never on the emit path).
+        assert!(
+            EventEmitter::Noop.acp_event_bus().is_none(),
+            "EventEmitter::Noop must expose no ACP internal bus"
+        );
 
         let mgr = ConnectionManager::new();
         let _rx = mgr
@@ -4796,12 +4795,6 @@ mod tests {
         // Private stream receives events for the title runner.
         let first = private_rx.try_recv().expect("private ContentDelta");
         assert!(matches!(first.payload, AcpEvent::ContentDelta { .. }));
-        // Noop must not publish to any InternalEventBus.
-        assert!(
-            lifecycle_rx.try_recv().is_err(),
-            "Noop must not publish to InternalEventBus"
-        );
-        let _ = bus;
     }
 
     #[tokio::test]

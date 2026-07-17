@@ -47,6 +47,7 @@ pub trait TitleAgentRunner: Send + Sync {
 }
 
 /// Crate-private connection surface used by [`HiddenAgentRunner`].
+/// Exact contract: spawn, identity_and_subscribe, send_internal, disconnect.
 #[async_trait]
 pub(crate) trait TitleConnectionDriver: Send + Sync {
     async fn spawn_internal_title(
@@ -69,9 +70,12 @@ pub(crate) trait TitleConnectionDriver: Send + Sync {
     ) -> Result<(), AcpError>;
 
     async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError>;
+}
 
-    /// Read `external_id` without creating a new stream subscription.
-    async fn peek_external_id(&self, conn_id: &str) -> Result<Option<String>, AcpError>;
+/// Launch-policy helper: internal title connections always use silent Noop
+/// delivery (no ACP bus / transport target).
+pub(crate) fn internal_title_event_emitter() -> EventEmitter {
+    EventEmitter::Noop
 }
 
 /// Production driver that shares existing [`ConnectionManager`] internals.
@@ -102,7 +106,7 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
                 None,
                 launch_inputs,
                 INTERNAL_TITLE_OWNER.to_string(),
-                EventEmitter::Noop,
+                internal_title_event_emitter(),
                 None,
                 std::collections::BTreeMap::new(),
                 ConnectionLaunchContext {
@@ -132,18 +136,6 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
 
     async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
         self.manager.disconnect(conn_id).await
-    }
-
-    async fn peek_external_id(&self, conn_id: &str) -> Result<Option<String>, AcpError> {
-        let state_arc = self
-            .manager
-            .get_state(conn_id)
-            .await
-            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-        let guard = state_arc.read().await;
-        let id = guard.external_id.clone();
-        drop(guard);
-        Ok(id)
     }
 }
 
@@ -318,19 +310,14 @@ impl HiddenAgentRunner {
         let external_id = if let Some(id) = initial_id {
             id
         } else {
-            let driver = Arc::clone(&self.driver);
-            let conn_id = conn_id.to_string();
+            // One atomic snapshot+subscription: await SessionStarted on that
+            // private receiver only (no peek/poll API).
             match wait_for_session_identity(
                 cancellation,
                 overall_deadline,
                 lease_deadline,
                 lease,
                 &mut rx,
-                || {
-                    let driver = Arc::clone(&driver);
-                    let conn_id = conn_id.clone();
-                    async move { driver.peek_external_id(&conn_id).await.ok().flatten() }
-                },
             )
             .await
             {
@@ -423,18 +410,16 @@ where
     }
 }
 
-async fn wait_for_session_identity<F, Fut>(
+/// Await `SessionStarted` on the single receiver from `identity_and_subscribe`.
+/// Races cancellation, the overall deadline, and the 15s discovery-lease deadline.
+/// `Lagged` / `Closed` fail safely — no peek/poll recovery path.
+async fn wait_for_session_identity(
     cancellation: &CancellationToken,
     overall_deadline: Instant,
     lease_deadline: Instant,
     lease: &mut Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
     rx: &mut broadcast::Receiver<Arc<EventEnvelope>>,
-    mut peek_external_id: F,
-) -> Result<String, AutoTitleRunError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
-{
+) -> Result<String, AutoTitleRunError> {
     loop {
         tokio::select! {
             biased;
@@ -459,24 +444,15 @@ where
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed events may include SessionStarted — recover
-                        // from the authoritative SessionState snapshot.
-                        if let Some(id) = peek_external_id().await {
-                            return Ok(id);
-                        }
+                        return Err(AutoTitleRunError::Identity(
+                            "private stream lagged before SessionStarted".into(),
+                        ));
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         return Err(AutoTitleRunError::Identity(
                             "private stream closed before SessionStarted".into(),
                         ));
                     }
-                }
-            }
-            // Periodic state peek recovers races where SessionStarted applied
-            // but the private-stream delivery was lagged or missed.
-            _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                if let Some(id) = peek_external_id().await {
-                    return Ok(id);
                 }
             }
         }
@@ -722,6 +698,8 @@ mod tests {
     enum Scenario {
         Happy,
         Permission,
+        /// Private-stream QuestionRequest (no Codeg MCP question UI path).
+        Question,
         Refusal,
         Disconnect,
         MalformedOutput,
@@ -791,6 +769,8 @@ mod tests {
         finish_text: StdMutex<Option<String>>,
         spawn_cancelled_no_id: AtomicBool,
         force_spawn_fail: AtomicBool,
+        /// Count of events observed on the private stream after Noop emit.
+        private_stream_events: AtomicUsize,
     }
 
     impl FakeAgent {
@@ -819,6 +799,7 @@ mod tests {
                 finish_text: StdMutex::new(None),
                 spawn_cancelled_no_id: AtomicBool::new(false),
                 force_spawn_fail: AtomicBool::new(false),
+                private_stream_events: AtomicUsize::new(0),
             })
         }
 
@@ -831,7 +812,15 @@ mod tests {
                 // Connection already cleaned up — ignore late scenario emits.
                 return;
             };
+            // Probe private stream before emit so Noop delivery is observed.
+            let mut private_rx = {
+                let guard = state.read().await;
+                guard.event_stream().subscribe()
+            };
             emit_with_state(&state, &EventEmitter::Noop, payload).await;
+            if private_rx.try_recv().is_ok() {
+                self.private_stream_events.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         async fn emit_session_started(&self) {
@@ -879,6 +868,8 @@ mod tests {
         block_completion: AtomicBool,
         /// When set, spawn waits on gate and can be cancelled with no conn id.
         cancelable_spawn: AtomicBool,
+        /// Exact `working_dir` last passed to `spawn_internal_title`.
+        last_working_dir: StdMutex<Option<PathBuf>>,
     }
 
     impl FakeTitleConnectionDriver {
@@ -892,7 +883,12 @@ mod tests {
                 block_prompt: AtomicBool::new(false),
                 block_completion: AtomicBool::new(false),
                 cancelable_spawn: AtomicBool::new(false),
+                last_working_dir: StdMutex::new(None),
             })
+        }
+
+        fn last_working_dir(&self) -> Option<PathBuf> {
+            self.last_working_dir.lock().unwrap().clone()
         }
     }
 
@@ -907,6 +903,7 @@ mod tests {
         ) -> Result<String, AcpError> {
             let _ = agent;
             self.agent.record("spawn_enter");
+            *self.last_working_dir.lock().unwrap() = Some(working_dir.clone());
 
             if self.agent.force_spawn_fail.load(Ordering::SeqCst) {
                 return Err(AcpError::protocol("forced spawn failure"));
@@ -930,7 +927,8 @@ mod tests {
                     &self.agent.conn_id,
                     self.agent_type,
                     Some(working_dir),
-                    EventEmitter::Noop,
+                    // Mirror production spawn policy (Noop only).
+                    internal_title_event_emitter(),
                 )
                 .await;
             {
@@ -1038,6 +1036,16 @@ mod tests {
                                 })
                                 .await;
                         }
+                        Scenario::Question => {
+                            // Codeg MCP question UI is not injected for InternalTitle;
+                            // private-stream QuestionRequest is still an attempt failure.
+                            agent
+                                .emit(AcpEvent::QuestionRequest {
+                                    question_id: "q1".into(),
+                                    questions: vec![],
+                                })
+                                .await;
+                        }
                         Scenario::Refusal => {
                             agent
                                 .emit(AcpEvent::TurnComplete {
@@ -1089,19 +1097,6 @@ mod tests {
             }
             self.agent.manager.disconnect(conn_id).await
         }
-
-        async fn peek_external_id(&self, conn_id: &str) -> Result<Option<String>, AcpError> {
-            let state_arc = self
-                .agent
-                .manager
-                .get_state(conn_id)
-                .await
-                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            let guard = state_arc.read().await;
-            let id = guard.external_id.clone();
-            drop(guard);
-            Ok(id)
-        }
     }
 
     struct HiddenRunnerFixture {
@@ -1124,15 +1119,6 @@ mod tests {
                 first_user_text: "Fix the README search".into(),
                 first_assistant_text: "Updated search section".into(),
             }
-        }
-
-        fn transport_event_count(&self) -> usize {
-            // Noop emitter never hits desktop/web transport.
-            0
-        }
-
-        fn lifecycle_event_count(&self) -> usize {
-            0
         }
 
         fn was_disconnected(&self) -> bool {
@@ -1209,14 +1195,40 @@ mod tests {
         let (_, filter) = fixture.registry.shared_filter().await.expect("filter");
         assert!(filter.contains(AgentType::Codex, Some("internal-1"), None));
         assert!(fixture.agent.prompt_was_sent_after_registration());
-        assert_eq!(fixture.transport_event_count(), 0);
-        assert_eq!(fixture.lifecycle_event_count(), 0);
+        // Isolation: Noop has no ACP bus/transport target; private stream
+        // is the only delivery surface used by the fake emit path.
+        assert!(
+            internal_title_event_emitter().acp_event_bus().is_none(),
+            "EventEmitter::Noop must not expose an ACP internal bus"
+        );
+        assert!(
+            fixture
+                .agent
+                .private_stream_events
+                .load(Ordering::SeqCst)
+                > 0,
+            "private connection stream must receive Noop-emitted events"
+        );
+    }
+
+    #[test]
+    fn manager_title_spawn_policy_uses_noop_emitter_without_acp_bus() {
+        let emitter = internal_title_event_emitter();
+        assert!(
+            matches!(emitter, EventEmitter::Noop),
+            "production title spawn must use EventEmitter::Noop"
+        );
+        assert!(
+            emitter.acp_event_bus().is_none(),
+            "Noop must have no ACP internal bus / transport target"
+        );
     }
 
     #[tokio::test]
     async fn permission_abnormal_stop_and_registry_failure_are_attempt_failures() {
         for scenario in [
             Scenario::Permission,
+            Scenario::Question,
             Scenario::Refusal,
             Scenario::Disconnect,
             Scenario::MalformedOutput,
@@ -1301,7 +1313,18 @@ mod tests {
             agent.prompt_count.load(Ordering::SeqCst) > 0,
             "prompt must be sent before final timeout slice"
         );
+        // Shared deadline is exactly 90s: settle before awaiting the join.
         tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.is_finished(),
+            "runner must settle at overall second 90 (shared deadline)"
+        );
 
         let result = handle.await.expect("join");
         assert!(
@@ -1417,45 +1440,78 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_and_registry_failures_leave_reserved_root_sessions_filtered() {
-        // Spawn failure: run dir under reserved_root still filters by path.
+        // Spawn failure: fake records the exact working_dir the runner passed.
+        // After cleanup removes that directory, the path string remains under
+        // reserved_root and is still matched by the lexical registry filter.
         let fixture = hidden_runner_fixture().await;
         fixture.agent.force_spawn_fail.store(true, Ordering::SeqCst);
         let reserved = fixture.registry.reserved_root().to_path_buf();
-        let orphan = reserved.join("orphan-run");
-        std::fs::create_dir_all(&orphan).expect("orphan dir");
 
         let err = fixture
             .runner
             .run(fixture.attempt(AppLocale::En), CancellationToken::new())
             .await;
-        assert!(err.is_err());
+        assert!(
+            matches!(err, Err(AutoTitleRunError::Spawn(_))),
+            "forced spawn failure must surface Spawn, got {err:?}"
+        );
+
+        let run_dir = fixture
+            .driver
+            .last_working_dir()
+            .expect("spawn must record the exact working_dir passed by the runner");
+        assert!(
+            crate::auto_title::internal_sessions::is_lexically_below(
+                &run_dir.to_string_lossy(),
+                &reserved,
+            ),
+            "runner spawn working_dir must be lexically under reserved_root: {run_dir:?}"
+        );
+        assert!(
+            !run_dir.exists(),
+            "per-run directory must be removed after spawn failure cleanup"
+        );
 
         let (_, filter) = fixture.registry.shared_filter().await.expect("filter");
         assert!(
-            filter.contains(AgentType::Codex, None, Some(&orphan.to_string_lossy()),),
-            "reserved-root child must remain filtered after spawn failure"
+            filter.contains(
+                AgentType::Codex,
+                None,
+                Some(&run_dir.to_string_lossy()),
+            ),
+            "recorded run path must remain matched by reserved-root filter after removal"
         );
 
-        // Registry failure path: identity registered in memory before DB fail
-        // or working_dir still under reserved root.
+        // Outside reserved_root is not hidden by path fallback.
+        let outside = fixture
+            .data_dir
+            .path()
+            .join("outside-reserved-run");
+        assert!(
+            !filter.contains(AgentType::Codex, None, Some(&outside.to_string_lossy())),
+            "path outside reserved_root must not match the filter"
+        );
+
+        // Registry failure path: durable id and/or reserved-root path hide.
         let fixture2 = hidden_runner_fixture_for(Scenario::RegistryFailure).await;
         fixture2
             .agent
             .emit_session_started_before_subscription("internal-1");
-        // Create a reserved-root sibling so path fallback remains observable
-        // even after the per-run directory is cleaned up.
-        let reserved2 = fixture2.registry.reserved_root().to_path_buf();
-        let sibling = reserved2.join("still-hidden");
-        std::fs::create_dir_all(&sibling).expect("sibling dir");
         let err = fixture2
             .runner
             .run(fixture2.attempt(AppLocale::En), CancellationToken::new())
             .await;
         assert!(err.is_err(), "registry failure must fail the attempt");
+        let recorded2 = fixture2
+            .driver
+            .last_working_dir()
+            .expect("registry-failure path still spawns");
         let (_, filter2) = fixture2.registry.shared_filter().await.expect("filter");
-        // Memory-side id insert precedes persistence (best-effort hide) and/or
-        // reserved-root lexical fallback covers sibling/orphan paths.
-        let path_hit = filter2.contains(AgentType::Codex, None, Some(&sibling.to_string_lossy()));
+        let path_hit = filter2.contains(
+            AgentType::Codex,
+            None,
+            Some(&recorded2.to_string_lossy()),
+        );
         let id_hit = filter2.contains(AgentType::Codex, Some("internal-1"), None);
         assert!(
             path_hit || id_hit,
@@ -1465,6 +1521,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_interrupts_each_runner_phase_and_disconnects_after_spawn() {
+        // Status/config are wrapped by the shared `phase()` helper in production.
+        // There is no deterministic DB gate for status; StatusConfig cancels
+        // immediately pre-run (limitation: does not prove mid-DB cancellation).
+        // Spawn/identity/prompt/completion use explicit mid-phase gates.
         for phase in [
             BlockedPhase::StatusConfig,
             BlockedPhase::Spawn,
@@ -1476,7 +1536,8 @@ mod tests {
             let cancel = CancellationToken::new();
             match phase {
                 BlockedPhase::StatusConfig => {
-                    // Status/config is first; cancel immediately before run.
+                    // Immediate pre-run cancel — status/config use phase() but
+                    // have no injectable mid-call DB gate in this fixture.
                     cancel.cancel();
                 }
                 BlockedPhase::Spawn => {
@@ -1522,7 +1583,7 @@ mod tests {
 
             let handle = tokio::spawn(async move { runner.run(attempt, cancel2).await });
 
-            // Enter blocked phase then cancel.
+            // Enter blocked phase then cancel (representative mid-phase gates).
             match phase {
                 BlockedPhase::StatusConfig => {}
                 BlockedPhase::Spawn => {
@@ -1596,8 +1657,15 @@ mod tests {
             .store(true, Ordering::SeqCst);
         fixture.agent.block_disconnect.store(true, Ordering::SeqCst);
 
+        // Sibling sentinel under reserved_root must survive per-run cleanup.
+        let reserved = fixture.registry.reserved_root().to_path_buf();
+        let sentinel_dir = reserved.join("sentinel-sibling");
+        std::fs::create_dir_all(&sentinel_dir).expect("sentinel dir");
+        let sentinel_file = sentinel_dir.join("keep.txt");
+        std::fs::write(&sentinel_file, b"keep").expect("sentinel file");
+
         let agent = Arc::clone(&fixture.agent);
-        let data_dir = fixture.data_dir.path().to_path_buf();
+        let driver = Arc::clone(&fixture.driver);
         let attempt = fixture.attempt(AppLocale::En);
         let runner = fixture.runner;
 
@@ -1613,6 +1681,18 @@ mod tests {
             tokio::time::advance(Duration::from_millis(1)).await;
         }
         assert!(agent.prompt_count() > 0, "must reach completion phase");
+        let run_dir = driver
+            .last_working_dir()
+            .expect("spawn records exact per-run working_dir");
+        assert!(
+            run_dir.exists(),
+            "per-run directory must exist before cleanup"
+        );
+        assert_ne!(
+            run_dir, sentinel_dir,
+            "run dir must not be the sentinel sibling"
+        );
+
         // Force timeout by advancing remaining overall budget.
         tokio::time::advance(Duration::from_secs(90)).await;
 
@@ -1625,16 +1705,22 @@ mod tests {
         let result = timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "runner must settle after cleanup budget");
         let outcome = result.unwrap().expect("join");
-        // Original outcome preserved (Timeout or other non-hanging error).
+        // Original outcome preserved (Timeout).
         assert!(
             matches!(outcome, Err(AutoTitleRunError::Timeout)),
             "expected Timeout, got {outcome:?}"
         );
-        // Per-run directory cleanup attempted (reserved root empty or cleaned).
-        let _ = data_dir;
         assert!(
             agent.disconnect_count.load(Ordering::SeqCst) >= 1,
             "disconnect must be attempted"
+        );
+        assert!(
+            !run_dir.exists(),
+            "exact per-run directory must be removed after bounded cleanup: {run_dir:?}"
+        );
+        assert!(
+            sentinel_dir.exists() && sentinel_file.exists(),
+            "sibling sentinel under reserved_root must remain"
         );
     }
 
