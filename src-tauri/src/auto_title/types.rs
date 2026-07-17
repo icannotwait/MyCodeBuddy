@@ -1,3 +1,5 @@
+use sea_orm::DatabaseConnection;
+
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 
@@ -40,8 +42,8 @@ pub struct ConnectionLaunchContext {
 }
 
 impl Default for ConnectionLaunchContext {
-    /// Temporary English user default for tests and Task 4B production callers
-    /// until Task 4C wires persisted/channel/parent locale sources.
+    /// Test-only English user default. Production UI/automation roots must use
+    /// [`user_launch_context_from_db`]; chat channel is Task 4C2.
     fn default() -> Self {
         Self {
             purpose: ConnectionPurpose::User,
@@ -105,5 +107,38 @@ pub fn app_locale_to_wire(locale: AppLocale) -> &'static str {
         AppLocale::Fr => "fr",
         AppLocale::Pt => "pt",
         AppLocale::Ar => "ar",
+    }
+}
+
+/// Build optional capture context from wire `visibleText` / `locale` fields.
+///
+/// - Both absent → `None` (manager falls back to ACP blocks + connection locale).
+/// - `Some(visible_text)` including empty is preserved as authoritative.
+/// - Locale is lossy: unknown/mixed-case wire values become `None` so the
+///   request is accepted and the connection effective locale is used.
+pub fn prompt_capture_from_wire(
+    visible_text: Option<String>,
+    locale: Option<String>,
+) -> Option<PromptCaptureContext> {
+    if visible_text.is_none() && locale.is_none() {
+        return None;
+    }
+    Some(PromptCaptureContext::new(
+        visible_text,
+        parse_supported_app_locale(locale.as_deref()),
+    ))
+}
+
+/// User-purpose launch context from persisted `SystemLanguageSettings.language`.
+/// Production UI and automation roots must use this rather than a context-free
+/// English default. Load failures fall back to English.
+pub async fn user_launch_context_from_db(conn: &DatabaseConnection) -> ConnectionLaunchContext {
+    let language = crate::commands::system_settings::load_system_language_settings(conn)
+        .await
+        .map(|settings| settings.language)
+        .unwrap_or_default();
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::User,
+        inherited_locale: Some(language),
     }
 }

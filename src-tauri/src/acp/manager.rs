@@ -45,6 +45,16 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
+/// Launch policy for delegated children. Must stay in lockstep with
+/// `ConnectionManagerSpawner::spawn` — the named inheritance test exercises
+/// this helper as the production policy.
+fn delegation_launch_context(parent_effective_locale: AppLocale) -> ConnectionLaunchContext {
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::Delegation,
+        inherited_locale: Some(parent_effective_locale),
+    }
+}
+
 /// Launch policy for `probe_agent_options`. Must stay in lockstep with that
 /// call site — the unit test exercises this helper as the production policy.
 /// Internal probes have no user/channel locale; connection launch falls back
@@ -2695,23 +2705,26 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         // owner_window. Falling back is not safe: a child whose emitter is
         // wired to a different broadcaster would emit events the frontend
         // never sees.
-        let (emitter, owner_window, parent_working_dir) = {
+        let (emitter, owner_window, parent_working_dir, parent_locale) = {
             let conns = self.manager.connections.lock().await;
             let parent = conns.get(parent_connection_id).ok_or_else(|| {
                 SpawnerError::Spawn(format!(
                     "parent connection {parent_connection_id} not found"
                 ))
             })?;
-            let pwd = {
+            let (pwd, locale) = {
                 let s = parent.state.read().await;
-                s.working_dir
+                let pwd = s
+                    .working_dir
                     .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|p| p.to_string_lossy().to_string());
+                (pwd, s.effective_locale)
             };
             (
                 parent.emitter.clone(),
                 parent.owner_window_label.clone(),
                 pwd,
+                locale,
             )
         };
         let effective_working_dir = working_dir.or(parent_working_dir);
@@ -2729,11 +2742,8 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
 
-        // Temporary Task 4B: Delegation purpose; parent locale inheritance is Task 4C.
-        let launch_context = ConnectionLaunchContext {
-            purpose: ConnectionPurpose::Delegation,
-            inherited_locale: Some(AppLocale::En),
-        };
+        // Delegation purpose + parent's latest effective locale (not English).
+        let launch_context = delegation_launch_context(parent_locale);
         self.manager
             .spawn_agent(
                 agent_type,
@@ -2781,6 +2791,9 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .await
             .map_err(|e| SpawnerError::Send(format!("add_folder: {e}")))?;
 
+        // Broker task is the authoritative visible text; locale resolves via
+        // the child's inherited effective_locale (capture locale = None).
+        let capture = Some(PromptCaptureContext::new(Some(task.clone()), None));
         let result = self
             .manager
             .send_prompt_linked(
@@ -2790,7 +2803,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 Some(folder.id),
                 None,
                 Some(link),
-                None, // Task 4C: broker task as explicit visible text
+                capture,
             )
             .await
             .map_err(|e| SpawnerError::Send(e.to_string()))?;
@@ -2919,6 +2932,130 @@ mod tests {
         let ctx = internal_probe_launch_context();
         assert_eq!(ctx.purpose, ConnectionPurpose::InternalProbe);
         assert_eq!(ctx.inherited_locale, None);
+    }
+
+    #[tokio::test]
+    async fn delegated_child_inherits_parent_effective_locale() {
+        // Real manager/database path: parent locale is ZhCn; the production
+        // launch policy must inherit it onto the child; delegated send must
+        // persist the broker task as first_user_text under that locale.
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
+        )
+        .await
+        .expect("enable auto title");
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let parent_id = "deleg-parent-locale";
+        let child_id = "deleg-child-locale";
+        let _parent_rx = mgr
+            .insert_test_connection_live(
+                parent_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/deleg-parent-locale")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(parent_id).await.unwrap();
+            let mut s = state.write().await;
+            s.effective_locale = AppLocale::ZhCn;
+            s.purpose = ConnectionPurpose::User;
+        }
+
+        let parent_locale = {
+            let state = mgr.get_state(parent_id).await.unwrap();
+            let guard = state.read().await;
+            let locale = guard.effective_locale;
+            drop(guard);
+            locale
+        };
+        assert_eq!(parent_locale, AppLocale::ZhCn);
+
+        // Production policy used by ConnectionManagerSpawner::spawn.
+        let launch = delegation_launch_context(parent_locale);
+        assert_eq!(launch.purpose, ConnectionPurpose::Delegation);
+        assert_eq!(
+            launch.inherited_locale,
+            Some(AppLocale::ZhCn),
+            "delegated child must inherit parent effective_locale, not English default"
+        );
+
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(PathBuf::from("/tmp/deleg-child-locale")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = launch.purpose;
+            s.effective_locale = launch.inherited_locale.unwrap_or(AppLocale::En);
+        }
+
+        let parent_conversation = {
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-parent-locale").await;
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent conversation")
+        };
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+        };
+        let task = "delegated broker task body".to_string();
+        let conversation_id = spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                task.clone(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-locale".into(),
+                    delegation_call_id: "call-locale".into(),
+                },
+            )
+            .await
+            .expect("delegated send");
+
+        // Drain the enqueued command so the receiver stays live for the assert.
+        let _ = child_rx.try_recv();
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .expect("query job")
+            .expect("job enrolled");
+        assert_eq!(
+            job.first_user_text.as_deref(),
+            Some(task.as_str()),
+            "broker task must be the first-user-text source"
+        );
+        assert_eq!(
+            job.locale.as_deref(),
+            Some("zh_cn"),
+            "capture locale must resolve to the inherited child locale"
+        );
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let s = state.read().await;
+            assert_eq!(s.effective_locale, AppLocale::ZhCn);
+            assert_eq!(s.purpose, ConnectionPurpose::Delegation);
+        }
     }
 
     #[test]

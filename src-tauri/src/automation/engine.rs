@@ -426,6 +426,8 @@ impl AutomationEngine {
         }
 
         // Fresh connection (session_id=None), owner-labelled "automation".
+        // Load persisted system language so title capture inherits the UI locale.
+        let launch_context = crate::auto_title::user_launch_context_from_db(&self.db.conn).await;
         let conn_id = self
             .manager
             .spawn_agent(
@@ -437,7 +439,7 @@ impl AutomationEngine {
                 self.emitter.clone(),
                 cfg.mode_id.clone(),
                 cfg.config_values.clone(),
-                crate::auto_title::ConnectionLaunchContext::default(),
+                launch_context,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -498,6 +500,12 @@ impl AutomationEngine {
             return Ok(());
         }
 
+        // Exact user-visible automation task text drives first_user_text;
+        // locale comes from the connection's inherited system language.
+        let capture = Some(crate::auto_title::PromptCaptureContext::new(
+            Some(cfg.display_text.clone()),
+            None,
+        ));
         match self
             .manager
             .send_prompt_linked_background(
@@ -506,7 +514,7 @@ impl AutomationEngine {
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
-                None, // Task 4C: automation visible capture
+                capture,
             )
             .await
         {
@@ -1060,6 +1068,109 @@ mod tests {
             .await
             .expect("all jobs");
         assert_eq!(total.len(), 1);
+    }
+
+    /// Pre-created automation root captures display_text + system locale via
+    /// the same launch/capture helpers production `launch` uses (without
+    /// spawning a real agent CLI).
+    #[tokio::test]
+    async fn automation_root_captures_visible_task_and_system_locale() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::acp::types::PromptInputBlock;
+        use crate::auto_title::{user_launch_context_from_db, PromptCaptureContext};
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::models::agent::AgentType;
+        use crate::models::system::{AppLocale, LanguageMode, SystemLanguageSettings};
+        use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
+        use std::path::PathBuf;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&SystemLanguageSettings {
+                mode: LanguageMode::Manual,
+                language: AppLocale::Ko,
+            })
+            .expect("serialize language"),
+        )
+        .await
+        .expect("persist language");
+
+        let launch = user_launch_context_from_db(&db.conn).await;
+        assert_eq!(launch.purpose, crate::auto_title::ConnectionPurpose::User);
+        assert_eq!(launch.inherited_locale, Some(AppLocale::Ko));
+
+        let folder_id = seed_folder(&db, "/tmp/automation-title-capture").await;
+        let display_text = "nightly review task".to_string();
+        let conversation_id = create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some(first_chars(&display_text, 80)),
+        )
+        .await
+        .expect("create conversation");
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "auto-capture-conn";
+        let mut rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/automation-title-capture")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = launch.purpose;
+            s.effective_locale = launch.inherited_locale.unwrap_or(AppLocale::En);
+            s.conversation_id = Some(conversation_id);
+            s.folder_id = Some(folder_id);
+        }
+
+        // Same capture policy as production: display_text authoritative, locale
+        // from inherited connection locale (None explicit).
+        let capture = Some(PromptCaptureContext::new(Some(display_text.clone()), None));
+        mgr.send_prompt_linked_background(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "wire block that differs".into(),
+            }],
+            Some(folder_id),
+            Some(conversation_id),
+            capture,
+        )
+        .await
+        .expect("automation background send");
+        let _ = rx.try_recv();
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("job");
+        assert_eq!(
+            job.first_user_text.as_deref(),
+            Some(display_text.as_str()),
+            "automation must capture display_text, not wire blocks"
+        );
+        assert_eq!(job.locale.as_deref(), Some("ko"));
     }
 
     #[test]

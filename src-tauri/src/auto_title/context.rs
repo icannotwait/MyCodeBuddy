@@ -221,4 +221,64 @@ mod tests {
         assert_eq!(captured.visible_text, "hi");
         assert_eq!(captured.locale, AppLocale::Ko);
     }
+
+    #[test]
+    fn prompt_capture_from_wire_omits_when_both_absent() {
+        use crate::auto_title::types::prompt_capture_from_wire;
+        assert_eq!(prompt_capture_from_wire(None, None), None);
+    }
+
+    #[test]
+    fn prompt_capture_from_wire_keeps_empty_visible_text_authoritative() {
+        use crate::auto_title::types::prompt_capture_from_wire;
+        let capture = prompt_capture_from_wire(Some(String::new()), Some("ja".into()))
+            .expect("capture present");
+        assert_eq!(capture.visible_text.as_deref(), Some(""));
+        assert_eq!(capture.locale, Some(AppLocale::Ja));
+    }
+
+    #[test]
+    fn prompt_capture_from_wire_unknown_locale_is_none_not_reject() {
+        use crate::auto_title::types::prompt_capture_from_wire;
+        let capture = prompt_capture_from_wire(Some("visible".into()), Some("Klingon".into()))
+            .expect("unknown locale must not reject");
+        assert_eq!(capture.visible_text.as_deref(), Some("visible"));
+        assert_eq!(
+            capture.locale, None,
+            "unknown wire locale falls through to connection effective locale"
+        );
+        let mixed = prompt_capture_from_wire(None, Some("Zh_Cn".into())).expect("present");
+        assert_eq!(mixed.visible_text, None);
+        assert_eq!(mixed.locale, None);
+    }
+
+    #[tokio::test]
+    async fn user_launch_context_loads_persisted_system_language() {
+        use crate::auto_title::types::user_launch_context_from_db;
+        use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use crate::models::system::{LanguageMode, SystemLanguageSettings};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let settings = SystemLanguageSettings {
+            mode: LanguageMode::Manual,
+            language: AppLocale::Ja,
+        };
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&settings).expect("serialize language"),
+        )
+        .await
+        .expect("persist language");
+
+        let launch = user_launch_context_from_db(&db.conn).await;
+        assert_eq!(launch.purpose, ConnectionPurpose::User);
+        assert_eq!(
+            launch.inherited_locale,
+            Some(AppLocale::Ja),
+            "UI/automation roots must load persisted system language, not English default"
+        );
+    }
 }
