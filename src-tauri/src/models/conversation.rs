@@ -33,6 +33,9 @@ pub struct DbConversationSummary {
     /// Mirror of `conversation.title_locked`: the user renamed this row by hand,
     /// so the auto-title backfill must leave it alone.
     pub title_locked: bool,
+    /// Mirror of `conversation.auto_title_finalized`: automatic title generation
+    /// has finished for this conversation (success or permanent failure).
+    pub auto_title_finalized: bool,
     pub agent_type: AgentType,
     pub status: String,
     pub awaiting_reply_token: Option<String>,

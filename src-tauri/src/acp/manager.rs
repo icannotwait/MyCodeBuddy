@@ -1789,6 +1789,7 @@ impl ConnectionManager {
                         folder_id: Set(folder_id),
                         title: Set(clean_title),
                         title_locked: Set(false),
+                        auto_title_finalized: Set(false),
                         agent_type: Set(agent_type_str),
                         status: Set(ConversationStatus::PendingReview),
                         kind: Set(sibling_kind),

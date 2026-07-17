@@ -47,6 +47,10 @@ pub struct Model {
     /// per-turn auto-title backfill (see `get_folder_conversation_core`) so a
     /// hand-set title is never overwritten by a parsed session-file title.
     pub title_locked: bool,
+    /// True once automatic title generation has finalized for this conversation
+    /// (success or permanent failure). Legacy rows default to false but have no
+    /// `auto_title_jobs` row and are therefore ineligible.
+    pub auto_title_finalized: bool,
     pub agent_type: String,
     pub status: ConversationStatus,
     pub kind: ConversationKind,

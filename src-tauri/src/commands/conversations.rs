@@ -1634,6 +1634,7 @@ mod tests {
             folder_id: 1,
             title: None,
             title_locked: false,
+            auto_title_finalized: false,
             agent_type: AgentType::Codex,
             status: status.into(),
             awaiting_reply_token: None,

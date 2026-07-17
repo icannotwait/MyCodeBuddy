@@ -155,6 +155,7 @@ async fn import_one(
         folder_id: Set(folder_id),
         title: Set(summary.title.clone()),
         title_locked: Set(false),
+        auto_title_finalized: Set(false),
         agent_type: Set(at_str),
         status: Set(conversation::ConversationStatus::Completed),
         // Imports scan regular folders' session files; chat scratch dirs and
@@ -370,6 +371,7 @@ mod tests {
             folder_id: Set(folder),
             title: Set(Some("child original".to_string())),
             title_locked: Set(false),
+            auto_title_finalized: Set(false),
             agent_type: Set(at_str),
             status: Set(conversation::ConversationStatus::Completed),
             kind: Set(conversation::ConversationKind::Delegate),
