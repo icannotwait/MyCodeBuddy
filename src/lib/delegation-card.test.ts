@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 
-import { resolveDelegationStatus } from "@/lib/delegation-card"
+import { parseInput, resolveDelegationStatus } from "@/lib/delegation-card"
 import type { DelegationBinding } from "@/contexts/delegation-context"
+import { AGENT_LABELS, ALL_AGENT_TYPES } from "@/lib/types"
 
 function binding(
   overrides: Partial<DelegationBinding> = {}
@@ -93,5 +94,30 @@ describe("resolveDelegationStatus — live binding observation", () => {
         childAwaitingPermission: false,
       })
     ).toBe("running")
+  })
+})
+
+describe("parseInput — historical agent types", () => {
+  it("resolves agent_type grok for history reload without a live binding", () => {
+    const parsed = parseInput(
+      JSON.stringify({
+        agent_type: "grok",
+        task: "fix review findings",
+        working_dir: "D:\\MyCodeBuddy",
+      })
+    )
+    expect(parsed.agentType).toBe("grok")
+    expect(ALL_AGENT_TYPES).toContain("grok")
+    expect(AGENT_LABELS.grok).toBe("Grok")
+    expect(parsed.task).toBe("fix review findings")
+  })
+
+  it("accepts every agent type in ALL_AGENT_TYPES", () => {
+    for (const agentType of ALL_AGENT_TYPES) {
+      const parsed = parseInput(
+        JSON.stringify({ agent_type: agentType, task: "t" })
+      )
+      expect(parsed.agentType).toBe(agentType)
+    }
   })
 })

@@ -426,12 +426,19 @@ fn value_to_preview(value: Option<&serde_json::Value>) -> Option<String> {
     serde_json::to_string(v).ok()
 }
 
+/// Built-in Codeg MCP companion server name injected into agent CLI configs.
+const CODEG_MCP_SERVER_NAME: &str = "codeg-mcp";
+
+/// JS property form of the built-in server (hyphens → underscores).
+/// Real Codex rollouts call `tools.mcp__codeg_mcp__delegate_to_agent(...)`.
+const CODEG_MCP_JS_TOOL_PREFIX: &str = "mcp__codeg_mcp__";
+
 /// Codeg MCP tools that own dedicated cards in the parent timeline. Codex
 /// records them as `event_msg.mcp_tool_call_end` (with the real tool name) and
-/// often also as a shadow `custom_tool_call` named `exec` / `wait` whose call_id
-/// does **not** match — history must reconstruct from the MCP event, then drop
-/// the shadow so the user does not see a raw "exec" shell card instead of a
-/// sub-agent / status card.
+/// often also as a shadow `custom_tool_call`/`function_call` named `exec` /
+/// `wait` whose call_id does **not** match — history must reconstruct from the
+/// MCP event, then drop the shadow so the user does not see a raw "exec" shell
+/// card instead of a sub-agent / status card.
 fn is_codeg_mcp_history_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -439,10 +446,107 @@ fn is_codeg_mcp_history_tool(tool: &str) -> bool {
     )
 }
 
-/// Whether a model-facing tool name is a known Codex-side shadow for MCP
-/// execute/wait (paired with `mcp_tool_call_end` in the same turn).
+/// Only reconstruct when the invocation is for the built-in Codeg server.
+fn is_codeg_mcp_history_invocation(server: Option<&str>, tool: &str) -> bool {
+    server == Some(CODEG_MCP_SERVER_NAME) && is_codeg_mcp_history_tool(tool)
+}
+
+/// Whether a model-facing tool name is a known Codex-side exec/wait wrapper
+/// that may shadow MCP (paired with `mcp_tool_call_end` in the same turn).
 fn is_mcp_shadow_tool_name(name: &str) -> bool {
     matches!(name, "exec" | "wait")
+}
+
+/// If `exec` input targets a Codeg history tool via the JS MCP binding, return
+/// that tool name. Used to classify wrapper intent without an overbroad
+/// "nearest open exec/wait" rule.
+fn codeg_history_tool_from_exec_input(input: &str) -> Option<&'static str> {
+    // Prefer the canonical JS form; also accept a hyphenated variant if seen.
+    const TOOLS: &[&str] = &[
+        "delegate_to_agent",
+        "get_delegation_status",
+        "cancel_delegation",
+    ];
+    for tool in TOOLS {
+        let js = format!("{CODEG_MCP_JS_TOOL_PREFIX}{tool}");
+        if input.contains(&js) {
+            return Some(*tool);
+        }
+        let alt = format!("mcp__codeg-mcp__{tool}");
+        if input.contains(&alt) {
+            return Some(*tool);
+        }
+    }
+    None
+}
+
+/// Parse Codex deferred-cell text: `Script running with cell ID 11`.
+fn extract_deferred_cell_id(text: &str) -> Option<String> {
+    let lower: String = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let marker = "cell id ";
+    let pos = lower.find(marker)?;
+    let after = text[pos + marker.len()..].trim_start();
+    let id: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Pull `cell_id` from a wait tool's arguments / input preview.
+fn extract_wait_cell_id(input: Option<&str>) -> Option<String> {
+    let raw = input?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(id) = v.get("cell_id").and_then(|c| c.as_str()) {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+        if let Some(id) = v.get("cell_id").and_then(|c| c.as_i64()) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// Flatten Codex tool output (string or content-part array) for cell-id scans.
+fn tool_output_text(payload: &serde_json::Value) -> String {
+    let Some(output) = payload.get("output") else {
+        return String::new();
+    };
+    if let Some(s) = output.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = output.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                parts.push(t);
+            } else if let Some(s) = item.as_str() {
+                parts.push(s);
+            }
+        }
+        return parts.join("\n");
+    }
+    String::new()
+}
+
+/// Buffered model-facing `exec`/`wait` while we decide whether it is a Codeg
+/// MCP wrapper (suppress) or a real tool (emit on output / EOF).
+struct BufferedExecWait {
+    name: String,
+    input_preview: Option<String>,
+    timestamp: DateTime<Utc>,
+    /// Set when exec input calls `tools.mcp__codeg_mcp__<history_tool>`.
+    codeg_wrapper_tool: Option<String>,
+    /// Deferred cell from this exec's output (Codeg async wrappers).
+    deferred_cell_id: Option<String>,
+    /// Wait target cell, when this buffer entry is a `wait`.
+    wait_cell_id: Option<String>,
 }
 
 /// Pull CallToolResult body out of Codex's `{ "Ok": {...} } | { "Err": ... }`
@@ -1077,16 +1181,17 @@ impl CodexParser {
         // and as `response_item.image_generation_call`, sharing the same call_id/id.
         // Emit at most one ContentBlock::Image per id to avoid duplicate display.
         let mut emitted_image_ids: HashSet<String> = HashSet::new();
-        // Shadow `exec`/`wait` custom_tool_calls that wrap codeg-mcp tools: buffer
-        // until output (or suppress when an MCP end for the real tool arrives in
-        // between). Keyed by model call_id (`call_…`), not the MCP `exec-…` id.
-        let mut buffered_shadow_tools: HashMap<String, (String, Option<String>, DateTime<Utc>)> =
-            HashMap::new();
-        // Open shadow call_ids in open order — most recent is suppressed when MCP ends.
-        let mut open_shadow_call_ids: Vec<String> = Vec::new();
-        let mut suppressed_shadow_call_ids: HashSet<String> = HashSet::new();
-        // `task_id` → parent `delegate_to_agent` tool_use_id so later status polls
-        // can refresh the card past the launch ack.
+        // Model-facing `exec`/`wait` buffer: real tools emit on output (or at EOF
+        // if truncated); Codeg MCP wrappers stay buffered and are suppressed when
+        // the matching `mcp_tool_call_end` reconstructs the real tool card.
+        // Keyed by model call_id (`call_…`), not the MCP `exec-…` id.
+        let mut buffered_exec_wait: HashMap<String, BufferedExecWait> = HashMap::new();
+        let mut suppressed_exec_wait_ids: HashSet<String> = HashSet::new();
+        // Deferred cell id → codeg wrapper exec call_id (and completed cells).
+        let mut codeg_cell_to_exec: HashMap<String, String> = HashMap::new();
+        let mut suppressed_codeg_cells: HashSet<String> = HashSet::new();
+        // `task_id` → parent `delegate_to_agent` tool_use_id so later status /
+        // cancel reports can refresh the card past the launch ack.
         let mut task_id_to_delegate_tool_use: HashMap<String, String> = HashMap::new();
         // Streaming reasoning buffer. Codex emits one `event_msg.agent_reasoning`
         // per reasoning section, then groups the same sections into a single
@@ -1504,11 +1609,14 @@ impl CodexParser {
                                 // that Codex only records here — not as custom_tool_call
                                 // with the real tool name (shadow is often `exec`/`wait`).
                                 let invocation = payload.get("invocation");
+                                let server = invocation
+                                    .and_then(|i| i.get("server"))
+                                    .and_then(|s| s.as_str());
                                 let tool_name = invocation
                                     .and_then(|i| i.get("tool"))
                                     .and_then(|t| t.as_str())
                                     .unwrap_or("");
-                                if !is_codeg_mcp_history_tool(tool_name) {
+                                if !is_codeg_mcp_history_invocation(server, tool_name) {
                                     continue;
                                 }
 
@@ -1521,11 +1629,51 @@ impl CodexParser {
                                         format!("mcp-{}-{}", tool_name, messages.len())
                                     });
 
-                                // Suppress the nearest open model-facing shadow call
-                                // (`exec`/`wait`) so it does not also render.
-                                if let Some(shadow_id) = open_shadow_call_ids.pop() {
-                                    suppressed_shadow_call_ids.insert(shadow_id.clone());
-                                    buffered_shadow_tools.remove(&shadow_id);
+                                // Suppress correlated Codeg wrapper exec/wait only —
+                                // match by wrapper intent + deferred-cell identity,
+                                // never an overbroad "nearest open" pop.
+                                {
+                                    let mut suppress_ids: Vec<String> = Vec::new();
+                                    // Most recent buffered exec that targets this tool.
+                                    let mut best_exec: Option<(
+                                        String,
+                                        Option<String>,
+                                        DateTime<Utc>,
+                                    )> = None;
+                                    for (id, buf) in buffered_exec_wait.iter() {
+                                        if buf.codeg_wrapper_tool.as_deref() != Some(tool_name) {
+                                            continue;
+                                        }
+                                        let better = best_exec
+                                            .as_ref()
+                                            .map(|(_, _, ts)| buf.timestamp >= *ts)
+                                            .unwrap_or(true);
+                                        if better {
+                                            best_exec = Some((
+                                                id.clone(),
+                                                buf.deferred_cell_id.clone(),
+                                                buf.timestamp,
+                                            ));
+                                        }
+                                    }
+                                    if let Some((exec_id, cell, _)) = best_exec {
+                                        suppress_ids.push(exec_id);
+                                        if let Some(cell_id) = cell {
+                                            suppressed_codeg_cells.insert(cell_id.clone());
+                                            codeg_cell_to_exec.remove(&cell_id);
+                                            for (id, buf) in buffered_exec_wait.iter() {
+                                                if buf.wait_cell_id.as_deref()
+                                                    == Some(cell_id.as_str())
+                                                {
+                                                    suppress_ids.push(id.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for id in suppress_ids {
+                                        suppressed_exec_wait_ids.insert(id.clone());
+                                        buffered_exec_wait.remove(&id);
+                                    }
                                 }
 
                                 let args = invocation.and_then(|i| i.get("arguments")).cloned();
@@ -1584,6 +1732,26 @@ impl CodexParser {
                                                     &mut messages,
                                                     parent_id,
                                                     task,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // cancel_delegation returns a single task report
+                                // (not a tasks[] array) — patch the original card.
+                                if tool_name == "cancel_delegation" {
+                                    if let Some(sc) = structured.as_ref() {
+                                        if let Some(tid) =
+                                            sc.get("task_id").and_then(|v| v.as_str())
+                                        {
+                                            if let Some(parent_id) =
+                                                task_id_to_delegate_tool_use.get(tid)
+                                            {
+                                                patch_delegation_blocks_for_task(
+                                                    &mut messages,
+                                                    parent_id,
+                                                    sc,
                                                 );
                                             }
                                         }
@@ -1790,20 +1958,47 @@ impl CodexParser {
                                                     .or_else(|| payload.get("input")),
                                             )
                                         };
-                                        // Buffer Codex MCP shadows (`exec`/`wait`) until
-                                        // output: if an `mcp_tool_call_end` for a codeg
-                                        // tool arrives first, the shadow is suppressed.
+                                        // Buffer `exec`/`wait` until output (or EOF).
+                                        // Codeg MCP wrappers are classified from exec
+                                        // input / deferred-cell identity and suppressed
+                                        // when the matching mcp_tool_call_end arrives.
                                         if is_mcp_shadow_tool_name(raw_tool_name) {
                                             if let Some(ref id) = tool_use_id {
-                                                buffered_shadow_tools.insert(
+                                                let codeg_wrapper_tool = if raw_tool_name == "exec"
+                                                {
+                                                    input_preview
+                                                        .as_deref()
+                                                        .and_then(
+                                                            codeg_history_tool_from_exec_input,
+                                                        )
+                                                        .map(|s| s.to_string())
+                                                } else {
+                                                    None
+                                                };
+                                                let wait_cell_id = if raw_tool_name == "wait" {
+                                                    extract_wait_cell_id(input_preview.as_deref())
+                                                } else {
+                                                    None
+                                                };
+                                                // Late wait after MCP end already
+                                                // marked this deferred cell — drop it.
+                                                if let Some(ref cell) = wait_cell_id {
+                                                    if suppressed_codeg_cells.contains(cell) {
+                                                        suppressed_exec_wait_ids.insert(id.clone());
+                                                        continue;
+                                                    }
+                                                }
+                                                buffered_exec_wait.insert(
                                                     id.clone(),
-                                                    (
-                                                        raw_tool_name.to_string(),
+                                                    BufferedExecWait {
+                                                        name: raw_tool_name.to_string(),
                                                         input_preview,
                                                         timestamp,
-                                                    ),
+                                                        codeg_wrapper_tool,
+                                                        deferred_cell_id: None,
+                                                        wait_cell_id,
+                                                    },
                                                 );
-                                                open_shadow_call_ids.push(id.clone());
                                             }
                                             continue;
                                         }
@@ -1833,34 +2028,57 @@ impl CodexParser {
                                     .and_then(|id| id.as_str())
                                     .map(|s| s.to_string());
 
-                                // Drop MCP shadow pairs already covered by
-                                // `mcp_tool_call_end` (delegate_to_agent cards).
+                                // Finalize buffered exec/wait, or drop Codeg wrappers.
                                 if let Some(ref id) = tool_use_id {
-                                    open_shadow_call_ids.retain(|x| x != id);
-                                    if suppressed_shadow_call_ids.remove(id) {
-                                        buffered_shadow_tools.remove(id);
+                                    if suppressed_exec_wait_ids.remove(id) {
+                                        buffered_exec_wait.remove(id);
                                         continue;
                                     }
-                                    if let Some((shadow_name, input_preview, call_ts)) =
-                                        buffered_shadow_tools.remove(id)
-                                    {
-                                        // Real exec/wait (no MCP reconstruction) —
-                                        // emit the buffered ToolUse, then fall through
-                                        // to normal ToolResult handling below.
+                                    if let Some(mut buf) = buffered_exec_wait.remove(id) {
+                                        // Codeg wrapper exec: record deferred cell and
+                                        // keep buffered until mcp_tool_call_end (do not
+                                        // re-emit the raw exec shell card).
+                                        if buf.codeg_wrapper_tool.is_some() {
+                                            let out_text = tool_output_text(payload);
+                                            if let Some(cell) = extract_deferred_cell_id(&out_text)
+                                            {
+                                                codeg_cell_to_exec.insert(cell.clone(), id.clone());
+                                                buf.deferred_cell_id = Some(cell);
+                                            }
+                                            // If MCP already suppressed us between
+                                            // remove and re-insert, drop.
+                                            if suppressed_exec_wait_ids.contains(id) {
+                                                continue;
+                                            }
+                                            buffered_exec_wait.insert(id.clone(), buf);
+                                            continue;
+                                        }
+                                        // Wait for a Codeg-owned deferred cell —
+                                        // suppress both halves; MCP owns the card.
+                                        if let Some(ref cell) = buf.wait_cell_id {
+                                            if codeg_cell_to_exec.contains_key(cell)
+                                                || suppressed_codeg_cells.contains(cell)
+                                            {
+                                                suppressed_exec_wait_ids.insert(id.clone());
+                                                continue;
+                                            }
+                                        }
+                                        // Real exec/wait — emit ToolUse, then fall
+                                        // through to normal ToolResult handling.
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
                                                 tool_use_id: Some(id.clone()),
-                                                tool_name: shadow_name,
-                                                input_preview,
+                                                tool_name: buf.name,
+                                                input_preview: buf.input_preview,
                                                 meta: None,
                                             }],
-                                            timestamp: call_ts,
+                                            timestamp: buf.timestamp,
                                             usage: None,
                                             duration_ms: None,
                                             model: None,
-                                            completed_at: Some(call_ts),
+                                            completed_at: Some(buf.timestamp),
                                         });
                                     }
                                 }
@@ -2129,6 +2347,35 @@ impl CodexParser {
         // (the `agent_reasoning` events were written but the file ended before the
         // grouped `response_item.reasoning` summary) — flush it so it isn't lost.
         flush_pending_reasoning(&mut messages, &mut pending_reasoning, pending_reasoning_ts);
+
+        // Unpaired real exec/wait at EOF (truncated rollout): emit ToolUse only —
+        // never invent a result. Successfully reconstructed Codeg wrappers are
+        // already removed/suppressed and must not reappear.
+        if !buffered_exec_wait.is_empty() {
+            let mut pending: Vec<(String, BufferedExecWait)> =
+                buffered_exec_wait.into_iter().collect();
+            pending.sort_by_key(|(_, b)| b.timestamp);
+            for (id, buf) in pending {
+                if suppressed_exec_wait_ids.contains(&id) {
+                    continue;
+                }
+                messages.push(UnifiedMessage {
+                    id: format!("tool-{}", messages.len()),
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        tool_use_id: Some(id),
+                        tool_name: buf.name,
+                        input_preview: buf.input_preview,
+                        meta: None,
+                    }],
+                    timestamp: buf.timestamp,
+                    usage: None,
+                    duration_ms: None,
+                    model: None,
+                    completed_at: Some(buf.timestamp),
+                });
+            }
+        }
 
         // Fill in subagent tool call stats (and, only as a fallback, the result)
         // on each spawn execution capsule.
@@ -4742,7 +4989,7 @@ mod tests {
                     "type":"custom_tool_call",
                     "call_id":"call_shadow_exec",
                     "name":"exec",
-                    "input":"const prompt = `implement task 1`",
+                    "input":"const res = await tools.mcp__codeg_mcp__delegate_to_agent({agent_type:\"grok\",task:`implement task 1`});",
                     "status":"completed",
                 }),
             ),
@@ -4926,6 +5173,605 @@ mod tests {
             })
             .count();
         assert_eq!(status_uses, 1, "status poll also surfaces as its own card");
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Finding A: a real unfinished exec/wait at EOF must surface as an unpaired
+    /// ToolUse (no fabricated result). Truncated rollouts must not drop it.
+    #[test]
+    fn unfinished_real_exec_at_eof_retained_as_unpaired_tool_use() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T10:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"eof-exec","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T10:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"run"}]
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T10:00:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_unfinished_exec",
+                    "name":"exec",
+                    "input":"const r = await tools.shell_command({command:\"echo hi\"});",
+                    "status":"in_progress",
+                }),
+            ),
+            // File ends here — no output, no MCP end.
+        ];
+
+        let path = write_temp_rollout("eof-exec", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "eof-exec")
+            .expect("parse ok");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+
+        let unfinished = blocks.iter().find_map(|b| match b {
+            ContentBlock::ToolUse {
+                tool_use_id: Some(id),
+                tool_name,
+                ..
+            } if id == "call_unfinished_exec" => Some(tool_name.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            unfinished,
+            Some("exec"),
+            "truncated real exec must remain as ToolUse"
+        );
+
+        let has_result = blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    ..
+                } if id == "call_unfinished_exec"
+            )
+        });
+        assert!(
+            !has_result,
+            "must not manufacture a ToolResult for unpaired exec"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Finding B: cancel_delegation's structured task report must patch the
+    /// original delegate_to_agent card to a terminal canceled/error state when
+    /// no later status poll arrives.
+    #[test]
+    fn cancel_delegation_patches_original_delegate_card() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T11:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"cancel-del","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T11:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"delegate then cancel"}]
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T11:00:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-delegate-cancel",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"delegate_to_agent",
+                        "arguments":{"agent_type":"grok","task":"long job"}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"Delegation successful. task_id=task-cancel-1."}],
+                            "structuredContent":{
+                                "agent_type":"grok",
+                                "child_conversation_id":91,
+                                "message":"Delegation successful. task_id=task-cancel-1.",
+                                "status":"running",
+                                "task_id":"task-cancel-1"
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            // One running status poll (does not complete the task).
+            rollout_line(
+                "2026-07-17T11:00:03Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-status-running",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"get_delegation_status",
+                        "arguments":{"task_ids":["task-cancel-1"],"wait_ms":1000}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"still running"}],
+                            "structuredContent":{
+                                "tasks":[{
+                                    "agent_type":"grok",
+                                    "child_conversation_id":91,
+                                    "message":"still working",
+                                    "status":"running",
+                                    "task_id":"task-cancel-1"
+                                }]
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            // cancel_delegation — no later status poll.
+            rollout_line(
+                "2026-07-17T11:00:04Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-cancel-1",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"cancel_delegation",
+                        "arguments":{"task_id":"task-cancel-1","reason":"user"}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"canceled: user"}],
+                            "structuredContent":{
+                                "agent_type":"grok",
+                                "child_conversation_id":91,
+                                "error_code":"canceled",
+                                "message":"canceled: user",
+                                "status":"canceled",
+                                "task_id":"task-cancel-1"
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        let path = write_temp_rollout("cancel-del", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "cancel-del")
+            .expect("parse ok");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+
+        let (meta, _) = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    meta,
+                    ..
+                } if id == "exec-mcp-delegate-cancel" && tool_name == "delegate_to_agent" => {
+                    Some((meta.clone(), id.clone()))
+                }
+                _ => None,
+            })
+            .expect("delegate_to_agent tool use present");
+        let meta = meta.expect("codeg.delegation meta");
+        let status = meta
+            .pointer("/codeg.delegation/status")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            status,
+            Some("failed"),
+            "cancel must terminalize original delegate meta (not leave running)"
+        );
+        let child = meta
+            .pointer("/codeg.delegation/child_conversation_id")
+            .and_then(|v| v.as_i64());
+        assert_eq!(child, Some(91), "child id preserved through cancel");
+
+        let (out, is_error) = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview,
+                    is_error,
+                    ..
+                } if id == "exec-mcp-delegate-cancel" => Some((output_preview.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("delegate ToolResult present");
+        assert!(is_error, "canceled delegate result must be error");
+        let out = out.unwrap_or_default();
+        assert!(
+            out.contains("task-cancel-1") && (out.contains("canceled") || out.contains("cancel")),
+            "result should carry task id + canceled status: {out}"
+        );
+
+        let cancel_uses = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { tool_name, .. } if tool_name == "cancel_delegation"
+                )
+            })
+            .count();
+        assert_eq!(
+            cancel_uses, 1,
+            "cancel_delegation itself still renders as its own card"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Finding C: both halves of the async Codeg MCP wrapper sequence
+    /// (exec + wait on deferred cell) must be suppressed once the MCP end is
+    /// reconstructed — including when mcp_tool_call_end lands before wait.
+    #[test]
+    fn codeg_async_exec_wait_wrappers_both_suppressed() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T12:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"async-wrap","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"poll status"}]
+                }),
+            ),
+            // Ordering 1: exec → deferred out → wait → mcp_end → wait out
+            rollout_line(
+                "2026-07-17T12:00:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_status_exec_1",
+                    "name":"exec",
+                    "input":"const res = await tools.mcp__codeg_mcp__get_delegation_status({task_ids:[\"task-1\"],wait_ms:30000});",
+                    "status":"completed",
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_status_exec_1",
+                    "output":"Script running with cell ID 11\nWall time 10.0 seconds\nOutput:\n"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call_status_wait_1",
+                    "name":"wait",
+                    "arguments":"{\"cell_id\":\"11\",\"yield_time_ms\":20000,\"max_tokens\":5000}"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:05Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-status-async-1",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"get_delegation_status",
+                        "arguments":{"task_ids":["task-1"],"wait_ms":30000}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"running"}],
+                            "structuredContent":{
+                                "tasks":[{
+                                    "task_id":"task-1",
+                                    "status":"running",
+                                    "message":"still going",
+                                    "child_conversation_id":50
+                                }]
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:06Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output",
+                    "call_id":"call_status_wait_1",
+                    "output":"Script completed\nOutput:\nstill going\n"
+                }),
+            ),
+            // Ordering 2: exec → deferred out → mcp_end → wait → wait out
+            rollout_line(
+                "2026-07-17T12:00:07Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_status_exec_2",
+                    "name":"exec",
+                    "input":"const res = await tools.mcp__codeg_mcp__get_delegation_status({task_ids:[\"task-1\"],wait_ms:30000});",
+                    "status":"completed",
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:08Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_status_exec_2",
+                    "output":"Script running with cell ID 12\nWall time 10.0 seconds\nOutput:\n"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:09Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-mcp-status-async-2",
+                    "invocation":{
+                        "server":"codeg-mcp",
+                        "tool":"get_delegation_status",
+                        "arguments":{"task_ids":["task-1"],"wait_ms":30000}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"done"}],
+                            "structuredContent":{
+                                "tasks":[{
+                                    "task_id":"task-1",
+                                    "status":"completed",
+                                    "message":"All done",
+                                    "text":"All done",
+                                    "child_conversation_id":50
+                                }]
+                            },
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:10Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call_status_wait_2",
+                    "name":"wait",
+                    "arguments":"{\"cell_id\":\"12\",\"yield_time_ms\":20000,\"max_tokens\":5000}"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:11Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output",
+                    "call_id":"call_status_wait_2",
+                    "output":"Script completed\nOutput:\nAll done\n"
+                }),
+            ),
+            // Unrelated shell exec + deferred wait must remain visible.
+            rollout_line(
+                "2026-07-17T12:00:12Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_shell_exec",
+                    "name":"exec",
+                    "input":"const r = await tools.shell_command({command:\"sleep 5 && echo hi\"});",
+                    "status":"completed",
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:13Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_shell_exec",
+                    "output":"Script running with cell ID 99\nWall time 10.0 seconds\nOutput:\n"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:14Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call_shell_wait",
+                    "name":"wait",
+                    "arguments":"{\"cell_id\":\"99\",\"yield_time_ms\":20000,\"max_tokens\":5000}"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:15Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output",
+                    "call_id":"call_shell_wait",
+                    "output":"Script completed\nOutput:\nhi\n"
+                }),
+            ),
+        ];
+
+        let path = write_temp_rollout("async-wrap", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "async-wrap")
+            .expect("parse ok");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+
+        let tool_use_ids: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    ..
+                } if tool_name == "exec" || tool_name == "wait" => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        for forbidden in [
+            "call_status_exec_1",
+            "call_status_wait_1",
+            "call_status_exec_2",
+            "call_status_wait_2",
+        ] {
+            assert!(
+                !tool_use_ids.contains(&forbidden),
+                "Codeg MCP wrapper {forbidden} must be suppressed, got {tool_use_ids:?}"
+            );
+        }
+        assert!(
+            tool_use_ids.contains(&"call_shell_exec"),
+            "unrelated shell exec must remain: {tool_use_ids:?}"
+        );
+        assert!(
+            tool_use_ids.contains(&"call_shell_wait"),
+            "unrelated shell wait must remain: {tool_use_ids:?}"
+        );
+
+        let status_count = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { tool_name, .. }
+                        if tool_name == "get_delegation_status"
+                )
+            })
+            .count();
+        assert_eq!(
+            status_count, 2,
+            "both status polls must reconstruct from mcp_tool_call_end"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Finding D: only the built-in codeg-mcp server is reconstructed. A
+    /// different MCP server exposing the same tool name must not become a
+    /// Codeg delegation card or suppress unrelated exec/wait.
+    #[test]
+    fn non_codeg_mcp_server_not_reconstructed_as_delegation() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T13:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"other-mcp","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T13:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"call other"}]
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T13:00:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call",
+                    "call_id":"call_other_exec",
+                    "name":"exec",
+                    "input":"const res = await tools.mcp__other_server__delegate_to_agent({task:\"x\"});",
+                    "status":"completed",
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T13:00:03Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"mcp_tool_call_end",
+                    "call_id":"exec-other-delegate",
+                    "invocation":{
+                        "server":"other-server",
+                        "tool":"delegate_to_agent",
+                        "arguments":{"task":"x"}
+                    },
+                    "result":{
+                        "Ok":{
+                            "content":[{"type":"text","text":"ok"}],
+                            "structuredContent":{"status":"running","task_id":"other-1"},
+                            "isError":false
+                        }
+                    }
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T13:00:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_other_exec",
+                    "output":"Script completed\nOutput:\nok\n"
+                }),
+            ),
+        ];
+
+        let path = write_temp_rollout("other-mcp", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "other-mcp")
+            .expect("parse ok");
+        let blocks: Vec<&ContentBlock> =
+            detail.turns.iter().flat_map(|t| t.blocks.iter()).collect();
+
+        let delegate_count = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse { tool_name, .. }
+                        if tool_name == "delegate_to_agent"
+                )
+            })
+            .count();
+        assert_eq!(
+            delegate_count, 0,
+            "foreign MCP server must not reconstruct as Codeg delegate_to_agent"
+        );
+
+        let has_other_exec = blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    tool_name,
+                    ..
+                } if id == "call_other_exec" && tool_name == "exec"
+            )
+        });
+        assert!(
+            has_other_exec,
+            "unrelated/foreign exec wrapper must remain visible"
+        );
 
         let _ = fs::remove_file(path);
     }

@@ -11,7 +11,7 @@
  */
 
 import { extractEmbeddedJsonObject } from "@/lib/embedded-json"
-import { type AgentType } from "@/lib/types"
+import { ALL_AGENT_TYPES, type AgentType } from "@/lib/types"
 import {
   type DelegationBinding,
   type DelegationStatus,
@@ -42,17 +42,9 @@ export type ParsedInput = {
   workingDir: string | null
 }
 
-const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<AgentType>([
-  "claude_code",
-  "codex",
-  "open_code",
-  "gemini",
-  "cline",
-  "hermes",
-  "code_buddy",
-  "kimi_code",
-  "pi",
-])
+/** Derived from the shared registry so history reload cannot drift behind
+ *  `ALL_AGENT_TYPES` (e.g. missing `grok` → generic "Sub-agent" label). */
+const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<string>(ALL_AGENT_TYPES)
 
 export type ParsedMeta = {
   status: DelegationStatus
