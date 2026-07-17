@@ -735,6 +735,22 @@ pub mod mock {
             );
         }
 
+        /// Seed the direct parent/child conversation edge for a running task
+        /// (used by coordination / attention Broker tests).
+        pub async fn seed_edge(
+            &self,
+            task_id: &str,
+            parent_conversation_id: i32,
+            child_conversation_id: i32,
+        ) {
+            self.seed_running(
+                task_id,
+                child_conversation_id,
+                Some(parent_conversation_id),
+            )
+            .await;
+        }
+
         pub async fn queue_settle_ok(&self, settlement: Settlement) {
             self.settle_script
                 .lock()

@@ -660,6 +660,20 @@ pub mod mock {
             Self::default()
         }
 
+        /// Record the authorized direct edge for a task. Open stays permissive
+        /// for existing Join unit tests that call `open_or_recover` without
+        /// seeding; Broker coordination tests call this for API parity with
+        /// [`crate::acp::delegation::store::mock::MockTaskStore::seed_edge`].
+        pub async fn seed_edge(
+            &self,
+            _task_id: &str,
+            _parent_conversation_id: i32,
+            _child_conversation_id: i32,
+        ) {
+            // Memory open does not gate on conversation-row edges; the Broker
+            // loads child_conversation_id from the task store instead.
+        }
+
         fn find_by_task_and_tool_locked(
             rows: &HashMap<String, AttentionRecord>,
             task_id: &str,

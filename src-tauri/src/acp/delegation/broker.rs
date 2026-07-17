@@ -57,7 +57,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::acp::delegation::attention::{DelegationAttentionStore, NoopDelegationAttentionStore};
+use crate::acp::delegation::attention::{
+    validate_attention_payload, AttentionRecord, AttentionResolutionCode, AttentionResolveResult,
+    AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
+    NoopDelegationAttentionStore,
+};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -71,8 +75,8 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
-    ObservationSnapshot, TaskObservation, TaskStatus,
+    DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
+    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, TaskObservation, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::db::entities::conversation::ConversationStatus;
@@ -347,6 +351,10 @@ struct PendingInner {
     /// order. Keys and stamps share this sequence but are never cross-compared
     /// (keys match by identity, stamps only by `<` against other stamps).
     seq: u64,
+    /// Live coordination edges keyed by child connection id. Registered before
+    /// the child's first prompt enqueue; removed after attention closure on a
+    /// winning terminal settlement (not on Join waiter cancel).
+    coordination_by_child: HashMap<String, CoordinationIdentity>,
 }
 
 /// One in-flight `handle_request` setup tracked for parent-cancel coverage.
@@ -358,6 +366,92 @@ struct InflightSetup {
     /// so a cancel can't be lost between `handle_request`'s checkpoints, and its
     /// stamp lets the park order it against a racing child terminal.
     canceled_at: Option<u64>,
+}
+
+/// Live parent/child coordination edge for attention (parent-decision) waits.
+/// Keyed by child connection id; registered before the child's first prompt is
+/// enqueued so an immediate MCP `request_parent_decision` can resolve the edge.
+#[derive(Debug, Clone)]
+pub(crate) struct CoordinationIdentity {
+    pub(crate) task_id: String,
+    #[allow(dead_code)] // reserved for later cascade / tooling tasks
+    pub(crate) child_connection_id: String,
+    pub(crate) parent_connection_id: String,
+    pub(crate) parent_conversation_id: i32,
+    #[allow(dead_code)] // reserved for later cascade / tooling tasks
+    pub(crate) parent_tool_use_id: String,
+}
+
+fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
+    match error {
+        AttentionStoreError::PayloadTooLarge => (
+            "payload_too_large",
+            "attention payload exceeds 16 KiB",
+        ),
+        AttentionStoreError::BlankPayload => (
+            "invalid_payload",
+            "attention payload must not be blank",
+        ),
+        AttentionStoreError::Unauthorized => (
+            "unauthorized",
+            "delegation attention edge is not authorized",
+        ),
+        AttentionStoreError::AlreadyOpen => (
+            "already_open",
+            "this task already has an open parent decision request",
+        ),
+        AttentionStoreError::TaskNotRunning => (
+            "task_not_running",
+            "delegation task is no longer running",
+        ),
+        AttentionStoreError::NotFound => (
+            "not_found",
+            "delegation attention request was not found",
+        ),
+        AttentionStoreError::Database(_) => (
+            "attention_unavailable",
+            "delegation attention persistence is unavailable",
+        ),
+    }
+}
+
+fn rejected_decision(error: AttentionStoreError) -> ParentDecisionResult {
+    let (code, message) = attention_rejection(&error);
+    ParentDecisionResult::Rejected {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn rejected_reply(error: AttentionStoreError) -> DelegationReplyResult {
+    let (code, message) = attention_rejection(&error);
+    DelegationReplyResult::Rejected {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn map_reply_result(request_id: &str, result: AttentionResolveResult) -> DelegationReplyResult {
+    match result {
+        AttentionResolveResult::Resolved(_) => DelegationReplyResult::Replied {
+            request_id: request_id.to_string(),
+        },
+        AttentionResolveResult::Idempotent(_) => DelegationReplyResult::Idempotent {
+            request_id: request_id.to_string(),
+        },
+        AttentionResolveResult::Conflict(record) => match record.resolution_code {
+            Some(resolution_code) => DelegationReplyResult::AlreadyResolved {
+                request_id: request_id.to_string(),
+                resolution_code,
+            },
+            None => DelegationReplyResult::Rejected {
+                code: "attention_invariant".into(),
+                message: "resolved attention is missing its resolution code".into(),
+            },
+        },
+        AttentionResolveResult::Missing => DelegationReplyResult::Missing,
+        AttentionResolveResult::Unauthorized => DelegationReplyResult::Unauthorized,
+    }
 }
 
 impl PendingInner {
@@ -1375,6 +1469,9 @@ pub struct DelegationBroker {
     /// production and Join-focused tests inject a real/memory store via
     /// [`Self::with_attention_store`].
     attention_store: Arc<dyn DelegationAttentionStore>,
+    /// Woken after durable attention open / reply / terminal closure so a
+    /// parked `request_parent_decision` rechecks `wait_snapshot`.
+    attention_notify: Arc<Notify>,
     /// Count of persistence-retry workers actually spawned (single-flight
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1445,6 +1542,7 @@ impl DelegationBroker {
             supervisor_wake_rx: Arc::new(std::sync::Mutex::new(None)),
             metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
             attention_store: Arc::new(NoopDelegationAttentionStore),
+            attention_notify: Arc::new(Notify::new()),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -1459,13 +1557,206 @@ impl DelegationBroker {
         self
     }
 
-    /// Inject the attention store used by Join (`list_open_for_tasks`).
+    /// Inject the attention store used by Join (`list_open_for_tasks`) and the
+    /// parent-decision lifecycle (`request_parent_decision` / `reply_to_delegation`).
     pub fn with_attention_store(
         mut self,
         attention_store: Arc<dyn DelegationAttentionStore>,
     ) -> Self {
         self.attention_store = attention_store;
         self
+    }
+
+    /// Child requests a blocking parent decision. Persists an open attention
+    /// row first, wakes Join via `result_notify`, then parks until a durable
+    /// resolution appears in `wait_snapshot`. Dropping this future (MCP socket
+    /// close) does not resolve or delete the row; a replay of the same
+    /// internal tool call id recovers it.
+    pub async fn request_parent_decision(
+        &self,
+        child_connection_id: &str,
+        child_tool_call_id: &str,
+        message: &str,
+    ) -> ParentDecisionResult {
+        if child_tool_call_id.is_empty() {
+            return ParentDecisionResult::Rejected {
+                code: "invalid_tool_call_id".into(),
+                message: "decision request is missing its internal call id".into(),
+            };
+        }
+        if let Err(error) = validate_attention_payload(message) {
+            return rejected_decision(error);
+        }
+        let identity = {
+            self.pending
+                .inner
+                .lock()
+                .await
+                .coordination_by_child
+                .get(child_connection_id)
+                .cloned()
+        };
+        let Some(identity) = identity else {
+            return ParentDecisionResult::Rejected {
+                code: "not_delegation_child".into(),
+                message: "only a live Codeg delegation child can request a parent decision"
+                    .into(),
+            };
+        };
+        let persisted = match self.task_store.load(&identity.task_id).await {
+            Ok(Some(task)) if task.parent_id == Some(identity.parent_conversation_id) => task,
+            _ => {
+                return ParentDecisionResult::Rejected {
+                    code: "task_unavailable".into(),
+                    message: "delegation task is unavailable".into(),
+                };
+            }
+        };
+        let opened = match self
+            .attention_store
+            .open_or_recover(NewAttentionRequest {
+                task_id: identity.task_id.clone(),
+                parent_conversation_id: identity.parent_conversation_id,
+                child_conversation_id: persisted.child_conversation_id,
+                child_tool_call_id: child_tool_call_id.to_string(),
+                message: message.to_string(),
+                created_at: Utc::now(),
+            })
+            .await
+        {
+            Ok(opened) => opened,
+            Err(error) => return rejected_decision(error),
+        };
+        let request_id = opened.record().summary.request_id.clone();
+
+        // The row is durable before either waiter is nudged.
+        self.result_notify.notify_waiters();
+        loop {
+            let notified = self.attention_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let record = match self.attention_store.wait_snapshot(&request_id).await {
+                Ok(record) => record,
+                Err(error) => return rejected_decision(error),
+            };
+            if let Some(code) = record.resolution_code {
+                return if code == AttentionResolutionCode::ParentReply {
+                    match record.reply {
+                        Some(reply) => ParentDecisionResult::Replied {
+                            request_id,
+                            reply,
+                        },
+                        None => ParentDecisionResult::Rejected {
+                            code: "attention_invariant".into(),
+                            message: "parent reply resolution is missing its reply".into(),
+                        },
+                    }
+                } else {
+                    ParentDecisionResult::Closed {
+                        request_id,
+                        resolution_code: code,
+                    }
+                };
+            }
+            notified.await;
+        }
+    }
+
+    /// Direct parent replies to an open attention request. Authorization is
+    /// the durable parent conversation id plus a live coordination edge while
+    /// the request is still open. Persist resolution before waking the child
+    /// or Join waiters.
+    pub async fn reply_to_delegation(
+        &self,
+        caller_connection_id: &str,
+        caller_conversation_id: Option<i32>,
+        request_id: &str,
+        reply: &str,
+    ) -> DelegationReplyResult {
+        if let Err(error) = validate_attention_payload(reply) {
+            return rejected_reply(error);
+        }
+        let Some(caller_conversation_id) = caller_conversation_id else {
+            return DelegationReplyResult::Unauthorized;
+        };
+        let record = match self.attention_store.wait_snapshot(request_id).await {
+            Ok(record) => record,
+            Err(AttentionStoreError::NotFound) => return DelegationReplyResult::Missing,
+            Err(error) => return rejected_reply(error),
+        };
+        if record.parent_conversation_id != caller_conversation_id {
+            return DelegationReplyResult::Unauthorized;
+        }
+        if record.resolution_code.is_none() {
+            let owns_live_edge = self
+                .pending
+                .inner
+                .lock()
+                .await
+                .coordination_by_child
+                .values()
+                .any(|identity| {
+                    identity.task_id == record.summary.task_id
+                        && identity.parent_connection_id == caller_connection_id
+                        && identity.parent_conversation_id == caller_conversation_id
+                });
+            if !owns_live_edge {
+                return DelegationReplyResult::Unauthorized;
+            }
+        }
+
+        let result = match self
+            .attention_store
+            .reply(caller_conversation_id, request_id, reply, Utc::now())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return rejected_reply(error),
+        };
+        let public = map_reply_result(request_id, result);
+        if matches!(
+            public,
+            DelegationReplyResult::Replied { .. } | DelegationReplyResult::Idempotent { .. }
+        ) {
+            // Resolution is durable before the child waiter is nudged.
+            self.attention_notify.notify_waiters();
+            self.result_notify.notify_waiters();
+        }
+        public
+    }
+
+    /// Close any open attention for `task_id` with a terminal resolution code.
+    /// Persist-before-notify; storage errors are logged and do not undo a
+    /// winning task CAS. Always nudges attention waiters so a stuck child can
+    /// recheck (and fail open via NotFound / already-resolved snapshot).
+    async fn close_task_attention(
+        &self,
+        task_id: &str,
+        code: AttentionResolutionCode,
+    ) -> Option<AttentionRecord> {
+        match self
+            .attention_store
+            .resolve_task(task_id, code, Utc::now())
+            .await
+        {
+            Ok(record) => {
+                if record.is_some() {
+                    self.attention_notify.notify_waiters();
+                    self.result_notify.notify_waiters();
+                }
+                record
+            }
+            Err(error) => {
+                let (error_code, _) = attention_rejection(&error);
+                tracing::error!(
+                    %task_id,
+                    error_code,
+                    "[delegation] failed to close attention"
+                );
+                self.attention_notify.notify_waiters();
+                None
+            }
+        }
     }
 
     /// Shared metrics handle for supervisor / listener / tests.
@@ -1665,14 +1956,35 @@ impl DelegationBroker {
         self
     }
 
-    /// Reconcile orphaned running delegate rows after host restart. Call after
-    /// migrations/settings load and before the delegation listener accepts
-    /// requests.
+    /// Reconcile open attention, then orphaned running delegate rows, after
+    /// host restart. Call after migrations/settings load and before the
+    /// delegation listener accepts requests. Attention is reconciled first so
+    /// Task 11 can record host_restarted/task_terminal reasons from the
+    /// winning attention records without re-querying by timestamp.
     pub async fn reconcile_running_on_startup(&self) -> Result<u64, String> {
-        self.task_store
-            .reconcile_running(Utc::now())
+        let at = Utc::now();
+        let reconciled_attention = self
+            .attention_store
+            .reconcile_open(at)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|error| format!("reconcile attention failed: {error}"))?;
+        let attention_count = reconciled_attention.len();
+        let task_count = self
+            .task_store
+            .reconcile_running(at)
+            .await
+            .map_err(|error| format!("reconcile running tasks failed: {error}"))?;
+        // Keep `reconciled_attention` alive through task reconciliation so
+        // future metrics (Task 11) can consume these exact winning records.
+        let _ = reconciled_attention;
+        tracing::info!(
+            attention_count,
+            task_count,
+            "[delegation] startup reconciliation complete"
+        );
+        self.attention_notify.notify_waiters();
+        self.result_notify.notify_waiters();
+        Ok(task_count)
     }
 
     /// Record a parent ACP `tool_call_id` whose title indicates the LLM is
@@ -2695,11 +3007,23 @@ impl DelegationBroker {
         // `child_connection_id` lets each resolver gate on the id it holds —
         // `complete_call` the `call_id`, `cancel_by_child_connection` the
         // `child_connection_id`.
-        self.pending
-            .inner
-            .lock()
-            .await
-            .reserve(&call_id, &child_connection_id);
+        // Reserve setup AND register coordination under the same lock before
+        // the prompt-enqueue boundary so an immediate child MCP decision call
+        // can resolve the parent edge without waiting for `running` insert.
+        {
+            let mut inner = self.pending.inner.lock().await;
+            inner.reserve(&call_id, &child_connection_id);
+            inner.coordination_by_child.insert(
+                child_connection_id.clone(),
+                CoordinationIdentity {
+                    task_id: call_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_conversation_id: req.parent_conversation_id,
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                },
+            );
+        }
 
         let child_conversation_id = match self
             .spawner
@@ -2708,10 +3032,11 @@ impl DelegationBroker {
         {
             Ok(cid) => cid,
             Err(e) => {
-                // Clear setup reservation before any settle / disconnect.
+                // Clear setup reservation + coordination before any settle / disconnect.
                 {
                     let mut inner = self.pending.inner.lock().await;
                     inner.unreserve(&call_id, &child_connection_id);
+                    inner.coordination_by_child.remove(&child_connection_id);
                     inner.deregister_inflight(inflight_id);
                 }
                 // Prefer child id from the structured Send error; otherwise
@@ -3050,6 +3375,21 @@ impl DelegationBroker {
                     report.message = None;
                 } else if let Some(msg) = ctx.message.clone() {
                     report.message = Some(msg);
+                }
+                // Attention closure + coordination release before completed
+                // cache / Join notify / meta / event / disconnect. Attention
+                // write errors are logged inside the helper and never undo the
+                // winning task CAS.
+                if won {
+                    let _ = self
+                        .close_task_attention(task_id, AttentionResolutionCode::TaskTerminal)
+                        .await;
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner
+                            .coordination_by_child
+                            .remove(&ctx.child_connection_id);
+                    }
                 }
                 // Atomic settling → completed (or first completed insert for
                 // setup-window settles that never entered `running`).
@@ -4219,6 +4559,21 @@ impl DelegationBroker {
         self.result_notify.notify_waiters();
     }
 
+    /// Peek the live coordination identity for a child connection (Task 5 tests).
+    #[cfg(test)]
+    async fn coordination_for_test(
+        &self,
+        child_connection_id: &str,
+    ) -> Option<CoordinationIdentity> {
+        self.pending
+            .inner
+            .lock()
+            .await
+            .coordination_by_child
+            .get(child_connection_id)
+            .cloned()
+    }
+
     /// Insert a live running task under `parent_connection_id` without going
     /// through spawn (cross-parent ownership tests).
     #[cfg(any(test, feature = "test-utils"))]
@@ -5096,6 +5451,226 @@ mod tests {
             .unwrap();
         assert_eq!(reports[0].status, TaskStatus::Completed);
         assert_eq!(reports[1].status, TaskStatus::Running);
+    }
+
+    // -- Coordination identity + attention lifecycle (Task 5) --------------
+
+    async fn wait_until<F, Fut>(mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if check().await {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("wait_until timed out");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_for_open_request(
+        attention: &crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore,
+        task_id: &str,
+    ) -> crate::acp::delegation::attention::AttentionRequestSummary {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // list_open_for_tasks needs the parent conversation id; scan via
+            // wait_snapshot is not available by task alone, so open a temporary
+            // recover path is not used — instead open_or_recover recovery is
+            // checked through list with a wide parent id probe after seed.
+            // Broker tests seed edges with known parent ids; poll both common
+            // parents and any open row matching task_id.
+            for parent in [1i32, 2, 3, 11, 22] {
+                if let Ok(open) = attention.list_open_for_tasks(parent, &[task_id.to_string()]).await
+                {
+                    if let Some(summary) = open.into_iter().next() {
+                        return summary;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("wait_for_open_request timed out for task {task_id}");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn coordination_broker() -> (
+        DelegationBroker,
+        Arc<MockSpawner>,
+        Arc<crate::acp::delegation::store::mock::MockTaskStore>,
+        Arc<crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore>,
+    ) {
+        use crate::acp::delegation::attention::{
+            mock::MemoryDelegationAttentionStore, DelegationAttentionStore,
+        };
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        let task_store = Arc::new(MockTaskStore::accept_any_running(22));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = DelegationBroker::new(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>)
+        .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
+        enable_delegation(&broker).await;
+        (broker, spawner, task_store, attention)
+    }
+
+    fn coordination_request(parent_conn: &str, parent_conv: i32) -> DelegationRequest {
+        let mut req = request(parent_conv, "tu-coord");
+        req.parent_connection_id = parent_conn.into();
+        req
+    }
+
+    #[tokio::test]
+    async fn coordination_identity_exists_before_child_prompt_enqueue_can_run() {
+        let (broker, spawner, _task_store, _attention) = coordination_broker().await;
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(22)).await;
+        let release = spawner.install_send_gate().await;
+
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+        let identity = broker.coordination_for_test("child-conn").await.unwrap();
+        assert_eq!(identity.parent_connection_id, "parent");
+        assert_eq!(identity.parent_conversation_id, 11);
+        assert!(!identity.task_id.is_empty());
+        assert!(!start.is_finished());
+
+        release.send(()).unwrap();
+        assert_eq!(start.await.unwrap().status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn decision_persists_wakes_join_and_blocks_until_direct_parent_replies() {
+        use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+
+        let (broker, spawner, task_store, attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        task_store.seed_edge(&task_id, 11, 22).await;
+        attention.seed_edge(&task_id, 11, 22).await;
+        let ids = vec![task_id.clone()];
+
+        let join = tokio::spawn({
+            let broker = broker.clone();
+            let ids = ids.clone();
+            async move { broker.join_tasks_status("parent", Some(11), &ids).await }
+        });
+        let decision = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("child-conn", "child-tool-1", "Use A or B?")
+                    .await
+            }
+        });
+
+        let joined = within(join).await.unwrap();
+        assert_eq!(joined.wake_reason, Some(DelegationWakeReason::AttentionRequired));
+        let request_id = joined.attention_requests.unwrap()[0].request_id.clone();
+        assert!(!decision.is_finished());
+
+        let reply = broker
+            .reply_to_delegation("parent", Some(11), &request_id, "Use A")
+            .await;
+        assert!(matches!(reply, DelegationReplyResult::Replied { .. }));
+        assert_eq!(
+            within(decision).await.unwrap(),
+            ParentDecisionResult::Replied {
+                request_id,
+                reply: "Use A".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_and_reply_follow_direct_edges_only_in_nested_delegation() {
+        use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+
+        let (broker, spawner, task_store, attention) = coordination_broker().await;
+        let root_child = spawn_running(&broker, &spawner, "root-conn", 1, "child-conn").await;
+        let grandchild = spawn_running(&broker, &spawner, "child-conn", 2, "grand-conn").await;
+        task_store.seed_edge(&root_child, 1, 2).await;
+        task_store.seed_edge(&grandchild, 2, 3).await;
+        attention.seed_edge(&root_child, 1, 2).await;
+        attention.seed_edge(&grandchild, 2, 3).await;
+
+        let wait = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("grand-conn", "tc-grand", "Which API?")
+                    .await
+            }
+        });
+        let open = wait_for_open_request(&attention, &grandchild).await;
+
+        assert_eq!(
+            broker
+                .reply_to_delegation("root-conn", Some(1), &open.request_id, "v1")
+                .await,
+            DelegationReplyResult::Unauthorized
+        );
+        assert!(matches!(
+            broker
+                .reply_to_delegation("child-conn", Some(2), &open.request_id, "v2")
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            within(wait).await.unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_winner_closes_open_decision_and_unblocks_child_once() {
+        use crate::acp::delegation::attention::AttentionResolutionCode;
+        use crate::acp::delegation::types::ParentDecisionResult;
+
+        let (broker, spawner, task_store, attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        task_store.seed_edge(&task_id, 11, 22).await;
+        attention.seed_edge(&task_id, 11, 22).await;
+        let decision = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("child-conn", "tc-1", "Continue?")
+                    .await
+            }
+        });
+        wait_for_open_request(&attention, &task_id).await;
+
+        complete(&broker, &task_id, "finished elsewhere").await;
+        assert!(matches!(
+            within(decision).await.unwrap(),
+            ParentDecisionResult::Closed {
+                resolution_code: AttentionResolutionCode::TaskTerminal,
+                ..
+            }
+        ));
+        assert!(broker.coordination_for_test("child-conn").await.is_none());
     }
 
     /// A batch `Infinite` wait must NOT hold an already-terminal result hostage

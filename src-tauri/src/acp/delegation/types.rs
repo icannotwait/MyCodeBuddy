@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::models::AgentType;
 
 /// Soft-watchdog health for a **running** Broker task only. Terminal tasks
@@ -456,6 +457,39 @@ impl DelegationStatusBatch {
             attention_requests: Some(attention_requests),
         }
     }
+}
+
+/// Result of a child `request_parent_decision` wait (MCP surface later in Task 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ParentDecisionResult {
+    Replied {
+        request_id: String,
+        reply: String,
+    },
+    Closed {
+        request_id: String,
+        resolution_code: AttentionResolutionCode,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+/// Result of a parent `reply_to_delegation` attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DelegationReplyResult {
+    Replied { request_id: String },
+    Idempotent { request_id: String },
+    AlreadyResolved {
+        request_id: String,
+        resolution_code: AttentionResolutionCode,
+    },
+    Missing,
+    Unauthorized,
+    Rejected { code: String, message: String },
 }
 
 impl DelegationOutcome {

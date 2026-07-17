@@ -144,6 +144,9 @@ pub fn build_delegation_stack(
     };
     use crate::acp::delegation::meta_writer::{ConnectionManagerMetaWriter, DelegationMetaWriter};
     use crate::acp::delegation::spawner::ConnectionSpawner;
+    use crate::acp::delegation::attention::{
+        DbDelegationAttentionStore, DelegationAttentionStore,
+    };
     use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
     use crate::acp::manager::ConnectionManagerSpawner;
 
@@ -164,6 +167,8 @@ pub fn build_delegation_stack(
         Arc::new(DbDepthLookup { db: db_arc.clone() }) as Arc<dyn ConversationDepthLookup>;
     let task_store =
         Arc::new(DbDelegationTaskStore::new(db_arc.clone())) as Arc<dyn DelegationTaskStore>;
+    let attention_store = Arc::new(DbDelegationAttentionStore::new(db_arc.clone()))
+        as Arc<dyn DelegationAttentionStore>;
     let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
         manager: cm_arc.clone(),
@@ -177,6 +182,7 @@ pub fn build_delegation_stack(
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
             .with_task_store(task_store)
+            .with_attention_store(attention_store)
             .with_status_lookup(status_lookup)
             .with_live_reply_lookup(live_reply_lookup)
             .with_metrics(delegation_metrics.clone()),
