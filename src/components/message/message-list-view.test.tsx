@@ -341,9 +341,7 @@ function lastOverlayProps(): {
   return calls[calls.length - 1][0]
 }
 
-function activityTaskIds(
-  props: ReturnType<typeof lastOverlayProps>
-): string[] {
+function activityTaskIds(props: ReturnType<typeof lastOverlayProps>): string[] {
   return (props.activities ?? [])
     .map((a) => a.task_id)
     .filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -738,7 +736,12 @@ describe("MessageListView sub-agent overlay composition", () => {
     // derivation + dedupe (not a store non-empty short circuit).
     seedHistory([
       userTurn("u1", "first"),
-      nativeSpawnAssistantTurn("a1", "call-old", "task-older", "2026-05-28T00:00:01.000Z"),
+      nativeSpawnAssistantTurn(
+        "a1",
+        "call-old",
+        "task-older",
+        "2026-05-28T00:00:01.000Z"
+      ),
       userTurn("u2", "second"),
       nativeSpawnAssistantTurn(
         "a2",
@@ -784,9 +787,7 @@ describe("MessageListView sub-agent overlay composition", () => {
 
     const props = lastOverlayProps()
     const taskIds = activityTaskIds(props)
-    expect(taskIds).toEqual(
-      expect.arrayContaining(["task-store", "task-live"])
-    )
+    expect(taskIds).toEqual(expect.arrayContaining(["task-store", "task-live"]))
     expect(taskIds.filter((id) => id === "task-store")).toHaveLength(1)
     expect(taskIds.filter((id) => id === "task-live")).toHaveLength(1)
   })
