@@ -637,10 +637,11 @@ async fn build_agent(
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
             //    CLI's background self-update (it would drift off the pin and can
             //    break the ACP contract). Config twin: `[cli].auto_update = false`.
-            //  - `--disallowed-tools ask_user_question`: Grok's built-in
-            //    `ask_user_question` collides with `codeg-mcp__ask_user_question`
-            //    and blocks outside Codeg's QuestionRequest flow. Disable the
-            //    native tool so structured questions route through codeg-mcp.
+            //  - `--disallowed-tools ask_user_question`: best-effort only —
+            //    Grok treats this flag as **headless-only** (`-p`); on
+            //    `agent stdio` ACP it is ignored. The effective disable is
+            //    `_meta.askUserQuestion: false` on session new/load/resume
+            //    (see `merge_grok_ask_user_question_meta`).
             //  - `--always-approve`: auto-approve tool executions, but ONLY when the
             //    user selected that permission mode in the Grok panel. "ask"/unset
             //    leaves it off so ACP permission requests still reach codeg's UI.
@@ -1836,9 +1837,30 @@ fn merge_claude_route_meta(
     Ok(meta)
 }
 
-/// Merge Claude raw-SDK meta, route suppression, terminal snapshot, and adapter
-/// contributions. Consumes the immutable `route_plan` only for
-/// `native_suppression` (Claude deny list).
+/// Stamp Grok pager `--no-ask-user` parity into session `_meta`.
+///
+/// Grok shell reads `_meta.askUserQuestion == false` (via
+/// `parse_ask_user_question_from_meta`) and strips native
+/// `GrokBuild:ask_user_question` from the toolset so structured questions route
+/// through `codeg-mcp__ask_user_question`. CLI `--disallowed-tools` is
+/// **headless-only** and is ignored on `agent stdio` ACP launches — this meta
+/// stamp is the ACP-effective gate.
+fn merge_grok_ask_user_question_meta(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    agent_type: AgentType,
+) -> serde_json::Map<String, serde_json::Value> {
+    if agent_type == AgentType::Grok {
+        meta.insert(
+            "askUserQuestion".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    meta
+}
+
+/// Merge Claude raw-SDK meta, Grok ask-user gate, route suppression, terminal
+/// snapshot, and adapter contributions. Consumes the immutable `route_plan`
+/// only for `native_suppression` (Claude deny list).
 fn session_request_meta(
     agent_type: AgentType,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -1846,7 +1868,8 @@ fn session_request_meta(
     adapter: &dyn AcpTerminalAdapter,
 ) -> Result<Meta, AcpError> {
     let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
-    let with_route = merge_claude_route_meta(existing, route_plan)?;
+    let with_grok = merge_grok_ask_user_question_meta(existing, agent_type);
+    let with_route = merge_claude_route_meta(with_grok, route_plan)?;
     terminal_metadata(with_route, spec, adapter)
 }
 
@@ -8096,6 +8119,87 @@ mod tests {
         let meta = req.meta.as_ref().expect("terminal meta required");
         assert!(!meta.contains_key("claudeCode"));
         assert!(meta.contains_key("codeg.dev/terminal"));
+    }
+
+    /// Grok pager `--no-ask-user` stamps `_meta.askUserQuestion = false` so the
+    /// shell strips native `GrokBuild:ask_user_question`. Codeg must do the same
+    /// on every session open path (new / load / resume); ACP ignores the
+    /// headless-only `--disallowed-tools` flag.
+    #[test]
+    fn grok_session_meta_disables_native_ask_user_on_new_load_resume() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::Grok);
+        let plan = native_plan(AgentType::Grok);
+
+        let new_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let load_req = build_load_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-load".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+        let resume_req = build_resume_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-resume".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+        )
+        .unwrap();
+
+        for (label, meta) in [
+            ("new", new_req.meta.as_ref()),
+            ("load", load_req.meta.as_ref()),
+            ("resume", resume_req.meta.as_ref()),
+        ] {
+            let meta = meta.unwrap_or_else(|| panic!("{label}: session meta required"));
+            assert_eq!(
+                meta.get("askUserQuestion").and_then(|v| v.as_bool()),
+                Some(false),
+                "{label}: askUserQuestion must be false (Grok --no-ask-user parity)"
+            );
+            // Terminal snapshot still merges; the ask-user stamp is additive.
+            assert!(
+                meta.contains_key("codeg.dev/terminal"),
+                "{label}: terminal meta must remain"
+            );
+        }
+    }
+
+    #[test]
+    fn non_grok_session_meta_omits_ask_user_question_flag() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        for agent in [AgentType::Codex, AgentType::ClaudeCode] {
+            let req = build_new_session_request(
+                agent,
+                &cwd,
+                Vec::new(),
+                &test_posix_spec(),
+                adapter_for(agent),
+                &native_plan(agent),
+            )
+            .unwrap();
+            let meta = req.meta.as_ref().expect("session meta required");
+            assert!(
+                !meta.contains_key("askUserQuestion"),
+                "{agent:?}: askUserQuestion is Grok-only"
+            );
+        }
     }
 
     fn assert_codeg_terminal_meta(value: &serde_json::Value, dialect: &str, shell: &str) {
