@@ -412,7 +412,6 @@ pub(crate) fn find_session_file_in(base_dir: &Path, session_id: &str) -> Option<
 }
 
 impl ClaudeParser {
-
     fn parse_jsonl_summary(
         &self,
         path: &PathBuf,
@@ -839,26 +838,15 @@ impl ClaudeRecordAccumulator {
                     .and_then(|c| c.as_str())
                 {
                     if raw.trim_start().starts_with("<task-notification>") {
-                        if let Some(task_id) =
-                            capture_tag(task_notification_task_id_regex(), raw)
-                        {
+                        if let Some(task_id) = capture_tag(task_notification_task_id_regex(), raw) {
                             background_notifications.insert(
                                 task_id,
                                 BackgroundNotification {
-                                    status: capture_tag(
-                                        task_notification_status_regex(),
-                                        raw,
-                                    )
-                                    .unwrap_or_else(|| "completed".to_string()),
-                                    summary: capture_tag(
-                                        task_notification_summary_regex(),
-                                        raw,
-                                    ),
-                                    result: capture_tag(
-                                        task_notification_result_regex(),
-                                        raw,
-                                    )
-                                    .map(|r| truncate_str(&r, BACKGROUND_RESULT_MAX_CHARS)),
+                                    status: capture_tag(task_notification_status_regex(), raw)
+                                        .unwrap_or_else(|| "completed".to_string()),
+                                    summary: capture_tag(task_notification_summary_regex(), raw),
+                                    result: capture_tag(task_notification_result_regex(), raw)
+                                        .map(|r| truncate_str(&r, BACKGROUND_RESULT_MAX_CHARS)),
                                 },
                             );
                         }
@@ -928,17 +916,14 @@ impl ClaudeRecordAccumulator {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                         {
-                            if let Some(ack_tool_use_id) =
-                                content.iter().find_map(|b| match b {
-                                    ContentBlock::ToolResult {
-                                        tool_use_id: Some(id),
-                                        ..
-                                    } => Some(id.clone()),
-                                    _ => None,
-                                })
-                            {
-                                background_acks
-                                    .insert(ack_tool_use_id, task_id.to_string());
+                            if let Some(ack_tool_use_id) = content.iter().find_map(|b| match b {
+                                ContentBlock::ToolResult {
+                                    tool_use_id: Some(id),
+                                    ..
+                                } => Some(id.clone()),
+                                _ => None,
+                            }) {
+                                background_acks.insert(ack_tool_use_id, task_id.to_string());
                             }
                         }
                     }
@@ -957,8 +942,7 @@ impl ClaudeRecordAccumulator {
                                 let subagent_path =
                                     subagent_dir.join(format!("agent-{}.jsonl", agent_id));
                                 if subagent_path.exists() {
-                                    stats.tool_calls =
-                                        parse_subagent_tool_calls(&subagent_path);
+                                    stats.tool_calls = parse_subagent_tool_calls(&subagent_path);
                                 }
                             }
                         }
@@ -1354,8 +1338,8 @@ fn extract_user_text(value: &serde_json::Value) -> Option<String> {
         for item in arr {
             if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if let Some(cleaned) = strip_system_tags(text)
-                        .and_then(|t| super::visible_user_text(&t))
+                    if let Some(cleaned) =
+                        strip_system_tags(text).and_then(|t| super::visible_user_text(&t))
                     {
                         return Some(cleaned);
                     }
@@ -1379,9 +1363,7 @@ fn extract_user_content(value: &serde_json::Value) -> Vec<ContentBlock> {
     };
 
     if let Some(text) = content.as_str() {
-        if let Some(cleaned) =
-            strip_system_tags(text).and_then(|t| super::visible_user_text(&t))
-        {
+        if let Some(cleaned) = strip_system_tags(text).and_then(|t| super::visible_user_text(&t)) {
             blocks.push(ContentBlock::Text { text: cleaned });
         }
         return blocks;
@@ -1393,8 +1375,8 @@ fn extract_user_content(value: &serde_json::Value) -> Vec<ContentBlock> {
             match block_type {
                 "text" => {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        if let Some(cleaned) = strip_system_tags(text)
-                            .and_then(|t| super::visible_user_text(&t))
+                        if let Some(cleaned) =
+                            strip_system_tags(text).and_then(|t| super::visible_user_text(&t))
                         {
                             blocks.push(ContentBlock::Text { text: cleaned });
                         }
@@ -1952,10 +1934,8 @@ mod tests {
         let settled = &previews.iter().find(|(id, _)| id == "toolu_01").unwrap().1;
         assert!(settled.starts_with(BACKGROUND_TASK_MARKER));
         assert!(!settled.contains("never quote"));
-        let payload: serde_json::Value = serde_json::from_str(
-            settled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap(),
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(settled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap()).unwrap();
         assert_eq!(payload["task_id"], "abc123");
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["summary"], "Agent \"Run pnpm build\" finished");
@@ -1964,10 +1944,8 @@ mod tests {
         // Unsettled: marker present, status null (frontend must NOT claim
         // "running" from the transcript alone — CC's zombie trap).
         let unsettled = &previews.iter().find(|(id, _)| id == "toolu_02").unwrap().1;
-        let payload: serde_json::Value = serde_json::from_str(
-            unsettled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap(),
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(unsettled.strip_prefix(BACKGROUND_TASK_MARKER).unwrap()).unwrap();
         assert_eq!(payload["task_id"], "nores99");
         assert!(payload["status"].is_null());
     }
@@ -2854,6 +2832,8 @@ earlier terminal context records.\n\
             .iter()
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
-        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
     }
 }

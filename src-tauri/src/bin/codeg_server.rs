@@ -307,17 +307,11 @@ async fn async_main() -> ExitCode {
     .await;
     // Same for the live-feedback enable flag, so the first companion launch
     // sees the operator's configured behavior.
-    codeg_lib::commands::feedback::apply_persisted_feedback_config(
-        &state.db.conn,
-        &stack.feedback,
-    )
-    .await;
+    codeg_lib::commands::feedback::apply_persisted_feedback_config(&state.db.conn, &stack.feedback)
+        .await;
     // Same for the ask-user-question enable flag.
-    codeg_lib::commands::question::apply_persisted_question_config(
-        &state.db.conn,
-        &stack.ask,
-    )
-    .await;
+    codeg_lib::commands::question::apply_persisted_question_config(&state.db.conn, &stack.ask)
+        .await;
     // Same for the get-session-info enable flag.
     codeg_lib::commands::session_info::apply_persisted_session_info_config(
         &state.db.conn,

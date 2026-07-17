@@ -253,11 +253,7 @@ pub async fn set_conversation_delegation_route(
     {
         let mut map = state.connection_manager.connections.lock().await;
         for conn in map.values_mut() {
-            let bound = conn
-                .state
-                .try_read()
-                .ok()
-                .and_then(|s| s.conversation_id)
+            let bound = conn.state.try_read().ok().and_then(|s| s.conversation_id)
                 == Some(params.conversation_id);
             if bound {
                 conn.route_preference = params.route_override;

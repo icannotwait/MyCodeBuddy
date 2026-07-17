@@ -17,9 +17,9 @@ use crate::app_state::AppState;
 pub async fn get_delegation_metrics(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<DelegationMetricsSnapshot>, AppCommandError> {
-    Ok(Json(crate::commands::delegation::get_delegation_metrics_core(
-        state.delegation_metrics.as_ref(),
-    )))
+    Ok(Json(
+        crate::commands::delegation::get_delegation_metrics_core(state.delegation_metrics.as_ref()),
+    ))
 }
 
 #[cfg(test)]

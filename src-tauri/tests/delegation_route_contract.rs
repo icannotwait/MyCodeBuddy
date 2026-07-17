@@ -49,7 +49,9 @@ fn automation_engine_uses_background_prompt_path_not_generic_with_message_id() {
     ));
     let launch_body = automation_launch_fn_body(engine_src);
 
-    let bg_calls = launch_body.matches(".send_prompt_linked_background(").count();
+    let bg_calls = launch_body
+        .matches(".send_prompt_linked_background(")
+        .count();
     assert_eq!(
         bg_calls, 1,
         "automation launch must call .send_prompt_linked_background( exactly once \

@@ -308,9 +308,7 @@ impl OpenCodeParser {
                 .await?;
 
             // Hide wire-only Codeg terminal context from user text parts only.
-            if matches!(role, MessageRole::User)
-                && !sanitize_user_blocks(&mut content_blocks)
-            {
+            if matches!(role, MessageRole::User) && !sanitize_user_blocks(&mut content_blocks) {
                 continue;
             }
 
@@ -1155,12 +1153,7 @@ earlier terminal context records.\n\
                 conn.execute(Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
                     "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
-                    [
-                        mid.into(),
-                        session_id.into(),
-                        ts.into(),
-                        user_data.into(),
-                    ],
+                    [mid.into(), session_id.into(), ts.into(), user_data.into()],
                 ))
                 .await
                 .expect("message");
@@ -1193,6 +1186,8 @@ earlier terminal context records.\n\
             .iter()
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
-        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
     }
 }

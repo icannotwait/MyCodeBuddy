@@ -443,7 +443,9 @@ impl TerminalRuntime {
         request: &CreateTerminalRequest,
     ) -> Result<ExecutionMode, TerminalRuntimeError> {
         if !request.args.is_empty() {
-            return Ok(ExecutionMode::DirectProgram(PathBuf::from(&request.command)));
+            return Ok(ExecutionMode::DirectProgram(PathBuf::from(
+                &request.command,
+            )));
         }
 
         let cwd = self.effective_cwd(request);
@@ -724,9 +726,7 @@ impl TerminalRuntime {
             .map(|terminal| {
                 tokio::spawn(async move {
                     if let Err(err) = terminal.kill_command().await {
-                        tracing::error!(
-                            "[ACP] Failed to release terminal during cleanup: {err:?}"
-                        );
+                        tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
                     }
                 })
             })
@@ -1069,8 +1069,7 @@ mod tests {
     #[test]
     fn empty_args_existing_executable_with_spaces_is_direct() {
         let temp = tempfile::tempdir().unwrap();
-        let executable =
-            create_test_executable(temp.path().join(test_executable_name("my tool")));
+        let executable = create_test_executable(temp.path().join(test_executable_name("my tool")));
         let runtime = test_runtime(test_shell_spec()).with_default_cwd(Some(temp.path().into()));
         let request = CreateTerminalRequest::new(
             SessionId::new("s"),
@@ -1108,12 +1107,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir(&bin_dir).unwrap();
-        let executable =
-            create_test_executable(bin_dir.join(test_executable_name("special-tool")));
+        let executable = create_test_executable(bin_dir.join(test_executable_name("special-tool")));
 
         let runtime = test_runtime(test_shell_spec());
-        let mut request =
-            CreateTerminalRequest::new(SessionId::new("s"), "special-tool");
+        let mut request = CreateTerminalRequest::new(SessionId::new("s"), "special-tool");
         // Prefer the Windows-style `Path` key so classification still matches
         // case-insensitive env layering on Windows (and exact `PATH` on Unix
         // would also work — here we exercise the override path with PATH).
@@ -1140,8 +1137,7 @@ mod tests {
     #[test]
     fn request_cwd_is_used_for_relative_executable_resolution() {
         let temp = tempfile::tempdir().unwrap();
-        let executable =
-            create_test_executable(temp.path().join(test_executable_name("rel-tool")));
+        let executable = create_test_executable(temp.path().join(test_executable_name("rel-tool")));
         let runtime = test_runtime(test_shell_spec());
 
         #[cfg(windows)]
@@ -1242,10 +1238,7 @@ mod tests {
         // `/C` argument, which breaks cmd's nested-quote parsing for
         // `cd /d "path"`. Temp paths have no spaces, so unquoted `cd /d` is
         // still a real CMD builtin line under the snapshotted Cmd strategy.
-        let line = format!(
-            "cd /d {} && where cmd.exe",
-            temp.path().to_string_lossy()
-        );
+        let line = format!("cd /d {} && where cmd.exe", temp.path().to_string_lossy());
         let runtime = test_runtime(windows_cmd_test_shell());
         let session_id = SessionId::new("cmd-builtins");
         let response = runtime
@@ -1303,17 +1296,12 @@ mod tests {
         assert!(!shell_rpc.to_string().contains("test-command-secret"));
 
         let program_runtime = test_runtime(test_shell_spec());
-        let mut direct = CreateTerminalRequest::new(
-            SessionId::new("program-error"),
-            "missing-program-for-test",
-        );
+        let mut direct =
+            CreateTerminalRequest::new(SessionId::new("program-error"), "missing-program-for-test");
         direct.args = vec!["--version".into()];
         let program_error = program_runtime.create_terminal(direct).await.unwrap_err();
         let program_rpc = serde_json::to_value(program_error.into_rpc_error()).unwrap();
-        assert_eq!(
-            program_rpc["data"]["code"],
-            "terminal_program_spawn_failed"
-        );
+        assert_eq!(program_rpc["data"]["code"], "terminal_program_spawn_failed");
         assert_eq!(program_rpc["data"]["mode"], "direct_program");
     }
 
@@ -1395,8 +1383,8 @@ mod tests {
     async fn falls_back_to_default_cwd_when_request_omits_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("cwd-default".to_string());
         // Bare `pwd` (no whitespace) → may be DirectProgram if on PATH;
@@ -1449,8 +1437,7 @@ mod tests {
 
         // Genuine shell operators must evaluate, not be passed as literal args.
         let session_id = SessionId::new("shell-ops".to_string());
-        let request =
-            CreateTerminalRequest::new(session_id.clone(), "true && echo OK".to_string());
+        let request = CreateTerminalRequest::new(session_id.clone(), "true && echo OK".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
         assert!(
             output.contains("OK"),
@@ -1464,8 +1451,8 @@ mod tests {
     async fn shell_wrapped_command_respects_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("shell-cwd".to_string());
         let request =
@@ -1485,8 +1472,7 @@ mod tests {
         let runtime = test_runtime(platform_test_shell());
 
         let session_id = SessionId::new("direct-exec".to_string());
-        let mut request =
-            CreateTerminalRequest::new(session_id.clone(), "/bin/echo".to_string());
+        let mut request = CreateTerminalRequest::new(session_id.clone(), "/bin/echo".to_string());
         request.args = vec!["hello world".into()];
         let output = run_and_capture(&runtime, &session_id, request).await;
         assert!(
@@ -1554,8 +1540,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&exe, perms).expect("chmod");
 
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
         let session_id = SessionId::new("rel-space-exe".to_string());
         let request = CreateTerminalRequest::new(session_id.clone(), "./my tool".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
@@ -1594,7 +1580,10 @@ mod tests {
             let guard = terminal.child.lock().await;
             guard.as_ref().and_then(|child| child.id())
         };
-        assert!(child_pid.is_some(), "expected a live child pid before release");
+        assert!(
+            child_pid.is_some(),
+            "expected a live child pid before release"
+        );
 
         let wait_runtime = Arc::clone(&runtime);
         let wait_session = session_id.clone();
@@ -1744,9 +1733,7 @@ mod tests {
         let observed = receiver.borrow().clone();
         assert_eq!(observed, Some(expected));
 
-        runtime
-            .release_all_for_session(session_id.0.as_ref())
-            .await;
+        runtime.release_all_for_session(session_id.0.as_ref()).await;
     }
 
     #[cfg(windows)]

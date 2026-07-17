@@ -1520,9 +1520,7 @@ mod tests {
         }
     }
 
-    fn state_with_route(
-        plan: crate::acp::delegation::route::DelegationRoutePlan,
-    ) -> SessionState {
+    fn state_with_route(plan: crate::acp::delegation::route::DelegationRoutePlan) -> SessionState {
         let mut s = fresh_state();
         s.agent_type = AgentType::Codex;
         s.set_route_plan_snapshot(&plan);

@@ -81,7 +81,9 @@ pub fn spawn_command_dispatcher(
             let text = cmd.command_text.trim();
             tracing::info!(
                 "[ChatChannel] received command from channel={} sender={}: {:?}",
-                cmd.channel_id, cmd.sender_id, text
+                cmd.channel_id,
+                cmd.sender_id,
+                text
             );
 
             // Log inbound command
@@ -127,7 +129,8 @@ pub fn spawn_command_dispatcher(
                 Err(e) => {
                     tracing::error!(
                         "[ChatChannel] failed to send response for {:?} to channel {}: {e}",
-                        text, cmd.channel_id
+                        text,
+                        cmd.channel_id
                     );
                     ("failed", Some(e.to_string()))
                 }
@@ -215,16 +218,7 @@ async fn dispatch_command(
         }
         "task" | "do" => {
             session_commands::handle_task(
-                db,
-                args,
-                channel_id,
-                sender_id,
-                conn_mgr,
-                emitter,
-                bridge,
-                lang,
-                prefix,
-                runtime,
+                db, args, channel_id, sender_id, conn_mgr, emitter, bridge, lang, prefix, runtime,
                 data_dir,
             )
             .await
@@ -234,16 +228,7 @@ async fn dispatch_command(
         }
         "resume" => {
             session_commands::handle_resume(
-                db,
-                args,
-                channel_id,
-                sender_id,
-                conn_mgr,
-                emitter,
-                bridge,
-                lang,
-                prefix,
-                runtime,
+                db, args, channel_id, sender_id, conn_mgr, emitter, bridge, lang, prefix, runtime,
                 data_dir,
             )
             .await

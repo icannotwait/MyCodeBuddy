@@ -257,10 +257,7 @@ pub fn extract_mandatory_profile_ids(text: &str) -> Vec<String> {
             continue;
         };
         let token = after[..token_end].trim();
-        let path = token
-            .split([' ', '"', '\''])
-            .next()
-            .unwrap_or("");
+        let path = token.split([' ', '"', '\'']).next().unwrap_or("");
         let candidate = path.rsplit_once('/').map(|(_, id)| id).unwrap_or(path);
         if let Some(id) = uuid(candidate) {
             out.insert(id);

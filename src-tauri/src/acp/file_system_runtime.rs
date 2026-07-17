@@ -41,10 +41,7 @@ impl FileSystemRuntimeError {
 pub fn mode_allows_outside_workspace(mode_id: &str) -> bool {
     matches!(
         mode_id,
-        "agent-full-access"
-            | "full-access"
-            | "danger-full-access"
-            | "bypassPermissions"
+        "agent-full-access" | "full-access" | "danger-full-access" | "bypassPermissions"
     )
 }
 
@@ -77,14 +74,12 @@ impl FileSystemRuntime {
     }
 
     pub fn with_allow_outside_workspace(self, allow: bool) -> Self {
-        self.allow_outside_workspace
-            .store(allow, Ordering::Relaxed);
+        self.allow_outside_workspace.store(allow, Ordering::Relaxed);
         self
     }
 
     pub fn set_allow_outside_workspace(&self, allow: bool) {
-        self.allow_outside_workspace
-            .store(allow, Ordering::Relaxed);
+        self.allow_outside_workspace.store(allow, Ordering::Relaxed);
     }
 
     pub fn allow_outside_workspace(&self) -> bool {

@@ -332,8 +332,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
     // command can emit a trailing (stale/cumulative) `tool_call_update` *after*
     // its `task_completed` — those must not clobber the authoritative snapshot
     // output. toolCallIds are unique within a session, so this is never cleared.
-    let mut finalized_tools: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut finalized_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Stats for the in-flight turn (tokens/timing/model), applied to the
     // assistant turn when it is finalized. Reset at each turn boundary.
     let mut turn_meta = GrokTurnMeta::default();
@@ -531,10 +530,7 @@ fn update_text(update: &Value) -> String {
 }
 
 fn str_field(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// Peel Grok's `use_tool` MCP envelope (`{tool_name, tool_input}`) into its inner
@@ -765,10 +761,7 @@ impl GrokTurnMeta {
     }
 }
 
-fn ensure_assistant(
-    assistant: &mut Option<MessageTurn>,
-    ts: DateTime<Utc>,
-) -> &mut MessageTurn {
+fn ensure_assistant(assistant: &mut Option<MessageTurn>, ts: DateTime<Utc>) -> &mut MessageTurn {
     if assistant.is_none() {
         *assistant = Some(MessageTurn {
             id: String::new(),
@@ -870,18 +863,29 @@ mod tests {
 
     // Two turns: a plain Q&A, then a prompt that runs a backgrounded command.
     const UPDATES: &str = concat!(
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"你会做什么"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Thinking about it"}}},"timestamp":1783584019}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"我是 Grok"}}},"timestamp":1783584024}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584024}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"执行 pnpm build"},"_meta":{"promptIndex":1}}},"timestamp":1783584029}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"正在执行"}}},"timestamp":1783584029}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"partial output"}}]}},"timestamp":1783584033}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"call-1","output":"build ok","exit_code":0}}},"timestamp":1783584122}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"你会做什么"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Thinking about it"}}},"timestamp":1783584019}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"我是 Grok"}}},"timestamp":1783584024}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"执行 pnpm build"},"_meta":{"promptIndex":1}}},"timestamp":1783584029}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"正在执行"}}},"timestamp":1783584029}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"partial output"}}]}},"timestamp":1783584033}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"call-1","output":"build ok","exit_code":0}}},"timestamp":1783584122}"#,
+        "\n",
         // Trailing (stale) update AFTER task_completed — must NOT clobber "build ok".
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"STALE trailing output"}}]}},"timestamp":1783584123}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584129}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"STALE trailing output"}}]}},"timestamp":1783584123}"#,
+        "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584129}"#,
+        "\n",
     );
 
     #[test]
@@ -915,7 +919,9 @@ mod tests {
         assert!(matches!(&turns[0].blocks[0], ContentBlock::Text { text } if text == "你会做什么"));
 
         assert!(matches!(turns[1].role, TurnRole::Assistant));
-        assert!(matches!(&turns[1].blocks[0], ContentBlock::Thinking { text } if text == "Thinking about it"));
+        assert!(
+            matches!(&turns[1].blocks[0], ContentBlock::Thinking { text } if text == "Thinking about it")
+        );
         assert!(matches!(&turns[1].blocks[1], ContentBlock::Text { text } if text == "我是 Grok"));
 
         // Assistant turn 2: text, then tool use + tool result.
@@ -950,9 +956,12 @@ mod tests {
         // timing in the OUTER `params._meta` (`totalTokens` cumulative,
         // `turnStartMs` → `agentTimestampMs`).
         let updates = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"modelId":"grok-4.5-fast","promptIndex":0}},"_meta":{"turnStartMs":1000,"totalTokens":100}},"timestamp":1783584019}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}},"_meta":{"totalTokens":500,"agentTimestampMs":3000}},"timestamp":1783584024}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"},"_meta":{"agentTimestampMs":5000}},"timestamp":1783584024}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"modelId":"grok-4.5-fast","promptIndex":0}},"_meta":{"turnStartMs":1000,"totalTokens":100}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}},"_meta":{"totalTokens":500,"agentTimestampMs":3000}},"timestamp":1783584024}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"},"_meta":{"agentTimestampMs":5000}},"timestamp":1783584024}"#,
+            "\n",
         );
         let (_tmp, sessions) = fixture(SUMMARY, updates);
         let parser = GrokParser::with_base_dir(sessions);
@@ -991,9 +1000,12 @@ mod tests {
         // from summary.json `current_model_id`, and without `params._meta` no
         // token/duration stats are fabricated.
         let updates = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}},"timestamp":1783584024}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584024}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}},"timestamp":1783584024}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+            "\n",
         );
         let (_tmp, sessions) = fixture(SUMMARY, updates);
         let parser = GrokParser::with_base_dir(sessions);
@@ -1012,10 +1024,14 @@ mod tests {
         // the delegation card classifies + shows the task, and the ack (carrying
         // task_id, in an MCP `rawOutput`) surfaces as the tool result.
         let updates = concat!(
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"委派构建"}}},"timestamp":1783584019}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-d","title":"use_tool","rawInput":{"tool_name":"codeg-mcp__delegate_to_agent","tool_input":{"agent_type":"codex","working_dir":"/w","task":"run build"}},"_meta":{"x.ai/tool":{"name":"use_tool"}}}},"timestamp":1783584029}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-d","status":"completed","rawOutput":{"type":"MCP","tool_name":"delegate_to_agent","server_name":"codeg-mcp","output":{"OkayOutput":"Delegation successful. task_id=2dc85849-5426-44f7."}}}},"timestamp":1783584122}"#, "\n",
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584129}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"委派构建"}}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-d","title":"use_tool","rawInput":{"tool_name":"codeg-mcp__delegate_to_agent","tool_input":{"agent_type":"codex","working_dir":"/w","task":"run build"}},"_meta":{"x.ai/tool":{"name":"use_tool"}}}},"timestamp":1783584029}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-d","status":"completed","rawOutput":{"type":"MCP","tool_name":"delegate_to_agent","server_name":"codeg-mcp","output":{"OkayOutput":"Delegation successful. task_id=2dc85849-5426-44f7."}}}},"timestamp":1783584122}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584129}"#,
+            "\n",
         );
         let (_tmp, sessions) = fixture(SUMMARY, updates);
         let parser = GrokParser::with_base_dir(sessions);
@@ -1044,7 +1060,10 @@ mod tests {
             input.contains("\"task\":\"run build\""),
             "input carries the task: {input}"
         );
-        assert!(!input.contains("tool_input"), "the wrapper is peeled: {input}");
+        assert!(
+            !input.contains("tool_input"),
+            "the wrapper is peeled: {input}"
+        );
 
         // The MCP ack (with task_id) is the tool result.
         let result = assistant
@@ -1070,9 +1089,12 @@ mod tests {
         let long_task = "x".repeat(GROK_TOOL_INPUT_CAP + 5_000);
         let updates = format!(
             concat!(
-                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"go"}}}}}},"timestamp":1783584019}}"#, "\n",
-                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call","toolCallId":"call-d","title":"use_tool","rawInput":{{"tool_name":"codeg-mcp__delegate_to_agent","tool_input":{{"agent_type":"codex","task":"{}"}}}}}}}},"timestamp":1783584029}}"#, "\n",
-                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}}},"timestamp":1783584129}}"#, "\n",
+                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"go"}}}}}},"timestamp":1783584019}}"#,
+                "\n",
+                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call","toolCallId":"call-d","title":"use_tool","rawInput":{{"tool_name":"codeg-mcp__delegate_to_agent","tool_input":{{"agent_type":"codex","task":"{}"}}}}}}}},"timestamp":1783584029}}"#,
+                "\n",
+                r#"{{"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}}},"timestamp":1783584129}}"#,
+                "\n",
             ),
             long_task
         );
@@ -1094,8 +1116,7 @@ mod tests {
             .expect("tool use present");
         // The stored preview parses as valid JSON, preserving the structure, and
         // stays within the input cap (a raw byte truncation would corrupt it).
-        let parsed: Value =
-            serde_json::from_str(&input).expect("input_preview must be valid JSON");
+        let parsed: Value = serde_json::from_str(&input).expect("input_preview must be valid JSON");
         assert_eq!(
             parsed.get("agent_type").and_then(Value::as_str),
             Some("codex")
@@ -1226,6 +1247,8 @@ earlier terminal context records.\n\
             .iter()
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
-        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
     }
 }

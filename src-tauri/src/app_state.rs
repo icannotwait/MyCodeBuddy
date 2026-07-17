@@ -135,7 +135,6 @@ pub fn build_delegation_stack(
     use crate::acp::delegation::broker::{
         ChildStatusLookup, ConversationDepthLookup, DbChildStatusLookup, DbDepthLookup,
     };
-    use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
     use crate::acp::delegation::event_emitter::{
         ConnectionManagerEventEmitter, DelegationEventEmitter,
     };
@@ -145,6 +144,7 @@ pub fn build_delegation_stack(
     };
     use crate::acp::delegation::meta_writer::{ConnectionManagerMetaWriter, DelegationMetaWriter};
     use crate::acp::delegation::spawner::ConnectionSpawner;
+    use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
     use crate::acp::manager::ConnectionManagerSpawner;
 
     let cm_arc = Arc::new(connection_manager.clone_ref());
@@ -164,8 +164,7 @@ pub fn build_delegation_stack(
         Arc::new(DbDepthLookup { db: db_arc.clone() }) as Arc<dyn ConversationDepthLookup>;
     let task_store =
         Arc::new(DbDelegationTaskStore::new(db_arc.clone())) as Arc<dyn DelegationTaskStore>;
-    let status_lookup =
-        Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
+    let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
         manager: cm_arc.clone(),
     }) as Arc<dyn DelegationMetaWriter>;
@@ -193,8 +192,7 @@ pub fn build_delegation_stack(
     // injection + broker; rx is taken once at desktop/server startup after
     // reconcile (see spawn_delegation_supervisor).
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(64);
-    let supervisor_wake =
-        crate::acp::delegation::supervisor::SupervisorWake::new(wake_tx);
+    let supervisor_wake = crate::acp::delegation::supervisor::SupervisorWake::new(wake_tx);
     broker.set_supervisor_wake(supervisor_wake.clone());
 
     // Install the injection on the manager so spawn_agent picks it up
@@ -243,9 +241,7 @@ pub fn spawn_delegation_supervisor(
     use crate::acp::delegation::supervisor::{DelegationSupervisor, SystemClock};
 
     let Some(wake_rx) = broker.take_supervisor_wake_rx() else {
-        tracing::warn!(
-            "[delegation] supervisor wake rx already taken; skipping soft supervisor"
-        );
+        tracing::warn!("[delegation] supervisor wake rx already taken; skipping soft supervisor");
         return;
     };
 
@@ -313,8 +309,7 @@ impl AppState {
         let emitter = EventEmitter::web_only(broadcaster.clone(), acp_event_bus.clone());
 
         let connection_manager = default_connection_manager();
-        let stack =
-            build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
+        let stack = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
         Self {
             db,

@@ -780,9 +780,15 @@ mod tests {
                 profiles: vec![profile("11111111-1111-4111-8111-111111111111", " GLM5.2 ")],
             },
         };
-        let saved = set_delegation_bundle_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), bundle)
-            .await
-            .unwrap();
+        let saved = set_delegation_bundle_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
+            bundle,
+        )
+        .await
+        .unwrap();
         assert!(saved.settings.enabled);
         assert_eq!(saved.settings.depth_limit, 3);
         assert_eq!(saved.profiles.profiles[0].name, "GLM5.2");
@@ -831,9 +837,15 @@ mod tests {
             depth_limit: 3,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
-            .await
-            .unwrap();
+        let saved = set_delegation_settings_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
+            desired,
+        )
+        .await
+        .unwrap();
         assert!(!saved.enabled);
         assert_eq!(saved.depth_limit, 3);
 
@@ -869,9 +881,15 @@ mod tests {
             agent_defaults: agent_defaults.clone(),
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
-            .await
-            .unwrap();
+        let saved = set_delegation_settings_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
+            desired,
+        )
+        .await
+        .unwrap();
         assert_eq!(saved.agent_defaults, agent_defaults);
 
         // Re-read from DB — the JSON blob should round-trip identically.
@@ -941,9 +959,15 @@ mod tests {
             completed_cache_max_mb: 8,
             ..DelegationSettings::default()
         };
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
-            .await
-            .unwrap();
+        let saved = set_delegation_settings_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
+            desired,
+        )
+        .await
+        .unwrap();
         assert_eq!(saved.completed_cache_max_mb, 8);
 
         // Persisted + reloaded identically.
@@ -1048,9 +1072,15 @@ mod tests {
             completed_cache_max_mb: 512,
         };
 
-        let saved = set_delegation_settings_core(&db.conn, &broker, &runtime, &crate::acp::manager::ConnectionManager::new(), desired)
-            .await
-            .unwrap();
+        let saved = set_delegation_settings_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &crate::acp::manager::ConnectionManager::new(),
+            desired,
+        )
+        .await
+        .unwrap();
         rx.changed().await.unwrap();
         assert_eq!(saved.route_policy, DelegationRoutePolicy::Native);
         assert_eq!(rx.borrow().stalled_after_seconds, 120);

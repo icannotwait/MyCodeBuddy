@@ -196,12 +196,8 @@ impl DelegationSupervisor {
         }
 
         for h in health {
-            let snap = derive_observation(
-                now,
-                h.last_agent_activity_at,
-                h.waiting_input,
-                threshold,
-            );
+            let snap =
+                derive_observation(now, h.last_agent_activity_at, h.waiting_input, threshold);
             let prev_snap = {
                 let last = self.last_emitted.lock().expect("last_emitted lock");
                 last.get(&h.task_id).cloned()
@@ -216,10 +212,8 @@ impl DelegationSupervisor {
                 // emit events but do not bump stalled episode counters).
                 if let Some(prev) = &prev_snap {
                     if prev.observation != snap.observation {
-                        self.metrics.record_observation_transition(
-                            prev.observation,
-                            snap.observation,
-                        );
+                        self.metrics
+                            .record_observation_transition(prev.observation, snap.observation);
                         super::metrics::DelegationAuditRecord::observation(
                             &h.task_id,
                             prev.observation,
@@ -228,7 +222,9 @@ impl DelegationSupervisor {
                         .emit_observation();
                     }
                 }
-                self.sink.publish_observation(&h.task_id, snap.clone()).await;
+                self.sink
+                    .publish_observation(&h.task_id, snap.clone())
+                    .await;
                 self.last_emitted
                     .lock()
                     .expect("last_emitted lock")
@@ -453,7 +449,10 @@ mod tests {
         // Exactly at threshold is stalled (silence at least N seconds).
         let exact = derive_observation(last + chrono::Duration::seconds(300), last, false, 300);
         assert_eq!(exact.observation, TaskObservation::Stalled);
-        assert_eq!(exact.stalled_since, Some(last + chrono::Duration::seconds(300)));
+        assert_eq!(
+            exact.stalled_since,
+            Some(last + chrono::Duration::seconds(300))
+        );
     }
 
     #[tokio::test]

@@ -938,10 +938,7 @@ pub struct GitHeadInfo {
     pub short_sha: Option<String>,
 }
 
-async fn git_output(
-    path: &str,
-    args: &[&str],
-) -> Result<std::process::Output, AppCommandError> {
+async fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, AppCommandError> {
     crate::process::tokio_command("git")
         .args(args)
         .current_dir(path)
@@ -2331,8 +2328,7 @@ pub async fn resolve_worktree_folder_core(
     let folder_id = folders
         .into_iter()
         .find(|f| {
-            let canon =
-                std::fs::canonicalize(&f.path).unwrap_or_else(|_| PathBuf::from(&f.path));
+            let canon = std::fs::canonicalize(&f.path).unwrap_or_else(|_| PathBuf::from(&f.path));
             canon == canonical_wt
         })
         .map(|f| f.id);
@@ -2853,14 +2849,10 @@ struct WorkspaceSearchRegistration {
     token: Arc<CancellationToken>,
 }
 
-static WORKSPACE_SEARCH_REGISTRY: LazyLock<
-    Mutex<HashMap<String, WorkspaceSearchRegistration>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static WORKSPACE_SEARCH_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-        WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS,
-    ))
-});
+static WORKSPACE_SEARCH_REGISTRY: LazyLock<Mutex<HashMap<String, WorkspaceSearchRegistration>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WORKSPACE_SEARCH_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS)));
 
 fn validate_workspace_search_identity(
     search_session_id: Option<&str>,
@@ -2990,8 +2982,7 @@ pub(crate) fn search_workspace_files_sync(
     if token.is_cancelled() {
         return Ok(WorkspaceFileSearchResult::empty());
     }
-    let limit = limit
-        .clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
+    let limit = limit.clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
     let q = query.trim().to_lowercase();
     let mut files: Vec<WorkspaceFileHit> = Vec::with_capacity(limit);
     let mut truncated = false;
@@ -3257,10 +3248,7 @@ fn unquote_git_path(path: &str) -> String {
     }
 }
 
-pub(crate) fn resolve_tree_path(
-    root: &Path,
-    rel_path: &str,
-) -> Result<PathBuf, AppCommandError> {
+pub(crate) fn resolve_tree_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppCommandError> {
     let rel = Path::new(rel_path);
     if rel.is_absolute() {
         return Err(AppCommandError::invalid_input("Path must be relative"));
@@ -3696,10 +3684,7 @@ pub async fn search_workspace_files(
     let root = PathBuf::from(&path);
     let q = query.unwrap_or_default();
     let lim = limit.unwrap_or(WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT);
-    let lease = register_workspace_search(
-        search_session_id.as_deref(),
-        request_id.as_deref(),
-    )?;
+    let lease = register_workspace_search(search_session_id.as_deref(), request_id.as_deref())?;
     let token = lease.token();
     let result = run_workspace_search_task(
         Arc::clone(&WORKSPACE_SEARCH_SEMAPHORE),
@@ -3719,7 +3704,8 @@ pub async fn cancel_workspace_file_search(
     let Some((session_id, request_id)) = validate_workspace_search_identity(
         Some(search_session_id.as_str()),
         Some(request_id.as_str()),
-    )? else {
+    )?
+    else {
         unreachable!("cancel always supplies both workspace search identifiers");
     };
     Ok(cancel_workspace_search_registration(
@@ -3835,17 +3821,14 @@ pub async fn read_workspace_file_base64(
         // read race: the original `target` symlink can't be re-resolved (we use
         // the canonical path), a final-component symlink swapped in after the
         // check makes the open fail, and metadata/read never re-look-up the path.
-        let canonical_root =
-            std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
-        let canonical_target =
-            std::fs::canonicalize(&target).map_err(AppCommandError::io)?;
+        let canonical_root = std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
+        let canonical_target = std::fs::canonicalize(&target).map_err(AppCommandError::io)?;
         if !canonical_target.starts_with(&canonical_root) {
             return Err(AppCommandError::invalid_input(
                 "Path is outside workspace root",
             ));
         }
-        let mut file =
-            open_no_follow(&canonical_target).map_err(AppCommandError::io)?;
+        let mut file = open_no_follow(&canonical_target).map_err(AppCommandError::io)?;
         let metadata = file.metadata().map_err(AppCommandError::io)?;
         if !metadata.is_file() {
             return Err(AppCommandError::invalid_input("Path is not a file"));
@@ -5132,9 +5115,7 @@ branch refs/heads/main";
         for node in nodes {
             match node {
                 FileTreeNode::File { path, .. } => out.push(path.clone()),
-                FileTreeNode::Dir {
-                    path, children, ..
-                } => {
+                FileTreeNode::Dir { path, children, .. } => {
                     out.push(path.clone());
                     collect_tree_paths(children, out);
                 }
@@ -5170,8 +5151,8 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("dist/out.js"), "bundle\n");
         write_tree_fixture(&root.path().join("target/debug/foo"), "bin\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
-            .expect("walk tree");
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
         paths.sort();
@@ -5206,8 +5187,8 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("app.rs"), "fn main(){}\n");
         write_tree_fixture(&root.path().join("vendor/lib.rs"), "// big\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
-            .expect("walk tree");
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
 
@@ -5225,8 +5206,8 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
         write_tree_fixture(&root.path().join("src/main.rs"), "fn main(){}\n");
 
-        let tree = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
-            .expect("walk tree");
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
 
@@ -5247,16 +5228,13 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("dist/bundle.js"), "bundle\n");
         write_tree_fixture(&root.path().join("src/main.ts"), "main\n");
         write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
-        write_tree_fixture(
-            &root.path().join("__pycache__/module.pyc"),
-            "cache\n",
-        );
+        write_tree_fixture(&root.path().join("__pycache__/module.pyc"), "cache\n");
         write_tree_fixture(&root.path().join(".DS_Store"), "metadata\n");
 
         let hidden = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
             .expect("pruned tree");
-        let shown = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, true)
-            .expect("full tree");
+        let shown =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, true).expect("full tree");
         let mut hidden_paths = Vec::new();
         let mut shown_paths = Vec::new();
         collect_tree_paths(&hidden, &mut hidden_paths);
@@ -5280,13 +5258,9 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("ok.txt"), "hi\n");
         write_tree_fixture(&root.path().join("heavy/blob.bin"), "x\n");
 
-        let tree = get_file_tree(
-            root.path().to_string_lossy().into_owned(),
-            Some(10),
-            None,
-        )
-        .await
-        .expect("async walk");
+        let tree = get_file_tree(root.path().to_string_lossy().into_owned(), Some(10), None)
+            .await
+            .expect("async walk");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
         assert!(paths.iter().any(|p| p == "ok.txt"), "got {paths:?}");
@@ -5302,13 +5276,9 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join(".ignore"), "generated/\n");
         write_tree_fixture(&root.path().join("generated/out.txt"), "out\n");
 
-        let tree = get_file_tree(
-            root.path().to_string_lossy().into_owned(),
-            Some(10),
-            None,
-        )
-        .await
-        .expect("tree");
+        let tree = get_file_tree(root.path().to_string_lossy().into_owned(), Some(10), None)
+            .await
+            .expect("tree");
         let mut paths = Vec::new();
         collect_tree_paths(&tree, &mut paths);
         assert!(!paths.iter().any(|path| path.starts_with("generated")));
@@ -5321,19 +5291,11 @@ branch refs/heads/main";
         write_tree_fixture(&root.path().join("src/foo.ts"), "a\n");
         write_tree_fixture(&root.path().join("src/bar.ts"), "b\n");
         write_tree_fixture(&root.path().join("docs/foo.md"), "c\n");
-        write_tree_fixture(
-            &root.path().join("node_modules/pkg/index.js"),
-            "skip\n",
-        );
+        write_tree_fixture(&root.path().join("node_modules/pkg/index.js"), "skip\n");
         let token = CancellationToken::new();
 
-        let by_name = search_workspace_files_sync(
-            root.path().to_path_buf(),
-            "foo",
-            50,
-            &token,
-        )
-        .expect("search");
+        let by_name = search_workspace_files_sync(root.path().to_path_buf(), "foo", 50, &token)
+            .expect("search");
         let paths: Vec<_> = by_name.files.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"src/foo.ts"), "got {paths:?}");
         assert!(paths.contains(&"docs/foo.md"), "got {paths:?}");
@@ -5342,13 +5304,8 @@ branch refs/heads/main";
             "ignored paths must not appear, got {paths:?}"
         );
 
-        let capped = search_workspace_files_sync(
-            root.path().to_path_buf(),
-            "",
-            2,
-            &token,
-        )
-        .expect("capped empty query");
+        let capped = search_workspace_files_sync(root.path().to_path_buf(), "", 2, &token)
+            .expect("capped empty query");
         assert_eq!(capped.files.len(), 2);
         assert!(capped.truncated, "more than 2 entries exist under the root");
     }
@@ -5363,12 +5320,11 @@ branch refs/heads/main";
         assert!(validate_workspace_search_identity(Some(""), Some("request")).is_err());
         assert!(validate_workspace_search_identity(Some("   "), Some("request")).is_err());
         let longest_valid = "x".repeat(128);
-        assert!(validate_workspace_search_identity(
-            Some(&longest_valid),
-            Some("request"),
-        )
-        .expect("128-byte id")
-        .is_some());
+        assert!(
+            validate_workspace_search_identity(Some(&longest_valid), Some("request"),)
+                .expect("128-byte id")
+                .is_some()
+        );
         let too_long = "x".repeat(129);
         assert!(validate_workspace_search_identity(Some(&too_long), Some("request")).is_err());
     }
@@ -5403,13 +5359,8 @@ branch refs/heads/main";
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = search_workspace_files_sync(
-            root.path().to_path_buf(),
-            "",
-            10,
-            &token,
-        )
-        .expect("cancelled search");
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "", 10, &token)
+            .expect("cancelled search");
 
         assert!(result.files.is_empty());
         assert!(!result.truncated);
@@ -5422,13 +5373,8 @@ branch refs/heads/main";
         let token = CancellationToken::new();
 
         for query in ["ä", "Ä"] {
-            let result = search_workspace_files_sync(
-                root.path().to_path_buf(),
-                query,
-                10,
-                &token,
-            )
-            .expect("search");
+            let result = search_workspace_files_sync(root.path().to_path_buf(), query, 10, &token)
+                .expect("search");
             assert_eq!(result.files.len(), 1, "query {query}");
             assert_eq!(result.files[0].path, "Ä.TXT");
         }
@@ -5568,7 +5514,10 @@ branch refs/heads/main";
         .expect("blocking search should start");
 
         task.abort();
-        assert!(task.await.expect_err("caller task should abort").is_cancelled());
+        assert!(task
+            .await
+            .expect_err("caller task should abort")
+            .is_cancelled());
         let permits_while_detached = semaphore.available_permits();
         let could_acquire_while_detached = semaphore.try_acquire().is_ok();
 
@@ -5635,8 +5584,7 @@ mod workspace_confinement_tests {
         let root = tempfile::tempdir().expect("root");
         let outside = tempfile::tempdir().expect("outside");
         std::fs::write(outside.path().join("secret"), b"top").expect("write");
-        symlink(outside.path().join("secret"), root.path().join("link"))
-            .expect("symlink");
+        symlink(outside.path().join("secret"), root.path().join("link")).expect("symlink");
         // The canonical target resolves outside the root, so the read is denied
         // even though `root/link` is lexically inside the workspace.
         let res = read_workspace_file_base64(
@@ -5645,7 +5593,10 @@ mod workspace_confinement_tests {
             None,
         )
         .await;
-        assert!(res.is_err(), "symlink escaping the workspace must be rejected");
+        assert!(
+            res.is_err(),
+            "symlink escaping the workspace must be rejected"
+        );
     }
 
     #[test]

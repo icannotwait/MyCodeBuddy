@@ -1685,7 +1685,9 @@ fn codebuddy_config_path() -> PathBuf {
 }
 
 fn codebuddy_settings_path() -> PathBuf {
-    home_dir_or_default().join(".codebuddy").join("settings.json")
+    home_dir_or_default()
+        .join(".codebuddy")
+        .join("settings.json")
 }
 
 fn read_codebuddy_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
@@ -2389,7 +2391,10 @@ fn kimi_code_entry_to_canonical(spec: &Value, id: &str) -> Result<Value, AppComm
     // Read the discriminant into an owned value first so the map isn't borrowed when
     // we mutate it below. `transport` absent ⇒ infer; present-but-non-string or an
     // unknown literal ⇒ reject (as Kimi would).
-    let explicit_transport = obj.get("transport").and_then(Value::as_str).map(str::to_string);
+    let explicit_transport = obj
+        .get("transport")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if obj.contains_key("transport") {
         let canonical_type = match explicit_transport.as_deref() {
             Some("stdio") => "stdio",
@@ -2402,7 +2407,10 @@ fn kimi_code_entry_to_canonical(spec: &Value, id: &str) -> Result<Value, AppComm
                 )));
             }
         };
-        obj.insert("type".to_string(), Value::String(canonical_type.to_string()));
+        obj.insert(
+            "type".to_string(),
+            Value::String(canonical_type.to_string()),
+        );
     }
     obj.remove("transport");
     canonicalize_spec(&Value::Object(obj), &format!("Kimi Code config '{id}'"))
@@ -2469,7 +2477,10 @@ fn canonical_to_kimi_code_entry(spec: &Value) -> Result<Value, AppCommandError> 
         }
     }
     if let Some(transport) = transport {
-        out.insert("transport".to_string(), Value::String(transport.to_string()));
+        out.insert(
+            "transport".to_string(),
+            Value::String(transport.to_string()),
+        );
     }
     Ok(Value::Object(out))
 }
@@ -2478,11 +2489,7 @@ fn upsert_kimi_code_server(id: &str, spec: &Value) -> Result<(), AppCommandError
     upsert_kimi_code_server_at(&kimi_code_mcp_json_path(), id, spec)
 }
 
-fn upsert_kimi_code_server_at(
-    path: &Path,
-    id: &str,
-    spec: &Value,
-) -> Result<(), AppCommandError> {
+fn upsert_kimi_code_server_at(path: &Path, id: &str, spec: &Value) -> Result<(), AppCommandError> {
     let mut root = read_json_file(path)?;
     if !root.is_object() {
         root = json!({});
@@ -2575,7 +2582,10 @@ fn write_grok_root_toml_at(path: &Path, root: &toml::Value) -> Result<(), AppCom
         fs::create_dir_all(parent).map_err(AppCommandError::io)?;
     }
     let serialized = toml::to_string_pretty(root).map_err(|e| {
-        mcp_configuration_invalid(format!("failed to serialize TOML for {}: {e}", path.display()))
+        mcp_configuration_invalid(format!(
+            "failed to serialize TOML for {}: {e}",
+            path.display()
+        ))
     })?;
     fs::write(path, format!("{serialized}\n")).map_err(AppCommandError::io)
 }
@@ -2596,7 +2606,10 @@ fn canonical_to_grok_entry(spec: &Value) -> Result<toml::Value, AppCommandError>
             let command = obj.get("command").and_then(Value::as_str).ok_or_else(|| {
                 mcp_invalid_input("Grok conversion: stdio MCP spec missing command")
             })?;
-            table.insert("command".to_string(), toml::Value::String(command.to_string()));
+            table.insert(
+                "command".to_string(),
+                toml::Value::String(command.to_string()),
+            );
             if let Some(args) = obj.get("args").and_then(Value::as_array) {
                 let values = args
                     .iter()
@@ -2705,8 +2718,15 @@ fn grok_entry_to_canonical(id: &str, value: &toml::Value) -> Result<Value, AppCo
         || (has_url && explicit_type != Some("stdio"));
 
     if is_remote {
-        let canonical_type = if explicit_type == Some("sse") { "sse" } else { "http" };
-        spec.insert("type".to_string(), Value::String(canonical_type.to_string()));
+        let canonical_type = if explicit_type == Some("sse") {
+            "sse"
+        } else {
+            "http"
+        };
+        spec.insert(
+            "type".to_string(),
+            Value::String(canonical_type.to_string()),
+        );
         if let Some(url) = table.get("url").and_then(toml::Value::as_str) {
             spec.insert("url".to_string(), Value::String(url.trim().to_string()));
         }
@@ -2847,7 +2867,10 @@ fn remove_grok_server_at(path: &Path, id: &str) -> Result<bool, AppCommandError>
         return Ok(false);
     };
     let mut removed = false;
-    if let Some(mcp_servers) = table.get_mut("mcp_servers").and_then(toml::Value::as_table_mut) {
+    if let Some(mcp_servers) = table
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+    {
         removed |= mcp_servers.remove(id).is_some();
         if mcp_servers.is_empty() {
             table.remove("mcp_servers");
@@ -4953,11 +4976,8 @@ mod tests {
         // file also holds unrelated `[cli]`/`[ui]` sections that must survive.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[cli]\nauto_update = true\n\n[ui]\nyolo = false\n",
-        )
-        .expect("seed config");
+        std::fs::write(&path, "[cli]\nauto_update = true\n\n[ui]\nyolo = false\n")
+            .expect("seed config");
 
         // Missing entry → no servers; removing is a no-op.
         assert!(read_grok_servers_at(&path).expect("read seed").is_empty());
@@ -5001,7 +5021,9 @@ mod tests {
         let remote = servers.get("remote").expect("remote present");
         assert_eq!(remote.get("type").and_then(Value::as_str), Some("http"));
         assert_eq!(
-            remote.pointer("/headers/Authorization").and_then(Value::as_str),
+            remote
+                .pointer("/headers/Authorization")
+                .and_then(Value::as_str),
             Some("Bearer xyz")
         );
         let linear = servers.get("linear").expect("linear present");
@@ -5307,8 +5329,9 @@ mod tests {
         );
 
         // Full writer→reader round-trip stays canonical and transport-free.
-        let written = canonical_to_kimi_code_entry(&json!({"type": "sse", "url": "https://x/stream"}))
-            .expect("write sse");
+        let written =
+            canonical_to_kimi_code_entry(&json!({"type": "sse", "url": "https://x/stream"}))
+                .expect("write sse");
         let back = kimi_code_entry_to_canonical(&written, "srv").expect("read back");
         assert_eq!(back.get("type").and_then(Value::as_str), Some("sse"));
         assert!(back.get("transport").is_none());
@@ -5334,11 +5357,9 @@ mod tests {
 
         // An on-disk `type` with NO `transport` does not classify: Kimi strips `type`
         // and infers HTTP from the url, so codeg must too (not report it as SSE).
-        let stale_type = kimi_code_entry_to_canonical(
-            &json!({"type": "sse", "url": "https://host/mcp"}),
-            "s",
-        )
-        .expect("type-without-transport");
+        let stale_type =
+            kimi_code_entry_to_canonical(&json!({"type": "sse", "url": "https://host/mcp"}), "s")
+                .expect("type-without-transport");
         assert_eq!(stale_type.get("type").and_then(Value::as_str), Some("http"));
 
         // Explicit `transport: "sse"` yields SSE (and `type` is ignored, matching
@@ -5365,10 +5386,11 @@ mod tests {
             );
         }
         // A non-string transport is rejected too (Kimi's literals are exact).
-        assert!(
-            kimi_code_entry_to_canonical(&json!({"url": "https://host/mcp", "transport": 3}), "s")
-                .is_err()
-        );
+        assert!(kimi_code_entry_to_canonical(
+            &json!({"url": "https://host/mcp", "transport": 3}),
+            "s"
+        )
+        .is_err());
 
         // The `transport` discriminant wins over the entry's key shape: an explicit
         // `sse` on an entry that ALSO carries `command` is SSE (Kimi ignores the
@@ -5378,7 +5400,10 @@ mod tests {
             "s",
         )
         .expect("transport wins over command");
-        assert_eq!(sse_over_cmd.get("type").and_then(Value::as_str), Some("sse"));
+        assert_eq!(
+            sse_over_cmd.get("type").and_then(Value::as_str),
+            Some("sse")
+        );
     }
 
     #[test]
@@ -5395,8 +5420,14 @@ mod tests {
         .expect("http entry");
         let obj = entry.as_object().expect("object");
         assert_eq!(obj.get("transport").and_then(Value::as_str), Some("http"));
-        assert!(!obj.contains_key("enabled"), "wrong-typed enabled must be dropped");
-        assert!(!obj.contains_key("autoApprove"), "foreign key must be dropped");
+        assert!(
+            !obj.contains_key("enabled"),
+            "wrong-typed enabled must be dropped"
+        );
+        assert!(
+            !obj.contains_key("autoApprove"),
+            "foreign key must be dropped"
+        );
 
         // A correctly-typed `enabled` bool is preserved.
         let ok = canonical_to_kimi_code_entry(&json!({
@@ -5404,7 +5435,9 @@ mod tests {
         }))
         .expect("http entry");
         assert_eq!(
-            ok.as_object().and_then(|o| o.get("enabled")).and_then(Value::as_bool),
+            ok.as_object()
+                .and_then(|o| o.get("enabled"))
+                .and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -5441,7 +5474,10 @@ mod tests {
         .as_table()
         .cloned()
         .expect("table");
-        assert_eq!(entry.get("enabled").and_then(toml::Value::as_bool), Some(true));
+        assert_eq!(
+            entry.get("enabled").and_then(toml::Value::as_bool),
+            Some(true)
+        );
         for dropped in [
             "type",
             "required",

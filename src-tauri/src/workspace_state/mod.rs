@@ -381,10 +381,7 @@ impl WatchEventBatch {
 }
 
 fn is_ignore_control_path(path: &str) -> bool {
-    let name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     matches!(name, ".gitignore" | ".ignore" | ".rgignore")
 }
 
@@ -985,7 +982,8 @@ async fn flush_watch_batch(
             Ok(tree) => refreshed_tree = Some(tree),
             Err(err) => tracing::error!(
                 "[workspace-state-watch] tree refresh failed for {}: {}",
-                root_display, err
+                root_display,
+                err
             ),
         }
     }
@@ -995,7 +993,8 @@ async fn flush_watch_batch(
             Ok(git_snapshot) => refreshed_git = Some(git_snapshot),
             Err(err) => tracing::error!(
                 "[workspace-state-watch] git refresh failed for {}: {}",
-                root_display, err
+                root_display,
+                err
             ),
         }
     }
@@ -1210,23 +1209,23 @@ async fn refresh_tree_git_snapshots(
     root_display: &str,
     root_canonical: &Path,
 ) {
-    let refreshed_tree =
-        match folders::get_file_tree(
-            root_display.to_string(),
-            Some(WORKSPACE_TREE_MAX_DEPTH),
-            None,
-        )
-            .await
-        {
-            Ok(tree) => Some(tree),
-            Err(err) => {
-                tracing::error!(
-                    "[workspace-state-watch] upgrade tree refresh failed for {}: {}",
-                    root_display, err
-                );
-                None
-            }
-        };
+    let refreshed_tree = match folders::get_file_tree(
+        root_display.to_string(),
+        Some(WORKSPACE_TREE_MAX_DEPTH),
+        None,
+    )
+    .await
+    {
+        Ok(tree) => Some(tree),
+        Err(err) => {
+            tracing::error!(
+                "[workspace-state-watch] upgrade tree refresh failed for {}: {}",
+                root_display,
+                err
+            );
+            None
+        }
+    };
     let is_git = is_git_repo(root_canonical);
     let refreshed_git = if is_git {
         collect_git_snapshot(root_display).await.ok()
@@ -1294,8 +1293,8 @@ pub async fn start_workspace_state_stream_core(
         })?;
         if let Some(entry) = streams.get_mut(&key) {
             entry.ref_count += 1;
-            let became_full = wants_tree_git
-                && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
+            let became_full =
+                wants_tree_git && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
             if !became_full {
                 let snapshot = entry.state.lock().map_err(|_| {
                     AppCommandError::task_execution_failed(
@@ -1311,8 +1310,7 @@ pub async fn start_workspace_state_stream_core(
     };
 
     if let Some((existing_state, root_display)) = existing_upgrade {
-        refresh_tree_git_snapshots(&existing_state, &emitter, &root_display, &root_canonical)
-            .await;
+        refresh_tree_git_snapshots(&existing_state, &emitter, &root_display, &root_canonical).await;
         let snapshot = existing_state.lock().map_err(|_| {
             AppCommandError::task_execution_failed("Failed to lock workspace state snapshot")
         })?;
@@ -1394,7 +1392,8 @@ pub async fn start_workspace_state_stream_core(
                 Err(err) => {
                     tracing::error!(
                         "[workspace-state-watch] failed event for {}: {}",
-                        root_display_for_error, err
+                        root_display_for_error,
+                        err
                     );
                 }
             },
@@ -1413,7 +1412,8 @@ pub async fn start_workspace_state_stream_core(
     if let Err(err) = watch_result {
         tracing::info!(
             "[workspace-state-watch] degraded (no realtime updates) for {}: {}",
-            root_path, err
+            root_path,
+            err
         );
         if let Some(mut created_watcher) = watcher.take() {
             let _ = created_watcher.unwatch(&root_canonical);
@@ -1457,8 +1457,8 @@ pub async fn start_workspace_state_stream_core(
             // (outside the lock, below) so this response carries fresh
             // snapshots instead of the winner's empty paths-only seed.
             entry.ref_count += 1;
-            let became_full = wants_tree_git
-                && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
+            let became_full =
+                wants_tree_git && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
             let upgrade = if became_full {
                 Some((Arc::clone(&entry.state), entry.root_display.clone()))
             } else {
@@ -1503,8 +1503,7 @@ pub async fn start_workspace_state_stream_core(
     }
 
     if let Some((winner_state, winner_display)) = lost_race_upgrade {
-        refresh_tree_git_snapshots(&winner_state, &emitter, &winner_display, &root_canonical)
-            .await;
+        refresh_tree_git_snapshots(&winner_state, &emitter, &winner_display, &root_canonical).await;
         let snapshot = winner_state
             .lock()
             .map_err(|_| {
@@ -1551,11 +1550,12 @@ pub async fn stop_workspace_state_stream_core(
         // between start and stop bookkeeping) must not underflow and wedge
         // the stream in permanent full-scan mode.
         if wants_tree_git {
-            let _ = entry.full_subscribers.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |count| count.checked_sub(1),
-            );
+            let _ =
+                entry
+                    .full_subscribers
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(1)
+                    });
         }
         if entry.ref_count > 1 {
             entry.ref_count -= 1;
@@ -1639,11 +1639,7 @@ pub async fn get_workspace_snapshot_core(
     let is_git = wants_tree_git && is_git_repo(&root_canonical);
     let (refreshed_tree, refreshed_git) = if wants_tree_git {
         let tree_fut =
-            folders::get_file_tree(
-                root_display.clone(),
-                Some(WORKSPACE_TREE_MAX_DEPTH),
-                None,
-            );
+            folders::get_file_tree(root_display.clone(), Some(WORKSPACE_TREE_MAX_DEPTH), None);
         let git_fut = async {
             if is_git {
                 collect_git_snapshot(&root_display).await.ok()
@@ -1910,10 +1906,9 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
 
         // Paths-only cold start: seeding scans are skipped entirely.
-        let paths_snapshot =
-            start_workspace_state_stream_core(test_emitter(), root.clone(), false)
-                .await
-                .expect("paths start");
+        let paths_snapshot = start_workspace_state_stream_core(test_emitter(), root.clone(), false)
+            .await
+            .expect("paths start");
         assert!(
             paths_snapshot.tree_snapshot.unwrap_or_default().is_empty(),
             "paths-only seed must not scan the tree"
@@ -1921,10 +1916,9 @@ mod tests {
 
         // First full subscriber: the upgrade contract guarantees a freshly
         // scanned tree in the start response (not the empty paths seed).
-        let full_snapshot =
-            start_workspace_state_stream_core(test_emitter(), root.clone(), true)
-                .await
-                .expect("full start");
+        let full_snapshot = start_workspace_state_stream_core(test_emitter(), root.clone(), true)
+            .await
+            .expect("full start");
         assert!(
             !full_snapshot.tree_snapshot.unwrap_or_default().is_empty(),
             "first full subscriber must receive a refreshed tree snapshot"

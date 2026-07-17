@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 
 use crate::models::*;
 use crate::parsers::{
-    folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str,
-    visible_title, visible_user_text, AgentParser, ParseError,
+    folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError,
 };
 
 pub struct GeminiParser {
@@ -1320,7 +1320,9 @@ earlier terminal context records.\n\
             .iter()
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
-        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
 
         let _ = fs::remove_dir_all(base);
     }

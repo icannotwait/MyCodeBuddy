@@ -79,11 +79,7 @@ impl TerminalManager {
             .map_err(|e| TerminalError::SpawnFailed(e.to_string()))?;
 
         let mut cmd = CommandBuilder::new(&opts.shell.executable);
-        configure_interactive_command(
-            &opts.shell,
-            &mut cmd,
-            opts.initial_command.as_deref(),
-        );
+        configure_interactive_command(&opts.shell, &mut cmd, opts.initial_command.as_deref());
         cmd.cwd(&opts.working_dir);
 
         // Inject extra environment variables (e.g. git credential helper config)
@@ -205,7 +201,8 @@ impl TerminalManager {
                 Err(err) => {
                     tracing::error!(
                         "[TERM] failed to query child status for terminal {}: {}",
-                        id, err
+                        id,
+                        err
                     );
                     exited_terminal_ids.push(id.clone());
                 }
