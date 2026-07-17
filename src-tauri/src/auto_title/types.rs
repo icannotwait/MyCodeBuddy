@@ -80,6 +80,16 @@ pub enum FinalizeTitleOutcome {
     Cancelled,
 }
 
+/// Durable transition after a failed title attempt. `Ready` means attempt two
+/// can start immediately (a newer usable turn already exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureTransition {
+    Ready,
+    RetryWait,
+    Exhausted,
+    Cancelled,
+}
+
 /// Why a connection was launched. Title capture bypasses internal purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionPurpose {

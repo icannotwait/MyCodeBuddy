@@ -270,6 +270,23 @@ async fn async_main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let title_db = Arc::new(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    });
+    let auto_title_coordinator = codeg_lib::auto_title::build_production_coordinator(
+        title_db,
+        connection_manager.clone_ref(),
+        Arc::clone(&internal_sessions),
+        data_dir.clone(),
+        emitter.clone(),
+    );
+    if let Err(e) = auto_title_coordinator.recover_and_start().await {
+        tracing::error!("[SERVER] auto-title recovery failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let conversation_experience_gate = Arc::new(
+        codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+    );
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -279,6 +296,8 @@ async fn async_main() -> ExitCode {
         emitter,
         data_dir,
         internal_sessions: internal_sessions.clone(),
+        auto_title_coordinator: auto_title_coordinator.clone(),
+        conversation_experience_gate,
         web_server_state: WebServerState::new(),
         chat_channel_manager: codeg_lib::app_state::default_chat_channel_manager(),
         workspace_transfer: Arc::new(

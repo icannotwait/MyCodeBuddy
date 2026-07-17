@@ -789,6 +789,14 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::auto_title::InternalAgentSessionRegistry>>()
             .inner()
             .clone(),
+        auto_title_coordinator: app
+            .state::<Arc<crate::auto_title::AutoTitleCoordinator>>()
+            .inner()
+            .clone(),
+        conversation_experience_gate: app
+            .state::<Arc<crate::commands::conversation_experience::ConversationExperienceMutationGate>>()
+            .inner()
+            .clone(),
         web_server_state: WebServerState::new(), // placeholder; not used by handlers
         chat_channel_manager: crate::app_state::default_chat_channel_manager(),
         workspace_transfer: app

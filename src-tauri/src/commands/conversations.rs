@@ -1796,14 +1796,17 @@ pub async fn update_conversation_status(
 
 pub async fn update_conversation_title_core(
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
-    // Temporary discard until Task 8 wires coordinator cancellation.
-    conversation_service::update_title(conn, conversation_id, title)
+    let removed_job = conversation_service::update_title(conn, conversation_id, title)
         .await
-        .map_err(AppCommandError::from)
-        .map(|_| ())
+        .map_err(AppCommandError::from)?;
+    if removed_job {
+        coordinator.cancel_conversation(conversation_id).await;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1811,10 +1814,17 @@ pub async fn update_conversation_title_core(
 pub async fn update_conversation_title(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::auto_title::AutoTitleCoordinator>>,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
-    update_conversation_title_core(&db.conn, conversation_id, title).await?;
+    update_conversation_title_core(
+        &db.conn,
+        coordinator.inner().as_ref(),
+        conversation_id,
+        title,
+    )
+    .await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
     Ok(())
 }
@@ -1881,13 +1891,16 @@ pub async fn clear_awaiting_reply(
 
 pub async fn delete_conversation_core(
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
-    // Temporary discard until Task 8 wires coordinator cancellation.
-    conversation_service::soft_delete(conn, conversation_id)
+    let removed_job = conversation_service::soft_delete(conn, conversation_id)
         .await
-        .map_err(AppCommandError::from)
-        .map(|_| ())
+        .map_err(AppCommandError::from)?;
+    if removed_job {
+        coordinator.cancel_conversation(conversation_id).await;
+    }
+    Ok(())
 }
 
 /// When the deleted conversation was backed by a dedicated hidden chat folder,
@@ -1938,6 +1951,7 @@ pub async fn cleanup_chat_folder_for_deleted_conversation(
 pub async fn delete_conversation_with_cleanup_core(
     emitter: &EventEmitter,
     conn: &sea_orm::DatabaseConnection,
+    coordinator: &crate::auto_title::AutoTitleCoordinator,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
     // Capture the backing folder AND parent before the soft-delete: a hidden
@@ -1949,7 +1963,7 @@ pub async fn delete_conversation_with_cleanup_core(
         .ok();
     let folder_id = pre.as_ref().map(|c| c.folder_id);
     let parent_id = pre.as_ref().and_then(|c| c.parent_id);
-    delete_conversation_core(conn, conversation_id).await?;
+    delete_conversation_core(conn, coordinator, conversation_id).await?;
     emit_conversation_deleted(emitter, conversation_id);
     // A removed delegation child drops its parent's child_count (→ 0 hides the
     // chevron). Re-emit the parent from the authoritative aggregate so every
@@ -1969,10 +1983,17 @@ pub async fn delete_conversation_with_cleanup_core(
 pub async fn delete_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    coordinator: tauri::State<'_, std::sync::Arc<crate::auto_title::AutoTitleCoordinator>>,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
     let emitter = EventEmitter::Tauri(app);
-    delete_conversation_with_cleanup_core(&emitter, &db.conn, conversation_id).await
+    delete_conversation_with_cleanup_core(
+        &emitter,
+        &db.conn,
+        coordinator.inner().as_ref(),
+        conversation_id,
+    )
+    .await
 }
 
 fn compute_stats(all_conversations: &[ConversationSummary]) -> AgentStats {
@@ -2020,6 +2041,10 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 
 #[cfg(test)]
 mod tests {
+    fn inert_title_coordinator(db: &crate::db::AppDatabase) -> std::sync::Arc<crate::auto_title::AutoTitleCoordinator> {
+        crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone())
+    }
+
     use super::*;
     use crate::acp::delegation::route::DelegationRoutePolicy;
     use crate::app_error::AppErrorCode;
@@ -3138,7 +3163,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3231,7 +3256,7 @@ mod tests {
         )
         .await
         .expect("create");
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3399,7 +3424,7 @@ mod tests {
                 .expect("second conversation");
 
         // Deleting the first must NOT retire the folder — the second remains.
-        delete_conversation_core(&db.conn, res.conversation_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
             .await
             .expect("delete first");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3412,7 +3437,7 @@ mod tests {
         );
 
         // Deleting the last one retires the now-empty folder.
-        delete_conversation_core(&db.conn, second.id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), second.id)
             .await
             .expect("delete second");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
@@ -3625,7 +3650,7 @@ mod tests {
 
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete");
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
@@ -3724,7 +3749,7 @@ mod tests {
         assert_eq!(saved.version, 1);
 
         // Server deletes c1 and atomically cleans its tab → v2 (only c2 remains).
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete c1");
         cleanup_tabs_for_deleted_conversation(&EventEmitter::Noop, &db.conn, c1).await;
@@ -3834,7 +3859,7 @@ mod tests {
 
         // c1 deleted with no persisted c1 tab → zero rows removed, but the
         // version barrier still advances (v1 → v2) and nothing is broadcast.
-        delete_conversation_core(&db.conn, c1)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), c1)
             .await
             .expect("delete c1");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -3918,7 +3943,7 @@ mod tests {
         let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
-        update_conversation_title_core(&db.conn, conv_id, "Renamed".into())
+        update_conversation_title_core(&db.conn, inert_title_coordinator(&db).as_ref(), conv_id, "Renamed".into())
             .await
             .expect("update");
         let summary = conversation_service::get_by_id(&db.conn, conv_id)
@@ -3934,7 +3959,7 @@ mod tests {
         let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
             .await
             .expect("create");
-        delete_conversation_core(&db.conn, conv_id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), conv_id)
             .await
             .expect("delete");
         // After soft delete the row should no longer show up in list_all.
@@ -4185,7 +4210,7 @@ mod tests {
         let id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
-        delete_conversation_core(&db.conn, id)
+        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), id)
             .await
             .expect("delete");
         let (broadcaster, emitter) = sync_test_emitter();
@@ -4272,7 +4297,7 @@ mod tests {
         .expect("child");
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_with_cleanup_core(&emitter, &db.conn, child.id)
+        delete_conversation_with_cleanup_core(&emitter, &db.conn, inert_title_coordinator(&db).as_ref(), child.id)
             .await
             .expect("delete child");
         let mut saw_deleted = false;

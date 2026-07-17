@@ -7,7 +7,8 @@ use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
-use crate::auto_title::InternalAgentSessionRegistry;
+use crate::auto_title::{AutoTitleCoordinator, InternalAgentSessionRegistry};
+use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::chat_channel::manager::ChatChannelManager;
 use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
@@ -32,6 +33,10 @@ pub struct AppState {
     /// Shared registry of internal-only agent sessions (auto-title runs, etc.).
     /// One instance is cloned into Tauri managed state and embedded Axum state.
     pub internal_sessions: Arc<InternalAgentSessionRegistry>,
+    /// Durable automatic-title worker. Shared by lifecycle, Tauri commands, and Axum.
+    pub auto_title_coordinator: Arc<AutoTitleCoordinator>,
+    /// Process-local mutation gate for conversation-experience settings.
+    pub conversation_experience_gate: Arc<ConversationExperienceMutationGate>,
     pub web_server_state: WebServerState,
     pub chat_channel_manager: ChatChannelManager,
     pub workspace_transfer: Arc<WorkspaceTransferManager>,
@@ -319,6 +324,9 @@ impl AppState {
         let internal_sessions =
             InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), &data_dir)
                 .expect("empty internal session registry for tests");
+        let auto_title_coordinator =
+            AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
 
         Self {
             db,
@@ -329,6 +337,8 @@ impl AppState {
             emitter,
             data_dir,
             internal_sessions,
+            auto_title_coordinator,
+            conversation_experience_gate,
             web_server_state: crate::web::WebServerState::new(),
             chat_channel_manager: default_chat_channel_manager(),
             workspace_transfer: Arc::new(

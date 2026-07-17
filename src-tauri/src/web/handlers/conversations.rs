@@ -362,6 +362,7 @@ pub async fn update_conversation_title(
 ) -> Result<Json<()>, AppCommandError> {
     conv_commands::update_conversation_title_core(
         &state.db.conn,
+        state.auto_title_coordinator.as_ref(),
         params.conversation_id,
         params.title,
     )
@@ -428,6 +429,7 @@ pub async fn delete_conversation(
     conv_commands::delete_conversation_with_cleanup_core(
         &state.emitter,
         &state.db.conn,
+        state.auto_title_coordinator.as_ref(),
         params.conversation_id,
     )
     .await?;

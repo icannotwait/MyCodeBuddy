@@ -237,9 +237,12 @@ async fn handle_turn_complete_internal(
             // still advance on usable completions from the event-owned sidecar.
             if let Some(snapshot) = completion.as_ref() {
                 let txn = db_conn.begin().await?;
-                let _transition =
+                let transition =
                     apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
                 txn.commit().await?;
+                if transition.became_ready {
+                    crate::auto_title::notify_live_coordinator_ready();
+                }
             }
             if let Some(b) = broker {
                 // Empty broker text when no sidecar — never re-read SessionState.
@@ -262,9 +265,12 @@ async fn handle_turn_complete_internal(
             );
             if let Some(snapshot) = completion.as_ref() {
                 let txn = db_conn.begin().await?;
-                let _transition =
+                let transition =
                     apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
                 txn.commit().await?;
+                if transition.became_ready {
+                    crate::auto_title::notify_live_coordinator_ready();
+                }
             }
             if let Some(b) = broker {
                 let text = broker_text
@@ -296,11 +302,16 @@ async fn handle_turn_complete_internal(
         }
         _ => None,
     };
+    let mut became_ready = false;
     if let Some(snapshot) = completion.as_ref() {
-        // `became_ready` is reserved for Task 8's coordinator after commit.
-        let _transition = apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+        let transition = apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+        became_ready = transition.became_ready;
     }
     txn.commit().await?;
+    // Notify the durable title worker only after the transaction commits.
+    if became_ready {
+        crate::auto_title::notify_live_coordinator_ready();
+    }
 
     if let Some(patch) = cas_patch {
         let status = if stop_reason == "end_turn" {

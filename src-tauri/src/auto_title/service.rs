@@ -5,19 +5,21 @@ use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, Set, TransactionTrait,
+    EntityTrait, Order, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::acp::types::PromptInputBlock;
 use crate::auto_title::context::{bound_context, project_visible_prompt};
 use crate::auto_title::types::{
-    app_locale_to_wire, AutoTitleClaim, CapturedPrompt, CompletionTransition, FinalizeTitleOutcome,
-    PromptCaptureContext, TurnCompletionSnapshot,
+    app_locale_to_wire, parse_supported_app_locale, AutoTitleClaim, CapturedPrompt,
+    CompletionTransition, FailureTransition, FinalizeTitleOutcome, PromptCaptureContext,
+    TurnCompletionSnapshot,
 };
 use crate::commands::conversation_experience::load_auto_title_agent_from;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
+use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 
 /// Enroll a newly created conversation for automatic titles when the setting
@@ -208,6 +210,178 @@ pub async fn apply_usable_completion(
         usable_turn_seq: new_seq,
         became_ready,
     })
+}
+
+/// Claim the oldest ready job: `ready → running`, increment attempts, snapshot
+/// the configured agent. When the setting is Off, delete all ready orphans and
+/// return `None` so the worker does not spin.
+pub async fn claim_next_ready(
+    conn: &DatabaseConnection,
+) -> Result<Option<AutoTitleClaim>, DbError> {
+    let txn = conn.begin().await?;
+
+    let Some(agent) = load_auto_title_agent_from(&txn).await? else {
+        auto_title_job::Entity::delete_many()
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        return Ok(None);
+    };
+
+    loop {
+        let candidate = auto_title_job::Entity::find()
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .order_by(auto_title_job::Column::UpdatedAt, Order::Asc)
+            .order_by(auto_title_job::Column::ConversationId, Order::Asc)
+            .one(&txn)
+            .await?;
+
+        let Some(job) = candidate else {
+            txn.commit().await?;
+            return Ok(None);
+        };
+
+        let first_user = job.first_user_text.clone().unwrap_or_default();
+        let first_assistant = job.first_assistant_text.clone().unwrap_or_default();
+        if first_user.trim().is_empty() || first_assistant.trim().is_empty() {
+            // Unusable ready row — drop it and continue.
+            auto_title_job::Entity::delete_by_id(job.conversation_id)
+                .exec(&txn)
+                .await?;
+            continue;
+        }
+
+        let locale = match parse_supported_app_locale(job.locale.as_deref()) {
+            Some(locale) => locale,
+            None => {
+                if job.locale.is_some() {
+                    tracing::warn!(
+                        conversation_id = job.conversation_id,
+                        locale = ?job.locale,
+                        "corrupt auto-title job locale; falling back to English"
+                    );
+                }
+                AppLocale::En
+            }
+        };
+
+        let new_attempts = job.attempts + 1;
+        let attempt_turn_seq = job.usable_turn_seq;
+        let updated = auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(AutoTitleJobState::Running),
+            )
+            .col_expr(auto_title_job::Column::Attempts, Expr::value(new_attempts))
+            .col_expr(
+                auto_title_job::Column::AttemptTurnSeq,
+                Expr::value(attempt_turn_seq),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(auto_title_job::Column::ConversationId.eq(job.conversation_id))
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .exec(&txn)
+            .await?;
+
+        if updated.rows_affected != 1 {
+            // Lost the race — try the next candidate under the same permit.
+            continue;
+        }
+
+        txn.commit().await?;
+        return Ok(Some(AutoTitleClaim {
+            conversation_id: job.conversation_id,
+            attempt: new_attempts,
+            agent,
+            first_user_text: first_user,
+            first_assistant_text: first_assistant,
+            locale,
+            attempt_turn_seq,
+        }));
+    }
+}
+
+/// True while the exact claim still owns a `running` job row (not cancelled /
+/// renamed / superseded).
+pub async fn claim_is_still_running(
+    conn: &DatabaseConnection,
+    claim: &AutoTitleClaim,
+) -> Result<bool, DbError> {
+    let job = auto_title_job::Entity::find_by_id(claim.conversation_id)
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Running))
+        .filter(auto_title_job::Column::Attempts.eq(claim.attempt))
+        .filter(auto_title_job::Column::AttemptTurnSeq.eq(claim.attempt_turn_seq))
+        .one(conn)
+        .await?;
+    Ok(job.is_some())
+}
+
+/// Record a failed attempt for the exact claim. Attempt one becomes `ready` if
+/// a newer usable turn already exists, else `retry_wait`. Attempt two deletes.
+pub async fn record_attempt_failure(
+    conn: &DatabaseConnection,
+    claim: &AutoTitleClaim,
+) -> Result<FailureTransition, DbError> {
+    let txn = conn.begin().await?;
+    let job = auto_title_job::Entity::find_by_id(claim.conversation_id)
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Running))
+        .filter(auto_title_job::Column::Attempts.eq(claim.attempt))
+        .filter(auto_title_job::Column::AttemptTurnSeq.eq(claim.attempt_turn_seq))
+        .one(&txn)
+        .await?;
+
+    let Some(job) = job else {
+        txn.commit().await?;
+        return Ok(FailureTransition::Cancelled);
+    };
+
+    if claim.attempt >= 2 {
+        auto_title_job::Entity::delete_by_id(claim.conversation_id)
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        return Ok(FailureTransition::Exhausted);
+    }
+
+    let next = if job.usable_turn_seq > job.attempt_turn_seq {
+        FailureTransition::Ready
+    } else {
+        FailureTransition::RetryWait
+    };
+
+    let mut active: auto_title_job::ActiveModel = job.into();
+    active.state = Set(match next {
+        FailureTransition::Ready => AutoTitleJobState::Ready,
+        FailureTransition::RetryWait => AutoTitleJobState::RetryWait,
+        _ => unreachable!(),
+    });
+    active.updated_at = Set(Utc::now());
+    active.update(&txn).await?;
+    txn.commit().await?;
+    Ok(next)
+}
+
+/// Convert interrupted `running` rows into retry/ready/deleted after restart.
+pub async fn recover_interrupted_jobs(conn: &DatabaseConnection) -> Result<(), DbError> {
+    let running = auto_title_job::Entity::find()
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Running))
+        .all(conn)
+        .await?;
+
+    for job in running {
+        let claim = AutoTitleClaim {
+            conversation_id: job.conversation_id,
+            attempt: job.attempts,
+            agent: AgentType::ClaudeCode, // agent unused by failure transition
+            first_user_text: String::new(),
+            first_assistant_text: String::new(),
+            locale: AppLocale::En,
+            attempt_turn_seq: job.attempt_turn_seq,
+        };
+        let _ = record_attempt_failure(conn, &claim).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
