@@ -45,9 +45,8 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
-/// Launch policy for delegated children. Must stay in lockstep with
-/// `ConnectionManagerSpawner::spawn` — the named inheritance test exercises
-/// this helper as the production policy.
+/// Launch policy for delegated children. Built only by the spawn-owned parent
+/// launch snapshot resolver that `ConnectionManagerSpawner::spawn` consumes.
 fn delegation_launch_context(parent_effective_locale: AppLocale) -> ConnectionLaunchContext {
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::Delegation,
@@ -423,8 +422,9 @@ impl ConnectionManager {
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
-        // Temporary Task 4B launch context (purpose + inherited locale). Task 4C
-        // replaces production defaults with persisted/channel/parent sources.
+        // Purpose + inherited locale from the caller's launch policy (UI system
+        // language, parent effective locale for delegation, channel locale in
+        // Task 4C2, or probe/test defaults).
         launch_context: ConnectionLaunchContext,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
@@ -2690,6 +2690,50 @@ pub struct ConnectionManagerSpawner {
     pub data_dir: Arc<PathBuf>,
 }
 
+/// Coherent parent snapshot for delegated child launch. Owned by
+/// `ConnectionManagerSpawner` and consumed only by production `spawn` (and the
+/// named inheritance test that pins that path without spawning an agent).
+struct ParentSpawnLaunchSnapshot {
+    emitter: EventEmitter,
+    owner_window_label: String,
+    parent_working_dir: Option<String>,
+    launch_context: ConnectionLaunchContext,
+}
+
+impl ConnectionManagerSpawner {
+    /// Read live parent emitter/owner/workdir and build Delegation launch
+    /// context from the parent's latest `effective_locale` in one snapshot.
+    /// Production `spawn` is the only call site besides the focused test.
+    async fn resolve_parent_spawn_launch_snapshot(
+        &self,
+        parent_connection_id: &str,
+    ) -> Result<ParentSpawnLaunchSnapshot, crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        // Falling back is not safe: a child whose emitter is wired to a
+        // different broadcaster would emit events the frontend never sees.
+        let conns = self.manager.connections.lock().await;
+        let parent = conns.get(parent_connection_id).ok_or_else(|| {
+            SpawnerError::Spawn(format!(
+                "parent connection {parent_connection_id} not found"
+            ))
+        })?;
+        let (parent_working_dir, parent_locale) = {
+            let s = parent.state.read().await;
+            let pwd = s
+                .working_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string());
+            (pwd, s.effective_locale)
+        };
+        Ok(ParentSpawnLaunchSnapshot {
+            emitter: parent.emitter.clone(),
+            owner_window_label: parent.owner_window_label.clone(),
+            parent_working_dir,
+            launch_context: delegation_launch_context(parent_locale),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpawner {
     async fn spawn(
@@ -2701,33 +2745,10 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
-        // Resolve the parent connection so we can inherit its emitter and
-        // owner_window. Falling back is not safe: a child whose emitter is
-        // wired to a different broadcaster would emit events the frontend
-        // never sees.
-        let (emitter, owner_window, parent_working_dir, parent_locale) = {
-            let conns = self.manager.connections.lock().await;
-            let parent = conns.get(parent_connection_id).ok_or_else(|| {
-                SpawnerError::Spawn(format!(
-                    "parent connection {parent_connection_id} not found"
-                ))
-            })?;
-            let (pwd, locale) = {
-                let s = parent.state.read().await;
-                let pwd = s
-                    .working_dir
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string());
-                (pwd, s.effective_locale)
-            };
-            (
-                parent.emitter.clone(),
-                parent.owner_window_label.clone(),
-                pwd,
-                locale,
-            )
-        };
-        let effective_working_dir = working_dir.or(parent_working_dir);
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
 
         // Build the same launch inputs `acp_connect` would build for a
         // user-initiated session — disabled check, settings overrides,
@@ -2742,19 +2763,18 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
 
-        // Delegation purpose + parent's latest effective locale (not English).
-        let launch_context = delegation_launch_context(parent_locale);
+        // Snapshot carries Delegation purpose + parent's latest effective locale.
         self.manager
             .spawn_agent(
                 agent_type,
                 effective_working_dir,
                 None,
                 launch_inputs,
-                owner_window,
-                emitter,
+                parent.owner_window_label,
+                parent.emitter,
                 preferred_mode_id,
                 preferred_config_values,
-                launch_context,
+                parent.launch_context,
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
@@ -2936,9 +2956,11 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_child_inherits_parent_effective_locale() {
-        // Real manager/database path: parent locale is ZhCn; the production
-        // launch policy must inherit it onto the child; delegated send must
-        // persist the broker task as first_user_text under that locale.
+        // Real manager/database path: parent locale is ZhCn; the spawn-owned
+        // parent launch snapshot (consumed by ConnectionManagerSpawner::spawn)
+        // must inherit it onto the child; delegated send must persist the
+        // broker task as first_user_text under that locale. Does not spawn a
+        // real external agent.
         use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
         use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
         use crate::db::entities::auto_title_job;
@@ -2958,11 +2980,12 @@ mod tests {
         let mgr = Arc::new(ConnectionManager::new());
         let parent_id = "deleg-parent-locale";
         let child_id = "deleg-child-locale";
+        let parent_workdir = PathBuf::from("/tmp/deleg-parent-locale");
         let _parent_rx = mgr
             .insert_test_connection_live(
                 parent_id,
                 AgentType::ClaudeCode,
-                Some(PathBuf::from("/tmp/deleg-parent-locale")),
+                Some(parent_workdir.clone()),
                 EventEmitter::Noop,
             )
             .await;
@@ -2973,23 +2996,31 @@ mod tests {
             s.purpose = ConnectionPurpose::User;
         }
 
-        let parent_locale = {
-            let state = mgr.get_state(parent_id).await.unwrap();
-            let guard = state.read().await;
-            let locale = guard.effective_locale;
-            drop(guard);
-            locale
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
         };
-        assert_eq!(parent_locale, AppLocale::ZhCn);
-
-        // Production policy used by ConnectionManagerSpawner::spawn.
-        let launch = delegation_launch_context(parent_locale);
-        assert_eq!(launch.purpose, ConnectionPurpose::Delegation);
+        // Production spawn-owned resolver: must read live parent state and build
+        // Delegation + parent effective_locale (not English default).
+        let snapshot = spawner
+            .resolve_parent_spawn_launch_snapshot(parent_id)
+            .await
+            .expect("parent spawn launch snapshot");
         assert_eq!(
-            launch.inherited_locale,
+            snapshot.launch_context.purpose,
+            ConnectionPurpose::Delegation
+        );
+        assert_eq!(
+            snapshot.launch_context.inherited_locale,
             Some(AppLocale::ZhCn),
             "delegated child must inherit parent effective_locale, not English default"
         );
+        assert_eq!(
+            snapshot.parent_working_dir.as_deref(),
+            Some(parent_workdir.to_string_lossy().as_ref())
+        );
+        assert_eq!(snapshot.owner_window_label, "test-window");
 
         let mut child_rx = mgr
             .insert_test_connection_live(
@@ -3002,8 +3033,11 @@ mod tests {
         {
             let state = mgr.get_state(child_id).await.unwrap();
             let mut s = state.write().await;
-            s.purpose = launch.purpose;
-            s.effective_locale = launch.inherited_locale.unwrap_or(AppLocale::En);
+            s.purpose = snapshot.launch_context.purpose;
+            s.effective_locale = snapshot
+                .launch_context
+                .inherited_locale
+                .unwrap_or(AppLocale::En);
         }
 
         let parent_conversation = {
@@ -3013,11 +3047,6 @@ mod tests {
                 .expect("parent conversation")
         };
 
-        let spawner = ConnectionManagerSpawner {
-            manager: mgr.clone(),
-            db: db.clone(),
-            data_dir: Arc::new(PathBuf::from("/tmp")),
-        };
         let task = "delegated broker task body".to_string();
         let conversation_id = spawner
             .send_prompt_linked_for_delegation(
