@@ -977,7 +977,7 @@
       "remoteUnavailable": "{versionText}. Remote-Version ist derzeit nicht verfügbar.",
       "latest": "{versionText}. Bereits aktuell.",
       "bundled": "Integriert: {version}",
-      "bundledMissing": "Der integrierte Adapter fehlt. Installieren oder aktualisieren Sie MyCodeBuddy erneut."
+      "bundledMissing": "Der integrierte Adapter fehlt. Installieren oder aktualisieren Sie DrawCode erneut."
     },
     "cline": {
       "configDescription": "Konfigurieren Sie den Cline API-Anbieter und die Anmeldedaten. Einstellungen werden in ~/.cline/data/ gespeichert."
@@ -1088,8 +1088,8 @@
     "loadFailed": "Laden fehlgeschlagen: {message}"
   },
   "LoginPage": {
-    "documentTitle": "Anmelden - codeg",
-    "brand": "Codeg",
+    "documentTitle": "Anmelden - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "Gib dein Zugriffstoken ein, um dich mit der Desktop-App zu verbinden",
     "tokenPlaceholder": "Zugriffstoken",
     "connect": "Verbinden",
@@ -2062,6 +2062,9 @@
         "connectFailedTitle": "{agent} Verbindung fehlgeschlagen",
         "toolFallbackTitle": "Werkzeug",
         "eventErrorTitle": "Agentenfehler",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} hat die Antwort abgeschlossen",
         "notificationError": "{agent} Fehler: {message}",
         "claudeApiRetry": {
@@ -2766,11 +2769,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "Das Umschalten ändert nur die hier angezeigte und geöffnete Adresse – der Dienst lauscht auf allen Schnittstellen und bleibt unter jeder Adresse erreichbar.",
     "sectionTitle": "Webdienst",
-    "sectionDescription": "Aktivieren Sie den Fernzugriff auf Codeg über den Browser",
+    "sectionDescription": "Aktivieren Sie den Fernzugriff auf DrawCode über den Browser",
     "port": "Port",
     "status": "Status",
     "autoStart": "Automatisch starten",
-    "autoStartHint": "Webdienst beim Start von Codeg starten",
+    "autoStartHint": "Webdienst beim Start von DrawCode starten",
     "running": "Läuft",
     "stopped": "Gestoppt",
     "processing": "Verarbeitung...",
@@ -2785,7 +2788,7 @@
     "copy": "Kopieren",
     "qrcode": "QR-Code",
     "qrcodeTitle": "Zum Öffnen scannen",
-    "qrcodeHint": "Scanne mit deinem Handy, um Codeg im Browser zu öffnen",
+    "qrcodeHint": "Scanne mit deinem Handy, um DrawCode im Browser zu öffnen",
     "addressLabel": "Zugriffsadresse",
     "tokenLabel": "Zugriffstoken",
     "tokenHint": "Geben Sie dieses Token beim ersten Zugriff auf den Web-Client ein",
@@ -2793,7 +2796,7 @@
     "regenerate": "Neu generieren",
     "stalePortOccupiedTitle": "Port {port} wird von einem anderen Prozess belegt",
     "stalePortUnknownTitle": "Status von Port {port} unklar",
-    "stalePortHint": "Codeg kann sich nicht binden, bis der Port freigegeben ist. Ändere den Port oben oder beende den Prozess, der ihn hält.",
+    "stalePortHint": "DrawCode kann sich nicht binden, bis der Port freigegeben ist. Ändere den Port oben oder beende den Prozess, der ihn hält.",
     "errors": {
       "alreadyRunning": "Der Web-Dienst läuft bereits",
       "invalidAddress": "Host- oder Portformat ungültig",
@@ -3027,7 +3030,7 @@
     },
     "confirm": {
       "disableTitle": "Diese Verknüpfungen deaktivieren?",
-      "disableBody": "Dadurch werden {count} von codeg verwaltete Skill-Verknüpfungen entfernt. Skills, die ein eigenes Verzeichnis belegen, bleiben unberührt. Du kannst sie jederzeit wieder aktivieren.",
+      "disableBody": "Dadurch werden {count} von DrawCode verwaltete Skill-Verknüpfungen entfernt. Skills, die ein eigenes Verzeichnis belegen, bleiben unberührt. Du kannst sie jederzeit wieder aktivieren.",
       "cancel": "Abbrechen",
       "confirm": "Deaktivieren"
     },
@@ -3093,7 +3096,7 @@
   },
   "ScienceSettings": {
     "title": "Wissenschaftliche Skills",
-    "description": "Aktiviere kuratierte wissenschaftliche Skills für deine KI-Coding-Agents — Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung und Literatursuche. MyCodeBuddy verwaltet eine zentrale Kopie und verlinkt jeden Skill in die von dir gewählten Agents.",
+    "description": "Aktiviere kuratierte wissenschaftliche Skills für deine KI-Coding-Agents — Hypothesengenerierung, Versuchsplanung, Statistik, Visualisierung, kritische Bewertung und Literatursuche. DrawCode verwaltet eine zentrale Kopie und verlinkt jeden Skill in die von dir gewählten Agents.",
     "loading": "Wissenschaftliche Skills werden geladen…",
     "emptySkills": "Keine wissenschaftlichen Skills verfügbar. Prüfe die Anwendungsprotokolle.",
     "searchPlaceholder": "Wissenschaftliche Skills nach Name, ID oder Beschreibung suchen",
@@ -3437,7 +3440,7 @@
         "incompatible": "Inkompatibel",
         "createdAt": "Erstellt: {value}",
         "appVersion": "App-Version: {value}",
-        "incompatibleHint": "Diese Sicherung wurde mit einer neueren Version von codeg erstellt und kann nicht wiederhergestellt werden."
+        "incompatibleHint": "Diese Sicherung wurde mit einer neueren Version von DrawCode erstellt und kann nicht wiederhergestellt werden."
       },
       "replaceWarning": "Beim Wiederherstellen werden alle aktuellen codeg-Daten (Datenbank und Uploads) ersetzt. Deine aktuellen Daten werden zuvor als Snapshot gesichert.",
       "keyringNote": "GitHub-/Chat-Tokens der Desktop-App liegen im Schlüsselbund des Betriebssystems und sind nicht enthalten; gib sie nach dem Wiederherstellen erneut ein.",

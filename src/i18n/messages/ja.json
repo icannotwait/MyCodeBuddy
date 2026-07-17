@@ -977,7 +977,7 @@
       "remoteUnavailable": "{versionText}。現在リモートバージョンは取得できません。",
       "latest": "{versionText}。すでに最新です。",
       "bundled": "内蔵バージョン: {version}",
-      "bundledMissing": "内蔵アダプターがありません。MyCodeBuddy を再インストールまたは更新してください。"
+      "bundledMissing": "内蔵アダプターがありません。DrawCode を再インストールまたは更新してください。"
     },
     "cline": {
       "configDescription": "Cline API プロバイダーと認証情報を設定します。設定は ~/.cline/data/ に保存されます。"
@@ -1088,8 +1088,8 @@
     "loadFailed": "読み込みに失敗しました: {message}"
   },
   "LoginPage": {
-    "documentTitle": "ログイン - codeg",
-    "brand": "Codeg",
+    "documentTitle": "ログイン - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "デスクトップアプリに接続するためのアクセストークンを入力してください",
     "tokenPlaceholder": "アクセストークン",
     "connect": "接続",
@@ -2062,6 +2062,9 @@
         "connectFailedTitle": "{agent} の接続に失敗しました",
         "toolFallbackTitle": "ツール",
         "eventErrorTitle": "エージェントエラー",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} の応答が完了しました",
         "notificationError": "{agent} エラー：{message}",
         "claudeApiRetry": {
@@ -2766,11 +2769,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "切り替えても、ここに表示され開くアドレスが変わるだけです。サービスはすべてのインターフェースで待ち受けており、どのアドレスからもアクセスできます。",
     "sectionTitle": "Webサービス",
-    "sectionDescription": "有効にするとブラウザからCodegにリモートアクセスできます",
+    "sectionDescription": "有効にするとブラウザからDrawCodeにリモートアクセスできます",
     "port": "ポート",
     "status": "ステータス",
     "autoStart": "自動起動",
-    "autoStartHint": "Codeg の起動時に Web サービスを開始",
+    "autoStartHint": "DrawCode の起動時に Web サービスを開始",
     "running": "実行中",
     "stopped": "停止中",
     "processing": "処理中...",
@@ -2785,7 +2788,7 @@
     "copy": "コピー",
     "qrcode": "QRコード",
     "qrcodeTitle": "スキャンして開く",
-    "qrcodeHint": "スマートフォンでスキャンして、ブラウザで Codeg を開きます",
+    "qrcodeHint": "スマートフォンでスキャンして、ブラウザで DrawCode を開きます",
     "addressLabel": "アクセスアドレス",
     "tokenLabel": "アクセストークン",
     "tokenHint": "Webクライアントの初回アクセス時にこのトークンを入力してください",
@@ -2793,7 +2796,7 @@
     "regenerate": "再生成",
     "stalePortOccupiedTitle": "ポート {port} は他のプロセスに使用されています",
     "stalePortUnknownTitle": "ポート {port} の状態を確認できません",
-    "stalePortHint": "ポートが解放されるまで Codeg はバインドできません。上のポートを変更するか、占有しているプロセスを終了してください。",
+    "stalePortHint": "ポートが解放されるまで DrawCode はバインドできません。上のポートを変更するか、占有しているプロセスを終了してください。",
     "errors": {
       "alreadyRunning": "Web サービスはすでに起動しています",
       "invalidAddress": "ホストまたはポートの形式が無効です",
@@ -3093,7 +3096,7 @@
   },
   "ScienceSettings": {
     "title": "科学研究スキル",
-    "description": "AI コーディングエージェント向けに厳選した科学研究スキル（仮説生成・実験計画・統計・可視化・批判的評価・文献検索）を有効化します。MyCodeBuddy が中央コピーを管理し、選んだエージェントに各スキルをリンクします。",
+    "description": "AI コーディングエージェント向けに厳選した科学研究スキル（仮説生成・実験計画・統計・可視化・批判的評価・文献検索）を有効化します。DrawCode が中央コピーを管理し、選んだエージェントに各スキルをリンクします。",
     "loading": "科学研究スキルを読み込み中…",
     "emptySkills": "利用可能な科学研究スキルがありません。アプリのログを確認してください。",
     "searchPlaceholder": "名前・ID・説明で科学研究スキルを検索",

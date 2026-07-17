@@ -69,6 +69,7 @@ function createIngestorHarness(
   const gaps: SequenceGap[] = []
   let scheduled: FrameRequestCallback | null = null
   const onUnmapped = vi.fn()
+  const onDuplicate = vi.fn()
   let commitImpl: (frame: AcceptedEventFrame) => void = (frame) => {
     commits.push(frame)
     for (const connection of frame.connections) {
@@ -81,6 +82,7 @@ function createIngestorHarness(
     readCursor: (contextKey) => cursorByKey.get(contextKey) ?? 0,
     commit: (frame) => commitImpl(frame),
     onGap: (gap) => gaps.push(gap),
+    onDuplicate,
     onUnmapped,
     scheduleFrame: (callback) => {
       scheduled = callback
@@ -94,6 +96,7 @@ function createIngestorHarness(
     commits,
     gaps,
     onUnmapped,
+    onDuplicate,
     ingestor,
     setCommit: (fn: (frame: AcceptedEventFrame) => void) => {
       commitImpl = fn
@@ -150,6 +153,14 @@ describe("EventIngestor", () => {
     expect(h.commits[0].connections[0].highestSeq).toBe(14)
     expect(h.commits[0].deliveryIds).toEqual([4, 5])
     expect(h.commits[0].connections[0].deliveryIds).toEqual([4, 5])
+    // seq 10 was already applied (cursor) — reported as duplicate.
+    expect(h.onDuplicate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "c1",
+        contextKey: "tab-1",
+        seq: 10,
+      })
+    )
   })
 
   it("stops a connection at the first sequence gap", () => {

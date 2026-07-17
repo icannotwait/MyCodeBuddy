@@ -29,6 +29,8 @@ export interface PerfRunMetadata {
   rateProfile?: PerfRateProfile
   expectedEvents?: number
   expectedTextSha256?: string
+  /** Fixture connection — integrity only counts this id's accepted events. */
+  targetConnectionId?: string | null
 }
 
 export interface PerfClock {
@@ -107,8 +109,10 @@ interface ActiveRun {
   integrity: StreamingPerfReport["integrity"]
   /** Events accepted by the frontend frame commit path (not backend emit counts). */
   frontendAcceptedEvents: number
-  /** Canonical assistant text observed via committed content_delta frames. */
+  /** Final canonical assistant text (set after quiet from liveMessage). */
   frontendText: string
+  /** Only this connection contributes to integrity counts / gap / dup. */
+  targetConnectionId: string | null
   deliverySnapshot: EventBusMetricsSnapshot | null
   environment: StreamingPerfReport["environment"] | null
 }
@@ -314,6 +318,7 @@ export class StreamingPerfRecorder {
       cadenceFrozen: false,
       paintFlushIds: [],
       paintRafHandle: null,
+      targetConnectionId: metadata.targetConnectionId ?? null,
       integrity: {
         expectedEvents: metadata.expectedEvents ?? GROK_RICH_V1_EXPECTED_EVENTS,
         appliedEvents: 0,
@@ -647,11 +652,28 @@ export class StreamingPerfRecorder {
     active.integrity.appliedEvents = active.frontendAcceptedEvents
   }
 
-  /** Append committed assistant text for frontend checksum integrity. */
+  /** Append committed assistant text (incremental path; prefer setFrontendText). */
   appendFrontendText(delta: string): void {
     const active = this.active
     if (!active || !delta) return
     active.frontendText += delta
+  }
+
+  /** Replace frontend text with final canonical assistant body for hashing. */
+  setFrontendText(text: string): void {
+    const active = this.active
+    if (!active) return
+    active.frontendText = text
+  }
+
+  getTargetConnectionId(): string | null {
+    return this.active?.targetConnectionId ?? null
+  }
+
+  matchesTargetConnection(connectionId: string): boolean {
+    const target = this.active?.targetConnectionId
+    if (!target) return true
+    return connectionId === target
   }
 
   markFrontendSequenceGap(): void {

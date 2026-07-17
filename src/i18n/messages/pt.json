@@ -632,7 +632,7 @@
       "configTomlHint": "Salvo literalmente como todo o ~/.grok/config.toml. TOML inválido é rejeitado para que um erro de digitação nunca trunque seu arquivo.",
       "configTomlPlaceholder": "# Chaves além dos controles acima, por ex.\n# [mcp_servers.*], [cli], regras [permission].",
       "customModelTitle": "Modelo personalizado (endpoint próprio)",
-      "customModelHint": "Aponte o Grok para um endpoint personalizado ou auto-hospedado. O codeg grava um bloco `[model.*]` por modelo e o define como padrão. Deixe o ID do modelo vazio para removê-lo.",
+      "customModelHint": "Aponte o Grok para um endpoint personalizado ou auto-hospedado. o DrawCode grava um bloco `[model.*]` por modelo e o define como padrão. Deixe o ID do modelo vazio para removê-lo.",
       "customModelIdLabel": "ID do modelo",
       "customModelIdPlaceholder": "ex.: grok-custom",
       "customModelIdHint": "Registrado como um bloco `[model.*]` e enviado à API como nome do modelo; também definido como `[models].default`.",
@@ -771,7 +771,7 @@
     },
     "hermes": {
       "configManagement": "Configuração do Hermes",
-      "configDescription": "O Hermes gerencia suas próprias credenciais em ~/.hermes/.env e as configurações em ~/.hermes/config.yaml. Escolha um provedor e, em seguida, defina a chave de API e o modelo — o codeg grava os dois arquivos para você.",
+      "configDescription": "O Hermes gerencia suas próprias credenciais em ~/.hermes/.env e as configurações em ~/.hermes/config.yaml. Escolha um provedor e, em seguida, defina a chave de API e o modelo — o DrawCode grava os dois arquivos para você.",
       "providerLabel": "Provedor",
       "providerHint": "O provedor determina qual variável de chave de API e qual model.provider o Hermes usa. Provedores OAuth são configurados pela configuração de terminal abaixo.",
       "groupApiKey": "Provedores com chave de API",
@@ -977,7 +977,7 @@
       "remoteUnavailable": "{versionText}. A versão remota está indisponível no momento.",
       "latest": "{versionText}. Já está na versão mais recente.",
       "bundled": "Integrado: {version}",
-      "bundledMissing": "O adaptador integrado está ausente. Reinstale ou atualize o MyCodeBuddy."
+      "bundledMissing": "O adaptador integrado está ausente. Reinstale ou atualize o DrawCode."
     },
     "cline": {
       "configDescription": "Configure o provedor de API e as credenciais do Cline. As configurações são salvas em ~/.cline/data/."
@@ -1049,7 +1049,7 @@
       "installing": "Instalando…",
       "recheck": "Verificar novamente",
       "trustTitle": "Confiar automaticamente nos espaços de trabalho abertos",
-      "trustDescription": "Quando o codeg conecta o pi a uma pasta, marca essa pasta como confiável para que o pi carregue a configuração e as habilidades locais do projeto sem uma confirmação separada.",
+      "trustDescription": "Quando o DrawCode conecta o pi a uma pasta, marca essa pasta como confiável para que o pi carregue a configuração e as habilidades locais do projeto sem uma confirmação separada.",
       "trustHint": "Apenas as pastas que você abre aqui são confiáveis, nunca a máquina inteira — e isso afeta somente o carregamento da configuração, não o que o pi pode executar.",
       "configDirSkillsNote": "Com um diretório de configuração personalizado, as habilidades, os especialistas e as ferramentas de escritório gerenciados nas Configurações não se aplicam a este pi — gerencie as habilidades dele diretamente nessa pasta."
     }
@@ -1088,8 +1088,8 @@
     "loadFailed": "Falha ao carregar: {message}"
   },
   "LoginPage": {
-    "documentTitle": "Entrar - codeg",
-    "brand": "Codeg",
+    "documentTitle": "Entrar - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "Digite seu token de acesso para conectar ao aplicativo de desktop",
     "tokenPlaceholder": "Token de acesso",
     "connect": "Conectar",
@@ -2062,6 +2062,9 @@
         "connectFailedTitle": "Falha na conexão de {agent}",
         "toolFallbackTitle": "Ferramenta",
         "eventErrorTitle": "Erro do agente",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} terminou de responder",
         "notificationError": "{agent} erro: {message}",
         "claudeApiRetry": {
@@ -2185,7 +2188,7 @@
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> alterna o painel direito para ver os arquivos tocados e as mudanças do Git desta sessão.",
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> abre o terminal integrado, <shortcut>{toggleSidebar}</shortcut> alterna a barra lateral.",
           "customShortcuts": "Todos os atalhos podem ser reatribuídos em Configurações → Atalhos.",
-          "webService": "Ative Configurações → Serviço web para que sua equipe acesse o mesmo codeg pelo navegador.",
+          "webService": "Ative Configurações → Serviço web para que sua equipe acesse o mesmo DrawCode pelo navegador.",
           "fusionMode": "Abra um arquivo ou diff para exibi-lo automaticamente ao lado da conversa.",
           "quickMessages": "Abra o botão + ao lado da entrada e escolha Mensagens rápidas para inserir um trecho salvo (gerencie-os em Configurações → Mensagens rápidas).",
           "experts": "O botão + tem um menu Habilidades de especialista — carregue papéis como Depuração ou Planejamento com um clique."
@@ -2766,11 +2769,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "Alternar muda apenas o endereço mostrado e aberto aqui; o serviço escuta em todas as interfaces e continua acessível em cada endereço.",
     "sectionTitle": "Serviço Web",
-    "sectionDescription": "Ativar para acessar o Codeg remotamente pelo navegador",
+    "sectionDescription": "Ativar para acessar o DrawCode remotamente pelo navegador",
     "port": "Porta",
     "status": "Status",
     "autoStart": "Início automático",
-    "autoStartHint": "Iniciar o serviço Web ao abrir o Codeg",
+    "autoStartHint": "Iniciar o serviço Web ao abrir o DrawCode",
     "running": "Em execução",
     "stopped": "Parado",
     "processing": "Processando...",
@@ -2785,7 +2788,7 @@
     "copy": "Copiar",
     "qrcode": "Código QR",
     "qrcodeTitle": "Escanear para abrir",
-    "qrcodeHint": "Escaneie com seu telefone para abrir o Codeg no navegador",
+    "qrcodeHint": "Escaneie com seu telefone para abrir o DrawCode no navegador",
     "addressLabel": "Endereço de acesso",
     "tokenLabel": "Token de acesso",
     "tokenHint": "Insira este token ao acessar o cliente Web pela primeira vez",
@@ -2793,7 +2796,7 @@
     "regenerate": "Regenerar",
     "stalePortOccupiedTitle": "A porta {port} está em uso por outro processo",
     "stalePortUnknownTitle": "Estado da porta {port} é incerto",
-    "stalePortHint": "O Codeg não consegue vincular até a porta ser liberada. Altere a porta acima ou feche o processo que a retém.",
+    "stalePortHint": "o DrawCode não consegue vincular até a porta ser liberada. Altere a porta acima ou feche o processo que a retém.",
     "errors": {
       "alreadyRunning": "O serviço Web já está em execução",
       "invalidAddress": "Formato de host ou porta inválido",
@@ -3027,7 +3030,7 @@
     },
     "confirm": {
       "disableTitle": "Desativar estes links?",
-      "disableBody": "Isto remove {count} links de habilidades gerenciados pelo codeg. Habilidades que ocupam um diretório personalizado não são afetadas. Você pode reativá-las a qualquer momento.",
+      "disableBody": "Isto remove {count} links de habilidades gerenciados pelo DrawCode. Habilidades que ocupam um diretório personalizado não são afetadas. Você pode reativá-las a qualquer momento.",
       "cancel": "Cancelar",
       "confirm": "Desativar"
     },
@@ -3048,7 +3051,7 @@
   },
   "ExpertsSettings": {
     "title": "Habilidades de Especialista",
-    "description": "Ative fluxos de trabalho de habilidades selecionados e comprovados em campo para seus agentes de codificação de IA. Cada especialista é uma habilidade independente do projeto superpowers — o codeg gerencia a cópia central e a vincula aos agentes escolhidos.",
+    "description": "Ative fluxos de trabalho de habilidades selecionados e comprovados em campo para seus agentes de codificação de IA. Cada especialista é uma habilidade independente do projeto superpowers — o DrawCode gerencia a cópia central e a vincula aos agentes escolhidos.",
     "loading": "Carregando especialistas…",
     "loadingContent": "Carregando conteúdo…",
     "emptyExperts": "Nenhum especialista disponível. Verifique os logs da aplicação.",
@@ -3057,7 +3060,7 @@
     "searchPlaceholder": "Pesquisar especialistas por nome, ID ou descrição",
     "enableForAgents": "Ativar para agentes",
     "noAgents": "Nenhum agente ACP detectado.",
-    "copyModeWarning": "Copiado (não vinculado). Reative após as atualizações do codeg para obter a versão mais recente.",
+    "copyModeWarning": "Copiado (não vinculado). Reative após as atualizações do DrawCode para obter a versão mais recente.",
     "previewTitle": "Prévia do SKILL.md",
     "categories": {
       "discovery": "Descoberta e Design",
@@ -3093,7 +3096,7 @@
   },
   "ScienceSettings": {
     "title": "Habilidades de pesquisa científica",
-    "description": "Ative habilidades de pesquisa científica selecionadas para seus agentes de código com IA: geração de hipóteses, delineamento experimental, estatística, visualização, avaliação crítica e busca de literatura. O MyCodeBuddy gerencia uma cópia central e vincula cada habilidade aos agentes que você escolher.",
+    "description": "Ative habilidades de pesquisa científica selecionadas para seus agentes de código com IA: geração de hipóteses, delineamento experimental, estatística, visualização, avaliação crítica e busca de literatura. O DrawCode gerencia uma cópia central e vincula cada habilidade aos agentes que você escolher.",
     "loading": "Carregando habilidades científicas…",
     "emptySkills": "Nenhuma habilidade científica disponível. Verifique os registros do aplicativo.",
     "searchPlaceholder": "Pesquisar habilidades científicas por nome, id ou descrição",
@@ -3187,7 +3190,7 @@
   },
   "SkillPacksSettings": {
     "title": "Pacotes de habilidades",
-    "description": "Pacotes de habilidades selecionados que o codeg gerencia de forma centralizada e vincula aos seus agentes de IA — especialistas em programação, pesquisa científica e ferramentas de documentos de escritório. Ative-os por agente abaixo.",
+    "description": "Pacotes de habilidades selecionados que o DrawCode gerencia de forma centralizada e vincula aos seus agentes de IA — especialistas em programação, pesquisa científica e ferramentas de documentos de escritório. Ative-os por agente abaixo.",
     "tabs": {
       "experts": "Especialistas",
       "science": "Ciência",
@@ -3407,7 +3410,7 @@
   },
   "BackupSettings": {
     "title": "Backup e restauração",
-    "description": "Exporte um backup portátil dos seus dados do codeg ou restaure a partir de um.",
+    "description": "Exporte um backup portátil dos seus dados do DrawCode ou restaure a partir de um.",
     "tabs": {
       "backup": "Backup",
       "restore": "Restauração"
@@ -3437,9 +3440,9 @@
         "incompatible": "Incompatível",
         "createdAt": "Criado: {value}",
         "appVersion": "Versão do app: {value}",
-        "incompatibleHint": "Este backup foi criado por uma versão mais recente do codeg e não pode ser restaurado."
+        "incompatibleHint": "Este backup foi criado por uma versão mais recente do DrawCode e não pode ser restaurado."
       },
-      "replaceWarning": "Restaurar substitui todos os dados atuais do codeg (banco de dados e uploads). Seus dados atuais são salvos em um snapshot primeiro, para que possam ser recuperados.",
+      "replaceWarning": "Restaurar substitui todos os dados atuais do DrawCode (banco de dados e uploads). Seus dados atuais são salvos em um snapshot primeiro, para que possam ser recuperados.",
       "keyringNote": "Os tokens de GitHub/chat do desktop ficam no chaveiro do sistema e não são incluídos; insira-os novamente após restaurar.",
       "button": "Restaurar",
       "staging": "Preparando a restauração…",
@@ -3448,7 +3451,7 @@
       "restartTimeout": "O servidor não voltou a tempo. Recarregue a página quando ele estiver ativo.",
       "externalSideLocation": "As transcrições de conversas foram restauradas em {path}",
       "confirmTitle": "Substituir todos os dados?",
-      "confirmBody": "Isto substituirá seu banco de dados e uploads atuais do codeg pelo backup e, em seguida, reiniciará. Seus dados atuais são salvos em um snapshot primeiro.",
+      "confirmBody": "Isto substituirá seu banco de dados e uploads atuais do DrawCode pelo backup e, em seguida, reiniciará. Seus dados atuais são salvos em um snapshot primeiro.",
       "cancel": "Cancelar",
       "confirmAction": "Substituir e reiniciar",
       "external": {
@@ -3466,15 +3469,15 @@
       },
       "restartFailed": "Restauração preparada, mas o servidor não conseguiu reiniciar. Reinicie-o manualmente para aplicá-la."
     },
-    "remoteUnsupported": "O backup e a restauração atuam sobre os dados da máquina que executa o codeg. Você está conectado a um espaço de trabalho remoto — gerencie os backups dele diretamente nesse servidor."
+    "remoteUnsupported": "O backup e a restauração atuam sobre os dados da máquina que executa o DrawCode. Você está conectado a um espaço de trabalho remoto — gerencie os backups dele diretamente nesse servidor."
   },
   "backup": {
     "restore": {
       "error": {
         "badPassphrase": "Senha incorreta ou backup corrompido.",
         "corrupted": "O arquivo de backup está corrompido.",
-        "unknownFormat": "Este arquivo não é um backup do codeg reconhecido.",
-        "newerVersion": "Este backup foi criado pelo codeg {backupVersion}, mais recente que esta versão ({appVersion}).",
+        "unknownFormat": "Este arquivo não é um backup do DrawCode reconhecido.",
+        "newerVersion": "Este backup foi criado pelo DrawCode {backupVersion}, mais recente que esta versão ({appVersion}).",
         "alreadyPending": "Já existe uma restauração preparada. Reinicie para aplicá-la antes de preparar outra."
       }
     },

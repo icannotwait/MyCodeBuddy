@@ -18,9 +18,15 @@ This document owns the **observation release** after Tasks 1–16. Flags and the
 | `incremental_live_transcript` | `CODEG_INCREMENTAL_LIVE_TRANSCRIPT` |
 | `deferred_streaming_rich_content` | `CODEG_DEFERRED_STREAMING_RICH_CONTENT` |
 
-Release defaults (after Task 15): all three **true**, with downward normalization (incremental/deferred require batching). Env false still disables.
+Release defaults: all three **false** (legacy path) until P4 publish gates complete
+(macOS/Linux smoke, real multi-turn soak, resource sampling, integrity re-run).
+Opt in with env `=1` / `true`. Downward normalization still applies when enabling.
 
-**Known validation limits (merge caveats):** absolute gates and fixture integrity are **Windows-only** in this branch. macOS WKWebView / Linux WebKitGTK smoke were not executed in-session. Frontend integrity now counts **accepted envelopes + SHA-256 of committed content_delta text** (not backend emit counters). Prefer env opt-out (`=0`) if a platform shows delivery/integrity incidents before those smokes land.
+**Known validation limits:** absolute gates and fixture integrity are **Windows-only**
+in this branch. Frontend integrity binds the fixture `connectionId`, counts
+ingestor-accepted seqs, reports duplicates/gaps, and hashes final canonical
+liveMessage text. Runtime delivery failure is **fail-closed** (process restart
+required; soft conversation reload is not sufficient).
 
 ## Metric fields (content-free)
 

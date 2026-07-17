@@ -977,7 +977,7 @@
       "remoteUnavailable": "{versionText}. الإصدار البعيد غير متاح حاليًا.",
       "latest": "{versionText}. أنت على أحدث إصدار.",
       "bundled": "مدمج: {version}",
-      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت MyCodeBuddy أو حدّثه."
+      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت DrawCode أو حدّثه."
     },
     "cline": {
       "configDescription": "تكوين مزود واجهة برمجة التطبيقات وبيانات اعتماد Cline. يتم حفظ الإعدادات في ~/.cline/data/."
@@ -1088,8 +1088,8 @@
     "loadFailed": "فشل التحميل: {message}"
   },
   "LoginPage": {
-    "documentTitle": "تسجيل الدخول - codeg",
-    "brand": "Codeg",
+    "documentTitle": "تسجيل الدخول - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "أدخل رمز الوصول للاتصال بتطبيق سطح المكتب",
     "tokenPlaceholder": "رمز الوصول",
     "connect": "اتصال",
@@ -2062,6 +2062,9 @@
         "connectFailedTitle": "فشل اتصال {agent}",
         "toolFallbackTitle": "أداة",
         "eventErrorTitle": "خطأ الوكيل",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} أنهى الاستجابة",
         "notificationError": "{agent} خطأ: {message}",
         "claudeApiRetry": {
@@ -2766,11 +2769,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "التبديل يغيّر فقط العنوان المعروض والمفتوح هنا؛ تستمع الخدمة على جميع الواجهات وتبقى قابلة للوصول من كل عنوان.",
     "sectionTitle": "خدمة الويب",
-    "sectionDescription": "تفعيل للوصول إلى Codeg عن بُعد عبر المتصفح",
+    "sectionDescription": "تفعيل للوصول إلى DrawCode عن بُعد عبر المتصفح",
     "port": "المنفذ",
     "status": "الحالة",
     "autoStart": "تشغيل تلقائي",
-    "autoStartHint": "تشغيل خدمة الويب عند بدء Codeg",
+    "autoStartHint": "تشغيل خدمة الويب عند بدء DrawCode",
     "running": "قيد التشغيل",
     "stopped": "متوقف",
     "processing": "جارٍ المعالجة...",
@@ -2785,7 +2788,7 @@
     "copy": "نسخ",
     "qrcode": "رمز QR",
     "qrcodeTitle": "امسح للفتح",
-    "qrcodeHint": "امسح بهاتفك لفتح Codeg في المتصفح",
+    "qrcodeHint": "امسح بهاتفك لفتح DrawCode في المتصفح",
     "addressLabel": "عنوان الوصول",
     "tokenLabel": "رمز الوصول",
     "tokenHint": "أدخل هذا الرمز عند الوصول إلى عميل الويب لأول مرة",
@@ -2793,7 +2796,7 @@
     "regenerate": "إعادة التوليد",
     "stalePortOccupiedTitle": "المنفذ {port} مستخدم من قبل عملية أخرى",
     "stalePortUnknownTitle": "حالة المنفذ {port} غير واضحة",
-    "stalePortHint": "لا يستطيع Codeg الربط قبل تحرير المنفذ. غيّر المنفذ أعلاه، أو أغلق العملية التي تحتفظ به.",
+    "stalePortHint": "لا يستطيع DrawCode الربط قبل تحرير المنفذ. غيّر المنفذ أعلاه، أو أغلق العملية التي تحتفظ به.",
     "errors": {
       "alreadyRunning": "خدمة الويب قيد التشغيل بالفعل",
       "invalidAddress": "تنسيق المضيف أو المنفذ غير صالح",
@@ -3093,7 +3096,7 @@
   },
   "ScienceSettings": {
     "title": "مهارات البحث العلمي",
-    "description": "فعّل مهارات البحث العلمي المنسّقة لوكلاء البرمجة بالذكاء الاصطناعي: توليد الفرضيات، وتصميم التجارب، والإحصاء، والتصور، والتقييم النقدي، والبحث في الأدبيات. يدير MyCodeBuddy نسخة مركزية ويربط كل مهارة بالوكلاء الذين تختارهم.",
+    "description": "فعّل مهارات البحث العلمي المنسّقة لوكلاء البرمجة بالذكاء الاصطناعي: توليد الفرضيات، وتصميم التجارب، والإحصاء، والتصور، والتقييم النقدي، والبحث في الأدبيات. يدير DrawCode نسخة مركزية ويربط كل مهارة بالوكلاء الذين تختارهم.",
     "loading": "جارٍ تحميل مهارات البحث العلمي…",
     "emptySkills": "لا توجد مهارات بحث علمي متاحة. تحقّق من سجلات التطبيق.",
     "searchPlaceholder": "ابحث في مهارات البحث العلمي بالاسم أو المعرّف أو الوصف",

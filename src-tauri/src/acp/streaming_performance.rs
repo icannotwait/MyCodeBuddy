@@ -50,14 +50,12 @@ impl StreamingPerformanceFlags {
 
     /// Phase default when env vars are absent or invalid.
     ///
-    /// P4 (Task 15): all three flags default on after P3 gate; explicit env
-    /// false values and downward normalization remain available for opt-out.
+    /// Safe default remains **legacy (all off)** until P4 publish gates complete:
+    /// macOS/Linux smoke, real multi-turn soak, resource sampling, and integrity
+    /// re-runs under frontend-accepted counting. Opt in via env:
+    /// `CODEG_DESKTOP_ACP_EVENT_BATCHING=1` (and dependents).
     pub fn phase_default() -> Self {
-        Self {
-            desktop_acp_event_batching: true,
-            incremental_live_transcript: true,
-            deferred_streaming_rich_content: true,
-        }
+        Self::legacy()
     }
 
     /// Parse flags from process environment, then normalize.
@@ -166,17 +164,19 @@ mod tests {
     }
 
     #[test]
-    fn release_defaults_enable_the_complete_path() {
+    fn release_defaults_stay_legacy_until_p4_gates() {
         let flags = StreamingPerformanceFlags::from_lookup(|_| None);
-        assert!(flags.desktop_acp_event_batching);
-        assert!(flags.incremental_live_transcript);
-        assert!(flags.deferred_streaming_rich_content);
+        assert_eq!(flags, StreamingPerformanceFlags::legacy());
+        assert!(!flags.desktop_acp_event_batching);
+        assert!(!flags.incremental_live_transcript);
+        assert!(!flags.deferred_streaming_rich_content);
     }
 
     #[test]
     fn from_lookup_uses_phase_default_when_absent() {
         let flags = StreamingPerformanceFlags::from_lookup(|_| None);
         assert_eq!(flags, StreamingPerformanceFlags::phase_default());
+        assert_eq!(flags, StreamingPerformanceFlags::legacy());
     }
 
     #[test]
@@ -200,9 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_true_opts_into_full_path() {
+        let flags = StreamingPerformanceFlags::from_lookup(|name| match name {
+            "CODEG_DESKTOP_ACP_EVENT_BATCHING"
+            | "CODEG_INCREMENTAL_LIVE_TRANSCRIPT"
+            | "CODEG_DEFERRED_STREAMING_RICH_CONTENT" => Some("1".into()),
+            _ => None,
+        });
+        assert!(flags.desktop_acp_event_batching);
+        assert!(flags.incremental_live_transcript);
+        assert!(flags.deferred_streaming_rich_content);
+    }
+
+    #[test]
     fn explicit_false_keeps_opt_out_of_single_flag() {
-        let flags = StreamingPerformanceFlags::from_lookup(|name| {
-            (name == "CODEG_DEFERRED_STREAMING_RICH_CONTENT").then_some("off".into())
+        let flags = StreamingPerformanceFlags::from_lookup(|name| match name {
+            "CODEG_DESKTOP_ACP_EVENT_BATCHING" => Some("1".into()),
+            "CODEG_INCREMENTAL_LIVE_TRANSCRIPT" => Some("1".into()),
+            "CODEG_DEFERRED_STREAMING_RICH_CONTENT" => Some("off".into()),
+            _ => None,
         });
         assert!(flags.desktop_acp_event_batching);
         assert!(flags.incremental_live_transcript);
