@@ -308,8 +308,8 @@ impl DbDelegationTaskStore {
             agent_type: parse_agent_type(&row.agent_type),
             status,
             error_code: row.delegation_error_code,
-            started_at: row.delegation_started_at.map(Into::into),
-            finished_at: row.delegation_finished_at.map(Into::into),
+            started_at: row.delegation_started_at,
+            finished_at: row.delegation_finished_at,
         })
     }
 }

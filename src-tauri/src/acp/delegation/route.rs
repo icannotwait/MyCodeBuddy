@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(codeg.effective, DelegationRoutePolicy::Codeg);
         assert!(codeg.native_suppression.suppresses_creation());
         let once = safe_native_fallback(&codeg, reason);
-        assert_eq!(once.managed, true);
+        assert!(once.managed);
         assert_eq!(once.requested, DelegationRoutePolicy::Codeg);
         assert_eq!(once.effective, DelegationRoutePolicy::Native);
         assert_eq!(once.source, DelegationRouteSource::SafeFallback);

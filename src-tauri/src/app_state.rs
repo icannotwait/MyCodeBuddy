@@ -105,6 +105,20 @@ pub fn default_chat_channel_manager() -> ChatChannelManager {
     ChatChannelManager::new()
 }
 
+/// Named result of [`build_delegation_stack`]. Keeps the shared desktop/
+/// server/test bootstrap surface readable without a 9-element tuple.
+pub struct DelegationStack {
+    pub broker: Arc<DelegationBroker>,
+    pub tokens: Arc<TokenRegistry>,
+    pub leases: Arc<CompanionLeaseRegistry>,
+    pub socket_path: PathBuf,
+    pub feedback: crate::acp::feedback::FeedbackRuntimeConfig,
+    pub ask: crate::acp::question::QuestionRuntimeConfig,
+    pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
+    pub runtime_settings: DelegationRuntimeSettings,
+    pub metrics: Arc<DelegationMetrics>,
+}
+
 /// Build the delegation broker + token registry + per-process UDS socket
 /// path. Shared between codeg-server bootstrap and the Tauri `setup` block
 /// so both modes apply identical depth limit + timeout defaults.
@@ -116,17 +130,7 @@ pub fn build_delegation_stack(
     connection_manager: &ConnectionManager,
     db_conn: sea_orm::DatabaseConnection,
     data_dir: PathBuf,
-) -> (
-    Arc<DelegationBroker>,
-    Arc<TokenRegistry>,
-    Arc<CompanionLeaseRegistry>,
-    PathBuf,
-    crate::acp::feedback::FeedbackRuntimeConfig,
-    crate::acp::question::QuestionRuntimeConfig,
-    crate::acp::session_info::SessionInfoRuntimeConfig,
-    DelegationRuntimeSettings,
-    Arc<DelegationMetrics>,
-) {
+) -> DelegationStack {
     use crate::acp::connection::DelegationInjection;
     use crate::acp::delegation::broker::{
         ChildStatusLookup, ConversationDepthLookup, DbChildStatusLookup, DbDepthLookup,
@@ -215,7 +219,7 @@ pub fn build_delegation_stack(
     // Park the wake receiver on the broker until startup takes it.
     broker.park_supervisor_wake_rx(wake_rx);
 
-    (
+    DelegationStack {
         broker,
         tokens,
         leases,
@@ -224,8 +228,8 @@ pub fn build_delegation_stack(
         ask,
         sessions,
         runtime_settings,
-        delegation_metrics,
-    )
+        metrics: delegation_metrics,
+    }
 }
 
 /// Spawn the soft supervisor after Task 8 reconcile and with/before the
@@ -309,17 +313,8 @@ impl AppState {
         let emitter = EventEmitter::web_only(broadcaster.clone(), acp_event_bus.clone());
 
         let connection_manager = default_connection_manager();
-        let (
-            delegation_broker,
-            delegation_tokens,
-            delegation_leases,
-            delegation_socket_path,
-            feedback_config,
-            question_config,
-            session_info_config,
-            delegation_runtime_settings,
-            delegation_metrics,
-        ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
+        let stack =
+            build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
         Self {
             db,
@@ -337,15 +332,15 @@ impl AppState {
                 ),
             ),
             pet_state: crate::pet_state_mapper::new_pet_state_handle(),
-            delegation_broker,
-            delegation_metrics,
-            delegation_runtime_settings,
-            delegation_tokens,
-            delegation_leases,
-            delegation_socket_path,
-            feedback_config,
-            question_config,
-            session_info_config,
+            delegation_broker: stack.broker,
+            delegation_metrics: stack.metrics,
+            delegation_runtime_settings: stack.runtime_settings,
+            delegation_tokens: stack.tokens,
+            delegation_leases: stack.leases,
+            delegation_socket_path: stack.socket_path,
+            feedback_config: stack.feedback,
+            question_config: stack.ask,
+            session_info_config: stack.sessions,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
         }

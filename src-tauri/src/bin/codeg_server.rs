@@ -255,17 +255,7 @@ async fn async_main() -> ExitCode {
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
     let connection_manager = codeg_lib::app_state::default_connection_manager();
-    let (
-        delegation_broker,
-        delegation_tokens,
-        delegation_leases,
-        delegation_socket_path,
-        feedback_config,
-        question_config,
-        session_info_config,
-        delegation_runtime_settings,
-        delegation_metrics,
-    ) = codeg_lib::app_state::build_delegation_stack(
+    let stack = codeg_lib::app_state::build_delegation_stack(
         &connection_manager,
         db.conn.clone(),
         data_dir.clone(),
@@ -284,15 +274,15 @@ async fn async_main() -> ExitCode {
             codeg_lib::workspace_transfer::WorkspaceTransferManager::new_from_env(),
         ),
         pet_state: pet_state_handle.clone(),
-        delegation_broker: delegation_broker.clone(),
-        delegation_metrics: delegation_metrics.clone(),
-        delegation_runtime_settings: delegation_runtime_settings.clone(),
-        delegation_tokens: delegation_tokens.clone(),
-        delegation_leases: delegation_leases.clone(),
-        delegation_socket_path: delegation_socket_path.clone(),
-        feedback_config: feedback_config.clone(),
-        question_config: question_config.clone(),
-        session_info_config: session_info_config.clone(),
+        delegation_broker: stack.broker.clone(),
+        delegation_metrics: stack.metrics.clone(),
+        delegation_runtime_settings: stack.runtime_settings.clone(),
+        delegation_tokens: stack.tokens.clone(),
+        delegation_leases: stack.leases.clone(),
+        delegation_socket_path: stack.socket_path.clone(),
+        feedback_config: stack.feedback.clone(),
+        question_config: stack.ask.clone(),
+        session_info_config: stack.sessions.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
@@ -311,27 +301,27 @@ async fn async_main() -> ExitCode {
     // timeout to apply here.
     codeg_lib::commands::delegation::apply_persisted_config(
         &state.db.conn,
-        &delegation_broker,
-        &delegation_runtime_settings,
+        &stack.broker,
+        &stack.runtime_settings,
     )
     .await;
     // Same for the live-feedback enable flag, so the first companion launch
     // sees the operator's configured behavior.
     codeg_lib::commands::feedback::apply_persisted_feedback_config(
         &state.db.conn,
-        &feedback_config,
+        &stack.feedback,
     )
     .await;
     // Same for the ask-user-question enable flag.
     codeg_lib::commands::question::apply_persisted_question_config(
         &state.db.conn,
-        &question_config,
+        &stack.ask,
     )
     .await;
     // Same for the get-session-info enable flag.
     codeg_lib::commands::session_info::apply_persisted_session_info_config(
         &state.db.conn,
-        &session_info_config,
+        &stack.sessions,
     )
     .await;
 
@@ -339,7 +329,7 @@ async fn async_main() -> ExitCode {
     // orphaned running delegate rows as host_restarted. Fail-closed: do not
     // start the listener (or continue accepting work) when reconcile fails.
     if let Err(e) = codeg_lib::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
-        delegation_broker.reconcile_running_on_startup().await,
+        stack.broker.reconcile_running_on_startup().await,
     ) {
         tracing::error!("[delegation][FATAL] {e}; aborting startup.");
         return ExitCode::from(2);
@@ -348,9 +338,9 @@ async fn async_main() -> ExitCode {
     // Soft supervisor: after reconcile (fail-closed preserved), before/with
     // the listener. Observe-only — no cancel/settle/route capability.
     codeg_lib::app_state::spawn_delegation_supervisor(
-        delegation_broker.clone(),
+        stack.broker.clone(),
         state.connection_manager.clone_ref(),
-        &delegation_runtime_settings,
+        &stack.runtime_settings,
     );
 
     // Spawn the delegation listener so companion processes can round-trip
@@ -358,9 +348,9 @@ async fn async_main() -> ExitCode {
     // the lifetime of the process.
     {
         let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
-            delegation_broker,
-            delegation_tokens,
-            delegation_leases,
+            stack.broker,
+            stack.tokens,
+            stack.leases,
             Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
                 manager: Arc::new(state.connection_manager.clone_ref()),
             }),
@@ -376,7 +366,7 @@ async fn async_main() -> ExitCode {
                 }),
             )),
         );
-        let socket = delegation_socket_path.clone();
+        let socket = stack.socket_path.clone();
         tokio::spawn(async move {
             if let Err(e) = listener.run(socket).await {
                 tracing::info!("[delegation] listener exited: {e}");
@@ -434,8 +424,10 @@ async fn async_main() -> ExitCode {
             state.db.conn.clone(),
             state.connection_manager.clone_ref(),
             state.emitter.clone(),
-            state.delegation_runtime_settings.clone(),
-            state.data_dir.clone(),
+            codeg_lib::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
+                runtime: state.delegation_runtime_settings.clone(),
+                data_dir: state.data_dir.clone(),
+            },
         )
         .await;
 

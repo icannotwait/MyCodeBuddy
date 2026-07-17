@@ -296,7 +296,7 @@ mod tests {
 
         fn advance_seconds(&self, secs: i64) {
             let mut n = self.now.lock().expect("clock");
-            *n = *n + chrono::Duration::seconds(secs);
+            *n += chrono::Duration::seconds(secs);
         }
 
         fn now_value(&self) -> DateTime<Utc> {

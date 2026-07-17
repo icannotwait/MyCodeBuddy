@@ -115,6 +115,7 @@ pub struct BrokerStatusRequest {
     /// - `Some(ms > 0)` → supervised wait, clamped to **60000** ms; returns on
     ///   terminal, stalled, waiting_input, a requested observation transition,
     ///   or the deadline (a still-running snapshot at deadline is success).
+    ///
     /// Batch waits resolve when ANY requested id meets the mode condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,

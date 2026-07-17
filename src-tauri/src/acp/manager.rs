@@ -18,7 +18,9 @@ use crate::acp::connection::{
 };
 use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 #[cfg(any(test, feature = "test-utils"))]
-use crate::acp::delegation::route::{DelegationRoutePlan, RouteDegradedReason};
+use crate::acp::delegation::route::DelegationRoutePlan;
+#[cfg(test)]
+use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::error::AcpError;
 use crate::acp::terminal_context::{
     finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,

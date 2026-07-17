@@ -450,10 +450,13 @@ mod tauri_app {
                         .state::<crate::commands::delegation::DelegationRuntimeSettings>()
                         .inner()
                         .clone();
-                    let data_dir = effective_data_dir.clone();
+                    let runtime_ctx = crate::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
+                        runtime,
+                        data_dir: effective_data_dir.clone(),
+                    };
                     tauri::async_runtime::spawn(async move {
                         ccm_ref
-                            .start_background(br, bus, db_conn, cm, emitter, runtime, data_dir)
+                            .start_background(br, bus, db_conn, cm, emitter, runtime_ctx)
                             .await;
                     });
                 }
@@ -527,42 +530,32 @@ mod tauri_app {
                 let broker_for_lifecycle = {
                     let cm_state = app.state::<ConnectionManager>();
                     let db_conn = app.state::<db::AppDatabase>().conn.clone();
-                    let (
-                        broker,
-                        tokens,
-                        leases,
-                        socket_path,
-                        feedback_config,
-                        question_config,
-                        session_info_config,
-                        runtime_settings,
-                        delegation_metrics,
-                    ) = crate::app_state::build_delegation_stack(
+                    let stack = crate::app_state::build_delegation_stack(
                         &cm_state,
                         db_conn.clone(),
                         effective_data_dir.clone(),
                     );
-                    app.manage(broker.clone());
-                    app.manage(tokens.clone());
-                    app.manage(leases.clone());
-                    app.manage(feedback_config.clone());
-                    app.manage(question_config.clone());
-                    app.manage(session_info_config.clone());
-                    app.manage(runtime_settings.clone());
-                    app.manage(delegation_metrics.clone());
+                    app.manage(stack.broker.clone());
+                    app.manage(stack.tokens.clone());
+                    app.manage(stack.leases.clone());
+                    app.manage(stack.feedback.clone());
+                    app.manage(stack.ask.clone());
+                    app.manage(stack.sessions.clone());
+                    app.manage(stack.runtime_settings.clone());
+                    app.manage(stack.metrics.clone());
                     app.manage(crate::commands::delegation::DelegationSocketPath(
-                        socket_path.clone(),
+                        stack.socket_path.clone(),
                     ));
 
                     // Push persisted settings into the broker + runtime snapshot
                     // + feedback + question + session-info config before listener
                     // accept.
-                    let broker_for_init = broker.clone();
-                    let runtime_for_init = runtime_settings.clone();
+                    let broker_for_init = stack.broker.clone();
+                    let runtime_for_init = stack.runtime_settings.clone();
                     let db_for_init = db_conn.clone();
-                    let feedback_for_init = feedback_config.clone();
-                    let question_for_init = question_config.clone();
-                    let session_info_for_init = session_info_config.clone();
+                    let feedback_for_init = stack.feedback.clone();
+                    let question_for_init = stack.ask.clone();
+                    let session_info_for_init = stack.sessions.clone();
                     let reconcile_result = tauri::async_runtime::block_on(async move {
                         delegation_commands::apply_persisted_config(
                             &db_for_init,
@@ -600,16 +593,16 @@ mod tauri_app {
                     // Soft supervisor: after reconcile (fail-closed preserved),
                     // before/with listener. Observe-only.
                     crate::app_state::spawn_delegation_supervisor(
-                        broker.clone(),
+                        stack.broker.clone(),
                         cm_state.clone_ref(),
-                        &runtime_settings,
+                        &stack.runtime_settings,
                     );
 
-                    let listener_broker = broker.clone();
+                    let listener_broker = stack.broker.clone();
                     let listener = crate::acp::delegation::listener::DelegationListener::new(
                         listener_broker,
-                        tokens,
-                        leases,
+                        stack.tokens,
+                        stack.leases,
                         std::sync::Arc::new(
                             crate::acp::manager::ConnectionManagerParentLookup {
                                 manager: std::sync::Arc::new(cm_state.clone_ref()),
@@ -633,12 +626,13 @@ mod tauri_app {
                             ),
                         ),
                     );
+                    let socket_path = stack.socket_path;
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = listener.run(socket_path).await {
                             tracing::info!("[delegation] listener exited: {e}");
                         }
                     });
-                    broker
+                    stack.broker
                 };
 
                 // Spawn the LifecycleSubscriber: persists cross-connection DB state

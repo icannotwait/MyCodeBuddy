@@ -206,7 +206,7 @@ impl DelegationSettings {
         }
     }
 
-    fn into_runtime_snapshot(&self) -> DelegationRuntimeSnapshot {
+    fn to_runtime_snapshot(&self) -> DelegationRuntimeSnapshot {
         DelegationRuntimeSnapshot {
             enabled: self.enabled,
             route_policy: self.route_policy,
@@ -297,7 +297,7 @@ pub async fn apply_persisted_config(
     runtime: &DelegationRuntimeSettings,
 ) {
     let settings = load_delegation_settings(conn).await;
-    runtime.set(settings.into_runtime_snapshot());
+    runtime.set(settings.to_runtime_snapshot());
     let mut config = settings.into_broker_config();
     // Preserve currently-live profiles unless a replacement loads cleanly.
     config.profiles = broker.config_snapshot().await.profiles;
@@ -390,7 +390,7 @@ pub async fn set_delegation_settings_core(
         .map_err(crate::db::error::DbError::from)
         .map_err(AppCommandError::from)?;
     // Commit succeeded — notify live consumers. Must not run on txn failure.
-    let after = clamped.into_runtime_snapshot();
+    let after = clamped.to_runtime_snapshot();
     runtime.set(after.clone());
     let profiles = broker.config_snapshot().await.profiles;
     let mut config = clamped.clone().into_broker_config();
@@ -444,7 +444,7 @@ pub async fn set_delegation_bundle_core(
         .map_err(crate::db::error::DbError::from)
         .map_err(AppCommandError::from)?;
 
-    let after = clamped.into_runtime_snapshot();
+    let after = clamped.to_runtime_snapshot();
     runtime.set(after.clone());
     let mut config = clamped.clone().into_broker_config();
     config.profiles = normalized

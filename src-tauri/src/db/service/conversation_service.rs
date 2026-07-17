@@ -43,9 +43,11 @@ pub async fn create_with_route_override(
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Regular,
-        delegation_route_override,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Regular,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -86,9 +88,11 @@ pub async fn create_chat_with_route_override(
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Chat,
-        delegation_route_override,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Chat,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -114,9 +118,27 @@ pub async fn create_with_delegation(
         ConversationKind::Regular
     };
     create_inner(
-        conn, folder_id, agent_type, title, git_branch, delegation, kind, None,
+        conn,
+        folder_id,
+        agent_type,
+        title,
+        git_branch,
+        CreateInnerOptions {
+            delegation,
+            kind,
+            delegation_route_override: None,
+        },
     )
     .await
+}
+
+/// Private options for [`create_inner`]: kind, optional broker linkage, and
+/// optional managed route override. Bundled so the private insert helper stays
+/// under the clippy argument threshold.
+struct CreateInnerOptions {
+    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+    kind: ConversationKind,
+    delegation_route_override: Option<DelegationRoutePolicy>,
 }
 
 async fn create_inner(
@@ -125,10 +147,13 @@ async fn create_inner(
     agent_type: AgentType,
     title: Option<String>,
     git_branch: Option<String>,
-    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
-    kind: ConversationKind,
-    delegation_route_override: Option<DelegationRoutePolicy>,
+    options: CreateInnerOptions,
 ) -> Result<conversation::Model, DbError> {
+    let CreateInnerOptions {
+        delegation,
+        kind,
+        delegation_route_override,
+    } = options;
     let at_str = serde_json::to_value(agent_type)
         .ok()
         .and_then(|v| v.as_str().map(String::from))

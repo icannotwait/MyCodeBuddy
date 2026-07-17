@@ -25,9 +25,8 @@ fn managed_platforms_never_resolve_a_mixed_creation_route() {
             })
             .unwrap();
             plan.assert_exclusive().unwrap();
-            assert_ne!(
-                plan.native_creation_exposed() && plan.expose_codeg_delegation,
-                true,
+            assert!(
+                !(plan.native_creation_exposed() && plan.expose_codeg_delegation),
                 "mixed route for {agent:?}",
             );
         }

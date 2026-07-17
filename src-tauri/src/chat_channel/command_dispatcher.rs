@@ -17,6 +17,15 @@ use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
 use crate::web::event_bridge::EventEmitter;
 
+/// Bundles live delegation runtime + data directory for chat command
+/// dispatch so `start_background` / `spawn_command_dispatcher` stay under
+/// the clippy argument threshold without changing clone ownership.
+#[derive(Clone)]
+pub struct ChatCommandRuntimeContext {
+    pub runtime: DelegationRuntimeSettings,
+    pub data_dir: PathBuf,
+}
+
 const COMMAND_PREFIX_KEY: &str = "chat_command_prefix";
 const DEFAULT_COMMAND_PREFIX: &str = "/";
 const MESSAGE_LANGUAGE_KEY: &str = "chat_message_language";
@@ -62,11 +71,11 @@ pub fn spawn_command_dispatcher(
     conn_mgr: ConnectionManager,
     emitter: EventEmitter,
     bridge: Arc<Mutex<SessionBridge>>,
-    runtime: DelegationRuntimeSettings,
-    data_dir: PathBuf,
+    runtime_ctx: ChatCommandRuntimeContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut config = CommandConfigCache::new();
+        let ChatCommandRuntimeContext { runtime, data_dir } = runtime_ctx;
 
         while let Some(cmd) = command_rx.recv().await {
             let text = cmd.command_text.trim();
