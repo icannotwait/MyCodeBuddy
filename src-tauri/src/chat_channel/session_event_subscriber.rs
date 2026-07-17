@@ -111,19 +111,28 @@ async fn handle_acp_envelope(
 
     match &envelope.payload {
         AcpEvent::SessionStarted { session_id } => {
-            let mut guard = bridge.lock().await;
-            if let Some(session) = guard.get_mut(connection_id) {
+            // Mirror TurnComplete: copy immutable ids + take pending under the
+            // process-global bridge lock, then release before DB / manager /
+            // channel work so other chat sessions are not stalled.
+            let kickoff: Option<(i32, i32, Option<String>)> = {
+                let mut guard = bridge.lock().await;
+                guard.get_mut(connection_id).map(|session| {
+                    let conversation_id = session.conversation_id;
+                    let channel_id = session.channel_id;
+                    let pending = session.pending_prompt.take();
+                    (conversation_id, channel_id, pending)
+                })
+            };
+
+            if let Some((conversation_id, channel_id, pending_prompt)) = kickoff {
                 let _ = conversation_service::update_external_id(
                     db,
-                    session.conversation_id,
+                    conversation_id,
                     session_id.clone(),
                 )
                 .await;
 
-                if let Some(prompt_text) = session.pending_prompt.take() {
-                    // Clone so the prompt can be RESTORED (not dropped) if a turn
-                    // is already in flight — see the TurnInProgress arm below.
-                    let conversation_id = session.conversation_id;
+                if let Some(prompt_text) = pending_prompt {
                     if let Err(e) = super::session_commands::send_prompt_linked_for_chat(
                         db,
                         conn_mgr,
@@ -140,12 +149,23 @@ async fn handle_acp_envelope(
                         // retries the kickoff once the in-flight turn finishes,
                         // instead of silently dropping the task's initial prompt.
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-                            session.pending_prompt = Some(prompt_text);
+                            {
+                                let mut guard = bridge.lock().await;
+                                if let Some(session) = guard.get_mut(connection_id) {
+                                    // Only restore onto the still-matching active
+                                    // session: do not overwrite a newer pending
+                                    // prompt or resurrect a removed/replaced row.
+                                    if session.conversation_id == conversation_id
+                                        && session.pending_prompt.is_none()
+                                    {
+                                        session.pending_prompt = Some(prompt_text);
+                                    }
+                                }
+                            }
                             tracing::warn!(
                                 "[SessionEventSub] kickoff deferred; a turn is already in \
                                  progress, will retry on TurnComplete"
                             );
-                            let channel_id = session.channel_id;
                             let lang = get_lang(db).await;
                             let msg = RichMessage::info(
                                 super::i18n::task_deferred_busy(lang).to_string(),
@@ -153,7 +173,6 @@ async fn handle_acp_envelope(
                             let _ = manager.send_to_channel(channel_id, &msg).await;
                         } else {
                             tracing::error!("[SessionEventSub] failed to send pending prompt: {e}");
-                            let channel_id = session.channel_id;
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_channel(channel_id, &msg).await;
                         }
@@ -1769,6 +1788,192 @@ mod async_relay_dedup_tests {
                 .is_none(),
             "successful first send clears pending_prompt"
         );
+    }
+
+    /// SessionStarted must release the process-global SessionBridge Mutex before
+    /// the linked kickoff blocks in `cmd_tx.reserve()`. Holding the bridge across
+    /// that await stalls every other chat session.
+    #[tokio::test]
+    async fn session_started_releases_bridge_before_linked_kickoff_blocks() {
+        use crate::acp::types::PromptInputBlock;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::service::app_metadata_service;
+        use crate::db::service::conversation_service;
+        use crate::models::system::AppLocale;
+        use crate::web::event_bridge::EventEmitter;
+        use std::time::Duration;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "en")
+            .await
+            .expect("channel locale");
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/chat-bridge-release").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("kickoff-while-full".into()),
+            None,
+        )
+        .await
+        .expect("pre-create conversation");
+
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "conn".into(),
+            ActiveSession {
+                channel_id: 7,
+                sender_id: "u".into(),
+                conversation_id: conv.id,
+                connection_id: "conn".into(),
+                agent_type: AgentType::ClaudeCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: HashMap::new(),
+                delegation_rendered: HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: Some("kickoff-while-full".into()),
+                permission_pending: None,
+            },
+        );
+        let chat = Arc::new(ChatChannelManager::new());
+        let rec = Recorder::default();
+        chat.add_channel(
+            7,
+            "test".into(),
+            ChannelType::Telegram,
+            Box::new(RecordingBackend { rec: rec.clone() }),
+        )
+        .await
+        .unwrap();
+
+        // Live command channel (capacity 4). Keep the receiver so reserve waits
+        // instead of failing with ProcessExited.
+        let conn = Arc::new(ConnectionManager::new());
+        let mut cmd_rx = conn
+            .insert_test_connection_live(
+                "conn",
+                AgentType::ClaudeCode,
+                Some(std::path::PathBuf::from("/tmp/chat-bridge-release")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = None;
+            s.folder_id = None;
+            s.purpose = crate::auto_title::ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+            s.active_turn = None;
+            s.turn_in_flight = false;
+        }
+
+        // Fill the channel through public send APIs so the next kickoff blocks
+        // in reserve(). Reset turn_in_flight between fills (each successful
+        // send admits a turn).
+        for i in 0..4 {
+            {
+                let state = conn.get_state("conn").await.unwrap();
+                state.write().await.turn_in_flight = false;
+            }
+            conn.send_prompt_background(
+                "conn",
+                vec![PromptInputBlock::Text {
+                    text: format!("fill-{i}"),
+                }],
+            )
+            .await
+            .expect("fill send must succeed while capacity remains");
+        }
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            state.write().await.turn_in_flight = false;
+        }
+
+        let started = EventEnvelope {
+            seq: 1,
+            connection_id: "conn".into(),
+            payload: AcpEvent::SessionStarted {
+                session_id: "S-bridge-release".into(),
+            },
+        };
+        let bridge_for_kickoff = Arc::clone(&bridge);
+        let chat_for_kickoff = Arc::clone(&chat);
+        let conn_for_kickoff = Arc::clone(&conn);
+        let db_for_kickoff = db.conn.clone();
+        let kickoff = tokio::spawn(async move {
+            handle_acp_envelope(
+                &started,
+                &bridge_for_kickoff,
+                &chat_for_kickoff,
+                &conn_for_kickoff,
+                &db_for_kickoff,
+                &EventEmitter::Noop,
+            )
+            .await;
+        });
+
+        // Bounded probe: wait until SessionStarted has taken the pending prompt
+        // (progressed into the linked send) and is still running (blocked in
+        // reserve on the full channel). Only then must SessionBridge be free.
+        // Acquiring before kickoff starts (pending still Some) does not count.
+        // On the buggy path the global lock is held across reserve, so this
+        // loop times out with free_while_blocked=false.
+        let probe_deadline = Instant::now() + Duration::from_secs(2);
+        let mut bridge_free_while_blocked = false;
+        while Instant::now() < probe_deadline {
+            if kickoff.is_finished() {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(50), bridge.lock()).await {
+                Ok(guard) => {
+                    let pending_taken = guard
+                        .get("conn")
+                        .map(|s| s.pending_prompt.is_none())
+                        .unwrap_or(false);
+                    drop(guard);
+                    if pending_taken && !kickoff.is_finished() {
+                        bridge_free_while_blocked = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // Lock held by SessionStarted (or contention) — keep probing.
+                }
+            }
+        }
+
+        assert!(
+            !kickoff.is_finished(),
+            "kickoff must still be blocked in reserve (channel was full)"
+        );
+        assert!(
+            bridge_free_while_blocked,
+            "SessionBridge must be acquirable while SessionStarted linked kickoff \
+             is blocked in reserve(); holding the global lock across that await is a bug"
+        );
+
+        // Unblock: drain one command so reserve succeeds, then finish/cleanup.
+        let _ = cmd_rx.recv().await;
+        let finish = tokio::time::timeout(Duration::from_secs(2), kickoff).await;
+        match finish {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => panic!("kickoff task panicked: {join_err}"),
+            Err(_) => {
+                // Should not hang after capacity freed; abort for clean teardown.
+                // (If we reach here the production path is stuck elsewhere.)
+                panic!("kickoff did not complete after draining one command slot");
+            }
+        }
+        while cmd_rx.try_recv().is_ok() {}
     }
 }
 
