@@ -2596,14 +2596,23 @@ async fn run_connection(
     // Shared across fork restarts of this conversation loop; browser/transport
     // reattachment reuses the live AgentConnection and never re-enters here.
     let terminal_prompt_context = Arc::new(TerminalPromptContext::new(terminal_shell.spec.clone()));
-    let _bg_watch = background_watch::spawn_if_claude(
-        &connection_id,
-        agent_type,
-        Arc::clone(&state),
-        emitter.clone(),
-        cwd_string.clone(),
-        Arc::clone(&prompt_ledger),
-    );
+    // Internal title runs must not start background transcript watchers.
+    let is_internal_title = {
+        let s = state.read().await;
+        s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+    };
+    let _bg_watch = if is_internal_title {
+        None
+    } else {
+        background_watch::spawn_if_claude(
+            &connection_id,
+            agent_type,
+            Arc::clone(&state),
+            emitter.clone(),
+            cwd_string.clone(),
+            Arc::clone(&prompt_ledger),
+        )
+    };
 
     let connect_with_result = Client
         .builder()
@@ -3551,6 +3560,30 @@ async fn handle_permission_request(
     req: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
 ) {
+    // Internal title runs have no interactive UI path: decline immediately and
+    // still emit so the private-stream runner observes Interactive failure.
+    let is_internal_title = {
+        let s = state.read().await;
+        s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+    };
+    if is_internal_title {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _ = responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PermissionRequest {
+                request_id,
+                tool_call: serde_json::to_value(&req.tool_call).unwrap_or_default(),
+                options: vec![],
+            },
+        )
+        .await;
+        return;
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
 
     let options: Vec<PermissionOptionInfo> = req
@@ -4836,7 +4869,15 @@ async fn run_conversation_loop<'a>(
                 // Wire-only mutation: first prompt on this process gets the
                 // versioned shell context. Live UI / optimistic dedup / title
                 // paths never see this block (they use `user_message` below).
-                terminal_prompt_context.append_once(&mut prompt_blocks);
+                // InternalTitle must send the exact title prompt without a
+                // silent terminal-instruction prefix.
+                let skip_terminal_prefix = {
+                    let s = state.read().await;
+                    s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+                };
+                if !skip_terminal_prefix {
+                    terminal_prompt_context.append_once(&mut prompt_blocks);
+                }
 
                 emit_with_state(
                     state,
@@ -8132,15 +8173,9 @@ mod tests {
         let adapter = adapter_for(AgentType::Grok);
         let plan = native_plan(AgentType::Grok);
 
-        let new_req = build_new_session_request(
-            AgentType::Grok,
-            &cwd,
-            Vec::new(),
-            &spec,
-            adapter,
-            &plan,
-        )
-        .unwrap();
+        let new_req =
+            build_new_session_request(AgentType::Grok, &cwd, Vec::new(), &spec, adapter, &plan)
+                .unwrap();
         let load_req = build_load_session_request(
             AgentType::Grok,
             SessionId::new("sess-load".to_string()),
