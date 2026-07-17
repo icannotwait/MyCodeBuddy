@@ -6012,6 +6012,7 @@ pub async fn acp_connect(
     verify_agent_installed(agent_type).await?;
 
     let emitter = EventEmitter::Tauri(app_handle);
+    let launch_context = crate::auto_title::user_launch_context_from_db(&db.conn).await;
     manager
         .spawn_agent(
             agent_type,
@@ -6022,21 +6023,26 @@ pub async fn acp_connect(
             emitter,
             preferred_mode_id,
             preferred_config_values.unwrap_or_default(),
+            launch_context,
         )
         .await
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn acp_prompt(
     connection_id: String,
     blocks: Vec<PromptInputBlock>,
     folder_id: Option<i32>,
     conversation_id: Option<i32>,
     client_message_id: Option<String>,
+    visible_text: Option<String>,
+    locale: Option<String>,
     db: State<'_, crate::db::AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    let capture = crate::auto_title::prompt_capture_from_wire(visible_text, locale);
     manager
         .send_prompt_linked_with_message_id(
             &db,
@@ -6046,6 +6052,7 @@ pub async fn acp_prompt(
             conversation_id,
             None,
             client_message_id,
+            capture,
         )
         .await
         .map(|_| ())

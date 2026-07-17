@@ -333,6 +333,7 @@ pub async fn handle_task(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            crate::auto_title::ConnectionLaunchContext::default(),
         )
         .await
     {
@@ -537,6 +538,7 @@ pub async fn handle_resume(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            crate::auto_title::ConnectionLaunchContext::default(),
         )
         .await
     {

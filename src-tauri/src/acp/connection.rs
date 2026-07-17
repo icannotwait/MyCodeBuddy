@@ -45,7 +45,9 @@ use crate::acp::types::{
     SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
     ToolCallImageInfo, UserMessageBlock,
 };
+use crate::auto_title::ConnectionLaunchContext;
 use crate::models::agent::AgentType;
+use crate::models::system::AppLocale;
 use crate::network::proxy;
 use crate::terminal::shell::ResolvedShellSpec;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -954,6 +956,7 @@ pub async fn spawn_agent_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    launch_context: ConnectionLaunchContext,
 ) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -971,6 +974,10 @@ pub async fn spawn_agent_connection(
     if let Some(inj) = delegation_injection.as_ref() {
         initial_state.supervisor_wake = inj.supervisor_wake.clone();
     }
+    // Purpose + inherited/effective locale from launch. Task 4B may pass
+    // temporary English defaults; Task 4C wires real sources.
+    initial_state.purpose = launch_context.purpose;
+    initial_state.effective_locale = launch_context.inherited_locale.unwrap_or(AppLocale::En);
 
     // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
     // first event (StatusChanged{Connecting} below) doesn't race with the

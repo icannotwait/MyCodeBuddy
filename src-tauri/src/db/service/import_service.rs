@@ -163,6 +163,7 @@ async fn import_one(
         folder_id: Set(folder_id),
         title: Set(summary.title.clone()),
         title_locked: Set(false),
+        auto_title_finalized: Set(false),
         agent_type: Set(at_str),
         status: Set(conversation::ConversationStatus::Completed),
         // Imports scan regular folders' session files; chat scratch dirs and
@@ -222,6 +223,40 @@ mod tests {
             .expect("query")
             .expect("row exists")
             .id
+    }
+
+    #[tokio::test]
+    async fn imported_raw_session_never_enrolls_auto_title() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
+        let at = AgentType::ClaudeCode;
+
+        let outcome =
+            import_one(&db.conn, folder, &at, &summary("raw-ext-1", Some("historical")))
+                .await
+                .expect("import");
+        assert_eq!(outcome, ImportOutcome::Imported);
+
+        let id = find_id(&db.conn, "raw-ext-1").await;
+        assert!(
+            auto_title_job::Entity::find_by_id(id)
+                .one(&db.conn)
+                .await
+                .expect("query job")
+                .is_none(),
+            "raw import must stay historical and never enroll an auto-title job"
+        );
     }
 
     #[tokio::test]
@@ -398,6 +433,7 @@ mod tests {
             folder_id: Set(folder),
             title: Set(Some("child original".to_string())),
             title_locked: Set(false),
+            auto_title_finalized: Set(false),
             agent_type: Set(at_str),
             status: Set(conversation::ConversationStatus::Completed),
             kind: Set(conversation::ConversationKind::Delegate),
