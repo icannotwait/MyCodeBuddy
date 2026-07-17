@@ -6757,11 +6757,7 @@ pub(crate) async fn acp_update_agent_display_preferences_core(
     agent_setting_service::update_show_thinking(&db.conn, agent_type, show_thinking)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
-    emit_acp_agents_updated(
-        emitter,
-        "display_preferences_updated",
-        Some(agent_type),
-    );
+    emit_acp_agents_updated(emitter, "display_preferences_updated", Some(agent_type));
     Ok(())
 }
 
@@ -8545,14 +8541,9 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster.clone());
         let mut rx = broadcaster.subscribe();
 
-        acp_update_agent_display_preferences_core(
-            AgentType::Codex,
-            true,
-            &db,
-            &emitter,
-        )
-        .await
-        .expect("update display preference");
+        acp_update_agent_display_preferences_core(AgentType::Codex, true, &db, &emitter)
+            .await
+            .expect("update display preference");
 
         let agents = acp_list_agents_core(&db).await.expect("list agents");
         let codex = agents
