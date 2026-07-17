@@ -3412,8 +3412,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         conn_id: &str,
         task: String,
         link: crate::acp::delegation::spawner::DelegationLink,
-    ) -> Result<i32, crate::acp::delegation::spawner::SpawnerError> {
-        use crate::acp::delegation::spawner::SpawnerError;
+    ) -> Result<
+        crate::acp::delegation::spawner::AcceptedDelegationPrompt,
+        crate::acp::delegation::spawner::SpawnerError,
+    > {
+        use crate::acp::delegation::spawner::{AcceptedDelegationPrompt, SpawnerError};
         // The child has no caller-supplied conversation_id (it's brand new).
         // folder_id must be None too — the manager's create-new-row branch
         // requires folder_id, which we resolve from the child's working_dir
@@ -3460,7 +3463,40 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 if let Some(state) = self.manager.get_state(conn_id).await {
                     state.write().await.mark_agent_activity(chrono::Utc::now());
                 }
-                Ok(cid)
+                // Authoritative wall start: exact row / timestamp lookup only.
+                // Missing or unreadable timestamps fail setup with a fixed
+                // non-secret error (no start publication upstream).
+                const TIMESTAMP_UNAVAILABLE: &str = "accepted delegation timestamp unavailable";
+                match conversation_service::get_by_id(&self.db.conn, cid).await {
+                    Ok(row) => match row.delegation_started_at {
+                        Some(started_at) => Ok(AcceptedDelegationPrompt {
+                            child_conversation_id: cid,
+                            started_at,
+                        }),
+                        None => {
+                            tracing::error!(
+                                child_conversation_id = cid,
+                                code = "accepted_delegation_timestamp_unavailable",
+                                "[delegation] accepted row missing delegation_started_at"
+                            );
+                            Err(SpawnerError::Send {
+                                message: TIMESTAMP_UNAVAILABLE.into(),
+                                child_conversation_id: Some(cid),
+                            })
+                        }
+                    },
+                    Err(_e) => {
+                        tracing::error!(
+                            child_conversation_id = cid,
+                            code = "accepted_delegation_timestamp_unavailable",
+                            "[delegation] accepted row timestamp lookup failed"
+                        );
+                        Err(SpawnerError::Send {
+                            message: TIMESTAMP_UNAVAILABLE.into(),
+                            child_conversation_id: Some(cid),
+                        })
+                    }
+                }
             }
             Ok(None) => Err(SpawnerError::send(
                 "send_prompt_linked succeeded but no conversation_id was bound",
@@ -3698,7 +3734,7 @@ mod tests {
         };
 
         let task = "delegated broker task body".to_string();
-        let conversation_id = spawner
+        let accepted = spawner
             .send_prompt_linked_for_delegation(
                 child_id,
                 task.clone(),
@@ -3710,6 +3746,11 @@ mod tests {
             )
             .await
             .expect("delegated send");
+        let conversation_id = accepted.child_conversation_id;
+        assert!(
+            accepted.started_at.timestamp() > 0,
+            "accepted path must return durable started_at"
+        );
 
         // Drain the enqueued command so the receiver stays live for the assert.
         let _ = child_rx.try_recv();

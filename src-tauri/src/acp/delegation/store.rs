@@ -624,6 +624,13 @@ pub mod mock {
         /// Optional gate: each `settle` waits on a oneshot after signaling entry.
         settle_gate: Mutex<Option<SettleGate>>,
         pub settle_count: AtomicUsize,
+        /// Ordered runtime-stats write attempts (Task 8 coalescing tests).
+        runtime_writes: Mutex<Vec<(String, DelegationRuntimeStats)>>,
+        /// One queued runtime-write error (consumed on the next attempt).
+        fail_next_runtime: Mutex<Option<TaskStoreError>>,
+        /// When true, the next `write_runtime_stats` hangs until cancelled
+        /// (for timeout tests with a paused Tokio clock).
+        hang_next_runtime: std::sync::atomic::AtomicBool,
     }
 
     /// Deterministic settle delay for mid-settle observation tests.
@@ -644,6 +651,9 @@ pub mod mock {
                 seed_on_load: std::sync::atomic::AtomicBool::new(false),
                 settle_gate: Mutex::new(None),
                 settle_count: AtomicUsize::new(0),
+                runtime_writes: Mutex::new(Vec::new()),
+                fail_next_runtime: Mutex::new(None),
+                hang_next_runtime: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -774,6 +784,52 @@ pub mod mock {
             self.settle_calls.lock().await.len()
         }
 
+        /// Queue one permanent/transient failure for the next runtime write.
+        pub fn fail_next_runtime_write(&self, err: TaskStoreError) {
+            *self
+                .fail_next_runtime
+                .try_lock()
+                .expect("MockTaskStore::fail_next_runtime_write: mutex busy") = Some(err);
+        }
+
+        /// Next `write_runtime_stats` hangs until the outer timeout cancels it.
+        pub fn hang_next_runtime_write(&self) {
+            self.hang_next_runtime.store(true, Ordering::SeqCst);
+        }
+
+        pub async fn runtime_write_count(&self, task_id: &str) -> usize {
+            self.runtime_writes
+                .lock()
+                .await
+                .iter()
+                .filter(|(id, _)| id == task_id)
+                .count()
+        }
+
+        /// Latest accepted runtime snapshot for `task_id` (row, else last attempt).
+        pub async fn latest_runtime(&self, task_id: &str) -> Option<DelegationRuntimeStats> {
+            if let Some(stats) = self
+                .tasks
+                .lock()
+                .await
+                .get(task_id)
+                .and_then(|t| t.runtime_stats.clone())
+            {
+                return Some(stats);
+            }
+            self.runtime_writes
+                .lock()
+                .await
+                .iter()
+                .rev()
+                .find(|(id, _)| id == task_id)
+                .map(|(_, stats)| stats.clone())
+        }
+
+        pub async fn all_runtime_writes(&self) -> Vec<(String, DelegationRuntimeStats)> {
+            self.runtime_writes.lock().await.clone()
+        }
+
         fn seed_if_missing(map: &mut HashMap<String, PersistedTask>, task_id: &str, child_id: i32) {
             map.entry(task_id.to_string())
                 .or_insert_with(|| PersistedTask {
@@ -875,12 +931,40 @@ pub mod mock {
             task_id: &str,
             stats: &DelegationRuntimeStats,
         ) -> Result<(), TaskStoreError> {
+            // Record every attempt (including hangs that complete after cancel
+            // never reach here — hang is before record so timed-out calls still
+            // count once the future is polled).
+            if self.hang_next_runtime.swap(false, Ordering::SeqCst) {
+                // Count the attempt, then hang until the outer timeout cancels.
+                self.runtime_writes
+                    .lock()
+                    .await
+                    .push((task_id.to_string(), stats.clone()));
+                std::future::pending::<()>().await;
+                unreachable!("hang_next_runtime future was resumed after cancel");
+            }
+            self.runtime_writes
+                .lock()
+                .await
+                .push((task_id.to_string(), stats.clone()));
+            if let Some(err) = self.fail_next_runtime.lock().await.take() {
+                return Err(err);
+            }
             let mut map = self.tasks.lock().await;
+            // accept_any_running mode: seed a running row so coalesced writes
+            // during setup/running can land without an explicit seed_edge.
+            let child_id = self.default_child_id.load(Ordering::SeqCst);
+            if !map.contains_key(task_id) && child_id != 0 {
+                Self::seed_if_missing(&mut map, task_id, child_id);
+            }
             let Some(entry) = map.get_mut(task_id) else {
                 return Err(TaskStoreError::Permanent(format!(
                     "runtime_stats write for missing task {task_id}"
                 )));
             };
+            // Task 3 predicates: running snapshot only updates a running row;
+            // matching terminal snapshot only updates the already-terminal row
+            // with the same finished_at; stale running after terminal is benign.
             let accept = if stats.finished_at.is_none() {
                 entry.status == TaskStatus::Running
             } else {

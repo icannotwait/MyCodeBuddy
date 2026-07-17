@@ -51,11 +51,13 @@
 //! [`ParentTurnEndReason::JoinAbandoned`] (no-op when no live Codeg children).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, Notify};
 
 use crate::acp::delegation::attention::{
@@ -68,6 +70,8 @@ use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveRepl
 use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaWriter, NoopMetaWriter,
 };
+use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
+use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
 use crate::acp::delegation::store::{
     DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
@@ -80,10 +84,43 @@ use crate::acp::delegation::types::{
     DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
     TaskObservation, TaskStatus,
 };
-use crate::acp::types::DelegationResultSummary;
+use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::models::AgentType;
-use chrono::Utc;
+
+/// Coalesced runtime-stats write window (one worker sleep per flush cycle).
+const RUNTIME_STATS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound a single `write_runtime_stats` so a stuck DB call cannot own
+/// `persist_lock` forever.
+const RUNTIME_STATS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shared live runtime projector + coalesced-write coordination for one task.
+/// One allocation is shared across setup / running / terminal paths.
+pub(crate) struct LiveRuntimeState {
+    projector: Mutex<RuntimeStatsProjector>,
+    dirty_version: AtomicU64,
+    flush_scheduled: AtomicBool,
+    coalesced_persistence_disabled: AtomicBool,
+    started_published: AtomicBool,
+    terminal: AtomicBool,
+    persist_lock: Mutex<()>,
+    publication_lock: Mutex<()>,
+}
+
+impl LiveRuntimeState {
+    fn new(started_at: DateTime<Utc>, working_dir: PathBuf) -> Self {
+        Self {
+            projector: Mutex::new(RuntimeStatsProjector::new(started_at, working_dir)),
+            dirty_version: AtomicU64::new(0),
+            flush_scheduled: AtomicBool::new(false),
+            coalesced_persistence_disabled: AtomicBool::new(false),
+            started_published: AtomicBool::new(false),
+            terminal: AtomicBool::new(false),
+            persist_lock: Mutex::new(()),
+            publication_lock: Mutex::new(()),
+        }
+    }
+}
 
 /// Default per-parent byte budget for cached completed-task result text. The
 /// completed-cache lets `get_delegation_status` / `cancel_delegation` return a
@@ -220,8 +257,11 @@ struct RunningTask {
     /// that didn't come through MCP (tests, future internal callers).
     external_handle: Option<String>,
     /// When the child started running (after `send_prompt` succeeded). Used to
-    /// compute a real `duration_ms` at terminal time.
+    /// compute a real `duration_ms` at terminal time. Monotonic only — wall
+    /// timestamps live on the shared [`LiveRuntimeState`] projector.
     started_at: Instant,
+    /// Shared runtime projector / coalesced writer (same Arc as coordination).
+    runtime: Arc<LiveRuntimeState>,
 }
 
 /// A terminal delegation result retained so `get_delegation_status` /
@@ -382,7 +422,7 @@ struct InflightSetup {
 /// Live parent/child coordination edge for attention (parent-decision) waits.
 /// Keyed by child connection id; registered before the child's first prompt is
 /// enqueued so an immediate MCP `request_parent_decision` can resolve the edge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CoordinationIdentity {
     pub(crate) task_id: String,
     #[allow(dead_code)] // reserved for later cascade / tooling tasks
@@ -391,6 +431,8 @@ pub(crate) struct CoordinationIdentity {
     pub(crate) parent_conversation_id: i32,
     #[allow(dead_code)] // reserved for later cascade / tooling tasks
     pub(crate) parent_tool_use_id: String,
+    /// Shared with [`RunningTask::runtime`] — created before prompt enqueue.
+    pub(crate) runtime: Arc<LiveRuntimeState>,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -792,6 +834,8 @@ struct SettleContext {
     /// Normal completion/failure/explicit cancel use [`AttentionResolutionCode::TaskTerminal`];
     /// parent-tree teardown uses the mapped parent-end code.
     attention_resolution: AttentionResolutionCode,
+    /// Shared runtime state for terminal flush (same Arc as setup/running).
+    runtime: Option<Arc<LiveRuntimeState>>,
 }
 
 /// Observability context for the process-local persistence retry worker.
@@ -818,6 +862,7 @@ impl SettleContext {
             disconnect_on_loss: true,
             message: None,
             attention_resolution: AttentionResolutionCode::TaskTerminal,
+            runtime: Some(task.runtime.clone()),
         }
     }
 }
@@ -3038,6 +3083,11 @@ impl DelegationBroker {
         // Reserve setup AND register coordination under the same lock before
         // the prompt-enqueue boundary so an immediate child MCP decision call
         // can resolve the parent edge without waiting for `running` insert.
+        // Create the shared runtime projector with a provisional wall start;
+        // rebase to the accepted durable timestamp after send succeeds.
+        let provisional_started = Utc::now();
+        let working_dir = PathBuf::from(req.working_dir.clone().unwrap_or_default());
+        let runtime = Arc::new(LiveRuntimeState::new(provisional_started, working_dir));
         {
             let mut inner = self.pending.inner.lock().await;
             inner.reserve(&call_id, &child_connection_id);
@@ -3049,24 +3099,18 @@ impl DelegationBroker {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_conversation_id: req.parent_conversation_id,
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    runtime: runtime.clone(),
                 },
             );
         }
 
-        let child_conversation_id = match self
+        let accepted = match self
             .spawner
             .send_prompt_linked_for_delegation(&child_connection_id, req.task.clone(), link)
             .await
         {
-            Ok(cid) => cid,
+            Ok(accepted) => accepted,
             Err(e) => {
-                // Clear setup reservation + coordination before any settle / disconnect.
-                {
-                    let mut inner = self.pending.inner.lock().await;
-                    inner.unreserve(&call_id, &child_connection_id);
-                    inner.coordination_by_child.remove(&child_connection_id);
-                    inner.deregister_inflight(inflight_id);
-                }
                 // Prefer child id from the structured Send error; otherwise
                 // decide row existence by the known task/delegation call id.
                 // A durable row must settle failed/spawn_failed even when the
@@ -3092,7 +3136,14 @@ impl DelegationBroker {
                 };
                 let child_for_settle = err_child_id.or(persisted_child);
                 if let Some(cid) = child_for_settle {
-                    // Row-backed (or error-carried child id): durable settle.
+                    // Row-backed: clear reservation/inflight but keep the same
+                    // runtime Arc for terminal flush; coordination is released
+                    // inside settle_task after the winning CAS.
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.unreserve(&call_id, &child_connection_id);
+                        inner.deregister_inflight(inflight_id);
+                    }
                     let terminal = TerminalTaskWrite::failed(
                         "spawn_failed",
                         Utc::now(),
@@ -3109,6 +3160,7 @@ impl DelegationBroker {
                         disconnect_on_loss: true,
                         message: Some(message.clone()),
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
+                        runtime: Some(runtime),
                     };
                     let mut report = self.settle_task(&call_id, terminal, None, ctx).await;
                     if report.error_code.is_none() {
@@ -3121,11 +3173,28 @@ impl DelegationBroker {
                     report.agent_type = Some(req.agent_type);
                     return report;
                 }
-                // No row and no child id — unaccepted setup failure, no task id.
+                // No durable row — set terminal before removing coordination so
+                // a scheduled coalesced worker stops without a missing-row write.
+                runtime.terminal.store(true, Ordering::Release);
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.unreserve(&call_id, &child_connection_id);
+                    inner.coordination_by_child.remove(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                }
                 let _ = self.spawner.disconnect(&child_connection_id).await;
                 return report_err(req.agent_type, DelegationError::SpawnFailed(message), None);
             }
         };
+        let child_conversation_id = accepted.child_conversation_id;
+
+        // Rebase provisional wall start to the durable accepted timestamp
+        // before any running meta / DelegationStarted publication.
+        runtime
+            .projector
+            .lock()
+            .await
+            .rebase_started_at(accepted.started_at);
 
         // The child is now running. Stamp the start so terminal paths can
         // report a real `duration_ms`.
@@ -3151,6 +3220,9 @@ impl DelegationBroker {
             ),
         )
         .await;
+        runtime
+            .started_published
+            .store(true, Ordering::Release);
 
         // Announce the live delegation on the PARENT's event stream so the
         // frontend `DelegationContext` binds the child inline and attaches its
@@ -3258,6 +3330,7 @@ impl DelegationBroker {
                             agent_type: req.agent_type,
                             external_handle: req.external_handle.clone(),
                             started_at,
+                            runtime: runtime.clone(),
                         },
                     );
                     inner.deregister_inflight(inflight_id);
@@ -3285,6 +3358,7 @@ impl DelegationBroker {
                     disconnect_on_loss: true,
                     message: None,
                     attention_resolution: AttentionResolutionCode::TaskTerminal,
+                    runtime: Some(runtime),
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -3310,6 +3384,7 @@ impl DelegationBroker {
                     disconnect_on_loss: true,
                     message: Some(reason.message().to_string()),
                     attention_resolution: reason.attention_code(),
+                    runtime: Some(runtime),
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
             }
@@ -3351,6 +3426,7 @@ impl DelegationBroker {
                         disconnect_on_loss: true,
                         message: None,
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
+                        runtime: Some(runtime),
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
@@ -3391,6 +3467,9 @@ impl DelegationBroker {
         result_text: Option<String>,
         ctx: SettleContext,
     ) -> DelegationTaskReport {
+        // Capture finished_at before moving the write into settle_with_retry so
+        // the terminal runtime flush uses the exact same timestamp.
+        let finished_at = terminal.finished_at;
         let conversation_status = terminal.conversation_status.clone();
         let settlement = self.settle_with_retry(task_id, terminal).await;
         match settlement {
@@ -3414,13 +3493,49 @@ impl DelegationBroker {
                 // cache / Join notify / meta / event / disconnect. Attention
                 // write errors are logged inside the helper and never undo the
                 // winning task CAS.
+                //
+                // On win: set terminal=true then hold publication_lock for
+                // attention → final runtime flush → terminal meta → event so a
+                // later runtime publisher cannot overwrite terminal state.
+                let mut _runtime_stats: Option<DelegationRuntimeStats> = None;
                 if won {
-                    let _ = self
-                        .close_task_attention(task_id, ctx.attention_resolution)
+                    if let Some(runtime) = ctx.runtime.as_ref() {
+                        runtime.terminal.store(true, Ordering::Release);
+                        let _publication = runtime.publication_lock.lock().await;
+                        let _ = self
+                            .close_task_attention(task_id, ctx.attention_resolution)
+                            .await;
+                        _runtime_stats = Some(
+                            self.flush_terminal_runtime(task_id, runtime, finished_at)
+                                .await,
+                        );
+                        {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.coordination_by_child.remove(&ctx.child_connection_id);
+                        }
+                        // Terminal meta + event while still holding publication_lock.
+                        self.publish_terminal_meta_and_event(
+                            task_id,
+                            &report,
+                            &ctx,
+                            conversation_status,
+                        )
                         .await;
-                    {
-                        let mut inner = self.pending.inner.lock().await;
-                        inner.coordination_by_child.remove(&ctx.child_connection_id);
+                    } else {
+                        let _ = self
+                            .close_task_attention(task_id, ctx.attention_resolution)
+                            .await;
+                        {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.coordination_by_child.remove(&ctx.child_connection_id);
+                        }
+                        self.publish_terminal_meta_and_event(
+                            task_id,
+                            &report,
+                            &ctx,
+                            conversation_status,
+                        )
+                        .await;
                     }
                 }
                 // Atomic settling → completed (or first completed insert for
@@ -3473,48 +3588,6 @@ impl DelegationBroker {
                             Some(true),
                         );
                     terminal_audit.emit_task_transition();
-                    // Live sidebar coherence: one ConversationStatusChanged
-                    // matching the durable CAS write (Existing/loser skips).
-                    self.emit_conversation_status_if_real(
-                        &ctx.parent_connection_id,
-                        ctx.child_conversation_id,
-                        conversation_status,
-                    )
-                    .await;
-                    // Terminal meta + event only for the CAS winner.
-                    let outcome_for_meta = report_to_outcome_for_meta(&report, &ctx);
-                    self.write_meta_if_real(
-                        &ctx.parent_connection_id,
-                        &ctx.parent_tool_use_id,
-                        match &outcome_for_meta {
-                            DelegationOutcome::Ok(ok) => build_delegation_meta(
-                                "completed",
-                                Some(&ctx.child_connection_id),
-                                Some(ctx.child_conversation_id),
-                                None,
-                                build_text_preview(&ok.text).as_deref(),
-                                Some(ctx.duration_ms),
-                            ),
-                            DelegationOutcome::Err { code, .. } => build_delegation_meta(
-                                "failed",
-                                Some(&ctx.child_connection_id),
-                                Some(ctx.child_conversation_id),
-                                Some(code),
-                                None,
-                                Some(ctx.duration_ms),
-                            ),
-                        },
-                    )
-                    .await;
-                    self.emit_completed_if_real(
-                        &ctx.parent_connection_id,
-                        &ctx.parent_tool_use_id,
-                        &ctx.child_connection_id,
-                        ctx.child_conversation_id,
-                        ctx.agent_type,
-                        outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
-                    )
-                    .await;
                     if ctx.cancel_turn {
                         let _ = self.spawner.cancel(&ctx.child_connection_id).await;
                     }
@@ -3526,6 +3599,7 @@ impl DelegationBroker {
                     // DelegationCompleted / terminal meta.
                     let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
                 }
+                let _ = _runtime_stats;
                 report
             }
             Err(err) => {
@@ -3536,6 +3610,22 @@ impl DelegationBroker {
                     error = %err,
                     "[delegation] terminal persist failed; publishing persistence_error"
                 );
+                // Same terminal flag + publication lock as the win path so a
+                // later runtime publisher cannot race the in-memory failure.
+                if let Some(runtime) = ctx.runtime.as_ref() {
+                    runtime.terminal.store(true, Ordering::Release);
+                    let _publication = runtime.publication_lock.lock().await;
+                    let _ = self
+                        .flush_terminal_runtime(task_id, runtime, finished_at)
+                        .await;
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.coordination_by_child.remove(&ctx.child_connection_id);
+                    }
+                } else {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.coordination_by_child.remove(&ctx.child_connection_id);
+                }
                 let report = DelegationTaskReport {
                     task_id: Some(task_id.to_string()),
                     status: TaskStatus::Failed,
@@ -3598,6 +3688,231 @@ impl DelegationBroker {
                 report
             }
         }
+    }
+
+    /// Publish terminal conversation status, meta, and DelegationCompleted.
+    /// Caller holds `runtime.publication_lock` when a runtime Arc is present.
+    async fn publish_terminal_meta_and_event(
+        &self,
+        _task_id: &str,
+        report: &DelegationTaskReport,
+        ctx: &SettleContext,
+        conversation_status: ConversationStatus,
+    ) {
+        self.emit_conversation_status_if_real(
+            &ctx.parent_connection_id,
+            ctx.child_conversation_id,
+            conversation_status,
+        )
+        .await;
+        let outcome_for_meta = report_to_outcome_for_meta(report, ctx);
+        self.write_meta_if_real(
+            &ctx.parent_connection_id,
+            &ctx.parent_tool_use_id,
+            match &outcome_for_meta {
+                DelegationOutcome::Ok(ok) => build_delegation_meta(
+                    "completed",
+                    Some(&ctx.child_connection_id),
+                    Some(ctx.child_conversation_id),
+                    None,
+                    build_text_preview(&ok.text).as_deref(),
+                    Some(ctx.duration_ms),
+                ),
+                DelegationOutcome::Err { code, .. } => build_delegation_meta(
+                    "failed",
+                    Some(&ctx.child_connection_id),
+                    Some(ctx.child_conversation_id),
+                    Some(code),
+                    None,
+                    Some(ctx.duration_ms),
+                ),
+            },
+        )
+        .await;
+        self.emit_completed_if_real(
+            &ctx.parent_connection_id,
+            &ctx.parent_tool_use_id,
+            &ctx.child_connection_id,
+            ctx.child_conversation_id,
+            ctx.agent_type,
+            outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
+        )
+        .await;
+    }
+
+    /// Project a structured child ToolCall / ToolCallUpdate into the live
+    /// runtime stats for the coordinating task (if any).
+    pub async fn project_child_tool_event(
+        &self,
+        child_connection_id: &str,
+        event: &AcpEvent,
+    ) {
+        if !matches!(
+            event,
+            AcpEvent::ToolCall { .. } | AcpEvent::ToolCallUpdate { .. }
+        ) {
+            return;
+        }
+        let identity = {
+            self.pending
+                .inner
+                .lock()
+                .await
+                .coordination_by_child
+                .get(child_connection_id)
+                .cloned()
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        if identity.runtime.terminal.load(Ordering::Acquire) {
+            return;
+        }
+        let changed = {
+            let mut projector = identity.runtime.projector.lock().await;
+            // Terminal flush sets terminal before taking the projector lock. If
+            // this event got the lock first, terminal flush will include it; if
+            // terminal flush got there first, the event is ignored.
+            if identity.runtime.terminal.load(Ordering::Acquire) {
+                return;
+            }
+            projector.apply(event)
+        };
+        if !changed {
+            return;
+        }
+        identity
+            .runtime
+            .dirty_version
+            .fetch_add(1, Ordering::AcqRel);
+        self.schedule_runtime_flush(identity.task_id.clone(), identity.runtime);
+    }
+
+    fn record_runtime_projection_error(
+        &self,
+        kind: RuntimeProjectionErrorKind,
+        task_id: &str,
+    ) {
+        tracing::error!(
+            %task_id,
+            kind = kind.as_str(),
+            "[delegation] runtime projection failed"
+        );
+    }
+
+    fn schedule_runtime_flush(&self, task_id: String, state: Arc<LiveRuntimeState>) {
+        if state
+            .coalesced_persistence_disabled
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        if state
+            .flush_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let broker = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RUNTIME_STATS_FLUSH_INTERVAL).await;
+                let written_version;
+                {
+                    let _persist = state.persist_lock.lock().await;
+                    if state.terminal.load(Ordering::Acquire) {
+                        state.flush_scheduled.store(false, Ordering::Release);
+                        return;
+                    }
+                    written_version = state.dirty_version.load(Ordering::Acquire);
+                    let stats = state.projector.lock().await.snapshot();
+                    match tokio::time::timeout(
+                        RUNTIME_STATS_WRITE_TIMEOUT,
+                        broker.task_store.write_runtime_stats(&task_id, &stats),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            if !error.is_transient() {
+                                state
+                                    .coalesced_persistence_disabled
+                                    .store(true, Ordering::Release);
+                            }
+                            broker.record_runtime_projection_error(
+                                RuntimeProjectionErrorKind::Persistence,
+                                &task_id,
+                            );
+                        }
+                        Err(_error) => {
+                            state
+                                .coalesced_persistence_disabled
+                                .store(true, Ordering::Release);
+                            broker.record_runtime_projection_error(
+                                RuntimeProjectionErrorKind::Persistence,
+                                &task_id,
+                            );
+                        }
+                    }
+                }
+                if state
+                    .coalesced_persistence_disabled
+                    .load(Ordering::Acquire)
+                {
+                    state.flush_scheduled.store(false, Ordering::Release);
+                    return;
+                }
+                if state.dirty_version.load(Ordering::Acquire) != written_version {
+                    continue;
+                }
+                state.flush_scheduled.store(false, Ordering::Release);
+                if state.dirty_version.load(Ordering::Acquire) == written_version {
+                    return;
+                }
+                if state
+                    .flush_scheduled
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn flush_terminal_runtime(
+        &self,
+        task_id: &str,
+        runtime: &Arc<LiveRuntimeState>,
+        finished_at: DateTime<Utc>,
+    ) -> DelegationRuntimeStats {
+        let _persist = runtime.persist_lock.lock().await;
+        debug_assert!(runtime.terminal.load(Ordering::Acquire));
+        let stats = {
+            let mut projector = runtime.projector.lock().await;
+            projector.finish(finished_at);
+            projector.snapshot()
+        };
+        runtime.dirty_version.fetch_add(1, Ordering::AcqRel);
+        match tokio::time::timeout(
+            RUNTIME_STATS_WRITE_TIMEOUT,
+            self.task_store.write_runtime_stats(task_id, &stats),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_error)) => self.record_runtime_projection_error(
+                RuntimeProjectionErrorKind::TerminalPersistence,
+                task_id,
+            ),
+            Err(_error) => self.record_runtime_projection_error(
+                RuntimeProjectionErrorKind::TerminalPersistence,
+                task_id,
+            ),
+        }
+        runtime.flush_scheduled.store(false, Ordering::Release);
+        stats
     }
 
     async fn settle_with_retry(
@@ -4706,6 +5021,7 @@ impl DelegationBroker {
                 agent_type: AgentType::ClaudeCode,
                 external_handle: None,
                 started_at: Instant::now(),
+                runtime: Arc::new(LiveRuntimeState::new(Utc::now(), PathBuf::new())),
             },
         );
         task_id.to_string()
@@ -4882,7 +5198,7 @@ impl DelegationObservationSink for BrokerObservationSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::delegation::spawner::{mock::MockSpawner, SpawnerError};
+    use crate::acp::delegation::spawner::{accepted, mock::MockSpawner, SpawnerError};
     use crate::acp::delegation::types::DelegationSuccess;
     use crate::models::AgentType;
 
@@ -4983,7 +5299,7 @@ mod tests {
     async fn happy_path_returns_ok_after_complete_call() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -5037,7 +5353,7 @@ mod tests {
     async fn infinite_wait_parks_until_terminal() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -5098,7 +5414,7 @@ mod tests {
 
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
                 .with_live_reply_lookup(Arc::new(MockChildLiveReplyLookup::new(Some(
@@ -5128,7 +5444,7 @@ mod tests {
     async fn running_status_stays_bare_without_live_reply() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -5155,7 +5471,7 @@ mod tests {
         tool_use: &str,
     ) -> String {
         mock.queue_spawn(Ok(child_conn.into())).await;
-        mock.queue_send(Ok(child_conv)).await;
+        mock.queue_send(Ok(accepted(child_conv, Utc::now()))).await;
         broker
             .start_delegation(request(1, tool_use))
             .await
@@ -5325,7 +5641,7 @@ mod tests {
         spawner.queue_spawn(Ok(child_conn.into())).await;
         // Distinct child conversation ids per child connection name.
         let child_conv = child_conn.bytes().map(|b| b as i32).sum::<i32>().abs() + 1;
-        spawner.queue_send(Ok(child_conv)).await;
+        spawner.queue_send(Ok(accepted(child_conv, Utc::now()))).await;
         let mut req = request(parent_conv, child_conn);
         req.parent_connection_id = parent_conn.into();
         broker
@@ -5650,7 +5966,7 @@ mod tests {
     async fn coordination_identity_exists_before_child_prompt_enqueue_can_run() {
         let (broker, spawner, _task_store, _attention) = coordination_broker().await;
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(22)).await;
+        spawner.queue_send(Ok(accepted(22, Utc::now()))).await;
         let release = spawner.install_send_gate().await;
 
         let start = tokio::spawn({
@@ -5789,6 +6105,533 @@ mod tests {
             }
         ));
         assert!(broker.coordination_for_test("child-conn").await.is_none());
+    }
+
+    // -- Task 8: child runtime projection + coalesced persistence ----------
+
+    fn tool_call(id: &str, kind: &str, title: &str) -> AcpEvent {
+        AcpEvent::ToolCall {
+            tool_call_id: id.to_string(),
+            title: title.to_string(),
+            kind: kind.to_string(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        }
+    }
+
+    fn tool_update(id: &str, title: Option<&str>, meta: Option<serde_json::Value>) -> AcpEvent {
+        AcpEvent::ToolCallUpdate {
+            tool_call_id: id.to_string(),
+            title: title.map(str::to_string),
+            status: None,
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta,
+            images: None,
+        }
+    }
+
+    fn edit_meta(path: &str, patch: &str) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "changes": {
+                path: { "old_text": "", "new_text": patch }
+            }
+        }))
+    }
+
+    fn completed_outcome(text: &str) -> DelegationOutcome {
+        DelegationOutcome::Ok(DelegationSuccess {
+            text: text.into(),
+            child_conversation_id: 22,
+            child_agent_type: AgentType::ClaudeCode,
+            turn_count: 1,
+            duration_ms: 1,
+            token_usage: None,
+        })
+    }
+
+    /// Prefer MockTaskStore for real predicates; ordered log wraps meta/event.
+    async fn ordered_broker(
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> (
+        DelegationBroker,
+        Arc<MockSpawner>,
+        Arc<crate::acp::delegation::store::mock::MockTaskStore>,
+        Arc<crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore>,
+    ) {
+        use crate::acp::delegation::attention::{
+            mock::MemoryDelegationAttentionStore, DelegationAttentionStore,
+        };
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        let task_store = Arc::new(MockTaskStore::accept_any_running(22));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let meta = Arc::new(LoggingMetaWriter { log: log.clone() });
+        let events = Arc::new(LoggingEventEmitter { log: log.clone() });
+        // Keep MockTaskStore for predicates; wrap write via LoggingRuntimeStore.
+        let runtime_store = Arc::new(LoggingRuntimeStore {
+            inner: task_store.clone(),
+            log: log.clone(),
+        });
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            meta as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(runtime_store as Arc<dyn DelegationTaskStore>)
+        .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
+        enable_delegation(&broker).await;
+        (broker, spawner, task_store, attention)
+    }
+
+    struct LoggingRuntimeStore {
+        inner: Arc<crate::acp::delegation::store::mock::MockTaskStore>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::acp::delegation::store::DelegationTaskStore for LoggingRuntimeStore {
+        async fn load(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<crate::acp::delegation::store::PersistedTask>, crate::acp::delegation::store::TaskStoreError>
+        {
+            self.inner.load(task_id).await
+        }
+        async fn settle(
+            &self,
+            task_id: &str,
+            terminal: crate::acp::delegation::store::TerminalTaskWrite,
+        ) -> Result<
+            crate::acp::delegation::store::Settlement,
+            crate::acp::delegation::store::TaskStoreError,
+        > {
+            self.inner.settle(task_id, terminal).await
+        }
+        async fn reconcile_running(
+            &self,
+            at: DateTime<Utc>,
+        ) -> Result<u64, crate::acp::delegation::store::TaskStoreError> {
+            self.inner.reconcile_running(at).await
+        }
+        async fn write_runtime_stats(
+            &self,
+            task_id: &str,
+            stats: &DelegationRuntimeStats,
+        ) -> Result<(), crate::acp::delegation::store::TaskStoreError> {
+            self.log.lock().await.push("runtime_write".into());
+            self.inner.write_runtime_stats(task_id, stats).await
+        }
+        async fn put_retry(&self, retry: crate::acp::delegation::store::PendingTerminalRetry) {
+            self.inner.put_retry(retry).await
+        }
+        async fn remove_retry(&self, task_id: &str) {
+            self.inner.remove_retry(task_id).await
+        }
+        async fn has_retry_record(&self, task_id: &str) -> bool {
+            self.inner.has_retry_record(task_id).await
+        }
+    }
+
+    struct LoggingMetaWriter {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::acp::delegation::meta_writer::DelegationMetaWriter for LoggingMetaWriter {
+        async fn write_meta(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            meta: serde_json::Value,
+        ) {
+            let status = meta
+                .get("codeg.delegation")
+                .and_then(|d| d.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if status == "completed" || status == "failed" {
+                self.log.lock().await.push("terminal_meta".into());
+            }
+        }
+    }
+
+    struct LoggingEventEmitter {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::acp::delegation::event_emitter::DelegationEventEmitter for LoggingEventEmitter {
+        async fn emit_started(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            _child_connection_id: &str,
+            _child_conversation_id: i32,
+            _agent_type: AgentType,
+        ) {
+        }
+        async fn emit_completed(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            _child_connection_id: &str,
+            _child_conversation_id: i32,
+            _agent_type: AgentType,
+            _result: crate::acp::types::DelegationResultSummary,
+        ) {
+            self.log.lock().await.push("terminal_event".into());
+        }
+        async fn emit_conversation_status_changed(
+            &self,
+            _parent_connection_id: &str,
+            _conversation_id: i32,
+            _status: ConversationStatus,
+        ) {
+        }
+        async fn emit_observation_changed(
+            &self,
+            _parent_connection_id: &str,
+            _parent_tool_use_id: &str,
+            _task_id: &str,
+            _observation: TaskObservation,
+            _last_agent_activity_at: DateTime<Utc>,
+            _stalled_since: Option<DateTime<Utc>>,
+        ) {
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_child_tool_event_is_projected_before_running_registration() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        let persisted_start = dt("2026-07-17T10:00:00Z");
+        spawner
+            .queue_send(Ok(accepted(22, persisted_start)))
+            .await;
+        let release = spawner.install_send_gate().await;
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
+            .await;
+        release.send(()).unwrap();
+        let task_id = start.await.unwrap().task_id.unwrap();
+        // Park the coalesced worker on sleep before advancing the paused clock.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RUNTIME_STATS_FLUSH_INTERVAL).await;
+        for _ in 0..20 {
+            if store.runtime_write_count(&task_id).await > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.latest_runtime(&task_id).await.unwrap().tool_call_count,
+            1
+        );
+        assert_eq!(
+            store.latest_runtime(&task_id).await.unwrap().started_at,
+            persisted_start
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_writes_are_coalesced_and_sparse_updates_count_once() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        for event in [
+            tool_call("tc-1", "read", "Read"),
+            tool_update("tc-1", Some("Edit"), edit_meta("a.rs", "+x")),
+            tool_call("tc-2", "search", "Search"),
+        ] {
+            broker
+                .project_child_tool_event("child-conn", &event)
+                .await;
+        }
+        assert_eq!(store.runtime_write_count(&task_id).await, 0);
+
+        // Must park sleep before advance or the 500ms window restarts.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RUNTIME_STATS_FLUSH_INTERVAL).await;
+        for _ in 0..20 {
+            if store.runtime_write_count(&task_id).await > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.runtime_write_count(&task_id).await, 1);
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert_eq!(stats.tool_call_count, 2);
+        assert_eq!(stats.edit_tool_call_count, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_flush_persists_latest_projection_before_terminal_publication() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (broker, spawner, store, _attention) = ordered_broker(log.clone()).await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-final", "edit", "Edit"))
+            .await;
+
+        complete(&broker, &task_id, "done").await;
+        let entries = log.lock().await.clone();
+        let runtime_pos = entries
+            .iter()
+            .position(|item| item == "runtime_write")
+            .unwrap();
+        let meta_pos = entries
+            .iter()
+            .position(|item| item == "terminal_meta")
+            .unwrap();
+        let event_pos = entries
+            .iter()
+            .position(|item| item == "terminal_event")
+            .unwrap();
+        assert!(runtime_pos < meta_pos && meta_pos < event_pos);
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert!(stats.finished_at.is_some());
+        assert_eq!(stats.tool_call_count, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_persistence_failure_never_blocks_terminal_settlement() {
+        use crate::acp::delegation::store::TaskStoreError;
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        store.fail_next_runtime_write(TaskStoreError::Permanent("disk full".into()));
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-1", "edit", "Edit"))
+            .await;
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.complete_call(&task_id, completed_outcome("done")),
+        )
+        .await
+        .unwrap();
+        // complete_call returns (); inspect store status.
+        let _ = report;
+        assert_eq!(
+            store.load(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_tool_id_does_not_start_runtime_persistence() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        broker
+            .project_child_tool_event("child-conn", &tool_call("", "read", "Read"))
+            .await;
+        assert_eq!(store.runtime_write_count(&task_id).await, 0);
+        assert!(store.latest_runtime(&task_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_root_connection_events_do_not_write_runtime() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        broker
+            .project_child_tool_event("root-conn", &tool_call("tc-1", "read", "Read"))
+            .await;
+        assert_eq!(store.runtime_write_count(&task_id).await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_window_tool_call_is_included_in_terminal_flush_with_accepted_start() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        let persisted_start = dt("2026-07-17T11:00:00Z");
+        spawner
+            .queue_send(Ok(accepted(22, persisted_start)))
+            .await;
+        let release = spawner.install_send_gate().await;
+        let start = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .start_delegation(coordination_request("parent", 11))
+                    .await
+            }
+        });
+        wait_until(|| {
+            let broker = broker.clone();
+            async move { broker.coordination_for_test("child-conn").await.is_some() }
+        })
+        .await;
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-setup", "read", "Read"))
+            .await;
+        // Buffer a child terminal while still gated on send.
+        let call_id = broker
+            .coordination_for_test("child-conn")
+            .await
+            .unwrap()
+            .task_id;
+        let complete = tokio::spawn({
+            let broker = broker.clone();
+            let call_id = call_id.clone();
+            async move {
+                broker
+                    .complete_call(&call_id, completed_outcome("setup-done"))
+                    .await
+            }
+        });
+        release.send(()).unwrap();
+        let report = start.await.unwrap();
+        // Either setup-window settle returns terminal, or complete finishes after.
+        let _ = complete.await;
+        let task_id = report.task_id.unwrap_or(call_id);
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert_eq!(stats.tool_call_count, 1);
+        assert_eq!(stats.started_at, persisted_start);
+        assert!(stats.finished_at.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_runtime_write_disables_coalesced_retry_but_terminal_still_settles() {
+        use crate::acp::delegation::store::DelegationTaskStore;
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        store.hang_next_runtime_write();
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
+            .await;
+        // Park coalesced sleep, then advance flush window so hang starts.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RUNTIME_STATS_FLUSH_INTERVAL).await;
+        for _ in 0..10 {
+            if store.runtime_write_count(&task_id).await > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.runtime_write_count(&task_id).await >= 1,
+            "hanging write must be observed as an attempt"
+        );
+        // Advance past write timeout so the coalesced worker releases persist_lock.
+        tokio::time::advance(RUNTIME_STATS_WRITE_TIMEOUT + Duration::from_millis(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let writes_after_timeout = store.runtime_write_count(&task_id).await;
+        // Project another event — must not start a second coalesced DB call.
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-2", "read", "Read"))
+            .await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RUNTIME_STATS_FLUSH_INTERVAL * 2).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.runtime_write_count(&task_id).await,
+            writes_after_timeout,
+            "coalesced persistence disabled after hang; no second write"
+        );
+        // Terminal settle uses a fresh timeout; hang flag already consumed.
+        broker
+            .complete_call(&task_id, completed_outcome("still ok"))
+            .await;
+        assert_eq!(
+            store.load(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert!(stats.finished_at.is_some());
+        assert!(stats.tool_call_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_delegation_timestamp_unavailable_skips_start_publication() {
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner
+            .queue_send(Err(SpawnerError::Send {
+                message: "accepted delegation timestamp unavailable".into(),
+                child_conversation_id: Some(22),
+            }))
+            .await;
+        let store = Arc::new(MockTaskStore::accept_any_running_loadable(22));
+        let meta = Arc::new(MockMetaWriter::new());
+        let events = Arc::new(MockEventEmitter::new());
+        let broker = DelegationBroker::with_writers(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            meta.clone() as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+            events.clone()
+                as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>);
+        enable_delegation(&broker).await;
+
+        let report = broker
+            .start_delegation(coordination_request("parent", 11))
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert_eq!(events.started_count().await, 0);
+        // No running meta (status=running) on the parent tool card.
+        let metas = meta.snapshot().await;
+        assert!(
+            metas.iter().all(|m| {
+                m.meta
+                    .get("codeg.delegation")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|s| s.as_str())
+                    != Some("running")
+            }),
+            "must not publish running meta without accepted timestamp"
+        );
+        assert!(
+            spawner
+                .disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "child-conn"),
+            "child teardown must run"
+        );
     }
 
     // -- Task 7: join-only parent-turn ownership + stable cascade codes ----
@@ -6045,7 +6888,7 @@ mod tests {
     async fn parent_cancel_while_child_spawn_is_gated_uses_parent_canceled() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-gate".into())).await;
-        mock.queue_send(Ok(91)).await;
+        mock.queue_send(Ok(accepted(91, Utc::now()))).await;
         let release = mock.install_spawn_gate().await;
         let store = Arc::new(crate::acp::delegation::store::mock::MockTaskStore::accept_any_running(91));
         let broker = DelegationBroker::new(
@@ -6081,7 +6924,7 @@ mod tests {
     async fn clean_end_turn_while_send_is_gated_uses_join_abandoned() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-end".into())).await;
-        mock.queue_send(Ok(92)).await;
+        mock.queue_send(Ok(accepted(92, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -7061,7 +7904,7 @@ mod tests {
         // sticks around even after a generous idle window.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(99)).await;
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -7105,7 +7948,7 @@ mod tests {
         let mock = Arc::new(MockSpawner::new());
         for i in 0..3 {
             mock.queue_spawn(Ok(format!("c{i}"))).await;
-            mock.queue_send(Ok(100 + i)).await;
+            mock.queue_send(Ok(accepted(100 + i, Utc::now()))).await;
         }
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -7143,7 +7986,7 @@ mod tests {
     async fn cancel_by_parent_ignores_other_parents() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(200)).await;
+        mock.queue_send(Ok(accepted(200, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8306,7 +9149,7 @@ mod tests {
     async fn empty_parent_tool_use_id_claims_pending_then_completes() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8348,7 +9191,7 @@ mod tests {
         // pick it up rather than falling back to the synthetic UUID.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-late".into())).await;
-        mock.queue_send(Ok(13)).await;
+        mock.queue_send(Ok(accepted(13, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8394,7 +9237,7 @@ mod tests {
     async fn empty_parent_tool_use_id_with_no_pending_falls_back_to_uuid() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(11)).await;
+        mock.queue_send(Ok(accepted(11, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8567,7 +9410,7 @@ mod tests {
         // awaiting `handle_request` as canceled exactly once.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -8623,7 +9466,7 @@ mod tests {
     async fn depth_limit_allows_root() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let lookup = Arc::new(MockDepth(vec![(1, None)])) as Arc<dyn ConversationDepthLookup>;
         let broker = DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, lookup);
         broker
@@ -8681,7 +9524,7 @@ mod tests {
     async fn meta_writer_records_running_then_completed_on_happy_path() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
@@ -8759,7 +9602,7 @@ mod tests {
     async fn meta_writer_records_failed_on_err_outcome() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-2".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
@@ -8813,7 +9656,7 @@ mod tests {
     async fn child_failure_before_park_resolves_instead_of_hanging() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-fast-fail".into())).await;
-        mock.queue_send(Ok(55)).await;
+        mock.queue_send(Ok(accepted(55, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
@@ -8901,7 +9744,7 @@ mod tests {
     async fn completion_before_park_resolves_instead_of_hanging() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-fast-ok".into())).await;
-        mock.queue_send(Ok(70)).await;
+        mock.queue_send(Ok(accepted(70, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
@@ -8991,7 +9834,7 @@ mod tests {
     async fn normal_completion_leaves_no_reservation_or_buffer() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-clean".into())).await;
-        mock.queue_send(Ok(60)).await;
+        mock.queue_send(Ok(accepted(60, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -9049,7 +9892,7 @@ mod tests {
     async fn parent_cancel_in_spawn_window_disconnects_child_without_sending() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c2".into())).await;
-        mock.queue_send(Ok(99)).await; // staged but must NOT be consumed
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await; // staged but must NOT be consumed
         let release = mock.install_spawn_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9101,7 +9944,7 @@ mod tests {
     async fn parent_cancel_in_reserve_park_window_tears_down_child() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c3".into())).await;
-        mock.queue_send(Ok(33)).await;
+        mock.queue_send(Ok(accepted(33, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
@@ -9175,7 +10018,7 @@ mod tests {
     async fn child_terminal_wins_over_later_parent_cancel() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c4".into())).await;
-        mock.queue_send(Ok(44)).await;
+        mock.queue_send(Ok(accepted(44, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9229,7 +10072,7 @@ mod tests {
     async fn parent_cancel_wins_when_it_arrives_before_child_terminal() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c5".into())).await;
-        mock.queue_send(Ok(55)).await;
+        mock.queue_send(Ok(accepted(55, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9298,7 +10141,7 @@ mod tests {
     async fn child_failure_wins_over_later_parent_cancel() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("cF".into())).await;
-        mock.queue_send(Ok(66)).await;
+        mock.queue_send(Ok(accepted(66, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9358,7 +10201,7 @@ mod tests {
     async fn parent_teardown_in_reserve_park_window_tears_down_child() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c7".into())).await;
-        mock.queue_send(Ok(77)).await;
+        mock.queue_send(Ok(accepted(77, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9394,7 +10237,7 @@ mod tests {
     async fn parent_cancel_for_other_parent_leaves_setup_intact() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c8".into())).await;
-        mock.queue_send(Ok(88)).await;
+        mock.queue_send(Ok(accepted(88, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9453,7 +10296,7 @@ mod tests {
     async fn inflight_drained_on_normal_park() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-ok".into())).await;
-        mock.queue_send(Ok(70)).await;
+        mock.queue_send(Ok(accepted(70, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -9556,7 +10399,7 @@ mod tests {
     async fn meta_writer_records_failed_on_parent_cancel() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-cancel".into())).await;
-        mock.queue_send(Ok(33)).await;
+        mock.queue_send(Ok(accepted(33, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
@@ -9591,7 +10434,7 @@ mod tests {
     async fn meta_writer_skipped_for_synthetic_parent_tool_use_id() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(8)).await;
+        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
@@ -9664,7 +10507,7 @@ mod tests {
     async fn emitter_records_ok_on_complete_call_happy_path() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-1".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9721,7 +10564,7 @@ mod tests {
     async fn emitter_records_started_on_start_delegation_happy_path() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-start".into())).await;
-        mock.queue_send(Ok(55)).await;
+        mock.queue_send(Ok(accepted(55, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9778,7 +10621,7 @@ mod tests {
     async fn emitter_skips_started_for_synthetic_parent_tool_use_id() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth-start".into())).await;
-        mock.queue_send(Ok(9)).await;
+        mock.queue_send(Ok(accepted(9, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9821,7 +10664,7 @@ mod tests {
     async fn emitter_records_err_on_complete_call_err_outcome() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-err".into())).await;
-        mock.queue_send(Ok(11)).await;
+        mock.queue_send(Ok(accepted(11, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9865,7 +10708,7 @@ mod tests {
         // child, and emit DelegationCompleted with error_code = "canceled".
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-h".into())).await;
-        mock.queue_send(Ok(91)).await;
+        mock.queue_send(Ok(accepted(91, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9912,7 +10755,7 @@ mod tests {
         // in-flight call drains itself on its post-registration checkpoint.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-pre".into())).await;
-        mock.queue_send(Ok(13)).await;
+        mock.queue_send(Ok(accepted(13, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -9950,7 +10793,7 @@ mod tests {
     async fn parent_cancel_covers_external_handle_setup_window() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-eh".into())).await;
-        mock.queue_send(Ok(21)).await;
+        mock.queue_send(Ok(accepted(21, Utc::now()))).await;
         let release = mock.install_send_gate().await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -9990,7 +10833,7 @@ mod tests {
     async fn emitter_records_canceled_on_cancel_by_child_connection() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-dropped".into())).await;
-        mock.queue_send(Ok(55)).await;
+        mock.queue_send(Ok(accepted(55, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -10035,7 +10878,7 @@ mod tests {
         // cause (e.g. Gemini OAuth expired) instead of the opaque default.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-auth".into())).await;
-        mock.queue_send(Ok(77)).await;
+        mock.queue_send(Ok(accepted(77, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -10070,7 +10913,7 @@ mod tests {
         // dangling "...:" suffix on the reason — fall back to the default.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-empty".into())).await;
-        mock.queue_send(Ok(78)).await;
+        mock.queue_send(Ok(accepted(78, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
@@ -10102,7 +10945,7 @@ mod tests {
         let mock = Arc::new(MockSpawner::new());
         for i in 0..3 {
             mock.queue_spawn(Ok(format!("c{i}"))).await;
-            mock.queue_send(Ok(100 + i)).await;
+            mock.queue_send(Ok(accepted(100 + i, Utc::now()))).await;
         }
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
@@ -10146,7 +10989,7 @@ mod tests {
     async fn emitter_does_not_double_emit_on_repeat_cancel_by_parent() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-once".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -10173,7 +11016,7 @@ mod tests {
     async fn emitter_skipped_for_synthetic_parent_tool_use_id() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(8)).await;
+        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -10220,7 +11063,7 @@ mod tests {
         // emitter records.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-order".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
@@ -10317,7 +11160,7 @@ mod tests {
         // noop because this test is asserting the event-fanout invariant.
         let mock_spawner = Arc::new(MockSpawner::new());
         mock_spawner.queue_spawn(Ok("child-conn-real".into())).await;
-        mock_spawner.queue_send(Ok(77)).await;
+        mock_spawner.queue_send(Ok(accepted(77, Utc::now()))).await;
         let real_emitter = Arc::new(ConnectionManagerEventEmitter {
             manager: Arc::new(manager.clone_ref()),
         });
@@ -10441,7 +11284,7 @@ mod tests {
         mock_spawner
             .queue_spawn(Ok("child-conn-started".into()))
             .await;
-        mock_spawner.queue_send(Ok(88)).await;
+        mock_spawner.queue_send(Ok(accepted(88, Utc::now()))).await;
         let real_emitter = Arc::new(ConnectionManagerEventEmitter {
             manager: Arc::new(manager.clone_ref()),
         });
@@ -10518,7 +11361,7 @@ mod tests {
         });
         let mock_spawner = Arc::new(MockSpawner::new());
         mock_spawner.queue_spawn(Ok("c-orphan".into())).await;
-        mock_spawner.queue_send(Ok(1)).await;
+        mock_spawner.queue_send(Ok(accepted(1, Utc::now()))).await;
         let broker = DelegationBroker::with_writers(
             mock_spawner.clone() as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
@@ -10802,7 +11645,7 @@ mod tests {
     async fn accepted_running_task_fixture() -> AcceptedFixture {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let broker = broker_with_store(spawner.clone(), store);
         enable_delegation(&broker).await;
@@ -10840,6 +11683,10 @@ mod tests {
                             agent_type: AgentType::ClaudeCode,
                             external_handle: None,
                             started_at: Instant::now(),
+                            runtime: Arc::new(LiveRuntimeState::new(
+                                Utc::now(),
+                                PathBuf::new(),
+                            )),
                         },
                     );
                 }
@@ -10998,7 +11845,7 @@ mod tests {
         // Spawn succeeds but send is gated: no running ack until enqueue returns.
         spawner.queue_spawn(Ok("child-conn".into())).await;
         let send_gate = spawner.install_send_gate().await;
-        spawner.queue_send(Ok(7)).await;
+        spawner.queue_send(Ok(accepted(7, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(7));
         let broker = broker_with_store(spawner.clone(), store);
         enable_delegation(&broker).await;
@@ -11021,7 +11868,7 @@ mod tests {
     async fn cache_eviction_retains_status_error_truth_from_store() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(99)).await;
+        spawner.queue_send(Ok(accepted(99, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(99));
         let broker = broker_with_store(spawner, store.clone());
         enable_delegation(&broker).await;
@@ -11081,7 +11928,7 @@ mod tests {
         use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let events = Arc::new(MockEventEmitter::default());
         let broker = DelegationBroker::with_writers(
@@ -11118,7 +11965,7 @@ mod tests {
         use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let events = Arc::new(MockEventEmitter::default());
         let broker = DelegationBroker::with_writers(
@@ -11183,7 +12030,7 @@ mod tests {
         use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let events = Arc::new(MockEventEmitter::default());
         let broker = DelegationBroker::with_writers(
@@ -11213,7 +12060,7 @@ mod tests {
     async fn mid_settle_status_and_waits_remain_running_until_terminal() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -11293,7 +12140,7 @@ mod tests {
     async fn running_task_child_ids_includes_settling_until_completed() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
-        spawner.queue_send(Ok(42)).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -11637,7 +12484,7 @@ mod tests {
         for (i, label) in labels.iter().enumerate() {
             let child = format!("child-{label}");
             mock.queue_spawn(Ok(child)).await;
-            mock.queue_send(Ok((i + 1) as i32)).await;
+            mock.queue_send(Ok(accepted((i + 1) as i32, Utc::now()))).await;
             let task_id = broker
                 .start_delegation(request(1, &format!("pt-{label}")))
                 .await
@@ -11807,7 +12654,7 @@ mod tests {
 
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-obs".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let events = Arc::new(MockEventEmitter::new());
         let broker = Arc::new(DelegationBroker::with_writers(
             mock as Arc<dyn ConnectionSpawner>,

@@ -24,6 +24,27 @@ use crate::acp::delegation::transport::CancelDelegationReason;
 use crate::acp::delegation::types::{TaskObservation, TaskStatus};
 use crate::models::AgentType;
 
+// ── Runtime projection diagnostics (Task 8; Task 11 adds counters) ─────────
+
+/// Stable diagnostic kind for runtime projection failures.
+/// Task 11 adds a counter without changing Task 8 call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProjectionErrorKind {
+    Event,
+    Persistence,
+    TerminalPersistence,
+}
+
+impl RuntimeProjectionErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Persistence => "persistence",
+            Self::TerminalPersistence => "terminal_persistence",
+        }
+    }
+}
+
 // ── Wait labels ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

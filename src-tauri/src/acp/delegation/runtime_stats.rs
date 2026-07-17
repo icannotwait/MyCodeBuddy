@@ -249,6 +249,18 @@ impl RuntimeStatsProjector {
         true
     }
 
+    /// Replace the provisional wall-clock start with the durable accepted
+    /// `delegation_started_at`. Does not change counts; must run before the
+    /// active card exists / start publication.
+    pub fn rebase_started_at(&mut self, started_at: DateTime<Utc>) -> bool {
+        debug_assert!(self.stats.finished_at.is_none());
+        if self.stats.started_at == started_at {
+            return false;
+        }
+        self.stats.started_at = started_at;
+        true
+    }
+
     pub fn snapshot(&self) -> DelegationRuntimeStats {
         self.stats.clone()
     }
@@ -1788,5 +1800,27 @@ mod tests {
         let file = &projector.snapshot().touched_files[0];
         assert!(file.outside_workspace);
         assert!(file.path.replace('\\', "/").ends_with("/repo/shared/a.rs"));
+    }
+
+    #[test]
+    fn empty_tool_id_does_not_change_projection() {
+        let mut projector = RuntimeStatsProjector::new(Utc::now(), PathBuf::from("/repo"));
+        assert!(!projector.apply(&tool_call("", "read", "Read", None, None)));
+        let stats = projector.snapshot();
+        assert_eq!(stats.tool_call_count, 0);
+        assert_eq!(stats.edit_tool_call_count, 0);
+    }
+
+    #[test]
+    fn rebase_started_at_replaces_provisional_without_changing_counts() {
+        let provisional = Utc.with_ymd_and_hms(2026, 7, 17, 9, 0, 0).unwrap();
+        let durable = Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap();
+        let mut projector = RuntimeStatsProjector::new(provisional, PathBuf::from("/repo"));
+        assert!(projector.apply(&tool_call("tc-1", "read", "Read", None, None)));
+        assert!(projector.rebase_started_at(durable));
+        assert!(!projector.rebase_started_at(durable));
+        let stats = projector.snapshot();
+        assert_eq!(stats.started_at, durable);
+        assert_eq!(stats.tool_call_count, 1);
     }
 }

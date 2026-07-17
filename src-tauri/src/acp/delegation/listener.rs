@@ -1002,7 +1002,10 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
-    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
+    use crate::acp::delegation::spawner::{
+        accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
+    };
+    use chrono::Utc;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use serde_json::json;
     use std::time::Duration;
@@ -1318,7 +1321,7 @@ mod tests {
     async fn happy_path_ack_then_status_collects_result() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -1390,7 +1393,7 @@ mod tests {
     async fn running_task_fixture() -> (Arc<DelegationBroker>, Arc<TokenRegistry>, String) {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -1562,9 +1565,9 @@ mod tests {
     async fn batch_status_over_listener_multi_id() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Ok(1)).await;
+        mock.queue_send(Ok(accepted(1, Utc::now()))).await;
         mock.queue_spawn(Ok("child-2".into())).await;
-        mock.queue_send(Ok(2)).await;
+        mock.queue_send(Ok(accepted(2, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -1668,7 +1671,7 @@ mod tests {
     async fn cancel_task_by_id_over_listener() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -1714,7 +1717,7 @@ mod tests {
     async fn cancel_task_timeout_reason_returns_guidance_without_canceling() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -1893,7 +1896,7 @@ mod tests {
     async fn cancel_message_routed_to_broker() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-cancel".into())).await;
-        mock.queue_send(Ok(99)).await;
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
@@ -2848,7 +2851,7 @@ mod tests {
     ) {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(22)).await;
+        mock.queue_send(Ok(accepted(22, Utc::now()))).await;
         let task_store = Arc::new(MockTaskStore::accept_any_running(22));
         let attention = Arc::new(MemoryDelegationAttentionStore::new());
         let broker = Arc::new(
@@ -3246,9 +3249,9 @@ mod tests {
     async fn nested_child_can_request_from_parent_and_reply_to_grandchild() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(2)).await;
+        mock.queue_send(Ok(accepted(2, Utc::now()))).await;
         mock.queue_spawn(Ok("grand-conn".into())).await;
-        mock.queue_send(Ok(3)).await;
+        mock.queue_send(Ok(accepted(3, Utc::now()))).await;
         let task_store = Arc::new(MockTaskStore::accept_any_running(2));
         let attention = Arc::new(MemoryDelegationAttentionStore::new());
         let broker = Arc::new(

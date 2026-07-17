@@ -1655,6 +1655,14 @@ pub fn lifecycle_subscriber_task(
                             envelope_arc.event.as_ref(),
                         )
                         .await;
+                        // Child runtime projection beside ToolCall correlation —
+                        // independent of the DB-coupled worker mailbox so
+                        // ToolCall/ToolCallUpdate never need the worker path.
+                        b.project_child_tool_event(
+                            &envelope_arc.connection_id,
+                            &envelope_arc.payload,
+                        )
+                        .await;
                     }
 
                     // Fast-path filter: skip events the worker would no-op.
@@ -3130,7 +3138,8 @@ mod tests {
     // broker chain is exercised the same way it runs in production.
 
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
-    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+    use crate::acp::delegation::spawner::{accepted, mock::MockSpawner, ConnectionSpawner};
+    use chrono::Utc;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationRequest};
     use async_trait::async_trait;
 
@@ -3169,7 +3178,7 @@ mod tests {
     ) {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok(child_conn_id.to_string())).await;
-        mock.queue_send(Ok(child_conv_id)).await;
+        mock.queue_send(Ok(accepted(child_conv_id, Utc::now()))).await;
         let broker = Arc::new(DelegationBroker::new(
             mock as Arc<dyn ConnectionSpawner>,
             Arc::new(NoopDepthLookup) as Arc<dyn ConversationDepthLookup>,
