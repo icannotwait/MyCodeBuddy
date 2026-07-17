@@ -333,11 +333,38 @@ impl RuntimeStatsProjector {
         self.subtract_contribution(&previous);
 
         let state = self.calls.get(&id).cloned().unwrap_or_default();
-        let next = self.compute_contribution(&state);
+        let next = self.admit_paths(self.compute_contribution(&state));
         self.add_contribution(&next);
         self.contributions.insert(id, next);
         self.rebuild_public_fields();
         self.stats != before
+    }
+
+    /// Admit retained paths into the bounded first-200 history before storage.
+    ///
+    /// Keys already present in history are kept. New keys are admitted only
+    /// while history has fewer than [`MAX_TOUCHED_FILES`] entries. All other
+    /// new keys set sticky overflow and are dropped from the stored
+    /// contribution (and therefore from ref-counts and per-path maps). Call-
+    /// level edit/line counters are left intact.
+    fn admit_paths(&mut self, mut contrib: ToolContribution) -> ToolContribution {
+        let mut kept = Vec::with_capacity(contrib.retained_paths.len());
+        for path in contrib.retained_paths.drain(..) {
+            if self.retained_path_first_display.contains_key(&path.key) {
+                kept.push(path);
+                continue;
+            }
+            if self.retained_path_order.len() < MAX_TOUCHED_FILES {
+                self.retained_path_order.push(path.key.clone());
+                self.retained_path_first_display
+                    .insert(path.key.clone(), path.display.clone());
+                kept.push(path);
+                continue;
+            }
+            self.overflow_seen = true;
+        }
+        contrib.retained_paths = kept;
+        contrib
     }
 
     fn subtract_contribution(&mut self, contrib: &ToolContribution) {
@@ -424,21 +451,14 @@ impl RuntimeStatsProjector {
                 }
             }
         }
+        // Paths in `contrib.retained_paths` were already admitted (or were
+        // already in the first-200 history). Never grow history here.
         for path in &contrib.retained_paths {
             let entry = self
                 .retained_path_ref_counts
                 .entry(path.key.clone())
                 .or_insert(0);
             *entry = entry.saturating_add(1);
-            if !self.retained_path_first_display.contains_key(&path.key) {
-                if self.retained_path_order.len() < MAX_TOUCHED_FILES {
-                    self.retained_path_order.push(path.key.clone());
-                    self.retained_path_first_display
-                        .insert(path.key.clone(), path.display.clone());
-                } else {
-                    self.overflow_seen = true;
-                }
-            }
             if path.textual_edit {
                 match (path.additions, path.deletions) {
                     (Some(add), Some(del)) => {
@@ -1693,6 +1713,85 @@ mod tests {
         assert_eq!(stats.touched_files.len(), MAX_TOUCHED_FILES);
         assert!(stats.touched_files_truncated);
         assert_eq!(stats.touched_files[0].path, "A.rs");
+        assert_eq!(projector.retained_path_order.len(), MAX_TOUCHED_FILES);
+        assert_eq!(
+            projector.retained_path_first_display.len(),
+            MAX_TOUCHED_FILES
+        );
+        assert!(projector.retained_path_ref_counts.len() <= MAX_TOUCHED_FILES);
+        assert!(projector.retained_path_additions.len() <= MAX_TOUCHED_FILES);
+        assert!(projector.retained_path_deletions.len() <= MAX_TOUCHED_FILES);
+        assert!(
+            projector.retained_path_textual_with_counts.len() <= MAX_TOUCHED_FILES
+        );
+        assert!(
+            projector.retained_path_textual_without_counts.len() <= MAX_TOUCHED_FILES
+        );
+        assert_eq!(
+            projector
+                .contributions
+                .values()
+                .map(|contribution| contribution.retained_paths.len())
+                .sum::<usize>(),
+            MAX_TOUCHED_FILES
+        );
+    }
+
+    #[test]
+    fn overflow_only_edit_keeps_call_counts_without_retaining_path() {
+        let mut projector = RuntimeStatsProjector::new_for_test(
+            Utc::now(),
+            PathBuf::from("/repo"),
+            true,
+        );
+        for i in 0..MAX_TOUCHED_FILES {
+            projector.apply(&structured_patch(
+                &format!("tc-{i}"),
+                &format!("/repo/file-{i}.rs"),
+                " a\n+b",
+            ));
+        }
+        assert!(projector.apply(&structured_patch(
+            "overflow-edit",
+            "/repo/overflow.rs",
+            " a\n+b",
+        )));
+        let stats = projector.snapshot();
+        assert!(stats.touched_files_truncated);
+        assert_eq!(stats.touched_files.len(), MAX_TOUCHED_FILES);
+        assert!(!stats
+            .touched_files
+            .iter()
+            .any(|file| file.path.contains("overflow")));
+        assert_eq!(
+            stats.edit_tool_call_count,
+            (MAX_TOUCHED_FILES as u64).saturating_add(1)
+        );
+        assert_eq!(
+            (stats.additions, stats.deletions),
+            (
+                Some((MAX_TOUCHED_FILES as u64).saturating_add(1)),
+                Some(0)
+            )
+        );
+        assert!(stats.line_counts_complete);
+        assert_eq!(projector.retained_path_order.len(), MAX_TOUCHED_FILES);
+        assert_eq!(projector.retained_path_ref_counts.len(), MAX_TOUCHED_FILES);
+        assert!(!projector
+            .retained_path_first_display
+            .keys()
+            .any(|key| key.contains("overflow")));
+        assert!(!projector
+            .retained_path_ref_counts
+            .keys()
+            .any(|key| key.contains("overflow")));
+        let overflow = projector
+            .contributions
+            .get("overflow-edit")
+            .expect("overflow contribution stored");
+        assert!(overflow.edit);
+        assert_eq!((overflow.additions, overflow.deletions), (Some(1), Some(0)));
+        assert!(overflow.retained_paths.is_empty());
     }
 
     #[test]
