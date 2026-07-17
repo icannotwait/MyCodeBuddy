@@ -676,6 +676,27 @@ pub mod mock {
             // loads child_conversation_id from the task store instead.
         }
 
+        /// Test helper: any attention row for `task_id` (open or resolved).
+        pub async fn record_for_task(&self, task_id: &str) -> Option<AttentionRecord> {
+            self.inner
+                .lock()
+                .await
+                .values()
+                .find(|r| r.summary.task_id == task_id)
+                .cloned()
+        }
+
+        /// Test helper: 1 when a request has a durable resolution, else 0.
+        /// Memory store CAS guarantees at most one winner per request id.
+        pub async fn resolution_winner_count(&self, request_id: &str) -> usize {
+            self.inner
+                .lock()
+                .await
+                .get(request_id)
+                .map(|r| if r.resolution_code.is_some() { 1 } else { 0 })
+                .unwrap_or(0)
+        }
+
         fn find_by_task_and_tool_locked(
             rows: &HashMap<String, AttentionRecord>,
             task_id: &str,

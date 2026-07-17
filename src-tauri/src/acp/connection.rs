@@ -4758,6 +4758,21 @@ fn stop_reason_to_str(reason: StopReason) -> &'static str {
     }
 }
 
+/// Map a parent turn's stop-reason string onto the join-only ownership cascade
+/// reason. Clean `end_turn` still drains live Codeg children as
+/// [`ParentTurnEndReason::JoinAbandoned`] (no-op when none remain).
+fn parent_turn_end_reason(stop_reason: &str) -> crate::acp::delegation::types::ParentTurnEndReason {
+    use crate::acp::delegation::types::ParentTurnEndReason;
+    match stop_reason {
+        "cancelled" => ParentTurnEndReason::ParentCanceled,
+        "end_turn" => ParentTurnEndReason::JoinAbandoned,
+        "refusal" | "max_tokens" | "max_turn_requests" | "empty" | "unknown" => {
+            ParentTurnEndReason::ParentTurnFailed
+        }
+        _ => ParentTurnEndReason::ParentTurnFailed,
+    }
+}
+
 /// Classify a `session/load` failure into a stable frontend `code` when the
 /// historical session cannot be restored — either the agent has no record of
 /// it (`ResourceNotFound`, -32002) or the agent process/session died mid-load.
@@ -5206,36 +5221,36 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
-                                    // Cascade-cancel any pending delegations
-                                    // whenever the parent's turn ended for a
-                                    // reason other than clean `end_turn`. The
-                                    // `end_turn` path lets the legitimate
-                                    // delegation completion drain naturally;
-                                    // every other reason (cancelled / refusal /
-                                    // max_tokens / max_turn_requests / empty /
-                                    // unknown) means the parent will never
-                                    // consume the in-flight result, so the
-                                    // child must be torn down. The connection
+                                    // Join-only ownership: every parent stop
+                                    // reason (including clean `end_turn`) drains
+                                    // live Codeg descendants under a stable root
+                                    // code. `end_turn` → JoinAbandoned (no-op when
+                                    // no live children remain); cancelled →
+                                    // ParentCanceled; refusal/max_tokens/empty/
+                                    // unknown → ParentTurnFailed. The connection
                                     // stays alive (only the turn ended), so use
                                     // the turn-scoped cancel that keeps the
                                     // parent's `consumed` tool_call memory — a
                                     // late re-emit must not re-register and
                                     // mis-bind the next same-key delegation.
                                     //
-                                    // Await inline: the fast tracker +
-                                    // parked-call drain MUST finish before the
-                                    // loop accepts the next prompt so it stays
-                                    // scoped to the just-ended turn. The broker
-                                    // backgrounds the slow child teardown
+                                    // Await inline: the fast tracker + tree
+                                    // drain MUST finish before the loop accepts
+                                    // the next prompt so it stays scoped to the
+                                    // just-ended turn. The broker backgrounds
+                                    // the slow child teardown
                                     // (spawner.cancel/disconnect) internally, so
                                     // this won't block on slow agents; its
                                     // idempotent drain also lets the cleanup-
                                     // guard cascade at run_connection exit run
                                     // without race-double-drain.
-                                    if reason_str != "end_turn" {
-                                        if let Some(inj) = delegation_injection {
-                                            inj.broker.cancel_by_parent_turn(conn_id).await;
-                                        }
+                                    if let Some(inj) = delegation_injection {
+                                        inj.broker
+                                            .cancel_by_parent_turn(
+                                                conn_id,
+                                                parent_turn_end_reason(reason_str),
+                                            )
+                                            .await;
                                     }
                                     break;
                                 }
@@ -5284,18 +5299,20 @@ async fn run_conversation_loop<'a>(
                             )
                             .await;
                             // Mirror the StopReason-message branch above:
-                            // cascade-cancel on any non-`end_turn` reason
-                            // so in-flight delegations don't dangle when
-                            // the parent's turn ended without consuming
-                            // their result. Turn-scoped (connection stays
-                            // alive → keep `consumed`) and awaited inline
-                            // (fast drain before the next prompt; broker
-                            // backgrounds the slow child teardown) for the
-                            // same reasons as that branch — see above.
-                            if reason_str != "end_turn" {
-                                if let Some(inj) = delegation_injection {
-                                    inj.broker.cancel_by_parent_turn(conn_id).await;
-                                }
+                            // join-only ownership drains live Codeg children
+                            // on every stop reason (including clean end_turn).
+                            // Turn-scoped (connection stays alive → keep
+                            // `consumed`) and awaited inline (fast drain before
+                            // the next prompt; broker backgrounds the slow
+                            // child teardown) for the same reasons as that
+                            // branch — see above.
+                            if let Some(inj) = delegation_injection {
+                                inj.broker
+                                    .cancel_by_parent_turn(
+                                        conn_id,
+                                        parent_turn_end_reason(reason_str),
+                                    )
+                                    .await;
                             }
                             break;
                         }
@@ -5481,7 +5498,12 @@ async fn run_conversation_loop<'a>(
                                     // drain-first lock guarantees no double
                                     // DelegationCompleted emit.
                                     if let Some(inj) = delegation_injection {
-                                        inj.broker.cancel_by_parent_turn(conn_id).await;
+                                        inj.broker
+                                            .cancel_by_parent_turn(
+                                                conn_id,
+                                                crate::acp::delegation::types::ParentTurnEndReason::ParentCanceled,
+                                            )
+                                            .await;
                                     }
                                     // Drain the prompt response in the background so
                                     // the SACP library doesn't log "receiver dropped"
@@ -5631,7 +5653,12 @@ async fn run_conversation_loop<'a>(
                 // backgrounds the slow child teardown): see inner Cancel
                 // handler above for rationale.
                 if let Some(inj) = delegation_injection {
-                    inj.broker.cancel_by_parent_turn(conn_id).await;
+                    inj.broker
+                        .cancel_by_parent_turn(
+                            conn_id,
+                            crate::acp::delegation::types::ParentTurnEndReason::ParentCanceled,
+                        )
+                        .await;
                 }
             }
             Some(ConnectionCommand::Fork { reply }) => {
@@ -6979,6 +7006,33 @@ mod tests {
         assert!(!advances_agent_activity(&available_commands_update()));
         assert!(!advances_agent_activity(&usage_update()));
         assert!(!advances_agent_activity(&user_message_update("keepalive")));
+    }
+
+    #[test]
+    fn parent_turn_end_reason_maps_stop_strings() {
+        use crate::acp::delegation::types::ParentTurnEndReason;
+        assert_eq!(
+            parent_turn_end_reason("cancelled"),
+            ParentTurnEndReason::ParentCanceled
+        );
+        assert_eq!(
+            parent_turn_end_reason("end_turn"),
+            ParentTurnEndReason::JoinAbandoned
+        );
+        for failure in [
+            "refusal",
+            "max_tokens",
+            "max_turn_requests",
+            "empty",
+            "unknown",
+            "something_new",
+        ] {
+            assert_eq!(
+                parent_turn_end_reason(failure),
+                ParentTurnEndReason::ParentTurnFailed,
+                "stop_reason={failure}"
+            );
+        }
     }
 
     fn diff_content(path: &str, old: Option<&str>, new: &str) -> ToolCallContent {

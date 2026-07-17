@@ -46,8 +46,9 @@
 //! Cancellation cascade: when a parent session goes away (user-initiated
 //! cancel, parent disconnect), the lifecycle subscriber calls
 //! [`DelegationBroker::cancel_by_parent`] which fans out cancel + disconnect
-//! to every running child of that parent. A normal `end_turn` does NOT cancel
-//! children — they keep running in the background (the whole point of async).
+//! to every live descendant under a stable root reason. A clean `end_turn`
+//! also joins ownership via [`DelegationBroker::cancel_by_parent_turn`] with
+//! [`ParentTurnEndReason::JoinAbandoned`] (no-op when no live Codeg children).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,7 +77,8 @@ use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
     DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
-    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, TaskObservation, TaskStatus,
+    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
+    TaskObservation, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::db::entities::conversation::ConversationStatus;
@@ -357,15 +359,24 @@ struct PendingInner {
     coordination_by_child: HashMap<String, CoordinationIdentity>,
 }
 
+/// Parent-end marker stamped onto an in-flight setup (first-write-wins).
+#[derive(Debug, Clone, Copy)]
+struct InflightParentEnd {
+    stamp: u64,
+    reason: ParentTurnEndReason,
+}
+
 /// One in-flight `handle_request` setup tracked for parent-cancel coverage.
 struct InflightSetup {
     parent_connection_id: String,
-    /// `Some(stamp)` once a parent cancel lands while this delegation is
-    /// mid-setup (spawned / sending, not yet parked), where `stamp` is the `seq`
-    /// arrival-clock value at that moment. First-write-wins and never cleared,
-    /// so a cancel can't be lost between `handle_request`'s checkpoints, and its
-    /// stamp lets the park order it against a racing child terminal.
-    canceled_at: Option<u64>,
+    /// `Some(end)` once a parent turn/connection end lands while this
+    /// delegation is mid-setup (spawned / sending, not yet parked). `stamp` is
+    /// the `seq` arrival-clock value; `reason` is the stable root cause.
+    /// First-write-wins and never cleared, so a cancel can't be lost between
+    /// checkpoints, and its stamp lets the park order it against a racing child
+    /// terminal without collapsing distinct parent-end codes to generic
+    /// `"canceled"`.
+    parent_end: Option<InflightParentEnd>,
 }
 
 /// Live parent/child coordination edge for attention (parent-decision) waits.
@@ -549,7 +560,7 @@ impl PendingInner {
             id,
             InflightSetup {
                 parent_connection_id: parent_connection_id.to_string(),
-                canceled_at: None,
+                parent_end: None,
             },
         );
         id
@@ -560,36 +571,31 @@ impl PendingInner {
         self.inflight.remove(&id);
     }
 
-    /// Whether a parent cancel flagged this in-flight setup. False once the
-    /// record is gone (already parked / deregistered). Used by the pre-spawn /
-    /// post-spawn checkpoints, which only need the boolean.
-    fn inflight_canceled(&self, id: u64) -> bool {
-        self.inflight
-            .get(&id)
-            .map(|s| s.canceled_at.is_some())
-            .unwrap_or(false)
+    /// Parent-end marker (stamp + reason) for this in-flight setup, if any
+    /// (`None` when not canceled, or the record is already gone). Used at park
+    /// to order the parent end against a buffered child terminal and to settle
+    /// with the stable root code.
+    fn inflight_parent_end(&self, id: u64) -> Option<InflightParentEnd> {
+        self.inflight.get(&id).and_then(|s| s.parent_end)
     }
 
-    /// Arrival stamp of the parent cancel that flagged this in-flight setup, if
-    /// any (`None` when not canceled, or the record is already gone). Used at
-    /// park to order the cancel against a buffered child terminal.
-    fn inflight_canceled_at(&self, id: u64) -> Option<u64> {
-        self.inflight.get(&id).and_then(|s| s.canceled_at)
-    }
-
-    /// Flag every in-flight setup owned by `parent_connection_id` as canceled,
-    /// stamping each with one shared arrival-clock value (this cancel is a
-    /// single event). First-write-wins per setup, so a later cancel can't push
-    /// an earlier one's stamp forward. Called from `drain_for_parent_cancel` in
+    /// Flag every in-flight setup owned by `parent_connection_id` as ended,
+    /// stamping each with one shared arrival-clock value and `reason` (this end
+    /// is a single event). First-write-wins per setup, so a later end can't push
+    /// an earlier one's stamp/reason forward. Called from `drain_parent_tree` in
     /// the SAME lock acquisition that drains the parked `calls`, so each of the
     /// parent's delegations is caught either here (still in-flight → flagged;
     /// `handle_request` tears its child down at the next checkpoint) or by the
     /// parked-call drain (already parked) — never neither.
-    fn mark_inflight_canceled_for_parent(&mut self, parent_connection_id: &str) {
+    fn mark_inflight_canceled_for_parent(
+        &mut self,
+        parent_connection_id: &str,
+        reason: ParentTurnEndReason,
+    ) {
         let stamp = self.tick();
         for setup in self.inflight.values_mut() {
-            if setup.parent_connection_id == parent_connection_id && setup.canceled_at.is_none() {
-                setup.canceled_at = Some(stamp);
+            if setup.parent_connection_id == parent_connection_id && setup.parent_end.is_none() {
+                setup.parent_end = Some(InflightParentEnd { stamp, reason });
             }
         }
     }
@@ -767,6 +773,10 @@ struct SettleContext {
     disconnect_on_loss: bool,
     /// Optional message override (e.g. cancel reason text).
     message: Option<String>,
+    /// Attention resolution applied when this settle wins the durable CAS.
+    /// Normal completion/failure/explicit cancel use [`AttentionResolutionCode::TaskTerminal`];
+    /// parent-tree teardown uses the mapped parent-end code.
+    attention_resolution: AttentionResolutionCode,
 }
 
 /// Observability context for the process-local persistence retry worker.
@@ -792,7 +802,31 @@ impl SettleContext {
             cancel_turn,
             disconnect_on_loss: true,
             message: None,
+            attention_resolution: AttentionResolutionCode::TaskTerminal,
         }
+    }
+}
+
+/// Setup-window terminal report for a parent turn/connection end (no durable
+/// row yet when `task_id` is absent). Uses stable parent-end codes — never
+/// generic `"canceled"`.
+fn parent_end_setup_report(
+    agent_type: AgentType,
+    reason: ParentTurnEndReason,
+    child_conversation_id: Option<i32>,
+) -> DelegationTaskReport {
+    DelegationTaskReport {
+        task_id: None,
+        status: TaskStatus::Canceled,
+        child_conversation_id,
+        agent_type: Some(agent_type),
+        text: None,
+        error_code: Some(reason.error_code().to_string()),
+        message: Some(reason.message().to_string()),
+        duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -2613,17 +2647,16 @@ impl DelegationBroker {
             .unwrap_or_default()
     }
 
-    /// If this in-flight setup has been flagged canceled by a parent cancel,
-    /// deregister it and return true. One lock acquisition; used at the
+    /// If this in-flight setup has been flagged by a parent end, deregister it
+    /// and return the stable root reason. One lock acquisition; used at the
     /// pre-spawn / post-spawn checkpoints in `handle_request`.
-    async fn take_inflight_cancel(&self, inflight_id: u64) -> bool {
+    async fn take_inflight_cancel(&self, inflight_id: u64) -> Option<ParentTurnEndReason> {
         let mut inner = self.pending.inner.lock().await;
-        if inner.inflight_canceled(inflight_id) {
+        let reason = inner.inflight_parent_end(inflight_id).map(|end| end.reason);
+        if reason.is_some() {
             inner.deregister_inflight(inflight_id);
-            true
-        } else {
-            false
         }
+        reason
     }
 
     /// Drop this setup's in-flight record. Called on each `handle_request`
@@ -2922,17 +2955,11 @@ impl DelegationBroker {
                     .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
                     .unwrap_or((None, BTreeMap::new()))
             };
-        // Checkpoint #1 (opportunistic): if a parent cancel already landed
+        // Checkpoint #1 (opportunistic): if a parent end already landed
         // during the claim/depth phase, bail before spawning a child the parent
         // has abandoned. No child exists yet, so there's nothing to tear down.
-        if self.take_inflight_cancel(inflight_id).await {
-            return report_err(
-                req.agent_type,
-                DelegationError::Canceled {
-                    reason: "parent canceled".into(),
-                },
-                None,
-            );
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(req.agent_type, reason, None);
         }
         let child_connection_id = match self
             .spawner
@@ -2956,20 +2983,14 @@ impl DelegationBroker {
             }
         };
 
-        // Checkpoint #2: a parent cancel that landed during spawn() — the child
+        // Checkpoint #2: a parent end that landed during spawn() — the child
         // now exists but no prompt has been sent, so disconnect it (mirroring
         // the send-failure path's disconnect-only teardown) and bail. This is
         // the primary guard for the spawn window, which can block while the
         // agent process starts up.
-        if self.take_inflight_cancel(inflight_id).await {
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
             let _ = self.spawner.disconnect(&child_connection_id).await;
-            return report_err(
-                req.agent_type,
-                DelegationError::Canceled {
-                    reason: "parent canceled".into(),
-                },
-                None,
-            );
+            return parent_end_setup_report(req.agent_type, reason, None);
         }
 
         // --- Send linked prompt ------------------------------------------------
@@ -3072,6 +3093,7 @@ impl DelegationBroker {
                         cancel_turn: false,
                         disconnect_on_loss: true,
                         message: Some(message.clone()),
+                        attention_resolution: AttentionResolutionCode::TaskTerminal,
                     };
                     let mut report = self.settle_task(&call_id, terminal, None, ctx).await;
                     if report.error_code.is_none() {
@@ -3156,7 +3178,7 @@ impl DelegationBroker {
         // resolver to grab) rules out a double-finalize.
         enum Disposition {
             ChildTerminal(DelegationOutcome),
-            ParentCanceled,
+            ParentEnded(ParentTurnEndReason),
             Running,
         }
         // Near-zero elapsed for these setup-window races, but measured for
@@ -3181,19 +3203,19 @@ impl DelegationBroker {
                             )
                         })
                 };
-            let parent_canceled_at = inner.inflight_canceled_at(inflight_id);
+            let parent_end = inner.inflight_parent_end(inflight_id);
             inner.unreserve(&call_id, &child_connection_id);
             // Terminal dispositions settle via the durable store AFTER this lock
             // is released (settle_task owns cache/meta/event/teardown). The
             // `Running` arm inserts the live task instead of parking a oneshot.
-            match (child_terminal, parent_canceled_at) {
+            match (child_terminal, parent_end) {
                 // Both raced in the setup window: the earlier arrival stamp wins.
-                (Some((child_stamp, outcome)), Some(cancel_stamp)) => {
+                (Some((child_stamp, outcome)), Some(end)) => {
                     inner.deregister_inflight(inflight_id);
-                    if child_stamp < cancel_stamp {
+                    if child_stamp < end.stamp {
                         Disposition::ChildTerminal(outcome)
                     } else {
-                        Disposition::ParentCanceled
+                        Disposition::ParentEnded(end.reason)
                     }
                 }
                 // Only a child terminal fired.
@@ -3201,10 +3223,10 @@ impl DelegationBroker {
                     inner.deregister_inflight(inflight_id);
                     Disposition::ChildTerminal(outcome)
                 }
-                // Only a parent cancel fired.
-                (None, Some(_)) => {
+                // Only a parent end fired.
+                (None, Some(end)) => {
                     inner.deregister_inflight(inflight_id);
-                    Disposition::ParentCanceled
+                    Disposition::ParentEnded(end.reason)
                 }
                 // Nothing beat us — register the running task for a future
                 // resolver, deregistering the in-flight record adjacent to the
@@ -3247,17 +3269,22 @@ impl DelegationBroker {
                     cancel_turn: false,
                     disconnect_on_loss: true,
                     message: None,
+                    attention_resolution: AttentionResolutionCode::TaskTerminal,
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
                 return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
-            // A parent cancel reached this delegation mid-setup — after the
-            // prompt was sent, before we registered.
-            Disposition::ParentCanceled => {
-                let outcome = canceled_outcome(child_conversation_id, "parent canceled");
-                let (terminal, result_text) = terminal_from_outcome(&outcome);
-                let mut ctx = SettleContext {
+            // A parent end reached this delegation mid-setup — after the
+            // prompt was sent, before we registered. Preserve the stable root
+            // code (do not collapse via DelegationError::Canceled).
+            Disposition::ParentEnded(reason) => {
+                let terminal = TerminalTaskWrite::canceled(
+                    reason.error_code(),
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                );
+                let ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
                     child_connection_id: child_connection_id.clone(),
@@ -3266,11 +3293,10 @@ impl DelegationBroker {
                     duration_ms: setup_duration_ms,
                     cancel_turn: true,
                     disconnect_on_loss: true,
-                    message: None,
+                    message: Some(reason.message().to_string()),
+                    attention_resolution: reason.attention_code(),
                 };
-                let (_, _, _, message) = terminal_fields(&outcome);
-                ctx.message = message;
-                return self.settle_task(&call_id, terminal, result_text, ctx).await;
+                return self.settle_task(&call_id, terminal, None, ctx).await;
             }
             // Registered in `running` — fall through to the second pre-cancel
             // check, then return the ack.
@@ -3309,6 +3335,7 @@ impl DelegationBroker {
                         cancel_turn: true,
                         disconnect_on_loss: true,
                         message: None,
+                        attention_resolution: AttentionResolutionCode::TaskTerminal,
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
@@ -3374,7 +3401,7 @@ impl DelegationBroker {
                 // winning task CAS.
                 if won {
                     let _ = self
-                        .close_task_attention(task_id, AttentionResolutionCode::TaskTerminal)
+                        .close_task_attention(task_id, ctx.attention_resolution)
                         .await;
                     {
                         let mut inner = self.pending.inner.lock().await;
@@ -3881,25 +3908,34 @@ impl DelegationBroker {
         self.settle_drained_canceled(drained, &reason, false).await;
     }
 
-    /// Cascade-cancel every pending delegation owned by `parent_connection_id`
-    /// when the parent **connection tears down** (disconnect / `run_connection`
-    /// exit). Drops the parent's entire tool_call tracker bucket (`pending` +
-    /// `consumed`) since the connection is going away. Runs fully inline — the
+    /// Cascade-cancel every live descendant under `parent_connection_id` when
+    /// the parent **connection tears down** (disconnect / `run_connection`
+    /// exit). Uses [`ParentTurnEndReason::ParentDisconnected`]. Drops each
+    /// visited connection's tool_call tracker bucket (`pending` + `consumed`)
+    /// since those connections are going away. Runs fully inline — the
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
         self.clear_mandatory_profile_routes(parent_connection_id);
         let drained = self
-            .drain_for_parent_cancel(parent_connection_id, false)
+            .drain_parent_tree(
+                parent_connection_id,
+                ParentTurnEndReason::ParentDisconnected,
+                false,
+            )
             .await;
-        self.finalize_parent_cancel(drained).await;
+        self.settle_drained_for_parent_end(
+            drained,
+            ParentTurnEndReason::ParentDisconnected,
+        )
+        .await;
     }
 
-    /// Cascade-cancel every pending delegation owned by `parent_connection_id`
-    /// for a **turn/prompt cancel** where the parent connection STAYS ALIVE
-    /// (a non-`end_turn` turn end, or a user Cancel between/within prompts).
+    /// Cascade-cancel every live descendant under `parent_connection_id` for a
+    /// **turn/prompt end** where the parent connection STAYS ALIVE (user Cancel,
+    /// turn failure, or clean `end_turn` that abandons live Codeg children).
     ///
     /// The fast, turn-scoped part — tombstoning the tool_call tracker and
-    /// removing this parent's parked calls — runs SYNCHRONOUSLY: the caller
+    /// draining the entire descendant tree — runs SYNCHRONOUSLY: the caller
     /// awaits it before the connection loop accepts the next prompt, so it can't
     /// race a next-turn registration and tombstone/cancel that turn's legitimate
     /// entries (the safety the `drop_tool_calls_for_parent` invariant relies
@@ -3907,84 +3943,137 @@ impl DelegationBroker {
     /// `disconnect`, which can block on slow agents) is backgrounded, so the
     /// user-visible Cancel path stays responsive.
     ///
-    /// RETAINS the parent's `consumed` tool_call memory (and tombstones the
-    /// cancelled turn's unclaimed `pending` ids into it): dropping it would let
-    /// a host re-emit of an already-handled `tool_call_id` re-register and
-    /// mis-bind the next same-key delegation on this live connection — see
-    /// `drop_tool_calls_for_parent`.
-    pub async fn cancel_by_parent_turn(&self, parent_connection_id: &str) {
+    /// A clean `end_turn` still calls this with
+    /// [`ParentTurnEndReason::JoinAbandoned`]; it is a no-op when no live
+    /// Codeg task remains under the tree (`drained` empty → return without
+    /// spawning settle work).
+    ///
+    /// RETAINS each visited connection's `consumed` tool_call memory (and
+    /// tombstones the cancelled turn's unclaimed `pending` ids into it):
+    /// dropping it would let a host re-emit of an already-handled
+    /// `tool_call_id` re-register and mis-bind the next same-key delegation on
+    /// this live connection — see `drop_tool_calls_for_parent`.
+    pub async fn cancel_by_parent_turn(
+        &self,
+        parent_connection_id: &str,
+        reason: ParentTurnEndReason,
+    ) {
+        debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
         let drained = self
-            .drain_for_parent_cancel(parent_connection_id, true)
+            .drain_parent_tree(parent_connection_id, reason, true)
             .await;
+        if drained.is_empty() {
+            return;
+        }
         // The fast drain above already ran inline (scoped to the just-ended
         // turn); background only the slow child teardown.
         let broker = self.clone();
         tokio::spawn(async move {
-            broker.finalize_parent_cancel(drained).await;
+            broker.settle_drained_for_parent_end(drained, reason).await;
         });
     }
 
-    /// Fast, lock-guarded part of a parent cancel: drop/tombstone this parent's
-    /// tool_call tracker (per `keep_consumed`, see `drop_tool_calls_for_parent`)
-    /// and remove every running task it owns, returning them for the (slow)
-    /// child teardown. Touches only the two broker mutexes — no spawner I/O — so
-    /// it is safe to await inline in the connection loop before the next prompt
-    /// is accepted.
+    /// Fast, lock-guarded part of a parent end: BFS the full descendant tree
+    /// under `parent_connection_id`, mark in-flight setups, and migrate every
+    /// live running task into `settling` under one `pending.inner` lock so
+    /// later child-disconnect callbacks cannot relabel grandchildren. Tool-call
+    /// tracker cleanup runs for every visited connection (`keep_consumed`
+    /// retains `consumed` only for turn-scoped ends).
     ///
-    /// `keep_consumed` also governs the completed-cache: a **turn** cancel
-    /// (`true`) records each drained task as `Canceled` so the still-alive
-    /// connection's LLM can still query it; a **connection teardown** (`false`)
-    /// drops the parent's whole completed-cache instead — the parent is gone, so
-    /// nothing will query it.
-    async fn drain_for_parent_cancel(
+    /// `keep_consumed` also governs the completed-cache: a **turn** end
+    /// (`true`) leaves completed results so the still-alive connection's LLM
+    /// can still query them; a **connection teardown** (`false`) drops each
+    /// visited connection's completed-cache — those connections are gone.
+    async fn drain_parent_tree(
         &self,
         parent_connection_id: &str,
+        reason: ParentTurnEndReason,
         keep_consumed: bool,
     ) -> Vec<(String, RunningTask, u64)> {
-        // Also drain any tool_call ids captured ahead of an MCP round-trip that
-        // never arrived — keeps the map bounded across parent reconnects.
-        // Teardown drops the whole bucket; a turn cancel keeps `consumed` so a
-        // later re-emit can't mis-bind the next delegation.
-        self.drop_tool_calls_for_parent(parent_connection_id, keep_consumed)
-            .await;
-        let drained = {
+        let (drained, visited) = {
             let mut inner = self.pending.inner.lock().await;
-            // Flag every still-in-flight setup this parent owns in the SAME lock
-            // acquisition that drains its running tasks: a delegation is then
-            // caught either here (mid-setup → `start_delegation` tears its child
-            // down at the next checkpoint) or by the running drain below (already
-            // registered) — there is no interleaving where both miss it.
-            inner.mark_inflight_canceled_for_parent(parent_connection_id);
-            let keys: Vec<String> = inner
-                .running
-                .iter()
-                .filter(|(_, v)| v.parent_connection_id == parent_connection_id)
-                .map(|(k, _)| k.clone())
-                .collect();
-            let drained = drain_running(&mut inner, keys);
-            if !keep_consumed {
-                // Connection teardown: drop this parent's completed-cache; durable
-                // truth lives in the store (settled below).
-                inner.drop_completed_for_parent(parent_connection_id);
+            let mut frontier = VecDeque::new();
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut drained: Vec<(String, RunningTask, u64)> = Vec::new();
+            frontier.push_back(parent_connection_id.to_string());
+
+            while let Some(conn_id) = frontier.pop_front() {
+                if !visited.insert(conn_id.clone()) {
+                    continue;
+                }
+                inner.mark_inflight_canceled_for_parent(&conn_id, reason);
+
+                // Coordination identities exist before running registration, so
+                // include their child connections in the traversal even during
+                // setup races.
+                frontier.extend(
+                    inner
+                        .coordination_by_child
+                        .values()
+                        .filter(|identity| identity.parent_connection_id == conn_id)
+                        .map(|identity| identity.child_connection_id.clone()),
+                );
+
+                let keys = inner
+                    .running
+                    .iter()
+                    .filter(|(_, task)| task.parent_connection_id == conn_id)
+                    .map(|(task_id, _)| task_id.clone())
+                    .collect::<Vec<_>>();
+                let level = drain_running(&mut inner, keys);
+                frontier.extend(
+                    level
+                        .iter()
+                        .map(|(_, task, _)| task.child_connection_id.clone()),
+                );
+                drained.extend(level);
             }
-            drained
+
+            if !keep_consumed {
+                for conn_id in &visited {
+                    inner.drop_completed_for_parent(conn_id);
+                }
+            }
+            (drained, visited)
         };
+
+        // Tracker cleanup after ownership drain so disconnect callbacks cannot
+        // re-bind drained task keys; retain `consumed` only for turn-scoped ends.
+        for conn_id in &visited {
+            self.drop_tool_calls_for_parent(conn_id, keep_consumed)
+                .await;
+        }
         drained
     }
 
-    /// Slow part of a parent cancel: durable settle + meta/event/teardown for
-    /// each drained task. Split out so a turn cancel can background it without
-    /// delaying the fast, turn-scoped drain.
-    async fn finalize_parent_cancel(&self, drained: Vec<(String, RunningTask, u64)>) {
-        self.settle_drained_canceled(drained, "parent canceled", true)
-            .await;
+    /// Settle every drained running task as canceled with a stable parent-end
+    /// code. Only the durable CAS winner emits terminal state; a completion
+    /// that already won remains completed.
+    async fn settle_drained_for_parent_end(
+        &self,
+        drained: Vec<(String, RunningTask, u64)>,
+        reason: ParentTurnEndReason,
+    ) {
+        for (task_id, task, duration_ms) in drained {
+            let terminal = TerminalTaskWrite::canceled(
+                reason.error_code(),
+                Utc::now(),
+                ConversationStatus::Cancelled,
+            );
+            let mut context = SettleContext::from_running(&task, duration_ms, true);
+            context.message = Some(reason.message().to_string());
+            context.attention_resolution = reason.attention_code();
+            self.settle_task(&task_id, terminal, None, context).await;
+        }
     }
 
     /// Settle every drained running task as canceled through the shared
-    /// durable path (store CAS first, then cache/meta/event/teardown).
+    /// durable path (store CAS first, then cache/meta/event/teardown). Used by
+    /// non-parent paths (child disconnect, explicit cancel) that still map to
+    /// generic `"canceled"`.
     async fn settle_drained_canceled(
         &self,
         drained: Vec<(String, RunningTask, u64)>,
@@ -3999,6 +4088,25 @@ impl DelegationBroker {
             ctx.message = message;
             self.settle_task(&task_id, terminal, result_text, ctx).await;
         }
+    }
+
+    /// Test helper: apply a parent-tree end with the given reason, awaiting
+    /// settle inline (even for turn-scoped reasons that production backgrounds).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn cancel_parent_tree_for_test(
+        &self,
+        parent_connection_id: &str,
+        reason: ParentTurnEndReason,
+    ) {
+        if reason == ParentTurnEndReason::ParentDisconnected {
+            self.cancel_by_parent(parent_connection_id).await;
+            return;
+        }
+        self.clear_mandatory_profile_routes(parent_connection_id);
+        let drained = self
+            .drain_parent_tree(parent_connection_id, reason, true)
+            .await;
+        self.settle_drained_for_parent_end(drained, reason).await;
     }
 
     /// Backs the `get_delegation_status` tool for a single task id — a thin
@@ -5668,6 +5776,312 @@ mod tests {
         assert!(broker.coordination_for_test("child-conn").await.is_none());
     }
 
+    // -- Task 7: join-only parent-turn ownership + stable cascade codes ----
+
+    async fn wait_for_terminal(
+        store: &crate::acp::delegation::store::mock::MockTaskStore,
+        task_id: &str,
+    ) -> crate::acp::delegation::store::PersistedTask {
+        use crate::acp::delegation::store::DelegationTaskStore;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(Some(row)) = store.load(task_id).await {
+                if row.status != TaskStatus::Running {
+                    return row;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("wait_for_terminal timed out for task {task_id}");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn seed_edges(
+        store: &crate::acp::delegation::store::mock::MockTaskStore,
+        attention: &crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore,
+        child: &str,
+        grandchild: &str,
+    ) {
+        store.seed_edge(child, 1, 2).await;
+        store.seed_edge(grandchild, 2, 3).await;
+        attention.seed_edge(child, 1, 2).await;
+        attention.seed_edge(grandchild, 2, 3).await;
+    }
+
+    async fn seed_edge(
+        store: &crate::acp::delegation::store::mock::MockTaskStore,
+        attention: &crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore,
+        task: &str,
+        parent_conv: i32,
+        child_conv: i32,
+    ) {
+        store.seed_edge(task, parent_conv, child_conv).await;
+        attention.seed_edge(task, parent_conv, child_conv).await;
+    }
+
+    async fn attention_for_task(
+        attention: &crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore,
+        task_id: &str,
+    ) -> crate::acp::delegation::attention::AttentionRecord {
+        attention
+            .record_for_task(task_id)
+            .await
+            .unwrap_or_else(|| panic!("no attention row for task {task_id}"))
+    }
+
+    #[tokio::test]
+    async fn user_cancel_applies_parent_canceled_to_entire_live_tree() {
+        use crate::acp::delegation::attention::AttentionResolutionCode;
+        use crate::acp::delegation::store::DelegationTaskStore as _;
+
+        let (broker, spawner, store, attention) = coordination_broker().await;
+        let child = spawn_running(&broker, &spawner, "root", 1, "child-conn").await;
+        let grandchild = spawn_running(&broker, &spawner, "child-conn", 2, "grand-conn").await;
+        seed_edges(&store, &attention, &child, &grandchild).await;
+
+        let decision = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("grand-conn", "tc-grand", "Choose?")
+                    .await
+            }
+        });
+        wait_for_open_request(&attention, &grandchild).await;
+
+        broker
+            .cancel_by_parent_turn("root", ParentTurnEndReason::ParentCanceled)
+            .await;
+        wait_for_terminal(&store, &child).await;
+        wait_for_terminal(&store, &grandchild).await;
+        let _ = within(decision).await;
+
+        for task_id in [&child, &grandchild] {
+            let row = store.load(task_id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Canceled);
+            assert_eq!(row.error_code.as_deref(), Some("parent_canceled"));
+        }
+        let request = attention_for_task(&attention, &grandchild).await;
+        assert_eq!(
+            request.resolution_code,
+            Some(AttentionResolutionCode::ParentCanceled)
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_end_turn_abandons_only_live_children() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let live = spawn_running(&broker, &spawner, "parent", 1, "child").await;
+        broker
+            .cancel_by_parent_turn("parent", ParentTurnEndReason::JoinAbandoned)
+            .await;
+        let row = wait_for_terminal(&store, &live).await;
+        assert_eq!(row.status, TaskStatus::Canceled);
+        assert_eq!(row.error_code.as_deref(), Some("join_abandoned"));
+
+        let before = store.settle_call_count().await;
+        broker
+            .cancel_by_parent_turn("parent", ParentTurnEndReason::JoinAbandoned)
+            .await;
+        // Drain is empty → no background settle spawn / no extra writes.
+        tokio::task::yield_now().await;
+        assert_eq!(store.settle_call_count().await, before);
+    }
+
+    #[tokio::test]
+    async fn parent_failure_and_disconnect_keep_distinct_codes() {
+        for (reason, expected) in [
+            (ParentTurnEndReason::ParentTurnFailed, "parent_turn_failed"),
+            (ParentTurnEndReason::ParentDisconnected, "parent_disconnected"),
+        ] {
+            let (broker, spawner, store, _attention) = coordination_broker().await;
+            let task = spawn_running(&broker, &spawner, "parent", 1, "child").await;
+            broker.cancel_parent_tree_for_test("parent", reason).await;
+            let row = wait_for_terminal(&store, &task).await;
+            assert_eq!(row.error_code.as_deref(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_winner_is_not_replaced_by_late_parent_end() {
+        use crate::acp::delegation::store::DelegationTaskStore as _;
+
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task = spawn_running(&broker, &spawner, "parent", 1, "child").await;
+        complete(&broker, &task, "done").await;
+        broker
+            .cancel_by_parent_turn("parent", ParentTurnEndReason::JoinAbandoned)
+            .await;
+        // Background settle of empty drain is a no-op; if anything raced, CAS
+        // keeps the completion winner.
+        tokio::task::yield_now().await;
+        let row = store.load(&task).await.unwrap().unwrap();
+        assert_eq!(row.status, TaskStatus::Completed);
+        assert_eq!(row.error_code, None);
+    }
+
+    #[tokio::test]
+    async fn parent_reply_racing_parent_cancel_has_one_durable_attention_winner() {
+        use crate::acp::delegation::attention::AttentionResolutionCode;
+        use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+
+        let (broker, spawner, store, attention) = coordination_broker().await;
+        let task = spawn_running(&broker, &spawner, "parent", 1, "child").await;
+        seed_edge(&store, &attention, &task, 1, 2).await;
+        let decision = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .request_parent_decision("child", "tc-1", "Choose?")
+                    .await
+            }
+        });
+        let request = wait_for_open_request(&attention, &task).await;
+
+        let (reply, ()) = tokio::join!(
+            broker.reply_to_delegation("parent", Some(1), &request.request_id, "A"),
+            broker.cancel_by_parent_turn("parent", ParentTurnEndReason::ParentCanceled),
+        );
+        wait_for_terminal(&store, &task).await;
+        let stored = {
+            use crate::acp::delegation::attention::DelegationAttentionStore;
+            attention
+                .wait_snapshot(&request.request_id)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            attention.resolution_winner_count(&request.request_id).await,
+            1
+        );
+        match stored.resolution_code.unwrap() {
+            AttentionResolutionCode::ParentReply => {
+                assert!(matches!(
+                    reply,
+                    DelegationReplyResult::Replied { .. }
+                        | DelegationReplyResult::Idempotent { .. }
+                ));
+                assert!(matches!(
+                    within(decision).await.unwrap(),
+                    ParentDecisionResult::Replied { .. }
+                ));
+            }
+            AttentionResolutionCode::ParentCanceled => {
+                assert!(matches!(
+                    reply,
+                    DelegationReplyResult::AlreadyResolved { .. }
+                ));
+                assert!(matches!(
+                    within(decision).await.unwrap(),
+                    ParentDecisionResult::Closed {
+                        resolution_code: AttentionResolutionCode::ParentCanceled,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected attention winner: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_while_child_spawn_is_gated_uses_parent_canceled() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-gate".into())).await;
+        mock.queue_send(Ok(91)).await;
+        let release = mock.install_spawn_gate().await;
+        let store = Arc::new(crate::acp::delegation::store::mock::MockTaskStore::accept_any_running(91));
+        let broker = DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_task_store(
+            store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+        );
+        enable_delegation(&broker).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-gate")).await })
+        };
+        loop {
+            if !mock.spawn_args.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let _ = release.send(());
+        match driver.await.unwrap() {
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "parent_canceled"),
+            other => panic!("expected parent_canceled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_end_turn_while_send_is_gated_uses_join_abandoned() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-end".into())).await;
+        mock.queue_send(Ok(92)).await;
+        let release = mock.install_send_gate().await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-end")).await })
+        };
+        loop {
+            if broker.reserved_child_count().await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::JoinAbandoned)
+            .await;
+        let _ = release.send(());
+        match driver.await.unwrap() {
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "join_abandoned"),
+            other => panic!("expected join_abandoned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_failure_cascades_to_child_and_grandchild() {
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let (broker, spawner, store, attention) = coordination_broker().await;
+        let child = spawn_running(&broker, &spawner, "root", 1, "child-conn").await;
+        let grandchild = spawn_running(&broker, &spawner, "child-conn", 2, "grand-conn").await;
+        seed_edges(&store, &attention, &child, &grandchild).await;
+        broker
+            .cancel_parent_tree_for_test("root", ParentTurnEndReason::ParentTurnFailed)
+            .await;
+        for task_id in [&child, &grandchild] {
+            let row = store.load(task_id).await.unwrap().unwrap();
+            assert_eq!(row.error_code.as_deref(), Some("parent_turn_failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_teardown_cascades_parent_disconnected() {
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let (broker, spawner, store, attention) = coordination_broker().await;
+        let child = spawn_running(&broker, &spawner, "root", 1, "child-conn").await;
+        let grandchild = spawn_running(&broker, &spawner, "child-conn", 2, "grand-conn").await;
+        seed_edges(&store, &attention, &child, &grandchild).await;
+        broker.cancel_by_parent("root").await;
+        for task_id in [&child, &grandchild] {
+            let row = store.load(task_id).await.unwrap().unwrap();
+            assert_eq!(row.error_code.as_deref(), Some("parent_disconnected"));
+        }
+    }
+
     /// A batch `Infinite` wait must NOT hold an already-terminal result hostage
     /// to a still-running sibling: when a task is terminal at call ENTRY (it
     /// completed before the poll), return immediately with the current snapshot
@@ -6657,8 +7071,10 @@ mod tests {
         for h in handles {
             let outcome = h.await.unwrap();
             match outcome {
-                DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
-                other => panic!("expected canceled, got {other:?}"),
+                DelegationOutcome::Err { code, .. } => {
+                    assert_eq!(code, "parent_disconnected")
+                }
+                other => panic!("expected parent_disconnected, got {other:?}"),
             }
         }
         assert_eq!(mock.cancels.lock().await.len(), 3);
@@ -7988,7 +8404,9 @@ mod tests {
             Some("tc-A"),
         );
         // Turn cancel — parent still alive.
-        broker.cancel_by_parent_turn("p1").await;
+        broker
+            .cancel_by_parent_turn("p1", ParentTurnEndReason::ParentCanceled)
+            .await;
         // Host re-emits the now-consumed id with the same key.
         broker
             .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(task_key("task A")))
@@ -8015,7 +8433,9 @@ mod tests {
         broker
             .register_pending_tool_call_with_key("p1", "tc-B".into(), Some(task_key("task B")))
             .await;
-        broker.cancel_by_parent_turn("p1").await;
+        broker
+            .cancel_by_parent_turn("p1", ParentTurnEndReason::ParentCanceled)
+            .await;
         assert!(
             broker
                 .take_matching_tool_call("p1", &task_key("task B"))
@@ -8040,7 +8460,9 @@ mod tests {
         broker
             .register_pending_tool_call_with_key("p1", "tc-X".into(), Some(task_key("task X")))
             .await;
-        broker.cancel_by_parent_turn("p1").await;
+        broker
+            .cancel_by_parent_turn("p1", ParentTurnEndReason::ParentCanceled)
+            .await;
         // Late re-emit of the cancelled turn's unclaimed id (same key).
         broker
             .register_pending_tool_call_with_key("p1", "tc-X".into(), Some(task_key("task X")))
@@ -8110,7 +8532,9 @@ mod tests {
             )
             .await;
 
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
 
         // (a) Synchronously — no sleep: the parked call is removed and the
         // tracker entry is dropped (tombstoned), so neither can leak into a
@@ -8129,10 +8553,10 @@ mod tests {
         );
 
         // (b) The backgrounded child teardown still resolves the driver as
-        // canceled and tears the child down exactly once.
+        // parent_canceled and tears the child down exactly once.
         match driver.await.unwrap() {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
-            other => panic!("expected canceled, got {other:?}"),
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "parent_canceled"),
+            other => panic!("expected parent_canceled, got {other:?}"),
         }
         assert_eq!(mock.cancels.lock().await.as_slice(), &["child-1"]);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["child-1"]);
@@ -8589,12 +9013,14 @@ mod tests {
         assert_eq!(broker.inflight_count().await, 1);
         assert_eq!(broker.reserved_child_count().await, 0, "not reserved yet");
 
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         let _ = release.send(());
 
         match driver.await.unwrap() {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
-            other => panic!("expected canceled, got {other:?}"),
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "parent_canceled"),
+            other => panic!("expected parent_canceled, got {other:?}"),
         }
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c2"]);
         assert!(
@@ -8637,7 +9063,9 @@ mod tests {
         assert_eq!(broker.inflight_count().await, 1);
         assert_eq!(broker.pending_count().await, 0, "not parked yet");
 
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         let _ = release.send(());
 
         match driver.await.unwrap() {
@@ -8646,10 +9074,10 @@ mod tests {
                 child_conversation_id,
                 ..
             } => {
-                assert_eq!(code, "canceled");
+                assert_eq!(code, "parent_canceled");
                 assert_eq!(child_conversation_id, Some(33));
             }
-            other => panic!("expected canceled, got {other:?}"),
+            other => panic!("expected parent_canceled, got {other:?}"),
         }
         // Prompt was sent → child cancel()'d AND disconnected.
         assert_eq!(mock.cancels.lock().await.as_slice(), &["c3"]);
@@ -8678,7 +9106,7 @@ mod tests {
         assert_eq!(failed.get("status").unwrap().as_str().unwrap(), "failed");
         assert_eq!(
             failed.get("error_code").unwrap().as_str().unwrap(),
-            "canceled"
+            "parent_canceled"
         );
     }
 
@@ -8722,7 +9150,9 @@ mod tests {
                 }),
             )
             .await;
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         let _ = release.send(());
 
         assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
@@ -8762,7 +9192,9 @@ mod tests {
         // Parent cancels FIRST (earlier arrival stamp); the child completes
         // afterward (later stamp) — first-terminal-wins judges the cancel the
         // winner and discards the late completion.
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         broker
             .complete_call(
                 &call_id,
@@ -8784,7 +9216,7 @@ mod tests {
                 child_conversation_id,
                 ..
             } => {
-                assert_eq!(code, "canceled");
+                assert_eq!(code, "parent_canceled");
                 assert_eq!(child_conversation_id, Some(55));
             }
             other => panic!(
@@ -8832,7 +9264,9 @@ mod tests {
         broker
             .cancel_by_child_connection("cF", Some("boom detail"))
             .await;
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         let _ = release.send(());
 
         match driver.await.unwrap() {
@@ -8887,8 +9321,10 @@ mod tests {
         let _ = release.send(());
 
         match driver.await.unwrap() {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
-            other => panic!("expected canceled, got {other:?}"),
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "parent_disconnected")
+            }
+            other => panic!("expected parent_disconnected, got {other:?}"),
         }
         assert_eq!(mock.cancels.lock().await.as_slice(), &["c7"]);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c7"]);
@@ -8918,7 +9354,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // Wrong-parent cancel — a no-op for this setup.
-        broker.cancel_by_parent_turn("some-other-parent").await;
+        broker
+            .cancel_by_parent_turn(
+                "some-other-parent",
+                ParentTurnEndReason::ParentCanceled,
+            )
+            .await;
         let _ = release.send(());
 
         // It must park normally; resolve it via its child completion.
@@ -9085,7 +9526,7 @@ mod tests {
         assert_eq!(inner.get("status").unwrap().as_str().unwrap(), "failed");
         assert_eq!(
             inner.get("error_code").unwrap().as_str().unwrap(),
-            "canceled"
+            "parent_disconnected"
         );
     }
 
@@ -9474,12 +9915,14 @@ mod tests {
         }
         assert_eq!(broker.inflight_count().await, 1);
 
-        broker.cancel_by_parent_turn("parent-conn").await;
+        broker
+            .cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
         let _ = release.send(());
 
         match driver.await.unwrap() {
-            DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
-            other => panic!("expected canceled, got {other:?}"),
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "parent_canceled"),
+            other => panic!("expected parent_canceled, got {other:?}"),
         }
         assert_eq!(mock.cancels.lock().await.as_slice(), &["c-eh"]);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-eh"]);
@@ -9635,9 +10078,9 @@ mod tests {
         for call in &calls {
             match &call.result {
                 DelegationResultSummary::Err { error_code } => {
-                    assert_eq!(error_code, "canceled")
+                    assert_eq!(error_code, "parent_disconnected")
                 }
-                other => panic!("expected Err{{canceled}}, got {other:?}"),
+                other => panic!("expected Err{{parent_disconnected}}, got {other:?}"),
             }
         }
     }
@@ -9874,9 +10317,9 @@ mod tests {
                 assert_eq!(*child_conversation_id, 77);
                 match result {
                     DelegationResultSummary::Err { error_code } => {
-                        assert_eq!(error_code, "canceled");
+                        assert_eq!(error_code, "parent_disconnected");
                     }
-                    other => panic!("expected Err{{canceled}}, got {other:?}"),
+                    other => panic!("expected Err{{parent_disconnected}}, got {other:?}"),
                 }
             }
             other => panic!("expected DelegationCompleted, got {other:?}"),
@@ -10040,7 +10483,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            DelegationOutcome::Err { ref code, .. } if code == "canceled"
+            DelegationOutcome::Err { ref code, .. } if code == "parent_disconnected"
         ));
         assert_eq!(
             broker.pending_count().await,

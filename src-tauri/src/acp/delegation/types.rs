@@ -459,6 +459,47 @@ impl DelegationStatusBatch {
     }
 }
 
+/// Why a parent turn or connection ended while Codeg children may still be live.
+/// Wire-stable snake_case codes; do **not** fold these into generic
+/// [`DelegationError::Canceled`] (`"canceled"`), which collapses all four cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentTurnEndReason {
+    ParentCanceled,
+    ParentTurnFailed,
+    JoinAbandoned,
+    ParentDisconnected,
+}
+
+impl ParentTurnEndReason {
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::ParentCanceled => "parent_canceled",
+            Self::ParentTurnFailed => "parent_turn_failed",
+            Self::JoinAbandoned => "join_abandoned",
+            Self::ParentDisconnected => "parent_disconnected",
+        }
+    }
+
+    pub fn attention_code(self) -> AttentionResolutionCode {
+        match self {
+            Self::ParentCanceled => AttentionResolutionCode::ParentCanceled,
+            Self::ParentTurnFailed => AttentionResolutionCode::ParentTurnFailed,
+            Self::JoinAbandoned => AttentionResolutionCode::JoinAbandoned,
+            Self::ParentDisconnected => AttentionResolutionCode::ParentDisconnected,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ParentCanceled => "parent turn was canceled",
+            Self::ParentTurnFailed => "parent turn failed",
+            Self::JoinAbandoned => "parent ended before joining live children",
+            Self::ParentDisconnected => "parent connection disconnected",
+        }
+    }
+}
+
 /// Result of a child `request_parent_decision` wait (MCP surface later in Task 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
