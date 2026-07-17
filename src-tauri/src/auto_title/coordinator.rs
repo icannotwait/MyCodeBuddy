@@ -1009,6 +1009,20 @@ mod tests {
             .expect("active attempt timeout");
         }
 
+        async fn wait_for_no_active_registration(&self, conversation_id: i32) {
+            timeout(TokioDuration::from_secs(2), async {
+                loop {
+                    if !self.coordinator.has_active_registration(conversation_id).await
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("active registration clear timeout");
+        }
+
         async fn manual_rename(&self, conversation_id: i32, title: &str) {
             let removed =
                 conversation_service::update_title(&self.db.conn, conversation_id, title.into())
@@ -1189,12 +1203,14 @@ mod tests {
         fixture.coordinator.set_finalize_fail_remaining(2);
         fixture.coordinator.notify_ready();
         fixture.wait_for_job_deleted(cid).await;
+        // Finalization unregisters after commit; wait so parallel suites cannot
+        // observe the brief post-commit registration window.
+        fixture.wait_for_no_active_registration(cid).await;
         assert_eq!(fixture.runner.call_count(), 1);
         assert_eq!(
             fixture.conversation_title(cid).await.as_deref(),
             Some("Generated Title")
         );
-        assert!(!fixture.coordinator.has_active_registration(cid).await);
     }
 
     #[tokio::test]
@@ -1207,25 +1223,20 @@ mod tests {
         fixture
             .wait_for_state(cid, AutoTitleJobState::Running)
             .await;
-        // Off replaces the root after claim captured a child of the old root.
-        set_auto_title_agent_persisted_core(&fixture.db, None)
-            .await
-            .expect("off");
+        // cancel_all alone must cancel the pre-registration Off-root child without
+        // relying on Off deleting durable jobs (still_running recheck path).
         fixture.coordinator.cancel_all().await;
         gate.notify_waiters();
-        timeout(TokioDuration::from_secs(2), async {
-            loop {
-                if !fixture.coordinator.has_active_registration(cid).await
-                    && fixture.runner.call_count() == 0
-                {
-                    return;
-                }
-                tokio::time::sleep(TokioDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("cancelled before run");
-        assert_eq!(fixture.runner.call_count(), 0);
+        tokio::time::sleep(TokioDuration::from_millis(200)).await;
+        assert_eq!(
+            fixture.runner.call_count(),
+            0,
+            "runner must not run after pre-registration cancel_all"
+        );
+        assert!(
+            !fixture.coordinator.has_active_registration(cid).await,
+            "active registration must be cleared"
+        );
     }
 
     #[tokio::test]
@@ -1248,19 +1259,16 @@ mod tests {
         .await
         .expect("rename");
         gate.notify_waiters();
-        timeout(TokioDuration::from_secs(2), async {
-            loop {
-                if !fixture.coordinator.has_active_registration(cid).await
-                    && fixture.runner.call_count() == 0
-                {
-                    return;
-                }
-                tokio::time::sleep(TokioDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("cancelled before run");
-        assert_eq!(fixture.runner.call_count(), 0);
+        tokio::time::sleep(TokioDuration::from_millis(200)).await;
+        assert_eq!(
+            fixture.runner.call_count(),
+            0,
+            "runner must not run after pre-registration rename"
+        );
+        assert!(
+            !fixture.coordinator.has_active_registration(cid).await,
+            "active registration must be cleared"
+        );
         assert!(fixture.state(cid).await.is_none());
     }
 
@@ -1390,16 +1398,11 @@ mod tests {
             .expect("off");
         fixture.coordinator.cancel_all().await;
 
-        timeout(TokioDuration::from_secs(2), async {
-            loop {
-                if fixture.runner.attempt_was_cancelled(1).await {
-                    return;
-                }
-                tokio::time::sleep(TokioDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("off cancels active");
+        tokio::time::sleep(TokioDuration::from_millis(200)).await;
+        assert!(
+            fixture.runner.attempt_was_cancelled(1).await,
+            "cancel_all must cancel active blocked title attempt"
+        );
         // Late unblock cannot finalize: job gone, claim cancelled.
         release.notify_waiters();
         tokio::time::sleep(TokioDuration::from_millis(50)).await;
