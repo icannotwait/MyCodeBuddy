@@ -1096,7 +1096,14 @@
     "restartRequired": "Saved. Restart the app for the change to take effect.",
     "restartNow": "Restart now",
     "restartFailed": "Failed to restart: {message}",
-    "loadFailed": "Load failed: {message}"
+    "loadFailed": "Load failed: {message}",
+    "conversationExperienceTitle": "Conversation experience",
+    "conversationExperienceDescription": "Configure automatic titles and reference search behavior.",
+    "autoTitleAgent": "Automatic title agent",
+    "autoTitleOff": "Off",
+    "autoTitleUnavailable": "{agent} (Unavailable)",
+    "autoTitleSaveFailed": "Failed to save automatic title agent: {message}",
+    "autoTitleLoading": "Loading automatic title settings..."
   },
   "LoginPage": {
     "documentTitle": "Login - DrawCode",

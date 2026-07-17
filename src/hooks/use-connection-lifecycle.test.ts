@@ -1,5 +1,59 @@
-import { describe, expect, it } from "vitest"
-import { shouldDisconnectOnUnmount } from "@/hooks/use-connection-lifecycle"
+import { act, renderHook, waitFor } from "@testing-library/react"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const h = vi.hoisted(() => ({
+  sendPrompt: vi.fn(async () => undefined),
+  setMode: vi.fn(async () => undefined),
+  locale: "zh_cn" as string,
+}))
+
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string) => key,
+}))
+
+vi.mock("@/contexts/acp-connections-context", () => ({
+  useAcpActions: () => ({
+    setActiveKey: vi.fn(),
+    touchActivity: vi.fn(),
+  }),
+}))
+
+vi.mock("@/contexts/task-context", () => ({
+  useTaskContext: () => ({
+    addTask: vi.fn(),
+    updateTask: vi.fn(),
+    removeTask: vi.fn(),
+  }),
+}))
+
+vi.mock("@/hooks/use-connection", () => ({
+  useConnection: () => ({
+    // Keep owner busy on unmount so cleanup skips disconnect (avoids ref churn).
+    status: "prompting",
+    isViewer: false,
+    backgroundOutstanding: 0,
+    selectorsReady: true,
+    connect: () => Promise.resolve(),
+    disconnect: () => Promise.resolve(),
+    sendPrompt: h.sendPrompt,
+    setMode: h.setMode,
+    setConfigOption: () => Promise.resolve(),
+    cancel: () => Promise.resolve(),
+    respondPermission: () => Promise.resolve(),
+    modes: null,
+    configOptions: null,
+    hasCachedSelectors: true,
+  }),
+}))
+
+vi.mock("@/lib/i18n", () => ({
+  getCurrentEffectiveAppLocale: () => h.locale,
+}))
+
+import {
+  shouldDisconnectOnUnmount,
+  useConnectionLifecycle,
+} from "@/hooks/use-connection-lifecycle"
 
 // Unmount cleanup (tab closed) must not kill an owner whose agent still has
 // work in flight: disconnecting kills the agent CLI, and any launched
@@ -46,5 +100,53 @@ describe("shouldDisconnectOnUnmount", () => {
         backgroundOutstanding: 5,
       })
     ).toBe(true)
+  })
+})
+
+describe("handle_send_forwards_display_text_and_effective_locale", () => {
+  beforeEach(() => {
+    h.sendPrompt.mockClear()
+    h.setMode.mockClear()
+    h.locale = "zh_cn"
+  })
+
+  it("forwards displayText and effective locale as promptContext", async () => {
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "tab-1",
+        agentType: "claude_code",
+        isActive: true,
+      })
+    )
+
+    act(() => {
+      result.current.handleSend(
+        {
+          blocks: [{ type: "text", text: "wire" }],
+          displayText: "README.md task",
+        },
+        null,
+        {
+          folderId: 1,
+          conversationId: 2,
+          clientMessageId: "m1",
+        }
+      )
+    })
+
+    await waitFor(() => {
+      expect(h.sendPrompt).toHaveBeenCalledWith(
+        [{ type: "text", text: "wire" }],
+        {
+          folderId: 1,
+          conversationId: 2,
+          clientMessageId: "m1",
+          promptContext: {
+            visibleText: "README.md task",
+            locale: "zh_cn",
+          },
+        }
+      )
+    })
   })
 })

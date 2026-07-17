@@ -92,6 +92,7 @@ import type {
   DesktopDeliveryCapabilities,
   DesktopDeliveryFailure,
   SequenceGap,
+  AcpPromptContext,
   PromptInputBlock,
   ToolCallImageWire,
   UserMessageBlock,
@@ -3186,6 +3187,7 @@ export interface AcpActionsValue {
       folderId?: number | null
       conversationId?: number | null
       clientMessageId?: string | null
+      promptContext?: AcpPromptContext
     }
   ): Promise<void>
   setMode(contextKey: string, modeId: string): Promise<void>
@@ -5156,6 +5158,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         folderId?: number | null
         conversationId?: number | null
         clientMessageId?: string | null
+        promptContext?: AcpPromptContext
       }
     ) => {
       if (desktopDeliveryFailedRef.current || readDesktopDeliveryFailed()) {
@@ -5175,12 +5178,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) return
       lastActivityRef.current.set(contextKey, Date.now())
+      const promptContext = opts?.promptContext ?? {
+        visibleText: null,
+        locale: null,
+      }
       await acpPrompt(
         conn.connectionId,
         blocks,
         opts?.folderId ?? null,
         opts?.conversationId ?? null,
-        opts?.clientMessageId ?? null
+        opts?.clientMessageId ?? null,
+        promptContext
       )
     },
     []

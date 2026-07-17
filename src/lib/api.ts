@@ -13,7 +13,9 @@ import { TurnBusyError, isTurnInProgressRejection } from "./turn-busy"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
+  AcpPromptContext,
   AgentDelegationDefaults,
+  ConversationExperienceSettings,
   DelegationProfileDocument,
   DelegationRoutePolicy,
   AgentOptionsSnapshot,
@@ -180,7 +182,8 @@ export async function acpPrompt(
   blocks: PromptInputBlock[],
   folderId: number | null = null,
   conversationId: number | null = null,
-  clientMessageId: string | null = null
+  clientMessageId: string | null = null,
+  context: AcpPromptContext = { visibleText: null, locale: null }
 ): Promise<void> {
   try {
     await getTransport().call("acp_prompt", {
@@ -189,6 +192,8 @@ export async function acpPrompt(
       folderId,
       conversationId,
       clientMessageId,
+      visibleText: context.visibleText,
+      locale: context.locale,
     })
   } catch (e) {
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
@@ -3381,6 +3386,18 @@ export async function setFeedbackSettings(
   settings: FeedbackSettings
 ): Promise<FeedbackSettings> {
   return getTransport().call("set_feedback_settings", { settings })
+}
+
+// ─── Conversation experience (automatic titles) ────────────────────────────
+
+export async function getConversationExperienceSettings(): Promise<ConversationExperienceSettings> {
+  return getTransport().call("get_conversation_experience_settings")
+}
+
+export async function setAutoTitleAgent(
+  agent: AgentType | null
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call("set_auto_title_agent", { agent })
 }
 
 /**

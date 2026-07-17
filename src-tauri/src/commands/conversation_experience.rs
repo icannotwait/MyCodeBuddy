@@ -1,7 +1,7 @@
 //! Conversation-experience settings persistence (automatic titles + reference search).
 //!
-//! Task 2 owns only the persisted cores and mutation gate. Gate acquisition,
-//! event emission, and runtime cancellation land in Task 9 command wrappers.
+//! Persisted cores and the mutation gate live here. Task 9 wrappers hold the
+//! gate through cancel_all + event emission so an older Off cannot race a newer On.
 
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
@@ -12,6 +12,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app_error::{AppCommandError, AppErrorCode};
+use crate::auto_title::AutoTitleCoordinator;
 use crate::commands::acp::acp_get_agent_status_core;
 use crate::db::entities::app_metadata;
 use crate::db::entities::auto_title_job;
@@ -19,6 +20,7 @@ use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+use crate::web::event_bridge::{emit_event, EventEmitter};
 
 pub const KEY_AUTO_TITLE_AGENT: &str = "conversation_experience.auto_title_agent";
 pub const KEY_REFERENCE_SEARCH_LIMIT: &str = "conversation_experience.reference_search_limit";
@@ -282,6 +284,67 @@ pub async fn set_reference_search_limit_persisted_core(
         SettingsFieldMutation::ReferenceSearchLimit(limit),
     )
     .await
+}
+
+/// Settings setter wrapper: holds the shared mutation gate through the
+/// committed cancellation decision and settings event so a delayed older Off
+/// cannot cancel work enrolled after a newer On.
+pub async fn set_auto_title_agent_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    coordinator: &AutoTitleCoordinator,
+    mutation_gate: &ConversationExperienceMutationGate,
+    agent: Option<AgentType>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let _mutation_guard = mutation_gate.lock().await;
+    let saved = set_auto_title_agent_persisted_core(db, agent).await?;
+    if saved.auto_title_agent.is_none() {
+        coordinator.cancel_all().await;
+    }
+    emit_event(
+        emitter,
+        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        saved.clone(),
+    );
+    Ok(saved)
+}
+
+// -------- Tauri commands -----------------------------------------------------
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_conversation_experience_settings(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        get_conversation_experience_settings_core(&db.conn).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_auto_title_agent(
+    agent: Option<AgentType>,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")]
+    coordinator: tauri::State<'_, std::sync::Arc<AutoTitleCoordinator>>,
+    #[cfg(feature = "tauri-runtime")]
+    mutation_gate: tauri::State<'_, std::sync::Arc<ConversationExperienceMutationGate>>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let emitter = EventEmitter::Tauri(app);
+        set_auto_title_agent_core(&db, &emitter, &coordinator, &mutation_gate, agent).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = agent;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
 }
 
 #[cfg(test)]

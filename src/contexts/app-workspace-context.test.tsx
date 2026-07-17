@@ -28,6 +28,7 @@ const h = vi.hoisted(() => ({
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
+  conversationExperienceBootstrap: vi.fn(),
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -73,6 +74,12 @@ vi.mock("@/lib/api", () => ({
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
   getFolder: vi.fn(),
+}))
+
+// Prevent the conversation-experience settings-event subscription from
+// overwriting this suite's intentionally narrow conversation/folder handler capture.
+vi.mock("@/stores/conversation-experience-store", () => ({
+  useConversationExperienceBootstrap: h.conversationExperienceBootstrap,
 }))
 
 function makeSummary(
@@ -188,6 +195,7 @@ beforeEach(() => {
   h.listOpenFolders.mockResolvedValue([])
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
+  h.conversationExperienceBootstrap.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -198,6 +206,11 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
     await mountProvider()
     expect(h.handler).toBeTypeOf("function")
     expect(h.reconnect).toBeTypeOf("function")
+  })
+
+  it("mounts conversation experience bootstrap on provider mount", async () => {
+    await mountProvider()
+    expect(h.conversationExperienceBootstrap).toHaveBeenCalled()
   })
 
   it("inserts a new root conversation, prepending most-recent-first", async () => {

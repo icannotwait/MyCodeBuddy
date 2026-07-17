@@ -1096,7 +1096,14 @@
     "restartRequired": "已儲存，需重新啟動應用程式才會生效。",
     "restartNow": "立即重新啟動",
     "restartFailed": "重新啟動失敗：{message}",
-    "loadFailed": "載入失敗：{message}"
+    "loadFailed": "載入失敗：{message}",
+    "conversationExperienceTitle": "對話體驗",
+    "conversationExperienceDescription": "設定自動標題與參照搜尋行為。",
+    "autoTitleAgent": "自動標題智慧體",
+    "autoTitleOff": "關閉",
+    "autoTitleUnavailable": "{agent}（無法使用）",
+    "autoTitleSaveFailed": "儲存自動標題智慧體失敗：{message}",
+    "autoTitleLoading": "正在載入自動標題設定..."
   },
   "LoginPage": {
     "documentTitle": "登入 - DrawCode",

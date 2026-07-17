@@ -413,6 +413,26 @@ export const FOLDER_CHANGED_EVENT = "folder://changed"
  *  frontend-only cache. Mirrors the Rust `FEEDBACK_SETTINGS_CHANGED_EVENT`. */
 export const FEEDBACK_SETTINGS_CHANGED_EVENT = "feedback-settings://changed"
 
+/** Full conversation-experience settings document (automatic titles + reference
+ *  search). Mirrors Rust `ConversationExperienceSettings`. */
+export interface ConversationExperienceSettings {
+  auto_title_agent: AgentType | null
+  reference_search_limit: number
+  revision: number
+}
+
+/** Backend side-channel for conversation-experience settings. Mirrors Rust
+ *  `CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT`. */
+export const CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT =
+  "conversation-experience-settings://changed"
+
+/** Visible UI context for ACP prompt capture (automatic titles). Flattened on
+ *  the wire as `visibleText` + `locale`. */
+export interface AcpPromptContext {
+  visibleText: string | null
+  locale: AppLocale | null
+}
+
 /** Payload for the global `tabs://changed` side-channel that keeps every
  *  client's open-tab set in sync across desktop + browsers. Mirrors the Rust
  *  `TabsChanged` struct. The full conversation-bound tab set is sent as a

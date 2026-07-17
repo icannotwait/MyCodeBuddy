@@ -12,6 +12,7 @@ import {
   type PendingQuestion,
 } from "@/contexts/acp-connections-context"
 import type {
+  AcpPromptContext,
   AgentType,
   AvailableCommandInfo,
   ConfigStaleKind,
@@ -107,6 +108,7 @@ export interface UseConnectionReturn {
       folderId?: number | null
       conversationId?: number | null
       clientMessageId?: string | null
+      promptContext?: AcpPromptContext
     }
   ) => Promise<void>
   setMode: (modeId: string) => Promise<void>

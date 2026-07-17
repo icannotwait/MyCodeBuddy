@@ -118,9 +118,24 @@ export async function acpConnect(
 
 export async function acpPrompt(
   connectionId: string,
-  blocks: PromptInputBlock[]
+  blocks: PromptInputBlock[],
+  folderId: number | null = null,
+  conversationId: number | null = null,
+  clientMessageId: string | null = null,
+  context: { visibleText: string | null; locale: string | null } = {
+    visibleText: null,
+    locale: null,
+  }
 ): Promise<void> {
-  return invoke("acp_prompt", { connectionId, blocks })
+  return invoke("acp_prompt", {
+    connectionId,
+    blocks,
+    folderId,
+    conversationId,
+    clientMessageId,
+    visibleText: context.visibleText,
+    locale: context.locale,
+  })
 }
 
 export async function acpSetMode(

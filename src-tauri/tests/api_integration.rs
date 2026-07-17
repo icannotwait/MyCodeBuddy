@@ -237,3 +237,449 @@ async fn feedback_settings_round_trip_defaults_off() {
 // The submit gate is per-connection (the agent's actual `check_user_feedback`
 // capability), unit-tested in `ConnectionManager::submit_feedback`
 // (`submit_feedback_rejected_when_tool_unavailable`), not via the global setting.
+
+// ────────────────────────────────────────────────────────────────────────────
+// Automatic conversation titles (Task 9 end-to-end)
+// ────────────────────────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use codeg_lib::acp::lifecycle::lifecycle_subscriber_task;
+use codeg_lib::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
+use codeg_lib::auto_title::{
+    capture_prompt_context, TitleAgentRunner, TurnCompletionSnapshot,
+};
+use codeg_lib::auto_title::{AutoTitleAttempt, AutoTitleRunError};
+use codeg_lib::commands::conversation_experience::{
+    get_conversation_experience_settings_core, set_auto_title_agent_core,
+    set_auto_title_agent_persisted_core, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+};
+use codeg_lib::db::entities::conversation;
+use codeg_lib::db::service::conversation_service::{create, create_with_delegation};
+use codeg_lib::db::test_helpers::seed_folder;
+use codeg_lib::models::agent::AgentType;
+use codeg_lib::models::system::AppLocale;
+use codeg_lib::acp::delegation::spawner::DelegationLink;
+use sea_orm::EntityTrait;
+use tokio_util::sync::CancellationToken;
+
+/// Deterministic title runner for integration tests — never launches a CLI.
+struct CountingTitleRunner {
+    calls: AtomicU64,
+    title_prefix: String,
+}
+
+impl CountingTitleRunner {
+    fn new(title_prefix: impl Into<String>) -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            title_prefix: title_prefix.into(),
+        }
+    }
+
+    fn call_count(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TitleAgentRunner for CountingTitleRunner {
+    async fn run(
+        &self,
+        attempt: AutoTitleAttempt,
+        _cancellation: CancellationToken,
+    ) -> Result<String, AutoTitleRunError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(format!(
+            "{}-{}-{}",
+            self.title_prefix, attempt.conversation_id, n
+        ))
+    }
+}
+
+#[tokio::test]
+async fn automatic_title_root_and_delegated_child_update_once_without_updated_at() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let db = fresh_in_memory_db().await;
+    let runner = Arc::new(CountingTitleRunner::new("auto"));
+    let state = Arc::new(AppState::new_for_test_with_title_runner(
+        db,
+        data_dir.path().to_path_buf(),
+        runner.clone() as Arc<dyn TitleAgentRunner>,
+    ));
+
+    // Lifecycle subscriber + coordinator worker (no attached clients).
+    tokio::spawn(lifecycle_subscriber_task(
+        state.db.conn.clone(),
+        state.connection_manager.clone_ref(),
+        Arc::clone(&state.acp_event_bus),
+        None,
+    ));
+    state
+        .auto_title_coordinator
+        .recover_and_start()
+        .await
+        .expect("start coordinator");
+
+    set_auto_title_agent_persisted_core(&state.db, Some(AgentType::ClaudeCode))
+        .await
+        .expect("enable auto title");
+
+    let folder_id = seed_folder(&state.db, "/tmp/auto-title-e2e").await;
+    let root = create(&state.db.conn, folder_id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("root");
+    let child = create_with_delegation(
+        &state.db.conn,
+        folder_id,
+        AgentType::Gemini,
+        Some("child".into()),
+        None,
+        Some(DelegationLink {
+            parent_conversation_id: root.id,
+            parent_tool_use_id: "tool-e2e".into(),
+            delegation_call_id: "call-e2e".into(),
+        }),
+    )
+    .await
+    .expect("child");
+
+    let blocks = vec![PromptInputBlock::Text {
+        text: "wire".into(),
+    }];
+    for id in [root.id, child.id] {
+        capture_prompt_context(
+            &state.db.conn,
+            id,
+            &blocks,
+            Some(&codeg_lib::auto_title::PromptCaptureContext::new(
+                Some(format!("task-{id}")),
+                Some(AppLocale::En),
+            )),
+            AppLocale::En,
+        )
+        .await
+        .expect("capture");
+    }
+
+    for (conn_id, conv_id, token) in [
+        ("root-conn", root.id, "tok-root"),
+        ("child-conn", child.id, "tok-child"),
+    ] {
+        let env = Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: conn_id.into(),
+            payload: AcpEvent::TurnComplete {
+                session_id: format!("sess-{conv_id}"),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        });
+        let completion = Arc::new(TurnCompletionSnapshot {
+            conversation_id: conv_id,
+            turn_token: token.into(),
+            locale: AppLocale::En,
+            final_text: Arc::from(format!("assistant reply for {conv_id}")),
+        });
+        state
+            .acp_event_bus
+            .send_with_completion(env, Some(completion));
+    }
+
+    // Wait until lifecycle has applied usable completion (jobs ready) and
+    // root status CAS has settled — that may bump updated_at. Snapshot
+    // updated_at after the status write so title finalize can be checked
+    // as non-mutating for that column.
+    let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (root_post_status, child_post_status) = loop {
+        let root_row = conversation::Entity::find_by_id(root.id)
+            .one(&state.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_row = conversation::Entity::find_by_id(child.id)
+            .one(&state.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        // Root leaves InProgress on end_turn; delegate keeps broker-owned status.
+        let root_settled = root_row.status
+            != codeg_lib::db::entities::conversation::ConversationStatus::InProgress;
+        if root_settled || tokio::time::Instant::now() > settle_deadline {
+            break (root_row.updated_at, child_row.updated_at);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let root_row = conversation::Entity::find_by_id(root.id)
+            .one(&state.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let child_row = conversation::Entity::find_by_id(child.id)
+            .one(&state.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        if root_row.auto_title_finalized && child_row.auto_title_finalized {
+            // Titles are deterministic: prefix-conversationId-callN (order may
+            // vary for concurrent claims; accept either call ordinal).
+            assert!(
+                root_row
+                    .title
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with(&format!("auto-{}-", root.id))),
+                "root title {:?}",
+                root_row.title
+            );
+            assert!(
+                child_row
+                    .title
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with(&format!("auto-{}-", child.id))),
+                "child title {:?}",
+                child_row.title
+            );
+            // finalize_generated_title must not bump conversation.updated_at.
+            assert_eq!(root_row.updated_at, root_post_status);
+            assert_eq!(child_row.updated_at, child_post_status);
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "titles not finalized in time; root={:?} child={:?} calls={}",
+                root_row.title,
+                child_row.title,
+                runner.call_count()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(runner.call_count(), 2, "each conversation titles once");
+}
+
+#[tokio::test]
+async fn conversation_experience_settings_http_round_trip() {
+    let (server, _data, _static) = build_test_server().await;
+
+    let resp = server
+        .post("/api/get_conversation_experience_settings")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["auto_title_agent"], Value::Null);
+    assert_eq!(body["reference_search_limit"], 50);
+    assert_eq!(body["revision"], 0);
+
+    // Turning Off is always valid (no agent availability check).
+    let resp = server
+        .post("/api/set_auto_title_agent")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "agent": null }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["auto_title_agent"], Value::Null);
+    assert_eq!(body["revision"], 1);
+}
+
+#[tokio::test]
+async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let db = fresh_in_memory_db().await;
+    let runner = Arc::new(CountingTitleRunner::new("gate"));
+    let state = Arc::new(AppState::new_for_test_with_title_runner(
+        db,
+        data_dir.path().to_path_buf(),
+        runner.clone() as Arc<dyn TitleAgentRunner>,
+    ));
+
+    // Start with On so Off has cancel_all work to do, then pause cancel_all.
+    set_auto_title_agent_persisted_core(&state.db, Some(AgentType::ClaudeCode))
+        .await
+        .expect("enable");
+
+    let mut broadcaster_rx = state.event_broadcaster.subscribe();
+
+    let (arrival, release) = state
+        .auto_title_coordinator
+        .pause_next_cancel_all_before_effect()
+        .await;
+
+    let gate = Arc::clone(&state.conversation_experience_gate);
+    let coord = Arc::clone(&state.auto_title_coordinator);
+    let emitter = state.emitter.clone();
+    let db_for_off = state.db.conn.clone();
+    let app_db = codeg_lib::db::AppDatabase {
+        conn: db_for_off.clone(),
+    };
+
+    let off_task = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        let coord = Arc::clone(&coord);
+        let emitter = emitter.clone();
+        async move {
+            set_auto_title_agent_core(&app_db, &emitter, &coord, &gate, None).await
+        }
+    });
+
+    // Wait until Off has committed and entered cancel_all.
+    tokio::time::timeout(Duration::from_secs(2), arrival)
+        .await
+        .expect("off cancel_all arrival")
+        .expect("arrival oneshot");
+
+    let app_db_on = codeg_lib::db::AppDatabase {
+        conn: state.db.conn.clone(),
+    };
+    let mut on_task = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        let coord = Arc::clone(&coord);
+        let emitter = emitter.clone();
+        async move {
+            set_auto_title_agent_core(
+                &app_db_on,
+                &emitter,
+                &coord,
+                &gate,
+                Some(AgentType::ClaudeCode),
+            )
+            .await
+        }
+    });
+
+    // On must remain blocked while Off still holds the mutation gate through cancel_all.
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut on_task).await;
+    assert!(
+        early.is_err(),
+        "On must still be pending while Off holds the gate through cancel_all"
+    );
+
+    release.send(()).expect("release off cancel_all");
+
+    let off_result = off_task.await.expect("join off").expect("off ok");
+    let on_result = on_task.await.expect("join on").expect("on ok");
+
+    assert_eq!(off_result.auto_title_agent, None);
+    assert_eq!(on_result.auto_title_agent, Some(AgentType::ClaudeCode));
+    assert!(
+        on_result.revision > off_result.revision,
+        "revisions must be monotonic with On last: off={} on={}",
+        off_result.revision,
+        on_result.revision
+    );
+
+    // Drain settings-changed events; last one must be On.
+    let mut last_revision = 0u64;
+    let mut saw_on = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        match broadcaster_rx.try_recv() {
+            Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                let rev = evt.payload["revision"].as_u64().unwrap_or(0);
+                assert!(rev >= last_revision, "event revisions must be monotonic");
+                last_revision = rev;
+                if evt.payload["auto_title_agent"] == json!("claude_code") {
+                    saw_on = true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if saw_on {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    assert!(saw_on, "expected On settings event last");
+    assert_eq!(last_revision, on_result.revision);
+
+    // Start coordinator for a fresh eligible conversation after On is last.
+    state
+        .auto_title_coordinator
+        .recover_and_start()
+        .await
+        .expect("start");
+    tokio::spawn(lifecycle_subscriber_task(
+        state.db.conn.clone(),
+        state.connection_manager.clone_ref(),
+        Arc::clone(&state.acp_event_bus),
+        None,
+    ));
+
+    let folder_id = seed_folder(&state.db, "/tmp/auto-title-gate").await;
+    let conv = create(&state.db.conn, folder_id, AgentType::ClaudeCode, None, None)
+        .await
+        .expect("conv");
+    capture_prompt_context(
+        &state.db.conn,
+        conv.id,
+        &[PromptInputBlock::Text {
+            text: "wire".into(),
+        }],
+        Some(&codeg_lib::auto_title::PromptCaptureContext::new(
+            Some("gate task".into()),
+            Some(AppLocale::En),
+        )),
+        AppLocale::En,
+    )
+    .await
+    .expect("capture");
+
+    let env = Arc::new(EventEnvelope {
+        seq: 1,
+        connection_id: "gate-conn".into(),
+        payload: AcpEvent::TurnComplete {
+            session_id: "sess-gate".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "claude_code".into(),
+            mark_awaiting_reply: true,
+        },
+    });
+    let completion = Arc::new(TurnCompletionSnapshot {
+        conversation_id: conv.id,
+        turn_token: "tok-gate".into(),
+        locale: AppLocale::En,
+        final_text: Arc::from("assistant for gate"),
+    });
+    state
+        .acp_event_bus
+        .send_with_completion(env, Some(completion));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&state.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.auto_title_finalized {
+            assert!(
+                row.title
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with(&format!("gate-{}-", conv.id))),
+                "title not cancelled: {:?}",
+                row.title
+            );
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("runner cancelled or never ran; title={:?}", row.title);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let loaded = get_conversation_experience_settings_core(&state.db.conn)
+        .await
+        .expect("load");
+    assert_eq!(loaded.auto_title_agent, Some(AgentType::ClaudeCode));
+}

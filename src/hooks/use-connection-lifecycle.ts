@@ -6,6 +6,7 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
+import { getCurrentEffectiveAppLocale } from "@/lib/i18n"
 import {
   AGENT_LABELS,
   type AgentType,
@@ -419,7 +420,15 @@ export function useConnectionLifecycle({
           // calls before CurrentModeUpdate arrives from the agent.
           modeIdRef.current = modeId
         }
-        await sendPrompt(draft.blocks, opts)
+        await sendPrompt(draft.blocks, {
+          folderId: opts?.folderId,
+          conversationId: opts?.conversationId,
+          clientMessageId: opts?.clientMessageId,
+          promptContext: {
+            visibleText: draft.displayText,
+            locale: getCurrentEffectiveAppLocale(),
+          },
+        })
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another

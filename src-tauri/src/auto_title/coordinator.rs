@@ -98,6 +98,15 @@ pub struct AutoTitleCoordinator {
     /// When true, `FailureTransition::Ready` does not auto-notify (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     suppress_ready_notify: AtomicBool,
+    /// One-shot pause placed at the start of `cancel_all` (test-only).
+    /// Arrival fires immediately before root replace/cancel; release continues.
+    #[cfg(any(test, feature = "test-utils"))]
+    cancel_all_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Build the production coordinator (hidden runner + manager driver) for
@@ -151,7 +160,27 @@ impl AutoTitleCoordinator {
             finalize_fail_remaining: std::sync::atomic::AtomicU32::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             suppress_ready_notify: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            cancel_all_pause: Mutex::new(None),
         })
+    }
+
+    /// Arm a one-shot pause at the start of the next `cancel_all` call.
+    ///
+    /// Returns `(arrival, release)` where `arrival` resolves immediately before
+    /// the off-root is replaced/cancelled, and `release.send(())` lets the
+    /// paused `cancel_all` continue. Compiled out of production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn pause_next_cancel_all_before_effect(
+        self: &Arc<Self>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.cancel_all_pause.lock().await = Some((arrival_tx, release_rx));
+        (arrival_rx, release_tx)
     }
 
     /// Inert coordinator for tests that must never invoke a title model.
@@ -190,6 +219,13 @@ impl AutoTitleCoordinator {
     }
 
     pub async fn cancel_all(&self) {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            if let Some((arrival_tx, release_rx)) = self.cancel_all_pause.lock().await.take() {
+                let _ = arrival_tx.send(());
+                let _ = release_rx.await;
+            }
+        }
         let new_root = CancellationToken::new();
         {
             let mut root = self.off_root.lock().await;

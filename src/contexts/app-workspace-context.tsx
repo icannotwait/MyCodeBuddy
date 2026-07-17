@@ -4,6 +4,7 @@ import { useEffect, type ReactNode } from "react"
 import { getGitHead } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useConversationExperienceBootstrap } from "@/stores/conversation-experience-store"
 import {
   CONVERSATION_CHANGED_EVENT,
   FOLDER_CHANGED_EVENT,
@@ -23,6 +24,8 @@ interface AppWorkspaceProviderProps {
  * poll.
  */
 export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
+  useConversationExperienceBootstrap()
+
   useEffect(() => {
     const { fetchFolders, refreshConversations } =
       useAppWorkspaceStore.getState()
