@@ -205,7 +205,9 @@ impl ChatChannelBackend for TelegramBackend {
                                             })
                                             .await;
                                         if let Err(e) = send_result {
-                                            tracing::error!("[Telegram] command_tx.send failed: {e}");
+                                            tracing::error!(
+                                                "[Telegram] command_tx.send failed: {e}"
+                                            );
                                         }
                                     } else {
                                         tracing::info!("[Telegram] update without /message/text");

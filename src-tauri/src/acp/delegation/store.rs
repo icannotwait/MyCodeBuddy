@@ -627,16 +627,17 @@ pub mod mock {
         }
 
         fn seed_if_missing(map: &mut HashMap<String, PersistedTask>, task_id: &str, child_id: i32) {
-            map.entry(task_id.to_string()).or_insert_with(|| PersistedTask {
-                task_id: task_id.to_string(),
-                child_conversation_id: child_id,
-                parent_id: Some(1),
-                agent_type: AgentType::ClaudeCode,
-                status: TaskStatus::Running,
-                error_code: None,
-                started_at: Some(Utc::now()),
-                finished_at: None,
-            });
+            map.entry(task_id.to_string())
+                .or_insert_with(|| PersistedTask {
+                    task_id: task_id.to_string(),
+                    child_conversation_id: child_id,
+                    parent_id: Some(1),
+                    agent_type: AgentType::ClaudeCode,
+                    status: TaskStatus::Running,
+                    error_code: None,
+                    started_at: Some(Utc::now()),
+                    finished_at: None,
+                });
         }
     }
 
@@ -785,9 +786,7 @@ mod tests {
         db
     }
 
-    async fn test_store_with_statuses(
-        rows: &[(&str, DelegationTaskStatus)],
-    ) -> Arc<AppDatabase> {
+    async fn test_store_with_statuses(rows: &[(&str, DelegationTaskStatus)]) -> Arc<AppDatabase> {
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-delegation-store-reconcile").await;
         let parent = conversation_service::create(
@@ -818,10 +817,9 @@ mod tests {
             if *status != DelegationTaskStatus::Running {
                 let store = DbDelegationTaskStore::new(db.clone());
                 let write = match status {
-                    DelegationTaskStatus::Completed => TerminalTaskWrite::completed(
-                        Utc::now(),
-                        ConversationStatus::PendingReview,
-                    ),
+                    DelegationTaskStatus::Completed => {
+                        TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                    }
                     DelegationTaskStatus::Failed => TerminalTaskWrite::failed(
                         "spawn_failed",
                         Utc::now(),
@@ -844,8 +842,7 @@ mod tests {
     async fn terminal_cas_has_one_winner_and_replays_persisted_truth() {
         let db = test_store_with_running_task("task-1").await;
         let store = DbDelegationTaskStore::new(db.clone());
-        let completed =
-            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview);
+        let completed = TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview);
         let canceled =
             TerminalTaskWrite::canceled("usercancel", Utc::now(), ConversationStatus::Cancelled);
 

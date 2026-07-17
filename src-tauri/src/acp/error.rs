@@ -259,10 +259,7 @@ mod tests {
         };
         let value = serde_json::to_value(&unsupported).expect("serialize");
         assert_eq!(value["code"], "terminal_shell_unsupported");
-        assert_eq!(
-            value["i18n_key"],
-            "backendErrors.terminalShellUnsupported"
-        );
+        assert_eq!(value["i18n_key"], "backendErrors.terminalShellUnsupported");
     }
 
     #[test]

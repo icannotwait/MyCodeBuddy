@@ -452,22 +452,21 @@ impl AutomationEngine {
 
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
-        let conversation_id =
-            match create_conversation_core(
-                &self.db.conn,
-                cwd.folder_id,
-                agent_type,
-                Some(title),
-                None,
-            )
-            .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    let _ = self.manager.disconnect(&conn_id).await;
-                    return Err(e.to_string());
-                }
-            };
+        let conversation_id = match create_conversation_core(
+            &self.db.conn,
+            cwd.folder_id,
+            agent_type,
+            Some(title),
+            None,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.manager.disconnect(&conn_id).await;
+                return Err(e.to_string());
+            }
+        };
 
         // Surface the produced conversation in every client's sidebar the instant
         // it exists (InProgress) — independent of the implicit upsert inside

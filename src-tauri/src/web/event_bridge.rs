@@ -4,9 +4,9 @@ use std::sync::Arc;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::sync::{broadcast, RwLock};
 
-use crate::acp::{AcpEvent, EventBusMetrics, EventEnvelope, InternalEventBus, SessionState};
 #[cfg(feature = "tauri-runtime")]
-use crate::acp::{DesktopAcpDelivery, desktop_event_batcher};
+use crate::acp::{desktop_event_batcher, DesktopAcpDelivery};
+use crate::acp::{AcpEvent, EventBusMetrics, EventEnvelope, InternalEventBus, SessionState};
 
 /// Broadcast-delivered event.
 ///
@@ -445,11 +445,7 @@ where
                     tracing::error!("[ACP] desktop delivery stopped: {error}");
                 }
             } else {
-                desktop_event_batcher::emit_legacy(
-                    app,
-                    envelope_arc.as_ref(),
-                    emitter.metrics(),
-                );
+                desktop_event_batcher::emit_legacy(app, envelope_arc.as_ref(), emitter.metrics());
             }
         }
         EventEmitter::WebOnly { bus, .. } => {

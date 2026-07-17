@@ -5973,9 +5973,7 @@ pub async fn acp_connect(
     working_dir: Option<String>,
     session_id: Option<String>,
     conversation_id: Option<i32>,
-    delegation_route_override: Option<
-        crate::acp::delegation::route::DelegationRoutePolicy,
-    >,
+    delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
     preferred_mode_id: Option<String>,
     preferred_config_values: Option<BTreeMap<String, String>>,
     manager: State<'_, ConnectionManager>,

@@ -18,6 +18,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::acp::types::AgentSkillScope;
+use crate::app_error::AppCommandError;
 use crate::commands::acp::{
     preferred_scope_skill_dir, remove_skill_entry, resolve_command_on_path, scoped_skill_dirs,
     skill_storage_spec, validate_skill_id,
@@ -26,7 +27,6 @@ use crate::commands::experts::{
     central_experts_dir, classify_link, create_link_raw, path_is_symlink, read_link_target,
     ExpertInstallStatus, ExpertLinkState, LinkOp, LinkOpResult,
 };
-use crate::app_error::AppCommandError;
 use crate::commands::folders::resolve_tree_path;
 use crate::models::agent::AgentType;
 use crate::process::tokio_command;
@@ -646,7 +646,12 @@ pub(crate) async fn officecli_install_core(
         Some(version) => format!("OfficeCLI {version} installed successfully"),
         None => "OfficeCLI installed successfully".to_string(),
     };
-    emit_officecli_install_event(emitter, &task_id, OfficecliInstallEventKind::Completed, done);
+    emit_officecli_install_event(
+        emitter,
+        &task_id,
+        OfficecliInstallEventKind::Completed,
+        done,
+    );
     Ok(info)
 }
 
@@ -1078,7 +1083,10 @@ pub async fn officecli_sync_skills() -> Result<SkillSyncReport, OfficeToolsError
                 report.errors.push(msg);
             }
             Err(e) => {
-                tracing::warn!("[office] load_skill {} could not be spawned: {e}", def.load_id);
+                tracing::warn!(
+                    "[office] load_skill {} could not be spawned: {e}",
+                    def.load_id
+                );
                 report
                     .errors
                     .push(format!("{}: command error: {e}", def.id));
@@ -1325,8 +1333,7 @@ pub async fn officecli_skill_list_all_install_statuses(
                 Err(_) => continue,
             };
             let state = classify_link(&link_path, &expected);
-            let target_path =
-                read_link_target(&link_path).map(|p| p.to_string_lossy().to_string());
+            let target_path = read_link_target(&link_path).map(|p| p.to_string_lossy().to_string());
             out.push(ExpertInstallStatus {
                 expert_id: def.id.to_string(),
                 agent_type: agent,
@@ -1493,7 +1500,10 @@ mod tests {
             .expect("batch returns Ok");
         assert_eq!(results.len(), 2);
         // Unknown skills fail their own op without aborting the batch.
-        assert!(results.iter().all(|r| !r.ok && r.error.is_some()), "{results:?}");
+        assert!(
+            results.iter().all(|r| !r.ok && r.error.is_some()),
+            "{results:?}"
+        );
     }
 
     #[tokio::test]
@@ -1596,7 +1606,10 @@ mod tests {
         let msg = officecli_run_failure_message("   ");
         assert!(!msg.is_empty());
         // No dangling "officecli error:" with nothing after it.
-        assert!(!msg.contains("officecli error:"), "no empty raw tail: {msg}");
+        assert!(
+            !msg.contains("officecli error:"),
+            "no empty raw tail: {msg}"
+        );
     }
 
     #[test]
@@ -1627,7 +1640,10 @@ mod tests {
             let github = script
                 .find("raw.githubusercontent.com")
                 .expect("github URL present");
-            assert!(mirror < github, "mirror must precede github for {os:?}: {script}");
+            assert!(
+                mirror < github,
+                "mirror must precede github for {os:?}: {script}"
+            );
         }
     }
 
@@ -1650,9 +1666,7 @@ mod tests {
 
         // The hardening preamble must run before the first network fetch, and
         // `$ProgressPreference` must also reach the vendor script run via `iex`.
-        let tls = win
-            .find("SecurityProtocol")
-            .expect("sets SecurityProtocol");
+        let tls = win.find("SecurityProtocol").expect("sets SecurityProtocol");
         let progress = win
             .find("$ProgressPreference")
             .expect("sets $ProgressPreference");
@@ -1700,17 +1714,24 @@ mod tests {
         // and `wait`s — so the tree outlives our short timeout.
         let child = tokio_command("sh")
             .arg("-c")
-            .arg(format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()))
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn sh");
 
-        let (status, _stdout, _stderr) =
-            stream_install_or_kill_tree(child, Duration::from_millis(300), "test", &EventEmitter::Noop)
-                .await
-                .expect("no io error");
+        let (status, _stdout, _stderr) = stream_install_or_kill_tree(
+            child,
+            Duration::from_millis(300),
+            "test",
+            &EventEmitter::Noop,
+        )
+        .await
+        .expect("no io error");
         assert!(status.is_none(), "expected a timeout (no exit status)");
 
         // Grandchild pid is written almost immediately; poll briefly for it.
@@ -1767,8 +1788,7 @@ mod tests {
         // `next_line()` loop would abort here and drop "third"; this must not.
         let data = b"first\n\xff\xfe garbage\nthird\n".to_vec();
         let mut seen: Vec<String> = Vec::new();
-        let collected =
-            collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
+        let collected = collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
 
         assert_eq!(seen.len(), 3, "all three lines emitted: {seen:?}");
         assert_eq!(seen[0], "first");
@@ -1789,8 +1809,7 @@ mod tests {
         // newline is still emitted (then EOF stops the loop).
         let data = b"a\r\nb\r\nno-newline".to_vec();
         let mut seen: Vec<String> = Vec::new();
-        let collected =
-            collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
+        let collected = collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
 
         assert_eq!(seen, vec!["a", "b", "no-newline"]);
         assert_eq!(collected, "a\nb\nno-newline");
@@ -1801,8 +1820,7 @@ mod tests {
         use std::io::Cursor;
         let mut seen: Vec<String> = Vec::new();
         let collected =
-            collect_lines_lossy(Cursor::new(Vec::<u8>::new()), |l| seen.push(l.to_string()))
-                .await;
+            collect_lines_lossy(Cursor::new(Vec::<u8>::new()), |l| seen.push(l.to_string())).await;
 
         assert!(seen.is_empty());
         assert!(collected.is_empty());

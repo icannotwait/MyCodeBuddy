@@ -193,19 +193,13 @@ impl EventBusMetrics {
             snapshot_cold_count: self.snapshot_cold_count.load(Ordering::Relaxed),
             forwarder_lagged_count: self.forwarder_lagged_count.load(Ordering::Relaxed),
             worker_queue_full_count: self.worker_queue_full_count.load(Ordering::Relaxed),
-            desktop_raw_envelope_count: self
-                .desktop_raw_envelope_count
-                .load(Ordering::Relaxed),
+            desktop_raw_envelope_count: self.desktop_raw_envelope_count.load(Ordering::Relaxed),
             desktop_raw_bytes: self.desktop_raw_bytes.load(Ordering::Relaxed),
-            desktop_emit_attempt_count: self
-                .desktop_emit_attempt_count
-                .load(Ordering::Relaxed),
+            desktop_emit_attempt_count: self.desktop_emit_attempt_count.load(Ordering::Relaxed),
             desktop_serialization_failure_count: self
                 .desktop_serialization_failure_count
                 .load(Ordering::Relaxed),
-            desktop_emit_failure_count: self
-                .desktop_emit_failure_count
-                .load(Ordering::Relaxed),
+            desktop_emit_failure_count: self.desktop_emit_failure_count.load(Ordering::Relaxed),
             desktop_legacy_emit_count: self.desktop_legacy_emit_count.load(Ordering::Relaxed),
             desktop_batch_count: self.desktop_batch_count.load(Ordering::Relaxed),
             desktop_batch_event_count: self.desktop_batch_event_count.load(Ordering::Relaxed),
@@ -215,9 +209,7 @@ impl EventBusMetrics {
             desktop_batch_latency_total_us: self
                 .desktop_batch_latency_total_us
                 .load(Ordering::Relaxed),
-            desktop_batch_latency_max_us: self
-                .desktop_batch_latency_max_us
-                .load(Ordering::Relaxed),
+            desktop_batch_latency_max_us: self.desktop_batch_latency_max_us.load(Ordering::Relaxed),
             desktop_queue_full_count: self.desktop_queue_full_count.load(Ordering::Relaxed),
             desktop_startup_fallback_count: self
                 .desktop_startup_fallback_count
@@ -317,10 +309,16 @@ mod tests {
     #[test]
     fn metrics_snapshot_includes_desktop_delivery_counters() {
         let metrics = EventBusMetrics::default();
-        metrics.desktop_raw_envelope_count.store(9, Ordering::Relaxed);
+        metrics
+            .desktop_raw_envelope_count
+            .store(9, Ordering::Relaxed);
         metrics.desktop_raw_bytes.store(4_096, Ordering::Relaxed);
-        metrics.desktop_emit_failure_count.store(2, Ordering::Relaxed);
-        metrics.desktop_batch_max_events.store(17, Ordering::Relaxed);
+        metrics
+            .desktop_emit_failure_count
+            .store(2, Ordering::Relaxed);
+        metrics
+            .desktop_batch_max_events
+            .store(17, Ordering::Relaxed);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.desktop_raw_envelope_count, 9);

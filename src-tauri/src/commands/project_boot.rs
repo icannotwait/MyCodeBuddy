@@ -267,13 +267,8 @@ pub async fn create_shadcn_project(
 /// The launcher only ever targets these agents (never the CLI's full 55+ agent
 /// universe via `--all`/`--agent '*'`), so installs stay scoped to tools codeg
 /// can actually orchestrate. Also the allowlist that validates incoming ids.
-const HYPERFRAMES_SKILL_AGENTS: [&str; 5] = [
-    "claude-code",
-    "codex",
-    "opencode",
-    "gemini-cli",
-    "cline",
-];
+const HYPERFRAMES_SKILL_AGENTS: [&str; 5] =
+    ["claude-code", "codex", "opencode", "gemini-cli", "cline"];
 
 /// Per-agent install status of the HyperFrames skills.
 #[derive(Debug, Clone, Serialize)]
@@ -458,7 +453,9 @@ pub async fn install_hyperframes_skills(agents: Vec<String>) -> Result<(), AppCo
     // `~/.agents/skills`, so one satisfied install covers all that read it.
     for &agent in &ran_ok {
         if !hyperframes_skill_installed(agent) {
-            tracing::info!("[ProjectBoot] {agent}: install exited 0 but no HyperFrames skill detected");
+            tracing::info!(
+                "[ProjectBoot] {agent}: install exited 0 but no HyperFrames skill detected"
+            );
             failures.push(format!(
                 "{agent}: install reported success but no HyperFrames skill was detected"
             ));

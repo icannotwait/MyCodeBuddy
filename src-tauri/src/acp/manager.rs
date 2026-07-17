@@ -16,11 +16,11 @@ use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
     SpawnHandshake,
 };
-use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
 use crate::acp::delegation::route::RouteDegradedReason;
+use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
@@ -644,7 +644,8 @@ impl ConnectionManager {
                     e.stable_code()
                 )));
             }
-            let suppression = crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+            let suppression =
+                crate::acp::connection::suppression_application_for_plan(&attempt_plan);
             crate::acp::delegation::metrics::DelegationAuditRecord::route(
                 "pending-spawn",
                 None,
@@ -872,10 +873,7 @@ impl ConnectionManager {
 
     /// Test/harness surface for [`Self::teardown_unexposed_attempt`].
     #[cfg(any(test, feature = "test-utils"))]
-    pub async fn teardown_unexposed_for_test(
-        &self,
-        connection_id: &str,
-    ) -> Result<(), AcpError> {
+    pub async fn teardown_unexposed_for_test(&self, connection_id: &str) -> Result<(), AcpError> {
         self.teardown_unexposed_attempt(connection_id).await
     }
 
@@ -3228,9 +3226,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         };
         let folder_path = working_dir_pathbuf
             .ok_or_else(|| {
-                SpawnerError::send(
-                    "child connection has no working_dir; cannot derive folder_id",
-                )
+                SpawnerError::send("child connection has no working_dir; cannot derive folder_id")
             })?
             .to_string_lossy()
             .to_string();
@@ -3256,10 +3252,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 // threshold window. Does not touch idle-sweep last_activity_at
                 // beyond whatever send_prompt already did for general liveness.
                 if let Some(state) = self.manager.get_state(conn_id).await {
-                    state
-                        .write()
-                        .await
-                        .mark_agent_activity(chrono::Utc::now());
+                    state.write().await.mark_agent_activity(chrono::Utc::now());
                 }
                 Ok(cid)
             }
@@ -7470,10 +7463,7 @@ mod tests {
             .await;
         let mut waiter = leases.register(&token).await;
         leases.mark_ready(&token).await.unwrap();
-        waiter
-            .wait_ready(Duration::from_millis(50))
-            .await
-            .unwrap();
+        waiter.wait_ready(Duration::from_millis(50)).await.unwrap();
 
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
@@ -7494,13 +7484,8 @@ mod tests {
         });
 
         let conn_id = "unexposed-1".to_string();
-        let mut state = SessionState::new(
-            conn_id.clone(),
-            AgentType::Codex,
-            None,
-            "test".into(),
-            None,
-        );
+        let mut state =
+            SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
         let state = Arc::new(RwLock::new(state));
@@ -7691,13 +7676,8 @@ mod tests {
         });
 
         let conn_id = "stuck-1".to_string();
-        let mut state = SessionState::new(
-            conn_id.clone(),
-            AgentType::Codex,
-            None,
-            "test".into(),
-            None,
-        );
+        let mut state =
+            SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
         let state = Arc::new(RwLock::new(state));
@@ -7824,9 +7804,7 @@ mod tests {
 
         for attempt in 1u8..=2 {
             attempt_n.fetch_add(1, Ordering::SeqCst);
-            seq.lock()
-                .unwrap()
-                .push(format!("attempt_{attempt}_start"));
+            seq.lock().unwrap().push(format!("attempt_{attempt}_start"));
             plans.push(plan.clone());
             match outcomes.next().unwrap() {
                 Ok(id) => {

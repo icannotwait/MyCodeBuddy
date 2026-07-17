@@ -73,18 +73,11 @@ mod tests {
     #[test]
     fn fork_request_contains_terminal_metadata() {
         let spec = test_pwsh_spec();
-        let meta = terminal_metadata(Meta::default(), &spec, adapter_for(AgentType::Codex)).unwrap();
-        let req = build_fork_session_request(
-            SessionId::new("s-fork"),
-            "/tmp/project",
-            meta,
-        );
+        let meta =
+            terminal_metadata(Meta::default(), &spec, adapter_for(AgentType::Codex)).unwrap();
+        let req = build_fork_session_request(SessionId::new("s-fork"), "/tmp/project", meta);
         let value = serde_json::to_value(req).unwrap();
-        assert_terminal_meta(
-            &value,
-            "powershell",
-            &spec.executable.to_string_lossy(),
-        );
+        assert_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
         assert_eq!(value["sessionId"], "s-fork");
     }
 

@@ -1620,7 +1620,8 @@ mod tests {
             route_plan: crate::acp::delegation::route::test_empty_route_plan(),
             origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
             route_preference: None,
-            route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 

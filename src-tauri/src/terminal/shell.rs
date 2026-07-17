@@ -397,9 +397,7 @@ pub fn configure_interactive_command(
                     cmd.args(["-l", "-i"]);
                 }
             }
-            InteractiveFlavor::Generic
-            | InteractiveFlavor::Cmd
-            | InteractiveFlavor::PowerShell => {
+            InteractiveFlavor::Generic | InteractiveFlavor::Cmd | InteractiveFlavor::PowerShell => {
                 // No-flag spawn for nu/xonsh/elvish/pwsh on Linux/etc. Most
                 // modern shells default to interactive when stdin is a TTY,
                 // so we get a usable session without guessing flag syntax.
@@ -828,7 +826,12 @@ mod tests {
             let envs: std::collections::HashMap<_, _> = cmd
                 .as_std()
                 .get_envs()
-                .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_string_lossy().into_owned(),
+                        v?.to_string_lossy().into_owned(),
+                    ))
+                })
                 .collect();
             assert_eq!(envs.get("PYTHONUTF8").map(String::as_str), Some("1"));
             assert_eq!(

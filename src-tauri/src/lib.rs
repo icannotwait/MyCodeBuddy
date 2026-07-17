@@ -90,8 +90,8 @@ mod tauri_app {
             summarize_web_auto_start_error(err)
         );
         tauri::async_runtime::spawn(async move {
-            let _ =
-                notification::send_notification(app, "DrawCode Web service".to_string(), body).await;
+            let _ = notification::send_notification(app, "DrawCode Web service".to_string(), body)
+                .await;
         });
     }
 

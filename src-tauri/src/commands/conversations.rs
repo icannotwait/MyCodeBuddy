@@ -989,10 +989,7 @@ pub(crate) fn emit_conversation_deleted(emitter: &EventEmitter, conversation_id:
 /// Emit a `conversation://changed` State carrying the exact backend patch from
 /// a successful status transition. Callers must pass the returned patch
 /// unchanged (no synthesized timestamp/token).
-pub(crate) fn emit_conversation_state(
-    emitter: &EventEmitter,
-    patch: ConversationStatePatch,
-) {
+pub(crate) fn emit_conversation_state(emitter: &EventEmitter, patch: ConversationStatePatch) {
     emit_event(
         emitter,
         CONVERSATION_CHANGED_EVENT,
@@ -1522,12 +1519,8 @@ pub async fn set_conversation_delegation_route(
     {
         let mut map = manager.connections.lock().await;
         for conn in map.values_mut() {
-            let bound = conn
-                .state
-                .try_read()
-                .ok()
-                .and_then(|s| s.conversation_id)
-                == Some(conversation_id);
+            let bound =
+                conn.state.try_read().ok().and_then(|s| s.conversation_id) == Some(conversation_id);
             if bound {
                 conn.route_preference = route_override;
             }

@@ -228,11 +228,9 @@ async fn load_persisted_route_override(
             }
             Ok(summary.delegation_route_override)
         }
-        Err(crate::db::error::DbError::Migration(msg)) if msg.contains("not found") => {
-            Err(AcpError::protocol(format!(
-                "conversation not found: {conversation_id}"
-            )))
-        }
+        Err(crate::db::error::DbError::Migration(msg)) if msg.contains("not found") => Err(
+            AcpError::protocol(format!("conversation not found: {conversation_id}")),
+        ),
         Err(e) => Err(AcpError::protocol(e.to_string())),
     }
 }
@@ -411,20 +409,15 @@ pub(crate) async fn build_acp_launch_inputs(
         crate::commands::acp::build_session_runtime_env(db, agent_type, session_id, data_dir)
             .await?;
 
-    let installed_version = crate::db::service::agent_setting_service::get_by_agent_type(
-        &db.conn,
-        agent_type,
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|s| s.installed_version);
+    let installed_version =
+        crate::db::service::agent_setting_service::get_by_agent_type(&db.conn, agent_type)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.installed_version);
 
-    let route_capability = build_route_capability_snapshot(
-        agent_type,
-        installed_version.as_deref(),
-        &runtime_env,
-    );
+    let route_capability =
+        build_route_capability_snapshot(agent_type, installed_version.as_deref(), &runtime_env);
 
     let route_preference = match route_request.origin {
         DelegationConnectionOrigin::CodegChild => None,
@@ -562,9 +555,8 @@ earlier terminal context records.\n\
         let rendered = render_terminal_prompt_context(&custom);
         assert!(rendered.contains("Selected shell: Fish\n"));
         assert!(rendered.contains("Dialect: custom\n"));
-        assert!(rendered.contains(
-            "Generate shell command lines using the selected custom shell's syntax.\n"
-        ));
+        assert!(rendered
+            .contains("Generate shell command lines using the selected custom shell's syntax.\n"));
         assert!(!rendered.contains("using custom syntax"));
     }
 
@@ -639,10 +631,7 @@ earlier terminal context records.\n\
 
         struct CollidingAdapter;
         impl AcpTerminalAdapter for CollidingAdapter {
-            fn agent_metadata(
-                &self,
-                _shell: &ResolvedShellSpec,
-            ) -> Result<Meta, AcpError> {
+            fn agent_metadata(&self, _shell: &ResolvedShellSpec) -> Result<Meta, AcpError> {
                 let mut m = Meta::default();
                 m.insert(
                     "codeg.dev/terminal".into(),
@@ -712,11 +701,7 @@ earlier terminal context records.\n\
         let dir = tempfile::tempdir().unwrap();
         // Use a PowerShell basename so the authoritative dialect is "powershell",
         // while the adapter tries to inject "cmd" / a bogus path.
-        let shell_name = if cfg!(windows) {
-            "pwsh.exe"
-        } else {
-            "pwsh"
-        };
+        let shell_name = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
         let path = make_usable_shell(dir.path(), shell_name);
 
         let mut adapter_env = BTreeMap::new();
@@ -725,10 +710,7 @@ earlier terminal context records.\n\
         adapter_env.insert("ADAPTER_EXTRA".into(), "1".into());
 
         let inputs = AcpLaunchInputs::with_placeholder_route(
-            BTreeMap::from([(
-                "COMSPEC".into(),
-                r"C:\Windows\System32\cmd.exe".into(),
-            )]),
+            BTreeMap::from([("COMSPEC".into(), r"C:\Windows\System32\cmd.exe".into())]),
             SystemTerminalSettings {
                 default_shell: Some(path.to_string_lossy().into_owned()),
             },
@@ -804,11 +786,7 @@ earlier terminal context records.\n\
                 // Fall through: host system shell unavailable; exercise via
                 // explicit usable shell path instead.
                 let dir = tempfile::tempdir().unwrap();
-                let shell_name = if cfg!(windows) {
-                    "pwsh.exe"
-                } else {
-                    "bash"
-                };
+                let shell_name = if cfg!(windows) { "pwsh.exe" } else { "bash" };
                 let path = make_usable_shell(dir.path(), shell_name);
                 let inputs = AcpLaunchInputs::with_placeholder_route(
                     BTreeMap::from([("COMSPEC".into(), original_comspec.clone())]),
@@ -818,9 +796,11 @@ earlier terminal context records.\n\
                 );
                 let mut adapter_env = BTreeMap::new();
                 adapter_env.insert("COMSPEC".into(), r"C:\evil\cmd.exe".into());
-                let err =
-                    finalize_acp_launch_config_with_adapter(inputs, &FakeAdapter { env: adapter_env })
-                        .unwrap_err();
+                let err = finalize_acp_launch_config_with_adapter(
+                    inputs,
+                    &FakeAdapter { env: adapter_env },
+                )
+                .unwrap_err();
                 match err {
                     AcpError::Protocol(msg) => assert!(msg.contains("COMSPEC")),
                     other => panic!("expected Protocol COMSPEC error, got {other}"),
@@ -849,9 +829,7 @@ earlier terminal context records.\n\
 
     #[tokio::test]
     async fn persisted_override_beats_connect_payload_but_draft_uses_payload() {
-        use crate::acp::delegation::route::{
-            DelegationRoutePolicy, DelegationRouteSource,
-        };
+        use crate::acp::delegation::route::{DelegationRoutePolicy, DelegationRouteSource};
         use crate::commands::delegation::DelegationRuntimeSnapshot;
         use crate::db::test_helpers::seed_folder;
 
@@ -875,10 +853,7 @@ earlier terminal context records.\n\
         let persisted = resolve_connect_route(
             &db.conn,
             AgentType::Codex,
-            AcpRouteRequest::root(
-                Some(conversation_id),
-                Some(DelegationRoutePolicy::Codeg),
-            ),
+            AcpRouteRequest::root(Some(conversation_id), Some(DelegationRoutePolicy::Codeg)),
             &runtime,
         )
         .await
@@ -899,11 +874,9 @@ earlier terminal context records.\n\
 
     #[tokio::test]
     async fn resolve_connect_route_rejects_mismatched_conversation_agent_type() {
-        use crate::acp::delegation::route::{
-            DelegationRoutePolicy, DelegationRouteSource,
-        };
-        use crate::db::test_helpers;
+        use crate::acp::delegation::route::{DelegationRoutePolicy, DelegationRouteSource};
         use crate::commands::delegation::DelegationRuntimeSnapshot;
+        use crate::db::test_helpers;
 
         let db = test_helpers::fresh_in_memory_db().await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/route-mismatch").await;
@@ -1085,8 +1058,8 @@ earlier terminal context records.\n\
             AcpRouteRequest::root(None, None),
             &runtime,
         )
-            .await
-            .expect("launch inputs load");
+        .await
+        .expect("launch inputs load");
         let err = finalize_acp_launch_config(inputs, AgentType::Grok).unwrap_err();
         assert!(
             matches!(
@@ -1132,8 +1105,8 @@ earlier terminal context records.\n\
             AcpRouteRequest::root(None, None),
             &runtime,
         )
-            .await
-            .expect("launch inputs load");
+        .await
+        .expect("launch inputs load");
         let err = finalize_acp_launch_config(inputs, AgentType::Grok).unwrap_err();
         assert!(
             matches!(err, AcpError::TerminalShellUnsupported { .. }),
@@ -1152,10 +1125,7 @@ earlier terminal context records.\n\
         let msg = err.to_string();
         assert!(!msg.contains("OPENAI"));
         assert!(!msg.contains("API_KEY"));
-        assert!(matches!(
-            err,
-            AcpError::TerminalShellUnavailable { .. }
-        ));
+        assert!(matches!(err, AcpError::TerminalShellUnavailable { .. }));
     }
 
     #[test]

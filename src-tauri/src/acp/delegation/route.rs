@@ -210,9 +210,9 @@ pub struct ManagedHostContractFacts {
 }
 
 fn env_has_nonempty(runtime_env: &BTreeMap<String, String>, key: &str) -> bool {
-    runtime_env.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case(key) && !v.trim().is_empty()
-    })
+    runtime_env
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case(key) && !v.trim().is_empty())
 }
 
 fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool {
@@ -252,8 +252,7 @@ pub fn classify_managed_host_contract(
 
     match agent_type {
         AgentType::Codex => {
-            let custom =
-                env_has_nonempty(runtime_env, crate::acp::codex_cli::CODEX_PATH_ENV);
+            let custom = env_has_nonempty(runtime_env, crate::acp::codex_cli::CODEX_PATH_ENV);
             ManagedHostContractFacts {
                 contract_version: Some(PINNED_CODEX_CLI_VERSION.to_string()),
                 custom_executable: custom,
@@ -262,8 +261,7 @@ pub fn classify_managed_host_contract(
         AgentType::Grok | AgentType::CodeBuddy | AgentType::ClaudeCode => {
             match installed_version.map(str::trim).filter(|s| !s.is_empty()) {
                 None => ManagedHostContractFacts {
-                    contract_version: managed_host_contract_version(agent_type)
-                        .map(str::to_string),
+                    contract_version: managed_host_contract_version(agent_type).map(str::to_string),
                     custom_executable: false,
                 },
                 Some(installed) => {
@@ -469,11 +467,7 @@ pub fn resolve_route(
             );
         }
         if !input.agent_mcp_supported {
-            return preflight_failure(
-                &input,
-                requested,
-                RouteDegradedReason::AgentMcpUnsupported,
-            );
+            return preflight_failure(&input, requested, RouteDegradedReason::AgentMcpUnsupported);
         }
     }
 
@@ -726,9 +720,8 @@ mod tests {
     fn override_feature_gate_child_and_fallback_have_stable_precedence() {
         let mut root = input(AgentType::Grok);
         root.session_override = Some(DelegationRoutePolicy::Native);
-        root.suppression = SuppressionCapability::unsupported(
-            RouteDegradedReason::NativeSuppressionUnsupported,
-        );
+        root.suppression =
+            SuppressionCapability::unsupported(RouteDegradedReason::NativeSuppressionUnsupported);
         root.agent_mcp_supported = false;
         root.companion_binary_available = false;
         let native = resolve_route(root.clone()).expect("native override");
@@ -775,9 +768,8 @@ mod tests {
     fn child_rejects_missing_capability_and_fingerprint_ignores_source_only() {
         let mut child = input(AgentType::ClaudeCode);
         child.origin = DelegationConnectionOrigin::CodegChild;
-        child.suppression = SuppressionCapability::unsupported(
-            RouteDegradedReason::NativeSuppressionUnsupported,
-        );
+        child.suppression =
+            SuppressionCapability::unsupported(RouteDegradedReason::NativeSuppressionUnsupported);
         assert_eq!(
             resolve_route(child).unwrap_err().stable_code(),
             "route_unavailable"

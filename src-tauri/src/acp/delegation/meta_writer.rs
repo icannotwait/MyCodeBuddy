@@ -274,7 +274,14 @@ mod tests {
 
     #[test]
     fn build_meta_includes_duration_on_terminal_write() {
-        let v = build_delegation_meta("completed", Some("conn-1"), Some(42), None, None, Some(1234));
+        let v = build_delegation_meta(
+            "completed",
+            Some("conn-1"),
+            Some(42),
+            None,
+            None,
+            Some(1234),
+        );
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
         assert_eq!(inner.get("duration_ms").unwrap().as_u64().unwrap(), 1234);
     }
