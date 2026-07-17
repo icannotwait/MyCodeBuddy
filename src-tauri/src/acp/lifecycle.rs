@@ -3051,12 +3051,14 @@ mod tests {
                 .unwrap();
 
         let mgr = ConnectionManager::new();
+        let conn = fake_connection_with_state("c1", Some(conv.id));
+        let mut status_rx = {
+            let state = conn.state.read().await;
+            state.event_stream().subscribe()
+        };
         {
             let mut map = mgr.connections.lock().await;
-            map.insert(
-                "c1".to_string(),
-                fake_connection_with_state("c1", Some(conv.id)),
-            );
+            map.insert("c1".to_string(), conn);
         }
 
         let metrics = Arc::new(EventBusMetrics::default());
@@ -3093,22 +3095,34 @@ mod tests {
             },
         }));
 
-        // Wait for the worker to fully drain. The TurnComplete is at the
-        // tail of the queue, so observing PendingReview proves nothing
-        // before it was dropped.
-        let observed = poll_status(
-            &db,
-            conv.id,
-            ConversationStatus::PendingReview,
-            Duration::from_secs(2),
-        )
-        .await;
+        // The private-stream acknowledgement is emitted after the worker
+        // commits the trailing event. `dispatcher.await` only performs
+        // dispatcher cleanup; it does not prove worker drain completion.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = status_rx
+                    .recv()
+                    .await
+                    .expect("private stream stays open until status acknowledgement");
+                if matches!(
+                    &envelope.payload,
+                    AcpEvent::ConversationStatusChanged {
+                        conversation_id,
+                        status: ConversationStatus::PendingReview,
+                    } if *conversation_id == conv.id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("trailing TurnComplete should commit and emit PendingReview");
 
         drop(bus);
         let _ = dispatcher.await;
 
         assert_eq!(
-            observed,
+            read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview,
             "TurnComplete at the tail of a 200-event burst MUST be delivered \
              (regression test for `try_send` drop bug)"
