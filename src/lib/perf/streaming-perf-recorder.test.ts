@@ -344,65 +344,73 @@ describe("StreamingPerfRecorder", () => {
           .join("")
       )
 
+    // Default recorders schedule drift timers via window.setTimeout when
+    // longtask is unavailable; always stop so timers cannot fire after teardown.
     const recorder = new StreamingPerfRecorder()
-    recorder.start({
-      ...runMetadata,
-      expectedEvents: 2,
-      expectedTextSha256: expectedHash,
-    })
-    recorder.markFrontendEventsAccepted(2)
-    recorder.appendFrontendText(expectedText)
-    const okHash = await recorder.computeFrontendTextSha256()
-    recorder.setIntegrity({
-      expectedEvents: 2,
-      appliedEvents: recorder.getFrontendAcceptedEvents(),
-      finalTextSha256: okHash,
-    })
-    expect(recorder.buildReport().integrity.ok).toBe(true)
-
-    // Duplicate marks must fail integrity even when counts/hash match.
-    recorder.markFrontendDuplicate()
-    expect(recorder.buildReport().integrity.ok).toBe(false)
-    expect(recorder.buildReport().integrity.duplicateCount).toBe(1)
-
-    // Gaps also fail.
     const recorder2 = new StreamingPerfRecorder()
-    recorder2.start({
-      ...runMetadata,
-      expectedEvents: 2,
-      expectedTextSha256: expectedHash,
-    })
-    recorder2.markFrontendEventsAccepted(2)
-    recorder2.appendFrontendText(expectedText)
-    recorder2.markFrontendSequenceGap()
-    recorder2.setIntegrity({
-      expectedEvents: 2,
-      appliedEvents: 2,
-      finalTextSha256: await recorder2.computeFrontendTextSha256(),
-    })
-    expect(recorder2.buildReport().integrity.ok).toBe(false)
-    expect(recorder2.buildReport().integrity.gapCount).toBe(1)
-
-    // Backend-looking counts without frontend text must fail.
     const recorder3 = new StreamingPerfRecorder()
-    recorder3.start({
-      ...runMetadata,
-      expectedEvents: 2,
-      expectedTextSha256: expectedHash,
-    })
-    // Pretend someone set applied from backend emit without accepting.
-    recorder3.setIntegrity({
-      expectedEvents: 2,
-      appliedEvents: 2,
-      finalTextSha256: expectedHash, // spoofed — text never observed
-    })
-    // appliedEvents was never driven by markFrontendEventsAccepted → still
-    // fails because frontend text digest is empty unless appendFrontendText ran.
-    // Here spoofed hash equals expected but we require non-empty from compute
-    // path in harness; buildReport accepts setIntegrity hash. Explicit check:
-    // zero frontendAccepted still allows setIntegrity override — harness must
-    // use getFrontendAcceptedEvents. Simulate harness discipline:
-    expect(recorder3.getFrontendAcceptedEvents()).toBe(0)
+    try {
+      recorder.start({
+        ...runMetadata,
+        expectedEvents: 2,
+        expectedTextSha256: expectedHash,
+      })
+      recorder.markFrontendEventsAccepted(2)
+      recorder.appendFrontendText(expectedText)
+      const okHash = await recorder.computeFrontendTextSha256()
+      recorder.setIntegrity({
+        expectedEvents: 2,
+        appliedEvents: recorder.getFrontendAcceptedEvents(),
+        finalTextSha256: okHash,
+      })
+      expect(recorder.buildReport().integrity.ok).toBe(true)
+
+      // Duplicate marks must fail integrity even when counts/hash match.
+      recorder.markFrontendDuplicate()
+      expect(recorder.buildReport().integrity.ok).toBe(false)
+      expect(recorder.buildReport().integrity.duplicateCount).toBe(1)
+
+      // Gaps also fail.
+      recorder2.start({
+        ...runMetadata,
+        expectedEvents: 2,
+        expectedTextSha256: expectedHash,
+      })
+      recorder2.markFrontendEventsAccepted(2)
+      recorder2.appendFrontendText(expectedText)
+      recorder2.markFrontendSequenceGap()
+      recorder2.setIntegrity({
+        expectedEvents: 2,
+        appliedEvents: 2,
+        finalTextSha256: await recorder2.computeFrontendTextSha256(),
+      })
+      expect(recorder2.buildReport().integrity.ok).toBe(false)
+      expect(recorder2.buildReport().integrity.gapCount).toBe(1)
+
+      // Backend-looking counts without frontend text must fail.
+      recorder3.start({
+        ...runMetadata,
+        expectedEvents: 2,
+        expectedTextSha256: expectedHash,
+      })
+      // Pretend someone set applied from backend emit without accepting.
+      recorder3.setIntegrity({
+        expectedEvents: 2,
+        appliedEvents: 2,
+        finalTextSha256: expectedHash, // spoofed — text never observed
+      })
+      // appliedEvents was never driven by markFrontendEventsAccepted → still
+      // fails because frontend text digest is empty unless appendFrontendText ran.
+      // Here spoofed hash equals expected but we require non-empty from compute
+      // path in harness; buildReport accepts setIntegrity hash. Explicit check:
+      // zero frontendAccepted still allows setIntegrity override — harness must
+      // use getFrontendAcceptedEvents. Simulate harness discipline:
+      expect(recorder3.getFrontendAcceptedEvents()).toBe(0)
+    } finally {
+      recorder.stop()
+      recorder2.stop()
+      recorder3.stop()
+    }
   })
 
   it("records input-to-paint samples via MessageChannel probe", () => {
