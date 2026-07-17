@@ -29,6 +29,8 @@ const h = vi.hoisted(() => ({
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
   conversationExperienceBootstrap: vi.fn(),
+  delegationProfileBootstrap: vi.fn(),
+  useAcpAgents: vi.fn(() => ({ agents: [], fresh: false, refresh: vi.fn() })),
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -80,6 +82,19 @@ vi.mock("@/lib/api", () => ({
 // overwriting this suite's intentionally narrow conversation/folder handler capture.
 vi.mock("@/stores/conversation-experience-store", () => ({
   useConversationExperienceBootstrap: h.conversationExperienceBootstrap,
+}))
+
+// Same for the profile-catalog bootstrap: keep one handler per channel.
+vi.mock("@/stores/delegation-profile-store", () => ({
+  useDelegationProfileBootstrap: h.delegationProfileBootstrap,
+  useDelegationProfileStore: {
+    getState: () => ({ ready: false }),
+  },
+}))
+
+vi.mock("@/hooks/use-acp-agents", () => ({
+  useAcpAgents: h.useAcpAgents,
+  selectAcpAgentsFresh: () => false,
 }))
 
 function makeSummary(
@@ -196,6 +211,8 @@ beforeEach(() => {
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
   h.conversationExperienceBootstrap.mockClear()
+  h.delegationProfileBootstrap.mockClear()
+  h.useAcpAgents.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -211,6 +228,12 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
   it("mounts conversation experience bootstrap on provider mount", async () => {
     await mountProvider()
     expect(h.conversationExperienceBootstrap).toHaveBeenCalled()
+  })
+
+  it("mounts acp agents and delegation profile bootstrap on provider mount", async () => {
+    await mountProvider()
+    expect(h.useAcpAgents).toHaveBeenCalled()
+    expect(h.delegationProfileBootstrap).toHaveBeenCalled()
   })
 
   it("inserts a new root conversation, prepending most-recent-first", async () => {

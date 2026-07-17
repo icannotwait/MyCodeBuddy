@@ -80,6 +80,25 @@ pub struct DelegationProfileDocument {
     pub profiles: Vec<DelegationProfile>,
 }
 
+/// Revisioned snapshot of profiles + effective enabled flag for mention /
+/// reference-search bootstrap. Profile setter inputs remain
+/// [`DelegationProfileDocument`]; this is the read/event wire type only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationProfileCatalog {
+    #[serde(default)]
+    pub profiles: Vec<DelegationProfile>,
+    pub delegation_enabled: bool,
+    pub revision: u64,
+}
+
+/// Result of a catalog-affecting mutation: the field-specific value plus the
+/// post-commit catalog snapshot (including the advanced revision).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationMutation<T> {
+    pub value: T,
+    pub catalog: DelegationProfileCatalog,
+}
+
 /// Everything the broker needs to dispatch a single delegation call.
 ///
 /// `parent_connection_id` is the codeg-internal ACP connection UUID for the

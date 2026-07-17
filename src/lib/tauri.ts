@@ -67,6 +67,7 @@ import type {
   McpMarketplaceProvider,
   McpMarketplaceItem,
   McpMarketplaceServerDetail,
+  DelegationProfileCatalog,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -1280,4 +1281,9 @@ export async function terminalKill(terminalId: string): Promise<void> {
 
 export async function terminalList(): Promise<TerminalInfo[]> {
   return invoke("terminal_list")
+}
+
+/** Desktop invoke facade for the revisioned delegation profile catalog. */
+export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
+  return invoke("get_delegation_profile_catalog")
 }

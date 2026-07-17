@@ -33,7 +33,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   type DelegationSettings,
   getDelegationSettings,
-  getDelegationProfiles,
+  getDelegationProfileCatalog,
   setDelegationBundle,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
@@ -96,11 +96,11 @@ export function DelegationSettingsSection() {
 
   useEffect(() => {
     let cancelled = false
-    void Promise.all([getDelegationSettings(), getDelegationProfiles()])
-      .then(([s, profileDocument]) => {
+    void Promise.all([getDelegationSettings(), getDelegationProfileCatalog()])
+      .then(([s, catalog]) => {
         if (cancelled) return
         applySettings(s)
-        setProfiles(profileDocument.profiles)
+        setProfiles(catalog.profiles)
         setLoadError(null)
       })
       .catch((err: unknown) => {
@@ -147,12 +147,12 @@ export function DelegationSettingsSection() {
       // Re-sync from server so a failed partial attempt never leaves the
       // form claiming dirty state that no longer matches persistence.
       try {
-        const [s, profileDocument] = await Promise.all([
+        const [s, catalog] = await Promise.all([
           getDelegationSettings(),
-          getDelegationProfiles(),
+          getDelegationProfileCatalog(),
         ])
         applySettings(s)
-        setProfiles(profileDocument.profiles)
+        setProfiles(catalog.profiles)
       } catch (reloadErr: unknown) {
         toast.error(t("loadFailed", { detail: toErrorMessage(reloadErr) }))
       }

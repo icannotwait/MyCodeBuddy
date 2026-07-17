@@ -1430,6 +1430,11 @@ pub struct DelegationBroker {
     tool_calls: Arc<ToolCallTracker>,
     pre_canceled_handles: Arc<PreCanceledHandles>,
     config: Arc<Mutex<DelegationConfig>>,
+    /// Orders persisted configuration mutations (settings / profiles / bundle)
+    /// across concurrent desktop and HTTP writers. Separate from `config` so
+    /// cores can hold this guard while calling `set_config` / `set_profiles`
+    /// (which take the config lock). Never acquired inside those setters.
+    config_mutation: Arc<Mutex<()>>,
     /// Parent-connection → profile UUIDs mentioned in the latest user prompt.
     /// When non-empty, `start_delegation` enforces profile routing **per
     /// `req.agent_type`**: only UUIDs whose live config profile matches that
@@ -1530,6 +1535,7 @@ impl DelegationBroker {
             tool_calls: Arc::new(ToolCallTracker::default()),
             pre_canceled_handles: Arc::new(PreCanceledHandles::default()),
             config: Arc::new(Mutex::new(DelegationConfig::default())),
+            config_mutation: Arc::new(Mutex::new(())),
             mandatory_profile_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             result_notify: Arc::new(Notify::new()),
             status_version: Arc::new(AtomicU64::new(0)),
@@ -1542,6 +1548,14 @@ impl DelegationBroker {
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Acquire the process-local configuration mutation gate. Callers that
+    /// persist settings/profiles must hold this through the write transaction
+    /// and the subsequent live-config application so concurrent writers cannot
+    /// apply an older catalog after a newer commit.
+    pub async fn configuration_mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.config_mutation.lock().await
     }
 
     /// Wire process-local reliability metrics (production: shared AppState Arc).

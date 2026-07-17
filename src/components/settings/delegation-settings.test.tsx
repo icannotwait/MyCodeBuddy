@@ -6,7 +6,7 @@ import { toast } from "sonner"
 vi.mock("@/lib/api", () => ({
   getDelegationSettings: vi.fn(),
   setDelegationSettings: vi.fn(),
-  getDelegationProfiles: vi.fn(),
+  getDelegationProfileCatalog: vi.fn(),
   setDelegationProfiles: vi.fn(),
   setDelegationBundle: vi.fn(),
   describeAgentOptions: vi.fn(),
@@ -24,13 +24,13 @@ import enMessages from "@/i18n/messages/en.json"
 import {
   getDelegationSettings,
   setDelegationBundle,
-  getDelegationProfiles,
+  getDelegationProfileCatalog,
   type DelegationSettings,
 } from "@/lib/api"
 
 const mockGetDelegationSettings = vi.mocked(getDelegationSettings)
 const mockSetDelegationBundle = vi.mocked(setDelegationBundle)
-const mockGetDelegationProfiles = vi.mocked(getDelegationProfiles)
+const mockGetDelegationProfileCatalog = vi.mocked(getDelegationProfileCatalog)
 const mockToastError = vi.mocked(toast.error)
 
 function renderWithIntl() {
@@ -65,7 +65,11 @@ beforeEach(() => {
     settings: bundle.settings,
     profiles: bundle.profiles,
   }))
-  mockGetDelegationProfiles.mockReset().mockResolvedValue({ profiles: [] })
+  mockGetDelegationProfileCatalog.mockReset().mockResolvedValue({
+    profiles: [],
+    delegation_enabled: false,
+    revision: 0,
+  })
   mockToastError.mockReset()
 })
 
@@ -219,8 +223,12 @@ describe("DelegationSettingsSection", () => {
     mockGetDelegationSettings
       .mockResolvedValueOnce(settings({ enabled: true }))
       .mockRejectedValueOnce(new Error("reload boom"))
-    mockGetDelegationProfiles
-      .mockResolvedValueOnce({ profiles: [] })
+    mockGetDelegationProfileCatalog
+      .mockResolvedValueOnce({
+        profiles: [],
+        delegation_enabled: true,
+        revision: 0,
+      })
       .mockRejectedValueOnce(new Error("reload boom"))
     mockSetDelegationBundle.mockRejectedValueOnce(new Error("persist boom"))
 

@@ -74,6 +74,10 @@ pub fn build_router(
             post(handlers::delegation::get_delegation_profiles),
         )
         .route(
+            "/get_delegation_profile_catalog",
+            post(handlers::delegation::get_delegation_profile_catalog),
+        )
+        .route(
             "/set_delegation_profiles",
             post(handlers::delegation::set_delegation_profiles),
         )

@@ -16,6 +16,7 @@ import type {
   AcpPromptContext,
   AgentDelegationDefaults,
   ConversationExperienceSettings,
+  DelegationProfileCatalog,
   DelegationProfileDocument,
   DelegationRoutePolicy,
   AgentOptionsSnapshot,
@@ -3352,6 +3353,10 @@ export async function setDelegationSettings(
 
 export async function getDelegationProfiles(): Promise<DelegationProfileDocument> {
   return getTransport().call("get_delegation_profiles")
+}
+
+export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
+  return getTransport().call("get_delegation_profile_catalog")
 }
 
 export async function setDelegationProfiles(

@@ -1017,6 +1017,19 @@ export interface DelegationProfileDocument {
   profiles: DelegationProfile[]
 }
 
+/** Revisioned delegation profile catalog for mention bootstrap. Mirrors Rust
+ *  `DelegationProfileCatalog`. */
+export interface DelegationProfileCatalog {
+  profiles: DelegationProfile[]
+  delegation_enabled: boolean
+  revision: number
+}
+
+/** Backend side-channel for the revisioned profile catalog. Mirrors Rust
+ *  `DELEGATION_PROFILE_CATALOG_CHANGED_EVENT`. */
+export const DELEGATION_PROFILE_CATALOG_CHANGED_EVENT =
+  "delegation-profile-catalog://changed"
+
 // ─── Automations ───────────────────────────────────────────────────────────
 // Mirrors src-tauri/src/models/automation.rs. Wire form is snake_case (serde
 // default), matching AgentDelegationDefaults.
