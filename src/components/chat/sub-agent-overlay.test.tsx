@@ -100,13 +100,32 @@ describe("SubAgentOverlay", () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it("collapses to a pill summarizing the count by default", () => {
+  it("expands by default and lists every sub-agent", () => {
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
       source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
     ]
     renderWithIntl(
       <SubAgentOverlay delegations={delegations} overlayKey="k-1" />
+    )
+    // Header title + both rows (one per delegation).
+    expect(screen.getByText("Sub-agents")).toBeInTheDocument()
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
+    expect(screen.getByText("Investigate flaky test")).toBeInTheDocument()
+    expect(screen.getByText("Write the fix")).toBeInTheDocument()
+  })
+
+  it("collapses to a pill summarizing the count when defaultExpanded is false", () => {
+    const delegations = [
+      source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+      source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
+    ]
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={delegations}
+        overlayKey="k-collapsed"
+        defaultExpanded={false}
+      />
     )
     expect(screen.getByText("Sub-agents 2")).toBeInTheDocument()
     // Rows are hidden while collapsed.
@@ -119,7 +138,11 @@ describe("SubAgentOverlay", () => {
       source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
     ]
     renderWithIntl(
-      <SubAgentOverlay delegations={delegations} overlayKey="k-2" />
+      <SubAgentOverlay
+        delegations={delegations}
+        overlayKey="k-2"
+        defaultExpanded={false}
+      />
     )
     fireEvent.click(screen.getByText("Sub-agents 2").closest("button")!)
 
