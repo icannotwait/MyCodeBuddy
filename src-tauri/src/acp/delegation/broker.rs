@@ -57,6 +57,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
+use crate::acp::delegation::attention::{
+    DelegationAttentionStore, NoopDelegationAttentionStore,
+};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -70,7 +73,8 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationRequest, DelegationTaskReport, ObservationSnapshot, TaskObservation, TaskStatus,
+    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
+    ObservationSnapshot, TaskObservation, TaskStatus,
 };
 use crate::acp::types::DelegationResultSummary;
 use crate::db::entities::conversation::ConversationStatus;
@@ -1030,6 +1034,7 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
 /// AFTER the lock is released, so a status query never nests the pending lock
 /// inside another await. This is the same lock-ordering the single-task path
 /// has always used; batching just captures it per id.
+#[derive(Clone)]
 enum StatusClass {
     /// Terminal/owned-cached, or a cross-parent `unknown` — the report is final.
     Settled(DelegationTaskReport),
@@ -1368,6 +1373,10 @@ pub struct DelegationBroker {
     /// Process-local reliability metrics (accepted/terminal/wait). Shared with
     /// AppState; tests default to a private Arc.
     metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    /// Open parent-decision (attention) rows for Join. Defaults to no-op;
+    /// production and Join-focused tests inject a real/memory store via
+    /// [`Self::with_attention_store`].
+    attention_store: Arc<dyn DelegationAttentionStore>,
     /// Count of persistence-retry workers actually spawned (single-flight
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1437,6 +1446,7 @@ impl DelegationBroker {
             supervisor_wake: Arc::new(std::sync::Mutex::new(SupervisorWake::noop())),
             supervisor_wake_rx: Arc::new(std::sync::Mutex::new(None)),
             metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            attention_store: Arc::new(NoopDelegationAttentionStore),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -1448,6 +1458,15 @@ impl DelegationBroker {
         metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
     ) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Inject the attention store used by Join (`list_open_for_tasks`).
+    pub fn with_attention_store(
+        mut self,
+        attention_store: Arc<dyn DelegationAttentionStore>,
+    ) -> Self {
+        self.attention_store = attention_store;
         self
     }
 
@@ -3862,6 +3881,117 @@ impl DelegationBroker {
             .await
     }
 
+    /// Event-driven Join: park until every requested task is non-Running, any
+    /// still-Running requested task has an open attention request, or the
+    /// Broker cannot wait safely (unknown / cold NotInMemory+Running /
+    /// attention-store error / missing parent conversation).
+    ///
+    /// Arm `result_notify` **before** the snapshot so a terminal or attention
+    /// wake between snapshot and await is not lost. Unrelated wakes recheck the
+    /// predicate and re-park. Does not consult observation state or
+    /// `status_version`. Does not cancel tasks when the waiter is dropped.
+    pub async fn join_tasks_status(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_ids: &[String],
+    ) -> DelegationStatusBatch {
+        let mut woke_from_hint = false;
+        if task_ids.is_empty() {
+            return DelegationStatusBatch::joined(
+                Vec::new(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            );
+        }
+        let Some(parent_conversation_id) = parent_conversation_id else {
+            let tasks = task_ids.iter().map(|id| unknown_report(id)).collect();
+            return DelegationStatusBatch::joined(
+                tasks,
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            );
+        };
+
+        loop {
+            let notified = self.result_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let classes = {
+                let inner = self.pending.inner.lock().await;
+                task_ids
+                    .iter()
+                    .map(|id| classify_locked(&inner, parent_connection_id, id))
+                    .collect::<Vec<_>>()
+            };
+            let class_views = classes.clone();
+            let tasks = self
+                .assemble_reports(Some(parent_conversation_id), task_ids, classes)
+                .await;
+            let mut attention_requests = match self
+                .attention_store
+                .list_open_for_tasks(parent_conversation_id, task_ids)
+                .await
+            {
+                Ok(requests) => requests,
+                Err(_error) => {
+                    tracing::error!("[delegation] Join attention snapshot failed");
+                    return DelegationStatusBatch::joined(
+                        tasks,
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    );
+                }
+            };
+            // A terminal transition and its attention closure are separate
+            // conditional writes. Exclude a stale open row unless this same
+            // snapshot still reports that task as Running.
+            attention_requests.retain(|request| {
+                tasks.iter().any(|task| {
+                    task.task_id.as_deref() == Some(request.task_id.as_str())
+                        && task.status == TaskStatus::Running
+                })
+            });
+
+            let unavailable = tasks.iter().any(|task| task.status == TaskStatus::Unknown)
+                || class_views.iter().zip(&tasks).any(|(class, task)| {
+                    matches!(class, StatusClass::NotInMemory)
+                        && task.status == TaskStatus::Running
+                });
+            if unavailable {
+                return DelegationStatusBatch::joined(
+                    tasks,
+                    DelegationWakeReason::Unavailable,
+                    attention_requests,
+                );
+            }
+            if !attention_requests.is_empty() {
+                return DelegationStatusBatch::joined(
+                    tasks,
+                    DelegationWakeReason::AttentionRequired,
+                    attention_requests,
+                );
+            }
+            if tasks.iter().all(|task| task.status != TaskStatus::Running) {
+                return DelegationStatusBatch::joined(
+                    tasks,
+                    DelegationWakeReason::AllTerminal,
+                    Vec::new(),
+                );
+            }
+
+            if woke_from_hint {
+                tracing::trace!(
+                    task_count = task_ids.len(),
+                    "[delegation] Join notification did not satisfy its predicate"
+                );
+            }
+            notified.await;
+            woke_from_hint = true;
+        }
+    }
+
     /// Finish a batch status pass: resolve each [`StatusClass`] into a final
     /// report AFTER the pending lock is released. `Running` ids get their latest
     /// live reply + observation cache attached; `NotInMemory` ids fall back to
@@ -4071,6 +4201,49 @@ impl DelegationBroker {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn pending_count(&self) -> usize {
         self.pending.inner.lock().await.running.len()
+    }
+
+    /// Wake Join / status waiters as if an observation transition fired.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn notify_observation_changed_for_test(&self) {
+        self.result_notify.notify_waiters();
+    }
+
+    /// Wake Join / status waiters as if `task_id` settled (id is unused; global
+    /// notify matches production terminal wakes).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn notify_result_for_test(&self, _task_id: &str) {
+        self.result_notify.notify_waiters();
+    }
+
+    /// Wake Join waiters as if an attention open/close transition fired.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn notify_attention_changed_for_test(&self) {
+        self.result_notify.notify_waiters();
+    }
+
+    /// Insert a live running task under `parent_connection_id` without going
+    /// through spawn (cross-parent ownership tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn seed_live_task_for_test(
+        &self,
+        parent_connection_id: &str,
+        task_id: &str,
+    ) -> String {
+        let mut inner = self.pending.inner.lock().await;
+        inner.running.insert(
+            task_id.to_string(),
+            RunningTask {
+                child_connection_id: format!("child-of-{task_id}"),
+                child_conversation_id: 99,
+                parent_connection_id: parent_connection_id.to_string(),
+                parent_tool_use_id: format!("pt-{task_id}"),
+                agent_type: AgentType::ClaudeCode,
+                external_handle: None,
+                started_at: Instant::now(),
+            },
+        );
+        task_id.to_string()
     }
 
     /// Count of cached completed results across all parents.
@@ -4647,6 +4820,287 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].status, TaskStatus::Completed);
         assert_eq!(reports[0].text.as_deref(), Some("first-done"));
+        assert_eq!(reports[1].status, TaskStatus::Running);
+    }
+
+    // -- Event-driven Join (Task 4) ----------------------------------------
+
+    async fn within<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(1), future)
+            .await
+            .expect("operation should finish within one second")
+    }
+
+    async fn join_broker() -> (
+        DelegationBroker,
+        Arc<MockSpawner>,
+        Arc<crate::acp::delegation::attention::mock::MemoryDelegationAttentionStore>,
+    ) {
+        use crate::acp::delegation::attention::{
+            mock::MemoryDelegationAttentionStore, DelegationAttentionStore,
+        };
+        let spawner = Arc::new(MockSpawner::new());
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = DelegationBroker::new(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
+        enable_delegation(&broker).await;
+        (broker, spawner, attention)
+    }
+
+    async fn spawn_running(
+        broker: &DelegationBroker,
+        spawner: &MockSpawner,
+        parent_conn: &str,
+        parent_conv: i32,
+        child_conn: &str,
+    ) -> String {
+        spawner.queue_spawn(Ok(child_conn.into())).await;
+        // Distinct child conversation ids per child connection name.
+        let child_conv = child_conn.bytes().map(|b| b as i32).sum::<i32>().abs() + 1;
+        spawner.queue_send(Ok(child_conv)).await;
+        let mut req = request(parent_conv, child_conn);
+        req.parent_connection_id = parent_conn.into();
+        broker
+            .start_delegation(req)
+            .await
+            .task_id
+            .expect("running task carries an id")
+    }
+
+    async fn complete(broker: &DelegationBroker, task_id: &str, text: &str) {
+        use crate::acp::delegation::types::DelegationSuccess;
+        broker
+            .complete_call(
+                task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: text.into(),
+                    child_conversation_id: 1,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 1,
+                    token_usage: None,
+                }),
+            )
+            .await;
+    }
+
+    fn dt(s: &str) -> chrono::DateTime<Utc> {
+        s.parse().expect("valid RFC3339 timestamp")
+    }
+
+    fn valid_attention(
+        task_id: &str,
+        parent_conv: i32,
+        child_conv: i32,
+        tool: &str,
+        message: &str,
+    ) -> crate::acp::delegation::attention::NewAttentionRequest {
+        valid_attention_at(task_id, parent_conv, child_conv, tool, message, Utc::now())
+    }
+
+    fn valid_attention_at(
+        task_id: &str,
+        parent_conv: i32,
+        child_conv: i32,
+        tool: &str,
+        message: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> crate::acp::delegation::attention::NewAttentionRequest {
+        crate::acp::delegation::attention::NewAttentionRequest {
+            task_id: task_id.to_string(),
+            parent_conversation_id: parent_conv,
+            child_conversation_id: child_conv,
+            child_tool_call_id: tool.to_string(),
+            message: message.to_string(),
+            created_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn join_holds_partial_completion_and_returns_one_ordered_final_batch() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        let (broker, spawner, attention) = join_broker().await;
+        let first = spawn_running(&broker, &spawner, "parent", 1, "child-a").await;
+        let second = spawn_running(&broker, &spawner, "parent", 1, "child-b").await;
+        let ids = vec![second.clone(), first.clone()];
+
+        let mut join = tokio::spawn({
+            let broker = broker.clone();
+            let ids = ids.clone();
+            async move { broker.join_tasks_status("parent", Some(1), &ids).await }
+        });
+        tokio::task::yield_now().await;
+        complete(&broker, &first, "first result").await;
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut join)
+            .await
+            .is_err());
+
+        complete(&broker, &second, "second result").await;
+        let batch = within(join).await.unwrap();
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
+        assert_eq!(
+            batch
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(batch
+            .tasks
+            .iter()
+            .all(|task| task.status == TaskStatus::Completed));
+        assert_eq!(batch.attention_requests, Some(Vec::new()));
+        assert!(attention
+            .list_open_for_tasks(1, &ids)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_returns_for_attention_before_or_after_wait_but_not_for_noise() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        let (broker, spawner, attention) = join_broker().await;
+        let task = spawn_running(&broker, &spawner, "parent", 1, "child-a").await;
+        broker.notify_observation_changed_for_test();
+        broker.notify_result_for_test("unrelated-task");
+
+        let ids = vec![task.clone()];
+        let mut parked = tokio::spawn({
+            let broker = broker.clone();
+            let ids = ids.clone();
+            async move { broker.join_tasks_status("parent", Some(1), &ids).await }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut parked)
+            .await
+            .is_err());
+
+        attention
+            .open_or_recover(valid_attention(&task, 1, 2, "tc-1", "Choose A or B"))
+            .await
+            .unwrap();
+        broker.notify_attention_changed_for_test();
+        let batch = within(parked).await.unwrap();
+        assert_eq!(
+            batch.wake_reason,
+            Some(DelegationWakeReason::AttentionRequired)
+        );
+        assert_eq!(batch.attention_requests.as_ref().unwrap().len(), 1);
+
+        let immediate = within(broker.join_tasks_status("parent", Some(1), &ids)).await;
+        assert_eq!(
+            immediate.wake_reason,
+            Some(DelegationWakeReason::AttentionRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn join_fails_open_for_unknown_or_cold_running_without_changing_task_state() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let (broker, _spawner, _attention) = join_broker().await;
+        let unknown = within(
+            broker.join_tasks_status("parent", Some(1), &["missing".to_string()]),
+        )
+        .await;
+        assert_eq!(unknown.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(unknown.tasks[0].status, TaskStatus::Unknown);
+
+        let foreign_task = broker
+            .seed_live_task_for_test("other-parent", "foreign")
+            .await;
+        let foreign = within(broker.join_tasks_status("parent", Some(1), &[foreign_task])).await;
+        assert_eq!(foreign.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(foreign.tasks[0].status, TaskStatus::Unknown);
+
+        let store = Arc::new(MockTaskStore::with_running("cold-running", 42));
+        let cold_broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>);
+        enable_delegation(&cold_broker).await;
+        let cold = within(
+            cold_broker.join_tasks_status("parent", Some(1), &["cold-running".to_string()]),
+        )
+        .await;
+        assert_eq!(cold.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(cold.tasks[0].status, TaskStatus::Running);
+        assert_eq!(
+            store.load("cold-running").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn join_returns_every_open_requested_attention_in_creation_order() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+        let (broker, spawner, attention) = join_broker().await;
+        let first = spawn_running(&broker, &spawner, "parent", 1, "child-a").await;
+        let second = spawn_running(&broker, &spawner, "parent", 1, "child-b").await;
+        let (second_open, first_open) = tokio::join!(
+            attention.open_or_recover(valid_attention_at(
+                &second,
+                1,
+                3,
+                "tc-2",
+                "Second question",
+                dt("2026-07-17T10:00:02Z"),
+            )),
+            attention.open_or_recover(valid_attention_at(
+                &first,
+                1,
+                2,
+                "tc-1",
+                "First question",
+                dt("2026-07-17T10:00:01Z"),
+            )),
+        );
+        second_open.unwrap();
+        first_open.unwrap();
+
+        let batch = within(broker.join_tasks_status("parent", Some(1), &[second, first])).await;
+        assert_eq!(
+            batch.wake_reason,
+            Some(DelegationWakeReason::AttentionRequired)
+        );
+        assert_eq!(
+            batch
+                .attention_requests
+                .unwrap()
+                .iter()
+                .map(|request| request.message.as_str())
+                .collect::<Vec<_>>(),
+            ["First question", "Second question"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_terminal_batch_still_returns_when_any_sibling_finishes() {
+        let (broker, spawner, _attention) = join_broker().await;
+        let first = spawn_running(&broker, &spawner, "parent", 1, "child-a").await;
+        let second = spawn_running(&broker, &spawner, "parent", 1, "child-b").await;
+        let ids = vec![first.clone(), second];
+        let wait = tokio::spawn({
+            let broker = broker.clone();
+            let ids = ids.clone();
+            async move {
+                broker
+                    .get_tasks_status("parent", Some(1), &ids, StatusWait::Terminal)
+                    .await
+            }
+        });
+        complete(&broker, &first, "done").await;
+        let reports = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reports[0].status, TaskStatus::Completed);
         assert_eq!(reports[1].status, TaskStatus::Running);
     }
 

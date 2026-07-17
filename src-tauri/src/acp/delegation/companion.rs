@@ -46,8 +46,9 @@ use crate::acp::delegation::transport::{
     client_feedback_round_trip, client_round_trip, client_session_round_trip,
     client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
+use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -75,6 +76,14 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
 /// a single embedded copy — no runtime file IO, no version skew with the
 /// broker's [`super::types::DelegationRequest`].
 pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
+
+/// Pre-coordination `delegate_to_agent` description restored when
+/// `coordination_v1` is off so old connections never see Join instructions.
+pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work before collecting results. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.";
+
+/// Pre-coordination `get_delegation_status` description restored when
+/// `coordination_v1` is off (also strips `return_when` from the schema).
+pub const LEGACY_STATUS_DESCRIPTION: &str = "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.";
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -135,6 +144,9 @@ pub fn err(id: Value, code: i64, message: impl Into<String>) -> JsonRpcResponse 
 #[derive(Debug, Clone, Copy)]
 pub struct CompanionFeatures {
     pub delegation: bool,
+    /// Connection-bound Join capability. Only the literal `coordination_v1`
+    /// feature token enables this; omitted `--features` stays legacy.
+    pub coordination_v1: bool,
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
@@ -142,14 +154,14 @@ pub struct CompanionFeatures {
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,feedback,ask,sessions`). Unknown tokens are ignored. An absent
-    /// value (`None`) defaults to delegation-only — backward compatible with a
-    /// parent that predates feature gating (companion + listener ship together, so
-    /// post-upgrade the parent always passes an explicit `--features`).
+    /// `delegation,coordination_v1,feedback,ask,sessions`). Unknown tokens are
+    /// ignored. An absent value (`None`) defaults to delegation-only without
+    /// Join — backward compatible with a parent that predates feature gating.
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(s) = raw else {
             return Self {
                 delegation: true,
+                coordination_v1: false,
                 feedback: false,
                 ask: false,
                 sessions: false,
@@ -157,6 +169,7 @@ impl CompanionFeatures {
         };
         let mut f = Self {
             delegation: false,
+            coordination_v1: false,
             feedback: false,
             ask: false,
             sessions: false,
@@ -164,6 +177,7 @@ impl CompanionFeatures {
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
                 "delegation" => f.delegation = true,
+                "coordination_v1" => f.coordination_v1 = true,
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
@@ -194,6 +208,8 @@ pub struct CompanionContext {
     pub token: String,
     /// Tool groups this launch exposes (see [`CompanionFeatures`]).
     pub features: CompanionFeatures,
+    /// Immutable launch role (`--role root|delegation_child`).
+    pub role: CompanionRole,
 }
 
 /// Per-in-flight-call state. The companion stashes one of these per
@@ -350,8 +366,9 @@ pub async fn dispatch_line(
                 }
             };
             let tools = match all.as_array() {
-                Some(arr) => Value::Array(
-                    arr.iter()
+                Some(arr) => {
+                    let mut filtered: Vec<Value> = arr
+                        .iter()
                         .filter(|t| {
                             t.get("name")
                                 .and_then(|v| v.as_str())
@@ -359,8 +376,45 @@ pub async fn dispatch_line(
                                 .unwrap_or(false)
                         })
                         .cloned()
-                        .collect(),
-                ),
+                        .collect();
+                    // Without coordination_v1, restore pre-Join descriptions
+                    // and hide return_when so old connections cannot call Join.
+                    if !ctx.features.coordination_v1 {
+                        for tool in &mut filtered {
+                            let name = tool
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            match name {
+                                "delegate_to_agent" => {
+                                    if let Some(obj) = tool.as_object_mut() {
+                                        obj.insert(
+                                            "description".into(),
+                                            Value::String(LEGACY_DELEGATE_DESCRIPTION.into()),
+                                        );
+                                    }
+                                }
+                                "get_delegation_status" => {
+                                    if let Some(obj) = tool.as_object_mut() {
+                                        obj.insert(
+                                            "description".into(),
+                                            Value::String(LEGACY_STATUS_DESCRIPTION.into()),
+                                        );
+                                        if let Some(props) = obj
+                                            .get_mut("inputSchema")
+                                            .and_then(|s| s.get_mut("properties"))
+                                            .and_then(Value::as_object_mut)
+                                        {
+                                            props.remove("return_when");
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Value::Array(filtered)
+                }
                 None => all,
             };
             LineAction::Respond(ok(id, json!({ "tools": tools })))
@@ -447,10 +501,15 @@ async fn build_tools_call_spawn(
                 Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
             };
             let wait_ms = arguments.get("wait_ms").and_then(|v| v.as_u64());
+            let return_when = match parse_return_when(&arguments, ctx.features.coordination_v1) {
+                Ok(v) => v,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
             let req = BrokerStatusRequest {
                 token: ctx.token.clone(),
                 task_ids,
                 wait_ms,
+                return_when,
             };
             // No external_handle: canceling a status query only suppresses its
             // response — it must not touch the task itself. The status round-trip
@@ -869,42 +928,61 @@ fn timeout_cancel_guidance_report(task_id: &str) -> Value {
     })
 }
 
-/// Render the `get_delegation_status` round-trip outcome (always a
-/// `{ "tasks": [..] }` envelope from the broker) into an MCP `tools/call`
-/// result. EVERY poll renders through [`render_batch_report`] — a single id and
-/// a fan-out take the SAME path — so the shape the LLM and frontend see is
-/// uniform: a `{ "tasks": [..] }` object with one entry per requested id (one
-/// entry for a single id), each carrying its `task_id` + `status`. A bare report
-/// with no `tasks` array (older / unexpected shape) is wrapped as a one-element
-/// batch so the output stays uniform.
+/// Render the `get_delegation_status` round-trip outcome into an MCP
+/// `tools/call` result. Preserves Join fields (`wake_reason`,
+/// `attention_requests`) in both text content and `structuredContent`. Legacy
+/// outcomes without those keys stay a tasks-only envelope.
 pub fn render_status_result(outcome: &Value) -> Value {
-    match outcome.get("tasks").and_then(|v| v.as_array()) {
-        Some(tasks) => render_batch_report(tasks),
-        None => render_batch_report(std::slice::from_ref(outcome)),
+    let tasks = outcome
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![outcome.clone()]);
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("tasks".into(), Value::Array(tasks.clone()));
+    for key in ["wake_reason", "attention_requests"] {
+        if let Some(value) = outcome.get(key) {
+            envelope.insert(key.into(), value.clone());
+        }
     }
+    render_status_envelope(Value::Object(envelope), &tasks)
 }
 
-/// Render a `get_delegation_status` result as a `{ "tasks": [..] }` batch — the
-/// single rendering path for every poll, whether it carries one report or many.
-/// The `content` text is the compact `{ "tasks": [..] }` JSON so hosts that
-/// persist only `CallToolResult.content` text (e.g. Claude Code) can still
-/// recover every task; `structuredContent` carries the same shape for hosts that
-/// keep it. `isError` is set only when EVERY task failed — a coarse signal (a
-/// lone failed task therefore flags `isError`, matching the old single-report
-/// behavior); the frontend derives per-task badges from the structured reports,
-/// not from this flag.
-fn render_batch_report(tasks: &[Value]) -> Value {
+fn render_status_envelope(envelope: Value, tasks: &[Value]) -> Value {
     let all_failed = !tasks.is_empty()
         && tasks
             .iter()
-            .all(|t| t.get("status").and_then(|v| v.as_str()) == Some("failed"));
-    let envelope = json!({ "tasks": tasks });
-    let text = serde_json::to_string(&envelope).unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
+            .all(|task| task.get("status").and_then(Value::as_str) == Some("failed"));
+    let text = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{"type": "text", "text": text}],
         "isError": all_failed,
         "structuredContent": envelope,
     })
+}
+
+/// Parse the optional Join `return_when` argument. Absent is legacy; present
+/// requires `coordination_v1`, the literal enum value, and explicit `wait_ms=0`.
+pub fn parse_return_when(
+    arguments: &Value,
+    coordination_v1: bool,
+) -> Result<Option<DelegationReturnWhen>, String> {
+    let Some(raw) = arguments.get("return_when") else {
+        return Ok(None);
+    };
+    if !coordination_v1 {
+        return Err("return_when is unavailable on this connection".into());
+    }
+    if raw.as_str() != Some("all_terminal_or_attention") {
+        return Err("return_when must be all_terminal_or_attention".into());
+    }
+    if arguments.get("wait_ms").and_then(Value::as_u64) != Some(0) {
+        return Err(
+            "return_when=all_terminal_or_attention requires explicit wait_ms=0".into(),
+        );
+    }
+    Ok(Some(DelegationReturnWhen::AllTerminalOrAttention))
 }
 
 /// Map a serialized [`super::types::DelegationTaskReport`] into MCP `tools/call`
@@ -1207,6 +1285,7 @@ mod tests {
         // keep seeing exactly the three delegation tools.
         ctx_with(CompanionFeatures {
             delegation: true,
+            coordination_v1: false,
             feedback: false,
             ask: false,
             sessions: false,
@@ -1219,6 +1298,7 @@ mod tests {
             socket_path: "/tmp/codeg-mcp-companion-test-nope.sock".into(),
             token: "tok".into(),
             features,
+            role: CompanionRole::Root,
         }
     }
 
@@ -1747,37 +1827,166 @@ mod tests {
         assert_eq!(render_status_result(&mixed)["isError"], false);
     }
 
+    #[test]
+    fn join_input_requires_capability_literal_value_and_explicit_zero() {
+        assert_eq!(parse_return_when(&json!({}), true).unwrap(), None);
+        assert!(parse_return_when(
+            &json!({"return_when":"all_terminal_or_attention","wait_ms":0}),
+            false,
+        )
+        .is_err());
+        assert!(parse_return_when(
+            &json!({"return_when":"all_terminal_or_attention"}),
+            true,
+        )
+        .is_err());
+        assert!(parse_return_when(
+            &json!({"return_when":"all_terminal_or_attention","wait_ms":1}),
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            parse_return_when(
+                &json!({"return_when":"all_terminal_or_attention","wait_ms":0}),
+                true,
+            )
+            .unwrap(),
+            Some(DelegationReturnWhen::AllTerminalOrAttention)
+        );
+    }
+
+    #[test]
+    fn legacy_batch_omits_join_fields_on_the_wire() {
+        use crate::acp::delegation::types::DelegationStatusBatch;
+        let value = serde_json::to_value(DelegationStatusBatch::legacy(vec![])).unwrap();
+        assert_eq!(value, json!({"tasks": []}));
+    }
+
+    #[test]
+    fn joined_batch_includes_empty_attention_array() {
+        use crate::acp::delegation::types::{DelegationStatusBatch, DelegationWakeReason};
+        let value = serde_json::to_value(DelegationStatusBatch::joined(
+            vec![],
+            DelegationWakeReason::AllTerminal,
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(value["wake_reason"], "all_terminal");
+        assert_eq!(value["attention_requests"], json!([]));
+    }
+
+    #[test]
+    fn joined_status_renderer_preserves_attention_in_text_and_structured_content() {
+        let outcome = json!({
+            "tasks": [{"task_id":"task-1", "status":"running"}],
+            "wake_reason": "attention_required",
+            "attention_requests": [{
+                "request_id":"request-1",
+                "task_id":"task-1",
+                "message":"Choose A or B",
+                "created_at":"2026-07-17T10:00:00Z"
+            }]
+        });
+        let rendered = render_status_result(&outcome);
+        assert_eq!(rendered["structuredContent"], outcome);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), outcome);
+    }
+
+    #[test]
+    fn legacy_status_renderer_keeps_the_exact_tasks_only_envelope() {
+        let outcome = json!({"tasks": []});
+        let rendered = render_status_result(&outcome);
+        assert_eq!(rendered["structuredContent"], outcome);
+        assert_eq!(rendered["content"][0]["text"], "{\"tasks\":[]}");
+    }
+
+    #[tokio::test]
+    async fn join_tools_list_hides_return_when_without_coordination() {
+        let legacy = unwrap_respond(
+            dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
+        );
+        let tools = legacy.result.unwrap()["tools"].as_array().unwrap().clone();
+        let status = tools
+            .iter()
+            .find(|t| t["name"] == "get_delegation_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("return_when")
+            .is_none());
+        assert!(!tool_guidance(status).contains("all_terminal_or_attention"));
+        let delegate = tools
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .unwrap();
+        assert!(!tool_guidance(delegate).contains("all_terminal_or_attention"));
+
+        let coord = unwrap_respond(
+            dispatch_with_features(
+                COORDINATION,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tools = coord.result.unwrap()["tools"].as_array().unwrap().clone();
+        let status = tools
+            .iter()
+            .find(|t| t["name"] == "get_delegation_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("return_when")
+            .is_some());
+        assert!(tool_guidance(status).contains("all_terminal_or_attention"));
+        let delegate = tools
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .unwrap();
+        assert!(tool_guidance(delegate).contains("join"));
+    }
+
     // -- check_user_feedback feature gating + rendering --------------------
 
     const FEEDBACK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: true,
         ask: false,
         sessions: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
+        coordination_v1: false,
         feedback: true,
         ask: false,
         sessions: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: false,
         ask: true,
         sessions: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: false,
         ask: false,
         sessions: true,
     };
     const ALL_FEATURES: CompanionFeatures = CompanionFeatures {
         delegation: true,
+        coordination_v1: true,
         feedback: true,
         ask: true,
         sessions: true,
+    };
+    const COORDINATION: CompanionFeatures = CompanionFeatures {
+        delegation: true,
+        coordination_v1: true,
+        feedback: false,
+        ask: false,
+        sessions: false,
     };
 
     const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 7_680;
@@ -1842,6 +2051,7 @@ mod tests {
                     "cannot see this conversation",
                     "task must include all context",
                     "fan out",
+                    "join",
                     "each distinct",
                     "call once",
                     "profile_id",
@@ -1852,6 +2062,8 @@ mod tests {
                 &[
                     "task_ids",
                     "wait_ms",
+                    "return_when",
+                    "all_terminal_or_attention",
                     "immediate snapshot",
                     "positive wait (max 60000 ms)",
                     "terminal, stalled, waiting_input, or its deadline",
@@ -1935,16 +2147,24 @@ mod tests {
 
     #[test]
     fn features_parse_defaults_and_tokens() {
-        // Absent → delegation-only (backward compatible).
+        // Absent → delegation-only (backward compatible), no Join.
         let def = CompanionFeatures::parse(None);
-        assert!(def.delegation && !def.feedback);
+        assert!(def.delegation && !def.feedback && !def.coordination_v1);
         assert!(!def.ask);
         assert!(!def.sessions);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions ,bogus"));
-        assert!(all.delegation && all.feedback && all.ask && all.sessions);
+        let all = CompanionFeatures::parse(Some(
+            " delegation , coordination_v1 , feedback , ask , sessions ,bogus",
+        ));
+        assert!(
+            all.delegation
+                && all.coordination_v1
+                && all.feedback
+                && all.ask
+                && all.sessions
+        );
         let fb = CompanionFeatures::parse(Some("feedback"));
-        assert!(!fb.delegation && fb.feedback && !fb.ask);
+        assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
         let ask = CompanionFeatures::parse(Some("ask"));
         assert!(!ask.delegation && !ask.feedback && ask.ask);
         let sessions = CompanionFeatures::parse(Some("sessions"));
@@ -1952,6 +2172,7 @@ mod tests {
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
         assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
+        assert!(!none.coordination_v1);
     }
 
     #[tokio::test]

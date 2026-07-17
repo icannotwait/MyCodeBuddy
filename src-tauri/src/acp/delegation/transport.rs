@@ -55,7 +55,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::QuestionSpec;
+
+/// Immutable companion launch role. Root sessions may Join; forced
+/// delegation children are marked so later tasks can gate decision tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionRole {
+    Root,
+    DelegationChild,
+}
 
 /// One delegation call's worth of input forwarded from the companion to the
 /// main process. The main process re-validates `token` and maps
@@ -119,6 +129,11 @@ pub struct BrokerStatusRequest {
     /// Batch waits resolve when ANY requested id meets the mode condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// Opt-in Join mode. Only meaningful when the connection advertised
+    /// `coordination_v1`; requires explicit `wait_ms = 0`. Omitted on every
+    /// legacy request so serialization stays a tasks-only (+ wait_ms) object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_when: Option<DelegationReturnWhen>,
 }
 
 /// Cancel a previously-issued delegation task by its broker `task_id`. Backs

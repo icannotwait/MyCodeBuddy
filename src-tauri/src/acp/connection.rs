@@ -2174,12 +2174,14 @@ fn is_executable_file(path: &Path) -> bool {
 /// delegate tool silently. Skipping leaves the agent fully functional minus
 /// `delegate_to_agent`, which is the right degradation when codeg-mcp didn't
 /// make it into the install.
-/// The `--features` value for a companion launch given the four feature flags,
+/// The `--features` value for a companion launch given the feature flags,
 /// or `None` when none is enabled (the companion isn't injected at all).
 /// Pulled out as a pure function so the inject/skip decision is unit-testable
-/// without a real binary on disk or a live broker.
+/// without a real binary on disk or a live broker. `coordination_v1` is only
+/// advertised when delegation is on (Join requires the delegation tools).
 fn companion_features_arg(
     delegation_enabled: bool,
+    coordination_v1: bool,
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
@@ -2187,9 +2189,12 @@ fn companion_features_arg(
     if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled {
         return None;
     }
-    let mut features: Vec<&str> = Vec::new();
+    let mut features = Vec::new();
     if delegation_enabled {
         features.push("delegation");
+        if coordination_v1 {
+            features.push("coordination_v1");
+        }
     }
     if feedback_enabled {
         features.push("feedback");
@@ -2225,12 +2230,22 @@ async fn inject_codeg_mcp(
     // never the live Broker settings toggle. Feedback/ask/sessions remain
     // independent launch-time snapshots of their runtime configs.
     let delegation_enabled = plan.expose_codeg_delegation;
+    // Join capability is connection-bound and follows Codeg delegation exposure.
+    let coordination_v1 = plan.expose_codeg_delegation;
+    let role = if plan.source
+        == crate::acp::delegation::route::DelegationRouteSource::ForcedChild
+    {
+        crate::acp::delegation::transport::CompanionRole::DelegationChild
+    } else {
+        crate::acp::delegation::transport::CompanionRole::Root
+    };
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
     // `None` (no feature enabled) short-circuits the whole injection.
     let features_arg = companion_features_arg(
         delegation_enabled,
+        coordination_v1,
         feedback_enabled,
         ask_enabled,
         sessions_enabled,
@@ -2252,6 +2267,8 @@ async fn inject_codeg_mcp(
             crate::acp::delegation::listener::TokenEntry {
                 parent_connection_id: parent_connection_id.to_string(),
                 working_dir: working_dir.to_path_buf(),
+                coordination_v1,
+                role,
             },
         )
         .await;
@@ -2261,6 +2278,12 @@ async fn inject_codeg_mcp(
         Some(injection.leases.register(token.clone()).await)
     } else {
         None
+    };
+    let role_arg = match role {
+        crate::acp::delegation::transport::CompanionRole::Root => "root",
+        crate::acp::delegation::transport::CompanionRole::DelegationChild => {
+            "delegation_child"
+        }
     };
     let mut server = McpServerStdio::new("codeg-mcp", binary_path);
     server = server.args(vec![
@@ -2276,9 +2299,12 @@ async fn inject_codeg_mcp(
         // (any platform).
         "--parent-pid".to_string(),
         std::process::id().to_string(),
-        // Tool groups to expose this launch (delegation / feedback / ask / sessions).
+        // Tool groups to expose this launch (delegation / coordination_v1 /
+        // feedback / ask / sessions).
         "--features".to_string(),
         features_arg,
+        "--role".to_string(),
+        role_arg.to_string(),
     ]);
     servers.push(McpServer::Stdio(server));
     Some(CompanionInjection {
@@ -10057,48 +10083,59 @@ mod tests {
 
     #[test]
     fn companion_features_follow_plan_not_live_broker_route_setting() {
-        // Plan-driven feature helper: expose_codeg_delegation maps to the
-        // first bool of companion_features_arg — never a live Broker re-read.
+        // Plan-driven feature helper: expose_codeg_delegation maps to
+        // delegation + coordination_v1 — never a live Broker re-read.
         assert_eq!(
-            companion_features_arg(true, true, false, false),
-            Some("delegation,feedback".into())
+            companion_features_arg(true, true, true, false, false),
+            Some("delegation,coordination_v1,feedback".into())
         );
         assert_eq!(
-            companion_features_arg(false, true, false, false),
+            companion_features_arg(false, false, true, false, false),
             Some("feedback".into())
         );
-        assert_eq!(companion_features_arg(false, false, false, false), None);
+        assert_eq!(
+            companion_features_arg(false, false, false, false, false),
+            None
+        );
     }
 
     #[test]
     fn companion_features_arg_inject_skip_decision() {
         // All off → no companion at all.
-        assert_eq!(companion_features_arg(false, false, false, false), None);
-        // Delegation only.
         assert_eq!(
-            companion_features_arg(true, false, false, false),
+            companion_features_arg(false, false, false, false, false),
+            None
+        );
+        // Delegation only without coordination → no Join token.
+        assert_eq!(
+            companion_features_arg(true, false, false, false, false),
             Some("delegation".to_string())
+        );
+        // Delegation + coordination_v1 (production Codeg-delegation plan).
+        assert_eq!(
+            companion_features_arg(true, true, false, false, false),
+            Some("delegation,coordination_v1".to_string())
         );
         // Feedback only — the decoupling: companion injected for feedback even
         // when delegation is off.
         assert_eq!(
-            companion_features_arg(false, true, false, false),
+            companion_features_arg(false, false, true, false, false),
             Some("feedback".to_string())
         );
         // Ask only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, true, false),
+            companion_features_arg(false, false, false, true, false),
             Some("ask".to_string())
         );
         // Sessions only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, false, true),
+            companion_features_arg(false, false, false, false, true),
             Some("sessions".to_string())
         );
         // All on → comma-joined, in declaration order.
         assert_eq!(
-            companion_features_arg(true, true, true, true),
-            Some("delegation,feedback,ask,sessions".to_string())
+            companion_features_arg(true, true, true, true, true),
+            Some("delegation,coordination_v1,feedback,ask,sessions".to_string())
         );
     }
 }

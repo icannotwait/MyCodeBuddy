@@ -406,6 +406,58 @@ pub struct DelegationTaskReport {
     pub stalled_since: Option<DateTime<Utc>>,
 }
 
+/// Opt-in Join wait mode for `get_delegation_status`. Absent `return_when` keeps
+/// the legacy snapshot / supervised / any-terminal wait semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationReturnWhen {
+    AllTerminalOrAttention,
+}
+
+/// Why a Join wait returned. Present on every Join-shaped batch; omitted on
+/// legacy `{ "tasks": [...] }` responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationWakeReason {
+    AllTerminal,
+    AttentionRequired,
+    Unavailable,
+}
+
+/// Additive status batch for Join (and a legacy wrapper around task reports).
+/// Legacy callers use [`Self::legacy`] so both Join-only fields stay `None` and
+/// serialize as the exact historical `{ "tasks": [...] }` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationStatusBatch {
+    pub tasks: Vec<DelegationTaskReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_reason: Option<DelegationWakeReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_requests: Option<Vec<crate::acp::delegation::attention::AttentionRequestSummary>>,
+}
+
+impl DelegationStatusBatch {
+    pub fn legacy(tasks: Vec<DelegationTaskReport>) -> Self {
+        Self {
+            tasks,
+            wake_reason: None,
+            attention_requests: None,
+        }
+    }
+
+    pub fn joined(
+        tasks: Vec<DelegationTaskReport>,
+        wake_reason: DelegationWakeReason,
+        attention_requests: Vec<crate::acp::delegation::attention::AttentionRequestSummary>,
+    ) -> Self {
+        Self {
+            tasks,
+            wake_reason: Some(wake_reason),
+            attention_requests: Some(attention_requests),
+        }
+    }
+}
+
 impl DelegationOutcome {
     /// Project a `DelegationError` onto the wire-stable `code` string used by
     /// the frontend and MCP companion. Keep these strings stable — they ship

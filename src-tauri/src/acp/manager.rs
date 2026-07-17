@@ -8471,10 +8471,8 @@ mod tests {
         tokens
             .register(
                 token.clone(),
-                TokenEntry {
-                    parent_connection_id: "unexposed-1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("unexposed-1", PathBuf::from("/tmp"),
+                ),
             )
             .await;
         let mut waiter = leases.register(&token).await;
@@ -8665,10 +8663,8 @@ mod tests {
         tokens
             .register(
                 token.clone(),
-                TokenEntry {
-                    parent_connection_id: "stuck-1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("stuck-1", PathBuf::from("/tmp"),
+                ),
             )
             .await;
         let _waiter = leases.register(&token).await;

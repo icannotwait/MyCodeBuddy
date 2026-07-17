@@ -21,9 +21,12 @@ use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
     BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
-    CompanionReadyAck,
+    CompanionReadyAck, CompanionRole,
 };
-use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    DelegationRequest, DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport,
+    DelegationWakeReason, TaskStatus,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
@@ -53,6 +56,22 @@ pub trait ParentSessionLookup: Send + Sync {
 pub struct TokenEntry {
     pub parent_connection_id: String,
     pub working_dir: PathBuf,
+    /// Whether this launch advertised `coordination_v1` (Join semantics).
+    pub coordination_v1: bool,
+    /// Immutable companion role for this launch.
+    pub role: CompanionRole,
+}
+
+impl TokenEntry {
+    /// Legacy entry without Join capability (tests / pre-coordination launches).
+    pub fn legacy(parent_connection_id: &str, working_dir: PathBuf) -> Self {
+        Self {
+            parent_connection_id: parent_connection_id.to_string(),
+            working_dir,
+            coordination_v1: false,
+            role: CompanionRole::Root,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -260,7 +279,7 @@ impl DelegationListener {
                         return Ok(());
                     },
                 };
-                reports_response(reports)?
+                status_response(reports)?
             }
             BrokerMessage::CancelTask(req) => report_response(self.process_cancel_task(req).await)?,
             BrokerMessage::Feedback(req) => {
@@ -452,39 +471,54 @@ impl DelegationListener {
     }
 
     /// Validate the token, resolve the caller's parent connection/conversation,
-    /// and query the status of every requested task id (optionally blocking per
-    /// the wire `wait_ms`: omitted → immediate snapshot, explicit `0` → block
-    /// until a task is terminal, a positive value → bounded long-poll clamped to
-    /// [`STATUS_WAIT_MAX_MS`]). Backs the `get_delegation_status` tool. Returns
-    /// one report per requested id, in request order. An invalid token reports
-    /// `Unknown` for each id — the caller can't usefully distinguish it from a
-    /// genuinely unknown task, and we don't leak which.
-    async fn process_status(&self, req: BrokerStatusRequest) -> Vec<DelegationTaskReport> {
+    /// and query the status of every requested task id. Legacy requests (no
+    /// `return_when`) keep snapshot / supervised / any-terminal waits. Join
+    /// requests require `return_when=all_terminal_or_attention` with explicit
+    /// `wait_ms=0`. Invalid-token Join still returns Join-shaped additive fields
+    /// without revealing ownership.
+    async fn process_status(&self, req: BrokerStatusRequest) -> DelegationStatusBatch {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
-            return req.task_ids.iter().map(|id| unknown_report(id)).collect();
+            let unknown_reports: Vec<_> =
+                req.task_ids.iter().map(|id| unknown_report(id)).collect();
+            return match req.return_when {
+                None => DelegationStatusBatch::legacy(unknown_reports),
+                Some(_) => DelegationStatusBatch::joined(
+                    unknown_reports,
+                    DelegationWakeReason::Unavailable,
+                    Vec::new(),
+                ),
+            };
         };
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
             .await;
-        // Map the wire `wait_ms` to a wait mode: omitted → snapshot (never park),
-        // explicit `0` → terminal-only (no timeout), positive → supervised with
-        // hard ceiling.
-        let wait = match req.wait_ms {
-            None => StatusWait::Snapshot,
-            Some(0) => StatusWait::Terminal,
-            Some(ms) => {
-                StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
+        match req.return_when {
+            None => DelegationStatusBatch::legacy(
+                self.broker
+                    .get_tasks_status(
+                        &entry.parent_connection_id,
+                        parent_conversation_id,
+                        &req.task_ids,
+                        legacy_wait_from(req.wait_ms),
+                    )
+                    .await,
+            ),
+            Some(DelegationReturnWhen::AllTerminalOrAttention) if req.wait_ms == Some(0) => {
+                self.broker
+                    .join_tasks_status(
+                        &entry.parent_connection_id,
+                        parent_conversation_id,
+                        &req.task_ids,
+                    )
+                    .await
             }
-        };
-        self.broker
-            .get_tasks_status(
-                &entry.parent_connection_id,
-                parent_conversation_id,
-                &req.task_ids,
-                wait,
-            )
-            .await
+            Some(_) => DelegationStatusBatch::joined(
+                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            ),
+        }
     }
 
     /// Backs the `cancel_delegation` tool. A `timeout` reason is explicitly
@@ -675,17 +709,27 @@ fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerRespon
     })
 }
 
-/// Serialize a batch of [`DelegationTaskReport`]s into a `{ "tasks": [..] }`
-/// envelope for the `Status` arm. The companion reads this back and renders it
-/// uniformly as a `{ "tasks": [..] }` result — one entry per requested id,
-/// whether the poll asked for a single id or a whole fan-out.
-fn reports_response(reports: Vec<DelegationTaskReport>) -> std::io::Result<BrokerResponse> {
+fn legacy_wait_from(wait_ms: Option<u64>) -> StatusWait {
+    match wait_ms {
+        None => StatusWait::Snapshot,
+        Some(0) => StatusWait::Terminal,
+        Some(ms) => StatusWait::Supervised(std::time::Duration::from_millis(
+            ms.min(STATUS_WAIT_MAX_MS),
+        )),
+    }
+}
+
+/// Serialize a [`DelegationStatusBatch`] for the `Status` arm. Legacy batches
+/// omit Join fields; Join batches include `wake_reason` and
+/// `attention_requests`.
+fn status_response(batch: DelegationStatusBatch) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
-        outcome: serde_json::json!({
-            "tasks": serde_json::to_value(&reports).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
-            })?,
-        }),
+        outcome: serde_json::to_value(batch).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("encode status batch: {error}"),
+            )
+        })?,
     })
 }
 
@@ -1098,10 +1142,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "other-parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("other-parent", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(
@@ -1122,10 +1163,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         // parent_conversation = None: parent has no live conversation.
@@ -1147,10 +1185,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(
@@ -1178,10 +1213,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
 
@@ -1230,6 +1262,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(1_000),
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1252,10 +1285,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let ack = broker
@@ -1289,6 +1319,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: None,
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         // No completion ever happens — an immediate poll must still return.
@@ -1315,6 +1346,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(0),
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1364,6 +1396,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: Some(0),
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1403,10 +1436,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let start = |tool_use: &'static str| {
@@ -1454,6 +1484,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![t1.clone(), t2.clone()],
             wait_ms: None,
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1484,6 +1515,7 @@ mod tests {
             token: "bad-token".into(),
             task_ids: vec!["a".into(), "b".into()],
             wait_ms: None,
+                    return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1508,10 +1540,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         // Start a task directly so we hold its id.
@@ -1557,10 +1586,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let ack = broker
@@ -1627,10 +1653,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
 
@@ -1742,10 +1765,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
@@ -1802,28 +1822,19 @@ mod tests {
         registry
             .register(
                 "t1".into(),
-                TokenEntry {
-                    parent_connection_id: "p1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("p1", PathBuf::from("/tmp")),
             )
             .await;
         registry
             .register(
                 "t2".into(),
-                TokenEntry {
-                    parent_connection_id: "p1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("p1", PathBuf::from("/tmp")),
             )
             .await;
         registry
             .register(
                 "t3".into(),
-                TokenEntry {
-                    parent_connection_id: "p2".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("p2", PathBuf::from("/tmp")),
             )
             .await;
 
@@ -1858,10 +1869,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(broker, tokens, Some(1));
@@ -1935,10 +1943,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -1986,10 +1991,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -2027,10 +2029,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -2094,10 +2093,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -2206,10 +2202,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -2263,10 +2256,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -2346,10 +2336,7 @@ mod tests {
         tokens
             .register(
                 "ready-tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
             )
             .await;
         let mut waiter = leases.register("ready-tok").await;
@@ -2403,10 +2390,7 @@ mod tests {
         tokens
             .register(
                 "dup-tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
             )
             .await;
         let mut waiter = leases.register("dup-tok").await;
@@ -2483,10 +2467,7 @@ mod tests {
         tokens
             .register(
                 "revoke-tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
             )
             .await;
         let mut waiter = leases.register("revoke-tok").await;
@@ -2533,10 +2514,7 @@ mod tests {
         tokens
             .register(
                 "good-tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
             )
             .await;
 
@@ -2662,10 +2640,7 @@ mod tests {
         tokens
             .register(
                 "fail-ack".into(),
-                TokenEntry {
-                    parent_connection_id: "parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
             )
             .await;
         let mut waiter = leases.register("fail-ack").await;

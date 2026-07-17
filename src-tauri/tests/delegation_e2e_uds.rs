@@ -151,10 +151,8 @@ async fn end_to_end_uds_happy_path() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from("/tmp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from("/tmp"),
+            ),
         )
         .await;
 
@@ -228,7 +226,8 @@ async fn end_to_end_uds_happy_path() {
         token: "tok".into(),
         task_ids: vec![task_id],
         wait_ms: Some(1_000),
-    };
+                return_when: None,
+        };
     let resp = client_status_round_trip(&socket.to_string_lossy(), &status_req)
         .await
         .expect("status round-trip");
@@ -267,10 +266,8 @@ async fn end_to_end_uds_batch_status() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from("/tmp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from("/tmp"),
+            ),
         )
         .await;
 
@@ -335,7 +332,8 @@ async fn end_to_end_uds_batch_status() {
         token: "tok".into(),
         task_ids: task_ids.clone(),
         wait_ms: None,
-    };
+                return_when: None,
+        };
     let resp = client_status_round_trip(&socket.to_string_lossy(), &status_req)
         .await
         .expect("batch status round-trip");
@@ -419,10 +417,8 @@ async fn end_to_end_uds_ask_question_round_trip() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from("/tmp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from("/tmp"),
+            ),
         )
         .await;
 
@@ -556,10 +552,8 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from("/tmp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from("/tmp"),
+            ),
         )
         .await;
 

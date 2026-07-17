@@ -35,7 +35,7 @@ use codeg_lib::acp::delegation::companion::{
     JsonRpcResponse, LineAction, SpawnResult,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
-use codeg_lib::acp::delegation::transport::client_establish_ready_lease;
+use codeg_lib::acp::delegation::transport::{client_establish_ready_lease, CompanionRole};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -50,10 +50,22 @@ struct Args {
     /// from. Omitted by older parents — backward compatible.
     parent_pid: Option<u32>,
     /// Comma-joined tool groups to expose (e.g.
-    /// `delegation,feedback,ask,sessions`). Omitted by parents that predate
-    /// feature gating; see `CompanionFeatures::parse` (defaults to
-    /// delegation-only).
+    /// `delegation,coordination_v1,feedback,ask,sessions`). Omitted by
+    /// parents that predate feature gating; see `CompanionFeatures::parse`
+    /// (defaults to delegation-only without Join).
     features: Option<String>,
+    /// Launch role. Omitted by older launchers → Root.
+    role: CompanionRole,
+}
+
+fn parse_role(raw: &str) -> Result<CompanionRole, String> {
+    match raw {
+        "root" => Ok(CompanionRole::Root),
+        "delegation_child" => Ok(CompanionRole::DelegationChild),
+        other => Err(format!(
+            "--role must be root or delegation_child, got {other}"
+        )),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +74,7 @@ fn parse_args() -> Result<Args, String> {
     let mut token = None;
     let mut parent_pid = None;
     let mut features = None;
+    let mut role = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -99,9 +112,15 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or_else(|| "--features requires a value".to_string())?,
                 );
             }
+            "--role" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--role requires a value".to_string())?;
+                role = Some(parse_role(&raw)?);
+            }
             "--help" | "-h" => {
                 println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,feedback,ask,sessions]"
+                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions] [--role root|delegation_child]"
                 );
                 std::process::exit(0);
             }
@@ -115,6 +134,8 @@ fn parse_args() -> Result<Args, String> {
         token: token.ok_or_else(|| "missing --token".to_string())?,
         parent_pid,
         features,
+        // Older launchers omit --role; default Root for backward compatibility.
+        role: role.unwrap_or(CompanionRole::Root),
     })
 }
 
@@ -153,6 +174,7 @@ async fn main() -> ExitCode {
         socket_path: args.socket_path.clone(),
         token: args.token.clone(),
         features,
+        role: args.role,
     };
 
     // When delegation is enabled, establish the authenticated ready lease

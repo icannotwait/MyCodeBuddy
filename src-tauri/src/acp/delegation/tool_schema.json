@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work before collecting results. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.",
+    "description": "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work, then Join every still-required returned task_id with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0) before ending the turn. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task"],
@@ -43,7 +43,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.",
+    "description": "Get status or results for one or more task_ids from delegate_to_agent. Canonical Join: pass return_when=all_terminal_or_attention with explicit wait_ms=0 to wait until all requested tasks are terminal, a requested child needs a parent decision (attention_requests), or the Broker cannot continue waiting safely (wake_reason=unavailable). Answer every returned attention request, then re-Join only still-running required task ids. Omitting return_when retains legacy snapshot / supervised / any-terminal behavior. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available; Join responses also include wake_reason and attention_requests. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -57,7 +57,12 @@
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
-          "description": "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout."
+          "description": "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. Join mode requires explicit wait_ms=0 with return_when."
+        },
+        "return_when": {
+          "type": "string",
+          "enum": ["all_terminal_or_attention"],
+          "description": "Join mode. Requires explicit wait_ms=0 and returns only when all requested tasks are terminal, a requested child needs a parent decision, or the Broker cannot continue waiting safely."
         }
       }
     }
