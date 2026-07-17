@@ -96,6 +96,8 @@ interface LiveSourceIdentity {
   pageInFlight: boolean
   abort: AbortController
   conversationPageStartedAt?: number
+  /** Canonical root established by the first non-empty file page of this drain. */
+  fileCanonicalRoot?: string
 }
 
 interface MembershipEntry {
@@ -280,7 +282,8 @@ export class ReferenceSearchController {
     ["commit", new Map()],
   ])
 
-  private pinnedBuckets = new Set<string>()
+  /** Last pinned bucket object per serialized key (needed to unpin abandoned aliases). */
+  private pinnedBuckets = new Map<string, ReferenceCacheBucketKey>()
   private selectedUri: string | null = null
   private selectedBucket: ReferenceCacheBucketKey | null = null
   private validation: ValidationState | null = null
@@ -964,7 +967,7 @@ export class ReferenceSearchController {
     }
 
     if (source === "file") {
-      return this.ingestFilePage(generation, live, page)
+      return this.ingestFilePage(generation, live, page, pageIndex)
     }
     if (source === "commit") {
       return this.ingestCommitPage(generation, live, page)
@@ -995,8 +998,9 @@ export class ReferenceSearchController {
 
   private ingestFilePage(
     _generation: number,
-    _live: LiveSourceIdentity,
-    page: ReferenceSearchPage
+    live: LiveSourceIdentity,
+    page: ReferenceSearchPage,
+    _pageIndex: number
   ): boolean {
     if (page.items.length === 0) {
       if (page.done && page.doneReason === "limit") {
@@ -1007,12 +1011,33 @@ export class ReferenceSearchController {
 
     let root: string | null = null
     for (const item of page.items) {
-      if (item.metadata.kind !== "file") return false
-      if (!item.metadata.canonicalWorkspaceRoot) return false
+      if (item.metadata.kind !== "file") {
+        this.markSourceProtocolError("file")
+        return false
+      }
+      if (!item.metadata.canonicalWorkspaceRoot) {
+        this.markSourceProtocolError("file")
+        return false
+      }
       if (root == null) root = item.metadata.canonicalWorkspaceRoot
-      else if (root !== item.metadata.canonicalWorkspaceRoot) return false
+      else if (root !== item.metadata.canonicalWorkspaceRoot) {
+        this.markSourceProtocolError("file")
+        return false
+      }
     }
-    if (!root || !this.defaultPath) return false
+    if (!root || !this.defaultPath) {
+      this.markSourceProtocolError("file")
+      return false
+    }
+
+    // A later page after this drain already established a root must match it.
+    // First non-empty page may still establish/repoint (even when pageIndex > 0
+    // after empty leading pages, or when a provisional alias pointed elsewhere).
+    const establishedRoot = live.fileCanonicalRoot
+    if (establishedRoot != null && establishedRoot !== root) {
+      this.markSourceProtocolError("file")
+      return false
+    }
 
     const previousBucket = this.fileBucket
     const newBucket: ReferenceCacheBucketKey = {
@@ -1021,31 +1046,28 @@ export class ReferenceSearchController {
       canonicalRoot: root,
     }
 
-    // First non-empty page establishes alias + bucket.
-    this.cache.rememberFileRootAlias(this.backendKey, this.defaultPath, root)
-    if (
-      previousBucket &&
-      serializeBucketKey(previousBucket) !== serializeBucketKey(newBucket)
-    ) {
-      this.discardRegexDrain("file")
-      // Drop provisional rows from the old bucket membership.
-      const map = this.membership.get("file")!
-      for (const [uri, entry] of [...map.entries()]) {
-        if (entry.bucketKey === serializeBucketKey(previousBucket)) {
-          map.delete(uri)
+    if (establishedRoot == null) {
+      // First non-empty page establishes/repoints the authoritative alias.
+      live.fileCanonicalRoot = root
+      this.cache.rememberFileRootAlias(this.backendKey, this.defaultPath, root)
+      if (
+        previousBucket &&
+        serializeBucketKey(previousBucket) !== serializeBucketKey(newBucket)
+      ) {
+        this.discardRegexDrain("file")
+        // Drop provisional rows from the old bucket membership.
+        const map = this.membership.get("file")!
+        for (const [uri, entry] of [...map.entries()]) {
+          if (entry.bucketKey === serializeBucketKey(previousBucket)) {
+            map.delete(uri)
+          }
         }
       }
-      if (isRegexQuery(this.query)) {
-        const handle = this.cache.beginRegexRefresh(
-          this.searchSessionId,
-          newBucket,
-          this.query
-        )
-        this.regexDrains.file = { handle, items: [] }
-      }
     }
+
     this.fileBucket = newBucket
 
+    const accepted: ReferenceCandidate[] = []
     for (const candidate of page.items) {
       const merged = this.cache.mergeCandidate(newBucket, candidate)
       if (!merged) continue
@@ -1055,8 +1077,25 @@ export class ReferenceSearchController {
         merged.candidate,
         merged.mutationRevision
       )
+      accepted.push(candidate)
+    }
+
+    // Regex drain is absent when there was no pre-existing alias at drain
+    // start (or the provisional alias was discarded on repoint). Begin after
+    // first merges so commitRegexRefresh snapshots match current revisions,
+    // then collect ranks.
+    if (isRegexQuery(this.query) && !this.regexDrains.file) {
+      const handle = this.cache.beginRegexRefresh(
+        this.searchSessionId,
+        newBucket,
+        this.query
+      )
+      this.regexDrains.file = { handle, items: [] }
+    }
+    for (const candidate of accepted) {
       this.noteRegexRank("file", candidate)
     }
+
     if (page.done && page.doneReason === "limit") {
       this.sourceTruncated.file = true
     }
@@ -1974,32 +2013,19 @@ export class ReferenceSearchController {
       })
     }
 
-    for (const key of this.pinnedBuckets) {
+    for (const [key, bucket] of this.pinnedBuckets) {
       if (!next.has(key)) {
-        // Clear disappeared bucket pins.
-        const bucket = this.bucketFromSerialized(key)
-        if (bucket) {
-          this.cache.pinVisible(this.searchSessionId, bucket, [])
-        }
+        // Clear pins for abandoned file/commit buckets after alias repoint
+        // or epoch switch (keys no longer reconstructible from live buckets).
+        this.cache.pinVisible(this.searchSessionId, bucket, [])
       }
     }
     for (const { bucket, uris } of next.values()) {
       this.cache.pinVisible(this.searchSessionId, bucket, uris)
     }
-    this.pinnedBuckets = new Set(next.keys())
-  }
-
-  private bucketFromSerialized(key: string): ReferenceCacheBucketKey | null {
-    if (this.fileBucket && serializeBucketKey(this.fileBucket) === key) {
-      return this.fileBucket
-    }
-    if (serializeBucketKey(this.conversationBucket) === key) {
-      return this.conversationBucket
-    }
-    if (this.commitBucket && serializeBucketKey(this.commitBucket) === key) {
-      return this.commitBucket
-    }
-    return null
+    this.pinnedBuckets = new Map(
+      [...next.entries()].map(([key, value]) => [key, value.bucket])
+    )
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────

@@ -60,9 +60,14 @@ const startQueues = new Map<
   ReferenceSearchSource,
   Resolver<ReferenceSearchPage>[]
 >()
+const nextQueues = new Map<
+  ReferenceSearchSource,
+  Resolver<ReferenceSearchPage>[]
+>()
 const validationQueue: Resolver<ReferenceCandidateValidation>[] = []
 const regexQueue: Resolver<ReferenceRegexMatch[]>[] = []
 const startCalls: StartReferenceSearchRequest[] = []
+const nextCalls: { source: ReferenceSearchSource; pageIndex: number }[] = []
 const cancelCalls: unknown[] = []
 const matchCalls: { query: string; descriptors: ReferenceDescriptor[] }[] = []
 const validateCalls: unknown[] = []
@@ -78,9 +83,19 @@ const mocks = {
       return d.promise
     }
   ),
-  nextReferenceSearchPage: vi.fn(async () => {
-    throw new Error("next not expected in these tests unless wired")
-  }),
+  nextReferenceSearchPage: vi.fn(
+    async (req: {
+      source: ReferenceSearchSource
+      pageIndex: number
+    }): Promise<ReferenceSearchPage> => {
+      nextCalls.push({ source: req.source, pageIndex: req.pageIndex })
+      const q = nextQueues.get(req.source) ?? []
+      const d = deferred<ReferenceSearchPage>()
+      q.push(d)
+      nextQueues.set(req.source, q)
+      return d.promise
+    }
+  ),
   cancelReferenceSearch: vi.fn(async (req: unknown) => {
     cancelCalls.push(req)
     return true
@@ -101,19 +116,38 @@ const mocks = {
   ),
 }
 
+function resolveQueuedPage(
+  queues: Map<ReferenceSearchSource, Resolver<ReferenceSearchPage>[]>,
+  source: ReferenceSearchSource,
+  page: ReferenceSearchPage
+): void {
+  const q = queues.get(source) ?? []
+  const d = q.shift()
+  queues.set(source, q)
+  d?.resolve(page)
+}
+
+function rejectQueuedPage(
+  queues: Map<ReferenceSearchSource, Resolver<ReferenceSearchPage>[]>,
+  source: ReferenceSearchSource,
+  error: unknown
+): void {
+  const q = queues.get(source) ?? []
+  const d = q.shift()
+  queues.set(source, q)
+  d?.reject(error)
+}
+
 const sourceApi = {
   file: {
     resolve(page: ReferenceSearchPage) {
-      const q = startQueues.get("file") ?? []
-      const d = q.shift()
-      startQueues.set("file", q)
-      d?.resolve(page)
+      resolveQueuedPage(startQueues, "file", page)
+    },
+    resolveNext(page: ReferenceSearchPage) {
+      resolveQueuedPage(nextQueues, "file", page)
     },
     reject(error: unknown) {
-      const q = startQueues.get("file") ?? []
-      const d = q.shift()
-      startQueues.set("file", q)
-      d?.reject(error)
+      rejectQueuedPage(startQueues, "file", error)
     },
   },
   conversation: {
@@ -477,9 +511,11 @@ beforeEach(() => {
   cache = new ReferenceSearchCache()
   uuidCounter = 0
   startQueues.clear()
+  nextQueues.clear()
   validationQueue.length = 0
   regexQueue.length = 0
   startCalls.length = 0
+  nextCalls.length = 0
   cancelCalls.length = 0
   matchCalls.length = 0
   validateCalls.length = 0
@@ -1165,12 +1201,37 @@ describe("ReferenceSearchController", () => {
     })
     c2.setQuery("app")
     expect(c2.getSnapshot().groups.file.items).toHaveLength(0)
+    // First non-empty page establishes alias; keep job open for a later page.
     sourceApi.file.resolve(
-      page("file", 0, [fileCandidate("app.ts", "C:/real")], true)
+      page("file", 0, [fileCandidate("app.ts", "C:/real")], false)
     )
     await flushMicrotasks(10)
     expect(cache2.resolveFileRootAlias(BACKEND, "C:/link")).toBe("C:/real")
     expect(c2.getSnapshot().groups.file.items).toHaveLength(1)
+    expect(c2.getSnapshot().groups.file.error).toBeNull()
+    expect(c2.getSnapshot().groups.file.loading).toBe(true)
+
+    // Later page with a different canonical root is a protocol error; no merge
+    // into either bucket and loading stops.
+    const otherRootCandidate = fileCandidate("other.ts", "C:/other", 2)
+    sourceApi.file.resolveNext(
+      page("file", 1, [otherRootCandidate], true)
+    )
+    await flushMicrotasks(10)
+    expect(c2.getSnapshot().groups.file.error).toBe("source")
+    expect(c2.getSnapshot().groups.file.loading).toBe(false)
+    expect(c2.getSnapshot().groups.file.items).toHaveLength(1)
+    expect(
+      c2.getSnapshot().groups.file.items[0]?.reference.uri
+    ).toBe(fileCandidate("app.ts", "C:/real").uri)
+    expect(
+      cache2.literalPreview(
+        { backend: BACKEND, source: "file", canonicalRoot: "C:/other" },
+        "other",
+        50
+      ).items
+    ).toHaveLength(0)
+    expect(cache2.resolveFileRootAlias(BACKEND, "C:/link")).toBe("C:/real")
 
     // Empty first page leaves alias absent.
     c2.close()
@@ -1194,6 +1255,115 @@ describe("ReferenceSearchController", () => {
     sourceApi.file.resolve(page("file", 0, [], true))
     await flushMicrotasks()
     expect(cache3.resolveFileRootAlias(BACKEND, "C:/link")).toBeNull()
+  })
+
+  it("mixed_or_missing_file_canonical_root_marks_protocol_error_and_stops_loading", async () => {
+    const controller = createController(catalogFixture())
+    controller.setQuery("app")
+    await flushMicrotasks()
+
+    // Mixed roots on a single page — no merge, error + not loading.
+    sourceApi.file.resolve(
+      page(
+        "file",
+        0,
+        [fileCandidate("a.ts", "C:/real"), fileCandidate("b.ts", "C:/other", 2)],
+        true
+      )
+    )
+    await flushMicrotasks(10)
+    expect(controller.getSnapshot().groups.file.error).toBe("source")
+    expect(controller.getSnapshot().groups.file.loading).toBe(false)
+    expect(controller.getSnapshot().groups.file.items).toHaveLength(0)
+    expect(
+      cache.literalPreview(
+        { backend: BACKEND, source: "file", canonicalRoot: "C:/real" },
+        "a",
+        50
+      ).items
+    ).toHaveLength(0)
+
+    controller.close()
+    const c2 = createController(catalogFixture())
+    c2.setQuery("app")
+    await flushMicrotasks()
+    const missingRoot = fileCandidate("x.ts", "C:/real")
+    // Force missing canonicalWorkspaceRoot after construction.
+    ;(missingRoot.metadata as { canonicalWorkspaceRoot?: string }).canonicalWorkspaceRoot =
+      undefined as unknown as string
+    sourceApi.file.resolve(page("file", 0, [missingRoot], true))
+    await flushMicrotasks(10)
+    expect(c2.getSnapshot().groups.file.error).toBe("source")
+    expect(c2.getSnapshot().groups.file.loading).toBe(false)
+    expect(c2.getSnapshot().groups.file.items).toHaveLength(0)
+  })
+
+  it("regex_file_drain_begins_on_first_non_empty_page_without_prior_alias", async () => {
+    const controller = createController(catalogFixture())
+    controller.setQuery("re:app")
+    // Resolve catalog regex quickly so it does not block the drain.
+    await flushMicrotasks()
+    while (regexQueue.length > 0) {
+      sourceApi.regex.resolve([])
+      await flushMicrotasks()
+    }
+
+    const ranked = fileCandidate("app.ts", "C:/real")
+    ranked.regexRank = { fieldTier: 0, start: 0, length: 3 }
+    sourceApi.file.resolve(page("file", 0, [ranked], true))
+    sourceApi.conversation.resolve(page("conversation", 0, [], true))
+    sourceApi.commit.resolve(page("commit", 0, [], true))
+    await flushMicrotasks(15)
+
+    expect(controller.getSnapshot().groups.file.error).toBeNull()
+    expect(controller.getSnapshot().groups.file.loading).toBe(false)
+    expect(controller.getSnapshot().groups.file.items).toHaveLength(1)
+
+    const snap = cache.getRegexSnapshot(
+      { backend: BACKEND, source: "file", canonicalRoot: "C:/real" },
+      "re:app"
+    )
+    expect(snap).not.toBeNull()
+    expect(snap!.items.map((i) => i.candidate.uri)).toEqual([ranked.uri])
+  })
+
+  it("sync_visible_pins_clears_abandoned_file_bucket_after_alias_repoint", async () => {
+    const pinSpy = vi.spyOn(cache, "pinVisible")
+    const oldRoot = "C:/old"
+    const newRoot = "C:/real"
+    const oldBucket: ReferenceCacheBucketKey = {
+      backend: BACKEND,
+      source: "file",
+      canonicalRoot: oldRoot,
+    }
+    cache.mergeCandidate(oldBucket, fileCandidate("app-old.ts", oldRoot))
+    cache.rememberFileRootAlias(BACKEND, "C:/link", oldRoot)
+
+    const controller = createController(catalogFixture())
+    controller.setQuery("app")
+    expect(controller.getSnapshot().groups.file.items).toHaveLength(1)
+    // Drain siblings so the file start is the only pending identity.
+    sourceApi.conversation.resolve(page("conversation", 0, [], true))
+    sourceApi.commit.resolve(page("commit", 0, [], true))
+    await flushMicrotasks()
+
+    pinSpy.mockClear()
+    const nextCandidate = fileCandidate("app.ts", newRoot)
+    sourceApi.file.resolve(page("file", 0, [nextCandidate], true))
+    await flushMicrotasks(10)
+
+    const clearedOld = pinSpy.mock.calls.some(
+      ([, bucket, uris]) =>
+        bucket.source === "file" &&
+        "canonicalRoot" in bucket &&
+        bucket.canonicalRoot === oldRoot &&
+        uris.length === 0
+    )
+    expect(clearedOld).toBe(true)
+    expect(controller.getSnapshot().groups.file.items).toHaveLength(1)
+    expect(
+      controller.getSnapshot().groups.file.items[0]?.reference.uri
+    ).toBe(nextCandidate.uri)
   })
 
   it("close_is_idempotent_and_reopen_allocates_new_source_identities", async () => {
