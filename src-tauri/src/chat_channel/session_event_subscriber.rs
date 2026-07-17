@@ -1579,15 +1579,27 @@ mod async_relay_dedup_tests {
         assert_eq!(job.locale.as_deref(), Some("ja"));
         // The retried prompt landed on the connection's command channel.
         let mut got_prompt = None;
+        let mut mark_awaiting_reply = None;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if let ConnectionCommand::Prompt { blocks, .. } = cmd {
+            if let ConnectionCommand::Prompt {
+                blocks,
+                mark_awaiting_reply: mark,
+                ..
+            } = cmd
+            {
                 got_prompt = Some(blocks);
+                mark_awaiting_reply = Some(mark);
             }
         }
         let blocks = got_prompt.expect("a Prompt command must be enqueued by the retry");
         assert!(
             matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == "do the task"),
             "the retried prompt must carry the deferred text, got {blocks:?}"
+        );
+        assert_eq!(
+            mark_awaiting_reply,
+            Some(false),
+            "chat deferred retry must keep mark_awaiting_reply=false (background linked send)"
         );
     }
 
@@ -1725,15 +1737,27 @@ mod async_relay_dedup_tests {
         );
 
         let mut got_prompt = None;
+        let mut mark_awaiting_reply = None;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if let ConnectionCommand::Prompt { blocks, .. } = cmd {
+            if let ConnectionCommand::Prompt {
+                blocks,
+                mark_awaiting_reply: mark,
+                ..
+            } = cmd
+            {
                 got_prompt = Some(blocks);
+                mark_awaiting_reply = Some(mark);
             }
         }
         let blocks = got_prompt.expect("Prompt command must be enqueued after capture");
         assert!(
             matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == &visible),
             "prompt blocks must carry exact channel text, got {blocks:?}"
+        );
+        assert_eq!(
+            mark_awaiting_reply,
+            Some(false),
+            "chat first-send must keep mark_awaiting_reply=false (background linked send)"
         );
         assert!(
             bridge

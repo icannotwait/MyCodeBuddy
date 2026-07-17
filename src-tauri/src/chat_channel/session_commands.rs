@@ -54,6 +54,10 @@ pub(crate) async fn channel_launch_context_from_db(
 
 /// Database-aware linked send for chat producers: authoritative conversation
 /// folder, exact visible text, and resolved channel locale.
+///
+/// Uses [`ConnectionManager::send_prompt_linked_background`] so chat keeps
+/// mandatory routes on while `mark_awaiting_reply=false` (same policy as the
+/// former unlinked `send_prompt_background` path).
 pub(crate) async fn send_prompt_linked_for_chat(
     db: &DatabaseConnection,
     conn_mgr: &ConnectionManager,
@@ -70,13 +74,12 @@ pub(crate) async fn send_prompt_linked_for_chat(
         text: text.to_string(),
     }];
     conn_mgr
-        .send_prompt_linked(
+        .send_prompt_linked_background(
             &app_db,
             connection_id,
             blocks,
             Some(conv.folder_id),
             Some(conversation_id),
-            None,
             Some(PromptCaptureContext::new(
                 Some(text.to_string()),
                 Some(locale),
@@ -1234,15 +1237,23 @@ mod tests {
 
         // Drain: ensure a prompt was enqueued (send reached manager).
         let mut saw_prompt = false;
+        let mut mark_awaiting_reply = None;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if matches!(
-                cmd,
-                crate::acp::connection::ConnectionCommand::Prompt { .. }
-            ) {
+            if let crate::acp::connection::ConnectionCommand::Prompt {
+                mark_awaiting_reply: mark,
+                ..
+            } = cmd
+            {
                 saw_prompt = true;
+                mark_awaiting_reply = Some(mark);
             }
         }
         assert!(saw_prompt, "follow-up must enqueue a Prompt command");
+        assert_eq!(
+            mark_awaiting_reply,
+            Some(false),
+            "chat follow-up must keep mark_awaiting_reply=false (background linked send)"
+        );
 
         // No conversation should have been created in the sender's other folder.
         let in_other =
