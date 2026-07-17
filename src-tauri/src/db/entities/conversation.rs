@@ -86,6 +86,15 @@ pub struct Model {
     pub delegation_error_code: Option<String>,
     pub delegation_started_at: Option<DateTimeUtc>,
     pub delegation_finished_at: Option<DateTimeUtc>,
+    /// Nullable runtime rollup for Broker-owned join. Historical/non-delegate
+    /// rows stay null; newly-created delegate rows start at zero-count snapshot.
+    pub delegation_tool_call_count: Option<i64>,
+    pub delegation_edit_tool_call_count: Option<i64>,
+    pub delegation_touched_files_json: Option<String>,
+    pub delegation_touched_files_truncated: Option<bool>,
+    pub delegation_additions: Option<i64>,
+    pub delegation_deletions: Option<i64>,
+    pub delegation_line_counts_complete: Option<bool>,
     pub message_count: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

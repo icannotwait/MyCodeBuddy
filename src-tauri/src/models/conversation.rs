@@ -75,6 +75,11 @@ pub struct DbConversationSummary {
     pub delegation_error_code: Option<String>,
     pub delegation_started_at: Option<DateTime<Utc>>,
     pub delegation_finished_at: Option<DateTime<Utc>>,
+    /// Typed projection of durable runtime rollup columns. Absent for
+    /// historical/non-delegate rows and for rows that fail invariant decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_runtime_stats:
+        Option<crate::acp::delegation::runtime_stats::DelegationRuntimeStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]

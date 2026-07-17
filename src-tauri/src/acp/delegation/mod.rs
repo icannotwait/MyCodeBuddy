@@ -41,6 +41,7 @@ pub mod meta_writer;
 pub mod metrics;
 pub mod parent_watcher;
 pub mod route;
+pub mod runtime_stats;
 pub mod spawner;
 pub mod store;
 pub mod supervisor;

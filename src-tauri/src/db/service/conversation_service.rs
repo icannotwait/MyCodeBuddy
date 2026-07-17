@@ -182,6 +182,29 @@ async fn create_inner(
         kind,
         delegation_route_override,
     } = options;
+    let is_delegate = delegation.is_some();
+    let rollup_defaults = if is_delegate {
+        (
+            Some(0_i64),
+            Some(0_i64),
+            Some("[]".to_string()),
+            Some(false),
+            None::<i64>,
+            None::<i64>,
+            Some(false),
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
+    let (
+        delegation_tool_call_count,
+        delegation_edit_tool_call_count,
+        delegation_touched_files_json,
+        delegation_touched_files_truncated,
+        delegation_additions,
+        delegation_deletions,
+        delegation_line_counts_complete,
+    ) = rollup_defaults;
     let at_str = serde_json::to_value(agent_type)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
@@ -230,6 +253,13 @@ async fn create_inner(
         delegation_error_code: Set(delegation_error_code),
         delegation_started_at: Set(delegation_started_at),
         delegation_finished_at: Set(delegation_finished_at),
+        delegation_tool_call_count: Set(delegation_tool_call_count),
+        delegation_edit_tool_call_count: Set(delegation_edit_tool_call_count),
+        delegation_touched_files_json: Set(delegation_touched_files_json),
+        delegation_touched_files_truncated: Set(delegation_touched_files_truncated),
+        delegation_additions: Set(delegation_additions),
+        delegation_deletions: Set(delegation_deletions),
+        delegation_line_counts_complete: Set(delegation_line_counts_complete),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
@@ -593,10 +623,38 @@ fn parse_agent_type(s: &str) -> AgentType {
 }
 
 fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
+    use crate::acp::delegation::runtime_stats::{
+        decode_persisted_runtime_stats, PersistedRuntimeStatsColumns,
+    };
+
     let status = serde_json::to_value(&r.status)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", r.status));
+    let conversation_id = r.id;
+    let delegation_runtime_stats = match decode_persisted_runtime_stats(
+        PersistedRuntimeStatsColumns {
+            started_at: r.delegation_started_at,
+            finished_at: r.delegation_finished_at,
+            tool_call_count: r.delegation_tool_call_count,
+            edit_tool_call_count: r.delegation_edit_tool_call_count,
+            touched_files_json: r.delegation_touched_files_json.as_deref(),
+            touched_files_truncated: r.delegation_touched_files_truncated,
+            additions: r.delegation_additions,
+            deletions: r.delegation_deletions,
+            line_counts_complete: r.delegation_line_counts_complete,
+        },
+    ) {
+        Ok(stats) => stats,
+        Err(err) => {
+            tracing::warn!(
+                conversation_id,
+                error = %err,
+                "[conversation_service] failed to decode delegation_runtime_stats"
+            );
+            None
+        }
+    };
     DbConversationSummary {
         id: r.id,
         folder_id: r.folder_id,
@@ -625,6 +683,7 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         delegation_error_code: r.delegation_error_code,
         delegation_started_at: r.delegation_started_at,
         delegation_finished_at: r.delegation_finished_at,
+        delegation_runtime_stats,
     }
 }
 
@@ -1370,6 +1429,37 @@ mod tests {
         .expect("delegate");
         assert_eq!(child.kind, ConversationKind::Delegate);
         assert_eq!(child.parent_id, Some(regular.id));
+    }
+
+    #[tokio::test]
+    async fn create_with_delegation_initializes_runtime_rollup() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/rollup-init").await;
+
+        let regular = create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("regular");
+        let delegated = create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: regular.id,
+                parent_tool_use_id: "tu-rollup".into(),
+                delegation_call_id: "call-rollup".into(),
+            }),
+        )
+        .await
+        .expect("delegate");
+
+        assert!(regular.delegation_tool_call_count.is_none());
+        assert_eq!(delegated.delegation_tool_call_count, Some(0));
+        assert_eq!(delegated.delegation_edit_tool_call_count, Some(0));
+        assert_eq!(delegated.delegation_touched_files_json.as_deref(), Some("[]"));
+        assert_eq!(delegated.delegation_touched_files_truncated, Some(false));
+        assert_eq!(delegated.delegation_line_counts_complete, Some(false));
     }
 
     #[tokio::test]

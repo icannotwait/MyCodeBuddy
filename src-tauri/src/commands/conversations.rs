@@ -1892,6 +1892,7 @@ mod tests {
             delegation_error_code: None,
             delegation_started_at: None,
             delegation_finished_at: None,
+            delegation_runtime_stats: None,
         }
     }
 
