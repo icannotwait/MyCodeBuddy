@@ -788,6 +788,8 @@ mod tests {
         force_spawn_fail: AtomicBool,
         /// Count of events observed on the private stream after Noop emit.
         private_stream_events: AtomicUsize,
+        /// Set after fake `identity_and_subscribe` returns (test sync only).
+        identity_ready: AtomicBool,
     }
 
     impl FakeAgent {
@@ -817,6 +819,7 @@ mod tests {
                 spawn_cancelled_no_id: AtomicBool::new(false),
                 force_spawn_fail: AtomicBool::new(false),
                 private_stream_events: AtomicUsize::new(0),
+                identity_ready: AtomicBool::new(false),
             })
         }
 
@@ -980,7 +983,11 @@ mod tests {
             if self.block_identity.load(Ordering::SeqCst) {
                 self.agent.identity_gate.wait_if_armed(true).await;
             }
-            self.agent.manager.identity_and_subscribe(conn_id).await
+            let result = self.agent.manager.identity_and_subscribe(conn_id).await;
+            // Signal only after subscribe returns so tests can await the real
+            // transition into wait_for_session_identity (not a fixed yield count).
+            self.agent.identity_ready.store(true, Ordering::SeqCst);
+            result
         }
 
         async fn send_internal(
@@ -1381,8 +1388,13 @@ mod tests {
     async fn slow_handshake_releases_discovery_lease_at_15_seconds_but_sends_only_after_registration(
     ) {
         let fixture = hidden_runner_fixture().await;
-        tokio::time::pause();
         // Do NOT emit SessionStarted before subscribe — hold it past 15s.
+        // Keep real time until spawn returns a live connection and identity
+        // subscribe completes. Fixed yield counts flake under full-suite load
+        // (status/config/lease/spawn need real scheduler progress). Pause only
+        // for the strict virtual-time 15s discovery-lease release sequence.
+        // lease_deadline Instant is already set before identity wait; remaining
+        // budget is still ~15s, so advancing 15 virtual seconds still fires it.
         fixture.agent.finish_with("Slow handshake title");
 
         let registry = Arc::clone(&fixture.registry);
@@ -1393,15 +1405,33 @@ mod tests {
         let handle =
             tokio::spawn(async move { runner.run(attempt, CancellationToken::new()).await });
 
-        // Let spawn + identity_and_subscribe complete and identity wait begin.
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        // Bounded real-time wait for the actual spawn→identity transition.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let live = agent.manager.get_state(&agent.conn_id).await.is_some();
+                let identity = agent.identity_ready.load(Ordering::SeqCst);
+                if live && identity {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawn must have returned a live connection before the 15s lease race");
+        // Let the runner task enter wait_for_session_identity's select so the
+        // lease timer is armed before we freeze the clock.
+        tokio::task::yield_now().await;
         assert!(
             agent.manager.get_state(&agent.conn_id).await.is_some(),
             "spawn must have returned a live connection before the 15s lease race"
         );
-        assert_eq!(agent.prompt_count(), 0);
+        assert_eq!(
+            agent.prompt_count(),
+            0,
+            "no SessionStarted yet: must not prompt before registration"
+        );
+
+        tokio::time::pause();
 
         // Advance past the 15s discovery-lease budget one second at a time so
         // the lease timer in wait_for_session_identity can fire.
