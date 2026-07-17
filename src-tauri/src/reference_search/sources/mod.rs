@@ -1,8 +1,8 @@
 //! Source cursor contract for incremental reference search.
 //!
-//! Production file / conversation cursors live here; commit lands in Task 5.
-//! Task 3 defined the trait surface and `SourcePage` so the registry can run
-//! against test factories.
+//! Production file / conversation / commit cursors live here. Task 3 defined
+//! the trait surface and `SourcePage` so the registry can run against test
+//! factories; Task 5 adds the production factory.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -13,9 +13,11 @@ use crate::reference_search::types::{
     ReferenceCandidate, ReferenceDoneReason, StartReferenceSearchRequest,
 };
 
+pub mod commit;
 pub mod conversation;
 pub mod file;
 
+pub use commit::CommitCursor;
 pub use conversation::ConversationCursor;
 pub use file::FileCursor;
 

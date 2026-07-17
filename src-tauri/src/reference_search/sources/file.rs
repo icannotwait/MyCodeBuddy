@@ -395,7 +395,8 @@ fn open_folder_paths_match(folder: &Path, requested: &Path) -> bool {
     }
 }
 
-fn path_is_under_root(target: &Path, root: &Path) -> bool {
+/// Containment check for a resolved target under a canonical open-workspace root.
+pub(crate) fn path_is_under_root(target: &Path, root: &Path) -> bool {
     if target.starts_with(root) {
         return true;
     }

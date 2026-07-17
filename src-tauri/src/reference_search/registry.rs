@@ -20,15 +20,59 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::commands::conversation_experience::{
     MAX_REFERENCE_SEARCH_LIMIT, MIN_REFERENCE_SEARCH_LIMIT,
 };
+use sea_orm::DatabaseConnection;
+
 use crate::reference_search::matcher::SearchPattern;
 use crate::reference_search::sources::{
-    ReferenceSourceCursor, ReferenceSourceFactory, SourcePage,
+    CommitCursor, ConversationCursor, FileCursor, ReferenceSourceCursor, ReferenceSourceFactory,
+    SourcePage,
 };
 use crate::reference_search::types::{
     parse_canonical_uuid_v4, validate_source_scope, CancelReferenceSearchRequest,
     NextReferenceSearchPageRequest, ReferenceSearchPage, ReferenceSearchSource,
     RequestFingerprint, SearchIdentity, StartReferenceSearchRequest,
 };
+
+/// Production factory that opens file / conversation / commit source cursors.
+pub struct ProductionReferenceSourceFactory {
+    pub db: DatabaseConnection,
+}
+
+#[async_trait::async_trait]
+impl ReferenceSourceFactory for ProductionReferenceSourceFactory {
+    async fn open(
+        &self,
+        request: &StartReferenceSearchRequest,
+        pattern: SearchPattern,
+        limit: usize,
+    ) -> Result<Box<dyn ReferenceSourceCursor>, AppCommandError> {
+        match request.source {
+            ReferenceSearchSource::File => {
+                let workspace = request
+                    .workspace_path
+                    .as_deref()
+                    .ok_or_else(|| error_invalid_request("file search requires workspace_path"))?;
+                let cursor = FileCursor::open(&self.db, workspace, pattern, limit).await?;
+                Ok(Box::new(cursor))
+            }
+            ReferenceSearchSource::Conversation => {
+                Ok(Box::new(ConversationCursor::open(
+                    self.db.clone(),
+                    pattern,
+                    limit,
+                )))
+            }
+            ReferenceSearchSource::Commit => {
+                let workspace = request
+                    .workspace_path
+                    .as_deref()
+                    .ok_or_else(|| error_invalid_request("commit search requires workspace_path"))?;
+                let cursor = CommitCursor::open(&self.db, workspace, pattern, limit).await?;
+                Ok(Box::new(cursor))
+            }
+        }
+    }
+}
 
 /// Fixed page size for every first and subsequent resource page.
 pub const REFERENCE_SEARCH_PAGE_SIZE: usize = 5;

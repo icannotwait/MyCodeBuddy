@@ -63,6 +63,25 @@ pub struct ValidateReferenceCandidateRequest {
     pub source_epoch: Option<String>,
 }
 
+/// Outcome of validating a selected reference candidate against live state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReferenceCandidateValidation {
+    Match {
+        validation_request_id: String,
+        candidate: ReferenceCandidate,
+        regex_rank: Option<ReferenceRegexRank>,
+    },
+    NotMatch {
+        validation_request_id: String,
+        candidate: ReferenceCandidate,
+        regex_rank: Option<ReferenceRegexRank>,
+    },
+    NotFound {
+        validation_request_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceDoneReason {
