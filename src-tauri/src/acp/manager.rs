@@ -3888,6 +3888,8 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_wrappers_encode_user_facing_and_background_attention() {
+        use crate::db::test_helpers;
+
         let mgr = ConnectionManager::new();
         let mut rx = mgr
             .insert_test_connection_live("policy-conn", AgentType::Codex, None, EventEmitter::Noop)
@@ -3920,6 +3922,40 @@ mod tests {
             panic!("expected background prompt command");
         };
         assert!(!mark_awaiting_reply);
+
+        // Automation uses the linked-background public API (hard-codes
+        // mark_awaiting_reply=false). Exercise that path against a live
+        // connection + real in-memory conversation, not the private impl.
+        {
+            let state = mgr.get_state("policy-conn").await.unwrap();
+            state.write().await.turn_in_flight = false;
+        }
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/policy-linked-bg").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::Codex, None, None)
+                .await
+                .expect("seed conversation");
+        mgr.send_prompt_linked_background(
+            &db,
+            "policy-conn",
+            one_text_block(),
+            Some(folder_id),
+            Some(conversation.id),
+        )
+        .await
+        .expect("linked background prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected linked background prompt command");
+        };
+        assert!(
+            !mark_awaiting_reply,
+            "send_prompt_linked_background must enqueue mark_awaiting_reply=false"
+        );
     }
 
     /// Insert a connection with a LIVE command receiver so `send_prompt_inner`'s
