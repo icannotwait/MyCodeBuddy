@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::acp::delegation::broker::DelegationBroker;
+use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
@@ -131,6 +132,7 @@ pub struct DelegationStack {
     pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
     pub runtime_settings: DelegationRuntimeSettings,
     pub metrics: Arc<DelegationMetrics>,
+    pub continuation_store: Arc<dyn ContinuationStore>,
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -166,6 +168,9 @@ pub fn build_delegation_stack(
     let db_arc = Arc::new(AppDatabase {
         conn: db_conn.clone(),
     });
+    let continuation_store =
+        Arc::new(DbContinuationStore::new(db_conn.clone())) as Arc<dyn ContinuationStore>;
+    connection_manager.install_continuation_store(continuation_store.clone());
     // Create the shared runtime handle before the spawner so child launches
     // always resolve against the live watch snapshot (never a second DB load).
     let runtime_settings = DelegationRuntimeSettings::default();
@@ -245,6 +250,7 @@ pub fn build_delegation_stack(
         sessions,
         runtime_settings,
         metrics: delegation_metrics,
+        continuation_store,
     }
 }
 

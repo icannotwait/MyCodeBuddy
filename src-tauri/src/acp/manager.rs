@@ -16,6 +16,7 @@ use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
     SpawnHandshake,
 };
+use crate::acp::delegation::continuation::store::ContinuationStore;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
@@ -359,6 +360,9 @@ pub struct ConnectionManager {
     /// init. `Arc<OnceLock>` so the inner `Self` cloned from `clone_ref` sees
     /// the install too — the lock is set once at startup and never mutated.
     delegation_injection: Arc<std::sync::OnceLock<crate::acp::connection::DelegationInjection>>,
+    /// Durable continuation ownership store installed once with the shared
+    /// delegation runtime. The outer Arc keeps `clone_ref` clones on one slot.
+    continuation_store: Arc<std::sync::OnceLock<Arc<dyn ContinuationStore>>>,
     /// Per-agent-type serialization for `probe_agent_options`. Without
     /// this, rapid agent-tab clicks in the settings UI would fan out one
     /// real CLI process per click — each one running up to 60s. The
@@ -398,6 +402,7 @@ impl ConnectionManager {
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
+            continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -410,6 +415,7 @@ impl ConnectionManager {
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             delegation_injection: self.delegation_injection.clone(),
+            continuation_store: self.continuation_store.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
         }
@@ -426,6 +432,15 @@ impl ConnectionManager {
         self.delegation_injection.get().cloned()
     }
 
+    pub(crate) fn install_continuation_store(&self, store: Arc<dyn ContinuationStore>) {
+        let _ = self.continuation_store.set(store);
+    }
+
+    #[allow(dead_code)]
+    fn continuation_store(&self) -> Option<Arc<dyn ContinuationStore>> {
+        self.continuation_store.get().cloned()
+    }
+
     /// Test-only constructor that overrides the spawn-handshake timeout.
     /// Production code should use `new()`.
     #[cfg(test)]
@@ -435,6 +450,7 @@ impl ConnectionManager {
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
+            continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -7056,6 +7072,25 @@ mod tests {
             cloned_locks.contains_key(&key),
             "spawn_locks must be shared between original and clone_ref"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_manager_clones_share_continuation_store() {
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, InMemoryContinuationStore,
+        };
+
+        let manager = ConnectionManager::new();
+        let store = Arc::new(InMemoryContinuationStore::default()) as Arc<dyn ContinuationStore>;
+        manager.install_continuation_store(store);
+        let cloned = manager.clone_ref();
+
+        assert!(Arc::ptr_eq(
+            &manager.continuation_store().expect("store installed"),
+            &cloned
+                .continuation_store()
+                .expect("shared store visible to clone"),
+        ));
     }
 
     /// Two concurrent `send_prompt_linked` calls on the SAME connection
