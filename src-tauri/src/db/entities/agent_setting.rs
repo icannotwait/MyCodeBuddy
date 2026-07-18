@@ -8,6 +8,7 @@ pub struct Model {
     pub agent_type: String,
     pub registry_id: String,
     pub enabled: bool,
+    pub show_thinking: bool,
     pub sort_order: i32,
     pub installed_version: Option<String>,
     pub env_json: Option<String>,

@@ -16,7 +16,16 @@ export function StatusBadge({
   status,
   errorCode,
 }: {
-  status: "starting" | "running" | "waiting" | "ok" | "err" | "checked"
+  status:
+    | "starting"
+    | "running"
+    | "active"
+    | "waiting"
+    | "waiting_input"
+    | "stalled"
+    | "ok"
+    | "err"
+    | "checked"
   errorCode?: string
 }) {
   const t = useTranslations("Folder.chat.delegation.status")
@@ -33,6 +42,31 @@ export function StatusBadge({
       <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
         <ShieldAlert className="text-amber-500" />
         {t("waiting")}
+      </Badge>
+    )
+  }
+  if (status === "waiting_input") {
+    return (
+      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
+        <ShieldAlert className="text-amber-500" />
+        {t("waitingInput")}
+      </Badge>
+    )
+  }
+  if (status === "stalled") {
+    // Soft-watchdog only — neutral warning, never destructive/failed.
+    return (
+      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
+        <Clock className="text-amber-500" />
+        {t("stalled")}
+      </Badge>
+    )
+  }
+  if (status === "active") {
+    return (
+      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
+        <Loader2 className="animate-spin" />
+        {t("active")}
       </Badge>
     )
   }

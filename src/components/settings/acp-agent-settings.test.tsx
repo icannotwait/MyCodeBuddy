@@ -37,6 +37,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     grok_settings: null,
     hermes_config_yaml: null,
     model_provider_id: null,
+    show_thinking: false,
     ...overrides,
   }
 }
@@ -80,11 +81,11 @@ const emptyCustoms = {
 
 describe("Codex CLI runtime env toggle", () => {
   it("defaults on for all platforms", () => {
-    expect(codexCliRuntimeDefaultOn("windows")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("macos")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("linux")).toBe(true)
-    expect(codexCliRuntimeDefaultOn("unknown")).toBe(true)
-    expect(codexCliRuntimeDefaultOn()).toBe(true)
+    expect(codexCliRuntimeDefaultOn("windows")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("macos")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("linux")).toBe(false)
+    expect(codexCliRuntimeDefaultOn("unknown")).toBe(false)
+    expect(codexCliRuntimeDefaultOn()).toBe(false)
   })
 
   it("treats absent env as the platform default", () => {
@@ -96,9 +97,7 @@ describe("Codex CLI runtime env toggle", () => {
   it("only enables for the literal value 1", () => {
     expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=1", false)).toBe(true)
     expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=0", true)).toBe(false)
-    expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=true", true)).toBe(
-      false
-    )
+    expect(isCodexCliRuntimeEnabled("CODEX_ACP_USE_CLI=true", true)).toBe(false)
   })
 
   it("pins 1/0 so user env overrides distribution defaults", () => {

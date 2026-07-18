@@ -11,13 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use codeg_lib::acp::delegation::broker::{
     ConversationDepthLookup, DelegationBroker, DelegationConfig,
 };
+use codeg_lib::acp::delegation::lease::CompanionLeaseRegistry;
 use codeg_lib::acp::delegation::listener::{
     DelegationListener, ParentSessionLookup, TokenEntry, TokenRegistry,
 };
-use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+use codeg_lib::acp::delegation::spawner::{accepted, mock::MockSpawner, ConnectionSpawner};
 use codeg_lib::acp::delegation::transport::{
     client_round_trip, client_status_round_trip, BrokerRequest, BrokerResponse, BrokerStatusRequest,
 };
@@ -25,6 +27,11 @@ use codeg_lib::acp::delegation::types::{DelegationError, DelegationOutcome, Dele
 use codeg_lib::acp::question::{QuestionSpec, RegisteredQuestion, SessionQuestionAccess};
 use codeg_lib::models::AgentType;
 use serde_json::json;
+
+/// Deterministic, non-semantic accepted timestamp for MockSpawner fixtures.
+fn fixture_started_at() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap()
+}
 
 struct AlwaysRoot;
 #[async_trait]
@@ -139,7 +146,8 @@ async fn client_status_round_trip_with_retry(
 async fn end_to_end_named_pipe_happy_path() {
     let mock = Arc::new(MockSpawner::new());
     mock.queue_spawn(Ok("child-conn-1".into())).await;
-    mock.queue_send(Ok(77)).await;
+    mock.queue_send(Ok(accepted(77, fixture_started_at())))
+        .await;
 
     let broker = Arc::new(DelegationBroker::new(
         mock.clone() as Arc<dyn ConnectionSpawner>,
@@ -157,16 +165,14 @@ async fn end_to_end_named_pipe_happy_path() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from(r"C:\Windows\Temp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp")),
         )
         .await;
 
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
@@ -220,6 +226,7 @@ async fn end_to_end_named_pipe_happy_path() {
         token: "tok".into(),
         task_ids: vec![task_id],
         wait_ms: Some(1_000),
+        return_when: None,
     };
     let resp = client_status_round_trip_with_retry(&pipe, &status_req)
         .await
@@ -239,9 +246,11 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
     // client will see "system cannot find the file specified".
     let mock = Arc::new(MockSpawner::new());
     mock.queue_spawn(Ok("child-1".into())).await;
-    mock.queue_send(Ok(1)).await;
+    mock.queue_send(Ok(accepted(1, fixture_started_at())))
+        .await;
     mock.queue_spawn(Ok("child-2".into())).await;
-    mock.queue_send(Ok(2)).await;
+    mock.queue_send(Ok(accepted(2, fixture_started_at())))
+        .await;
 
     let broker = Arc::new(DelegationBroker::new(
         mock.clone() as Arc<dyn ConnectionSpawner>,
@@ -259,15 +268,13 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
     tokens
         .register(
             "tok".into(),
-            TokenEntry {
-                parent_connection_id: "p1".into(),
-                working_dir: PathBuf::from(r"C:\Windows\Temp"),
-            },
+            TokenEntry::legacy("p1", PathBuf::from(r"C:\Windows\Temp")),
         )
         .await;
     let listener = DelegationListener::new(
         broker.clone(),
         tokens,
+        Arc::new(CompanionLeaseRegistry::default()),
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,

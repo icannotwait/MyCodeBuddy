@@ -6,7 +6,7 @@ import { toast } from "sonner"
 vi.mock("@/lib/api", () => ({
   getDelegationSettings: vi.fn(),
   setDelegationSettings: vi.fn(),
-  getDelegationProfiles: vi.fn(),
+  getDelegationProfileCatalog: vi.fn(),
   setDelegationProfiles: vi.fn(),
   setDelegationBundle: vi.fn(),
   describeAgentOptions: vi.fn(),
@@ -24,13 +24,13 @@ import enMessages from "@/i18n/messages/en.json"
 import {
   getDelegationSettings,
   setDelegationBundle,
-  getDelegationProfiles,
+  getDelegationProfileCatalog,
   type DelegationSettings,
 } from "@/lib/api"
 
 const mockGetDelegationSettings = vi.mocked(getDelegationSettings)
 const mockSetDelegationBundle = vi.mocked(setDelegationBundle)
-const mockGetDelegationProfiles = vi.mocked(getDelegationProfiles)
+const mockGetDelegationProfileCatalog = vi.mocked(getDelegationProfileCatalog)
 const mockToastError = vi.mocked(toast.error)
 
 function renderWithIntl() {
@@ -51,6 +51,8 @@ function settings(
   return {
     enabled: false,
     depth_limit: 1,
+    route_policy: "codeg",
+    stalled_after_seconds: 300,
     completed_cache_max_mb: 512,
     agent_defaults: {},
     ...overrides,
@@ -63,7 +65,11 @@ beforeEach(() => {
     settings: bundle.settings,
     profiles: bundle.profiles,
   }))
-  mockGetDelegationProfiles.mockReset().mockResolvedValue({ profiles: [] })
+  mockGetDelegationProfileCatalog.mockReset().mockResolvedValue({
+    profiles: [],
+    delegation_enabled: false,
+    revision: 0,
+  })
   mockToastError.mockReset()
 })
 
@@ -100,6 +106,8 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 1,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 0,
           agent_defaults: {},
         },
@@ -126,6 +134,8 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 1,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 512,
           agent_defaults: {},
         },
@@ -150,12 +160,62 @@ describe("DelegationSettingsSection", () => {
         settings: {
           enabled: true,
           depth_limit: 5,
+          route_policy: "codeg",
+          stalled_after_seconds: 300,
           completed_cache_max_mb: 512,
           agent_defaults: {},
         },
         profiles: { profiles: [] },
       })
     })
+  })
+
+  it("disables route choice with delegation off and clamps watchdog on save", async () => {
+    mockGetDelegationSettings.mockResolvedValue({
+      enabled: false,
+      depth_limit: 1,
+      route_policy: "codeg",
+      stalled_after_seconds: 300,
+      completed_cache_max_mb: 512,
+    })
+    renderWithIntl()
+    expect(await screen.findByRole("button", { name: "Codeg" })).toBeDisabled()
+    expect(screen.getByText(/effective.*Native/i)).toBeInTheDocument()
+
+    // Enable to edit watchdog, then save an out-of-range value.
+    const enableSwitch = screen.getByLabelText("Enable delegation")
+    fireEvent.click(enableSwitch)
+    const watchdog = screen.getByLabelText(/soft watchdog/i)
+    fireEvent.change(watchdog, { target: { value: "10" } })
+    fireEvent.click(screen.getByRole("button", { name: /save/i }))
+    await waitFor(() => {
+      expect(mockSetDelegationBundle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settings: expect.objectContaining({ stalled_after_seconds: 60 }),
+        })
+      )
+    })
+  })
+
+  it("highlights the active default route (aria-pressed) and toggles on click", async () => {
+    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: true }))
+
+    renderWithIntl()
+
+    const codeg = await screen.findByRole("button", { name: "Codeg" })
+    const native = screen.getByRole("button", { name: "Native" })
+
+    expect(codeg).toHaveAttribute("aria-pressed", "true")
+    expect(codeg).toHaveAttribute("data-variant", "default")
+    expect(native).toHaveAttribute("aria-pressed", "false")
+    expect(native).toHaveAttribute("data-variant", "outline")
+
+    fireEvent.click(native)
+
+    expect(native).toHaveAttribute("aria-pressed", "true")
+    expect(native).toHaveAttribute("data-variant", "default")
+    expect(codeg).toHaveAttribute("aria-pressed", "false")
+    expect(codeg).toHaveAttribute("data-variant", "outline")
   })
 
   it("reflects backend default (disabled): switch off, depth input disabled", async () => {
@@ -184,8 +244,12 @@ describe("DelegationSettingsSection", () => {
     mockGetDelegationSettings
       .mockResolvedValueOnce(settings({ enabled: true }))
       .mockRejectedValueOnce(new Error("reload boom"))
-    mockGetDelegationProfiles
-      .mockResolvedValueOnce({ profiles: [] })
+    mockGetDelegationProfileCatalog
+      .mockResolvedValueOnce({
+        profiles: [],
+        delegation_enabled: true,
+        revision: 0,
+      })
       .mockRejectedValueOnce(new Error("reload boom"))
     mockSetDelegationBundle.mockRejectedValueOnce(new Error("persist boom"))
 

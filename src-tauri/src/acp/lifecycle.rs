@@ -15,15 +15,18 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
-use crate::acp::internal_bus::InternalEventBus;
+use crate::acp::internal_bus::{
+    is_lifecycle_critical, EventBusMetrics, InternalEventBus, InternalEventEnvelope,
+};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+use crate::auto_title::{apply_usable_completion, TurnCompletionSnapshot};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -55,20 +58,23 @@ const WORKER_QUEUE_CAPACITY: usize = 64;
 /// worker AND fed every `ToolCall` (including each parallel child's tool
 /// stream) into worker mailboxes — pressure that could block the dispatcher
 /// and lag the bus into dropping a parent's second delegation `tool_call`.
-/// Registration now happens synchronously in the dispatcher loop via
+/// Registration runs on a dedicated off-select broker-tool worker via
 /// `register_delegation_tool_call_from_event`, so these high-frequency events
-/// never need to reach a worker.
+/// never need to reach a lifecycle worker and never park the dispatcher.
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
-    matches!(
-        event,
-        AcpEvent::SessionStarted { .. }
-            | AcpEvent::TurnComplete { .. }
-            | AcpEvent::ConversationLinked { .. }
-            | AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected
+    // Keep in sync with `internal_bus::is_lifecycle_critical` (critical lane).
+    // Non-terminal `Error` is also worker-relevant for logging paths that still
+    // forward it, but the critical lane only carries `terminal: true` Errors
+    // (see `is_lifecycle_critical`). Worker still accepts any Error via the
+    // broader match used historically for terminal-or-not branching.
+    is_lifecycle_critical(event)
+        || matches!(
+            event,
+            AcpEvent::Error {
+                terminal: false,
+                ..
             }
-            | AcpEvent::Error { .. }
-    )
+        )
 }
 
 /// Whether the dispatcher should tear down (drop the sender for) the per-
@@ -118,32 +124,32 @@ struct CachedConn {
 const HANDLE_EVENT_RETRY_BACKOFFS: &[Duration] =
     &[Duration::from_millis(100), Duration::from_millis(500)];
 
-/// Wrap `handle_event` with a small backoff retry. Most failures here
-/// are transient SQLite "database is locked" errors that clear within a
-/// few hundred milliseconds; without a retry the conversation row would
+/// Wrap `handle_internal_event` with a small backoff retry. Most failures
+/// here are transient SQLite "database is locked" errors that clear within
+/// a few hundred milliseconds; without a retry the conversation row would
 /// silently miss its `pending_review` write and the sidebar would stay
 /// stuck on `in_progress` until the next prompt's `in_progress` write.
 ///
 /// Final failure is logged at ERROR — this is the only signal the
 /// subscriber is dropping correctness on the floor, so it must be noisy.
-async fn handle_event_with_retry(
+async fn handle_internal_event_with_retry(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
-    envelope: &EventEnvelope,
+    internal: &InternalEventEnvelope,
     broker: Option<&Arc<DelegationBroker>>,
 ) {
-    match handle_event(db_conn, manager, envelope, broker).await {
+    match handle_internal_event(db_conn, manager, internal, broker).await {
         Ok(()) => return,
         Err(e) => {
             tracing::warn!(
                 "[lifecycle][WARN] handle_event failed (attempt 1, will retry) for {:?}: {e}",
-                envelope.payload
+                internal.payload
             );
         }
     }
     for (attempt, backoff) in HANDLE_EVENT_RETRY_BACKOFFS.iter().enumerate() {
         tokio::time::sleep(*backoff).await;
-        match handle_event(db_conn, manager, envelope, broker).await {
+        match handle_internal_event(db_conn, manager, internal, broker).await {
             Ok(()) => return,
             Err(e) => {
                 let attempt_num = attempt + 2;
@@ -157,11 +163,246 @@ async fn handle_event_with_retry(
                     } else {
                         ", will retry"
                     },
-                    envelope.payload
+                    internal.payload
                 );
             }
         }
     }
+}
+
+/// Production lifecycle entry for bus workers. Consumes the optional
+/// completion sidecar on `TurnComplete`; other events delegate to
+/// [`handle_event`].
+async fn handle_internal_event(
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    internal: &InternalEventEnvelope,
+    broker: Option<&Arc<DelegationBroker>>,
+) -> Result<(), DbError> {
+    match &internal.payload {
+        AcpEvent::TurnComplete {
+            stop_reason,
+            mark_awaiting_reply,
+            ..
+        } => {
+            handle_turn_complete_internal(
+                db_conn,
+                manager,
+                &internal.connection_id,
+                stop_reason,
+                *mark_awaiting_reply,
+                internal.completion.as_ref().map(Arc::clone),
+                broker,
+            )
+            .await
+        }
+        _ => handle_event(db_conn, manager, internal.event.as_ref(), broker).await,
+    }
+}
+
+/// Sidecar-aware TurnComplete path. When a completion snapshot is present,
+/// status CAS and usable-completion job updates share one transaction and
+/// never re-read mutable SessionState for assistant text / locale / token /
+/// conversation id. Without a sidecar, status still runs (for direct tests
+/// that still call [`handle_event`]); broker result text is empty.
+async fn handle_turn_complete_internal(
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    connection_id: &str,
+    stop_reason: &str,
+    mark_awaiting_reply: bool,
+    completion: Option<Arc<TurnCompletionSnapshot>>,
+    broker: Option<&Arc<DelegationBroker>>,
+) -> Result<(), DbError> {
+    let live = manager.get_state_and_emitter(connection_id).await;
+
+    let (conversation_id, broker_text) = if let Some(snapshot) = completion.as_ref() {
+        (
+            Some(snapshot.conversation_id),
+            Some(snapshot.final_text.clone()),
+        )
+    } else {
+        // Production emits always carry a sidecar when active_turn was set.
+        // Sidecar-free paths (direct unit tests via handle_event, or turns
+        // without active_turn) never fall back to mutable last_assistant_text.
+        let cid = match &live {
+            Some((state_arc, _)) => state_arc.read().await.conversation_id,
+            None => None,
+        };
+        (cid, None)
+    };
+
+    let Some(cid) = conversation_id else {
+        tracing::warn!(
+            connection_id = %connection_id,
+            stop_reason = %stop_reason,
+            has_completion_sidecar = completion.is_some(),
+            live_state_present = live.is_some(),
+            "[lifecycle] TurnComplete skipped: no conversation_id bound \
+             (row will stay in_progress if still InProgress)"
+        );
+        return Ok(());
+    };
+
+    tracing::info!(
+        connection_id = %connection_id,
+        conversation_id = cid,
+        stop_reason = %stop_reason,
+        mark_awaiting_reply,
+        has_completion_sidecar = completion.is_some(),
+        "[lifecycle] handling TurnComplete"
+    );
+
+    match conversation_is_delegate(db_conn, cid).await {
+        Ok(true) => {
+            // Delegate ConversationStatus is broker-owned, but auto-title jobs
+            // still advance on usable completions from the event-owned sidecar.
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                "[lifecycle] TurnComplete on delegate row; broker owns status CAS"
+            );
+            if let Some(snapshot) = completion.as_ref() {
+                let txn = db_conn.begin().await?;
+                let transition =
+                    apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+                txn.commit().await?;
+                if transition.became_ready {
+                    crate::auto_title::notify_live_coordinator_ready();
+                }
+            }
+            if let Some(b) = broker {
+                // Empty broker text when no sidecar — never re-read SessionState.
+                let text = broker_text
+                    .as_ref()
+                    .map(|t| t.as_ref().to_string())
+                    .unwrap_or_default();
+                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
+                    .await;
+            }
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(
+                conversation_id = cid,
+                error = %e,
+                "[lifecycle] is_delegate probe failed; skipping generic \
+                 ConversationStatus write (fail-closed)"
+            );
+            if let Some(snapshot) = completion.as_ref() {
+                let txn = db_conn.begin().await?;
+                let transition =
+                    apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+                txn.commit().await?;
+                if transition.became_ready {
+                    crate::auto_title::notify_live_coordinator_ready();
+                }
+            }
+            if let Some(b) = broker {
+                let text = broker_text
+                    .as_ref()
+                    .map(|t| t.as_ref().to_string())
+                    .unwrap_or_default();
+                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
+                    .await;
+            }
+            return Ok(());
+        }
+    }
+
+    // One transaction: status transition + usable completion (when sidecar).
+    let txn = db_conn.begin().await?;
+    let cas_patch = match stop_reason {
+        "end_turn" => {
+            conversation_service::finish_end_turn_if_in_progress(&txn, cid, mark_awaiting_reply)
+                .await?
+        }
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+            conversation_service::update_status_if_with_patch(
+                &txn,
+                cid,
+                ConversationStatus::InProgress,
+                ConversationStatus::Cancelled,
+            )
+            .await?
+        }
+        _ => {
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                "[lifecycle] TurnComplete stop_reason has no status CAS \
+                 (e.g. cancelled already written by manager.cancel)"
+            );
+            None
+        }
+    };
+    let mut became_ready = false;
+    if let Some(snapshot) = completion.as_ref() {
+        let transition = apply_usable_completion(&txn, snapshot.as_ref(), stop_reason).await?;
+        became_ready = transition.became_ready;
+    }
+    txn.commit().await?;
+    // Notify the durable title worker only after the transaction commits.
+    if became_ready {
+        crate::auto_title::notify_live_coordinator_ready();
+    }
+
+    match &cas_patch {
+        Some(patch) => {
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                new_status = %patch.status,
+                became_ready,
+                "[lifecycle] TurnComplete status CAS won"
+            );
+        }
+        None => {
+            tracing::warn!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                became_ready,
+                "[lifecycle] TurnComplete status CAS lost or no-op \
+                 (row may already be terminal / not in_progress)"
+            );
+        }
+    }
+
+    if let Some(patch) = cas_patch {
+        let status = if stop_reason == "end_turn" {
+            ConversationStatus::PendingReview
+        } else {
+            ConversationStatus::Cancelled
+        };
+        // DB status is already committed. Fan-out to SessionState + desktop
+        // must not stall this worker — a hung `app.emit` / delivery path would
+        // leave later TurnCompletes sitting in the per-connection mailbox and
+        // strand the row at `in_progress` (seen on Grok multi-turn sessions).
+        if let Some((state_arc, emitter)) = live.as_ref() {
+            let state_arc = Arc::clone(state_arc);
+            let emitter = emitter.clone();
+            let patch = patch.clone();
+            tokio::spawn(async move {
+                emit_with_state(
+                    &state_arc,
+                    &emitter,
+                    AcpEvent::ConversationStatusChanged {
+                        conversation_id: cid,
+                        status,
+                    },
+                )
+                .await;
+                crate::commands::conversations::emit_conversation_state(&emitter, patch);
+            });
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn handle_event(
@@ -196,7 +437,11 @@ pub(crate) async fn handle_event(
             }
             Ok(())
         }
-        AcpEvent::TurnComplete { stop_reason, .. } => {
+        AcpEvent::TurnComplete {
+            stop_reason,
+            mark_awaiting_reply,
+            ..
+        } => {
             // Centralized status transition: when the agent reports the turn
             // is done, flip the conversation row and re-broadcast the change
             // as `ConversationStatusChanged`. This lives in the lifecycle
@@ -206,26 +451,15 @@ pub(crate) async fn handle_event(
             // mid-turn — the row gets the correct status even if no
             // browser is connected to react to TurnComplete itself.
             //
-            // The target status depends on the stop reason: `end_turn` is the
-            // only success case and goes to `PendingReview`. `refusal`,
-            // `max_tokens`, `max_turn_requests`, `unknown`, and `empty`
-            // indicate the turn failed (often a backend/gateway error
-            // masquerading as `Refusal` per the ACP spec gap, or — common
-            // with OpenCode — a silent EndTurn that produced no output), so
-            // we flip to `Cancelled` and pair the transition with an
-            // `AcpEvent::Error` toast emitted upstream by `connection.rs`.
-            // `cancelled` is already written by `manager.cancel()` (eager
-            // CAS InProgress → Cancelled at the user-cancel entry point), so
-            // we leave it alone here. `completed` transitions remain
-            // frontend-driven.
-            let target_status = match stop_reason.as_str() {
-                "end_turn" => Some(ConversationStatus::PendingReview),
-                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
-                    Some(ConversationStatus::Cancelled)
-                }
-                // `cancelled` and any future reason: don't write here.
-                _ => None,
-            };
+            // CAS helpers from conversation_service own the write:
+            // `end_turn` → finish_end_turn_if_in_progress (PendingReview +
+            // optional token). Failure reasons → update_status_if_with_patch
+            // (InProgress → Cancelled, clears token). Emit the existing
+            // per-connection status event only when the CAS wins (`Some`),
+            // then the global ConversationChange::State with the returned
+            // backend patch. `cancelled` is already written by
+            // `manager.cancel()`; leave it alone. `completed` transitions
+            // remain frontend-driven.
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -241,34 +475,87 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
-            if let Some(ts) = target_status.clone() {
-                // DB write before emit so any downstream subscriber that observes
-                // the ConversationStatusChanged event can assume the row is
-                // already at the target status.
-                conversation_service::update_status(db_conn, cid, ts.clone()).await?;
+            // Delegate rows: durable task status + sidebar ConversationStatus are
+            // owned by the broker store CAS (`settle_task`). A generic
+            // ConversationStatus write here would race / obscure the terminal
+            // winner. Non-delegate chats keep the awaiting-reply CAS path.
+            // DB probe is fail-closed: on error never fall through to generic
+            // ConversationStatus mutation (may still route to broker).
+            match conversation_is_delegate(db_conn, cid).await {
+                Ok(true) => {
+                    if let Some(b) = broker {
+                        forward_turn_complete_to_broker(
+                            db_conn,
+                            b.as_ref(),
+                            cid,
+                            stop_reason.as_str(),
+                            last_text,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        conversation_id = cid,
+                        error = %e,
+                        "[lifecycle] is_delegate probe failed; skipping generic \
+                         ConversationStatus write (fail-closed)"
+                    );
+                    if let Some(b) = broker {
+                        forward_turn_complete_to_broker(
+                            db_conn,
+                            b.as_ref(),
+                            cid,
+                            stop_reason.as_str(),
+                            last_text,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+            }
+
+            let cas_patch = match stop_reason.as_str() {
+                "end_turn" => {
+                    conversation_service::finish_end_turn_if_in_progress(
+                        db_conn,
+                        cid,
+                        *mark_awaiting_reply,
+                    )
+                    .await?
+                }
+                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+                    conversation_service::update_status_if_with_patch(
+                        db_conn,
+                        cid,
+                        ConversationStatus::InProgress,
+                        ConversationStatus::Cancelled,
+                    )
+                    .await?
+                }
+                // `cancelled` and any future reason: don't write here.
+                _ => None,
+            };
+            if let Some(patch) = cas_patch {
+                // Map from the CAS arm we just took (not from patch.status string)
+                // so the per-connection event stays a typed ConversationStatus.
+                let status = if stop_reason.as_str() == "end_turn" {
+                    ConversationStatus::PendingReview
+                } else {
+                    ConversationStatus::Cancelled
+                };
                 emit_with_state(
                     &state_arc,
                     &emitter,
                     AcpEvent::ConversationStatusChanged {
                         conversation_id: cid,
-                        status: ts,
+                        status,
                     },
                 )
                 .await;
-            }
-
-            // If this conversation was spawned by a delegation, resolve the
-            // pending broker call. The broker maps the outcome onto the
-            // parent's `tool_use_id` via the registered `call_id`.
-            if let Some(b) = broker {
-                forward_turn_complete_to_broker(
-                    db_conn,
-                    b.as_ref(),
-                    cid,
-                    stop_reason.as_str(),
-                    last_text,
-                )
-                .await;
+                crate::commands::conversations::emit_conversation_state(&emitter, patch);
             }
             Ok(())
         }
@@ -276,6 +563,17 @@ pub(crate) async fn handle_event(
         // this dispatcher with new arms as the lifecycle scope grows.
         _ => Ok(()),
     }
+}
+
+/// Whether a conversation row is a Codeg delegation child (has
+/// `delegation_call_id`). Returns `Err` on DB failure so callers can fail
+/// closed instead of treating the probe as "not a delegate".
+async fn conversation_is_delegate(
+    db_conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let row = conversation_service::get_by_id(db_conn, conversation_id).await?;
+    Ok(row.delegation_call_id.is_some())
 }
 
 /// On TurnComplete for a delegation child, resolve the pending broker call
@@ -403,16 +701,32 @@ async fn handle_terminal_event(
         return Ok(());
     };
     let cid = entry.conversation_id;
-    let changed = conversation_service::update_status_if(
+    // Delegate rows: terminal ConversationStatus is owned by the broker store
+    // CAS. Skipping the generic InProgress→Cancelled write prevents racing the
+    // durable winner (completed/failed/canceled). Fail-closed on probe error.
+    match conversation_is_delegate(db_conn, cid).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(
+                conversation_id = cid,
+                error = %e,
+                "[lifecycle] is_delegate probe failed on terminal event; \
+                 skipping generic ConversationStatus write (fail-closed)"
+            );
+            return Ok(());
+        }
+    }
+    let Some(patch) = conversation_service::update_status_if_with_patch(
         db_conn,
         cid,
         ConversationStatus::InProgress,
         ConversationStatus::Cancelled,
     )
-    .await?;
-    if !changed {
+    .await?
+    else {
         return Ok(());
-    }
+    };
     emit_with_state(
         &entry.state,
         &entry.emitter,
@@ -422,6 +736,7 @@ async fn handle_terminal_event(
         },
     )
     .await;
+    crate::commands::conversations::emit_conversation_state(&entry.emitter, patch);
     Ok(())
 }
 
@@ -1273,7 +1588,7 @@ async fn connection_worker_loop(
     db: DatabaseConnection,
     manager: ConnectionManager,
     broker: Option<Arc<DelegationBroker>>,
-    mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
+    mut rx: mpsc::Receiver<Arc<InternalEventEnvelope>>,
 ) {
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
@@ -1290,8 +1605,8 @@ async fn connection_worker_loop(
     // aren't double-touched.
     let mut terminal_dispatched = false;
     while let Some(envelope_arc) = rx.recv().await {
-        let envelope: &EventEnvelope = envelope_arc.as_ref();
-        match &envelope.payload {
+        let internal: &InternalEventEnvelope = envelope_arc.as_ref();
+        match &internal.payload {
             AcpEvent::ConversationLinked {
                 conversation_id, ..
             } => {
@@ -1355,31 +1670,406 @@ async fn connection_worker_loop(
                 terminal_dispatched = true;
             }
             _ => {
-                handle_event_with_retry(&db, &manager, envelope, broker.as_ref()).await;
+                // Bound worker time so a stuck DB/broker call cannot freeze
+                // the per-connection mailbox forever (which used to back-pressure
+                // the dispatcher into broadcast Lagged and drop later TurnCompletes).
+                //
+                // TurnComplete is special: status CAS is correctness-critical.
+                // On timeout we retry (at-least-once processing) rather than
+                // silently moving on and leaving the row at `in_progress`.
+                // Non-TurnComplete events yield after one timeout so a later
+                // TurnComplete in the same mailbox can still run.
+                const WORKER_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
+                const TURN_COMPLETE_MAX_ATTEMPTS: u32 = 5;
+                let is_turn_complete = matches!(internal.payload, AcpEvent::TurnComplete { .. });
+                let max_attempts = if is_turn_complete {
+                    TURN_COMPLETE_MAX_ATTEMPTS
+                } else {
+                    1
+                };
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match tokio::time::timeout(
+                        WORKER_HANDLE_TIMEOUT,
+                        handle_internal_event_with_retry(&db, &manager, internal, broker.as_ref()),
+                    )
+                    .await
+                    {
+                        Ok(()) => break,
+                        Err(_) => {
+                            if attempt < max_attempts {
+                                tracing::error!(
+                                    connection_id = %connection_id,
+                                    event = %lifecycle_payload_kind(&internal.payload),
+                                    timeout_secs = 45,
+                                    attempt,
+                                    max_attempts,
+                                    "[lifecycle][ERROR] worker handle_event timed out — \
+                                     retrying TurnComplete (at-least-once status CAS)"
+                                );
+                                continue;
+                            }
+                            tracing::error!(
+                                connection_id = %connection_id,
+                                event = %lifecycle_payload_kind(&internal.payload),
+                                timeout_secs = 45,
+                                attempts = attempt,
+                                is_turn_complete,
+                                "[lifecycle][ERROR] worker handle_event timed out after \
+                                 all attempts — moving on so later events can drain \
+                                 (TurnComplete may leave row in_progress if this was CAS)"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/// Subscribe to the in-process bus synchronously and return the dispatcher
-/// loop future. Filters out events the lifecycle worker doesn't care about
+/// Label for logs (stable, short).
+fn lifecycle_payload_kind(payload: &AcpEvent) -> String {
+    match payload {
+        AcpEvent::TurnComplete { stop_reason, .. } => {
+            format!("TurnComplete({stop_reason})")
+        }
+        AcpEvent::SessionStarted { .. } => "SessionStarted".into(),
+        AcpEvent::ConversationLinked { .. } => "ConversationLinked".into(),
+        AcpEvent::StatusChanged { status, .. } => {
+            format!("StatusChanged({status:?})")
+        }
+        AcpEvent::Error { terminal, .. } => format!("Error(terminal={terminal})"),
+        other => format!("{other:?}")
+            .split_whitespace()
+            .next()
+            .unwrap_or("Other")
+            .to_string(),
+    }
+}
+
+/// Spawn a per-connection lifecycle worker and return its mailbox sender.
+fn spawn_lifecycle_worker(
+    conn_id: &str,
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    broker: &Option<Arc<DelegationBroker>>,
+) -> mpsc::Sender<Arc<InternalEventEnvelope>> {
+    let (tx, worker_rx) = mpsc::channel::<Arc<InternalEventEnvelope>>(WORKER_QUEUE_CAPACITY);
+    let db_clone = db_conn.clone();
+    let mgr_clone = manager.clone_ref();
+    let broker_clone = broker.clone();
+    let id_clone = conn_id.to_string();
+    tokio::spawn(connection_worker_loop(
+        id_clone,
+        db_clone,
+        mgr_clone,
+        broker_clone,
+        worker_rx,
+    ));
+    tx
+}
+
+/// Enqueue a lifecycle-relevant envelope onto the per-connection worker.
+///
+/// **Never awaits** a full mailbox. Blocking the dispatcher here was the
+/// production failure mode behind stuck `in_progress` rows: one stalled
+/// worker filled its queue, `send().await` froze the bus consumer, the
+/// broadcast lagged, and a later `TurnComplete` was dropped before enqueue
+/// (Codex #385: 19 emits, 18 CAS — last turn had `TurnComplete emitted` but
+/// no `enqueue`).
+///
+/// Full mailbox → spawn an overflow deliverer with a timeout. Closed →
+/// respawn worker and retry (or overflow).
+fn enqueue_lifecycle_envelope(
+    workers: &mut HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>>,
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    broker: &Option<Arc<DelegationBroker>>,
+    metrics: &EventBusMetrics,
+    envelope_arc: Arc<InternalEventEnvelope>,
+    source: &'static str,
+) {
+    let conn_id = envelope_arc.connection_id.clone();
+    let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
+    let payload_kind = lifecycle_payload_kind(&envelope_arc.payload);
+
+    if workers.get(&conn_id).is_some_and(|tx| tx.is_closed()) {
+        tracing::warn!(
+            connection_id = %conn_id,
+            event = %payload_kind,
+            source,
+            "[lifecycle][WARN] worker channel closed; respawning before enqueue \
+             (prior worker likely panicked)"
+        );
+        workers.remove(&conn_id);
+    }
+
+    let tx = workers
+        .entry(conn_id.clone())
+        .or_insert_with(|| spawn_lifecycle_worker(&conn_id, db_conn, manager, broker));
+
+    if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+        tracing::info!(
+            connection_id = %conn_id,
+            event = %payload_kind,
+            source,
+            has_completion_sidecar = envelope_arc.completion.is_some(),
+            "[lifecycle] enqueue TurnComplete to worker"
+        );
+    }
+
+    const OVERFLOW_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let overflow = |tx: mpsc::Sender<Arc<InternalEventEnvelope>>,
+                    env: Arc<InternalEventEnvelope>,
+                    conn_id: String,
+                    payload_kind: String,
+                    source: &'static str,
+                    why: &'static str| {
+        // Critical payloads (TurnComplete etc.) must not be cancelled by a
+        // timeout: `timeout` dropping a pending `send` discards the message.
+        // Wait indefinitely for capacity. Non-critical still use a 60s cap.
+        let critical = is_lifecycle_critical(&env.payload);
+        tokio::spawn(async move {
+            if critical {
+                tracing::warn!(
+                    connection_id = %conn_id,
+                    event = %payload_kind,
+                    source,
+                    why,
+                    "[lifecycle][WARN] overflow deliver waiting for worker mailbox \
+                     (critical — no drop timeout)"
+                );
+                match tx.send(env).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            connection_id = %conn_id,
+                            event = %payload_kind,
+                            source,
+                            "[lifecycle] overflow deliver succeeded (critical)"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            connection_id = %conn_id,
+                            event = %payload_kind,
+                            source,
+                            "[lifecycle][ERROR] DROPPED critical lifecycle event — \
+                             worker channel closed during overflow deliver"
+                        );
+                    }
+                }
+                return;
+            }
+            tracing::warn!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                why,
+                timeout_secs = 60,
+                "[lifecycle][WARN] overflow deliver waiting for worker mailbox"
+            );
+            match tokio::time::timeout(OVERFLOW_SEND_TIMEOUT, tx.send(env)).await {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle] overflow deliver succeeded"
+                    );
+                }
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle][ERROR] DROPPED lifecycle event — worker \
+                         channel closed during overflow deliver"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle][ERROR] DROPPED non-critical lifecycle event — \
+                         worker stuck >60s (mailbox never drained)"
+                    );
+                }
+            }
+        });
+    };
+
+    match tx.try_send(envelope_arc) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(env)) => {
+            metrics
+                .worker_queue_full_count
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                "[lifecycle][WARN] worker queue full — spawning overflow \
+                 deliverer (dispatcher stays unblocked)"
+            );
+            overflow(
+                tx.clone(),
+                env,
+                conn_id.clone(),
+                payload_kind.clone(),
+                source,
+                "queue_full",
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(env)) => {
+            tracing::error!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                "[lifecycle][ERROR] worker channel closed mid-send; respawning \
+                 and re-enqueueing"
+            );
+            workers.remove(&conn_id);
+            let tx2 = workers
+                .entry(conn_id.clone())
+                .or_insert_with(|| spawn_lifecycle_worker(&conn_id, db_conn, manager, broker));
+            match tx2.try_send(env) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(env2))
+                | Err(mpsc::error::TrySendError::Closed(env2)) => {
+                    overflow(
+                        tx2.clone(),
+                        env2,
+                        conn_id.clone(),
+                        payload_kind.clone(),
+                        source,
+                        "respawn_retry",
+                    );
+                }
+            }
+        }
+    }
+
+    if is_terminal {
+        // Drop the sender; worker drains the queue then exits. Overflow
+        // tasks hold their own Sender clone so they can still complete.
+        workers.remove(&conn_id);
+    }
+}
+
+/// Capacity of the off-select broker tool-effects mailbox. ToolCall floods
+/// can be large; the worker serializes register/project so ordering is
+/// preserved without ever parking the lifecycle dispatcher.
+const BROKER_TOOL_QUEUE_CAPACITY: usize = 1024;
+
+/// Test-only stall injected into the broker tool worker so regression tests
+/// can pin the register/project path without blocking the dispatcher.
+/// Filtered by `connection_id` so concurrent lifecycle tests are not hung.
+#[cfg(test)]
+struct TestBrokerToolStall {
+    connection_id: String,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static TEST_BROKER_TOOL_STALL: std::sync::Mutex<Option<TestBrokerToolStall>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_test_broker_tool_stall(
+    connection_id: impl Into<String>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    *TEST_BROKER_TOOL_STALL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(TestBrokerToolStall {
+        connection_id: connection_id.into(),
+        release,
+    });
+}
+
+/// Run parent tool_call registration + child runtime projection for one
+/// envelope. Always invoked from the dedicated broker-tool worker (never
+/// from the lifecycle `select!` branch).
+async fn run_broker_tool_side_effects(broker: &DelegationBroker, envelope: &InternalEventEnvelope) {
+    #[cfg(test)]
+    {
+        let stall = {
+            let mut guard = TEST_BROKER_TOOL_STALL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(s) if s.connection_id == envelope.connection_id => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(stall) = stall {
+            tracing::info!(
+                connection_id = %envelope.connection_id,
+                "[lifecycle][test] broker tool worker parked on test stall"
+            );
+            let _ = stall.release.await;
+        }
+    }
+    register_delegation_tool_call_from_event(broker, envelope.event.as_ref()).await;
+    broker
+        .project_child_tool_event(&envelope.connection_id, &envelope.payload)
+        .await;
+}
+
+/// Enqueue a tool event onto the off-select broker worker. Never awaits.
+fn enqueue_broker_tool_effect(
+    broker_tool_tx: &mpsc::Sender<Arc<InternalEventEnvelope>>,
+    envelope: Arc<InternalEventEnvelope>,
+) {
+    match broker_tool_tx.try_send(envelope) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(env)) => {
+            tracing::warn!(
+                connection_id = %env.connection_id,
+                "[lifecycle][WARN] broker tool queue full — overflow deliver \
+                 (dispatcher stays unblocked; TurnComplete path unaffected)"
+            );
+            let tx = broker_tool_tx.clone();
+            tokio::spawn(async move {
+                if tx.send(env).await.is_err() {
+                    tracing::error!("[lifecycle][ERROR] broker tool worker closed during overflow");
+                }
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(env)) => {
+            tracing::error!(
+                connection_id = %env.connection_id,
+                "[lifecycle][ERROR] broker tool worker closed — \
+                 register/project will not run for this ToolCall"
+            );
+        }
+    }
+}
+
+/// Subscribe to the in-process bus (and the critical lifecycle lane)
+/// synchronously and return the dispatcher loop future.
+///
+/// Filters out events the lifecycle worker doesn't care about
 /// (high-frequency ContentDelta / ToolCall / PermissionRequest etc.) and
 /// fans the rest out to per-connection worker tasks. Within a single
 /// connection, ordering is preserved by the per-worker mpsc; across
 /// connections, workers run independently so a slow SQLite write on one
 /// connection doesn't backpressure the others.
 ///
-/// All forwarded events (the 5 types in `is_lifecycle_relevant`) use
-/// blocking `send().await` to guarantee delivery even when the worker
-/// mailbox is full — `SessionStarted` (writes external_id) and
-/// `TurnComplete` (writes terminal status) are correctness-critical and
-/// silently dropping either leaves the conversation row in a permanently
-/// wrong state. Filtering keeps the queue from filling on noise traffic
-/// so the blocking path is rarely exercised.
+/// The dispatcher **never blocks** on a full worker mailbox, and **never
+/// awaits** broker tool registration/projection inside `select!` (those run
+/// on a dedicated serial worker). Critical events arrive only on the
+/// dedicated mpsc lane when it is live (single lifecycle source — no
+/// broadcast re-enqueue of the same `seq`), so a ContentDelta flood or a
+/// stuck `project_child_tool_event` cannot drop or delay `TurnComplete`.
 ///
-/// The `subscribe()` call happens here, before the future is returned, so any
-/// events emitted between this call and the first poll are buffered by the
-/// broadcast channel rather than dropped.
+/// The `subscribe()` / `take_critical_rx()` calls happen here, before the
+/// future is returned, so any events emitted between this call and the first
+/// poll are buffered rather than dropped.
 pub fn lifecycle_subscriber_task(
     db_conn: DatabaseConnection,
     manager: ConnectionManager,
@@ -1387,104 +2077,162 @@ pub fn lifecycle_subscriber_task(
     broker: Option<Arc<DelegationBroker>>,
 ) -> impl Future<Output = ()> + Send + 'static {
     let mut rx = bus.subscribe();
+    let mut critical_rx = bus.take_critical_rx();
+    let critical_lane_live = critical_rx.is_some();
+    if !critical_lane_live {
+        tracing::error!(
+            "[lifecycle][ERROR] critical lifecycle lane already taken or missing — \
+             TurnComplete relies on broadcast only (lag-prone)"
+        );
+    } else {
+        tracing::info!(
+            "[lifecycle] critical lane attached (TurnComplete sole source; \
+             broker tool work off-select)"
+        );
+    }
     let metrics = Arc::clone(bus.metrics());
+
     async move {
+        // Off-select serial worker for broker tool side-effects. Spawned
+        // inside the async body so we are on a Tokio runtime (this function
+        // is often constructed before `tauri::async_runtime::spawn`).
+        let broker_tool_tx = broker.as_ref().map(|b| {
+            let (tx, mut tool_rx) =
+                mpsc::channel::<Arc<InternalEventEnvelope>>(BROKER_TOOL_QUEUE_CAPACITY);
+            let b = Arc::clone(b);
+            tokio::spawn(async move {
+                while let Some(env) = tool_rx.recv().await {
+                    run_broker_tool_side_effects(b.as_ref(), env.as_ref()).await;
+                }
+            });
+            tx
+        });
+
         // connection_id → worker mailbox. Workers are spawned lazily on the
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).
-        let mut workers: HashMap<String, mpsc::Sender<Arc<EventEnvelope>>> = HashMap::new();
+        let mut workers: HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>> = HashMap::new();
         loop {
-            match rx.recv().await {
-                Ok(envelope_arc) => {
-                    // Off-worker delegation correlation. Register parent-side
-                    // `delegate_to_agent` tool_call_ids the instant they come
-                    // off the bus — before the `is_lifecycle_relevant` filter
-                    // and before any worker `send().await` that could block and
-                    // back-pressure the bus into dropping a later event. This is
-                    // why `ToolCall`/`ToolCallUpdate` no longer need to reach a
-                    // worker at all. See `register_delegation_tool_call_from_event`.
-                    if let Some(b) = broker.as_ref() {
-                        register_delegation_tool_call_from_event(b.as_ref(), &envelope_arc).await;
+            tokio::select! {
+                // Prefer critical lane so status CAS is not starved by a
+                // ContentDelta flood on the broadcast receiver.
+                biased;
+
+                crit = async {
+                    match critical_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
-
-                    // Fast-path filter: skip events the worker would no-op.
-                    // Avoids spawning a worker for connections that only emit
-                    // high-frequency noise and avoids crowding existing
-                    // workers' mailboxes.
-                    if !is_lifecycle_relevant(&envelope_arc.payload) {
-                        continue;
-                    }
-
-                    let conn_id = envelope_arc.connection_id.clone();
-                    let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
-
-                    let tx = workers.entry(conn_id.clone()).or_insert_with(|| {
-                        let (tx, worker_rx) =
-                            mpsc::channel::<Arc<EventEnvelope>>(WORKER_QUEUE_CAPACITY);
-                        let db_clone = db_conn.clone();
-                        let mgr_clone = manager.clone_ref();
-                        let broker_clone = broker.clone();
-                        let id_clone = conn_id.clone();
-                        tokio::spawn(connection_worker_loop(
-                            id_clone,
-                            db_clone,
-                            mgr_clone,
-                            broker_clone,
-                            worker_rx,
-                        ));
-                        tx
-                    });
-
-                    // Two-phase send: try non-blocking first (the common
-                    // case), only `await` when the mailbox is actually full.
-                    // Counts queue-full as back-pressure observation rather
-                    // than a drop event — nothing is dropped, the dispatcher
-                    // just waits for the worker to make room.
-                    let send_result = match tx.try_send(envelope_arc) {
-                        Ok(()) => Ok(()),
-                        Err(mpsc::error::TrySendError::Full(env)) => {
-                            metrics
-                                .worker_queue_full_count
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                "[lifecycle][WARN] worker queue full for \
-                                 {conn_id}, awaiting drain (back-pressure)"
+                } => {
+                    match crit {
+                        Some(envelope_arc) => {
+                            let kind = lifecycle_payload_kind(&envelope_arc.payload);
+                            if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+                                tracing::info!(
+                                    connection_id = %envelope_arc.connection_id,
+                                    event = %kind,
+                                    has_completion_sidecar = envelope_arc.completion.is_some(),
+                                    "[lifecycle] critical lane received TurnComplete"
+                                );
+                            }
+                            // Critical lane only carries lifecycle-critical
+                            // payloads — no broker tool-correlation needed here.
+                            enqueue_lifecycle_envelope(
+                                &mut workers,
+                                &db_conn,
+                                &manager,
+                                &broker,
+                                metrics.as_ref(),
+                                envelope_arc,
+                                "critical_lane",
                             );
-                            tx.send(env).await.map_err(|_| ())
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-                    };
-
-                    if send_result.is_err() {
-                        // Worker exited unexpectedly (panic). Clean up the
-                        // stale entry so the next relevant event respawns.
-                        workers.remove(&conn_id);
-                        continue;
-                    }
-
-                    if is_terminal {
-                        // Drop the sender; worker drains the queue then
-                        // exits. Releases the per-connection `CachedConn`
-                        // (state Arc + emitter) the worker was holding.
-                        workers.remove(&conn_id);
+                        None => {
+                            tracing::error!(
+                                "[lifecycle][ERROR] critical lifecycle lane closed"
+                            );
+                            critical_rx = None;
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Lagged at the bus level. Now that the dispatcher
-                    // filters and only blocks on the rare relevant events,
-                    // this should only fire under genuine emit-rate spikes
-                    // exceeding the 4096 broadcast capacity.
-                    tracing::warn!(
-                        "[lifecycle][WARN] internal bus lagged, dropped {skipped} events \
-                         (emit rate exceeded broadcast capacity)"
-                    );
-                    metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    tracing::info!("[lifecycle] internal bus closed; dispatcher exiting");
-                    // Drop all worker senders; workers drain & exit on their own.
-                    drop(workers);
-                    break;
+
+                bus_msg = rx.recv() => {
+                    match bus_msg {
+                        Ok(envelope_arc) => {
+                            if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+                                tracing::info!(
+                                    connection_id = %envelope_arc.connection_id,
+                                    event = %lifecycle_payload_kind(&envelope_arc.payload),
+                                    has_completion_sidecar = envelope_arc.completion.is_some(),
+                                    critical_lane_live = critical_rx.is_some(),
+                                    "[lifecycle] broadcast received TurnComplete"
+                                );
+                            }
+
+                            // Off-select delegation correlation: never await
+                            // register/project here. A stuck projector lock
+                            // used to freeze this select branch and starve
+                            // the critical lane (Codex #385 / child tool flood).
+                            if let Some(ref tool_tx) = broker_tool_tx {
+                                let needs_broker = matches!(
+                                    envelope_arc.payload,
+                                    AcpEvent::ToolCall { .. }
+                                        | AcpEvent::ToolCallUpdate { .. }
+                                );
+                                if needs_broker {
+                                    enqueue_broker_tool_effect(
+                                        tool_tx,
+                                        Arc::clone(&envelope_arc),
+                                    );
+                                }
+                            }
+
+                            if !is_lifecycle_relevant(&envelope_arc.payload) {
+                                continue;
+                            }
+
+                            // Single lifecycle source for critical payloads:
+                            // when the critical lane is live, broadcast must
+                            // NOT re-enqueue TurnComplete / SessionStarted /
+                            // terminal Error / Disconnected. Duplicates used
+                            // to re-spawn workers after terminal teardown and
+                            // race CAS / broker drain.
+                            if is_lifecycle_critical(&envelope_arc.payload)
+                                && critical_rx.is_some()
+                            {
+                                continue;
+                            }
+
+                            enqueue_lifecycle_envelope(
+                                &mut workers,
+                                &db_conn,
+                                &manager,
+                                &broker,
+                                metrics.as_ref(),
+                                envelope_arc,
+                                "broadcast",
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Critical lane should still deliver TurnComplete.
+                            // Log at ERROR so operators notice residual risk
+                            // (SessionStarted on broadcast-only consumers, etc.).
+                            tracing::error!(
+                                skipped,
+                                "[lifecycle][ERROR] internal bus lagged, dropped {skipped} \
+                                 broadcast events (critical lane should still carry \
+                                 TurnComplete/SessionStarted)"
+                            );
+                            metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "[lifecycle] internal bus closed; dispatcher exiting"
+                            );
+                            drop(workers);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1520,13 +2268,34 @@ mod tests {
             status: crate::acp::types::ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: crate::acp::connection::matching_config_pair(String::new(), "system").0,
-            observed_config: crate::acp::connection::matching_config_pair(String::new(), "system")
-                .1,
+            spawn_config: {
+                let plan = crate::acp::delegation::route::test_empty_route_plan();
+                crate::acp::connection::matching_config_pair(
+                    String::new(),
+                    "system",
+                    plan.fingerprint.clone(),
+                )
+                .0
+            },
+            observed_config: {
+                let plan = crate::acp::delegation::route::test_empty_route_plan();
+                crate::acp::connection::matching_config_pair(
+                    String::new(),
+                    "system",
+                    plan.fingerprint,
+                )
+                .1
+            },
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -1765,6 +2534,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1772,6 +2542,313 @@ mod tests {
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview
         );
+    }
+
+    async fn read_row_awaiting_reply_token(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+    ) -> Option<String> {
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("conversation row exists")
+            .awaiting_reply_token
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_marks_awaiting_reply() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-await").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::InProgress
+        );
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, conv.id).await.is_some(),
+            "eligible root end_turn must mint awaiting_reply_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_complete_emits_exactly_one_state_event_with_backend_token() {
+        use crate::db::entities::conversation;
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-state-event").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let mut conn = fake_connection_with_state("c1", Some(conv.id));
+            conn.emitter = EventEmitter::test_web_only(broadcaster.clone());
+            map.insert("c1".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::PendingReview);
+        let token = row
+            .awaiting_reply_token
+            .clone()
+            .expect("eligible end_turn mints token");
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(
+            state_events.len(),
+            1,
+            "end_turn CAS must emit exactly one conversation://changed state event"
+        );
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], conv.id);
+        assert_eq!(p["patch"]["status"], "pending_review");
+        assert_eq!(p["patch"]["awaiting_reply_token"], token);
+        assert_eq!(
+            p["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_disconnect_emits_exactly_one_state_event_on_cas_win() {
+        use crate::db::entities::conversation;
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/term-state-event").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let mut conn = fake_connection_with_state("c1", Some(conv.id));
+            conn.emitter = EventEmitter::test_web_only(broadcaster.clone());
+            map.insert("c1".to_string(), conn);
+        }
+        let mut cache: HashMap<String, CachedConn> = HashMap::new();
+        seed_cache(&mut cache, &mgr, "c1", conv.id).await;
+
+        handle_terminal_event(&db.conn, &mut cache, "c1")
+            .await
+            .unwrap();
+
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::Cancelled);
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(state_events.len(), 1);
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["status"], "cancelled");
+        assert_eq!(
+            p["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_background_no_token() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-bg").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, conv.id).await.is_none(),
+            "background root end_turn must not mint a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_child_no_token() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-child").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-1".into(),
+                delegation_call_id: "call-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(child.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "codex".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        // Linked delegates: broker/store CAS owns terminal ConversationStatus.
+        // Generic lifecycle must not mint PendingReview or an awaiting-reply token.
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::InProgress
+        );
+        assert!(
+            read_row_awaiting_reply_token(&db, child.id).await.is_none(),
+            "delegate end_turn never receives a generation even if mark is true"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_updates_conversation_status_on_turn_complete_respects_completed_cas() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-complete-completed").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::update_status(&db.conn, conv.id, ConversationStatus::Completed)
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: true,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::Completed,
+            "Completed row must win over delayed end_turn CAS"
+        );
+        assert!(read_row_awaiting_reply_token(&db, conv.id).await.is_none());
     }
 
     #[tokio::test]
@@ -1811,6 +2888,7 @@ mod tests {
                     session_id: "ext-1".into(),
                     stop_reason: stop_reason.into(),
                     agent_type: "open_code".into(),
+                    mark_awaiting_reply: false,
                 },
             };
             handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1849,6 +2927,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "cancelled".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -1883,6 +2962,7 @@ mod tests {
                 session_id: "ext-1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -2163,6 +3243,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,
@@ -2265,6 +3346,7 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         }));
     }
 
@@ -2416,6 +3498,7 @@ mod tests {
                 session_id: "ext-final".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         }));
 
@@ -2458,12 +3541,14 @@ mod tests {
                 .unwrap();
 
         let mgr = ConnectionManager::new();
+        let conn = fake_connection_with_state("c1", Some(conv.id));
+        let mut status_rx = {
+            let state = conn.state.read().await;
+            state.event_stream().subscribe()
+        };
         {
             let mut map = mgr.connections.lock().await;
-            map.insert(
-                "c1".to_string(),
-                fake_connection_with_state("c1", Some(conv.id)),
-            );
+            map.insert("c1".to_string(), conn);
         }
 
         let metrics = Arc::new(EventBusMetrics::default());
@@ -2496,29 +3581,154 @@ mod tests {
                 session_id: "ext-200".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         }));
 
-        // Wait for the worker to fully drain. The TurnComplete is at the
-        // tail of the queue, so observing PendingReview proves nothing
-        // before it was dropped.
-        let observed = poll_status(
-            &db,
-            conv.id,
-            ConversationStatus::PendingReview,
-            Duration::from_secs(2),
-        )
-        .await;
+        // The private-stream acknowledgement is emitted after the worker
+        // commits the trailing event. `dispatcher.await` only performs
+        // dispatcher cleanup; it does not prove worker drain completion.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = status_rx
+                    .recv()
+                    .await
+                    .expect("private stream stays open until status acknowledgement");
+                if matches!(
+                    &envelope.payload,
+                    AcpEvent::ConversationStatusChanged {
+                        conversation_id,
+                        status: ConversationStatus::PendingReview,
+                    } if *conversation_id == conv.id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("trailing TurnComplete should commit and emit PendingReview");
 
         drop(bus);
         let _ = dispatcher.await;
 
         assert_eq!(
-            observed,
+            read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview,
             "TurnComplete at the tail of a 200-event burst MUST be delivered \
              (regression test for `try_send` drop bug)"
         );
+    }
+
+    /// Regression for the #385 failure chain: a stuck broker tool path
+    /// (`project_child_tool_event` / register) must **not** park the
+    /// lifecycle `select!`, so `TurnComplete` on the critical lane still
+    /// flips the row to `pending_review` while the stall is held.
+    ///
+    /// Without the off-select broker worker, awaiting projection inside the
+    /// broadcast branch prevents critical-lane polling entirely.
+    #[tokio::test]
+    async fn turn_complete_cas_while_broker_tool_path_blocked() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/disp-broker-stall").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "parent-stall".to_string(),
+                fake_connection_with_state("parent-stall", Some(conv.id)),
+            );
+        }
+
+        // Park the broker tool worker before any ToolCall arrives.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        install_test_broker_tool_stall("child-tool-flood", release_rx);
+
+        // Real broker so the tool worker path is exercised (register/project).
+        let mock = Arc::new(MockSpawner::new());
+        let broker = Arc::new(DelegationBroker::new(
+            mock as Arc<dyn ConnectionSpawner>,
+            Arc::new(NoopDepthLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics.clone()));
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+            Some(broker),
+        ));
+
+        // ToolCall lands first and parks the broker tool worker on the stall.
+        bus.send(Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "child-tool-flood".to_string(),
+            payload: AcpEvent::ToolCall {
+                tool_call_id: "tc-stall".into(),
+                title: "bash".into(),
+                kind: "execute".into(),
+                status: "in_progress".into(),
+                content: None,
+                raw_input: Some(r#"{"command":"sleep"}"#.into()),
+                raw_output: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        }));
+
+        // Yield so the broker tool worker dequeues and hits the stall.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // TurnComplete must CAS while the stall is still held.
+        bus.send(Arc::new(EventEnvelope {
+            seq: 2,
+            connection_id: "parent-stall".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s-stall".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        }));
+
+        let observed = poll_status(
+            &db,
+            conv.id,
+            ConversationStatus::PendingReview,
+            Duration::from_secs(3),
+        )
+        .await;
+
+        // Still holding the stall — prove we did not need to release projection.
+        assert_eq!(
+            observed,
+            ConversationStatus::PendingReview,
+            "TurnComplete must CAS to pending_review while project_child_tool_event \
+             path remains blocked (critical lane must not share select await with broker)"
+        );
+        assert_eq!(
+            metrics.critical_lane_emit_count.load(Ordering::Relaxed),
+            1,
+            "TurnComplete must have entered the critical lane"
+        );
+        assert_eq!(
+            metrics.worker_queue_full_count.load(Ordering::Relaxed),
+            0,
+            "failure mode is broker await in select, not worker queue full"
+        );
+
+        // Release stall and tear down.
+        let _ = release_tx.send(());
+        drop(bus);
+        let _ = dispatcher.await;
     }
 
     // ── Broker-cancel routing regression ─────────────────────────────────
@@ -2544,9 +3754,10 @@ mod tests {
     // broker chain is exercised the same way it runs in production.
 
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
-    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+    use crate::acp::delegation::spawner::{accepted, mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationRequest};
     use async_trait::async_trait;
+    use chrono::Utc;
 
     struct NoopDepthLookup;
 
@@ -2583,7 +3794,8 @@ mod tests {
     ) {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok(child_conn_id.to_string())).await;
-        mock.queue_send(Ok(child_conv_id)).await;
+        mock.queue_send(Ok(accepted(child_conv_id, Utc::now())))
+            .await;
         let broker = Arc::new(DelegationBroker::new(
             mock as Arc<dyn ConnectionSpawner>,
             Arc::new(NoopDepthLookup) as Arc<dyn ConversationDepthLookup>,
@@ -2954,5 +4166,181 @@ mod tests {
 
         drop(bus);
         let _ = dispatcher.await;
+    }
+
+    // ── Task 8 review fix: is_delegate fail-closed ───────────────────────
+
+    #[tokio::test]
+    async fn conversation_is_delegate_false_for_regular_chat() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-regular").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert!(!conversation_is_delegate(&db.conn, conv.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn conversation_is_delegate_true_for_linked_child() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-child").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-1".into(),
+                delegation_call_id: "call-delegate-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(conversation_is_delegate(&db.conn, child.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn turn_complete_nondelegate_writes_pending_review() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/tc-nondelegate").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_complete_delegate_skips_generic_status_write() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/tc-delegate").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-1".into(),
+                delegation_call_id: "call-tc-del".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Delegate rows start InProgress; store CAS owns terminal ConversationStatus.
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::InProgress
+        );
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c-child".to_string(),
+                fake_connection_with_state("c-child", Some(child.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-child".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        assert_eq!(
+            read_row_status(&db, child.id).await,
+            ConversationStatus::InProgress,
+            "delegate TurnComplete must not write generic PendingReview"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_delegate_probe_db_error_skips_generic_status_write() {
+        // Soft-deleted rows are filtered by get_by_id → Err, which must fail
+        // closed (no generic ConversationStatus mutation) rather than treating
+        // the probe as "not a delegate".
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/is-delegate-err").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::soft_delete(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert!(
+            conversation_is_delegate(&db.conn, conv.id).await.is_err(),
+            "soft-deleted row must surface as probe error"
+        );
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        // Must not error out of handle_event, and must not resurrect status.
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        // Raw entity still InProgress (soft-deleted; no status flip).
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(row.status, ConversationStatus::InProgress);
     }
 }

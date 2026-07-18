@@ -68,9 +68,9 @@ import {
   loadConversationExpanded,
   saveConversationExpanded,
   type SidebarSectionCollapsed,
-  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
+import { getEffectiveConversationUpdatedAt } from "@/lib/conversation-activity"
 import {
   FOLDER_THEME_COLOR_INHERIT,
   THEME_COLOR_PREVIEW,
@@ -101,9 +101,11 @@ import {
   reuseSet,
   selectChatConversationsWithReuse,
   selectPinnedWithReuse,
+  sidebarRowKey,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 import { useSubsessionSync } from "@/hooks/use-subsession-sync"
+import { useSidebarReorderAnimation } from "./use-sidebar-reorder-animation"
 import { SidebarSectionHeader } from "./sidebar-section-header"
 import { ConversationManageDialog } from "./conversation-manage-dialog"
 import { CloneDialog } from "@/components/layout/clone-dialog"
@@ -552,14 +554,12 @@ export interface SidebarConversationListHandle {
 
 export interface SidebarConversationListProps {
   showCompleted?: boolean
-  sortMode?: SidebarSortMode
   sectionOrder?: SidebarSectionOrder
 }
 
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
   sectionOrder = "folders-first",
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>
@@ -575,6 +575,17 @@ export function SidebarConversationList({
   const folders = useAppWorkspaceStore((s) => s.folders)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const conversations = useAppWorkspaceStore((s) => s.conversations)
+  const optimisticActivityById = useAppWorkspaceStore(
+    (state) => state.optimisticActivityById
+  )
+  // Narrow activity signals for the reorder FLIP hook — sequence/id only so
+  // unrelated store churn does not resubscribe the animation path.
+  const conversationActivitySequence = useAppWorkspaceStore(
+    (state) => state.conversationActivitySequence
+  )
+  const lastConversationActivityId = useAppWorkspaceStore(
+    (state) => state.lastConversationActivityId
+  )
   const loading = useAppWorkspaceStore((s) => s.conversationsLoading)
   const error = useAppWorkspaceStore((s) => s.conversationsError)
   const refreshConversations = useAppWorkspaceStore(
@@ -859,21 +870,27 @@ export function SidebarConversationList({
     const next = selectChatConversationsWithReuse(
       conversations,
       showCompleted,
-      chatConvsRef.current
+      chatConvsRef.current,
+      optimisticActivityById
     )
     chatConvsRef.current = next
     return next
-  }, [conversations, showCompleted])
+  }, [conversations, showCompleted, optimisticActivityById])
 
   // Pinned bucket: the FULL conversation list (ignores "Show completed" — a
-  // pinned conversation stays visible regardless), sorted most-recently-pinned
-  // first, with reference reuse so an unrelated status event doesn't rebuild it.
+  // pinned conversation stays visible regardless), sorted by effective activity,
+  // then pinned_at, then id, with reference reuse so an unrelated status event
+  // doesn't rebuild it.
   const pinnedRef = useRef<DbConversationSummary[]>([])
   const pinned = useMemo(() => {
-    const next = selectPinnedWithReuse(conversations, pinnedRef.current)
+    const next = selectPinnedWithReuse(
+      conversations,
+      pinnedRef.current,
+      optimisticActivityById
+    )
     pinnedRef.current = next
     return next
-  }, [conversations])
+  }, [conversations, optimisticActivityById])
 
   // Maps each open worktree child folder → its (open) root folder. A child is
   // only redirected when its parent is also open, so a worktree whose root was
@@ -898,13 +915,13 @@ export function SidebarConversationList({
   const byFolder = useMemo(() => {
     const grouped = groupByFolderWithReuse(
       folderConversations,
-      sortMode,
       byFolderRef.current,
-      childToParent
+      childToParent,
+      optimisticActivityById
     )
     byFolderRef.current = grouped
     return grouped
-  }, [folderConversations, sortMode, childToParent])
+  }, [folderConversations, childToParent, optimisticActivityById])
 
   // Counts the unfiltered-but-non-pinned conversations per display group, so the
   // empty-hint renderer distinguishes a truly empty folder from one whose rows
@@ -1007,6 +1024,17 @@ export function SidebarConversationList({
   rowsRef.current = rows
   orderedFolderIdsRef.current = orderedFolderIds
   reorderingRef.current = reordering
+
+  // WAAPI FLIP on stable inner wrappers only. Consumes the store activity
+  // sequence/id, the live rows snapshot, the real OverlayScrollbars viewport,
+  // and folder-drag state. Does not own sticky/scrollToActive.
+  const { handleUserScroll } = useSidebarReorderAnimation({
+    rows,
+    activitySequence: conversationActivitySequence,
+    activityConversationId: lastConversationActivityId,
+    viewportEl,
+    dragging: dragging !== null,
+  })
 
   // Sticky-overlay lookup tables, rebuilt only when the flat rows change
   // (folder add/remove/expand, not status events). Consumed exclusively by the
@@ -1295,15 +1323,17 @@ export function SidebarConversationList({
     setStickyFolderId((prev) => (prev === nextFolderId ? prev : nextFolderId))
   }, [])
 
-  // virtua fires onScroll synchronously per scroll event; coalesce to one
-  // recompute per frame and keep the DOM write frame-aligned.
+  // virtua fires onScroll synchronously per scroll event. Cancel/rebase any
+  // in-flight reorder wave first, then coalesce sticky recompute to one frame
+  // so the DOM write stays frame-aligned.
   const handleVirtuaScroll = useCallback(() => {
+    handleUserScroll()
     if (stickyRafRef.current != null) return
     stickyRafRef.current = requestAnimationFrame(() => {
       stickyRafRef.current = null
       recomputeSticky()
     })
-  }, [recomputeSticky])
+  }, [handleUserScroll, recomputeSticky])
 
   // Collapse from the overlay, then bring the now-collapsed header to the top so
   // the eye lands on the folder just folded (the in-list toggle leaves you mid
@@ -1953,6 +1983,8 @@ export function SidebarConversationList({
     // Worktree child folders render under their parent group, so theme the row
     // by the display group (parent) for a unified look.
     const groupId = childToParent.get(conv.folder_id) ?? conv.folder_id
+    // data-conversation-id lives on the stable Virtua child wrapper (below),
+    // which still contains the card label for optimistic-time tests.
     return themeWrap(
       groupId,
       <SidebarConversationCard
@@ -1963,7 +1995,7 @@ export function SidebarConversationList({
         }
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
         timeLabel={formatRelative(
-          sortMode === "updated" ? conv.updated_at : conv.created_at,
+          getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
           now
         )}
         onSelect={handleSelect}
@@ -1979,15 +2011,6 @@ export function SidebarConversationList({
         onToggleExpand={toggleConversation}
       />
     )
-  }
-
-  const rowKey = (row: SidebarRow): string => {
-    if (row.kind === "section") return `section-${row.section}`
-    if (row.kind === "folder") return `folder-${row.folderId}`
-    if (row.kind === "empty") return `empty-${row.folderId}`
-    if (row.kind === "chats-empty") return "chats-empty"
-    if (row.kind === "subsession-loading") return `subloading-${row.parentId}`
-    return `conv-${row.conversation.agent_type}-${row.conversation.id}`
   }
 
   return (
@@ -2081,9 +2104,31 @@ export function SidebarConversationList({
                     bufferSize={400}
                     onScroll={handleVirtuaScroll}
                   >
-                    {(row: SidebarRow) => (
-                      <div key={rowKey(row)}>{renderRow(row)}</div>
-                    )}
+                    {(row: SidebarRow) => {
+                      // Metadata and keys live ONLY on this stable inner child.
+                      // Never style/pass ownership attrs to virtua's outer item
+                      // (no custom item/shift/transform/transition props).
+                      const ownedRow =
+                        row.kind === "conversation" ||
+                        row.kind === "subsession-loading"
+                          ? row
+                          : null
+                      return (
+                        <div
+                          key={sidebarRowKey(row)}
+                          data-sidebar-row-key={sidebarRowKey(row)}
+                          data-sidebar-root-id={ownedRow?.rootId}
+                          data-sidebar-bucket-key={ownedRow?.bucketKey}
+                          data-conversation-id={
+                            row.kind === "conversation"
+                              ? row.conversation.id
+                              : undefined
+                          }
+                        >
+                          {renderRow(row)}
+                        </div>
+                      )
+                    }}
                   </Virtualizer>
                 ) : (
                   <div className="flex flex-col gap-1.5 pt-1">

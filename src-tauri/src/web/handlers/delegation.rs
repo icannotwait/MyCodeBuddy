@@ -10,14 +10,15 @@ use std::sync::Arc;
 use axum::{extract::Extension, Json};
 use serde::Deserialize;
 
-use crate::acp::delegation::types::DelegationProfileDocument;
+use crate::acp::delegation::types::{DelegationProfileCatalog, DelegationProfileDocument};
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::delegation::{
-    apply_profiles_to_broker, load_delegation_profiles, load_delegation_settings,
+    load_delegation_profile_catalog, load_delegation_profiles, load_delegation_settings,
     set_delegation_bundle_core, set_delegation_profiles_core, set_delegation_settings_core,
-    DelegationBundle, DelegationSettings,
+    DelegationBundle, DelegationSettings, DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
 };
+use crate::web::event_bridge::emit_event;
 
 pub async fn get_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
@@ -34,16 +35,34 @@ pub async fn set_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationSettingsParams>,
 ) -> Result<Json<DelegationSettings>, AppCommandError> {
-    let saved =
-        set_delegation_settings_core(&state.db.conn, &state.delegation_broker, params.settings)
-            .await?;
-    Ok(Json(saved))
+    let mutation = set_delegation_settings_core(
+        &state.db.conn,
+        &state.delegation_broker,
+        &state.delegation_runtime_settings,
+        &state.connection_manager,
+        params.settings,
+    )
+    .await?;
+    emit_event(
+        &state.emitter,
+        DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+        mutation.catalog,
+    );
+    Ok(Json(mutation.value))
 }
 
 pub async fn get_delegation_profiles(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<DelegationProfileDocument>, AppCommandError> {
     Ok(Json(load_delegation_profiles(&state.db.conn).await?))
+}
+
+pub async fn get_delegation_profile_catalog(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<DelegationProfileCatalog>, AppCommandError> {
+    Ok(Json(
+        load_delegation_profile_catalog(&state.db.conn).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -55,9 +74,18 @@ pub async fn set_delegation_profiles(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationProfilesParams>,
 ) -> Result<Json<DelegationProfileDocument>, AppCommandError> {
-    let saved = set_delegation_profiles_core(&state.db.conn, params.document).await?;
-    apply_profiles_to_broker(&state.delegation_broker, &saved).await;
-    Ok(Json(saved))
+    let mutation = set_delegation_profiles_core(
+        &state.db.conn,
+        &state.delegation_broker,
+        params.document,
+    )
+    .await?;
+    emit_event(
+        &state.emitter,
+        DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+        mutation.catalog,
+    );
+    Ok(Json(mutation.value))
 }
 
 #[derive(Deserialize)]
@@ -69,7 +97,18 @@ pub async fn set_delegation_bundle(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationBundleParams>,
 ) -> Result<Json<DelegationBundle>, AppCommandError> {
-    let saved =
-        set_delegation_bundle_core(&state.db.conn, &state.delegation_broker, params.bundle).await?;
-    Ok(Json(saved))
+    let mutation = set_delegation_bundle_core(
+        &state.db.conn,
+        &state.delegation_broker,
+        &state.delegation_runtime_settings,
+        &state.connection_manager,
+        params.bundle,
+    )
+    .await?;
+    emit_event(
+        &state.emitter,
+        DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+        mutation.catalog,
+    );
+    Ok(Json(mutation.value))
 }

@@ -469,7 +469,7 @@ ${blocksToHtml(turn.blocks, labels)}
 <div class="container">
 ${header}
 <main>${messages}</main>
-<div class="footer">Codeg</div>
+<div class="footer">DrawCode</div>
 </div>
 </body>
 </html>`
@@ -502,7 +502,7 @@ export async function exportAsMarkdown(
   }
 
   parts.push("---")
-  parts.push("*Codeg*")
+  parts.push("*DrawCode*")
 
   return saveTextFile({
     content: parts.join("\n"),

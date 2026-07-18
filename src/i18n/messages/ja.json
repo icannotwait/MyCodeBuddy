@@ -562,7 +562,16 @@
       "noConfigAvailable": "このエージェントには設定可能な項目がありません。",
       "modeLabel": "モード",
       "agentDefaultHint": "エージェント既定: {value}",
-      "defaultOptionLabel": "既定（{value}）"
+      "defaultOptionLabel": "既定（{value}）",
+      "routePolicy": "デフォルトルート",
+      "routePolicyHint": "会話に上書きがない場合、管理対象エージェントはこのルートを使います。",
+      "routeEffectiveNative": "委任がオフです — 有効ルートは Native です。",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "ソフトウォッチドッグ（秒）",
+      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。キャンセルやルート変更はしません。"
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",
@@ -963,7 +972,8 @@
       "piBinaryInstallFailed": "pi のインストールに失敗しました",
       "piBinaryUninstalled": "pi をアンインストールしました",
       "piBinaryUninstallFailed": "pi のアンインストールに失敗しました",
-      "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました"
+      "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "バージョン状態",
@@ -977,7 +987,7 @@
       "remoteUnavailable": "{versionText}。現在リモートバージョンは取得できません。",
       "latest": "{versionText}。すでに最新です。",
       "bundled": "内蔵バージョン: {version}",
-      "bundledMissing": "内蔵アダプターがありません。MyCodeBuddy を再インストールまたは更新してください。"
+      "bundledMissing": "内蔵アダプターがありません。DrawCode を再インストールまたは更新してください。"
     },
     "cline": {
       "configDescription": "Cline API プロバイダーと認証情報を設定します。設定は ~/.cline/data/ に保存されます。"
@@ -1052,7 +1062,8 @@
       "trustDescription": "codeg が pi をフォルダーに接続する際、そのフォルダーを信頼済みとして登録し、別途の確認なしにプロジェクトのローカル設定とスキルを読み込めるようにします。",
       "trustHint": "信頼されるのはここで開いたフォルダーのみで、マシン全体ではありません。また影響するのは設定の読み込みだけで、pi が実行できる内容には影響しません。",
       "configDirSkillsNote": "カスタム設定ディレクトリを指定すると、設定画面で管理するスキル・エキスパート・オフィスツールはこの pi に適用されません。スキルはそのフォルダー内で直接管理してください。"
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "エージェント設定を読み込み中...",
@@ -1085,11 +1096,22 @@
     "restartRequired": "保存しました。再起動後に反映されます。",
     "restartNow": "今すぐ再起動",
     "restartFailed": "再起動に失敗しました: {message}",
-    "loadFailed": "読み込みに失敗しました: {message}"
+    "loadFailed": "読み込みに失敗しました: {message}",
+    "conversationExperienceTitle": "会話エクスペリエンス",
+    "conversationExperienceDescription": "自動タイトルと参照検索の動作を設定します。",
+    "autoTitleAgent": "自動タイトルエージェント",
+    "autoTitleOff": "オフ",
+    "autoTitleUnavailable": "{agent}（利用不可）",
+    "autoTitleSaveFailed": "自動タイトルエージェントを保存できませんでした: {message}",
+    "autoTitleLoading": "自動タイトル設定を読み込んでいます...",
+    "referenceSearchLimit": "参照結果の上限",
+    "referenceSearchLimitHint": "リソースソースごとにキャッシュおよび検索する結果の最大数（10～500）。",
+    "referenceSearchLimitSave": "参照上限を保存",
+    "referenceSearchLimitSaveFailed": "参照結果の上限を保存できませんでした: {message}"
   },
   "LoginPage": {
-    "documentTitle": "ログイン - codeg",
-    "brand": "Codeg",
+    "documentTitle": "ログイン - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "デスクトップアプリに接続するためのアクセストークンを入力してください",
     "tokenPlaceholder": "アクセストークン",
     "connect": "接続",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "チャットを上に",
       "statusRunningBadge": "実行中",
       "statusCancelledBadge": "キャンセル済み",
+      "statusAwaitingReplyBadge": "返信待ち",
       "conversationCountUnit": "{count} 件",
       "emptyFolderHint": "会話がありません",
       "noMatchingConversations": "一致する会話がありません",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "セッションに追加",
       "compareWithBranch": "ブランチと比較...",
       "reloadFromDisk": "ディスクから再読み込み",
+      "showIgnoredFiles": "無視されたファイルを表示",
       "new": "新規作成",
       "newFile": "ファイル",
       "newDirectory": "ディレクトリ",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "{name} のダウンロードに失敗しました",
         "downloadSaved": "{name} をダウンロードしました",
         "pathCopied": "パスをコピーしました",
-        "copyPathFailed": "パスのコピーに失敗しました"
+        "copyPathFailed": "パスのコピーに失敗しました",
+        "loadIgnoredFilesFailed": "無視されたファイルを読み込めませんでした"
       },
       "createDialog": {
         "newFile": "新規ファイル",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "{agent} の接続に失敗しました",
         "toolFallbackTitle": "ツール",
         "eventErrorTitle": "エージェントエラー",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} の応答が完了しました",
         "notificationError": "{agent} エラー：{message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "エージェント",
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
-        "mentionGroupSkill": "スキル"
+        "mentionGroupSkill": "スキル",
+        "mentionInvalidPattern": "正規表現が無効です",
+        "mentionSourceError": "このソースを更新できませんでした",
+        "mentionProfileError": "委任プロファイルを読み込めませんでした"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "サブエージェント",
         "collapsedSummary": "サブエージェント {count}",
-        "collapseAria": "サブエージェントを折りたたむ"
+        "collapseAria": "サブエージェントを折りたたむ",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "エージェントプラン",
@@ -2414,7 +2448,10 @@
             "child_empty": "サブエージェント応答なし",
             "child_unknown": "サブエージェント: エラー",
             "unknown": "不明なタスク"
-          }
+          },
+          "active": "アクティブ",
+          "waitingInput": "入力待ち",
+          "stalled": "最近のエージェント活動なし"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "閉じる",
         "reconnectFailed": "セッションの再接続に失敗しました",
         "applied": "新しい設定を適用しました",
-        "terminalShellTitle": "ターミナルシェルが更新されました"
+        "terminalShellTitle": "ターミナルシェルが更新されました",
+        "delegationRouteTitle": "委任ルートが更新されました"
       },
       "collabAgent": {
         "title": "サブエージェント",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "バックグラウンドタスクが完了しました",
         "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
         "cardResultPending": "結果はまだ返っていません"
+      },
+      "delegationRoute": {
+        "menuLabel": "委任ルート",
+        "inheritGlobal": "グローバルを継承",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg（継承）",
+        "updateFailed": "ルートの更新に失敗しました"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Native にフォールバックしました（{reason}）。再接続して Codeg を再試行してください。",
+        "delegationUnavailable": "Codeg ルートは有効ですが委任を利用できません。",
+        "reconnect": "再接続",
+        "reconnecting": "再接続中…",
+        "reconnected": "再接続しました",
+        "reconnectFailed": "再接続に失敗しました",
+        "reason": {
+          "native_suppression_unsupported": "ネイティブ抑制非対応",
+          "native_suppression_invalid": "ネイティブ抑制が無効",
+          "companion_binary_unavailable": "コンパニオンバイナリ不可",
+          "agent_mcp_unsupported": "エージェントが MCP 非対応",
+          "companion_initialization_failed": "コンパニオン初期化失敗",
+          "unknown": "低下"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "切り替えても、ここに表示され開くアドレスが変わるだけです。サービスはすべてのインターフェースで待ち受けており、どのアドレスからもアクセスできます。",
     "sectionTitle": "Webサービス",
-    "sectionDescription": "有効にするとブラウザからCodegにリモートアクセスできます",
+    "sectionDescription": "有効にするとブラウザからDrawCodeにリモートアクセスできます",
     "port": "ポート",
     "status": "ステータス",
     "autoStart": "自動起動",
-    "autoStartHint": "Codeg の起動時に Web サービスを開始",
+    "autoStartHint": "DrawCode の起動時に Web サービスを開始",
     "running": "実行中",
     "stopped": "停止中",
     "processing": "処理中...",
@@ -2782,7 +2844,7 @@
     "copy": "コピー",
     "qrcode": "QRコード",
     "qrcodeTitle": "スキャンして開く",
-    "qrcodeHint": "スマートフォンでスキャンして、ブラウザで Codeg を開きます",
+    "qrcodeHint": "スマートフォンでスキャンして、ブラウザで DrawCode を開きます",
     "addressLabel": "アクセスアドレス",
     "tokenLabel": "アクセストークン",
     "tokenHint": "Webクライアントの初回アクセス時にこのトークンを入力してください",
@@ -2790,7 +2852,7 @@
     "regenerate": "再生成",
     "stalePortOccupiedTitle": "ポート {port} は他のプロセスに使用されています",
     "stalePortUnknownTitle": "ポート {port} の状態を確認できません",
-    "stalePortHint": "ポートが解放されるまで Codeg はバインドできません。上のポートを変更するか、占有しているプロセスを終了してください。",
+    "stalePortHint": "ポートが解放されるまで DrawCode はバインドできません。上のポートを変更するか、占有しているプロセスを終了してください。",
     "errors": {
       "alreadyRunning": "Web サービスはすでに起動しています",
       "invalidAddress": "ホストまたはポートの形式が無効です",
@@ -3090,7 +3152,7 @@
   },
   "ScienceSettings": {
     "title": "科学研究スキル",
-    "description": "AI コーディングエージェント向けに厳選した科学研究スキル（仮説生成・実験計画・統計・可視化・批判的評価・文献検索）を有効化します。MyCodeBuddy が中央コピーを管理し、選んだエージェントに各スキルをリンクします。",
+    "description": "AI コーディングエージェント向けに厳選した科学研究スキル（仮説生成・実験計画・統計・可視化・批判的評価・文献検索）を有効化します。DrawCode が中央コピーを管理し、選んだエージェントに各スキルをリンクします。",
     "loading": "科学研究スキルを読み込み中…",
     "emptySkills": "利用可能な科学研究スキルがありません。アプリのログを確認してください。",
     "searchPlaceholder": "名前・ID・説明で科学研究スキルを検索",

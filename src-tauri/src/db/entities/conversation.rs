@@ -36,6 +36,22 @@ pub enum ConversationKind {
     Delegate,
 }
 
+/// Durable delegation task lifecycle for Broker-backed child rows.
+/// `unknown` and `stalled` are runtime-only views — never persisted.
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationTaskStatus {
+    #[sea_orm(string_value = "running")]
+    Running,
+    #[sea_orm(string_value = "completed")]
+    Completed,
+    #[sea_orm(string_value = "failed")]
+    Failed,
+    #[sea_orm(string_value = "canceled")]
+    Canceled,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "conversation")]
 pub struct Model {
@@ -47,6 +63,10 @@ pub struct Model {
     /// per-turn auto-title backfill (see `get_folder_conversation_core`) so a
     /// hand-set title is never overwritten by a parsed session-file title.
     pub title_locked: bool,
+    /// True once automatic title generation has finalized for this conversation
+    /// (success or permanent failure). Legacy rows default to false but have no
+    /// `auto_title_jobs` row and are therefore ineligible.
+    pub auto_title_finalized: bool,
     pub agent_type: String,
     pub status: ConversationStatus,
     pub kind: ConversationKind,
@@ -56,6 +76,25 @@ pub struct Model {
     pub parent_id: Option<i32>,
     pub parent_tool_use_id: Option<String>,
     pub delegation_call_id: Option<String>,
+    /// Root-only session route override (`codeg` / `native`). Stored as raw
+    /// text; typed as [`crate::acp::delegation::route::DelegationRoutePolicy`]
+    /// on the summary. Broker children keep this null (origin forces Codeg).
+    pub delegation_route_override: Option<String>,
+    /// Durable task lifecycle for delegate rows. Independent of
+    /// [`ConversationStatus`] so cold-load never re-infers task truth.
+    pub delegation_task_status: Option<DelegationTaskStatus>,
+    pub delegation_error_code: Option<String>,
+    pub delegation_started_at: Option<DateTimeUtc>,
+    pub delegation_finished_at: Option<DateTimeUtc>,
+    /// Nullable runtime rollup for Broker-owned join. Historical/non-delegate
+    /// rows stay null; newly-created delegate rows start at zero-count snapshot.
+    pub delegation_tool_call_count: Option<i64>,
+    pub delegation_edit_tool_call_count: Option<i64>,
+    pub delegation_touched_files_json: Option<String>,
+    pub delegation_touched_files_truncated: Option<bool>,
+    pub delegation_additions: Option<i64>,
+    pub delegation_deletions: Option<i64>,
+    pub delegation_line_counts_complete: Option<bool>,
     pub message_count: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
@@ -64,6 +103,9 @@ pub struct Model {
     /// the sidebar's "Pinned" section (sorted by this timestamp descending).
     /// Pinning never bumps `updated_at` — it is a view preference, not activity.
     pub pinned_at: Option<DateTimeUtc>,
+    /// Opaque generation token for race-safe awaiting-reply CAS. `None` means
+    /// not currently awaiting a reply generation (historical/default).
+    pub awaiting_reply_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

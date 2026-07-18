@@ -131,6 +131,7 @@ import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
+import { AgentThinkingVisibilitySwitch } from "./agent-thinking-visibility-switch"
 
 interface AgentCheckState {
   result?: PreflightResult
@@ -313,14 +314,15 @@ function patchEnvText(
 export const CODEX_ACP_USE_CLI_ENV = "CODEX_ACP_USE_CLI"
 
 /**
- * Product default injects `CODEX_ACP_USE_CLI=1` at launch via distribution env
- * on all platforms. Agent Settings can pin `0` to opt out (user env wins).
- * Platform arg kept for call-site compatibility; default is platform-independent.
+ * Product default injects `CODEX_ACP_USE_CLI=0` at launch via distribution env
+ * on all platforms (app-server). Agent Settings can pin `1` to enable CLI exec
+ * (user env wins). Platform arg kept for call-site compatibility; default is
+ * platform-independent.
  */
 export function codexCliRuntimeDefaultOn(
   _platform?: "macos" | "windows" | "linux" | "unknown"
 ): boolean {
-  return true
+  return false
 }
 
 /** Effective CLI-exec switch from Agent env text + platform default. */
@@ -2855,7 +2857,7 @@ export function buildVersionCheck(
           })
         : acpText(
             "version.bundledMissing",
-            "Built-in adapter is missing. Reinstall or update MyCodeBuddy."
+            "Built-in adapter is missing. Reinstall or update DrawCode."
           ),
       fixes: [],
     }
@@ -4794,6 +4796,19 @@ export function AcpAgentSettings() {
     setAgents(reordered)
     pendingOrderRef.current = reordered.map((agent) => agent.agent_type)
   }, [])
+
+  const handleThinkingVisibilityChange = useCallback(
+    (agentType: AgentType, showThinking: boolean) => {
+      setAgents((current) =>
+        current.map((agent) =>
+          agent.agent_type === agentType
+            ? { ...agent, show_thinking: showThinking }
+            : agent
+        )
+      )
+    },
+    []
+  )
 
   const renderCheck = (agent: AcpAgentInfo, check: UiCheckItem) => {
     const checkKey = `${agent.agent_type}:${check.check_id}`
@@ -7198,6 +7213,11 @@ export function AcpAgentSettings() {
                 <p className="mt-2 text-xs text-muted-foreground">
                   {selectedAgent.description}
                 </p>
+                <AgentThinkingVisibilitySwitch
+                  agentType={selectedAgent.agent_type}
+                  checked={selectedAgent.show_thinking}
+                  onCheckedChange={handleThinkingVisibilityChange}
+                />
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 space-y-4">

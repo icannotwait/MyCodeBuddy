@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "runId": "run-mrmphbid-ji9bk1",
+  "fixture": {
+    "id": "grok_rich_v1",
+    "version": "grok-rich-v1",
+    "seed": 49374,
+    "rateProfile": "eps_1000",
+    "expectedEvents": 1223,
+    "expectedTextChars": 30000,
+    "expectedTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039"
+  },
+  "environment": {
+    "platform": "Win32",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+    "webviewVersion": "150.0.0.0",
+    "buildMode": "production",
+    "hardwareAcceleration": "enabled",
+    "deliveryMode": "batched",
+    "flags": {
+      "desktop_acp_event_batching": true,
+      "incremental_live_transcript": true,
+      "deferred_streaming_rich_content": true
+    }
+  },
+  "delivery": {
+    "emitted_count": 11036,
+    "lagged_count": 0,
+    "ring_buffer_evict_count": 10770,
+    "replay_count": 0,
+    "replay_event_total": 0,
+    "snapshot_fallback_count": 0,
+    "snapshot_cold_count": 0,
+    "forwarder_lagged_count": 0,
+    "worker_queue_full_count": 0,
+    "desktop_raw_envelope_count": 11036,
+    "desktop_raw_bytes": 1632840,
+    "desktop_emit_attempt_count": 1886,
+    "desktop_serialization_failure_count": 0,
+    "desktop_emit_failure_count": 0,
+    "desktop_legacy_emit_count": 0,
+    "desktop_batch_count": 1886,
+    "desktop_batch_event_count": 11036,
+    "desktop_batch_bytes": 1632840,
+    "desktop_batch_max_events": 32,
+    "desktop_batch_max_bytes": 4973,
+    "desktop_batch_latency_total_us": 57029310,
+    "desktop_batch_latency_max_us": 32520,
+    "desktop_queue_full_count": 0,
+    "desktop_startup_fallback_count": 0,
+    "desktop_runtime_failure_count": 0
+  },
+  "pipelineCounts": {
+    "deliveryCallbacks": 42,
+    "ingestorFrames": 39,
+    "connectionMapPublications": 39,
+    "connectionTransactions": 39,
+    "livePublications": 39,
+    "reactCommits": 39,
+    "paints": 39
+  },
+  "timings": {
+    "receiptToTransaction": {
+      "count": 42,
+      "p50": 9.299999997019768,
+      "p95": 16.799999997019768,
+      "max": 17.600000008940697
+    },
+    "transactionToLivePublication": {
+      "count": 42,
+      "p50": 0,
+      "p95": 0.10000000894069672,
+      "max": 0.20000000298023224
+    },
+    "batchToCommit": {
+      "count": 42,
+      "p50": 12.900000005960464,
+      "p95": 19.5,
+      "max": 20.099999994039536
+    },
+    "batchToPaint": {
+      "count": 42,
+      "p50": 27.899999991059303,
+      "p95": 36.1000000089407,
+      "max": 102.70000000298023
+    },
+    "inputToPaint": {
+      "count": 20,
+      "p50": 14.599999994039536,
+      "p95": 245.40000000596046,
+      "max": 348.79999999701977
+    },
+    "longTasks": {
+      "count": 3,
+      "p50": 56,
+      "p95": 100,
+      "max": 100
+    },
+    "frameGaps": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "eventLoopDrift": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "renders": {
+    "conversationPanel": 0,
+    "historicalThread": 8,
+    "historicalRow": 3,
+    "liveRow": 239,
+    "markdownBlock": 30,
+    "toolCard": 53
+  },
+  "integrity": {
+    "expectedEvents": 1223,
+    "appliedEvents": 1223,
+    "firstSeq": 1,
+    "lastSeq": 9793,
+    "duplicateCount": 0,
+    "gapCount": 0,
+    "finalTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039",
+    "ok": true
+  },
+  "cadence": {
+    "queuedDurationMs": 1120.5999999940395,
+    "paintCount": 35,
+    "updatesPerSecond": 31.233267892366733
+  },
+  "resources": {
+    "markdownCacheEntries": null,
+    "markdownCacheBytes": null,
+    "highlightCacheEntries": null,
+    "highlightCacheBytes": null,
+    "liveConversations": null,
+    "liveSegments": null,
+    "liveTools": null,
+    "usedHeapBytes": 82995910,
+    "heapMeasurement": "supported"
+  },
+  "acceptance": {
+    "batchToPaint": true,
+    "inputToPaint": false,
+    "longTask": true,
+    "visualCadence": true,
+    "eventIntegrity": true,
+    "passed": false
+  }
+}

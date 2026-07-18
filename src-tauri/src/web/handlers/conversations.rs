@@ -95,9 +95,11 @@ pub struct ListConversationsParams {
 }
 
 pub async fn list_conversations(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<ListConversationsParams>,
 ) -> Result<Json<Vec<ConversationSummary>>, AppCommandError> {
-    let result = conv_commands::list_conversations(
+    let result = conv_commands::list_conversations_core(
+        state.internal_sessions.as_ref(),
         params.agent_type,
         params.search,
         params.sort_by,
@@ -115,9 +117,15 @@ pub struct GetConversationParams {
 }
 
 pub async fn get_conversation(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<GetConversationParams>,
 ) -> Result<Json<ConversationDetail>, AppCommandError> {
-    let result = conv_commands::get_conversation(params.agent_type, params.conversation_id).await?;
+    let result = conv_commands::get_conversation_core(
+        state.internal_sessions.as_ref(),
+        params.agent_type,
+        params.conversation_id,
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -136,24 +144,31 @@ pub async fn get_folder_conversation(
         &db.conn,
         &state.connection_manager,
         &state.emitter,
+        state.internal_sessions.as_ref(),
         params.conversation_id,
     )
     .await?;
     Ok(Json(result))
 }
 
-pub async fn list_folders() -> Result<Json<Vec<FolderInfo>>, AppCommandError> {
-    let result = conv_commands::list_folders().await?;
+pub async fn list_folders(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Vec<FolderInfo>>, AppCommandError> {
+    let result = conv_commands::list_folders_core(state.internal_sessions.as_ref()).await?;
     Ok(Json(result))
 }
 
-pub async fn get_stats() -> Result<Json<AgentStats>, AppCommandError> {
-    let result = conv_commands::get_stats().await?;
+pub async fn get_stats(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<AgentStats>, AppCommandError> {
+    let result = conv_commands::get_stats_core(state.internal_sessions.as_ref()).await?;
     Ok(Json(result))
 }
 
-pub async fn get_sidebar_data() -> Result<Json<SidebarData>, AppCommandError> {
-    let result = conv_commands::get_sidebar_data().await?;
+pub async fn get_sidebar_data(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<SidebarData>, AppCommandError> {
+    let result = conv_commands::get_sidebar_data_core(state.internal_sessions.as_ref()).await?;
     Ok(Json(result))
 }
 
@@ -171,6 +186,7 @@ pub async fn import_local_conversations(
         conv_commands::import_local_conversations_core(
             &state.db.conn,
             &state.emitter,
+            state.internal_sessions.as_ref(),
             params.folder_id,
         )
         .await?,
@@ -183,6 +199,7 @@ pub struct CreateConversationParams {
     pub folder_id: i32,
     pub agent_type: AgentType,
     pub title: Option<String>,
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 }
 
 pub async fn create_conversation(
@@ -190,15 +207,16 @@ pub async fn create_conversation(
     Json(params): Json<CreateConversationParams>,
 ) -> Result<Json<i32>, AppCommandError> {
     let db = &state.db;
-    let result = conv_commands::create_conversation_core(
+    let created = conv_commands::create_project_conversation_core(
         &db.conn,
         params.folder_id,
         params.agent_type,
         params.title,
+        params.delegation_route_override,
     )
     .await?;
-    conv_commands::emit_conversation_upsert(&state.emitter, &db.conn, result).await;
-    Ok(Json(result))
+    conv_commands::emit_project_conversation_created(&state.emitter, &db.conn, &created).await;
+    Ok(Json(created.conversation_id))
 }
 
 #[derive(Deserialize)]
@@ -209,6 +227,7 @@ pub struct CreateChatConversationParams {
     /// Reuse an eagerly-created scratch dir (from `create_chat_dir`) instead of
     /// minting a new one, so the ACP cwd stays put across the first send.
     pub existing_dir: Option<String>,
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
 }
 
 pub async fn create_chat_conversation(
@@ -221,11 +240,81 @@ pub async fn create_chat_conversation(
         params.agent_type,
         params.title,
         params.existing_dir.as_deref(),
+        params.delegation_route_override,
     )
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, result.conversation_id)
         .await;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConversationDelegationRouteParams {
+    pub conversation_id: i32,
+    pub route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+}
+
+pub async fn set_conversation_delegation_route(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SetConversationDelegationRouteParams>,
+) -> Result<Json<DbConversationSummary>, AppCommandError> {
+    let summary = conv_commands::set_conversation_delegation_route_core(
+        &state.db.conn,
+        params.conversation_id,
+        params.route_override,
+    )
+    .await?;
+    let snap = state.delegation_runtime_settings.snapshot();
+    {
+        let mut map = state.connection_manager.connections.lock().await;
+        for conn in map.values_mut() {
+            let bound = conn.state.try_read().ok().and_then(|s| s.conversation_id)
+                == Some(params.conversation_id);
+            if bound {
+                conn.route_preference = params.route_override;
+            }
+        }
+    }
+    state
+        .connection_manager
+        .refresh_delegation_route_staleness_for_conversation(
+            params.conversation_id,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await;
+    conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, params.conversation_id)
+        .await;
+    Ok(Json(summary))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDraftDelegationRoutePreferenceParams {
+    pub connection_id: String,
+    pub route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+}
+
+pub async fn set_draft_delegation_route_preference(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SetDraftDelegationRoutePreferenceParams>,
+) -> Result<Json<()>, AppCommandError> {
+    let snap = state.delegation_runtime_settings.snapshot();
+    state
+        .connection_manager
+        .set_draft_delegation_route_preference(
+            &params.connection_id,
+            params.route_override,
+            snap.route_policy,
+            snap.enabled,
+        )
+        .await
+        .map_err(|e| {
+            e.shell_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+        })?;
+    Ok(Json(()))
 }
 
 /// Eagerly create a chat-mode scratch directory (no DB rows) and return its
@@ -273,6 +362,7 @@ pub async fn update_conversation_title(
 ) -> Result<Json<()>, AppCommandError> {
     conv_commands::update_conversation_title_core(
         &state.db.conn,
+        state.auto_title_coordinator.as_ref(),
         params.conversation_id,
         params.title,
     )
@@ -306,6 +396,28 @@ pub async fn update_conversation_pinned(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClearAwaitingReplyParams {
+    pub conversation_id: i32,
+    pub expected_token: String,
+}
+
+pub async fn clear_awaiting_reply(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ClearAwaitingReplyParams>,
+) -> Result<Json<ConversationStatePatch>, AppCommandError> {
+    Ok(Json(
+        conv_commands::clear_awaiting_reply_core(
+            &state.db.conn,
+            &state.emitter,
+            params.conversation_id,
+            params.expected_token,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteConversationParams {
     pub conversation_id: i32,
 }
@@ -317,6 +429,7 @@ pub async fn delete_conversation(
     conv_commands::delete_conversation_with_cleanup_core(
         &state.emitter,
         &state.db.conn,
+        state.auto_title_coordinator.as_ref(),
         params.conversation_id,
     )
     .await?;

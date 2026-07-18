@@ -1,16 +1,31 @@
-import { render, screen } from "@testing-library/react"
+import { act, render, screen } from "@testing-library/react"
 import type { ReactNode } from "react"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import {
+  appendStreamingMarkdown,
+  createIncrementalStreamBlocks,
+} from "@/lib/markdown/incremental-stream-blocks"
+import { StreamingMarkdownDocument } from "@/components/message/streaming-markdown-document"
+import {
+  __getStreamdownPluginDebugStateForTest,
+  __resetStreamdownPluginsForTest,
+} from "./streamdown-plugins"
 
 vi.mock("streamdown", () => ({
   Streamdown: ({
     children,
     className,
+    remarkPlugins,
   }: {
     children: ReactNode
     className?: string
+    remarkPlugins?: unknown[]
   }) => (
-    <div className={className} data-testid="streamdown-root">
+    <div
+      className={className}
+      data-testid="streamdown-root"
+      data-remark-plugin-count={remarkPlugins?.length ?? 0}
+    >
       {children}
     </div>
   ),
@@ -36,6 +51,42 @@ vi.mock("@/components/ai-elements/link-safety", () => ({
 
 import { MessageResponse } from "./message"
 
+afterEach(() => {
+  __resetStreamdownPluginsForTest()
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
+
+function installIntersectionObserver(initiallyVisible: boolean) {
+  let enterNearViewport: (() => void) | null = null
+  class FakeIntersectionObserver implements IntersectionObserver {
+    readonly root: Element | Document | null = null
+    readonly rootMargin = "600px 0px"
+    readonly thresholds: ReadonlyArray<number> = [0]
+    constructor(next: IntersectionObserverCallback) {
+      enterNearViewport = () => {
+        next([{ isIntersecting: true } as IntersectionObserverEntry], this)
+      }
+    }
+    observe = vi.fn(() => {
+      if (initiallyVisible) {
+        enterNearViewport?.()
+      }
+    })
+    disconnect = vi.fn()
+    unobserve = vi.fn()
+    takeRecords = () => []
+  }
+  vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver)
+  return {
+    enter: () => {
+      act(() => {
+        enterNearViewport?.()
+      })
+    },
+  }
+}
+
 describe("MessageResponse", () => {
   it("applies marker styles so ordered Markdown lists render as lists", () => {
     render(<MessageResponse>{"1. First\n2. Second"}</MessageResponse>)
@@ -43,6 +94,86 @@ describe("MessageResponse", () => {
     expect(screen.getByTestId("streamdown-root")).toHaveClass(
       "[&_ol]:list-decimal",
       "[&_ol]:pl-3"
+    )
+  })
+
+  it("does not request Mermaid for a sealed streaming block", async () => {
+    render(
+      <MessageResponse richContentState="sealed-streaming">
+        {"```mermaid\ngraph TD; A-->B\n```"}
+      </MessageResponse>
+    )
+    await act(async () => {})
+    expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(0)
+    expect(screen.getByText(/graph TD/)).toBeVisible()
+  })
+
+  it("renders sealed math but never parses a lightweight tail", async () => {
+    render(
+      <MessageResponse richContentState="sealed-streaming">
+        {"$x$"}
+      </MessageResponse>
+    )
+    await vi.waitFor(() =>
+      expect(__getStreamdownPluginDebugStateForTest().requests.math).toBe(1)
+    )
+    // Identity splitter — avoid pulling Streamdown's real parseMarkdownIntoBlocks
+    // through the module mock used for MessageResponse.
+    const tail = appendStreamingMarkdown(
+      createIncrementalStreamBlocks("tail-1", (markdown) =>
+        markdown ? [markdown] : []
+      ),
+      "$unfinished"
+    )
+    render(<StreamingMarkdownDocument document={tail} />)
+    expect(__getStreamdownPluginDebugStateForTest().requests.math).toBe(1)
+  })
+
+  it("loads completed Mermaid only near the viewport", async () => {
+    const observer = installIntersectionObserver(false)
+    render(
+      <MessageResponse richContentState="complete">
+        {"```mermaid\ngraph TD; A-->B\n```"}
+      </MessageResponse>
+    )
+    expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(0)
+    observer.enter()
+    await vi.waitFor(() =>
+      expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(1)
+    )
+  })
+
+  it("cancels idle Mermaid enablement on unmount when IntersectionObserver is absent", () => {
+    vi.useFakeTimers()
+    vi.stubGlobal("IntersectionObserver", undefined)
+    vi.stubGlobal("requestIdleCallback", undefined)
+
+    const { unmount } = render(
+      <MessageResponse richContentState="complete">
+        {"```mermaid\ngraph TD; A-->B\n```"}
+      </MessageResponse>
+    )
+    expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(0)
+    unmount()
+    act(() => {
+      vi.advanceTimersByTime(1_000)
+    })
+    expect(__getStreamdownPluginDebugStateForTest().requests.mermaid).toBe(0)
+  })
+
+  it("reselects the remark pipeline when local-path autolinking changes", () => {
+    const { rerender } = render(
+      <MessageResponse autolinkLocalPaths={false}>plain</MessageResponse>
+    )
+    expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
+      "data-remark-plugin-count",
+      "1"
+    )
+
+    rerender(<MessageResponse autolinkLocalPaths>plain</MessageResponse>)
+    expect(screen.getByTestId("streamdown-root")).toHaveAttribute(
+      "data-remark-plugin-count",
+      "2"
     )
   })
 })

@@ -599,6 +599,7 @@ mod tests {
                 session_id: "s1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         ));
         s.apply(&env(
@@ -675,6 +676,7 @@ mod tests {
                 session_id: "s1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         ));
         s.apply(&env(
@@ -733,6 +735,7 @@ mod tests {
                 session_id: "s1".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         ));
 
@@ -846,6 +849,7 @@ mod tests {
     }
 
     fn delegation_started(parent: &str, child: &str) -> EventEnvelope {
+        let started = chrono::Utc::now();
         env(
             parent,
             AcpEvent::DelegationStarted {
@@ -854,11 +858,17 @@ mod tests {
                 child_connection_id: child.into(),
                 child_conversation_id: 1,
                 agent_type: crate::models::agent::AgentType::Codex,
+                task_id: "task-1".into(),
+                started_at: started,
+                runtime_stats:
+                    crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started),
+                attention_request: None,
             },
         )
     }
 
     fn delegation_completed(parent: &str, child: &str) -> EventEnvelope {
+        let started = chrono::Utc::now();
         env(
             parent,
             AcpEvent::DelegationCompleted {
@@ -867,6 +877,9 @@ mod tests {
                 child_connection_id: child.into(),
                 child_conversation_id: 1,
                 agent_type: crate::models::agent::AgentType::Codex,
+                task_id: "task-1".into(),
+                runtime_stats:
+                    crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started),
                 result: crate::acp::types::DelegationResultSummary::Ok {
                     duration_ms: 0,
                     text_preview: None,
@@ -1052,6 +1065,7 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
             AcpEvent::ConversationStatusChanged {
                 conversation_id: 1,
@@ -1264,6 +1278,7 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         );
 

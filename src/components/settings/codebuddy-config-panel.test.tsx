@@ -34,6 +34,7 @@ function makeAgent(env: Record<string, string>): AcpAgentInfo {
     cline_secrets_json: null,
     hermes_config_yaml: null,
     model_provider_id: null,
+    show_thinking: false,
   }
 }
 

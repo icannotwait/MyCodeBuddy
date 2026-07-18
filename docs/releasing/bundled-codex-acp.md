@@ -4,15 +4,14 @@ MyCodeBuddy's Windows x64 installer includes the customized codex-acp fork as
 `codex-acp.exe`. The source is pinned as the public Git submodule at
 `src-tauri/vendor/codex-acp`; Agent Settings never replaces this executable.
 
-## Runtime dependency: host Codex (CLI exec default on all platforms)
+## Runtime dependency: host Codex (app-server default on all platforms)
 
 MyCodeBuddy ships the **codex-acp adapter** (`codex-acp.exe` on Windows; npx
 package elsewhere). That fork keeps MyCodeBuddy's custom ACP surface. The
-product **defaults** to CLI exec mode via distribution env `CODEX_ACP_USE_CLI=1`
-on **all platforms**, so the adapter runs turns with host `codex exec --json`
-(avoids ChatGPT "official clients only" 403s common on the app-server path).
-Agent Settings exposes a toggle; turning it off writes `CODEX_ACP_USE_CLI=0`
-(user env wins over the distribution pin) and falls back to `codex app-server`.
+product **defaults** to app-server mode via distribution env
+`CODEX_ACP_USE_CLI=0` on **all platforms**. Agent Settings exposes a toggle;
+turning it on writes `CODEX_ACP_USE_CLI=1` (user env wins over the distribution
+pin) so the adapter runs turns with host `codex exec --json` instead.
 
 Resolution order for `CODEX_PATH`:
 
@@ -35,9 +34,9 @@ legacy-runtime fallback is supported.
 
 Clean-machine verification:
 
-1. Install MyCodeBuddy only → Codex preflight should fail on "Codex CLI" with install guidance.
-2. `npm install -g @openai/codex` → preflight passes; new Codex session initializes under CLI exec by default (single virtual model).
-3. Agent Settings → Codex → turn **Use CLI exec runtime** off, save env, new session → app-server path (`model/list` multi-model when authenticated).
+1. Install MyCodeBuddy only → Codex preflight should fail on "Codex CLI" with install guidance (Windows still requires host Codex for app-server).
+2. `npm install -g @openai/codex` → preflight passes; new Codex session initializes under app-server by default (`model/list` multi-model when authenticated).
+3. Agent Settings → Codex → turn **Use CLI exec runtime** on, save env, new session → CLI exec path (single virtual model unless hybrid control plane applies).
 4. With a global official `codex-acp` also installed, logs must still show the sibling
    bundled `codex-acp.exe` path as the adapter.
 
@@ -93,10 +92,10 @@ A failure in any step must block the installer release.
 On a clean Windows x64 machine, verify:
 
 1. MyCodeBuddy only (no host Codex CLI) → Codex preflight fails with install guidance.
-2. After `npm install -g @openai/codex` (or `CODEX_PATH` set) → preflight passes and a new Codex session initializes under default CLI exec (`CODEX_ACP_USE_CLI=1`).
+2. After `npm install -g @openai/codex` (or `CODEX_PATH` set) → preflight passes and a new Codex session initializes under default app-server (`CODEX_ACP_USE_CLI=0`).
 3. Users need **no** global `codex-acp` package; the sibling bundled `codex-acp.exe` is used.
 4. With a global official `codex-acp` also installed, logs must still identify the sibling bundled `codex-acp.exe` path as the adapter.
-5. Registry distribution env for Codex (Windows bundled **and** non-Windows npx) **must** include `CODEX_ACP_USE_CLI=1`. Opt-out is user Agent env `CODEX_ACP_USE_CLI=0` (or the settings toggle).
+5. Registry distribution env for Codex (Windows bundled **and** non-Windows npx) **must** include `CODEX_ACP_USE_CLI=0`. Opt-in is user Agent env `CODEX_ACP_USE_CLI=1` (or the settings toggle).
 
 ## Hybrid CLI model control plane (Windows bundled fork)
 

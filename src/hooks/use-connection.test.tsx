@@ -186,4 +186,52 @@ describe("useConnection snapshot stability", () => {
 
     expect(result.current.loadErrorCode).toBe("legacy_cli_session")
   })
+
+  it("re-renders when delegationRoute changes while liveMessage stays ignored", () => {
+    fake.reset()
+    fake.setConn(
+      makeConn({
+        lastAppliedSeq: 1,
+        delegationRoute: {
+          requested: "codeg",
+          effective: "codeg",
+          source: "global_default",
+          managed: true,
+          delegation_available: true,
+        },
+      })
+    )
+    let renders = 0
+    const { result } = renderHook(() => {
+      renders++
+      return useConnection("k")
+    })
+    const mounted = renders
+    const first = result.current
+
+    act(() => {
+      fake.setConn(
+        makeConn({
+          lastAppliedSeq: 2,
+          liveMessage: {
+            id: "m1",
+            role: "assistant",
+            content: [{ type: "text", text: "token" } as never],
+            startedAt: 0,
+          },
+          delegationRoute: {
+            requested: "codeg",
+            effective: "native",
+            source: "safe_fallback",
+            managed: true,
+            degraded_reason: "companion_binary_unavailable",
+            delegation_available: false,
+          },
+        })
+      )
+    })
+    expect(renders).toBe(mounted + 1)
+    expect(result.current).not.toBe(first)
+    expect(result.current.delegationRoute?.effective).toBe("native")
+  })
 })

@@ -51,6 +51,7 @@ import { Input } from "@/components/ui/input"
 import { ConversationStatusDot } from "./conversation-status-dot"
 import { SessionDetailsDialog } from "./session-details-dialog"
 import { AgentIcon } from "@/components/agent-icon"
+import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 
 /**
  * Horizontal indent added per delegation-nesting level. Chosen so a child's
@@ -203,6 +204,14 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const isCancelled = status === "cancelled"
   const isPinned = conversation.pinned_at != null
   const isCompleted = status === "completed"
+  // Unseen agent completion: pending_review + non-null token, only while the
+  // card is not selected (selecting the session clears the badge UX). Status
+  // alone is not enough — cancelled can retain a stale token; selection must
+  // suppress the awaiting chrome.
+  const showAwaitingReply =
+    status === "pending_review" &&
+    conversation.awaiting_reply_token !== null &&
+    !isSelected
   // Delegation sub-sessions (a child of another conversation) don't get the
   // hover quick actions: pinning a sub-agent run to the root Pinned section or
   // hand-toggling its status doesn't fit — its lifecycle is the sub-agent's. The
@@ -301,7 +310,10 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                   <ConversationStatusDot
                     status={status}
                     size="sm"
-                    className="absolute -right-0.5 -bottom-0.5 ring-2 ring-sidebar"
+                    className={cn(
+                      "absolute -right-0.5 -bottom-0.5 ring-2 ring-sidebar",
+                      showAwaitingReply && "bg-destructive"
+                    )}
                   />
                 </div>
 
@@ -415,14 +427,25 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                     </span>
                   ) : timeLabel ? (
                     <span
+                      title={
+                        showAwaitingReply
+                          ? tSidebar("statusAwaitingReplyBadge")
+                          : undefined
+                      }
                       className={cn(
-                        "relative shrink-0 tabular-nums",
-                        "text-[0.71875rem]",
-                        isSelected
-                          ? "font-medium text-muted-foreground"
-                          : "font-normal text-muted-foreground/70"
+                        "relative shrink-0 tabular-nums text-[0.71875rem]",
+                        showAwaitingReply
+                          ? "font-medium text-destructive"
+                          : isSelected
+                            ? "font-medium text-muted-foreground"
+                            : "font-normal text-muted-foreground/70"
                       )}
                     >
+                      {showAwaitingReply && (
+                        <span className="sr-only">
+                          {tSidebar("statusAwaitingReplyBadge")}:{" "}
+                        </span>
+                      )}
                       {timeLabel}
                     </span>
                   ) : null}
@@ -521,6 +544,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
             <Info className="h-4 w-4" />
             {tDetails("menuLabel")}
           </ContextMenuItem>
+          <DelegationRouteMenu
+            agentType={conversation.agent_type}
+            conversationId={conversation.id}
+            parentId={conversation.parent_id}
+            value={conversation.delegation_route_override ?? null}
+          />
           <ContextMenuSeparator />
           <ContextMenuSub>
             <ContextMenuSubTrigger>

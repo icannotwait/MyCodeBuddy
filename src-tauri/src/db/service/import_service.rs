@@ -3,6 +3,8 @@ use sea_orm::{
     QueryFilter, Set,
 };
 
+use crate::auto_title::InternalAgentSessionRegistry;
+use crate::commands::conversations::filter_internal_summaries;
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -15,23 +17,29 @@ use crate::parsers::gemini::GeminiParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
-use crate::parsers::pi::PiParser;
 use crate::parsers::opencode::OpenCodeParser;
+use crate::parsers::pi::PiParser;
 use crate::parsers::{path_eq_for_matching, AgentParser};
 
 /// Import (and refresh the titles of) the local agent sessions under
 /// `folder_path`. Returns the tally plus the ids of already-imported
 /// conversations whose title was refreshed, so the caller can broadcast a
 /// sidebar upsert for each without re-querying.
+///
+/// Holds the shared discovery lease across the full parser scan + filter so a
+/// concurrent internal registration cannot race into the import set.
 pub async fn import_local_conversations(
     conn: &DatabaseConnection,
+    registry: &InternalAgentSessionRegistry,
     folder_id: i32,
     folder_path: &str,
 ) -> Result<(ImportResult, Vec<i32>), DbError> {
     let path = folder_path.to_string();
+    let (guard, filter) = registry.shared_filter().await?;
 
     // Run parsers in blocking task since they do filesystem I/O
     let summaries = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
             (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
             (AgentType::Codex, Box::new(CodexParser::new())),
@@ -64,7 +72,8 @@ pub async fn import_local_conversations(
                 }
             }
         }
-        matched
+        // Exclude internal sessions before any DB import work.
+        filter_internal_summaries(matched, &filter)
     })
     .await
     .map_err(|e| DbError::Migration(e.to_string()))?;
@@ -85,12 +94,19 @@ pub async fn import_local_conversations(
         }
     }
 
-    Ok((ImportResult { imported, updated, skipped }, updated_ids))
+    Ok((
+        ImportResult {
+            imported,
+            updated,
+            skipped,
+        },
+        updated_ids,
+    ))
 }
 
 /// Outcome of reconciling a single parsed session against the DB.
 #[derive(Debug, PartialEq, Eq)]
-enum ImportOutcome {
+pub(crate) enum ImportOutcome {
     /// A new conversation row was inserted.
     Imported,
     /// An already-imported conversation had its auto-title refreshed; carries
@@ -101,6 +117,20 @@ enum ImportOutcome {
     Skipped,
 }
 
+/// Test-only aliases so conversation filter fixtures can exercise the same loop.
+#[cfg(test)]
+pub(crate) type ImportOutcomeForTest = ImportOutcome;
+
+#[cfg(test)]
+pub(crate) async fn import_one_for_test(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: &AgentType,
+    summary: &ConversationSummary,
+) -> Result<ImportOutcome, DbError> {
+    import_one(conn, folder_id, agent_type, summary).await
+}
+
 /// Insert a brand-new conversation, or — when it already exists — refresh its
 /// title from the freshly parsed session file so an AI-generated title that did
 /// not exist at first import is adopted. `refresh_auto_title` is a single
@@ -108,7 +138,7 @@ enum ImportOutcome {
 /// `updated_at`, so a re-import neither clobbers a manual rename nor reorders a
 /// recency-sorted sidebar. A missing/empty parsed title leaves the existing
 /// title intact rather than nulling it.
-async fn import_one(
+pub(crate) async fn import_one(
     conn: &DatabaseConnection,
     folder_id: i32,
     agent_type: &AgentType,
@@ -140,7 +170,8 @@ async fn import_one(
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            if conversation_service::refresh_auto_title(conn, existing.id, title.to_string()).await?
+            if conversation_service::refresh_auto_title(conn, existing.id, title.to_string())
+                .await?
             {
                 return Ok(ImportOutcome::Updated(existing.id));
             }
@@ -155,6 +186,7 @@ async fn import_one(
         folder_id: Set(folder_id),
         title: Set(summary.title.clone()),
         title_locked: Set(false),
+        auto_title_finalized: Set(false),
         agent_type: Set(at_str),
         status: Set(conversation::ConversationStatus::Completed),
         // Imports scan regular folders' session files; chat scratch dirs and
@@ -166,11 +198,24 @@ async fn import_one(
         parent_id: Set(None),
         parent_tool_use_id: Set(None),
         delegation_call_id: Set(None),
+        delegation_route_override: Set(None),
+        delegation_task_status: Set(None),
+        delegation_error_code: Set(None),
+        delegation_started_at: Set(None),
+        delegation_finished_at: Set(None),
+        delegation_tool_call_count: Set(None),
+        delegation_edit_tool_call_count: Set(None),
+        delegation_touched_files_json: Set(None),
+        delegation_touched_files_truncated: Set(None),
+        delegation_additions: Set(None),
+        delegation_deletions: Set(None),
+        delegation_line_counts_complete: Set(None),
         message_count: Set(summary.message_count as i32),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
         deleted_at: Set(None),
         pinned_at: Set(None),
+        awaiting_reply_token: Set(None),
     };
     conv.insert(conn).await?;
     Ok(ImportOutcome::Imported)
@@ -211,14 +256,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imported_raw_session_never_enrolls_auto_title() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
+        let at = AgentType::ClaudeCode;
+
+        let outcome = import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("raw-ext-1", Some("historical")),
+        )
+        .await
+        .expect("import");
+        assert_eq!(outcome, ImportOutcome::Imported);
+
+        let id = find_id(&db.conn, "raw-ext-1").await;
+        assert!(
+            auto_title_job::Entity::find_by_id(id)
+                .one(&db.conn)
+                .await
+                .expect("query job")
+                .is_none(),
+            "raw import must stay historical and never enroll an auto-title job"
+        );
+    }
+
+    #[tokio::test]
     async fn reimport_refreshes_a_changed_title() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-import").await;
         let at = AgentType::ClaudeCode;
 
-        let first = import_one(&db.conn, folder, &at, &summary("ext-1", Some("first prompt")))
-            .await
-            .expect("import");
+        let first = import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("ext-1", Some("first prompt")),
+        )
+        .await
+        .expect("import");
         assert_eq!(first, ImportOutcome::Imported);
 
         let id = find_id(&db.conn, "ext-1").await;
@@ -261,9 +349,14 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-lock").await;
         let at = AgentType::ClaudeCode;
 
-        import_one(&db.conn, folder, &at, &summary("ext-1", Some("first prompt")))
-            .await
-            .expect("import");
+        import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("ext-1", Some("first prompt")),
+        )
+        .await
+        .expect("import");
         let id = find_id(&db.conn, "ext-1").await;
         conversation_service::update_title(&db.conn, id, "User Pick".into())
             .await
@@ -356,9 +449,14 @@ mod tests {
             .to_string();
 
         // A root conversation to parent the child.
-        import_one(&db.conn, folder, &at, &summary("parent-ext", Some("parent")))
-            .await
-            .expect("import parent");
+        import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("parent-ext", Some("parent")),
+        )
+        .await
+        .expect("import parent");
         let parent_id = find_id(&db.conn, "parent-ext").await;
 
         // A delegation child carrying its own external_id, as a parser would
@@ -369,6 +467,7 @@ mod tests {
             folder_id: Set(folder),
             title: Set(Some("child original".to_string())),
             title_locked: Set(false),
+            auto_title_finalized: Set(false),
             agent_type: Set(at_str),
             status: Set(conversation::ConversationStatus::Completed),
             kind: Set(conversation::ConversationKind::Delegate),
@@ -378,19 +477,37 @@ mod tests {
             parent_id: Set(Some(parent_id)),
             parent_tool_use_id: Set(None),
             delegation_call_id: Set(None),
+            delegation_route_override: Set(None),
+            delegation_task_status: Set(None),
+            delegation_error_code: Set(None),
+            delegation_started_at: Set(None),
+            delegation_finished_at: Set(None),
+            delegation_tool_call_count: Set(None),
+            delegation_edit_tool_call_count: Set(None),
+            delegation_touched_files_json: Set(None),
+            delegation_touched_files_truncated: Set(None),
+            delegation_additions: Set(None),
+            delegation_deletions: Set(None),
+            delegation_line_counts_complete: Set(None),
             message_count: Set(1),
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
             pinned_at: Set(None),
+            awaiting_reply_token: Set(None),
         }
         .insert(&db.conn)
         .await
         .expect("insert child");
 
-        let outcome = import_one(&db.conn, folder, &at, &summary("child-ext", Some("AI Summary")))
-            .await
-            .expect("re-import child");
+        let outcome = import_one(
+            &db.conn,
+            folder,
+            &at,
+            &summary("child-ext", Some("AI Summary")),
+        )
+        .await
+        .expect("re-import child");
         assert_eq!(
             outcome,
             ImportOutcome::Skipped,

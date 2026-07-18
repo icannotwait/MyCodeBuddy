@@ -1,88 +1,99 @@
-"""Generate src-tauri/icons/tray-icon-template.png.
+"""Generate src-tauri/icons/tray-icon-template.png from Ikaros profile art.
 
 This is a macOS menu-bar template image: the system reads only the alpha
 channel and tints the opaque pixels to match light/dark/highlighted menu
-bar appearance. Re-run after editing the constants below:
+bar appearance. RGB channels are black.
 
-    python3 src-tauri/icons/tray-icon-template.gen.py
+Re-run after replacing the source portrait:
+
+    python src-tauri/icons/tray-icon-template.gen.py
 
 Requires Pillow (pip install Pillow).
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageChops
+
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+
+ROOT = Path(__file__).parent
+# Prefer the original webp; fall back to the generated 512 app icon.
+SOURCE_CANDIDATES = (
+    ROOT / "Ikaros_Profile.webp",
+    ROOT / "icon.png",
+)
+OUT = ROOT / "tray-icon-template.png"
+
+# Square logical size for a circular portrait in the menu bar.
+# Previous geometric mark was 52x44; 44x44 keeps the same height budget.
+SIZE = 44
+SCALE = 4  # supersample then Lanczos-downsample for smooth edges
+S = SIZE * SCALE
 
 
-# Width is elongated past height so the rounded rect can fit the
-# bracket-and-dots cutout without crowding.
-W_LOGICAL, H_LOGICAL = 52, 44
-
-# Render at 4x then downsample with Lanczos: PIL's drawing primitives
-# are not anti-aliased, so supersampling is what produces smooth
-# diagonals and round caps.
-SCALE = 4
-W, H = W_LOGICAL * SCALE, H_LOGICAL * SCALE
-
-PAD = 3
-CORNER = 7
-STROKE = 4
-
-LEFT_BRACKET = [(19, 12), (10, 22), (19, 32)]
-RIGHT_BRACKET = [(33, 12), (42, 22), (33, 32)]
-
-# Side+middle radii (4 + 5.5) exceed center spacing (6), so the three
-# circles overlap into a connected pill instead of staying as discrete
-# dots.
-DOTS = [(20, 22, 4.0), (26, 22, 5.5), (32, 22, 4.0)]
-
-
-def _scaled(p):
-    return (int(round(p[0] * SCALE)), int(round(p[1] * SCALE)))
-
-
-def _stroke_polyline(draw, pts, w):
-    for i in range(len(pts) - 1):
-        draw.line([_scaled(pts[i]), _scaled(pts[i + 1])], fill=255, width=w)
-    r = w // 2
-    for p in pts:
-        x, y = _scaled(p)
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=255)
-
-
-def _dot(draw, cx, cy, r):
-    cx, cy, rr = cx * SCALE, cy * SCALE, r * SCALE
-    draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=255)
-
-
-def main():
-    bg = Image.new("L", (W, H), 0)
-    ImageDraw.Draw(bg).rounded_rectangle(
-        [
-            (PAD * SCALE, PAD * SCALE),
-            ((W_LOGICAL - PAD) * SCALE - 1, (H_LOGICAL - PAD) * SCALE - 1),
-        ],
-        radius=CORNER * SCALE,
-        fill=255,
+def _load_source() -> Image.Image:
+    for path in SOURCE_CANDIDATES:
+        if path.exists():
+            return Image.open(path).convert("RGBA")
+    raise FileNotFoundError(
+        "No source portrait found. Place Ikaros_Profile.webp next to this script."
     )
 
-    cut = Image.new("L", (W, H), 0)
-    dc = ImageDraw.Draw(cut)
-    _stroke_polyline(dc, LEFT_BRACKET, STROKE * SCALE)
-    _stroke_polyline(dc, RIGHT_BRACKET, STROKE * SCALE)
-    for cx, cy, r in DOTS:
-        _dot(dc, cx, cy, r)
 
-    # bg − cut: the rounded rect stays opaque except where the bracket
-    # and dot shapes punch through to transparent.
-    alpha = ImageChops.subtract(bg, cut)
-    zero = Image.new("L", (W, H), 0)
+def _center_square(im: Image.Image) -> Image.Image:
+    w, h = im.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    return im.crop((left, top, left + side, top + side))
+
+
+def _circular_mask(size: int) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    # Small inset so the silhouette does not touch the menu-bar edge.
+    pad = max(1, int(size * 0.04))
+    draw.ellipse((pad, pad, size - pad - 1, size - pad - 1), fill=255)
+    # Soft feather for retina-friendly edges.
+    return mask.filter(ImageFilter.GaussianBlur(radius=max(1.0, size * 0.015)))
+
+
+def _portrait_alpha(gray: Image.Image) -> Image.Image:
+    """Map a light-subject portrait to menu-bar alpha.
+
+    Bright face/hair becomes solid (high alpha); darker features (eyes,
+    outlines) punch slightly so the face stays readable when the system
+    tints the icon black/white.
+    """
+    # Punch up midtones so the face does not wash out at 22pt.
+    g = ImageOps.autocontrast(gray, cutoff=1)
+    g = ImageEnhance.Contrast(g).enhance(1.25)
+    g = ImageEnhance.Brightness(g).enhance(1.05)
+
+    # Floor keeps dark regions (eyes/hair tips) faintly present instead of
+    # vanishing into transparent holes; ceiling keeps highlights solid.
+    def map_px(p: int) -> int:
+        # 28..255 — always a bit of ink inside the circle
+        return 28 + (p * 227) // 255
+
+    return g.point(map_px)
+
+
+def main() -> None:
+    src = _center_square(_load_source()).resize((S, S), Image.Resampling.LANCZOS)
+    alpha = _portrait_alpha(src.convert("L"))
+    alpha = Image.composite(alpha, Image.new("L", (S, S), 0), _circular_mask(S))
+
+    zero = Image.new("L", (S, S), 0)
     img = Image.merge("RGBA", (zero, zero, zero, alpha)).resize(
-        (W_LOGICAL, H_LOGICAL), Image.LANCZOS
+        (SIZE, SIZE), Image.Resampling.LANCZOS
     )
 
-    out = Path(__file__).parent / "tray-icon-template.png"
-    img.save(out)
-    print(f"wrote {out} {img.size}")
+    img.save(OUT, optimize=True)
+    a = img.getchannel("A")
+    nz = sum(1 for p in a.get_flattened_data() if p > 0)
+    print(f"wrote {OUT} {img.size} nonzero_alpha={nz}/{SIZE * SIZE}")
 
 
 if __name__ == "__main__":

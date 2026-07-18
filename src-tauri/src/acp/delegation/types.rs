@@ -12,9 +12,31 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::models::AgentType;
+
+/// Soft-watchdog health for a **running** Broker task only. Terminal tasks
+/// have no observation. Observe-only — never a lifecycle / terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskObservation {
+    Active,
+    Stalled,
+    WaitingInput,
+}
+
+/// Snapshot published by the soft supervisor when observation or timestamps
+/// change. `stalled_since` is `last_agent_activity_at + threshold` (not scan time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationSnapshot {
+    pub observation: TaskObservation,
+    pub last_agent_activity_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
+}
 
 /// Per-agent defaults applied when codeg-mcp spawns a subagent on behalf of a
 /// `delegate_to_agent` call. Mirrors the two knobs `ConnectionManager::spawn_agent`
@@ -56,6 +78,25 @@ pub struct DelegationProfile {
 pub struct DelegationProfileDocument {
     #[serde(default)]
     pub profiles: Vec<DelegationProfile>,
+}
+
+/// Revisioned snapshot of profiles + effective enabled flag for mention /
+/// reference-search bootstrap. Profile setter inputs remain
+/// [`DelegationProfileDocument`]; this is the read/event wire type only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationProfileCatalog {
+    #[serde(default)]
+    pub profiles: Vec<DelegationProfile>,
+    pub delegation_enabled: bool,
+    pub revision: u64,
+}
+
+/// Result of a catalog-affecting mutation: the field-specific value plus the
+/// post-commit catalog snapshot (including the advanced revision).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationMutation<T> {
+    pub value: T,
+    pub catalog: DelegationProfileCatalog,
 }
 
 /// Everything the broker needs to dispatch a single delegation call.
@@ -236,10 +277,7 @@ pub fn extract_mandatory_profile_ids(text: &str) -> Vec<String> {
             continue;
         };
         let token = after[..token_end].trim();
-        let path = token
-            .split([' ', '"', '\''])
-            .next()
-            .unwrap_or("");
+        let path = token.split([' ', '"', '\'']).next().unwrap_or("");
         let candidate = path.rsplit_once('/').map(|(_, id)| id).unwrap_or(path);
         if let Some(id) = uuid(candidate) {
             out.insert(id);
@@ -348,6 +386,10 @@ pub enum TaskStatus {
 /// Fields are all optional except `status` so one type can describe a running
 /// ack (ids + `Running`), a completed result (`text` + `duration_ms`), a
 /// failure (`error_code` + `message`), and a setup failure (`task_id: None`).
+///
+/// Soft-watchdog fields (`observation`, `last_agent_activity_at`,
+/// `stalled_since`) appear **only** on `Running` reports when the supervisor
+/// has published a snapshot; terminal and unknown reports omit them on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationTaskReport {
     /// Broker `call_id` (UUID) identifying the task. `None` only when setup
@@ -373,6 +415,148 @@ pub struct DelegationTaskReport {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Soft-watchdog health. Present only on `Running` when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<TaskObservation>,
+    /// Last child agent activity timestamp from the observation cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_activity_at: Option<DateTime<Utc>>,
+    /// Stall start (`last_agent_activity_at + threshold`); only when stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
+}
+
+/// Opt-in Join wait mode for `get_delegation_status`. Absent `return_when` keeps
+/// the legacy snapshot / supervised / any-terminal wait semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationReturnWhen {
+    AllTerminalOrAttention,
+}
+
+/// Why a Join wait returned. Present on every Join-shaped batch; omitted on
+/// legacy `{ "tasks": [...] }` responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationWakeReason {
+    AllTerminal,
+    AttentionRequired,
+    Unavailable,
+}
+
+/// Additive status batch for Join (and a legacy wrapper around task reports).
+/// Legacy callers use [`Self::legacy`] so both Join-only fields stay `None` and
+/// serialize as the exact historical `{ "tasks": [...] }` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationStatusBatch {
+    pub tasks: Vec<DelegationTaskReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_reason: Option<DelegationWakeReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_requests: Option<Vec<crate::acp::delegation::attention::AttentionRequestSummary>>,
+}
+
+impl DelegationStatusBatch {
+    pub fn legacy(tasks: Vec<DelegationTaskReport>) -> Self {
+        Self {
+            tasks,
+            wake_reason: None,
+            attention_requests: None,
+        }
+    }
+
+    pub fn joined(
+        tasks: Vec<DelegationTaskReport>,
+        wake_reason: DelegationWakeReason,
+        attention_requests: Vec<crate::acp::delegation::attention::AttentionRequestSummary>,
+    ) -> Self {
+        Self {
+            tasks,
+            wake_reason: Some(wake_reason),
+            attention_requests: Some(attention_requests),
+        }
+    }
+}
+
+/// Why a parent turn or connection ended while Codeg children may still be live.
+/// Wire-stable snake_case codes; do **not** fold these into generic
+/// [`DelegationError::Canceled`] (`"canceled"`), which collapses all four cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentTurnEndReason {
+    ParentCanceled,
+    ParentTurnFailed,
+    JoinAbandoned,
+    ParentDisconnected,
+}
+
+impl ParentTurnEndReason {
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::ParentCanceled => "parent_canceled",
+            Self::ParentTurnFailed => "parent_turn_failed",
+            Self::JoinAbandoned => "join_abandoned",
+            Self::ParentDisconnected => "parent_disconnected",
+        }
+    }
+
+    pub fn attention_code(self) -> AttentionResolutionCode {
+        match self {
+            Self::ParentCanceled => AttentionResolutionCode::ParentCanceled,
+            Self::ParentTurnFailed => AttentionResolutionCode::ParentTurnFailed,
+            Self::JoinAbandoned => AttentionResolutionCode::JoinAbandoned,
+            Self::ParentDisconnected => AttentionResolutionCode::ParentDisconnected,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ParentCanceled => "parent turn was canceled",
+            Self::ParentTurnFailed => "parent turn failed",
+            Self::JoinAbandoned => "parent ended before joining live children",
+            Self::ParentDisconnected => "parent connection disconnected",
+        }
+    }
+}
+
+/// Result of a child `request_parent_decision` wait (MCP surface later in Task 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ParentDecisionResult {
+    Replied {
+        request_id: String,
+        reply: String,
+    },
+    Closed {
+        request_id: String,
+        resolution_code: AttentionResolutionCode,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+/// Result of a parent `reply_to_delegation` attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DelegationReplyResult {
+    Replied {
+        request_id: String,
+    },
+    Idempotent {
+        request_id: String,
+    },
+    AlreadyResolved {
+        request_id: String,
+        resolution_code: AttentionResolutionCode,
+    },
+    Missing,
+    Unauthorized,
+    Rejected {
+        code: String,
+        message: String,
+    },
 }
 
 impl DelegationOutcome {

@@ -177,6 +177,67 @@ describe("link safety direct opening", () => {
     expect(window.open).not.toHaveBeenCalled()
   })
 
+  it("opens a literal Windows root at the line before its column", async () => {
+    render(<LinkSafetyHarness url="/C:/repo/src/app.ts:12:8" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("C:/repo/src/app.ts", {
+        line: 12,
+      })
+    })
+  })
+
+  it("keeps an encoded POSIX drive-like prefix rooted", async () => {
+    render(<LinkSafetyHarness url="/C%3A/repo/src/app.ts" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(
+        "/C:/repo/src/app.ts",
+        { line: undefined }
+      )
+    })
+  })
+
+  it("keeps an encoded terminal colon and digits in the POSIX filename", async () => {
+    render(<LinkSafetyHarness url="/tmp/report%3A12" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("/tmp/report:12", {
+        line: undefined,
+      })
+    })
+  })
+
+  it("preserves encoded POSIX data in a direct file URI", async () => {
+    render(<LinkSafetyHarness url="file:///C%3A/repo/report%3A12" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("/C:/repo/report:12", {
+        line: undefined,
+      })
+    })
+  })
+
+  it("decodes encoded hash and query characters after location syntax", async () => {
+    render(<LinkSafetyHarness url="/tmp/a%23b%3Fc.ts#L4" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("/tmp/a#b?c.ts", {
+        line: 4,
+      })
+    })
+  })
+
   it("passes ~ paths through for home expansion by the opener", async () => {
     render(<LinkSafetyHarness url="~/.claude/plans/notes.md" />)
 

@@ -37,7 +37,7 @@ tauri-runtime = [
 # `ConnectionManager::insert_test_connection`, parser `with_base_dir`, the
 # `db::test_helpers` module) for integration tests in `tests/*.rs`. Without
 # this feature the items are physically uncompiled in release builds.
-test-utils = []
+test-utils = ["tauri?/devtools"]
 
 [[bin]]
 name = "codeg"
@@ -71,9 +71,11 @@ thiserror = "2"
 dirs = "6"
 if-addrs = "0.13"
 walkdir = "2"
+# Same engine ripgrep uses: walk-time pruning via .gitignore / .ignore / .rgignore.
+ignore = "0.4"
 sacp = "11.0.0"
 sacp-tokio = "11.0.0"
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 futures-lite = "2"
@@ -117,6 +119,7 @@ argon2 = "0.5"
 tempfile = "3"
 minisign-verify = "0.2"
 semver = "1"
+similar = "2.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry", "std"] }
 tracing-appender = "0.2"

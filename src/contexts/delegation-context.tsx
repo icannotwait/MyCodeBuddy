@@ -31,7 +31,7 @@ import {
   useState,
 } from "react"
 
-import type { AgentType, EventEnvelope } from "@/lib/types"
+import type { AgentType, EventEnvelope, TaskObservation } from "@/lib/types"
 import { useAcpActions, useAcpEvent } from "@/contexts/acp-connections-context"
 
 export type DelegationStatus = "running" | "ok" | "err"
@@ -44,6 +44,10 @@ export interface DelegationBinding {
   agentType: AgentType
   status: DelegationStatus
   errorCode?: string
+  /** Soft-watchdog observation for a still-running binding. */
+  observation?: TaskObservation | null
+  lastAgentActivityAt?: string | null
+  stalledSince?: string | null
 }
 
 interface DelegationContextValue {
@@ -111,7 +115,13 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
           childConnectionId: envelope.child_connection_id,
           childConversationId: envelope.child_conversation_id,
           agentType: envelope.agent_type,
+          // Lifecycle stays running. Observation is non-terminal health only;
+          // live starts default to active; snapshot seeds may carry stalled /
+          // waiting_input from ActiveDelegationState.
           status: "running",
+          observation: envelope.observation ?? "active",
+          lastAgentActivityAt: envelope.last_agent_activity_at ?? null,
+          stalledSince: envelope.stalled_since ?? null,
         }
         setByToolUseId((prev) => {
           const m = new Map(prev)
@@ -131,6 +141,22 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
           parentConnectionId: envelope.parent_connection_id,
           parentToolUseId: envelope.parent_tool_use_id,
           agentType: envelope.agent_type,
+        })
+        return
+      }
+      if (envelope.type === "delegation_observation_changed") {
+        setByToolUseId((prev) => {
+          const existing = prev.get(envelope.parent_tool_use_id)
+          // Apply-only: never create a card for an unknown tool use.
+          if (!existing || existing.status !== "running") return prev
+          const m = new Map(prev)
+          m.set(envelope.parent_tool_use_id, {
+            ...existing,
+            observation: envelope.observation,
+            lastAgentActivityAt: envelope.last_agent_activity_at,
+            stalledSince: envelope.stalled_since ?? null,
+          })
+          return m
         })
         return
       }
@@ -155,11 +181,15 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
               ? {
                   ...base,
                   status: "ok",
+                  observation: null,
+                  stalledSince: null,
                 }
               : {
                   ...base,
                   status: "err",
                   errorCode: envelope.result.error_code,
+                  observation: null,
+                  stalledSince: null,
                 }
           const m = new Map(prev)
           m.set(envelope.parent_tool_use_id, updated)

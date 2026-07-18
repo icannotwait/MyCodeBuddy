@@ -225,6 +225,7 @@ impl ChatChannelManager {
         db_conn: DatabaseConnection,
         conn_mgr: ConnectionManager,
         emitter: EventEmitter,
+        runtime_ctx: super::command_dispatcher::ChatCommandRuntimeContext,
     ) {
         // Store broadcaster for status event emission
         *self.inner.broadcaster.lock().await = Some(broadcaster.clone());
@@ -243,7 +244,9 @@ impl ChatChannelManager {
             bridge.clone(),
         );
 
-        // Spawn session event subscriber (ACP event routing to channels)
+        // Spawn session event subscriber (ACP event routing to channels).
+        // Clone the durable app-level emitter so global state patches still
+        // fire after ConnectionManager drops the live connection entry.
         let manager_for_session_events = self.clone_ref();
         super::session_event_subscriber::spawn_session_event_subscriber(
             bus,
@@ -251,6 +254,7 @@ impl ChatChannelManager {
             manager_for_session_events,
             conn_mgr.clone_ref(),
             db_conn.clone(),
+            emitter.clone(),
         );
 
         // Spawn command dispatcher
@@ -264,9 +268,12 @@ impl ChatChannelManager {
                 conn_mgr,
                 emitter,
                 bridge,
+                runtime_ctx,
             );
         } else {
-            tracing::warn!("[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started");
+            tracing::warn!(
+                "[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started"
+            );
         }
 
         // Spawn daily report scheduler
@@ -293,7 +300,9 @@ impl ChatChannelManager {
                     Err(_) => {
                         tracing::warn!(
                             "[ChatChannel] unknown channel type '{}' for '{}' (id={}), skipping",
-                            ch.channel_type, ch.name, ch.id
+                            ch.channel_type,
+                            ch.name,
+                            ch.id
                         );
                         continue;
                     }
@@ -304,7 +313,8 @@ impl ChatChannelManager {
                 Err(e) => {
                     tracing::warn!(
                         "[ChatChannel] invalid config for '{}' (id={}): {e}, skipping",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -315,7 +325,8 @@ impl ChatChannelManager {
                 None => {
                     tracing::warn!(
                         "[ChatChannel] no token found for '{}' (id={}), skipping auto-connect",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -327,7 +338,8 @@ impl ChatChannelManager {
                 Err(e) => {
                     tracing::error!(
                         "[ChatChannel] failed to create backend for '{}' (id={}): {e}",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -339,7 +351,8 @@ impl ChatChannelManager {
             {
                 tracing::error!(
                     "[ChatChannel] failed to auto-connect '{}' (id={}): {e}",
-                    ch.name, ch.id
+                    ch.name,
+                    ch.id
                 );
             } else {
                 tracing::info!("[ChatChannel] auto-connected '{}' (id={})", ch.name, ch.id);

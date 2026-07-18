@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::AgentType;
 use super::message::{MessageTurn, TurnUsage};
-use crate::db::entities::conversation::ConversationKind;
+use crate::acp::delegation::route::DelegationRoutePolicy;
+use crate::db::entities::conversation::{ConversationKind, DelegationTaskStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
@@ -33,8 +34,12 @@ pub struct DbConversationSummary {
     /// Mirror of `conversation.title_locked`: the user renamed this row by hand,
     /// so the auto-title backfill must leave it alone.
     pub title_locked: bool,
+    /// Mirror of `conversation.auto_title_finalized`: automatic title generation
+    /// has finished for this conversation (success or permanent failure).
+    pub auto_title_finalized: bool,
     pub agent_type: AgentType,
     pub status: String,
+    pub awaiting_reply_token: Option<String>,
     /// Mirrors `conversation.kind` — drives sidebar visibility/grouping
     /// (serialized as "regular" | "chat" | "loop" | "delegate").
     pub kind: ConversationKind,
@@ -62,6 +67,32 @@ pub struct DbConversationSummary {
     pub parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_call_id: Option<String>,
+    /// Root-only managed-agent route override. Always serialized so cold-load
+    /// clients see `null` rather than an absent field.
+    pub delegation_route_override: Option<DelegationRoutePolicy>,
+    /// Durable Broker task status for delegate rows. Independent of `status`.
+    pub delegation_task_status: Option<DelegationTaskStatus>,
+    pub delegation_error_code: Option<String>,
+    pub delegation_started_at: Option<DateTime<Utc>>,
+    pub delegation_finished_at: Option<DateTime<Utc>>,
+    /// Typed projection of durable runtime rollup columns. Absent for
+    /// historical/non-delegate rows and for rows that fail invariant decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_runtime_stats:
+        Option<crate::acp::delegation::runtime_stats::DelegationRuntimeStats>,
+    /// Open parent-decision attention for this delegate task, if any.
+    /// Filled by a bulk query in conversation_service (never N+1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_attention_request:
+        Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationStatePatch {
+    pub id: i32,
+    pub status: String,
+    pub awaiting_reply_token: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core"
 import { getCurrentEffectiveAppLocale } from "./i18n"
 import type {
+  WorkspaceFileSearchIdentity,
+  WorkspaceFileSearchResult,
+} from "./api"
+import type {
   AgentType,
+  CancelReferenceSearchRequest,
+  ConversationExperienceSettings,
   ConversationSummary,
   ConversationDetail,
   DbConversationDetail,
@@ -36,8 +42,14 @@ import type {
   GitCommitResult,
   GitRemote,
   GitStashEntry,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
   PreflightResult,
   FolderCommand,
+  ReferenceCandidateValidation,
+  ReferenceRegexMatch,
+  ReferenceSearchPage,
+  StartReferenceSearchRequest,
   TerminalInfo,
   PromptInputBlock,
   FileTreeNode,
@@ -45,6 +57,7 @@ import type {
   FilePreviewContent,
   FileEditContent,
   FileSaveResult,
+  ValidateReferenceCandidateRequest,
   WorkspaceSnapshotResponse,
   GitLogResult,
   AvailableTerminalShells,
@@ -63,6 +76,7 @@ import type {
   McpMarketplaceProvider,
   McpMarketplaceItem,
   McpMarketplaceServerDetail,
+  DelegationProfileCatalog,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -114,9 +128,24 @@ export async function acpConnect(
 
 export async function acpPrompt(
   connectionId: string,
-  blocks: PromptInputBlock[]
+  blocks: PromptInputBlock[],
+  folderId: number | null = null,
+  conversationId: number | null = null,
+  clientMessageId: string | null = null,
+  context: { visibleText: string | null; locale: string | null } = {
+    visibleText: null,
+    locale: null,
+  }
 ): Promise<void> {
-  return invoke("acp_prompt", { connectionId, blocks })
+  return invoke("acp_prompt", {
+    connectionId,
+    blocks,
+    folderId,
+    conversationId,
+    clientMessageId,
+    visibleText: context.visibleText,
+    locale: context.locale,
+  })
 }
 
 export async function acpSetMode(
@@ -1073,9 +1102,73 @@ export async function listDirectoryEntries(
 
 export async function getFileTree(
   path: string,
-  maxDepth?: number
+  maxDepth?: number,
+  includeIgnored = false
 ): Promise<FileTreeNode[]> {
-  return invoke("get_file_tree", { path, maxDepth: maxDepth ?? null })
+  return invoke("get_file_tree", {
+    path,
+    maxDepth: maxDepth ?? null,
+    includeIgnored,
+  })
+}
+
+export async function searchWorkspaceFiles(
+  path: string,
+  query = "",
+  limit = 50,
+  identity?: WorkspaceFileSearchIdentity
+): Promise<WorkspaceFileSearchResult> {
+  return invoke("search_workspace_files", {
+    path,
+    query,
+    limit,
+    searchSessionId: identity?.searchSessionId ?? null,
+    requestId: identity?.requestId ?? null,
+  })
+}
+
+export async function cancelWorkspaceFileSearch(
+  identity: WorkspaceFileSearchIdentity
+): Promise<boolean> {
+  return invoke("cancel_workspace_file_search", { ...identity })
+}
+
+// ─── Incremental reference search (flat protocol payloads) ──────────────────
+
+export async function startReferenceSearch(
+  request: StartReferenceSearchRequest
+): Promise<ReferenceSearchPage> {
+  return invoke("start_reference_search", { ...request })
+}
+
+export async function nextReferenceSearchPage(
+  request: NextReferenceSearchPageRequest
+): Promise<ReferenceSearchPage> {
+  return invoke("next_reference_search_page", { ...request })
+}
+
+export async function cancelReferenceSearch(
+  request: CancelReferenceSearchRequest
+): Promise<boolean> {
+  return invoke("cancel_reference_search", { ...request })
+}
+
+export async function validateReferenceCandidate(
+  request: ValidateReferenceCandidateRequest
+): Promise<ReferenceCandidateValidation> {
+  return invoke("validate_reference_candidate", { ...request })
+}
+
+export async function matchReferenceRegex(
+  request: MatchReferenceRegexRequest
+): Promise<ReferenceRegexMatch[]> {
+  return invoke("match_reference_regex", { ...request })
+}
+
+export async function setReferenceSearchLimit(
+  limit: number
+): Promise<ConversationExperienceSettings> {
+  return invoke("set_reference_search_limit", { limit })
 }
 
 export async function startWorkspaceStateStream(
@@ -1235,4 +1328,9 @@ export async function terminalKill(terminalId: string): Promise<void> {
 
 export async function terminalList(): Promise<TerminalInfo[]> {
   return invoke("terminal_list")
+}
+
+/** Desktop invoke facade for the revisioned delegation profile catalog. */
+export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
+  return invoke("get_delegation_profile_catalog")
 }

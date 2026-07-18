@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::models::system::AppLocale;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Lang {
@@ -18,19 +20,41 @@ pub enum Lang {
 
 impl Lang {
     pub fn from_str_lossy(s: &str) -> Self {
+        Self::parse_strict(s).unwrap_or(Lang::En)
+    }
+
+    /// Strict channel-language parse. Unknown values return `None` so callers
+    /// can fall back to system language instead of silently defaulting to En.
+    pub fn parse_strict(s: &str) -> Option<Self> {
         match s {
-            "en" => Lang::En,
-            "zh-cn" | "zh-CN" | "zh_CN" => Lang::ZhCn,
-            "zh-tw" | "zh-TW" | "zh_TW" => Lang::ZhTw,
-            "ja" => Lang::Ja,
-            "ko" => Lang::Ko,
-            "es" => Lang::Es,
-            "de" => Lang::De,
-            "fr" => Lang::Fr,
-            "pt" => Lang::Pt,
-            "ar" => Lang::Ar,
-            _ => Lang::En,
+            "en" => Some(Lang::En),
+            "zh-cn" | "zh-CN" | "zh_CN" => Some(Lang::ZhCn),
+            "zh-tw" | "zh-TW" | "zh_TW" => Some(Lang::ZhTw),
+            "ja" => Some(Lang::Ja),
+            "ko" => Some(Lang::Ko),
+            "es" => Some(Lang::Es),
+            "de" => Some(Lang::De),
+            "fr" => Some(Lang::Fr),
+            "pt" => Some(Lang::Pt),
+            "ar" => Some(Lang::Ar),
+            _ => None,
         }
+    }
+}
+
+/// Exhaustive conversion from chat-channel [`Lang`] to system [`AppLocale`].
+pub fn lang_to_app_locale(lang: Lang) -> AppLocale {
+    match lang {
+        Lang::En => AppLocale::En,
+        Lang::ZhCn => AppLocale::ZhCn,
+        Lang::ZhTw => AppLocale::ZhTw,
+        Lang::Ja => AppLocale::Ja,
+        Lang::Ko => AppLocale::Ko,
+        Lang::Es => AppLocale::Es,
+        Lang::De => AppLocale::De,
+        Lang::Fr => AppLocale::Fr,
+        Lang::Pt => AppLocale::Pt,
+        Lang::Ar => AppLocale::Ar,
     }
 }
 
@@ -175,16 +199,18 @@ pub fn permission_request_title(lang: Lang) -> &'static str {
 
 pub fn permission_request_body(lang: Lang) -> &'static str {
     match lang {
-        Lang::ZhCn => "智能体正在请求权限，请在 Codeg 中查看并批准。",
-        Lang::ZhTw => "智慧代理正在請求權限，請在 Codeg 中查看並批准。",
-        Lang::Ja => "エージェントが権限を要求しています。Codeg で確認して承認してください。",
-        Lang::Ko => "에이전트가 권한을 요청하고 있습니다. Codeg에서 확인하고 승인하세요.",
-        Lang::Es => "Un agente solicita permiso. Revísalo y apruébalo en Codeg.",
-        Lang::De => "Ein Agent fordert eine Berechtigung an. Bitte in Codeg prüfen und genehmigen.",
-        Lang::Fr => "Un agent demande une autorisation. Vérifiez-la et approuvez-la dans Codeg.",
-        Lang::Pt => "Um agente está solicitando permissão. Revise e aprove no Codeg.",
-        Lang::Ar => "يطلب أحد الوكلاء إذنًا. يرجى مراجعته والموافقة عليه في Codeg.",
-        Lang::En => "An agent is requesting permission. Review and approve it in Codeg.",
+        Lang::ZhCn => "智能体正在请求权限，请在 DrawCode 中查看并批准。",
+        Lang::ZhTw => "智慧代理正在請求權限，請在 DrawCode 中查看並批准。",
+        Lang::Ja => "エージェントが権限を要求しています。DrawCode で確認して承認してください。",
+        Lang::Ko => "에이전트가 권한을 요청하고 있습니다. DrawCode에서 확인하고 승인하세요.",
+        Lang::Es => "Un agente solicita permiso. Revísalo y apruébalo en DrawCode.",
+        Lang::De => {
+            "Ein Agent fordert eine Berechtigung an. Bitte in DrawCode prüfen und genehmigen."
+        }
+        Lang::Fr => "Un agent demande une autorisation. Vérifiez-la et approuvez-la dans DrawCode.",
+        Lang::Pt => "Um agente está solicitando permissão. Revise e aprove no DrawCode.",
+        Lang::Ar => "يطلب أحد الوكلاء إذنًا. يرجى مراجعته والموافقة عليه في DrawCode.",
+        Lang::En => "An agent is requesting permission. Review and approve it in DrawCode.",
     }
 }
 
@@ -239,16 +265,16 @@ pub fn question_request_title(lang: Lang) -> &'static str {
 
 pub fn question_request_body(lang: Lang) -> &'static str {
     match lang {
-        Lang::ZhCn => "智能体正在向你提问，请在 Codeg 中回答。",
-        Lang::ZhTw => "智慧代理正在向你提問，請在 Codeg 中回答。",
-        Lang::Ja => "エージェントが質問しています。Codeg で回答してください。",
-        Lang::Ko => "에이전트가 질문하고 있습니다. Codeg에서 답변하세요.",
-        Lang::Es => "Un agente te hace una pregunta. Respóndela en Codeg.",
-        Lang::De => "Ein Agent stellt eine Frage. Bitte in Codeg beantworten.",
-        Lang::Fr => "Un agent vous pose une question. Répondez-y dans Codeg.",
-        Lang::Pt => "Um agente está fazendo uma pergunta. Responda no Codeg.",
-        Lang::Ar => "يطرح أحد الوكلاء سؤالاً. يرجى الإجابة عليه في Codeg.",
-        Lang::En => "An agent is asking a question. Answer it in Codeg.",
+        Lang::ZhCn => "智能体正在向你提问，请在 DrawCode 中回答。",
+        Lang::ZhTw => "智慧代理正在向你提問，請在 DrawCode 中回答。",
+        Lang::Ja => "エージェントが質問しています。DrawCode で回答してください。",
+        Lang::Ko => "에이전트가 질문하고 있습니다. DrawCode에서 답변하세요.",
+        Lang::Es => "Un agente te hace una pregunta. Respóndela en DrawCode.",
+        Lang::De => "Ein Agent stellt eine Frage. Bitte in DrawCode beantworten.",
+        Lang::Fr => "Un agent vous pose une question. Répondez-y dans DrawCode.",
+        Lang::Pt => "Um agente está fazendo uma pergunta. Responda no DrawCode.",
+        Lang::Ar => "يطرح أحد الوكلاء سؤالاً. يرجى الإجابة عليه في DrawCode.",
+        Lang::En => "An agent is asking a question. Answer it in DrawCode.",
     }
 }
 
@@ -556,16 +582,16 @@ pub fn channel_status_title(lang: Lang) -> &'static str {
 
 pub fn help_title(lang: Lang) -> &'static str {
     match lang {
-        Lang::ZhCn => "Codeg Bot 帮助",
-        Lang::ZhTw => "Codeg Bot 幫助",
-        Lang::Ja => "Codeg Bot ヘルプ",
-        Lang::Ko => "Codeg Bot 도움말",
-        Lang::Es => "Ayuda de Codeg Bot",
-        Lang::De => "Codeg Bot Hilfe",
-        Lang::Fr => "Aide Codeg Bot",
-        Lang::Pt => "Ajuda do Codeg Bot",
-        Lang::Ar => "مساعدة Codeg Bot",
-        Lang::En => "Codeg Bot Help",
+        Lang::ZhCn => "DrawCode Bot 帮助",
+        Lang::ZhTw => "DrawCode Bot 幫助",
+        Lang::Ja => "DrawCode Bot ヘルプ",
+        Lang::Ko => "DrawCode Bot 도움말",
+        Lang::Es => "Ayuda de DrawCode Bot",
+        Lang::De => "DrawCode Bot Hilfe",
+        Lang::Fr => "Aide DrawCode Bot",
+        Lang::Pt => "Ajuda do DrawCode Bot",
+        Lang::Ar => "مساعدة DrawCode Bot",
+        Lang::En => "DrawCode Bot Help",
     }
 }
 

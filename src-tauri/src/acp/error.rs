@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::acp::delegation::route::RouteDegradedReason;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::terminal::shell::ShellResolveError;
 
@@ -23,6 +24,12 @@ pub enum AcpError {
         display_name: String,
         executable: String,
     },
+    /// Managed Codeg route could not be established (child never falls back).
+    #[error("delegation route unavailable: {reason:?}")]
+    RouteUnavailable { reason: RouteDegradedReason },
+    /// Session-id reuse found an existing connection with an incompatible route.
+    #[error("session route conflict with connection {existing_connection_id}")]
+    SessionRouteConflict { existing_connection_id: String },
     #[error("agent process exited unexpectedly")]
     ProcessExited,
     /// A prompt arrived while this connection already had a turn in flight.
@@ -100,13 +107,15 @@ impl AcpError {
             Self::ConnectionNotFound(_) => Some("connection_not_found"),
             Self::TerminalShellUnavailable { .. } => Some("terminal_shell_unavailable"),
             Self::TerminalShellUnsupported { .. } => Some("terminal_shell_unsupported"),
+            Self::RouteUnavailable { .. } => Some("route_unavailable"),
+            Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
             Self::Protocol(_) => None,
         }
     }
 
-    /// Structured wire payload for shell preflight failures only.
+    /// Structured wire payload for shell preflight and route boundary failures.
     ///
-    /// Non-shell variants return `None` so Tauri serialization stays a bare
+    /// Other variants return `None` so Tauri serialization stays a bare
     /// legacy string (preserving SdkNotInstalled substring matching, etc.).
     pub(crate) fn shell_command_error(&self) -> Option<AppCommandError> {
         match self {
@@ -137,6 +146,22 @@ impl AcpError {
                     "backendErrors.terminalShellUnsupported",
                     BTreeMap::from([("shell".into(), display_name.clone())]),
                 ),
+            ),
+            AcpError::RouteUnavailable { reason } => Some(
+                AppCommandError::new(
+                    AppErrorCode::RouteUnavailable,
+                    "Delegation route unavailable",
+                )
+                .with_detail(format!("{reason:?}")),
+            ),
+            AcpError::SessionRouteConflict {
+                existing_connection_id,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::SessionRouteConflict,
+                    "Session route conflict with an existing connection",
+                )
+                .with_detail(existing_connection_id.clone()),
             ),
             _ => None,
         }
@@ -234,10 +259,7 @@ mod tests {
         };
         let value = serde_json::to_value(&unsupported).expect("serialize");
         assert_eq!(value["code"], "terminal_shell_unsupported");
-        assert_eq!(
-            value["i18n_key"],
-            "backendErrors.terminalShellUnsupported"
-        );
+        assert_eq!(value["i18n_key"], "backendErrors.terminalShellUnsupported");
     }
 
     #[test]

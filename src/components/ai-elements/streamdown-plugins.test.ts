@@ -49,8 +49,10 @@ vi.mock("@streamdown/mermaid", () => ({
 }))
 
 import {
+  __getStreamdownPluginDebugStateForTest,
   __resetStreamdownPluginsForTest,
   detectHeavyPlugins,
+  policyFor,
   prefetchHeavyPlugins,
   useStreamdownPlugins,
 } from "./streamdown-plugins"
@@ -61,6 +63,8 @@ afterEach(() => {
   mocks.supportsLanguage.mockClear()
   mocks.createMathPlugin.mockClear()
   mocks.supportsLanguage.mockReturnValue(true)
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe("detectHeavyPlugins", () => {
@@ -185,6 +189,8 @@ describe("useStreamdownPlugins", () => {
     const { result } = renderHook(() => useStreamdownPlugins("```\nx\n```"))
     await waitFor(() => expect(result.current.code).toBeDefined())
 
+    vi.useFakeTimers()
+    vi.stubGlobal("requestIdleCallback", undefined)
     mocks.supportsLanguage.mockReturnValue(false)
     result.current.code?.highlight(
       {
@@ -195,10 +201,59 @@ describe("useStreamdownPlugins", () => {
       undefined
     )
 
+    // Idle-deferred: underlying highlight has not run yet.
+    expect(mocks.highlight).not.toHaveBeenCalled()
+    await act(async () => {
+      vi.advanceTimersByTime(1_000)
+    })
     expect(mocks.highlight).toHaveBeenCalledWith(
       expect.objectContaining({ language: "text" }),
-      undefined
+      expect.any(Function)
     )
+  })
+
+  it("defers code highlight to idle and shares one pending job per key", async () => {
+    const { result } = renderHook(() => useStreamdownPlugins("```\nx\n```"))
+    await waitFor(() => expect(result.current.code).toBeDefined())
+
+    vi.useFakeTimers()
+    vi.stubGlobal("requestIdleCallback", undefined)
+    const callbackA = vi.fn()
+    const callbackB = vi.fn()
+    const options = {
+      code: "shared",
+      language: "ts" as never,
+      themes: ["light", "dark"] as never,
+    }
+    expect(result.current.code?.highlight(options, callbackA)).toBeNull()
+    expect(result.current.code?.highlight(options, callbackB)).toBeNull()
+    expect(mocks.highlight).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000)
+    })
+    expect(mocks.highlight).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not ensure engines denied by policy", async () => {
+    const { result } = renderHook(() =>
+      useStreamdownPlugins("```mermaid\ngraph TD\n```\n$x$", {
+        code: "disabled",
+        math: false,
+        mermaid: false,
+      })
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(result.current.code).toBeUndefined()
+    expect(result.current.math).toBeUndefined()
+    expect(result.current.mermaid).toBeUndefined()
+    expect(__getStreamdownPluginDebugStateForTest().requests).toEqual({
+      code: 0,
+      math: 0,
+      mermaid: 0,
+    })
   })
 
   it("serves an already-loaded engine synchronously to a later consumer (no flash)", async () => {
@@ -246,5 +301,25 @@ describe("useStreamdownPlugins", () => {
     const ref = result.current
     rerender({ text: "hello world" })
     expect(result.current).toBe(ref)
+  })
+})
+
+describe("policyFor", () => {
+  it("disables Mermaid for sealed streaming and gates completed Mermaid on viewport", () => {
+    expect(policyFor("sealed-streaming", true)).toEqual({
+      code: "idle",
+      math: true,
+      mermaid: false,
+    })
+    expect(policyFor("complete", false)).toEqual({
+      code: "idle",
+      math: true,
+      mermaid: false,
+    })
+    expect(policyFor("complete", true)).toEqual({
+      code: "idle",
+      math: true,
+      mermaid: true,
+    })
   })
 })

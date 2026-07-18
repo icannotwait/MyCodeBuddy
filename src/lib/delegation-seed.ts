@@ -34,6 +34,11 @@ export function buildDelegationSeedEnvelopes(
       child_connection_id: d.child_connection_id,
       child_conversation_id: d.child_conversation_id,
       agent_type: d.agent_type,
+      // Snapshot re-seed: carry soft-watchdog health so reattach does not
+      // hardcode every running card to Active. Live starts omit these fields.
+      observation: d.observation ?? "active",
+      last_agent_activity_at: d.last_agent_activity_at ?? null,
+      stalled_since: d.stalled_since ?? null,
     })
   }
   return out

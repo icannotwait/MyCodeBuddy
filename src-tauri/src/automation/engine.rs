@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+use sea_orm::EntityTrait;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -26,13 +26,16 @@ use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use crate::acp::InternalEventBus;
 use crate::commands::acp::verify_agent_installed;
-use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
+use crate::commands::conversations::{
+    create_conversation_core, emit_conversation_state, emit_conversation_upsert,
+};
 use crate::commands::folders::{
     emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
     git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::service::automation_service;
+use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::{
     AgentType, AutomationConfig, AutomationInfo, AutomationRunStatus, IsolationMode,
@@ -70,6 +73,9 @@ pub struct AutomationEngine {
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    /// Shared live delegation runtime (enabled / route_policy / stall).
+    /// Row-less automation roots resolve routes from `runtime.snapshot()`.
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
     /// Live automation runs: `connection_id -> (run_id, automation_id)`. The only
     /// way `TurnComplete` (keyed by connection_id) maps back to a run. Lost on
     /// restart — which is why boot reconcile + the conversation-status backstop
@@ -115,6 +121,7 @@ pub fn build_engine(
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
     data_dir: PathBuf,
+    runtime: crate::commands::delegation::DelegationRuntimeSettings,
 ) -> Option<Arc<AutomationEngine>> {
     let engine_lock = match acquire_engine_ownership(&data_dir) {
         Ownership::Exclusive(file) => file,
@@ -141,6 +148,7 @@ pub fn build_engine(
         emitter,
         bus,
         data_dir,
+        runtime,
         index: Arc::new(Mutex::new(HashMap::new())),
         automation_locks: Arc::new(Mutex::new(HashMap::new())),
         root_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -222,7 +230,9 @@ pub async fn run_automation_engine(engine: Arc<AutomationEngine>) {
     // holding the exclusive data-dir lock (see `build_engine`), so a process
     // sharing the data dir never reaches this point against another's live runs.
     match automation_service::boot_reconcile_interrupted(&engine.db.conn).await {
-        Ok(n) if n > 0 => tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)"),
+        Ok(n) if n > 0 => {
+            tracing::info!("[automation] boot reconcile failed {n} interrupted run(s)")
+        }
         Ok(_) => {}
         Err(e) => tracing::warn!("[automation] boot reconcile error: {e}"),
     }
@@ -309,16 +319,21 @@ impl AutomationEngine {
             .await
             .map_err(|e| e.to_string())?
         {
-            let _ =
-                automation_service::record_skipped_run(&self.db.conn, automation_id, trigger, scheduled_for)
-                    .await;
+            let _ = automation_service::record_skipped_run(
+                &self.db.conn,
+                automation_id,
+                trigger,
+                scheduled_for,
+            )
+            .await;
             self.emit(AutomationChange::Upsert { id: automation_id });
             return Err("previous run still active".to_string());
         }
 
-        let run = automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
-            .await
-            .map_err(|e| e.to_string())?;
+        let run =
+            automation_service::start_run(&self.db.conn, automation_id, trigger, scheduled_for)
+                .await
+                .map_err(|e| e.to_string())?;
         // Broadcast the running row immediately so every client sees it the
         // instant it exists — `launch` can take seconds (worktree add + agent
         // spawn) before it re-emits RunStarted with the live "View conversation"
@@ -386,11 +401,15 @@ impl AutomationEngine {
 
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
+        // Automation is a row-less root: resolve against the shared live runtime.
+        let runtime = self.runtime.snapshot();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
             &self.data_dir,
+            crate::acp::terminal_context::AcpRouteRequest::root(None, None),
+            &runtime,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -427,6 +446,9 @@ impl AutomationEngine {
         }
 
         // Fresh connection (session_id=None), owner-labelled "automation".
+        // System language + display_text capture for title admission.
+        let (launch_context, capture) =
+            automation_root_title_admission(&self.db.conn, &cfg.display_text).await;
         let conn_id = self
             .manager
             .spawn_agent(
@@ -438,21 +460,28 @@ impl AutomationEngine {
                 self.emitter.clone(),
                 cfg.mode_id.clone(),
                 cfg.config_values.clone(),
+                launch_context,
             )
             .await
             .map_err(|e| e.to_string())?;
 
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
-        let conversation_id =
-            match create_conversation_core(&self.db.conn, cwd.folder_id, agent_type, Some(title)).await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    let _ = self.manager.disconnect(&conn_id).await;
-                    return Err(e.to_string());
-                }
-            };
+        let conversation_id = match create_conversation_core(
+            &self.db.conn,
+            cwd.folder_id,
+            agent_type,
+            Some(title),
+            None,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.manager.disconnect(&conn_id).await;
+                return Err(e.to_string());
+            }
+        };
 
         // Surface the produced conversation in every client's sidebar the instant
         // it exists (InProgress) — independent of the implicit upsert inside
@@ -502,14 +531,13 @@ impl AutomationEngine {
 
         match self
             .manager
-            .send_prompt_linked_with_message_id(
+            .send_prompt_linked_background(
                 &self.db,
                 &conn_id,
                 blocks,
                 Some(cwd.folder_id),
                 Some(conversation_id),
-                None,
-                None,
+                capture,
             )
             .await
         {
@@ -933,17 +961,25 @@ impl AutomationEngine {
     /// Flip a produced conversation to a terminal status — used when a launch
     /// fails after the row was created `InProgress`, so it isn't left stranded.
     async fn cancel_conversation(&self, conversation_id: i32) {
-        if let Ok(Some(row)) = conversation::Entity::find_by_id(conversation_id)
-            .one(&self.db.conn)
-            .await
+        // Route through the service so a rare automation-launch cancel also
+        // clears any stale awaiting_reply_token atomically with the status write.
+        // Emit the returned backend patch on conversation://changed (no
+        // synthesized timestamp/token; no full-summary upsert needed for a
+        // pure status flip).
+        match conversation_service::update_status_with_patch(
+            &self.db.conn,
+            conversation_id,
+            ConversationStatus::Cancelled,
+        )
+        .await
         {
-            let mut active = row.into_active_model();
-            active.status = Set(ConversationStatus::Cancelled);
-            if active.update(&self.db.conn).await.is_ok() {
-                // The create-time upsert announced this row as InProgress; converge
-                // every sidebar to the terminal status (this direct flip emits no
-                // ConversationStatusChanged of its own).
-                emit_conversation_upsert(&self.emitter, &self.db.conn, conversation_id).await;
+            Ok(patch) => {
+                emit_conversation_state(&self.emitter, patch);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[automation] failed to cancel conversation {conversation_id}: {e}"
+                );
             }
         }
     }
@@ -988,6 +1024,25 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Title-admission inputs for automation roots: system-language User launch
+/// context plus authoritative `display_text` capture (locale inherits from the
+/// connection). Shared by production `launch` and its focused behavior test.
+async fn automation_root_title_admission(
+    conn: &sea_orm::DatabaseConnection,
+    display_text: &str,
+) -> (
+    crate::auto_title::ConnectionLaunchContext,
+    Option<crate::auto_title::PromptCaptureContext>,
+) {
+    (
+        crate::auto_title::user_launch_context_from_db(conn).await,
+        Some(crate::auto_title::PromptCaptureContext::new(
+            Some(display_text.to_string()),
+            None,
+        )),
+    )
+}
+
 fn basename(path: &str) -> &str {
     path.trim_end_matches('/')
         .rsplit('/')
@@ -1012,6 +1067,158 @@ fn short_suffix(run_id: i32) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn automation_root_creation_enrolls_auto_title() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::models::agent::AgentType;
+
+        // Automation roots go through `create_conversation_core` only — enrollment
+        // must live in the shared create path, not a second call site here.
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder = seed_folder(&db, "/tmp/automation-title-enroll").await;
+
+        let conversation_id = create_conversation_core(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("automation root".into()),
+            None,
+        )
+        .await
+        .expect("create_conversation_core");
+
+        let jobs = auto_title_job::Entity::find_by_id(conversation_id)
+            .all(&db.conn)
+            .await
+            .expect("jobs");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "automation root create must enroll exactly one auto-title job"
+        );
+        let total = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("all jobs");
+        assert_eq!(total.len(), 1);
+    }
+
+    /// Pre-created automation root captures display_text + system locale via
+    /// the same launch/capture helpers production `launch` uses (without
+    /// spawning a real agent CLI).
+    #[tokio::test]
+    async fn automation_root_captures_visible_task_and_system_locale() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::acp::types::PromptInputBlock;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::models::agent::AgentType;
+        use crate::models::system::{AppLocale, LanguageMode, SystemLanguageSettings};
+        use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
+        use std::path::PathBuf;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&SystemLanguageSettings {
+                mode: LanguageMode::Manual,
+                language: AppLocale::Ko,
+            })
+            .expect("serialize language"),
+        )
+        .await
+        .expect("persist language");
+
+        let folder_id = seed_folder(&db, "/tmp/automation-title-capture").await;
+        let display_text = "nightly review task".to_string();
+        // Production admission helper — must load system language + capture
+        // display_text (not English default / wire-block fallback).
+        let (launch, capture) = automation_root_title_admission(&db.conn, &display_text).await;
+        assert_eq!(launch.purpose, crate::auto_title::ConnectionPurpose::User);
+        assert_eq!(
+            launch.inherited_locale,
+            Some(AppLocale::Ko),
+            "automation root must inherit persisted system language, not English default"
+        );
+
+        let conversation_id = create_conversation_core(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some(first_chars(&display_text, 80)),
+            None,
+        )
+        .await
+        .expect("create conversation");
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "auto-capture-conn";
+        let mut rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/automation-title-capture")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = launch.purpose;
+            s.effective_locale = launch.inherited_locale.unwrap_or(AppLocale::En);
+            s.conversation_id = Some(conversation_id);
+            s.folder_id = Some(folder_id);
+        }
+
+        mgr.send_prompt_linked_background(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "wire block that differs".into(),
+            }],
+            Some(folder_id),
+            Some(conversation_id),
+            capture,
+        )
+        .await
+        .expect("automation background send");
+        let _ = rx.try_recv();
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("job");
+        assert_eq!(
+            job.first_user_text.as_deref(),
+            Some(display_text.as_str()),
+            "automation must capture display_text, not wire blocks"
+        );
+        assert_eq!(job.locale.as_deref(), Some("ko"));
+    }
+
     #[test]
     fn classify_stop_reason_maps_outcomes() {
         assert_eq!(classify_stop_reason("end_turn").1, "succeeded");
@@ -1025,7 +1232,10 @@ mod tests {
     fn worktree_names_carry_ids() {
         assert_eq!(basename("/home/me/repo"), "repo");
         assert_eq!(basename("/home/me/repo/"), "repo");
-        assert_eq!(sibling_path("/home/me/repo", "repo-automation-3-run-7"), "/home/me/repo-automation-3-run-7");
+        assert_eq!(
+            sibling_path("/home/me/repo", "repo-automation-3-run-7"),
+            "/home/me/repo-automation-3-run-7"
+        );
     }
 
     #[test]

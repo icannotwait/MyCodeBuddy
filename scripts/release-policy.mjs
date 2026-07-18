@@ -192,17 +192,22 @@ export function assertWindowsReleaseWorkflow(workflowText) {
       throw new Error("server release must checkout submodules recursively")
     }
   }
-  if (
-    !/oven-sh\/setup-bun@v2/i.test(desktopJob) ||
-    !/bun-version\s*:\s*1\.3\.14/i.test(desktopJob)
-  ) {
-    throw new Error("desktop release must pin Bun 1.3.14")
+  // Codex ACP ships via npm (`@agentclientprotocol/codex-acp`); desktop
+  // release must not re-introduce a Windows sidecar or its Bun compile pin.
+  if (/oven-sh\/setup-bun@/i.test(desktopJob)) {
+    throw new Error(
+      "desktop release must not install Bun (codex-acp is no longer a sidecar)"
+    )
   }
-  if (!desktopJob.includes("codex-acp-x86_64-pc-windows-msvc.exe")) {
-    throw new Error("desktop release must verify the codex-acp x64 sidecar")
+  if (desktopJob.includes("codex-acp-x86_64-pc-windows-msvc.exe")) {
+    throw new Error(
+      "desktop release must not stage or smoke a codex-acp sidecar"
+    )
   }
   if (policyText.includes("CODEG_SKIP_CODEX_ACP_SIDECAR")) {
-    throw new Error("desktop release must not skip the codex-acp sidecar")
+    throw new Error(
+      "desktop release must not reference CODEG_SKIP_CODEX_ACP_SIDECAR"
+    )
   }
   const targets = releaseTargets(policyText)
   for (const target of WINDOWS_RELEASE_TARGETS) {

@@ -5,16 +5,18 @@
 //! The companion speaks newline-delimited JSON-RPC 2.0 on stdio:
 //! one request → one response per line, with concurrent dispatch so
 //! `notifications/cancelled` can race an in-flight `tools/call`. It exposes up
-//! to six tools — `delegate_to_agent` (async; returns a `task_id` ack),
+//! to eight tools — `delegate_to_agent` (async; returns a `task_id` ack),
 //! `get_delegation_status` (poll/long-poll for the result), `cancel_delegation`,
 //! `check_user_feedback` (pull the user's mid-turn steering notes),
-//! `ask_user_question` (block on a multiple-choice card), and `get_session_info`
-//! (resolve a referenced session by id) — whose schemas are embedded at compile
-//! time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups (delegation
-//! / feedback / ask / sessions). Only `delegate_to_agent` registers a broker-side
-//! cancel handle; canceling a status / cancel / feedback / session round-trip
-//! merely suppresses its response — and for `check_user_feedback` also skips the
-//! delivery commit, so a cancelled note stays pending.
+//! `ask_user_question` (block on a multiple-choice card), `get_session_info`
+//! (resolve a referenced session by id), plus coordination-only
+//! `request_parent_decision` / `reply_to_delegation` — whose schemas are embedded
+//! at compile time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups
+//! (delegation / coordination_v1 / feedback / ask / sessions) and launch role.
+//! Only `delegate_to_agent` registers a broker-side cancel handle; canceling a
+//! status / cancel / feedback / session / decision round-trip merely suppresses
+//! its response — and for `check_user_feedback` also skips the delivery commit,
+//! so a cancelled note stays pending.
 //!
 //! Notifications (id = None) produce no response, matching MCP's expectation
 //! that `notifications/initialized` etc. are fire-and-forget.
@@ -41,13 +43,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
+use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_feedback_round_trip, client_round_trip, client_session_round_trip,
+    client_feedback_round_trip, client_parent_decision_round_trip,
+    client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
     client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerParentDecisionRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
+use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -75,6 +81,22 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
 /// a single embedded copy — no runtime file IO, no version skew with the
 /// broker's [`super::types::DelegationRequest`].
 pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
+
+/// Pre-coordination `delegate_to_agent` description restored when
+/// `coordination_v1` is off so old connections never see Join instructions.
+pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work before collecting results. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.";
+
+/// Pre-coordination `get_delegation_status` description restored when
+/// `coordination_v1` is off (also strips `return_when` from the schema).
+pub const LEGACY_STATUS_DESCRIPTION: &str = "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.";
+
+/// Pre-coordination `wait_ms` parameter description restored when
+/// `coordination_v1` is off so legacy tools/list does not advertise rejection.
+pub const LEGACY_WAIT_MS_DESCRIPTION: &str = "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout.";
+
+pub const COORDINATION_POSITIVE_WAIT_ERROR: &str =
+    "positive wait_ms is unavailable with coordination_v1; retry with \
+     return_when=\"all_terminal_or_attention\" and wait_ms=0";
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -135,6 +157,9 @@ pub fn err(id: Value, code: i64, message: impl Into<String>) -> JsonRpcResponse 
 #[derive(Debug, Clone, Copy)]
 pub struct CompanionFeatures {
     pub delegation: bool,
+    /// Connection-bound Join capability. Only the literal `coordination_v1`
+    /// feature token enables this; omitted `--features` stays legacy.
+    pub coordination_v1: bool,
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
@@ -142,14 +167,14 @@ pub struct CompanionFeatures {
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,feedback,ask,sessions`). Unknown tokens are ignored. An absent
-    /// value (`None`) defaults to delegation-only — backward compatible with a
-    /// parent that predates feature gating (companion + listener ship together, so
-    /// post-upgrade the parent always passes an explicit `--features`).
+    /// `delegation,coordination_v1,feedback,ask,sessions`). Unknown tokens are
+    /// ignored. An absent value (`None`) defaults to delegation-only without
+    /// Join — backward compatible with a parent that predates feature gating.
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(s) = raw else {
             return Self {
                 delegation: true,
+                coordination_v1: false,
                 feedback: false,
                 ask: false,
                 sessions: false,
@@ -157,6 +182,7 @@ impl CompanionFeatures {
         };
         let mut f = Self {
             delegation: false,
+            coordination_v1: false,
             feedback: false,
             ask: false,
             sessions: false,
@@ -164,6 +190,7 @@ impl CompanionFeatures {
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
                 "delegation" => f.delegation = true,
+                "coordination_v1" => f.coordination_v1 = true,
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
@@ -173,8 +200,8 @@ impl CompanionFeatures {
         f
     }
 
-    /// Whether the named MCP tool is exposed under the enabled feature groups.
-    pub fn allows_tool(&self, name: &str) -> bool {
+    /// Whether a pre-coordination MCP tool is exposed under the enabled groups.
+    fn allows_legacy_tool(&self, name: &str) -> bool {
         match name {
             "check_user_feedback" => self.feedback,
             "ask_user_question" => self.ask,
@@ -194,6 +221,25 @@ pub struct CompanionContext {
     pub token: String,
     /// Tool groups this launch exposes (see [`CompanionFeatures`]).
     pub features: CompanionFeatures,
+    /// Immutable launch role (`--role root|delegation_child`).
+    pub role: CompanionRole,
+}
+
+impl CompanionContext {
+    /// Whether the named MCP tool is exposed under this launch's features and
+    /// role. Used independently by `tools/list` and `tools/call` so a disabled
+    /// tool is indistinguishable from an unknown one.
+    pub fn allows_tool(&self, name: &str) -> bool {
+        match name {
+            "request_parent_decision" => {
+                self.features.delegation
+                    && self.features.coordination_v1
+                    && self.role == CompanionRole::DelegationChild
+            }
+            "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
+            other => self.features.allows_legacy_tool(other),
+        }
+    }
 }
 
 /// Per-in-flight-call state. The companion stashes one of these per
@@ -350,17 +396,64 @@ pub async fn dispatch_line(
                 }
             };
             let tools = match all.as_array() {
-                Some(arr) => Value::Array(
-                    arr.iter()
+                Some(arr) => {
+                    let mut filtered: Vec<Value> = arr
+                        .iter()
                         .filter(|t| {
                             t.get("name")
                                 .and_then(|v| v.as_str())
-                                .map(|n| ctx.features.allows_tool(n))
+                                .map(|n| ctx.allows_tool(n))
                                 .unwrap_or(false)
                         })
                         .cloned()
-                        .collect(),
-                ),
+                        .collect();
+                    // Without coordination_v1, restore pre-Join descriptions
+                    // and hide return_when so old connections cannot call Join.
+                    if !ctx.features.coordination_v1 {
+                        for tool in &mut filtered {
+                            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                            match name {
+                                "delegate_to_agent" => {
+                                    if let Some(obj) = tool.as_object_mut() {
+                                        obj.insert(
+                                            "description".into(),
+                                            Value::String(LEGACY_DELEGATE_DESCRIPTION.into()),
+                                        );
+                                    }
+                                }
+                                "get_delegation_status" => {
+                                    if let Some(obj) = tool.as_object_mut() {
+                                        obj.insert(
+                                            "description".into(),
+                                            Value::String(LEGACY_STATUS_DESCRIPTION.into()),
+                                        );
+                                        if let Some(props) = obj
+                                            .get_mut("inputSchema")
+                                            .and_then(|s| s.get_mut("properties"))
+                                            .and_then(Value::as_object_mut)
+                                        {
+                                            props.remove("return_when");
+                                            if let Some(wait_ms) = props
+                                                .get_mut("wait_ms")
+                                                .and_then(Value::as_object_mut)
+                                            {
+                                                wait_ms.remove("maximum");
+                                                wait_ms.insert(
+                                                    "description".into(),
+                                                    Value::String(
+                                                        LEGACY_WAIT_MS_DESCRIPTION.into(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Value::Array(filtered)
+                }
                 None => all,
             };
             LineAction::Respond(ok(id, json!({ "tools": tools })))
@@ -391,7 +484,7 @@ async fn build_tools_call_spawn(
     // tool is rejected uniformly as "unknown tool" — indistinguishable from a
     // genuinely nonexistent one (no leak that the feature exists but is off),
     // and matching the legacy unknown-tool rejection shape.
-    if !ctx.features.allows_tool(&name) {
+    if !ctx.allows_tool(&name) {
         return LineAction::Respond(err(id, -32602, format!("unknown tool: {name}")));
     }
     match name.as_str() {
@@ -446,11 +539,16 @@ async fn build_tools_call_spawn(
                 }
                 Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
             };
-            let wait_ms = arguments.get("wait_ms").and_then(|v| v.as_u64());
+            let (wait_ms, return_when) =
+                match parse_status_wait_arguments(&arguments, ctx.features.coordination_v1) {
+                    Ok(values) => values,
+                    Err(message) => return LineAction::Respond(err(id, -32602, message)),
+                };
             let req = BrokerStatusRequest {
                 token: ctx.token.clone(),
                 task_ids,
                 wait_ms,
+                return_when,
             };
             // No external_handle: canceling a status query only suppresses its
             // response — it must not touch the task itself. The status round-trip
@@ -549,6 +647,60 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+        }
+        "request_parent_decision" => {
+            let args = match parse_parent_decision_args(&arguments) {
+                Ok(args) => args,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            // Internal correlation only — never accepted from LLM arguments.
+            // Prefer MCP `_meta.tool_use_id` when the host provides it; otherwise
+            // the stable JSON-RPC request id for this tools/call lifetime/replay.
+            let child_tool_call_id = params
+                .get("_meta")
+                .and_then(|meta| meta.get("tool_use_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("mcp_request:{}", request_id_key(&id)));
+            let req = BrokerParentDecisionRequest {
+                token: ctx.token.clone(),
+                child_tool_call_id,
+                message: args.message,
+            };
+            // No external_handle: cancel suppresses the response and closes the
+            // socket (listener drops only the waiter) without Broker task cancel.
+            let round_trip =
+                Box::pin(async move { client_parent_decision_round_trip(&socket, &req).await });
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_parent_decision_result,
+            )
+            .await
+        }
+        "reply_to_delegation" => {
+            let args = match parse_reply_args(&arguments) {
+                Ok(args) => args,
+                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
+            };
+            let req = BrokerReplyDelegationRequest {
+                token: ctx.token.clone(),
+                request_id: args.request_id,
+                reply: args.reply,
+            };
+            let round_trip =
+                Box::pin(async move { client_reply_delegation_round_trip(&socket, &req).await });
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_reply_delegation_result,
+            )
+            .await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -869,41 +1021,197 @@ fn timeout_cancel_guidance_report(task_id: &str) -> Value {
     })
 }
 
-/// Render the `get_delegation_status` round-trip outcome (always a
-/// `{ "tasks": [..] }` envelope from the broker) into an MCP `tools/call`
-/// result. EVERY poll renders through [`render_batch_report`] — a single id and
-/// a fan-out take the SAME path — so the shape the LLM and frontend see is
-/// uniform: a `{ "tasks": [..] }` object with one entry per requested id (one
-/// entry for a single id), each carrying its `task_id` + `status`. A bare report
-/// with no `tasks` array (older / unexpected shape) is wrapped as a one-element
-/// batch so the output stays uniform.
+/// Render the `get_delegation_status` round-trip outcome into an MCP
+/// `tools/call` result. Preserves Join fields (`wake_reason`,
+/// `attention_requests`) in both text content and `structuredContent`. Legacy
+/// outcomes without those keys stay a tasks-only envelope.
 pub fn render_status_result(outcome: &Value) -> Value {
-    match outcome.get("tasks").and_then(|v| v.as_array()) {
-        Some(tasks) => render_batch_report(tasks),
-        None => render_batch_report(std::slice::from_ref(outcome)),
+    let tasks = outcome
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![outcome.clone()]);
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("tasks".into(), Value::Array(tasks.clone()));
+    for key in ["wake_reason", "attention_requests"] {
+        if let Some(value) = outcome.get(key) {
+            envelope.insert(key.into(), value.clone());
+        }
     }
+    render_status_envelope(Value::Object(envelope), &tasks)
 }
 
-/// Render a `get_delegation_status` result as a `{ "tasks": [..] }` batch — the
-/// single rendering path for every poll, whether it carries one report or many.
-/// The `content` text is the compact `{ "tasks": [..] }` JSON so hosts that
-/// persist only `CallToolResult.content` text (e.g. Claude Code) can still
-/// recover every task; `structuredContent` carries the same shape for hosts that
-/// keep it. `isError` is set only when EVERY task failed — a coarse signal (a
-/// lone failed task therefore flags `isError`, matching the old single-report
-/// behavior); the frontend derives per-task badges from the structured reports,
-/// not from this flag.
-fn render_batch_report(tasks: &[Value]) -> Value {
+fn render_status_envelope(envelope: Value, tasks: &[Value]) -> Value {
     let all_failed = !tasks.is_empty()
         && tasks
             .iter()
-            .all(|t| t.get("status").and_then(|v| v.as_str()) == Some("failed"));
-    let envelope = json!({ "tasks": tasks });
+            .all(|task| task.get("status").and_then(Value::as_str) == Some("failed"));
     let text = serde_json::to_string(&envelope).unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{"type": "text", "text": text}],
         "isError": all_failed,
         "structuredContent": envelope,
+    })
+}
+
+/// Parse the optional Join `return_when` argument. Absent is legacy; present
+/// requires `coordination_v1`, the literal enum value, and explicit `wait_ms=0`.
+pub fn parse_return_when(
+    arguments: &Value,
+    coordination_v1: bool,
+) -> Result<Option<DelegationReturnWhen>, String> {
+    let Some(raw) = arguments.get("return_when") else {
+        return Ok(None);
+    };
+    if !coordination_v1 {
+        return Err("return_when is unavailable on this connection".into());
+    }
+    if raw.as_str() != Some("all_terminal_or_attention") {
+        return Err("return_when must be all_terminal_or_attention".into());
+    }
+    if arguments.get("wait_ms").and_then(Value::as_u64) != Some(0) {
+        return Err("return_when=all_terminal_or_attention requires explicit wait_ms=0".into());
+    }
+    Ok(Some(DelegationReturnWhen::AllTerminalOrAttention))
+}
+
+fn parse_status_wait_arguments(
+    arguments: &Value,
+    coordination_v1: bool,
+) -> Result<(Option<u64>, Option<DelegationReturnWhen>), String> {
+    let wait_ms = arguments.get("wait_ms").and_then(Value::as_u64);
+    let return_when = parse_return_when(arguments, coordination_v1)?;
+    if coordination_v1 && return_when.is_none() && wait_ms.is_some_and(|ms| ms > 0) {
+        return Err(COORDINATION_POSITIVE_WAIT_ERROR.into());
+    }
+    Ok((wait_ms, return_when))
+}
+
+struct ParentDecisionArgs {
+    message: String,
+}
+
+struct ReplyArgs {
+    request_id: String,
+    reply: String,
+}
+
+fn exact_object<'a>(
+    value: &'a Value,
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "arguments must be an object".to_string())?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("arguments contain unexpected keys".into());
+    }
+    Ok(object)
+}
+
+fn bounded_nonblank(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
+    let value = object
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{key} must be a string"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{key} must not be blank"));
+    }
+    // `str::len` is UTF-8 byte length (same as `as_bytes().len()`).
+    if value.len() > ATTENTION_PAYLOAD_MAX_BYTES {
+        return Err(format!("{key} exceeds 16 KiB UTF-8"));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_parent_decision_args(arguments: &Value) -> Result<ParentDecisionArgs, String> {
+    let object = exact_object(arguments, &["message"])?;
+    Ok(ParentDecisionArgs {
+        message: bounded_nonblank(object, "message")?,
+    })
+}
+
+fn parse_reply_args(arguments: &Value) -> Result<ReplyArgs, String> {
+    let object = exact_object(arguments, &["request_id", "reply"])?;
+    let request_id = object
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "request_id must be a nonblank string".to_string())?
+        .to_string();
+    Ok(ReplyArgs {
+        request_id,
+        reply: bounded_nonblank(object, "reply")?,
+    })
+}
+
+fn render_parent_decision_result(outcome: &Value) -> Value {
+    let status = match outcome.get("status").and_then(Value::as_str) {
+        Some("replied") => "replied",
+        Some("closed") => "closed",
+        _ => "rejected",
+    };
+    let text = match status {
+        "replied" => outcome
+            .get("reply")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "closed" => format!(
+            "Parent decision request closed: {}",
+            outcome
+                .get("resolution_code")
+                .and_then(Value::as_str)
+                .unwrap_or("task_terminal")
+        ),
+        _ => outcome
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Parent decision request was rejected.")
+            .to_string(),
+    };
+    json!({
+        "content": [{"type":"text", "text":text}],
+        "isError": status == "rejected",
+        "structuredContent": outcome,
+    })
+}
+
+fn render_reply_delegation_result(outcome: &Value) -> Value {
+    let status = match outcome.get("status").and_then(Value::as_str) {
+        Some("replied") => "replied",
+        Some("idempotent") => "idempotent",
+        Some("already_resolved") => "already_resolved",
+        Some("missing") => "missing",
+        Some("unauthorized") => "unauthorized",
+        Some("rejected") => "rejected",
+        _ => "rejected",
+    };
+    let text = match status {
+        "replied" => "Reply delivered".to_string(),
+        "idempotent" => "Reply already delivered".to_string(),
+        "already_resolved" => format!(
+            "Request already resolved: {}",
+            outcome
+                .get("resolution_code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        "missing" => "Decision request was not found.".to_string(),
+        "unauthorized" => "Decision request is not owned by this parent.".to_string(),
+        _ => outcome
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Delegation reply was rejected.")
+            .to_string(),
+    };
+    json!({
+        "content": [{"type":"text", "text":text}],
+        "isError": matches!(
+            status,
+            "missing" | "unauthorized" | "already_resolved" | "rejected"
+        ),
+        "structuredContent": outcome,
     })
 }
 
@@ -994,7 +1302,10 @@ pub fn render_ask_result(outcome: &Value) -> Value {
             } else {
                 selected.join(", ")
             };
-            s.push_str(&format!("{}. [{header}] {question}\n   → {joined}\n", i + 1));
+            s.push_str(&format!(
+                "{}. [{header}] {question}\n   → {joined}\n",
+                i + 1
+            ));
         }
         s
     };
@@ -1137,8 +1448,14 @@ fn render_session_summary_text(o: &Value) -> String {
             .get("truncated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let suffix = if truncated { ", older turns omitted" } else { "" };
-        out.push_str(&format!("\nRecent messages ({included}/{total}{suffix}):\n"));
+        let suffix = if truncated {
+            ", older turns omitted"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\nRecent messages ({included}/{total}{suffix}):\n"
+        ));
         if let Some(items) = messages.get("items").and_then(|v| v.as_array()) {
             for item in items {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1198,6 +1515,7 @@ mod tests {
         // keep seeing exactly the three delegation tools.
         ctx_with(CompanionFeatures {
             delegation: true,
+            coordination_v1: false,
             feedback: false,
             ask: false,
             sessions: false,
@@ -1210,6 +1528,7 @@ mod tests {
             socket_path: "/tmp/codeg-mcp-companion-test-nope.sock".into(),
             token: "tok".into(),
             features,
+            role: CompanionRole::Root,
         }
     }
 
@@ -1623,6 +1942,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn coordination_rejects_positive_legacy_status_wait_without_spawning() {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_status",
+                "arguments": { "task_ids": ["task-a"], "wait_ms": 60_000 }
+            }
+        })
+        .to_string();
+
+        let response = unwrap_respond(dispatch_with_features(COORDINATION, &line).await);
+        let error = response.error.expect("positive coordination wait must fail");
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.message,
+            "positive wait_ms is unavailable with coordination_v1; retry with \
+             return_when=\"all_terminal_or_attention\" and wait_ms=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_keeps_supported_status_wait_forms() {
+        for arguments in [
+            json!({ "task_ids": ["task-a"] }),
+            json!({ "task_ids": ["task-a"], "wait_ms": 0 }),
+            json!({
+                "task_ids": ["task-a"],
+                "wait_ms": 0,
+                "return_when": "all_terminal_or_attention"
+            }),
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "tools/call",
+                "params": { "name": "get_delegation_status", "arguments": arguments }
+            })
+            .to_string();
+            assert!(matches!(
+                dispatch_with_features(COORDINATION, &line).await,
+                LineAction::Spawn(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_connection_keeps_positive_status_wait() {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_status",
+                "arguments": { "task_ids": ["task-a"], "wait_ms": 60_000 }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_for_test(&line).await,
+            LineAction::Spawn(_)
+        ));
+    }
+
     #[test]
     fn normalize_status_task_ids_dedups_preserves_order() {
         // Trim each entry, drop "", collapse the duplicate "a", keep first-seen
@@ -1738,32 +2123,191 @@ mod tests {
         assert_eq!(render_status_result(&mixed)["isError"], false);
     }
 
+    #[test]
+    fn join_input_requires_capability_literal_value_and_explicit_zero() {
+        assert_eq!(parse_return_when(&json!({}), true).unwrap(), None);
+        assert!(parse_return_when(
+            &json!({"return_when":"all_terminal_or_attention","wait_ms":0}),
+            false,
+        )
+        .is_err());
+        assert!(
+            parse_return_when(&json!({"return_when":"all_terminal_or_attention"}), true,).is_err()
+        );
+        assert!(parse_return_when(
+            &json!({"return_when":"all_terminal_or_attention","wait_ms":1}),
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            parse_return_when(
+                &json!({"return_when":"all_terminal_or_attention","wait_ms":0}),
+                true,
+            )
+            .unwrap(),
+            Some(DelegationReturnWhen::AllTerminalOrAttention)
+        );
+    }
+
+    #[test]
+    fn legacy_batch_omits_join_fields_on_the_wire() {
+        use crate::acp::delegation::types::DelegationStatusBatch;
+        let value = serde_json::to_value(DelegationStatusBatch::legacy(vec![])).unwrap();
+        assert_eq!(value, json!({"tasks": []}));
+    }
+
+    #[test]
+    fn joined_batch_includes_empty_attention_array() {
+        use crate::acp::delegation::types::{DelegationStatusBatch, DelegationWakeReason};
+        let value = serde_json::to_value(DelegationStatusBatch::joined(
+            vec![],
+            DelegationWakeReason::AllTerminal,
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(value["wake_reason"], "all_terminal");
+        assert_eq!(value["attention_requests"], json!([]));
+    }
+
+    #[test]
+    fn joined_status_renderer_preserves_attention_in_text_and_structured_content() {
+        let outcome = json!({
+            "tasks": [{"task_id":"task-1", "status":"running"}],
+            "wake_reason": "attention_required",
+            "attention_requests": [{
+                "request_id":"request-1",
+                "task_id":"task-1",
+                "message":"Choose A or B",
+                "created_at":"2026-07-17T10:00:00Z"
+            }]
+        });
+        let rendered = render_status_result(&outcome);
+        assert_eq!(rendered["structuredContent"], outcome);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), outcome);
+    }
+
+    #[test]
+    fn legacy_status_renderer_keeps_the_exact_tasks_only_envelope() {
+        let outcome = json!({"tasks": []});
+        let rendered = render_status_result(&outcome);
+        assert_eq!(rendered["structuredContent"], outcome);
+        assert_eq!(rendered["content"][0]["text"], "{\"tasks\":[]}");
+    }
+
+    #[tokio::test]
+    async fn coordination_and_legacy_tools_list_project_wait_contract() {
+        let legacy = unwrap_respond(
+            dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
+        );
+        let tools = legacy.result.unwrap()["tools"].as_array().unwrap().clone();
+        let status = tools
+            .iter()
+            .find(|t| t["name"] == "get_delegation_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("return_when")
+            .is_none());
+        assert!(!tool_guidance(status).contains("all_terminal_or_attention"));
+        let legacy_wait = &status["inputSchema"]["properties"]["wait_ms"];
+        assert_eq!(legacy_wait["minimum"], 0);
+        assert!(legacy_wait.get("maximum").is_none());
+        let legacy_guidance = tool_guidance(status);
+        assert!(legacy_guidance.contains("positive wait (max 60000 ms)"));
+        assert!(!legacy_guidance.contains("positive wait_ms is rejected"));
+        let delegate = tools
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .unwrap();
+        assert!(!tool_guidance(delegate).contains("all_terminal_or_attention"));
+
+        let coord = unwrap_respond(
+            dispatch_with_features(
+                COORDINATION,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tools = coord.result.unwrap()["tools"].as_array().unwrap().clone();
+        let status = tools
+            .iter()
+            .find(|t| t["name"] == "get_delegation_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]
+            .get("return_when")
+            .is_some());
+        assert!(tool_guidance(status).contains("all_terminal_or_attention"));
+        let coordination_wait = &status["inputSchema"]["properties"]["wait_ms"];
+        assert_eq!(coordination_wait["minimum"], 0);
+        assert_eq!(coordination_wait["maximum"], 0);
+        let coordination_guidance = tool_guidance(status);
+        for required in [
+            "omit wait_ms for an immediate snapshot",
+            "return_when=all_terminal_or_attention",
+            "positive wait_ms is rejected",
+            "re-join only still-running required",
+        ] {
+            assert!(
+                coordination_guidance.contains(required),
+                "coordination guidance missing {required:?}"
+            );
+        }
+        assert!(!coordination_guidance.contains("positive wait (max 60000 ms)"));
+        let delegate = tools
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .unwrap();
+        assert!(tool_guidance(delegate).contains("join"));
+    }
+
     // -- check_user_feedback feature gating + rendering --------------------
 
     const FEEDBACK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: true,
         ask: false,
         sessions: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
+        coordination_v1: false,
         feedback: true,
         ask: false,
         sessions: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: false,
         ask: true,
         sessions: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
+        coordination_v1: false,
         feedback: false,
         ask: false,
         sessions: true,
     };
+    const ALL_FEATURES: CompanionFeatures = CompanionFeatures {
+        delegation: true,
+        coordination_v1: true,
+        feedback: true,
+        ask: true,
+        sessions: true,
+    };
+    const COORDINATION: CompanionFeatures = CompanionFeatures {
+        delegation: true,
+        coordination_v1: true,
+        feedback: false,
+        ask: false,
+        sessions: false,
+    };
+
+    // Grok stdio hosts serialize the full tools/list in one line; stay at or
+    // under this budget (including the trailing newline).
+    const GROK_STDIO_SAFE_TOOLS_LIST_BYTES: usize = 7_680;
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
         let resp = unwrap_respond(action);
@@ -1775,18 +2319,241 @@ mod tests {
             .collect()
     }
 
+    fn legacy_root() -> CompanionContext {
+        ctx_with(CompanionFeatures {
+            delegation: true,
+            coordination_v1: false,
+            feedback: false,
+            ask: false,
+            sessions: false,
+        })
+    }
+
+    fn coordination_root() -> CompanionContext {
+        let mut c = ctx_with(COORDINATION);
+        c.role = CompanionRole::Root;
+        c
+    }
+
+    fn coordination_child() -> CompanionContext {
+        let mut c = ctx_with(COORDINATION);
+        c.role = CompanionRole::DelegationChild;
+        c
+    }
+
+    async fn dispatch_with_context(ctx: CompanionContext, line: &str) -> LineAction {
+        dispatch_line(&ctx, Arc::new(InflightCalls::new()), line).await
+    }
+
+    fn tools_list() -> &'static str {
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+    }
+
+    fn call(id: i64, name: &str, arguments: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+        .to_string()
+    }
+
+    fn tool_names(action: LineAction) -> Vec<String> {
+        list_tool_names(action)
+    }
+
+    fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
+        for forbidden in [
+            "progress",
+            "warning",
+            "log",
+            "heartbeat",
+            "detach",
+            "deliver_result",
+            "send_result",
+            "result_delivery",
+        ] {
+            assert!(
+                !names.iter().any(|n| n.contains(forbidden)),
+                "unexpected side-channel tool name containing {forbidden:?}: {names:?}"
+            );
+        }
+    }
+
+    fn collect_descriptions(value: &Value, output: &mut String) {
+        match value {
+            Value::Object(map) => {
+                if let Some(description) = map.get("description").and_then(Value::as_str) {
+                    output.push_str(description);
+                    output.push(' ');
+                }
+                for (key, nested) in map {
+                    if key != "description" || !nested.is_string() {
+                        collect_descriptions(nested, output);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_descriptions(item, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tool_guidance(tool: &Value) -> String {
+        let mut output = String::new();
+        collect_descriptions(tool, &mut output);
+        output.to_ascii_lowercase()
+    }
+
+    #[test]
+    fn tool_schema_retains_essential_agent_guidance() {
+        let schema: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let tools = schema.as_array().unwrap();
+        let ask_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "ask_user_question")
+            .unwrap();
+        assert!(
+            tool_guidance(ask_tool).contains("meaning or trade-off"),
+            "ask_user_question guidance lost nested option description"
+        );
+        let cases: [(&str, &[&str]); 8] = [
+            (
+                "delegate_to_agent",
+                &[
+                    "asynchronous",
+                    "task_id",
+                    "cold",
+                    "cannot see this conversation",
+                    "task must include all context",
+                    "fan out",
+                    "join",
+                    "each distinct",
+                    "call once",
+                    "profile_id",
+                ],
+            ),
+            (
+                "get_delegation_status",
+                &[
+                    "task_ids",
+                    "wait_ms",
+                    "return_when",
+                    "all_terminal_or_attention",
+                    "omit wait_ms for an immediate snapshot",
+                    "return_when=all_terminal_or_attention",
+                    "positive wait_ms is rejected",
+                    "re-join only still-running required",
+                    "all requested tasks are terminal",
+                    "attention",
+                    "unavailable",
+                    "input order",
+                    "wake_reason",
+                    "attention_requests",
+                ],
+            ),
+            (
+                "cancel_delegation",
+                &[
+                    "only when its result is no longer wanted",
+                    "timeout",
+                    "non-canceling",
+                    "keep waiting",
+                    "wait_ms for slow work",
+                    "already finished",
+                    "final result",
+                    "taskfail, usercancel, and others cancel",
+                ],
+            ),
+            (
+                "check_user_feedback",
+                &[
+                    "messages are available only through this tool",
+                    "non-blocking",
+                    "before starting implementation",
+                    "significant decision",
+                    "after a meaningful sub-task",
+                    "high-priority",
+                    "empty result means continue",
+                ],
+            ),
+            (
+                "ask_user_question",
+                &[
+                    "1-4 related",
+                    "block until submitted or dismissed",
+                    "genuinely user-owned discrete decision",
+                    "cannot be resolved",
+                    "do not ask merely whether to proceed",
+                    "confirm an obvious default",
+                    "open-ended input",
+                    "other is added automatically",
+                    "recommended",
+                    "one call",
+                    "meaning or trade-off",
+                ],
+            ),
+            (
+                "get_session_info",
+                &[
+                    "codeg://session/",
+                    "read-only metadata",
+                    "optional recent messages",
+                    "internal conversation id",
+                    "not the agent session id",
+                    "found: false",
+                    "not an error",
+                ],
+            ),
+            (
+                "request_parent_decision",
+                &[
+                    "direct parent",
+                    "blocking decision",
+                    "blocks until reply or closure",
+                    "not for progress, logs, or warnings",
+                ],
+            ),
+            (
+                "reply_to_delegation",
+                &[
+                    "open direct-child join decision",
+                    "first reply wins",
+                    "idempotent",
+                ],
+            ),
+        ];
+
+        for (name, required_phrases) in cases {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            let guidance = tool_guidance(tool);
+            for phrase in required_phrases {
+                assert!(
+                    guidance.contains(phrase),
+                    "{name} guidance lost required phrase: {phrase}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn features_parse_defaults_and_tokens() {
-        // Absent → delegation-only (backward compatible).
+        // Absent → delegation-only (backward compatible), no Join.
         let def = CompanionFeatures::parse(None);
-        assert!(def.delegation && !def.feedback);
+        assert!(def.delegation && !def.feedback && !def.coordination_v1);
         assert!(!def.ask);
         assert!(!def.sessions);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions ,bogus"));
-        assert!(all.delegation && all.feedback && all.ask && all.sessions);
+        let all = CompanionFeatures::parse(Some(
+            " delegation , coordination_v1 , feedback , ask , sessions ,bogus",
+        ));
+        assert!(all.delegation && all.coordination_v1 && all.feedback && all.ask && all.sessions);
         let fb = CompanionFeatures::parse(Some("feedback"));
-        assert!(!fb.delegation && fb.feedback && !fb.ask);
+        assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
         let ask = CompanionFeatures::parse(Some("ask"));
         assert!(!ask.delegation && !ask.feedback && ask.ask);
         let sessions = CompanionFeatures::parse(Some("sessions"));
@@ -1794,6 +2561,7 @@ mod tests {
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
         assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
+        assert!(!none.coordination_v1);
     }
 
     #[tokio::test]
@@ -1804,6 +2572,45 @@ mod tests {
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
         assert_eq!(names.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn all_feature_tools_list_stays_within_grok_stdio_budget() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                ALL_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let names: Vec<&str> = response.result.as_ref().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        // Root role + coordination_v1: reply only (no request_parent_decision).
+        assert_eq!(
+            names,
+            vec![
+                "delegate_to_agent",
+                "get_delegation_status",
+                "cancel_delegation",
+                "check_user_feedback",
+                "ask_user_question",
+                "get_session_info",
+                "reply_to_delegation",
+            ]
+        );
+        let mut line = serde_json::to_vec(&response).unwrap();
+        line.push(b'\n');
+
+        assert!(
+            line.len() <= GROK_STDIO_SAFE_TOOLS_LIST_BYTES,
+            "all-feature tools/list line is {} bytes; limit is {} bytes",
+            line.len(),
+            GROK_STDIO_SAFE_TOOLS_LIST_BYTES
+        );
     }
 
     #[tokio::test]
@@ -1867,6 +2674,39 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, -32602);
     }
 
+    /// tools/list and tools/call independently gate disabled delegation.
+    #[tokio::test]
+    async fn disabled_feature_absent_from_list_and_rejected_on_direct_call() {
+        let names = list_tool_names(
+            dispatch_with_features(
+                FEEDBACK_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("delegat")),
+            "disabled delegation tools must not appear in tools/list: {names:?}"
+        );
+        for tool in [
+            "delegate_to_agent",
+            "get_delegation_status",
+            "cancel_delegation",
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                "params": { "name": tool, "arguments": {} }
+            })
+            .to_string();
+            let resp = unwrap_respond(dispatch_with_features(FEEDBACK_ONLY, &line).await);
+            assert_eq!(
+                resp.error.as_ref().map(|e| e.code),
+                Some(-32602),
+                "direct call to disabled {tool} must be rejected"
+            );
+        }
+    }
+
     // -- ask_user_question feature gating + validation + rendering ----------
 
     #[tokio::test]
@@ -1876,8 +2716,11 @@ mod tests {
         );
         assert!(!off.contains(&"ask_user_question".to_string()));
         let on = list_tool_names(
-            dispatch_with_features(ASK_ONLY, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-                .await,
+            dispatch_with_features(
+                ASK_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
         );
         assert_eq!(on, vec!["ask_user_question".to_string()]);
     }
@@ -2008,7 +2851,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_session_info_missing_or_bad_id_rejected_synchronously() {
-        for args in [json!({}), json!({ "session_id": "abc" }), json!({ "session_id": true })] {
+        for args in [
+            json!({}),
+            json!({ "session_id": "abc" }),
+            json!({ "session_id": true }),
+        ] {
             let line = json!({
                 "jsonrpc": "2.0", "id": 32, "method": "tools/call",
                 "params": { "name": "get_session_info", "arguments": args }
@@ -2064,10 +2911,7 @@ mod tests {
             parse_max_messages(&json!({ "max_messages": 4_294_967_296_u64 })),
             200
         );
-        assert_eq!(
-            parse_max_messages(&json!({ "max_messages": 1e30 })),
-            200
-        );
+        assert_eq!(parse_max_messages(&json!({ "max_messages": 1e30 })), 200);
         // Invalid / negative / fractional → default (optional knob, not an error).
         assert_eq!(parse_max_messages(&json!({ "max_messages": "abc" })), 20);
         assert_eq!(parse_max_messages(&json!({ "max_messages": -5 })), 20);
@@ -2200,8 +3044,12 @@ mod tests {
             let (mut c1, _) = listener.accept().await.unwrap();
             let _: BrokerResponse = match read_frame::<_, BrokerMessage>(&mut c1).await.unwrap() {
                 BrokerMessage::Feedback(_) => {
-                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"])).await.unwrap();
-                    BrokerResponse { outcome: Value::Null }
+                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"]))
+                        .await
+                        .unwrap();
+                    BrokerResponse {
+                        outcome: Value::Null,
+                    }
                 }
                 other => panic!("expected Feedback, got {other:?}"),
             };
@@ -2210,7 +3058,14 @@ mod tests {
             if let BrokerMessage::CommitFeedback(req) = read_frame(&mut c2).await.unwrap() {
                 committed2.lock().await.push(req.ids);
             }
-            write_frame(&mut c2, &BrokerResponse { outcome: Value::Null }).await.unwrap();
+            write_frame(
+                &mut c2,
+                &BrokerResponse {
+                    outcome: Value::Null,
+                },
+            )
+            .await
+            .unwrap();
         });
 
         let inflight = Arc::new(InflightCalls::new());
@@ -2219,7 +3074,9 @@ mod tests {
             Value::from(1),
             sock,
             "tok".into(),
-            BrokerFeedbackRequest { token: "tok".into() },
+            BrokerFeedbackRequest {
+                token: "tok".into(),
+            },
         )
         .await;
         let LineAction::Spawn(call) = action else {
@@ -2309,6 +3166,131 @@ mod tests {
         );
         server.abort();
         // Crucially: no commit was sent for a cancelled (undelivered) check.
-        assert!(!*saw_commit.lock().await, "a cancelled check must not commit");
+        assert!(
+            !*saw_commit.lock().await,
+            "a cancelled check must not commit"
+        );
+    }
+
+    // -- Role-aware decision tools (Task 6) ---------------------------------
+
+    #[tokio::test]
+    async fn decision_tools_are_capability_and_role_scoped() {
+        let legacy = tool_names(dispatch_with_context(legacy_root(), tools_list()).await);
+        assert!(!legacy.contains(&"request_parent_decision".into()));
+        assert!(!legacy.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&legacy);
+
+        let root = tool_names(dispatch_with_context(coordination_root(), tools_list()).await);
+        assert!(!root.contains(&"request_parent_decision".into()));
+        assert!(root.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&root);
+
+        let child = tool_names(dispatch_with_context(coordination_child(), tools_list()).await);
+        assert!(child.contains(&"request_parent_decision".into()));
+        assert!(child.contains(&"reply_to_delegation".into()));
+        assert_no_generic_coordination_side_channel_tools(&child);
+    }
+
+    #[tokio::test]
+    async fn root_direct_call_to_child_only_tool_is_rejected_without_socket_io() {
+        let response = unwrap_respond(
+            dispatch_with_context(
+                coordination_root(),
+                &call(7, "request_parent_decision", json!({"message":"choose"})),
+            )
+            .await,
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_call_to_decision_tools_is_rejected() {
+        for name in ["request_parent_decision", "reply_to_delegation"] {
+            let args = if name == "request_parent_decision" {
+                json!({"message":"choose"})
+            } else {
+                json!({"request_id":"r1","reply":"A"})
+            };
+            let response =
+                unwrap_respond(dispatch_with_context(legacy_root(), &call(8, name, args)).await);
+            assert_eq!(response.error.unwrap().code, -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_child_spawns_request_parent_decision() {
+        let action = dispatch_with_context(
+            coordination_child(),
+            &call(9, "request_parent_decision", json!({"message":"choose"})),
+        )
+        .await;
+        assert!(matches!(action, LineAction::Spawn(_)));
+    }
+
+    #[tokio::test]
+    async fn coordination_root_spawns_reply_to_delegation() {
+        let action = dispatch_with_context(
+            coordination_root(),
+            &call(
+                10,
+                "reply_to_delegation",
+                json!({"request_id":"r1","reply":"A"}),
+            ),
+        )
+        .await;
+        assert!(matches!(action, LineAction::Spawn(_)));
+    }
+
+    #[test]
+    fn decision_payload_validation_is_utf8_byte_bounded_and_exact_keyed() {
+        assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024)})).is_ok());
+        assert!(parse_parent_decision_args(&json!({"message":"界".repeat(6000)})).is_err());
+        assert!(parse_parent_decision_args(&json!({"message":"  "})).is_err());
+        assert!(
+            parse_parent_decision_args(&json!({"message":"choose", "task_id":"foreign"})).is_err()
+        );
+        assert!(parse_reply_args(&json!({"request_id":"r1", "reply":"A", "parent_id":1})).is_err());
+        assert!(parse_parent_decision_args(&json!({"message":"x".repeat(16 * 1024 + 1)})).is_err());
+        assert!(
+            parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024)})).is_ok()
+        );
+        assert!(
+            parse_reply_args(&json!({"request_id":"r1","reply":"x".repeat(16 * 1024 + 1)}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn render_parent_decision_surfaces_reply_text_without_error_flag() {
+        let rendered = render_parent_decision_result(&json!({
+            "status": "replied",
+            "request_id": "r1",
+            "reply": "Use A",
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["content"][0]["text"], "Use A");
+        assert_eq!(rendered["structuredContent"]["status"], "replied");
+    }
+
+    #[test]
+    fn render_reply_delegation_idempotent_is_not_error() {
+        let rendered = render_reply_delegation_result(&json!({
+            "status": "idempotent",
+            "request_id": "r1",
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["content"][0]["text"], "Reply already delivered");
+    }
+
+    #[test]
+    fn render_reply_delegation_does_not_echo_reply_in_text() {
+        let rendered = render_reply_delegation_result(&json!({
+            "status": "replied",
+            "request_id": "r1",
+        }));
+        assert_eq!(rendered["content"][0]["text"], "Reply delivered");
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("secret-reply-body"));
     }
 }

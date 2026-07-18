@@ -1,8 +1,13 @@
 import type { DbConversationSummary } from "@/lib/types"
-import type {
-  SidebarSortMode,
-  SidebarSectionOrder,
-} from "@/lib/sidebar-view-mode-storage"
+import type { SidebarSectionOrder } from "@/lib/sidebar-view-mode-storage"
+import {
+  EMPTY_OPTIMISTIC_ACTIVITY_BY_ID,
+  getEffectiveConversationUpdatedAt,
+  parseActivityTimestamp,
+  type OptimisticActivityById,
+} from "@/lib/conversation-activity"
+
+export type SidebarBucketKey = "pinned" | "chat" | `folder:${number}`
 
 export function parseTimestamp(value: string): number {
   const timestamp = Date.parse(value)
@@ -11,32 +16,20 @@ export function parseTimestamp(value: string): number {
 
 export function compareByUpdatedAtDesc(
   left: DbConversationSummary,
-  right: DbConversationSummary
+  right: DbConversationSummary,
+  optimistic = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
 ): number {
   const updatedDiff =
-    parseTimestamp(right.updated_at) - parseTimestamp(left.updated_at)
+    parseActivityTimestamp(
+      getEffectiveConversationUpdatedAt(right, optimistic)
+    ) -
+    parseActivityTimestamp(getEffectiveConversationUpdatedAt(left, optimistic))
   if (updatedDiff !== 0) return updatedDiff
 
   const createdDiff =
-    parseTimestamp(right.created_at) - parseTimestamp(left.created_at)
-  if (createdDiff !== 0) return createdDiff
-
-  return right.id - left.id
-}
-
-export function compareByCreatedAtDesc(
-  left: DbConversationSummary,
-  right: DbConversationSummary
-): number {
-  const createdDiff =
-    parseTimestamp(right.created_at) - parseTimestamp(left.created_at)
-  if (createdDiff !== 0) return createdDiff
-
-  const updatedDiff =
-    parseTimestamp(right.updated_at) - parseTimestamp(left.updated_at)
-  if (updatedDiff !== 0) return updatedDiff
-
-  return right.id - left.id
+    parseActivityTimestamp(right.created_at) -
+    parseActivityTimestamp(left.created_at)
+  return createdDiff !== 0 ? createdDiff : right.id - left.id
 }
 
 /**
@@ -44,13 +37,12 @@ export function compareByCreatedAtDesc(
  * `list_children` ORDER BY created_at DESC, id DESC so a merged/inserted child
  * lands where a refetch would put it. Sub-sessions render newest-on-top like the
  * root list, so a freshly-spawned sub-agent surfaces right under its parent.
- * Deliberately created_at + id only (no `updated_at` middle key like
- * {@link compareByCreatedAtDesc}) to mirror the SQL order the raw fetch snapshot
- * is trusted to already be in. Parity holds at millisecond + id resolution:
- * `parseTimestamp` (Date.parse) truncates to ms, so two children created in the
- * same millisecond fall to the id tie-break here while the backend orders them
- * by full-precision `created_at` — harmless because ids increase with creation
- * time, so both still agree on newest-first.
+ * Deliberately created_at + id only (no `updated_at` middle key) to mirror the
+ * SQL order the raw fetch snapshot is trusted to already be in. Parity holds at
+ * millisecond + id resolution: `parseTimestamp` (Date.parse) truncates to ms, so
+ * two children created in the same millisecond fall to the id tie-break here
+ * while the backend orders them by full-precision `created_at` — harmless
+ * because ids increase with creation time, so both still agree on newest-first.
  */
 export function compareByChildCreatedAtDesc(
   left: DbConversationSummary,
@@ -63,17 +55,25 @@ export function compareByChildCreatedAtDesc(
 }
 
 /**
- * Most-recently-pinned first. Only ever applied to rows with a non-null
- * `pinned_at` (the pinned bucket), so the empty-string fallback is just a guard.
+ * Activity-first for pinned roots: effective updated time is primary; then
+ * most-recently-pinned; then id. Only ever applied to rows with a non-null
+ * `pinned_at` (the pinned bucket).
  */
 export function compareByPinnedAtDesc(
   left: DbConversationSummary,
-  right: DbConversationSummary
+  right: DbConversationSummary,
+  optimistic = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
 ): number {
-  const diff =
-    parseTimestamp(right.pinned_at ?? "") - parseTimestamp(left.pinned_at ?? "")
-  if (diff !== 0) return diff
-  return right.id - left.id
+  const updatedDiff =
+    parseActivityTimestamp(
+      getEffectiveConversationUpdatedAt(right, optimistic)
+    ) -
+    parseActivityTimestamp(getEffectiveConversationUpdatedAt(left, optimistic))
+  if (updatedDiff !== 0) return updatedDiff
+  const pinnedDiff =
+    parseActivityTimestamp(right.pinned_at) -
+    parseActivityTimestamp(left.pinned_at)
+  return pinnedDiff !== 0 ? pinnedDiff : right.id - left.id
 }
 
 /**
@@ -92,7 +92,13 @@ export function formatRelative(iso: string, now: number): string {
   if (m < 1) return "now"
   if (m < 60) return `${m}m`
   const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h`
+  if (h < 24) {
+    const remainingMinutes = m % 60
+    if (h < 10 && remainingMinutes > 0) {
+      return `${h}h${remainingMinutes}m`
+    }
+    return `${h}h`
+  }
   const d = Math.floor(h / 24)
   if (d < 30) return `${d}d`
   const mo = Math.floor(d / 30)
@@ -155,8 +161,9 @@ export function reuseSelected(
 }
 
 /**
- * Group conversations by folder, sorting each bucket, while reusing the
- * previous render's bucket array whenever a folder's sorted membership is
+ * Group conversations by folder, sorting each bucket by effective updated time
+ * (authoritative `updated_at` maxed with any optimistic overlay), while reusing
+ * the previous render's bucket array whenever a folder's sorted membership is
  * referentially unchanged.
  *
  * Reference stability is the whole point: a single `conversation_status_changed`
@@ -176,12 +183,16 @@ export function reuseSelected(
  * conversations together (sorted as one bucket). The conversation objects
  * themselves are untouched — only the grouping key is redirected, never
  * `folder_id` — so per-conversation cwd resolution stays correct.
+ *
+ * `optimisticActivityById` (optional) lifts a root's effective timestamp for
+ * presentation-only reorder before the backend's authoritative `updated_at`
+ * arrives.
  */
 export function groupByFolderWithReuse(
   filtered: readonly DbConversationSummary[],
-  sortMode: SidebarSortMode,
   prev: Map<number, DbConversationSummary[]>,
-  childToParent?: ReadonlyMap<number, number>
+  childToParent?: ReadonlyMap<number, number>,
+  optimisticActivityById: OptimisticActivityById = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
 ): Map<number, DbConversationSummary[]> {
   const next = new Map<number, DbConversationSummary[]>()
   for (const conv of filtered) {
@@ -191,10 +202,10 @@ export function groupByFolderWithReuse(
     else next.set(groupId, [conv])
   }
 
-  const comparator =
-    sortMode === "updated" ? compareByUpdatedAtDesc : compareByCreatedAtDesc
   for (const [folderId, list] of next) {
-    list.sort(comparator)
+    list.sort((left, right) =>
+      compareByUpdatedAtDesc(left, right, optimisticActivityById)
+    )
     const prevList = prev.get(folderId)
     // Replacing an existing key's value mid-iteration is safe (we never add or
     // remove keys here).
@@ -207,8 +218,8 @@ export function groupByFolderWithReuse(
 
 /**
  * Select the pinned conversations (those with a non-null `pinned_at`), sorted
- * most-recently-pinned first, reusing the previous array reference when the
- * sorted membership is referentially unchanged.
+ * by effective activity first (then pinned_at, then id), reusing the previous
+ * array reference when the sorted membership is referentially unchanged.
  *
  * Same reference-stability motivation as {@link groupByFolderWithReuse}: a
  * single status event replaces exactly one summary object, so this would
@@ -222,19 +233,22 @@ export function groupByFolderWithReuse(
  */
 export function selectPinnedWithReuse(
   conversations: readonly DbConversationSummary[],
-  prev: DbConversationSummary[]
+  prev: DbConversationSummary[],
+  optimisticActivityById: OptimisticActivityById = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
 ): DbConversationSummary[] {
   const next: DbConversationSummary[] = []
   for (const conv of conversations) {
     if (conv.pinned_at != null) next.push(conv)
   }
-  next.sort(compareByPinnedAtDesc)
+  next.sort((left, right) =>
+    compareByPinnedAtDesc(left, right, optimisticActivityById)
+  )
   return arraysShallowEqual(prev, next) ? prev : next
 }
 
 /**
  * Select the folderless "chat mode" conversations (`kind === "chat"`) for the
- * flat "Chat" sidebar section. Sorted most-recently-updated first, with
+ * flat "Chat" sidebar section. Sorted by effective updated time, with
  * reference reuse (same motivation as {@link selectPinnedWithReuse}).
  *
  * Excludes pinned conversations (they surface in the Pinned section, an explicit
@@ -246,7 +260,8 @@ export function selectPinnedWithReuse(
 export function selectChatConversationsWithReuse(
   conversations: readonly DbConversationSummary[],
   showCompleted: boolean,
-  prev: DbConversationSummary[]
+  prev: DbConversationSummary[],
+  optimisticActivityById: OptimisticActivityById = EMPTY_OPTIMISTIC_ACTIVITY_BY_ID
 ): DbConversationSummary[] {
   const next: DbConversationSummary[] = []
   for (const conv of conversations) {
@@ -255,7 +270,9 @@ export function selectChatConversationsWithReuse(
     if (!showCompleted && conv.status === "completed") continue
     next.push(conv)
   }
-  next.sort(compareByUpdatedAtDesc)
+  next.sort((left, right) =>
+    compareByUpdatedAtDesc(left, right, optimisticActivityById)
+  )
   return arraysShallowEqual(prev, next) ? prev : next
 }
 
@@ -285,6 +302,17 @@ export interface ConversationRow {
    * etc. Drives the card's per-level indent (a pure function of this number).
    */
   depth: number
+  /**
+   * Id of the root conversation that owns this row's animation block. Children
+   * and loading placeholders inherit the root's id so the block moves as one.
+   */
+  rootId: number
+  /**
+   * Display bucket this root lives in (`pinned` / `chat` / `folder:N`). Stored
+   * on every owned row — never re-derived from `folder_id` — so worktree merges
+   * and pin moves keep a stable block key.
+   */
+  bucketKey: SidebarBucketKey
 }
 
 export interface EmptyHintRow {
@@ -329,11 +357,15 @@ export interface SectionHeaderRow {
  * delegation children are being lazily fetched (between expand and the
  * `listChildConversations` response). Replaced by the real child rows once
  * loaded, or by nothing if the parent turns out to have no (live) children.
+ * Loading rows are owned by the root block (same `rootId` / `bucketKey`) — they
+ * are not stable structural anchors for animation.
  */
 export interface SubsessionLoadingRow {
   kind: "subsession-loading"
   parentId: number
   depth: number
+  rootId: number
+  bucketKey: SidebarBucketKey
 }
 
 export type SidebarRow =
@@ -343,6 +375,19 @@ export type SidebarRow =
   | EmptyHintRow
   | ChatsEmptyRow
   | SubsessionLoadingRow
+
+/**
+ * Stable React/virtua key for a flat sidebar row. Key strings match the
+ * historical component-local switch exactly so remounts stay quiet.
+ */
+export function sidebarRowKey(row: SidebarRow): string {
+  if (row.kind === "section") return `section-${row.section}`
+  if (row.kind === "folder") return `folder-${row.folderId}`
+  if (row.kind === "empty") return `empty-${row.folderId}`
+  if (row.kind === "chats-empty") return "chats-empty"
+  if (row.kind === "subsession-loading") return `subloading-${row.parentId}`
+  return `conv-${row.conversation.agent_type}-${row.conversation.id}`
+}
 
 const MAX_RENDER_DEPTH = 32
 
@@ -383,16 +428,22 @@ export function mergeChildrenById(
  * Child summaries are pushed by reference (never copied), exactly like root
  * rows, so a status event replacing one child keeps every sibling's identity and
  * the card `memo` still bails out through the virtualized render.
+ *
+ * `rootId` / `bucketKey` are fixed at the root call site and threaded through
+ * every descendant (including loading placeholders) so the animation block owns
+ * the full subtree.
  */
 function pushConversationRow(
   rows: SidebarRow[],
   conversation: DbConversationSummary,
   depth: number,
+  rootId: number,
+  bucketKey: SidebarBucketKey,
   conversationExpanded: ReadonlySet<number>,
   childrenByParent: ReadonlyMap<number, readonly DbConversationSummary[]>,
   childrenLoading: ReadonlySet<number>
 ): void {
-  rows.push({ kind: "conversation", conversation, depth })
+  rows.push({ kind: "conversation", conversation, depth, rootId, bucketKey })
   if (
     depth >= MAX_RENDER_DEPTH ||
     conversation.child_count <= 0 ||
@@ -411,6 +462,8 @@ function pushConversationRow(
       kind: "subsession-loading",
       parentId: conversation.id,
       depth: depth + 1,
+      rootId,
+      bucketKey,
     })
     return
   }
@@ -421,6 +474,8 @@ function pushConversationRow(
       rows,
       kid,
       depth + 1,
+      rootId,
+      bucketKey,
       conversationExpanded,
       childrenByParent,
       childrenLoading
@@ -517,6 +572,8 @@ export function buildRows(args: {
           rows,
           conv,
           0,
+          conv.id,
+          "pinned",
           conversationExpanded,
           childrenByParent,
           childrenLoading
@@ -557,6 +614,8 @@ export function buildRows(args: {
             rows,
             conv,
             0,
+            conv.id,
+            `folder:${folderId}`,
             conversationExpanded,
             childrenByParent,
             childrenLoading
@@ -584,6 +643,8 @@ export function buildRows(args: {
             rows,
             conv,
             0,
+            conv.id,
+            "chat",
             conversationExpanded,
             childrenByParent,
             childrenLoading

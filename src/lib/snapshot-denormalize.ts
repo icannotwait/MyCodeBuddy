@@ -3,6 +3,7 @@ import type {
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  DelegationRouteSnapshot,
   LiveContentBlock as WireLiveContentBlock,
   LiveMessage as WireLiveMessage,
   LiveSessionSnapshot,
@@ -72,6 +73,11 @@ export interface SnapshotPatch {
    *  `seedDelegationsFromSnapshot`); the reducer does not store this on
    *  ConnectionState. `[]` when the server omitted the field. */
   activeDelegations: ActiveDelegationState[]
+  /**
+   * Authoritative route snapshot from the backend. `null` when the server
+   * omitted the field (older payloads). Never derived from live settings.
+   */
+  delegationRoute: DelegationRouteSnapshot | null
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -125,6 +131,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     backgroundOutstanding: wire.background_outstanding ?? 0,
     eventSeq: wire.event_seq,
     activeDelegations: wire.active_delegations ?? [],
+    delegationRoute: wire.delegation_route ?? null,
   }
 }
 

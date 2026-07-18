@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "runId": "run-mrmjgy3n-3502u1",
+  "fixture": {
+    "id": "grok_rich_v1",
+    "version": "grok-rich-v1",
+    "seed": 49374,
+    "rateProfile": "eps_500",
+    "expectedEvents": 1223,
+    "expectedTextChars": 30000,
+    "expectedTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039"
+  },
+  "environment": {
+    "platform": "Win32",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+    "webviewVersion": "150.0.0.0",
+    "buildMode": "production",
+    "hardwareAcceleration": "enabled",
+    "deliveryMode": "legacy",
+    "flags": {
+      "desktop_acp_event_batching": false,
+      "incremental_live_transcript": false,
+      "deferred_streaming_rich_content": false
+    }
+  },
+  "delivery": {
+    "emitted_count": 15918,
+    "lagged_count": 0,
+    "ring_buffer_evict_count": 15662,
+    "replay_count": 0,
+    "replay_event_total": 0,
+    "snapshot_fallback_count": 0,
+    "snapshot_cold_count": 0,
+    "forwarder_lagged_count": 0,
+    "worker_queue_full_count": 0,
+    "desktop_raw_envelope_count": 15918,
+    "desktop_raw_bytes": 2352195,
+    "desktop_emit_attempt_count": 15918,
+    "desktop_serialization_failure_count": 0,
+    "desktop_emit_failure_count": 0,
+    "desktop_legacy_emit_count": 15918,
+    "desktop_batch_count": 0,
+    "desktop_batch_event_count": 0,
+    "desktop_batch_bytes": 0,
+    "desktop_batch_max_events": 0,
+    "desktop_batch_max_bytes": 0,
+    "desktop_batch_latency_total_us": 0,
+    "desktop_batch_latency_max_us": 0,
+    "desktop_queue_full_count": 0,
+    "desktop_startup_fallback_count": 0,
+    "desktop_runtime_failure_count": 0
+  },
+  "pipelineCounts": {
+    "deliveryCallbacks": 1223,
+    "ingestorFrames": 0,
+    "connectionMapPublications": 0,
+    "connectionTransactions": 1223,
+    "livePublications": 64,
+    "reactCommits": 64,
+    "paints": 52
+  },
+  "timings": {
+    "receiptToTransaction": {
+      "count": 1223,
+      "p50": 0,
+      "p95": 0.20000000298023224,
+      "max": 2
+    },
+    "transactionToLivePublication": {
+      "count": 64,
+      "p50": 0,
+      "p95": 0,
+      "max": 0.09999999403953552
+    },
+    "batchToCommit": {
+      "count": 64,
+      "p50": 6.399999991059303,
+      "p95": 12.899999991059303,
+      "max": 15.100000008940697
+    },
+    "batchToPaint": {
+      "count": 64,
+      "p50": 13.700000002980232,
+      "p95": 36.20000000298023,
+      "max": 45.80000001192093
+    },
+    "inputToPaint": {
+      "count": 27,
+      "p50": 43.099999994039536,
+      "p95": 110.40000000596046,
+      "max": 117.09999999403954
+    },
+    "longTasks": {
+      "count": 1,
+      "p50": 68,
+      "p95": 68,
+      "max": 68
+    },
+    "frameGaps": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    },
+    "eventLoopDrift": {
+      "count": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "renders": {
+    "conversationPanel": 0,
+    "historicalThread": 231,
+    "historicalRow": 2,
+    "liveRow": 223,
+    "markdownBlock": 0,
+    "toolCard": 0
+  },
+  "integrity": {
+    "expectedEvents": 1223,
+    "appliedEvents": 1223,
+    "firstSeq": 1,
+    "lastSeq": 14685,
+    "duplicateCount": 0,
+    "gapCount": 0,
+    "finalTextSha256": "65380735c9a752758c7bace17cc722d86400480a0ae1dff62759f37eafa4b039",
+    "ok": true
+  },
+  "cadence": {
+    "queuedDurationMs": 2341.2999999970198,
+    "paintCount": 49,
+    "updatesPerSecond": 20.928543971324636
+  },
+  "resources": {
+    "markdownCacheEntries": null,
+    "markdownCacheBytes": null,
+    "highlightCacheEntries": null,
+    "highlightCacheBytes": null,
+    "liveConversations": null,
+    "liveSegments": null,
+    "liveTools": null,
+    "usedHeapBytes": 133352955,
+    "heapMeasurement": "supported"
+  },
+  "acceptance": {
+    "batchToPaint": true,
+    "inputToPaint": false,
+    "longTask": true,
+    "visualCadence": false,
+    "eventIntegrity": true,
+    "passed": false
+  }
+}

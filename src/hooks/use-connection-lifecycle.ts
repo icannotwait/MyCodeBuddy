@@ -6,7 +6,13 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
-import { AGENT_LABELS, type AgentType, type PromptDraft } from "@/lib/types"
+import { getCurrentEffectiveAppLocale } from "@/lib/i18n"
+import {
+  AGENT_LABELS,
+  type AgentType,
+  type DelegationRoutePolicy,
+  type PromptDraft,
+} from "@/lib/types"
 
 interface UseConnectionLifecycleOptions {
   contextKey: string
@@ -20,6 +26,12 @@ interface UseConnectionLifecycleOptions {
    * (cross-client viewing) instead of always spawning a fresh agent.
    */
   conversationId?: number
+  /**
+   * Memory-only draft/session route override. Passed at connect time; changing
+   * it on an already-connected draft marks stale via a separate API (does not
+   * auto-reconnect).
+   */
+  delegationRouteOverride?: DelegationRoutePolicy | null
 }
 
 export interface UseConnectionLifecycleReturn {
@@ -88,6 +100,7 @@ export function useConnectionLifecycle({
   workingDir,
   sessionId,
   conversationId,
+  delegationRouteOverride,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
   const { setActiveKey, touchActivity } = useAcpActions()
@@ -167,6 +180,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     conversationIdRef.current = conversationId
   }, [conversationId])
+  const routeOverrideRef = useRef(delegationRouteOverride)
+  useEffect(() => {
+    routeOverrideRef.current = delegationRouteOverride
+  }, [delegationRouteOverride])
   const modeIdRef = useRef<string | null>(modes?.current_mode_id ?? null)
   useEffect(() => {
     modeIdRef.current = modes?.current_mode_id ?? null
@@ -196,7 +213,8 @@ export function useConnectionLifecycle({
         agentType,
         workingDir,
         sessionIdRef.current,
-        conversationIdRef.current
+        conversationIdRef.current,
+        routeOverrideRef.current
       )
       .then(() => {
         if (!cancelled) {
@@ -346,13 +364,17 @@ export function useConnectionLifecycle({
     touchActivity(contextKey)
     if (!status || status === "disconnected" || status === "error") {
       setLastAutoConnectError(null)
-      connConnect(agentType, workingDir, sessionId, conversationId).catch(
-        (e: unknown) => {
-          if (!isExpectedConnectError(e)) {
-            console.error("[ConnLifecycle] connect:", e)
-          }
+      connConnect(
+        agentType,
+        workingDir,
+        sessionId,
+        conversationId,
+        delegationRouteOverride
+      ).catch((e: unknown) => {
+        if (!isExpectedConnectError(e)) {
+          console.error("[ConnLifecycle] connect:", e)
         }
-      )
+      })
     }
   }, [
     isActive,
@@ -360,6 +382,7 @@ export function useConnectionLifecycle({
     workingDir,
     sessionId,
     conversationId,
+    delegationRouteOverride,
     status,
     connConnect,
     contextKey,
@@ -397,7 +420,15 @@ export function useConnectionLifecycle({
           // calls before CurrentModeUpdate arrives from the agent.
           modeIdRef.current = modeId
         }
-        await sendPrompt(draft.blocks, opts)
+        await sendPrompt(draft.blocks, {
+          folderId: opts?.folderId,
+          conversationId: opts?.conversationId,
+          clientMessageId: opts?.clientMessageId,
+          promptContext: {
+            visibleText: draft.displayText,
+            locale: getCurrentEffectiveAppLocale(),
+          },
+        })
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another

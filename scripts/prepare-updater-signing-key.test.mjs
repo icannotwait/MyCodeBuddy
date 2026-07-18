@@ -168,7 +168,7 @@ function assertModeIfPosix(filePath, mode) {
 
 test("updatePublicKey changes only plugins.updater.pubkey", () => {
   const config = {
-    productName: "MyCodeBuddy",
+    productName: "DrawCode",
     bundle: {
       active: true,
     },
@@ -186,7 +186,7 @@ test("updatePublicKey changes only plugins.updater.pubkey", () => {
   const updated = updatePublicKey(config, "public-key")
 
   assert.deepEqual(updated, {
-    productName: "MyCodeBuddy",
+    productName: "DrawCode",
     bundle: {
       active: true,
     },

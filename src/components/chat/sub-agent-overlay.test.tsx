@@ -100,13 +100,56 @@ describe("SubAgentOverlay", () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it("collapses to a pill summarizing the count by default", () => {
+  it("expands by default and lists every sub-agent", () => {
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
       source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
     ]
     renderWithIntl(
       <SubAgentOverlay delegations={delegations} overlayKey="k-1" />
+    )
+    // Header title + both rows (one per delegation).
+    expect(screen.getByText("Sub-agents")).toBeInTheDocument()
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
+    expect(screen.getByText("Investigate flaky test")).toBeInTheDocument()
+    expect(screen.getByText("Write the fix")).toBeInTheDocument()
+  })
+
+  it("keeps long multi-line task text to a single truncated line", () => {
+    // Multi-line tasks (and any long shell-context noise) must stay one line
+    // with ellipsis — not expand the overlay card via break-words.
+    const longTask =
+      "Line one of a very long delegated task description.\n" +
+      "Line two keeps going with more context that used to wrap.\n" +
+      "Line three would inflate the overlay without truncate."
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[source("pt-1", { agent_type: "codex", task: longTask })]}
+        overlayKey="k-truncate"
+      />
+    )
+    const row = screen.getByTestId("sub-agent-row")
+    const taskEl = Array.from(row.querySelectorAll("div")).find((el) =>
+      el.classList.contains("truncate")
+    )
+    expect(taskEl).toBeDefined()
+    expect(taskEl).toHaveClass("truncate")
+    expect(taskEl).not.toHaveClass("break-words")
+    expect(taskEl).toHaveAttribute("title", longTask)
+    expect(taskEl?.textContent).toContain("Line one of a very long")
+  })
+
+  it("collapses to a pill summarizing the count when defaultExpanded is false", () => {
+    const delegations = [
+      source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+      source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
+    ]
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={delegations}
+        overlayKey="k-collapsed"
+        defaultExpanded={false}
+      />
     )
     expect(screen.getByText("Sub-agents 2")).toBeInTheDocument()
     // Rows are hidden while collapsed.
@@ -119,7 +162,11 @@ describe("SubAgentOverlay", () => {
       source("pt-2", { agent_type: "claude_code", task: "Write the fix" }),
     ]
     renderWithIntl(
-      <SubAgentOverlay delegations={delegations} overlayKey="k-2" />
+      <SubAgentOverlay
+        delegations={delegations}
+        overlayKey="k-2"
+        defaultExpanded={false}
+      />
     )
     fireEvent.click(screen.getByText("Sub-agents 2").closest("button")!)
 
@@ -228,5 +275,68 @@ describe("SubAgentOverlay", () => {
     )
     expect(screen.getByTestId("sub-agent-row")).toBeInTheDocument()
     expect(screen.queryByText(/^#/)).not.toBeInTheDocument()
+  })
+
+  it("renders no cancel action for native activity", () => {
+    const nativeRunningActivity =
+      (): import("@/lib/types").DelegationActivityView => ({
+        origin: "native",
+        authoritative: false,
+        platform: "codex",
+        operation: "spawn",
+        observed_status: "running",
+        task_id: "agent-native-1",
+        started_at: "2026-07-16T10:00:00Z",
+        updated_at: "2026-07-16T10:00:00Z",
+      })
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        activities={[nativeRunningActivity()]}
+        overlayKey="k-native"
+        defaultExpanded
+      />
+    )
+    expect(screen.getByTestId("sub-agent-origin-native")).toBeInTheDocument()
+    const row = screen.getByTestId("sub-agent-row")
+    expect(row).toHaveAttribute("data-origin", "native")
+    expect(row).toHaveAttribute("data-authoritative", "false")
+    // Native row is an informational div, not a button / dialog trigger.
+    expect(row.tagName.toLowerCase()).toBe("div")
+    expect(row.closest("button")).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /cancel/i })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("groups Codeg and native activity with origin labels", () => {
+    const delegations = [
+      source("pt-1", { agent_type: "codex", task: "Codeg child work" }),
+    ]
+    const native: import("@/lib/types").DelegationActivityView = {
+      origin: "native",
+      authoritative: false,
+      platform: "grok",
+      operation: "spawn",
+      observed_status: "running",
+      started_at: "2026-07-16T10:00:00Z",
+      updated_at: "2026-07-16T10:00:00Z",
+    }
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={delegations}
+        activities={[native]}
+        overlayKey="k-mixed"
+        defaultExpanded
+      />
+    )
+    expect(screen.getByTestId("sub-agent-origin-codeg")).toBeInTheDocument()
+    expect(screen.getByTestId("sub-agent-origin-native")).toBeInTheDocument()
+    expect(screen.getByText("Codeg")).toBeInTheDocument()
+    expect(screen.getByText("Native")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /cancel/i })
+    ).not.toBeInTheDocument()
   })
 })

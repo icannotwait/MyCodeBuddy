@@ -11,6 +11,11 @@ import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom"
 
 export type MessageThreadProps = ComponentProps<typeof StickToBottom>
 
+/**
+ * Shared transcript scroll shell. Defaults stay `initial="instant"` and
+ * `resize="smooth"` for non-streaming callers; message list overrides
+ * `resize` to `"instant"` while a live footer is active.
+ */
 export const MessageThread = ({ className, ...props }: MessageThreadProps) => (
   <StickToBottom
     className={cn("relative flex-1 overflow-y-hidden", className)}
@@ -75,17 +80,27 @@ export const MessageThreadEmptyState = ({
   )
 }
 
-export type MessageThreadScrollButtonProps = ComponentProps<typeof Button>
+export type MessageThreadScrollButtonProps = ComponentProps<typeof Button> & {
+  /**
+   * Re-arm live-footer follow intent before scrolling. Message list wires
+   * `scrollApiRef.current?.footerScroll?.markAtBottom` because the button sits
+   * outside `MessageScrollProvider`.
+   */
+  onBeforeScrollToBottom?: () => void
+}
 
 export const MessageThreadScrollButton = ({
   className,
+  onBeforeScrollToBottom,
   ...props
 }: MessageThreadScrollButtonProps) => {
   const { isAtBottom, scrollToBottom } = useStickToBottomContext()
-
+  // Calling scrollToBottom without preserveScrollPosition re-locks stick-to-bottom;
+  // markAtBottom (via onBeforeScrollToBottom) re-enables LiveFooterScrollCoordinator.
   const handleScrollToBottom = useCallback(() => {
+    onBeforeScrollToBottom?.()
     scrollToBottom()
-  }, [scrollToBottom])
+  }, [onBeforeScrollToBottom, scrollToBottom])
 
   return (
     !isAtBottom && (
@@ -95,6 +110,7 @@ export const MessageThreadScrollButton = ({
           className
         )}
         onClick={handleScrollToBottom}
+        data-message-scroll-to-bottom
         size="icon"
         type="button"
         variant="outline"

@@ -21,7 +21,13 @@ import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
 } from "@/contexts/workspace-context"
+import { useIgnoredFileTree } from "@/hooks/use-ignored-file-tree"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import {
+  advanceLazyLoadGeneration,
+  finishLazyLoad,
+  isIgnoreFileName,
+} from "@/hooks/use-file-tree"
 import { findOwningFolder } from "@/lib/file-open-target"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
@@ -73,6 +79,7 @@ import {
 } from "@/components/ui/alert-dialog"
 import {
   ContextMenu,
+  ContextMenuCheckboxItem,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSub,
@@ -125,6 +132,7 @@ async function copyPathToClipboard(
 
 const FILE_TREE_ROOT_PATH = "__workspace_root__"
 const GITIGNORE_MUTED_CLASS = "text-muted-foreground/55"
+const EMPTY_IGNORED_PATHS: ReadonlySet<string> = new Set()
 
 interface FileActionTarget {
   kind: "file" | "dir"
@@ -895,6 +903,22 @@ export function FileTreeTab() {
     )
   }, [activeFilePath, folder])
   const workspaceState = useWorkspaceStateStore(folder?.path ?? null)
+  const handleIgnoredTreeError = useCallback(() => {
+    toast.error(t("toasts.loadIgnoredFilesFailed"))
+  }, [t])
+  const {
+    tree: sourceTree,
+    showIgnored,
+    setShowIgnored,
+    refresh: refreshIgnoredTree,
+    treeGeneration,
+  } = useIgnoredFileTree({
+    folderPath: folder?.path ?? null,
+    fallbackTree: workspaceState.tree,
+    workspaceSeq: workspaceState.seq,
+    subscribeEnvelopes: workspaceState.subscribeEnvelopes,
+    onError: handleIgnoredTreeError,
+  })
   const [nodes, setNodes] = useState<FileTreeNode[]>([])
   const [gitStatusByPath, setGitStatusByPath] = useState<Map<string, string>>(
     new Map()
@@ -967,19 +991,35 @@ export function FileTreeTab() {
   const lazyLoadedChildrenByPathRef = useRef<Map<string, FileTreeNode[]>>(
     new Map()
   )
-  const lazyLoadingDirPathsRef = useRef<Set<string>>(new Set())
+  const lazyLoadingDirPathsRef = useRef<Map<string, number>>(new Map())
   const loadDirectoryChildrenRef = useRef<
     ((dirPath: string) => Promise<void>) | null
   >(null)
   const expandedPathsRef = useRef<Set<string>>(new Set([FILE_TREE_ROOT_PATH]))
-  const workspaceTreeRef = useRef<FileTreeNode[]>([])
+  const workspaceTreeRef = useRef<FileTreeNode[]>(sourceTree)
+  const appliedTreeGenerationRef = useRef<number | null>(null)
+  const lazyLoadGenerationRef = useRef(0)
+  const lazyRequestConfigRef = useRef({
+    rootPath: folder?.path ?? null,
+    showIgnored,
+    treeGeneration,
+  })
+  lazyRequestConfigRef.current = {
+    rootPath: folder?.path ?? null,
+    showIgnored,
+    treeGeneration,
+  }
 
   useEffect(() => {
     setExpandedPaths(new Set([FILE_TREE_ROOT_PATH]))
     previousExpandedPathsRef.current = new Set([FILE_TREE_ROOT_PATH])
+    expandedPathsRef.current = new Set([FILE_TREE_ROOT_PATH])
     setGitignoreIgnoredPaths(new Set())
     lazyLoadedChildrenByPathRef.current.clear()
-    lazyLoadingDirPathsRef.current.clear()
+    lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+      lazyLoadingDirPathsRef.current,
+      lazyLoadGenerationRef.current
+    )
   }, [folder?.path])
 
   // Handle pending reveal path: expand all ancestor directories once tree is loaded
@@ -1035,7 +1075,14 @@ export function FileTreeTab() {
         (path) => path !== FILE_TREE_ROOT_PATH
       )
       lazyLoadedChildrenByPathRef.current.clear()
+      lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+        lazyLoadingDirPathsRef.current,
+        lazyLoadGenerationRef.current
+      )
       await workspaceState.requestResync("manual_refresh")
+      if (showIgnored) {
+        await refreshIgnoredTree()
+      }
       // Re-hydrate children for directories beyond WORKSPACE_TREE_MAX_DEPTH
       // that are still expanded — the backend snapshot does not include them.
       const loader = loadDirectoryChildrenRef.current
@@ -1045,23 +1092,8 @@ export function FileTreeTab() {
         }
       }
     },
-    [folder?.path, workspaceState]
+    [folder?.path, refreshIgnoredTree, showIgnored, workspaceState]
   )
-
-  // Tree updates are the only source that should cause a full setNodes.
-  // applyLazyTreeOverrides rebuilds every directory node object, which forces
-  // React to re-render the entire tree. Keeping this effect narrow avoids
-  // wasted work on health / seq / error / git transitions that don't touch
-  // the tree shape (e.g. the intermediate "resyncing" patch during a refresh).
-  useEffect(() => {
-    workspaceTreeRef.current = workspaceState.tree
-    setNodes(
-      applyLazyTreeOverrides(
-        workspaceState.tree,
-        lazyLoadedChildrenByPathRef.current
-      )
-    )
-  }, [folder?.path, workspaceState.tree])
 
   useEffect(() => {
     const nextStatusByPath = new Map<string, string>()
@@ -1086,7 +1118,12 @@ export function FileTreeTab() {
       const normalizedDirPath = normalizeComparePath(dirPath)
       if (!normalizedDirPath) return
       if (lazyLoadedChildrenByPathRef.current.has(normalizedDirPath)) return
-      if (lazyLoadingDirPathsRef.current.has(normalizedDirPath)) return
+      if (
+        lazyLoadingDirPathsRef.current.get(normalizedDirPath) ===
+        lazyLoadGenerationRef.current
+      ) {
+        return
+      }
 
       // Check the backend tree (source of truth), not the rendered `nodes`.
       // `nodes` carries stale lazy-cache overrides that don't invalidate
@@ -1104,12 +1141,30 @@ export function FileTreeTab() {
         return
       }
 
-      lazyLoadingDirPathsRef.current.add(normalizedDirPath)
+      const requestRootPath = rootPath
+      const requestShowIgnored = showIgnored
+      const requestTreeGeneration = treeGeneration
+      const requestGeneration = lazyLoadGenerationRef.current
+      lazyLoadingDirPathsRef.current.set(
+        normalizedDirPath,
+        requestGeneration
+      )
       try {
         const subtree = await getFileTree(
-          joinFsPath(rootPath, normalizedDirPath),
-          1
+          joinFsPath(requestRootPath, normalizedDirPath),
+          1,
+          requestShowIgnored
         )
+        const current = lazyRequestConfigRef.current
+        if (
+          current.rootPath !== requestRootPath ||
+          current.showIgnored !== requestShowIgnored ||
+          current.treeGeneration !== requestTreeGeneration ||
+          lazyLoadingDirPathsRef.current.get(normalizedDirPath) !==
+            requestGeneration
+        ) {
+          return
+        }
         const prefixed = prefixFileTreeNodePaths(subtree, normalizedDirPath)
         lazyLoadedChildrenByPathRef.current.set(normalizedDirPath, prefixed)
         setNodes((prev) =>
@@ -1118,15 +1173,47 @@ export function FileTreeTab() {
       } catch {
         // Ignore lazy load failures and keep current collapsed/empty state.
       } finally {
-        lazyLoadingDirPathsRef.current.delete(normalizedDirPath)
+        finishLazyLoad(
+          lazyLoadingDirPathsRef.current,
+          normalizedDirPath,
+          requestGeneration
+        )
       }
     },
-    [folder?.path]
+    [folder?.path, showIgnored, treeGeneration]
   )
 
   useEffect(() => {
     loadDirectoryChildrenRef.current = loadDirectoryChildren
   }, [loadDirectoryChildren])
+
+  // Root snapshots and lazy children belong to one folder/mode generation.
+  // A transition discards both caches before reloading expanded deep paths.
+  useEffect(() => {
+    const generationChanged =
+      appliedTreeGenerationRef.current !== treeGeneration
+    if (generationChanged) {
+      appliedTreeGenerationRef.current = treeGeneration
+      lazyLoadedChildrenByPathRef.current.clear()
+      lazyLoadGenerationRef.current = advanceLazyLoadGeneration(
+        lazyLoadingDirPathsRef.current,
+        lazyLoadGenerationRef.current
+      )
+    }
+
+    workspaceTreeRef.current = sourceTree
+    setNodes(
+      applyLazyTreeOverrides(sourceTree, lazyLoadedChildrenByPathRef.current)
+    )
+
+    if (!generationChanged) return
+    const loader = loadDirectoryChildrenRef.current
+    if (!loader) return
+    for (const path of expandedPathsRef.current) {
+      if (path === FILE_TREE_ROOT_PATH) continue
+      void loader(path)
+    }
+  }, [folder?.path, sourceTree, treeGeneration])
 
   useEffect(() => {
     expandedPathsRef.current = expandedPaths
@@ -1273,7 +1360,7 @@ export function FileTreeTab() {
   }, [filePathSet])
 
   useEffect(() => {
-    if (!folder?.path) {
+    if (!folder?.path || !showIgnored) {
       setGitignoreIgnoredPaths(new Set())
       return
     }
@@ -1292,14 +1379,26 @@ export function FileTreeTab() {
         const children = dirChildrenByPath.get(dirPath)
         if (!children || children.length === 0) continue
 
-        const gitignoreNode = children.find(
-          (child) => child.kind === "file" && child.name === ".gitignore"
+        // Honor the same gitignore-compatible set as `@` file search:
+        // .gitignore / .ignore / .rgignore (union of patterns in this dir).
+        const ignoreNodes = children.filter(
+          (child) => child.kind === "file" && isIgnoreFileName(child.name)
         )
-        if (!gitignoreNode || gitignoreNode.kind !== "file") continue
+        if (ignoreNodes.length === 0) continue
 
         try {
-          const result = await readFilePreview(folder.path, gitignoreNode.path)
-          const matcher = ignore().add(result.content)
+          const matcher = ignore()
+          for (const ignoreNode of ignoreNodes) {
+            try {
+              const result = await readFilePreview(
+                folder.path,
+                ignoreNode.path
+              )
+              matcher.add(result.content)
+            } catch {
+              // skip unreadable ignore file; others in this dir still apply
+            }
+          }
 
           // Collect all descendant nodes so multi-level patterns like
           // "public/vs" can be matched using relative paths.
@@ -1343,7 +1442,7 @@ export function FileTreeTab() {
     return () => {
       canceled = true
     }
-  }, [dirChildrenByPath, expandedDirPaths, folder?.path])
+  }, [dirChildrenByPath, expandedDirPaths, folder?.path, showIgnored])
 
   const gitChangedDirPaths = useMemo(() => {
     const dirs = new Set<string>()
@@ -2127,7 +2226,11 @@ export function FileTreeTab() {
                           gitStatusByPath={gitStatusByPath}
                           gitChangedDirPaths={gitChangedDirPaths}
                           untrackedDirPaths={untrackedDirPaths}
-                          gitignoreIgnoredPaths={gitignoreIgnoredPaths}
+                          gitignoreIgnoredPaths={
+                            showIgnored
+                              ? gitignoreIgnoredPaths
+                              : EMPTY_IGNORED_PATHS
+                          }
                           ancestorGitignoreIgnored={false}
                           ancestorUntracked={false}
                           onOpenFilePreview={(path) => {
@@ -2230,6 +2333,14 @@ export function FileTreeTab() {
                     >
                       {t("reloadFromDisk")}
                     </ContextMenuItem>
+                    <ContextMenuCheckboxItem
+                      checked={showIgnored}
+                      onCheckedChange={(checked) =>
+                        setShowIgnored(checked === true)
+                      }
+                    >
+                      {t("showIgnoredFiles")}
+                    </ContextMenuCheckboxItem>
                     <ContextMenuSub>
                       <ContextMenuSubTrigger>
                         {t("openIn")}
@@ -2310,6 +2421,12 @@ export function FileTreeTab() {
           >
             {t("reloadFromDisk")}
           </ContextMenuItem>
+          <ContextMenuCheckboxItem
+            checked={showIgnored}
+            onCheckedChange={(checked) => setShowIgnored(checked === true)}
+          >
+            {t("showIgnoredFiles")}
+          </ContextMenuCheckboxItem>
         </ContextMenuContent>
       </ContextMenu>
       {webMode && folder?.path && (

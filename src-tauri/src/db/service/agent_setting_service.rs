@@ -69,6 +69,7 @@ pub async fn ensure_defaults(
             agent_type: Set(agent_type),
             registry_id: Set(default.registry_id.clone()),
             enabled: Set(default_enabled(default.agent_type)),
+            show_thinking: Set(false),
             sort_order: Set(default.default_sort_order),
             installed_version: Set(None),
             env_json: Set(None),
@@ -140,6 +141,26 @@ pub async fn update(
     active.enabled = Set(patch.enabled);
     active.env_json = Set(patch.env_json);
     active.model_provider_id = Set(patch.model_provider_id);
+    active.updated_at = Set(Utc::now());
+    active.update(conn).await?;
+    Ok(())
+}
+
+pub async fn update_show_thinking(
+    conn: &DatabaseConnection,
+    agent_type: AgentType,
+    show_thinking: bool,
+) -> Result<(), DbError> {
+    let agent_type_str = serde_json::to_string(&agent_type)
+        .map_err(|e| DbError::Migration(format!("agent_type serialize failed: {e}")))?;
+    let model = agent_setting::Entity::find()
+        .filter(agent_setting::Column::AgentType.eq(agent_type_str.clone()))
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::Migration(format!("agent setting not found: {agent_type_str}")))?;
+
+    let mut active = model.into_active_model();
+    active.show_thinking = Set(show_thinking);
     active.updated_at = Set(Utc::now());
     active.update(conn).await?;
     Ok(())
@@ -223,4 +244,55 @@ pub async fn find_by_model_provider_id(
 fn is_sqlite_full_error(err: &DbError) -> bool {
     let message = err.to_string();
     message.contains("database or disk is full") || message.contains("(code: 13)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_helpers::fresh_in_memory_db;
+
+    #[tokio::test]
+    async fn thinking_visibility_defaults_off_and_updates_in_isolation() {
+        let db = fresh_in_memory_db().await;
+        let defaults = [AgentDefaultInput {
+            agent_type: AgentType::Codex,
+            registry_id: "codex-acp".to_string(),
+            default_sort_order: 3,
+        }];
+        ensure_defaults(&db.conn, &defaults)
+            .await
+            .expect("ensure default");
+
+        update(
+            &db.conn,
+            AgentType::Codex,
+            AgentSettingsUpdate {
+                enabled: false,
+                env_json: Some(r#"{"KEEP":"1"}"#.to_string()),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("seed runtime settings");
+
+        let before = get_by_agent_type(&db.conn, AgentType::Codex)
+            .await
+            .expect("read default")
+            .expect("agent row");
+        assert!(!before.show_thinking);
+
+        update_show_thinking(&db.conn, AgentType::Codex, true)
+            .await
+            .expect("update display preference");
+
+        let after = get_by_agent_type(&db.conn, AgentType::Codex)
+            .await
+            .expect("read updated")
+            .expect("agent row");
+        assert!(after.show_thinking);
+        assert!(!after.enabled);
+        assert_eq!(after.env_json.as_deref(), Some(r#"{"KEEP":"1"}"#));
+        assert_eq!(after.sort_order, 3);
+        assert_eq!(after.model_provider_id, None);
+    }
 }

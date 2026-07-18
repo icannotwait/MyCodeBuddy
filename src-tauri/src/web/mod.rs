@@ -783,6 +783,26 @@ pub(crate) async fn do_start_web_server_tauri(
         data_dir: crate::paths::resolve_effective_data_dir(
             &app.path().app_data_dir().unwrap_or_default(),
         ),
+        // Clone the desktop-managed registry so HTTP handlers and direct Tauri
+        // commands observe the same exclusion set.
+        internal_sessions: app
+            .state::<Arc<crate::auto_title::InternalAgentSessionRegistry>>()
+            .inner()
+            .clone(),
+        auto_title_coordinator: app
+            .state::<Arc<crate::auto_title::AutoTitleCoordinator>>()
+            .inner()
+            .clone(),
+        conversation_experience_gate: app
+            .state::<Arc<crate::commands::conversation_experience::ConversationExperienceMutationGate>>()
+            .inner()
+            .clone(),
+        // Clone the desktop-managed registry so HTTP handlers and direct Tauri
+        // commands observe the same limit epoch and live jobs.
+        reference_search_registry: app
+            .state::<Arc<crate::reference_search::ReferenceSearchRegistry>>()
+            .inner()
+            .clone(),
         web_server_state: WebServerState::new(), // placeholder; not used by handlers
         chat_channel_manager: crate::app_state::default_chat_channel_manager(),
         workspace_transfer: app
@@ -797,15 +817,28 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<crate::pet_state_mapper::PetStateHandle>()
             .inner()
             .clone(),
-        // Reuse the live broker / token registry / socket path from the
-        // Tauri-managed state so HTTP-side delegation commands target the
-        // same listener the desktop process is already running.
+        // Reuse the live broker / runtime settings / token registry / socket
+        // path from the Tauri-managed state so HTTP-side delegation commands
+        // target the same listener and watch channel the desktop process is
+        // already running.
         delegation_broker: app
             .state::<Arc<crate::acp::delegation::broker::DelegationBroker>>()
             .inner()
             .clone(),
+        delegation_metrics: app
+            .state::<Arc<crate::acp::delegation::metrics::DelegationMetrics>>()
+            .inner()
+            .clone(),
+        delegation_runtime_settings: app
+            .state::<crate::commands::delegation::DelegationRuntimeSettings>()
+            .inner()
+            .clone(),
         delegation_tokens: app
             .state::<Arc<crate::acp::delegation::listener::TokenRegistry>>()
+            .inner()
+            .clone(),
+        delegation_leases: app
+            .state::<Arc<crate::acp::delegation::lease::CompanionLeaseRegistry>>()
             .inner()
             .clone(),
         delegation_socket_path: app
@@ -944,9 +977,7 @@ pub async fn probe_web_service_port(
 
 #[cfg(test)]
 mod local_address_tests {
-    use super::{
-        addresses_for_bind, advertise_host, get_local_addresses, is_advertisable_ipv4,
-    };
+    use super::{addresses_for_bind, advertise_host, get_local_addresses, is_advertisable_ipv4};
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
@@ -956,7 +987,7 @@ mod local_address_tests {
         assert!(!is_advertisable_ipv4(Ipv4Addr::LOCALHOST)); // 127.0.0.1
         assert!(!is_advertisable_ipv4(Ipv4Addr::new(169, 254, 3, 4))); // link-local
         assert!(!is_advertisable_ipv4(Ipv4Addr::UNSPECIFIED)); // 0.0.0.0
-        // Accepted: ordinary private/LAN addresses the user may want to share.
+                                                               // Accepted: ordinary private/LAN addresses the user may want to share.
         assert!(is_advertisable_ipv4(Ipv4Addr::new(192, 168, 1, 5)));
         assert!(is_advertisable_ipv4(Ipv4Addr::new(10, 0, 0, 4)));
         assert!(is_advertisable_ipv4(Ipv4Addr::new(172, 16, 0, 9)));
@@ -1016,7 +1047,10 @@ mod local_address_tests {
         );
         // A wildcard bind stays wildcard, so addresses_for_bind still enumerates.
         assert_eq!(
-            advertise_host(Some("0.0.0.0:3080".parse::<SocketAddr>().unwrap()), "0.0.0.0"),
+            advertise_host(
+                Some("0.0.0.0:3080".parse::<SocketAddr>().unwrap()),
+                "0.0.0.0"
+            ),
             "0.0.0.0"
         );
         // End to end: a `localhost` config advertises only loopback, never LAN.

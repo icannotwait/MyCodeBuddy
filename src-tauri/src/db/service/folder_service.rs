@@ -31,12 +31,14 @@ fn parse_agent_type(s: &Option<String>) -> Option<AgentType> {
 
 fn to_detail(m: folder::Model) -> FolderDetail {
     let default_agent_type = parse_agent_type(&m.default_agent_type);
+    let last_agent_type = parse_agent_type(&m.last_agent_type);
     FolderDetail {
         id: m.id,
         name: m.name,
         path: m.path,
         git_branch: m.git_branch,
         default_agent_type,
+        last_agent_type,
         last_opened_at: m.last_opened_at,
         sort_order: m.sort_order,
         color: m.color,
@@ -132,6 +134,7 @@ async fn add_folder_inner(
             path: Set(path.to_string()),
             git_branch: Set(None),
             default_agent_type: Set(None),
+            last_agent_type: Set(None),
             last_opened_at: Set(now),
             created_at: Set(now),
             updated_at: Set(now),
@@ -176,6 +179,7 @@ pub async fn add_chat_folder(
         path: Set(path.to_string()),
         git_branch: Set(None),
         default_agent_type: Set(None),
+        last_agent_type: Set(None),
         last_opened_at: Set(now),
         created_at: Set(now),
         updated_at: Set(now),
@@ -233,6 +237,35 @@ pub async fn update_folder_default_agent(
 
     let mut active = row.into_active_model();
     active.default_agent_type = Set(serialized);
+    active.updated_at = Set(Utc::now());
+    let updated = active.update(conn).await?;
+    Ok(Some(to_detail(updated)))
+}
+
+pub async fn update_folder_last_agent(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+) -> Result<Option<FolderDetail>, DbError> {
+    let row = folder::Entity::find_by_id(folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .filter(folder::Column::Kind.eq(FolderKind::Regular))
+        .one(conn)
+        .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let value = serde_json::to_value(agent_type)
+        .map_err(|e| DbError::Migration(format!("agent_type serialize failed: {e}")))?;
+    let serialized = value
+        .as_str()
+        .ok_or_else(|| DbError::Migration("agent_type did not serialize as text".to_string()))?
+        .to_string();
+
+    let mut active = row.into_active_model();
+    active.last_agent_type = Set(Some(serialized));
     active.updated_at = Set(Utc::now());
     let updated = active.update(conn).await?;
     Ok(Some(to_detail(updated)))
@@ -372,4 +405,53 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_chat_folder, get_folder_by_id, update_folder_last_agent};
+    use crate::db::entities::folder;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::models::agent::AgentType;
+    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+    #[tokio::test]
+    async fn last_agent_round_trips_only_for_regular_folders() {
+        let db = fresh_in_memory_db().await;
+        let regular_id = seed_folder(&db, "/tmp/codeg-last-agent").await;
+        let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-last-agent")
+            .await
+            .expect("create chat folder");
+
+        let updated = update_folder_last_agent(&db.conn, regular_id, AgentType::Codex)
+            .await
+            .expect("update regular folder")
+            .expect("regular folder detail");
+        assert_eq!(updated.last_agent_type, Some(AgentType::Codex));
+        assert_eq!(updated.default_agent_type, None);
+
+        let chat_update = update_folder_last_agent(&db.conn, chat.id, AgentType::Gemini)
+            .await
+            .expect("ignore chat folder");
+        assert!(chat_update.is_none());
+        let chat_after = get_folder_by_id(&db.conn, chat.id)
+            .await
+            .expect("read chat folder")
+            .expect("chat folder");
+        assert_eq!(chat_after.last_agent_type, None);
+
+        let row = folder::Entity::find_by_id(regular_id)
+            .one(&db.conn)
+            .await
+            .expect("read raw folder")
+            .expect("raw folder");
+        let mut active = row.into_active_model();
+        active.last_agent_type = Set(Some("future_agent".to_string()));
+        active.update(&db.conn).await.expect("write invalid value");
+        let invalid = get_folder_by_id(&db.conn, regular_id)
+            .await
+            .expect("read invalid projection")
+            .expect("regular folder");
+        assert_eq!(invalid.last_agent_type, None);
+    }
 }

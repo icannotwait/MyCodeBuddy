@@ -4,6 +4,7 @@ pub mod app_update;
 pub mod automation;
 pub mod backup;
 pub mod chat_channel;
+pub mod conversation_experience;
 pub mod conversations;
 pub mod delegation;
 pub mod experts;
@@ -15,13 +16,14 @@ pub mod folders;
 pub mod logging;
 pub mod mcp;
 pub mod model_provider;
-pub mod office_tools;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;
+pub mod office_tools;
 pub mod pet;
 pub mod project_boot;
 pub mod question;
 pub mod quick_messages;
+pub mod reference_search;
 #[cfg(feature = "tauri-runtime")]
 pub mod remote_proxy;
 #[cfg(feature = "tauri-runtime")]

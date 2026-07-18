@@ -68,7 +68,7 @@ pub const BACKUP_I18N_KEY_CANCELLED: &str = "backup.error.cancelled";
 /// A restore is already staged and awaiting restart; only one at a time.
 pub const BACKUP_I18N_KEY_ALREADY_PENDING: &str = "backup.restore.error.alreadyPending";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppErrorCode {
     InvalidInput,
@@ -96,6 +96,46 @@ pub enum AppErrorCode {
     /// Selected terminal shell is not a supported dialect for ACP execution.
     /// Connection preflight only — maps to HTTP 400.
     TerminalShellUnsupported,
+    /// Managed Codeg route could not be established (child never falls back).
+    RouteUnavailable,
+    /// Session-id reuse found an existing connection with an incompatible route.
+    /// `detail` carries the existing connection id.
+    SessionRouteConflict,
+
+    // ─── Incremental reference search ─────────────────────────────────
+    /// Search job was cancelled by a later cancel/start for the same source.
+    /// Ordering/control result — HTTP 409.
+    Cancelled,
+    /// A start was rejected because a newer source sequence already advanced.
+    /// Ordering/control result — HTTP 409.
+    StaleStart,
+    /// Cached search job TTL expired before the client finished paging.
+    /// HTTP 410 Gone.
+    JobExpired,
+    /// Page request referenced a stale or unknown page for the active job.
+    /// Ordering/control result — HTTP 409.
+    StalePage,
+    /// Result-limit epoch changed mid-stream; client must restart.
+    /// Ordering/control result — HTTP 409.
+    LimitEpochChanged,
+    /// Query regex is empty, oversized, or rejected by the engine.
+    /// HTTP 400.
+    InvalidPattern,
+    /// Source epoch (e.g. git tip) changed during validation/paging.
+    /// Ordering/control result — HTTP 409.
+    SourceEpochChanged,
+    /// Source enumeration exceeded its time budget.
+    /// HTTP 408.
+    SourceTimeout,
+    /// Search registry refused a new job because it is at capacity.
+    /// HTTP 429.
+    RegistryOverloaded,
+    /// Underlying source (filesystem / DB / git) failed unexpectedly.
+    /// HTTP 500.
+    SourceFailed,
+    /// Protocol identity, scope, or other request shape is invalid.
+    /// HTTP 400.
+    InvalidRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]

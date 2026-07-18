@@ -6,13 +6,26 @@ import { fileURLToPath } from "node:url"
 
 const tauriDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 
-test("default Tauri bundle includes the Codex ACP adapter", () => {
+test("default Tauri bundle ships only the codeg-mcp sidecar", () => {
   const config = JSON.parse(
     readFileSync(join(tauriDir, "tauri.conf.json"), "utf8")
   )
 
-  assert.ok(
-    config.bundle.externalBin.includes("binaries/codex-acp"),
-    "default local bundles must include codex-acp"
+  assert.deepEqual(
+    config.bundle.externalBin,
+    ["binaries/codeg-mcp"],
+    "Codex ACP must come from npm, not a bundled sidecar"
+  )
+})
+
+test("release Tauri bundle ships only the codeg-mcp sidecar", () => {
+  const config = JSON.parse(
+    readFileSync(join(tauriDir, "tauri.release.conf.json"), "utf8")
+  )
+
+  assert.deepEqual(
+    config.bundle.externalBin,
+    ["binaries/codeg-mcp"],
+    "Codex ACP must come from npm, not a bundled sidecar"
   )
 })

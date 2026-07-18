@@ -517,6 +517,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK Management",
     "description": "Manage Agent SDK connection, enabled state, environment variables, config management and version preflight info in one place.",
+    "showThinking": "Show thinking",
     "loadingAgents": "Loading agent list...",
     "agentList": "Agent List",
     "emptyNoAgent": "No available agent.",
@@ -562,7 +563,16 @@
       "noConfigAvailable": "This agent has no configurable options.",
       "modeLabel": "Mode",
       "agentDefaultHint": "Agent default: {value}",
-      "defaultOptionLabel": "Default ({value})"
+      "defaultOptionLabel": "Default ({value})",
+      "routePolicy": "Default route",
+      "routePolicyHint": "Managed agents use this route when a conversation has no override.",
+      "routeEffectiveNative": "Delegation is off — effective route is Native.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "Soft watchdog (seconds)",
+      "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). Does not cancel or change route."
     },
     "actions": {
       "dragSort": "Drag to reorder",
@@ -921,6 +931,7 @@
       "localVersionRemoved": "Local version removed",
       "saveAgentOrderFailed": "Failed to save Agent order",
       "saveAgentSwitchFailed": "Failed to save Agent switch",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
       "saveEnvFailed": "Failed to save environment variables",
       "grokSaved": "Grok config saved",
       "saveGrokNativeFailed": "Failed to save Grok native config",
@@ -977,7 +988,7 @@
       "remoteUnavailable": "{versionText}. Remote version is currently unavailable.",
       "latest": "{versionText}. Already latest.",
       "bundled": "Built in: {version}",
-      "bundledMissing": "Built-in adapter is missing. Reinstall or update MyCodeBuddy."
+      "bundledMissing": "Built-in adapter is missing. Reinstall or update DrawCode."
     },
     "cline": {
       "configDescription": "Configure Cline API provider and credentials. Settings are saved to ~/.cline/data/."
@@ -1085,11 +1096,22 @@
     "restartRequired": "Saved. Restart the app for the change to take effect.",
     "restartNow": "Restart now",
     "restartFailed": "Failed to restart: {message}",
-    "loadFailed": "Load failed: {message}"
+    "loadFailed": "Load failed: {message}",
+    "conversationExperienceTitle": "Conversation experience",
+    "conversationExperienceDescription": "Configure automatic titles and reference search behavior.",
+    "autoTitleAgent": "Automatic title agent",
+    "autoTitleOff": "Off",
+    "autoTitleUnavailable": "{agent} (Unavailable)",
+    "autoTitleSaveFailed": "Failed to save automatic title agent: {message}",
+    "autoTitleLoading": "Loading automatic title settings...",
+    "referenceSearchLimit": "Reference result limit",
+    "referenceSearchLimitHint": "Maximum cached and searched results per resource source (10-500).",
+    "referenceSearchLimitSave": "Save reference limit",
+    "referenceSearchLimitSaveFailed": "Failed to save reference limit: {message}"
   },
   "LoginPage": {
-    "documentTitle": "Login - codeg",
-    "brand": "Codeg",
+    "documentTitle": "Login - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "Enter your access token to connect to the desktop app",
     "tokenPlaceholder": "Access Token",
     "connect": "Connect",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "Chat on top",
       "statusRunningBadge": "Running",
       "statusCancelledBadge": "Cancelled",
+      "statusAwaitingReplyBadge": "Awaiting your reply",
       "conversationCountUnit": "{count, plural, one {# conversation} other {# conversations}}",
       "emptyFolderHint": "No conversations",
       "noMatchingConversations": "No matching conversations",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "Add to session",
       "compareWithBranch": "Compare with branch...",
       "reloadFromDisk": "Reload from disk",
+      "showIgnoredFiles": "Show ignored files",
       "new": "New",
       "newFile": "File",
       "newDirectory": "Directory",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "Failed to download {name}",
         "downloadSaved": "Downloaded {name}",
         "pathCopied": "Path copied",
-        "copyPathFailed": "Failed to copy path"
+        "copyPathFailed": "Failed to copy path",
+        "loadIgnoredFilesFailed": "Failed to load ignored files"
       },
       "createDialog": {
         "newFile": "New file",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "{agent} connection failed",
         "toolFallbackTitle": "Tool",
         "eventErrorTitle": "Agent Error",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} has finished responding",
         "notificationError": "{agent} error: {message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Skills"
+        "mentionGroupSkill": "Skills",
+        "mentionInvalidPattern": "Invalid regular expression",
+        "mentionSourceError": "This source could not be refreshed",
+        "mentionProfileError": "Delegation profiles could not be loaded"
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "Sub-agents",
         "collapsedSummary": "Sub-agents {count}",
-        "collapseAria": "Collapse sub-agents"
+        "collapseAria": "Collapse sub-agents",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "Agent Plan",
@@ -2414,7 +2448,10 @@
             "child_empty": "subagent no output",
             "child_unknown": "subagent unknown error",
             "unknown": "unknown task"
-          }
+          },
+          "active": "Active",
+          "waitingInput": "Waiting for input",
+          "stalled": "No recent agent activity"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "Dismiss",
         "reconnectFailed": "Failed to reconnect session",
         "applied": "New configuration applied",
-        "terminalShellTitle": "Terminal shell updated"
+        "terminalShellTitle": "Terminal shell updated",
+        "delegationRouteTitle": "Delegation route updated"
       },
       "collabAgent": {
         "title": "Sub-agent",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "Background task completed",
         "cardFinishedWithStatus": "Background task finished ({status})",
         "cardResultPending": "Result not returned yet"
+      },
+      "delegationRoute": {
+        "menuLabel": "Delegation route",
+        "inheritGlobal": "Inherit global",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg (inherited)",
+        "updateFailed": "Failed to update route"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Fell back to Native ({reason}). Reconnect to retry Codeg.",
+        "delegationUnavailable": "Codeg route is active but delegation is unavailable.",
+        "reconnect": "Reconnect",
+        "reconnecting": "Reconnecting…",
+        "reconnected": "Reconnected",
+        "reconnectFailed": "Failed to reconnect",
+        "reason": {
+          "native_suppression_unsupported": "native suppression unsupported",
+          "native_suppression_invalid": "native suppression invalid",
+          "companion_binary_unavailable": "companion binary unavailable",
+          "agent_mcp_unsupported": "agent MCP unsupported",
+          "companion_initialization_failed": "companion initialization failed",
+          "unknown": "degraded"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "Switching only changes the address shown and opened here — the service listens on all interfaces and stays reachable at every address.",
     "sectionTitle": "Web Service",
-    "sectionDescription": "Enable to access Codeg remotely via browser",
+    "sectionDescription": "Enable to access DrawCode remotely via browser",
     "port": "Port",
     "status": "Status",
     "autoStart": "Auto-start",
-    "autoStartHint": "Start the Web service when Codeg launches",
+    "autoStartHint": "Start the Web service when DrawCode launches",
     "running": "Running",
     "stopped": "Stopped",
     "processing": "Processing...",
@@ -2782,7 +2844,7 @@
     "copy": "Copy",
     "qrcode": "QR Code",
     "qrcodeTitle": "Scan to Open",
-    "qrcodeHint": "Scan with your phone to open Codeg in a browser",
+    "qrcodeHint": "Scan with your phone to open DrawCode in a browser",
     "addressLabel": "Access Address",
     "tokenLabel": "Access Token",
     "tokenHint": "Enter this token when accessing the Web client for the first time",
@@ -2790,7 +2852,7 @@
     "regenerate": "Regenerate",
     "stalePortOccupiedTitle": "Port {port} is held by another process",
     "stalePortUnknownTitle": "Port {port} status is unclear",
-    "stalePortHint": "Codeg can't bind here until the port is released. Change the port above, or close the process holding it.",
+    "stalePortHint": "DrawCode can't bind here until the port is released. Change the port above, or close the process holding it.",
     "errors": {
       "alreadyRunning": "Web service is already running",
       "invalidAddress": "Invalid host or port format",
@@ -3102,7 +3164,7 @@
   },
   "ScienceSettings": {
     "title": "Scientific Research Skills",
-    "description": "Enable curated scientific-research skills for your AI coding agents — hypothesis generation, experimental design, statistics, visualization, critical appraisal, and literature search. MyCodeBuddy manages a central copy and links each skill into the agents you choose.",
+    "description": "Enable curated scientific-research skills for your AI coding agents — hypothesis generation, experimental design, statistics, visualization, critical appraisal, and literature search. DrawCode manages a central copy and links each skill into the agents you choose.",
     "loading": "Loading science skills…",
     "emptySkills": "No science skills available. Check the application logs.",
     "searchPlaceholder": "Search science skills by name, id, or description",

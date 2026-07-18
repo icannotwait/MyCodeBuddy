@@ -28,6 +28,8 @@ interface ConversationShellProps {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   defaultPath?: string
+  /** Authoritative folder scope for mention search (`ownFolderId`, not `0`). */
+  folderId?: number | null
   agentName?: string
   error: string | null
   claudeApiRetry: ClaudeApiRetryState | null
@@ -87,12 +89,15 @@ interface ConversationShellProps {
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
   topBanner?: ReactNode
+  /** Optional secondary notice under the top banner (e.g. route degraded). */
+  routeNotice?: ReactNode
 }
 
 export function ConversationShell({
   status,
   promptCapabilities,
   defaultPath,
+  folderId = null,
   agentName,
   error,
   claudeApiRetry,
@@ -137,6 +142,7 @@ export function ConversationShell({
   onCancelQueueEdit,
   onForkSend,
   topBanner,
+  routeNotice,
 }: ConversationShellProps) {
   const tAcp = useTranslations("Folder.chat.acpConnections")
   const retryLineText = useMemo(() => {
@@ -197,6 +203,7 @@ export function ConversationShell({
   return (
     <div className="relative flex h-full min-h-0 flex-col">
       {topBanner}
+      {routeNotice}
       <div className="flex-1 min-h-0">{children}</div>
 
       <PermissionDialog
@@ -230,6 +237,7 @@ export function ConversationShell({
               status={status}
               promptCapabilities={promptCapabilities}
               defaultPath={defaultPath}
+              folderId={folderId}
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}

@@ -42,6 +42,7 @@ function conv(id: number): DbConversationSummary {
     title_locked: false,
     agent_type: "claude_code",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -277,6 +278,66 @@ describe("SidebarConversationCard hover quick actions", () => {
     expect(queryByLabelText("Unpin")).toBeNull()
     expect(queryByLabelText("Mark as completed")).toBeNull()
     expect(queryByLabelText("Reopen")).toBeNull()
+  })
+})
+
+describe("SidebarConversationCard awaiting / cancelled presentation", () => {
+  function renderCard(
+    c: DbConversationSummary,
+    { isSelected = false }: { isSelected?: boolean } = {}
+  ) {
+    return renderWithIntl(
+      <SidebarConversationCard
+        conversation={c}
+        isSelected={isSelected}
+        timeLabel="5m"
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+  }
+
+  it("renders required awaiting reply chrome only for unselected pending review", () => {
+    const awaiting = {
+      ...conv(10),
+      status: "pending_review" as const,
+      awaiting_reply_token: "generation-10",
+    }
+    const { getByTitle, container } = renderCard(awaiting)
+    expect(getByTitle("Awaiting your reply")).toHaveClass(
+      "text-destructive",
+      "font-medium"
+    )
+    expect(container.querySelector(".bg-destructive")).not.toBeNull()
+    expect(getByTitle("Awaiting your reply")).toHaveTextContent("5m")
+  })
+
+  it("gives cancelled precedence over a malformed stale token", () => {
+    const cancelled = {
+      ...conv(11),
+      status: "cancelled" as const,
+      awaiting_reply_token: "stale",
+    }
+    const { getByTitle, queryByTitle, container } = renderCard(cancelled)
+    expect(getByTitle("Cancelled")).toBeInTheDocument()
+    expect(queryByTitle("Awaiting your reply")).toBeNull()
+    expect(container.querySelector(".bg-gray-400")).not.toBeNull()
+  })
+
+  it("does not show awaiting chrome when the pending_review card is selected", () => {
+    const awaiting = {
+      ...conv(12),
+      status: "pending_review" as const,
+      awaiting_reply_token: "generation-12",
+    }
+    const { queryByTitle, container } = renderCard(awaiting, {
+      isSelected: true,
+    })
+    expect(queryByTitle("Awaiting your reply")).toBeNull()
+    expect(container.querySelector(".bg-destructive")).toBeNull()
   })
 })
 

@@ -1,7 +1,12 @@
 "use client"
 
 import type { UIMessage } from "ai"
-import type { ComponentProps, HTMLAttributes, ReactElement } from "react"
+import type {
+  ComponentProps,
+  HTMLAttributes,
+  ReactElement,
+  RefObject,
+} from "react"
 
 import { Button } from "@/components/ui/button"
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group"
@@ -11,6 +16,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { scheduleIdleWork } from "@/lib/scheduling/idle-work"
 import { cn } from "@/lib/utils"
 import { useTranslations } from "next-intl"
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
@@ -21,6 +27,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react"
 import {
@@ -30,8 +37,14 @@ import {
 } from "streamdown"
 import { markdownLinkComponents } from "./markdown-link"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
+import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
-import { useStreamdownPlugins } from "./streamdown-plugins"
+import {
+  detectHeavyPlugins,
+  policyFor,
+  type RichContentState,
+  useStreamdownPlugins,
+} from "./streamdown-plugins"
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
   from: UIMessage["role"]
@@ -331,7 +344,11 @@ export const MessageBranchPage = ({
 // use it — they render as plain text + reference badges via PlainTextWithBadges
 // (see message/plain-text-with-badges.tsx) — so the former user-only `softBreaks`
 // / `/slash`-badging hooks were removed.
-export type MessageResponseProps = ComponentProps<typeof Streamdown>
+export type { RichContentState }
+export type MessageResponseProps = ComponentProps<typeof Streamdown> & {
+  richContentState?: RichContentState
+  autolinkLocalPaths?: boolean
+}
 
 // remark-math only supports `$` delimiters. Convert LaTeX-style
 // `\[...\]` / `\(...\)` to `$$...$$` / `$...$` so they are recognized.
@@ -360,14 +377,58 @@ const remarkPlugins = [
   remarkRewriteFileUriLinks,
 ]
 
+const remarkPluginsWithLocalPaths = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkAutolinkLocalPaths,
+  remarkRewriteFileUriLinks,
+]
+
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
 const rehypePlugins = rehypePluginsAllowingCodeg(defaultRehypePlugins)
 
+/**
+ * Observe whether an element is near the viewport (with a 600px root margin).
+ * When `enabled` is false, reports nearViewport immediately so callers can skip
+ * observer setup. Without IntersectionObserver (some WebViews), falls back to
+ * a cancellable idle schedule.
+ */
+function useNearViewport(enabled: boolean): {
+  ref: RefObject<HTMLDivElement | null>
+  nearViewport: boolean
+} {
+  const ref = useRef<HTMLDivElement>(null)
+  const [observedNearViewport, setObservedNearViewport] = useState(false)
+  useEffect(() => {
+    if (!enabled) return
+    const element = ref.current
+    if (!element) return
+    if (typeof IntersectionObserver !== "function") {
+      return scheduleIdleWork(() => setObservedNearViewport(true), {
+        timeoutMs: 1_000,
+      })
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setObservedNearViewport(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: "600px 0px" }
+    )
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [enabled])
+  return { ref, nearViewport: !enabled || observedNearViewport }
+}
+
 function MessageResponseImpl({
   className,
   children,
+  richContentState = "complete",
+  autolinkLocalPaths = false,
   ...props
 }: MessageResponseProps) {
   const normalized = useMemo(
@@ -377,32 +438,46 @@ function MessageResponseImpl({
         : children,
     [children]
   )
-  const plugins = useStreamdownPlugins(
-    typeof normalized === "string" ? normalized : undefined
+  const text = typeof normalized === "string" ? normalized : undefined
+  const needsMermaid =
+    typeof text === "string" && detectHeavyPlugins(text).mermaid
+  const { ref, nearViewport } = useNearViewport(
+    richContentState === "complete" && needsMermaid
   )
+  const policy = policyFor(richContentState, nearViewport)
+  const plugins = useStreamdownPlugins(text, policy)
 
   return (
-    <Streamdown
-      className={cn(
-        "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
-        className
-      )}
-      plugins={plugins}
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={rehypePlugins}
-      {...props}
-      // Merge after spreading props so a caller can still override other
-      // elements, but the link icon + safety routing on `a` always wins.
-      components={{ ...props.components, ...markdownLinkComponents }}
-    >
-      {normalized}
-    </Streamdown>
+    <div ref={ref} className="min-w-0">
+      <Streamdown
+        className={cn(
+          "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-3 [&_ol]:pl-3",
+          className
+        )}
+        plugins={plugins}
+        rehypePlugins={rehypePlugins}
+        {...props}
+        // App-selected remark plugins are authoritative so a caller's
+        // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
+        remarkPlugins={
+          autolinkLocalPaths ? remarkPluginsWithLocalPaths : remarkPlugins
+        }
+        // Merge after spreading props so a caller can still override other
+        // elements, but the link icon + safety routing on `a` always wins.
+        components={{ ...props.components, ...markdownLinkComponents }}
+      >
+        {normalized}
+      </Streamdown>
+    </div>
   )
 }
 
 export const MessageResponse = memo(
   MessageResponseImpl,
-  (prevProps, nextProps) => prevProps.children === nextProps.children
+  (prevProps, nextProps) =>
+    prevProps.children === nextProps.children &&
+    prevProps.richContentState === nextProps.richContentState &&
+    prevProps.autolinkLocalPaths === nextProps.autolinkLocalPaths
 )
 
 MessageResponse.displayName = "MessageResponse"

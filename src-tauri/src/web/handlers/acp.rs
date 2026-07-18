@@ -50,6 +50,10 @@ pub struct AcpConnectParams {
     pub working_dir: Option<String>,
     pub session_id: Option<String>,
     #[serde(default)]
+    pub conversation_id: Option<i32>,
+    #[serde(default)]
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    #[serde(default)]
     pub preferred_mode_id: Option<String>,
     #[serde(default)]
     pub preferred_config_values: Option<BTreeMap<String, String>>,
@@ -62,14 +66,23 @@ pub async fn acp_connect(
     let db = &state.db;
     let manager = &state.connection_manager;
 
+    let runtime = state.delegation_runtime_settings.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
         db,
         params.agent_type,
         params.session_id.as_deref(),
         &state.data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(
+            params.conversation_id,
+            params.delegation_route_override,
+        ),
+        &runtime,
     )
     .await
-    .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    .map_err(|e| {
+        e.shell_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
+    })?;
 
     // Guard: the session page must never trigger a download or install.
     // If the agent isn't ready, return SdkNotInstalled here so the frontend
@@ -79,6 +92,7 @@ pub async fn acp_connect(
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
 
     let emitter = state.emitter.clone();
+    let launch_context = crate::auto_title::user_launch_context_from_db(&db.conn).await;
     let connection_id = manager
         .spawn_agent(
             params.agent_type,
@@ -89,6 +103,7 @@ pub async fn acp_connect(
             emitter,
             params.preferred_mode_id,
             params.preferred_config_values.unwrap_or_default(),
+            launch_context,
         )
         .await
         .map_err(|error| {
@@ -141,12 +156,21 @@ pub struct AcpPromptParams {
     pub conversation_id: Option<i32>,
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// Optional composer-visible text for title capture. `Some("")` is
+    /// authoritative; absent falls back to ACP block projection.
+    #[serde(default)]
+    pub visible_text: Option<String>,
+    /// Optional wire locale (`en`, `zh_cn`, …). Deserialized as `String` so
+    /// unknown older-client values are accepted; lossy parse falls back.
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    let capture = crate::auto_title::prompt_capture_from_wire(params.visible_text, params.locale);
     state
         .connection_manager
         .send_prompt_linked_with_message_id(
@@ -157,6 +181,7 @@ pub async fn acp_prompt(
             params.conversation_id,
             None,
             params.client_message_id,
+            capture,
         )
         .await
         .map_err(|e| {
@@ -365,12 +390,14 @@ pub async fn acp_describe_agent_options(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpDescribeAgentOptionsParams>,
 ) -> Result<Json<crate::acp::types::AgentOptionsSnapshot>, AppCommandError> {
+    let runtime = state.delegation_runtime_settings.snapshot();
     let snapshot = crate::commands::acp::acp_describe_agent_options_core(
         &state.connection_manager,
         &state.db,
         &state.data_dir,
         params.agent_type,
         params.working_dir,
+        &runtime,
     )
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
@@ -566,6 +593,28 @@ pub async fn acp_update_agent_preferences(
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(affected))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpUpdateAgentDisplayPreferencesParams {
+    pub agent_type: AgentType,
+    pub show_thinking: bool,
+}
+
+pub async fn acp_update_agent_display_preferences(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpUpdateAgentDisplayPreferencesParams>,
+) -> Result<Json<()>, AppCommandError> {
+    acp_commands::acp_update_agent_display_preferences_core(
+        params.agent_type,
+        params.show_thinking,
+        &state.db,
+        &state.emitter,
+    )
+    .await
+    .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
 }
 
 #[derive(Deserialize)]
@@ -771,8 +820,8 @@ pub async fn acp_update_pi_config(
     Ok(Json(()))
 }
 
-pub async fn acp_load_pi_config(
-) -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError> {
+pub async fn acp_load_pi_config() -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError>
+{
     Ok(Json(acp_commands::load_pi_config_core()))
 }
 
@@ -1024,4 +1073,49 @@ pub async fn codex_poll_device_code(
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auto_title::{parse_supported_app_locale, prompt_capture_from_wire};
+
+    #[test]
+    fn acp_prompt_params_accept_optional_visible_text_and_lossy_locale() {
+        let with_fields = r#"{
+            "connectionId": "c1",
+            "blocks": [{"type":"text","text":"hi"}],
+            "visibleText": "composer visible",
+            "locale": "zh_cn"
+        }"#;
+        let params: AcpPromptParams =
+            serde_json::from_str(with_fields).expect("deserialize with optional fields");
+        assert_eq!(params.visible_text.as_deref(), Some("composer visible"));
+        assert_eq!(params.locale.as_deref(), Some("zh_cn"));
+        let capture = prompt_capture_from_wire(params.visible_text, params.locale).unwrap();
+        assert_eq!(capture.visible_text.as_deref(), Some("composer visible"));
+        assert_eq!(capture.locale, parse_supported_app_locale(Some("zh_cn")));
+
+        // Older clients omit the fields entirely.
+        let legacy = r#"{"connectionId":"c1","blocks":[]}"#;
+        let legacy_params: AcpPromptParams =
+            serde_json::from_str(legacy).expect("legacy payload without optional fields");
+        assert!(legacy_params.visible_text.is_none());
+        assert!(legacy_params.locale.is_none());
+        assert!(
+            prompt_capture_from_wire(legacy_params.visible_text, legacy_params.locale).is_none()
+        );
+
+        // Unknown locale must deserialize (not reject) then lossy-parse to None.
+        let unknown = r#"{
+            "connectionId": "c1",
+            "blocks": [],
+            "locale": "Klingon"
+        }"#;
+        let unknown_params: AcpPromptParams =
+            serde_json::from_str(unknown).expect("unknown locale must not reject request");
+        assert_eq!(unknown_params.locale.as_deref(), Some("Klingon"));
+        let capture = prompt_capture_from_wire(None, unknown_params.locale).unwrap();
+        assert_eq!(capture.locale, None);
+    }
 }

@@ -16,12 +16,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest, CancelDelegationReason,
+    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerParentDecisionRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
-use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    DelegationReplyResult, DelegationRequest, DelegationReturnWhen, DelegationStatusBatch,
+    DelegationTaskReport, DelegationWakeReason, ParentDecisionResult, TaskStatus,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
@@ -33,7 +38,6 @@ use serde_json::Value;
 /// keeps running past this; the LLM simply re-issues the wait. An explicit
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
-
 
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
@@ -52,6 +56,22 @@ pub trait ParentSessionLookup: Send + Sync {
 pub struct TokenEntry {
     pub parent_connection_id: String,
     pub working_dir: PathBuf,
+    /// Whether this launch advertised `coordination_v1` (Join semantics).
+    pub coordination_v1: bool,
+    /// Immutable companion role for this launch.
+    pub role: CompanionRole,
+}
+
+impl TokenEntry {
+    /// Legacy entry without Join capability (tests / pre-coordination launches).
+    pub fn legacy(parent_connection_id: &str, working_dir: PathBuf) -> Self {
+        Self {
+            parent_connection_id: parent_connection_id.to_string(),
+            working_dir,
+            coordination_v1: false,
+            role: CompanionRole::Root,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -73,16 +93,27 @@ impl TokenRegistry {
     }
 
     /// Drop every token whose `parent_connection_id` matches. Used on parent
-    /// connection teardown so a leaked token can't be reused.
-    pub async fn revoke_by_parent(&self, parent_connection_id: &str) {
+    /// connection teardown so a leaked token can't be reused. Returns the
+    /// revoked token strings so callers can also revoke ready leases.
+    pub async fn revoke_by_parent(&self, parent_connection_id: &str) -> Vec<String> {
         let mut map = self.inner.write().await;
-        map.retain(|_, entry| entry.parent_connection_id != parent_connection_id);
+        let mut revoked = Vec::new();
+        map.retain(|token, entry| {
+            if entry.parent_connection_id == parent_connection_id {
+                revoked.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        revoked
     }
 }
 
 pub struct DelegationListener {
     pub broker: Arc<DelegationBroker>,
     pub tokens: Arc<TokenRegistry>,
+    pub leases: Arc<CompanionLeaseRegistry>,
     pub parent_lookup: Arc<dyn ParentSessionLookup>,
     /// Pulls pending live-feedback notes for the `check_user_feedback` tool.
     /// Shares the same `tokens` registry and parent-connection scoping as the
@@ -95,6 +126,8 @@ pub struct DelegationListener {
     /// other arms this is NOT parent-scoped — it looks any non-deleted session up
     /// by its codeg conversation id (still token-gated against an invalid caller).
     pub session_info: Arc<dyn SessionInfoAccess>,
+    /// Process-local reliability metrics (wait peer-close, cancel classes).
+    pub metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
 }
 
 impl DelegationListener {
@@ -102,18 +135,22 @@ impl DelegationListener {
     pub fn new(
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
         parent_lookup: Arc<dyn ParentSessionLookup>,
         feedback: Arc<dyn SessionFeedbackAccess>,
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
     ) -> Arc<Self> {
+        let metrics = broker.metrics();
         Arc::new(Self {
             broker,
             tokens,
+            leases,
             parent_lookup,
             feedback,
             questions,
             session_info,
+            metrics,
         })
     }
 
@@ -189,7 +226,13 @@ impl DelegationListener {
         C: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let msg: BrokerMessage = read_frame(conn).await?;
+        // Ready lease is a long-lived hold: authenticate → mark ready → ack →
+        // select peer-EOF vs revoke, then mark closed exactly once.
+        if let BrokerMessage::Ready(req) = msg {
+            return self.serve_ready_lease(conn, req.token).await;
+        }
         let resp = match msg {
+            BrokerMessage::Ready(_) => unreachable!("handled above"),
             BrokerMessage::Call(req) => report_response(self.process(req).await)?,
             BrokerMessage::Status(req) => {
                 // A status long-poll — especially `wait_ms = 0` (block until
@@ -201,15 +244,42 @@ impl DelegationListener {
                 // abandoning the wait is safe and there's nothing to cancel
                 // broker-side. The companion never writes a second frame on
                 // this socket, so the probe read only resolves on EOF/error.
+                use crate::acp::delegation::metrics::{
+                    DelegationAuditRecord, WaitModeLabel, WaitReturnReason,
+                };
+                let wait_mode = match req.wait_ms {
+                    None => WaitModeLabel::Snapshot,
+                    Some(0) => WaitModeLabel::Terminal,
+                    Some(_) => WaitModeLabel::Supervised,
+                };
+                let requested_wait_ms = req.wait_ms.map(|ms| ms.min(STATUS_WAIT_MAX_MS));
+                let wait_started = std::time::Instant::now();
                 let status_fut = self.process_status(req);
                 tokio::pin!(status_fut);
                 let mut probe = [0u8; 1];
                 let reports = tokio::select! {
                     biased;
                     reports = &mut status_fut => reports,
-                    _ = conn.read(&mut probe) => return Ok(()),
+                    _ = conn.read(&mut probe) => {
+                        // Peer closed before broker returned: record once,
+                        // no task mutation, abandon wait.
+                        let wall = wait_started.elapsed();
+                        self.metrics.record_wait(
+                            wait_mode,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        );
+                        DelegationAuditRecord::wait(
+                            wait_mode,
+                            requested_wait_ms,
+                            wall,
+                            WaitReturnReason::PeerClosed,
+                        )
+                        .emit_wait();
+                        return Ok(());
+                    },
                 };
-                reports_response(reports)?
+                status_response(reports)?
             }
             BrokerMessage::CancelTask(req) => report_response(self.process_cancel_task(req).await)?,
             BrokerMessage::Feedback(req) => {
@@ -224,10 +294,7 @@ impl DelegationListener {
                         write_frame(conn, &feedback_response(&[])?).await?;
                     }
                     Some(parent_conn_id) => {
-                        let pending = self
-                            .feedback
-                            .read_pending_feedback(&parent_conn_id)
-                            .await;
+                        let pending = self.feedback.read_pending_feedback(&parent_conn_id).await;
                         // Read-only: the response carries the note ids
                         // (`_commit_ids`); delivery is committed LATER, by the
                         // companion's `CommitFeedback` once it actually returns
@@ -311,6 +378,26 @@ impl DelegationListener {
                 // and there is nothing to tear down on cancel.
                 session_response(self.process_session_info(req).await)?
             }
+            BrokerMessage::ParentDecision(req) => {
+                // Blocking parent decision: race Broker wait against peer-close
+                // on this one-shot socket. Peer close drops ONLY this waiter —
+                // the durable attention row stays open for replay; no task or
+                // attention mutation on abandon.
+                let decision_fut = self.process_parent_decision(req);
+                tokio::pin!(decision_fut);
+                let mut probe = [0_u8; 1];
+                let outcome = tokio::select! {
+                    biased;
+                    outcome = &mut decision_fut => outcome,
+                    _ = conn.read(&mut probe) => return Ok(()),
+                };
+                write_frame(conn, &value_response(&outcome)?).await?;
+                return Ok(());
+            }
+            BrokerMessage::ReplyDelegation(req) => {
+                // Immediate: serialize through the normal final write_frame path.
+                value_response(&self.process_reply_delegation(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -324,36 +411,214 @@ impl DelegationListener {
         Ok(())
     }
 
+    /// Authenticated two-frame ready lease.
+    ///
+    /// Order: validate/reserve token → write `{"ready":true}` ack → publish
+    /// host readiness via [`CompanionLeaseRegistry::mark_ready`]. Readiness is
+    /// never published until the ack write succeeds, so a dead companion cannot
+    /// make the host `wait_ready` / Connected / `RouteBootstrapOutcome::Ready`.
+    ///
+    /// On ack write failure the lease is revoked so the waiter fails closed
+    /// immediately (not merely availability=false after a false ready). If
+    /// revoke races between ack and mark_ready, mark_ready fails and the hold
+    /// is not entered.
+    async fn serve_ready_lease<C>(&self, conn: &mut C, token: String) -> std::io::Result<()>
+    where
+        C: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
+        // 1) Authenticate first — never publish ready for an unknown/revoked token.
+        if self.tokens.lookup(&token).await.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid ready-lease token",
+            ));
+        }
+        // 2) Reserve: host must have registered the lease before companion Ready.
+        let mut availability = self
+            .leases
+            .subscribe_availability(&token)
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "ready lease not registered")
+            })?;
+
+        // 3) Write ack only after authentication/reserve. Host readiness is
+        //    published only after this write succeeds.
+        if let Err(e) = write_frame(conn, &CompanionReadyAck { ready: true }).await {
+            // Fail closed: never mark_ready; drop the lease so wait_ready sees
+            // Closed immediately (ready_tx dropped) and cannot return Ready.
+            self.leases.revoke(&token).await;
+            return Err(e);
+        }
+
+        // 4) Publish host ready only after durable ack. Revoke race → fail closed.
+        //
+        // `AlreadyReady` is a successful secondary attach (e.g. CLI exec turns
+        // re-spawn the same codeg-mcp after a session-open prewarm already holds
+        // the exclusive ready lease). Ack was already written; do **not**
+        // mark_closed — that would tear down the primary holder's availability.
+        // Secondary instances return immediately without exclusive hold so they
+        // can serve MCP stdio tools for the agent turn.
+        match self.leases.mark_ready(&token).await {
+            Ok(()) => {}
+            Err(crate::acp::delegation::lease::ReadyLeaseError::AlreadyReady) => {
+                return Ok(());
+            }
+            Err(e) => {
+                self.leases.mark_closed(&token).await;
+                return Err(std::io::Error::other(format!("mark_ready: {e}")));
+            }
+        }
+
+        // Hold open: peer EOF or external revoke (availability → false).
+        let mut probe = [0u8; 1];
+        tokio::select! {
+            biased;
+            _ = conn.read(&mut probe) => {}
+            _ = async {
+                loop {
+                    if !*availability.borrow() {
+                        break;
+                    }
+                    if availability.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        self.leases.mark_closed(&token).await;
+        Ok(())
+    }
+
     /// Validate the token, resolve the caller's parent connection/conversation,
-    /// and query the status of every requested task id (optionally blocking per
-    /// the wire `wait_ms`: omitted → immediate snapshot, explicit `0` → block
-    /// until a task is terminal, a positive value → bounded long-poll clamped to
-    /// [`STATUS_WAIT_MAX_MS`]). Backs the `get_delegation_status` tool. Returns
-    /// one report per requested id, in request order. An invalid token reports
-    /// `Unknown` for each id — the caller can't usefully distinguish it from a
-    /// genuinely unknown task, and we don't leak which.
-    async fn process_status(&self, req: BrokerStatusRequest) -> Vec<DelegationTaskReport> {
+    /// and query the status of every requested task id. Legacy requests (no
+    /// `return_when`) keep snapshot / supervised / any-terminal waits. Join
+    /// requests require `return_when=all_terminal_or_attention` with explicit
+    /// `wait_ms=0` and a token that advertised `coordination_v1`. Invalid-token
+    /// or capability-denied Join still returns Join-shaped additive fields
+    /// without revealing ownership and without parking.
+    async fn process_status(&self, req: BrokerStatusRequest) -> DelegationStatusBatch {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
-            return req.task_ids.iter().map(|id| unknown_report(id)).collect();
+            let unknown_reports: Vec<_> =
+                req.task_ids.iter().map(|id| unknown_report(id)).collect();
+            return match req.return_when {
+                None => DelegationStatusBatch::legacy(unknown_reports),
+                Some(_) => DelegationStatusBatch::joined(
+                    unknown_reports,
+                    DelegationWakeReason::Unavailable,
+                    Vec::new(),
+                ),
+            };
         };
+        // Connection-bound capability: a legacy token must not enter Join or
+        // consult Broker ownership even if raw socket JSON sends return_when.
+        if req.return_when.is_some() && !entry.coordination_v1 {
+            return DelegationStatusBatch::joined(
+                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            );
+        }
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
             .await;
-        // Map the wire `wait_ms` to a wait mode: omitted → immediate poll, an
-        // explicit `0` → block with no timeout (long-running children), any
-        // positive value → bounded long-poll clamped to the hard ceiling.
-        let wait = match req.wait_ms {
-            None => StatusWait::Immediate,
-            Some(0) => StatusWait::Infinite,
-            Some(ms) => StatusWait::Bounded(ms.min(STATUS_WAIT_MAX_MS)),
+        match req.return_when {
+            None => DelegationStatusBatch::legacy(
+                self.broker
+                    .get_tasks_status(
+                        &entry.parent_connection_id,
+                        parent_conversation_id,
+                        &req.task_ids,
+                        legacy_wait_from(req.wait_ms),
+                    )
+                    .await,
+            ),
+            Some(DelegationReturnWhen::AllTerminalOrAttention) if req.wait_ms == Some(0) => {
+                self.broker
+                    .join_tasks_status(
+                        &entry.parent_connection_id,
+                        parent_conversation_id,
+                        &req.task_ids,
+                    )
+                    .await
+            }
+            Some(_) => DelegationStatusBatch::joined(
+                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// Stable non-secret rejection for unauthorized or capability-denied
+    /// parent-decision attempts.
+    fn decision_unavailable(code: &str, message: &str) -> ParentDecisionResult {
+        ParentDecisionResult::Rejected {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Backs `request_parent_decision`. Token must advertise `coordination_v1`
+    /// and role `DelegationChild`. Connection id bound to the token is the
+    /// child's ACP connection (see injection).
+    async fn process_parent_decision(
+        &self,
+        request: BrokerParentDecisionRequest,
+    ) -> ParentDecisionResult {
+        let Some(entry) = self.tokens.lookup(&request.token).await else {
+            return Self::decision_unavailable(
+                "unauthorized",
+                "decision request is not authorized on this connection",
+            );
         };
+        if !entry.coordination_v1 {
+            return Self::decision_unavailable(
+                "coordination_unavailable",
+                "delegation coordination is unavailable on this connection",
+            );
+        }
+        if entry.role != CompanionRole::DelegationChild {
+            return Self::decision_unavailable(
+                "not_delegation_child",
+                "only a live Codeg delegation child can request a parent decision",
+            );
+        }
         self.broker
-            .get_tasks_status(
+            .request_parent_decision(
                 &entry.parent_connection_id,
-                parent_conversation_id,
-                &req.task_ids,
-                wait,
+                &request.child_tool_call_id,
+                &request.message,
+            )
+            .await
+    }
+
+    /// Backs `reply_to_delegation`. Any coordination-aware token may attempt
+    /// a reply; Broker enforces direct-parent ownership.
+    async fn process_reply_delegation(
+        &self,
+        request: BrokerReplyDelegationRequest,
+    ) -> DelegationReplyResult {
+        let Some(entry) = self.tokens.lookup(&request.token).await else {
+            return DelegationReplyResult::Unauthorized;
+        };
+        if !entry.coordination_v1 {
+            return DelegationReplyResult::Rejected {
+                code: "coordination_unavailable".into(),
+                message: "delegation coordination is unavailable on this connection".into(),
+            };
+        }
+        let conversation_id = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await;
+        self.broker
+            .reply_to_delegation(
+                &entry.parent_connection_id,
+                conversation_id,
+                &request.request_id,
+                &request.reply,
             )
             .await
     }
@@ -368,6 +633,14 @@ impl DelegationListener {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             return unknown_report(&req.task_id);
         };
+        // Explicit task cancel (distinct from MCP request cancel).
+        self.metrics.record_explicit_cancel(req.reason);
+        crate::acp::delegation::metrics::DelegationAuditRecord::cancel(
+            &entry.parent_connection_id,
+            &req.task_id,
+            req.reason,
+        )
+        .emit_cancel();
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
@@ -417,6 +690,8 @@ impl DelegationListener {
         let Some(_entry) = self.tokens.lookup(&cancel.token).await else {
             return;
         };
+        // MCP tools/call cancellation — not an explicit cancel_delegation.
+        self.metrics.record_mcp_request_cancel();
         let reason = cancel
             .reason
             .unwrap_or_else(|| "mcp client canceled".into());
@@ -536,17 +811,36 @@ fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerRespon
     })
 }
 
-/// Serialize a batch of [`DelegationTaskReport`]s into a `{ "tasks": [..] }`
-/// envelope for the `Status` arm. The companion reads this back and renders it
-/// uniformly as a `{ "tasks": [..] }` result — one entry per requested id,
-/// whether the poll asked for a single id or a whole fan-out.
-fn reports_response(reports: Vec<DelegationTaskReport>) -> std::io::Result<BrokerResponse> {
+/// Serialize an arbitrary serde value as the broker outcome envelope.
+fn value_response<T: serde::Serialize>(outcome: &T) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
-        outcome: serde_json::json!({
-            "tasks": serde_json::to_value(&reports).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
-            })?,
-        }),
+        outcome: serde_json::to_value(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+fn legacy_wait_from(wait_ms: Option<u64>) -> StatusWait {
+    match wait_ms {
+        None => StatusWait::Snapshot,
+        Some(0) => StatusWait::Terminal,
+        Some(ms) => {
+            StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
+        }
+    }
+}
+
+/// Serialize a [`DelegationStatusBatch`] for the `Status` arm. Legacy batches
+/// omit Join fields; Join batches include `wake_reason` and
+/// `attention_requests`.
+fn status_response(batch: DelegationStatusBatch) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(batch).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("encode status batch: {error}"),
+            )
+        })?,
     })
 }
 
@@ -614,6 +908,9 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
         error_code: Some("canceled".into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -628,6 +925,9 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
         error_code: Some(error_code.into()),
         message: Some(message.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -643,6 +943,9 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some("unknown task id".into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -656,6 +959,9 @@ fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
         error_code: None,
         message: Some(crate::acp::delegation::types::TIMEOUT_CANCEL_GUIDANCE.into()),
         duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
     }
 }
 
@@ -696,7 +1002,10 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
-    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner, SpawnerError};
+    use crate::acp::delegation::spawner::{
+        accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
+    };
+    use chrono::Utc;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use serde_json::json;
     use std::time::Duration;
@@ -731,10 +1040,7 @@ mod tests {
     }
     #[async_trait]
     impl SessionFeedbackAccess for StubFeedback {
-        async fn read_pending_feedback(
-            &self,
-            parent_connection_id: &str,
-        ) -> Vec<PendingFeedback> {
+        async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
             *self.read_conn.lock().await = Some(parent_connection_id.to_string());
             self.items.lock().await.clone()
         }
@@ -754,9 +1060,7 @@ mod tests {
     #[derive(Default)]
     struct StubQuestion {
         pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
-        registered: tokio::sync::Mutex<
-            Vec<(String, Vec<crate::acp::question::QuestionSpec>)>,
-        >,
+        registered: tokio::sync::Mutex<Vec<(String, Vec<crate::acp::question::QuestionSpec>)>>,
         canceled: tokio::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
@@ -849,6 +1153,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(parent_conversation)),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -869,6 +1174,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             feedback,
             Arc::new(StubQuestion::default()),
@@ -890,6 +1196,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             questions,
@@ -910,6 +1217,7 @@ mod tests {
         DelegationListener::new(
             broker,
             tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(Some(1))),
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
@@ -948,10 +1256,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "other-parent".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("other-parent", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(
@@ -972,10 +1277,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         // parent_conversation = None: parent has no live conversation.
@@ -997,10 +1299,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(
@@ -1022,16 +1321,13 @@ mod tests {
     async fn happy_path_ack_then_status_collects_result() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(42)).await;
+        mock.queue_send(Ok(accepted(42, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
 
@@ -1080,6 +1376,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(1_000),
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1096,16 +1393,13 @@ mod tests {
     async fn running_task_fixture() -> (Arc<DelegationBroker>, Arc<TokenRegistry>, String) {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let ack = broker
@@ -1125,6 +1419,29 @@ mod tests {
         (broker, tokens, task_id)
     }
 
+    /// A legacy token (`coordination_v1=false`) must not enter Join or reveal
+    /// whether a requested running task exists, even if raw socket JSON sends
+    /// `return_when=all_terminal_or_attention`.
+    #[tokio::test]
+    async fn legacy_token_cannot_enter_join_or_reveal_a_running_task() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let batch = tokio::time::timeout(
+            Duration::from_secs(1),
+            listener.process_status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec![task_id],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .expect("legacy-token Join rejection must not park");
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
+        assert!(batch.attention_requests.unwrap().is_empty());
+    }
+
     /// Omitted `wait_ms` (the safe default) maps to an immediate snapshot: the
     /// status of a still-running task returns `running` right away rather than
     /// blocking.
@@ -1139,6 +1456,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         // No completion ever happens — an immediate poll must still return.
@@ -1165,6 +1483,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id.clone()],
             wait_ms: Some(0),
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1214,6 +1533,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![task_id],
             wait_ms: Some(0),
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -1245,18 +1565,15 @@ mod tests {
     async fn batch_status_over_listener_multi_id() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-1".into())).await;
-        mock.queue_send(Ok(1)).await;
+        mock.queue_send(Ok(accepted(1, Utc::now()))).await;
         mock.queue_spawn(Ok("child-2".into())).await;
-        mock.queue_send(Ok(2)).await;
+        mock.queue_send(Ok(accepted(2, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let start = |tool_use: &'static str| {
@@ -1304,6 +1621,7 @@ mod tests {
             token: "tok".into(),
             task_ids: vec![t1.clone(), t2.clone()],
             wait_ms: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1334,6 +1652,7 @@ mod tests {
             token: "bad-token".into(),
             task_ids: vec!["a".into(), "b".into()],
             wait_ms: None,
+            return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -1352,16 +1671,13 @@ mod tests {
     async fn cancel_task_by_id_over_listener() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         // Start a task directly so we hold its id.
@@ -1401,16 +1717,13 @@ mod tests {
     async fn cancel_task_timeout_reason_returns_guidance_without_canceling() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn".into())).await;
-        mock.queue_send(Ok(7)).await;
+        mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let ack = broker
@@ -1449,20 +1762,147 @@ mod tests {
         assert_eq!(broker.pending_count().await, 1);
     }
 
+    /// Explicit cancel counters are **authenticated request-attempt** metrics
+    /// (after token validation, Timeout excluded), not "successful running→
+    /// settling transition only". Successful terminal cancels are already
+    /// counted separately via `record_terminal(Canceled)`. MCP tools/call
+    /// cancel is a distinct counter at the same attempt boundary. An asymmetric
+    /// "success-only explicit vs attempt MCP" contract would contradict the
+    /// brief's separation of the two cancel surfaces and the terminal counter.
+    #[tokio::test]
+    async fn explicit_cancel_metrics_are_authenticated_request_attempts() {
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_metrics(metrics.clone()),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+
+        // 1) Unknown task + valid token still counts as explicit cancel request.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "authenticated cancel_delegation attempt counts even when task is unknown"
+        );
+
+        // 2) Timeout is non-canceling and must not increment.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "tok".into(),
+                task_id: "never-existed".into(),
+                reason: CancelDelegationReason::Timeout,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "Timeout must remain non-canceling for metrics"
+        );
+
+        // 3) Invalid token does not count.
+        let listener = make_listener(broker.clone(), tokens.clone(), Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+                token: "bad".into(),
+                task_id: "x".into(),
+                reason: CancelDelegationReason::UserCancel,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "invalid token must not count as explicit cancel"
+        );
+
+        // 4) MCP request cancel is a separate authenticated-attempt counter.
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+        write_frame(
+            &mut client,
+            &BrokerMessage::Cancel(BrokerCancelRequest {
+                token: "tok".into(),
+                external_handle: "no-such-handle".into(),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!(metrics.snapshot().mcp_request_cancel_count, 1);
+        assert_eq!(
+            metrics.snapshot().explicit_user_cancel_count,
+            1,
+            "MCP cancel must not bleed into explicit cancel counters"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_message_routed_to_broker() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-cancel".into())).await;
-        mock.queue_send(Ok(99)).await;
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await;
         let broker = make_broker(mock.clone()).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
@@ -1517,31 +1957,13 @@ mod tests {
     async fn token_registry_revoke_and_revoke_by_parent() {
         let registry = TokenRegistry::default();
         registry
-            .register(
-                "t1".into(),
-                TokenEntry {
-                    parent_connection_id: "p1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
-            )
+            .register("t1".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
             .await;
         registry
-            .register(
-                "t2".into(),
-                TokenEntry {
-                    parent_connection_id: "p1".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
-            )
+            .register("t2".into(), TokenEntry::legacy("p1", PathBuf::from("/tmp")))
             .await;
         registry
-            .register(
-                "t3".into(),
-                TokenEntry {
-                    parent_connection_id: "p2".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
-            )
+            .register("t3".into(), TokenEntry::legacy("p2", PathBuf::from("/tmp")))
             .await;
 
         registry.revoke("t1").await;
@@ -1575,10 +1997,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_listener(broker, tokens, Some(1));
@@ -1652,10 +2071,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -1682,7 +2098,10 @@ mod tests {
         let commit_ids = resp.outcome["_commit_ids"].as_array().unwrap();
         assert_eq!(commit_ids, &vec!["f1", "f2"]);
         // Read was scoped to the token's parent connection id.
-        assert_eq!(feedback.read_conn.lock().await.as_deref(), Some("parent-conn"));
+        assert_eq!(
+            feedback.read_conn.lock().await.as_deref(),
+            Some("parent-conn")
+        );
         // The Feedback arm is READ-ONLY — it does NOT commit (delivery is
         // committed later, by the companion's CommitFeedback).
         assert!(feedback.committed.lock().await.is_empty());
@@ -1700,10 +2119,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -1741,10 +2157,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_session_listener(tokens, session_info.clone());
@@ -1808,10 +2221,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_feedback_listener(tokens, feedback.clone());
@@ -1920,10 +2330,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -1977,10 +2384,7 @@ mod tests {
         tokens
             .register(
                 "tok".into(),
-                TokenEntry {
-                    parent_connection_id: "parent-conn".into(),
-                    working_dir: PathBuf::from("/tmp"),
-                },
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
             )
             .await;
         let listener = make_question_listener(tokens, questions.clone());
@@ -2000,7 +2404,10 @@ mod tests {
             .await
             .expect("serve_one must return after peer close");
         result.unwrap().unwrap();
-        assert_eq!(questions.canceled.lock().await.as_slice(), &["q-1".to_string()]);
+        assert_eq!(
+            questions.canceled.lock().await.as_slice(),
+            &["q-1".to_string()]
+        );
     }
 
     /// An invalid token never registers a question and returns a `declined`
@@ -2008,7 +2415,8 @@ mod tests {
     #[tokio::test]
     async fn ask_invalid_token_declined() {
         let questions = Arc::new(StubQuestion::default());
-        let listener = make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
+        let listener =
+            make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
         let (mut client, mut server) = duplex(8 * 1024);
         let server_task = tokio::spawn(async move {
             listener.serve_one(&mut server).await.unwrap();
@@ -2022,4 +2430,1025 @@ mod tests {
         assert!(questions.registered.lock().await.is_empty());
     }
 
+    // ─── Task 7: ready-lease wire protocol (duplex / serve_one) ───────────
+
+    fn make_ready_lease_listener(
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+    ) -> Arc<DelegationListener> {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationListener::new(
+            broker,
+            tokens,
+            leases,
+            Arc::new(StaticParentLookup(Some(1))),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        )
+    }
+
+    /// Valid token: Ready → ack → hold → peer EOF → closed exactly once.
+    #[tokio::test]
+    async fn ready_lease_wire_valid_token_acks_hold_then_closed_once_on_eof() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "ready-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+        let mut waiter = leases.register("ready-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "ready-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter
+            .wait_ready(Duration::from_millis(200))
+            .await
+            .expect("host must observe ready after authenticated ack");
+        assert!(*waiter.availability().borrow());
+
+        // Peer EOF ends the hold; closed exactly once.
+        drop(client);
+        server_task.await.unwrap();
+        // Availability may already be false (mark_closed ran); if still true, wait once.
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
+        assert!(!*waiter.availability().borrow());
+        // Second close is a no-op (idempotent).
+        leases.mark_closed("ready-tok").await;
+        assert!(!*waiter.availability().borrow());
+    }
+
+    /// Second Ready on an already-ready token acks without closing the primary
+    /// hold (CLI exec re-spawn after session-open prewarm).
+    #[tokio::test]
+    async fn ready_lease_wire_secondary_already_ready_does_not_close_primary() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "dup-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+        let mut waiter = leases.register("dup-tok").await;
+        let listener_primary = make_ready_lease_listener(tokens.clone(), Arc::clone(&leases));
+        let listener_secondary = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut primary_client, mut primary_server) = duplex(8 * 1024);
+        let primary_task = tokio::spawn(async move {
+            listener_primary.serve_one(&mut primary_server).await.unwrap();
+        });
+
+        write_frame(
+            &mut primary_client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "dup-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut primary_client).await.unwrap();
+        assert!(ack.ready);
+        waiter
+            .wait_ready(Duration::from_millis(200))
+            .await
+            .expect("primary ready");
+        assert!(*waiter.availability().borrow());
+
+        let (mut secondary_client, mut secondary_server) = duplex(8 * 1024);
+        let secondary_task = tokio::spawn(async move {
+            listener_secondary
+                .serve_one(&mut secondary_server)
+                .await
+                .unwrap();
+        });
+
+        write_frame(
+            &mut secondary_client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "dup-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let secondary_ack: CompanionReadyAck = read_frame(&mut secondary_client).await.unwrap();
+        assert!(secondary_ack.ready);
+        // Secondary ends without exclusive hold; connection may close after ack.
+        let _ = secondary_task.await;
+        drop(secondary_client);
+
+        // Primary hold still live — availability must stay true.
+        assert!(
+            *waiter.availability().borrow(),
+            "secondary AlreadyReady must not mark_closed the primary lease"
+        );
+
+        drop(primary_client);
+        primary_task.await.unwrap();
+        if *waiter.availability().borrow() {
+            waiter.availability().changed().await.unwrap();
+        }
+        assert!(!*waiter.availability().borrow());
+    }
+
+    /// Valid token held, then revoke → closed once; host never sees re-ready.
+    #[tokio::test]
+    async fn ready_lease_wire_revoke_while_held_closes_once() {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, CompanionReadyAck, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "revoke-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+        let mut waiter = leases.register("revoke-tok").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move {
+            listener.serve_one(&mut server).await.unwrap();
+        });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "revoke-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let ack: CompanionReadyAck = read_frame(&mut client).await.unwrap();
+        assert!(ack.ready);
+        waiter.wait_ready(Duration::from_millis(200)).await.unwrap();
+
+        leases.revoke("revoke-tok").await;
+        server_task.await.unwrap();
+        assert!(!*waiter.availability().borrow());
+        // Keep client open until server exits so revoke path is exercised.
+        drop(client);
+    }
+
+    /// Invalid token never becomes ready on the registry watch.
+    #[tokio::test]
+    async fn ready_lease_wire_invalid_token_never_ready() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::time::Duration;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        // Register a different token so the lease slot exists for a good token only.
+        let mut good_waiter = leases.register("good-tok").await;
+        let mut bad_slot = leases.register("bad-tok").await;
+        // Only "good-tok" is in the token registry.
+        tokens
+            .register(
+                "good-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Ready(CompanionReadyRequest {
+                token: "bad-tok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let serve_result = server_task.await.unwrap();
+        assert!(serve_result.is_err(), "invalid token must fail serve_one");
+        // Neither slot becomes ready.
+        assert!(good_waiter
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(bad_slot
+            .wait_ready(Duration::from_millis(30))
+            .await
+            .is_err());
+        assert!(!*good_waiter.availability().borrow());
+        assert!(!*bad_slot.availability().borrow());
+        drop(client);
+    }
+
+    /// Scripted ack write failure must leave the host waiter unable to become
+    /// Ready (not only availability=false). Valid path covered separately.
+    #[tokio::test]
+    async fn ready_lease_ack_write_failure_never_ready() {
+        use crate::acp::delegation::transport::{
+            write_frame, BrokerMessage, CompanionReadyRequest,
+        };
+        use std::io::Cursor;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        /// Readable Ready frame, then fail the first write (ack).
+        struct ReadyThenFailAckWrite {
+            read_buf: Cursor<Vec<u8>>,
+            wrote: bool,
+        }
+
+        impl AsyncRead for ReadyThenFailAckWrite {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let mut tmp = vec![0u8; buf.remaining()];
+                match std::io::Read::read(&mut self.read_buf, &mut tmp) {
+                    Ok(0) => Poll::Ready(Ok(())),
+                    Ok(n) => {
+                        buf.put_slice(&tmp[..n]);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+        }
+
+        impl AsyncWrite for ReadyThenFailAckWrite {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if !self.wrote {
+                    self.wrote = true;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected ack write failure",
+                    )));
+                }
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "already failed",
+                )))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Encode a real Ready frame into the scripted stream's read buffer.
+        let mut encode = Vec::new();
+        {
+            use tokio::io::AsyncWriteExt;
+            let (mut w, mut r) = duplex(4 * 1024);
+            write_frame(
+                &mut w,
+                &BrokerMessage::Ready(CompanionReadyRequest {
+                    token: "fail-ack".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            w.shutdown().await.unwrap();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut encode)
+                .await
+                .unwrap();
+        }
+
+        let tokens = Arc::new(TokenRegistry::default());
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        tokens
+            .register(
+                "fail-ack".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+        let mut waiter = leases.register("fail-ack").await;
+        let listener = make_ready_lease_listener(tokens, Arc::clone(&leases));
+
+        let mut conn = ReadyThenFailAckWrite {
+            read_buf: Cursor::new(encode),
+            wrote: false,
+        };
+        let result = listener.serve_one(&mut conn).await;
+        assert!(
+            result.is_err(),
+            "ack write failure must surface via serve_one"
+        );
+
+        // Host bootstrap must not observe Ready (Connected / RouteBootstrap Ready
+        // depend on wait_ready succeeding). Fail closed — not merely availability.
+        let wait = waiter
+            .wait_ready(std::time::Duration::from_millis(80))
+            .await;
+        assert!(
+            wait.is_err(),
+            "ack write failure must not make wait_ready Ready; got {wait:?}"
+        );
+        assert!(
+            !*waiter.availability().borrow(),
+            "ack write failure must leave availability false"
+        );
+        // A later mark_ready must not resurrect a failed handshake slot if revoked.
+        assert!(
+            leases.mark_ready("fail-ack").await.is_err(),
+            "failed ack path should revoke/forget lease so host cannot mark ready later"
+        );
+    }
+
+    // -- Role-aware parent decision tools (Task 6) -------------------------
+
+    use crate::acp::delegation::attention::{
+        mock::MemoryDelegationAttentionStore, AttentionResolutionCode, DelegationAttentionStore,
+    };
+    use crate::acp::delegation::store::mock::MockTaskStore;
+    use crate::acp::delegation::store::DelegationTaskStore;
+    use crate::acp::delegation::transport::{
+        BrokerParentDecisionRequest, BrokerReplyDelegationRequest,
+    };
+    use crate::acp::delegation::types::{DelegationReplyResult, ParentDecisionResult};
+    use std::collections::HashMap as StdHashMap;
+
+    struct MapParentLookup(StdHashMap<String, i32>);
+    #[async_trait]
+    impl ParentSessionLookup for MapParentLookup {
+        async fn current_conversation_id(&self, parent_connection_id: &str) -> Option<i32> {
+            self.0.get(parent_connection_id).copied()
+        }
+    }
+
+    fn child_token_entry(conn: &str) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: conn.to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: true,
+            role: CompanionRole::DelegationChild,
+        }
+    }
+
+    fn root_token_entry(conn: &str) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: conn.to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: true,
+            role: CompanionRole::Root,
+        }
+    }
+
+    async fn decision_fixture() -> (
+        Arc<DelegationListener>,
+        Arc<DelegationBroker>,
+        Arc<MemoryDelegationAttentionStore>,
+        String,
+    ) {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn".into())).await;
+        mock.queue_send(Ok(accepted(22, Utc::now()))).await;
+        let task_store = Arc::new(MockTaskStore::accept_any_running(22));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>)
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        let ack = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 11,
+                parent_tool_use_id: "pt-decision".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "decide".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await;
+        let task_id = ack.task_id.expect("running");
+        task_store.seed_edge(&task_id, 11, 22).await;
+        attention.seed_edge(&task_id, 11, 22).await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("child-tok".into(), child_token_entry("child-conn"))
+            .await;
+        tokens
+            .register("parent-tok".into(), root_token_entry("parent"))
+            .await;
+        tokens
+            .register("foreign-tok".into(), root_token_entry("foreign"))
+            .await;
+        tokens
+            .register(
+                "legacy-tok".into(),
+                TokenEntry::legacy("parent", PathBuf::from("/tmp")),
+            )
+            .await;
+
+        let mut convs = StdHashMap::new();
+        convs.insert("parent".into(), 11);
+        convs.insert("child-conn".into(), 22);
+        convs.insert("foreign".into(), 99);
+
+        let listener = DelegationListener::new(
+            broker.clone(),
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(MapParentLookup(convs)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        );
+        (listener, broker, attention, task_id)
+    }
+
+    async fn wait_open_request(
+        attention: &MemoryDelegationAttentionStore,
+        task_id: &str,
+    ) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(open) = attention.list_open_for_tasks(11, &[task_id.to_string()]).await {
+                if let Some(summary) = open.into_iter().next() {
+                    return summary.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("open attention request did not appear for {task_id}");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn root_token_request_parent_decision_is_rejected() {
+        let (listener, _broker, _attention, _task_id) = decision_fixture().await;
+        let outcome = listener
+            .process_parent_decision(BrokerParentDecisionRequest {
+                token: "parent-tok".into(),
+                child_tool_call_id: "tc-1".into(),
+                message: "choose".into(),
+            })
+            .await;
+        assert!(matches!(
+            outcome,
+            ParentDecisionResult::Rejected {
+                code,
+                ..
+            } if code == "not_delegation_child"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_decision_round_trip_blocks_until_direct_parent_replies() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+
+        // Child connection: ParentDecision blocks until reply.
+        let (mut child_client, mut child_server) = duplex(16 * 1024);
+        let child_listener = listener.clone();
+        let child_task = tokio::spawn(async move {
+            child_listener.serve_one(&mut child_server).await.unwrap();
+        });
+        write_frame(
+            &mut child_client,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "child-tool-1".into(),
+                message: "Use A or B?".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let request_id = wait_open_request(&attention, &task_id).await;
+
+        // Still pending: negative 25 ms timeout must not observe a response.
+        let early = tokio::time::timeout(Duration::from_millis(25), async {
+            read_frame::<_, BrokerResponse>(&mut child_client).await
+        })
+        .await;
+        assert!(early.is_err(), "ParentDecision must remain pending until reply");
+
+        // Parent replies on a second connection.
+        let (mut parent_client, mut parent_server) = duplex(8 * 1024);
+        let parent_listener = listener.clone();
+        let parent_task = tokio::spawn(async move {
+            parent_listener.serve_one(&mut parent_server).await.unwrap();
+        });
+        write_frame(
+            &mut parent_client,
+            &BrokerMessage::ReplyDelegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id: request_id.clone(),
+                reply: "Use A".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let parent_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut parent_client).await.unwrap()
+        })
+        .await
+        .expect("reply should complete");
+        parent_task.await.unwrap();
+        assert_eq!(parent_resp.outcome["status"], "replied");
+
+        let child_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut child_client).await.unwrap()
+        })
+        .await
+        .expect("decision should unblock");
+        child_task.await.unwrap();
+        assert_eq!(child_resp.outcome["status"], "replied");
+        assert_eq!(child_resp.outcome["reply"], "Use A");
+        assert_eq!(child_resp.outcome["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn decision_socket_peer_close_keeps_row_open_and_replay_recovers_request_id() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+
+        let (mut child_client, mut child_server) = duplex(16 * 1024);
+        let child_listener = listener.clone();
+        let child_task = tokio::spawn(async move {
+            child_listener.serve_one(&mut child_server).await.unwrap();
+        });
+        write_frame(
+            &mut child_client,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "replay-tool".into(),
+                message: "Need choice".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let request_id = wait_open_request(&attention, &task_id).await;
+
+        // Peer close after persistence: abandon waiter only.
+        drop(child_client);
+        tokio::time::timeout(Duration::from_secs(1), child_task)
+            .await
+            .expect("serve_one must exit on peer close")
+            .unwrap();
+
+        let still_open = attention
+            .list_open_for_tasks(11, &[task_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(still_open.len(), 1);
+        assert_eq!(still_open[0].request_id, request_id);
+
+        // Replay with same internal call id recovers the same request_id.
+        let (mut child_client2, mut child_server2) = duplex(16 * 1024);
+        let child_listener2 = listener.clone();
+        let child_task2 = tokio::spawn(async move {
+            child_listener2.serve_one(&mut child_server2).await.unwrap();
+        });
+        write_frame(
+            &mut child_client2,
+            &BrokerMessage::ParentDecision(BrokerParentDecisionRequest {
+                token: "child-tok".into(),
+                child_tool_call_id: "replay-tool".into(),
+                message: "Need choice".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Let recover settle; row still open with same id.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let open_again = attention
+            .list_open_for_tasks(11, &[task_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(open_again.len(), 1);
+        assert_eq!(open_again[0].request_id, request_id);
+
+        // Clean up by replying so the server task finishes.
+        let (mut parent_client, mut parent_server) = duplex(8 * 1024);
+        let parent_listener = listener.clone();
+        let parent_task = tokio::spawn(async move {
+            parent_listener.serve_one(&mut parent_server).await.unwrap();
+        });
+        write_frame(
+            &mut parent_client,
+            &BrokerMessage::ReplyDelegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id: request_id.clone(),
+                reply: "ok".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame::<_, BrokerResponse>(&mut parent_client).await.unwrap()
+        })
+        .await;
+        parent_task.await.unwrap();
+        let child_resp: BrokerResponse = tokio::time::timeout(Duration::from_secs(1), async {
+            read_frame(&mut child_client2).await.unwrap()
+        })
+        .await
+        .expect("replay should unblock");
+        child_task2.await.unwrap();
+        assert_eq!(child_resp.outcome["request_id"], request_id);
+        assert_eq!(child_resp.outcome["status"], "replied");
+    }
+
+    #[tokio::test]
+    async fn foreign_parent_reply_is_unauthorized() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-foreign".into(),
+                        message: "x".into(),
+                    })
+                    .await
+            }
+        });
+        let request_id = wait_open_request(&attention, &task_id).await;
+        let reply = listener
+            .process_reply_delegation(BrokerReplyDelegationRequest {
+                token: "foreign-tok".into(),
+                request_id: request_id.clone(),
+                reply: "nope".into(),
+            })
+            .await;
+        assert_eq!(reply, DelegationReplyResult::Unauthorized);
+        // Direct parent still succeeds.
+        let ok = listener
+            .process_reply_delegation(BrokerReplyDelegationRequest {
+                token: "parent-tok".into(),
+                request_id,
+                reply: "yes".into(),
+            })
+            .await;
+        assert!(matches!(ok, DelegationReplyResult::Replied { .. }));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), decision)
+                .await
+                .expect("decision completes")
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_direct_parent_reply_replay_is_idempotent_and_conflict_is_already_resolved() {
+        let (listener, _broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-idem".into(),
+                        message: "x".into(),
+                    })
+                    .await
+            }
+        });
+        let request_id = wait_open_request(&attention, &task_id).await;
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id: request_id.clone(),
+                    reply: "A".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id: request_id.clone(),
+                    reply: "A".into(),
+                })
+                .await,
+            DelegationReplyResult::Idempotent { .. }
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "parent-tok".into(),
+                    request_id,
+                    reply: "B".into(),
+                })
+                .await,
+            DelegationReplyResult::AlreadyResolved { .. }
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(1), decision).await;
+    }
+
+    #[tokio::test]
+    async fn task_terminal_while_decision_blocked_closes_with_task_terminal() {
+        let (listener, broker, attention, task_id) = decision_fixture().await;
+        let decision = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "child-tok".into(),
+                        child_tool_call_id: "tc-term".into(),
+                        message: "continue?".into(),
+                    })
+                    .await
+            }
+        });
+        wait_open_request(&attention, &task_id).await;
+        broker
+            .complete_call(
+                &task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 22,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 1,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), decision)
+            .await
+            .expect("decision closed")
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ParentDecisionResult::Closed {
+                resolution_code: AttentionResolutionCode::TaskTerminal,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_child_can_request_from_parent_and_reply_to_grandchild() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn".into())).await;
+        mock.queue_send(Ok(accepted(2, Utc::now()))).await;
+        mock.queue_spawn(Ok("grand-conn".into())).await;
+        mock.queue_send(Ok(accepted(3, Utc::now()))).await;
+        let task_store = Arc::new(MockTaskStore::accept_any_running(2));
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>)
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let root_child = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "root-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: "pt-root".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "mid".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await
+            .task_id
+            .unwrap();
+        let grandchild = broker
+            .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                parent_connection_id: "child-conn".into(),
+                parent_conversation_id: 2,
+                parent_tool_use_id: "pt-mid".into(),
+                agent_type: AgentType::Codex,
+                profile_id: None,
+                task: "leaf".into(),
+                working_dir: None,
+                requested_working_dir: None,
+                external_handle: None,
+            })
+            .await
+            .task_id
+            .unwrap();
+        task_store.seed_edge(&root_child, 1, 2).await;
+        task_store.seed_edge(&grandchild, 2, 3).await;
+        attention.seed_edge(&root_child, 1, 2).await;
+        attention.seed_edge(&grandchild, 2, 3).await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        // Middle connection is a coordination child (can request + reply).
+        tokens
+            .register("mid-tok".into(), child_token_entry("child-conn"))
+            .await;
+        tokens
+            .register("grand-tok".into(), child_token_entry("grand-conn"))
+            .await;
+        tokens
+            .register("root-tok".into(), root_token_entry("root-conn"))
+            .await;
+
+        let mut convs = StdHashMap::new();
+        convs.insert("root-conn".into(), 1);
+        convs.insert("child-conn".into(), 2);
+        convs.insert("grand-conn".into(), 3);
+
+        let listener = DelegationListener::new(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(MapParentLookup(convs)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+        );
+
+        // Grandchild requests from middle child.
+        let grand_wait = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "grand-tok".into(),
+                        child_tool_call_id: "tc-grand".into(),
+                        message: "Which API?".into(),
+                    })
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let grand_request_id = loop {
+            if let Ok(open) = attention
+                .list_open_for_tasks(2, &[grandchild.clone()])
+                .await
+            {
+                if let Some(s) = open.into_iter().next() {
+                    break s.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("grandchild attention missing");
+            }
+            tokio::task::yield_now().await;
+        };
+        // Middle child replies to its child.
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "mid-tok".into(),
+                    request_id: grand_request_id,
+                    reply: "v2".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), grand_wait)
+                .await
+                .unwrap()
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+
+        // Middle child can also request from root.
+        let mid_wait = tokio::spawn({
+            let listener = listener.clone();
+            async move {
+                listener
+                    .process_parent_decision(BrokerParentDecisionRequest {
+                        token: "mid-tok".into(),
+                        child_tool_call_id: "tc-mid".into(),
+                        message: "Ship?".into(),
+                    })
+                    .await
+            }
+        });
+        let mid_request_id = loop {
+            if let Ok(open) = attention.list_open_for_tasks(1, &[root_child.clone()]).await {
+                if let Some(s) = open.into_iter().next() {
+                    break s.request_id;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("mid attention missing");
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "root-tok".into(),
+                    request_id: mid_request_id,
+                    reply: "ship".into(),
+                })
+                .await,
+            DelegationReplyResult::Replied { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), mid_wait)
+                .await
+                .unwrap()
+                .unwrap(),
+            ParentDecisionResult::Replied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_token_cannot_use_decision_tools() {
+        let (listener, _broker, _attention, _task_id) = decision_fixture().await;
+        assert!(matches!(
+            listener
+                .process_parent_decision(BrokerParentDecisionRequest {
+                    token: "legacy-tok".into(),
+                    child_tool_call_id: "tc".into(),
+                    message: "x".into(),
+                })
+                .await,
+            ParentDecisionResult::Rejected {
+                code,
+                ..
+            } if code == "coordination_unavailable"
+        ));
+        assert!(matches!(
+            listener
+                .process_reply_delegation(BrokerReplyDelegationRequest {
+                    token: "legacy-tok".into(),
+                    request_id: "missing".into(),
+                    reply: "x".into(),
+                })
+                .await,
+            DelegationReplyResult::Rejected {
+                code,
+                ..
+            } if code == "coordination_unavailable"
+        ));
+    }
 }

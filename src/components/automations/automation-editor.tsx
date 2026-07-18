@@ -10,7 +10,7 @@ import {
   type RichComposerHandle,
 } from "@/components/chat/composer/rich-composer"
 import {
-  useReferenceSearch,
+  useReferenceSearchController,
   type ReferenceGroupLabels,
 } from "@/components/chat/composer/use-reference-search"
 import { docToPromptBlocks } from "@/components/chat/composer/to-prompt-blocks"
@@ -163,12 +163,16 @@ export function AutomationEditor({
       listbox: tComposer("mentionListLabel"),
       more: tComposer("mentionMore"),
       count: (count: number) => tComposer("mentionCount", { count }),
+      invalidPattern: tComposer("mentionInvalidPattern"),
+      sourceError: tComposer("mentionSourceError"),
+      profileError: tComposer("mentionProfileError"),
     }),
     [tComposer]
   )
-  // Live data sources for the @ panel (files/agents/sessions/commits). All
-  // transport-only — no live ACP session needed; just the folder path.
-  const referenceSearch = useReferenceSearch({
+  // Independent-source @ panel. Folder + path scope commit identity / files;
+  // agents and global sessions still resolve when folderId is null.
+  const referenceController = useReferenceSearchController({
+    folderId,
     defaultPath: folderPath,
     enabled: true,
     labels: referenceGroupLabels,
@@ -384,7 +388,7 @@ export function AutomationEditor({
           defaultText={automation?.config?.display_text ?? ""}
           placeholder={t("promptPlaceholder")}
           ariaLabel={t("prompt")}
-          referenceSearch={referenceSearch}
+          referenceController={referenceController}
           mentionUiLabels={mentionUiLabels}
           tabLabels={referenceGroupLabels}
           onChange={(text) => {

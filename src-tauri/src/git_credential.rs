@@ -515,7 +515,8 @@ pub async fn try_inject_for_repo_remote(
         None => {
             tracing::info!(
                 "[GIT_CRED] no remote URL found for {} (remote: {})",
-                repo_path, target_remote
+                repo_path,
+                target_remote
             );
             return false;
         }
@@ -562,7 +563,8 @@ pub async fn try_inject_for_repo_remote(
 
     tracing::info!(
         "[GIT_CRED] injecting credentials for {} (user: {})",
-        remote_url, account.username
+        remote_url,
+        account.username
     );
     inject_credentials(cmd, &account.username, &token, &askpass);
     true

@@ -22,7 +22,11 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { useAcpActions, useAcpEvent } from "@/contexts/acp-connections-context"
+import {
+  useAcpActions,
+  useAcpEvent,
+  useConnectionStore,
+} from "@/contexts/acp-connections-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
@@ -32,8 +36,11 @@ import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
+import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
+import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice"
+import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
 import { FeedbackDialog } from "@/components/chat/feedback-dialog"
@@ -61,11 +68,13 @@ import {
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
 import {
+  completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
@@ -195,6 +204,12 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
 }: ConversationTabViewProps) {
+  // Freeze mount-time eligibility for uncached history scroll. Lazy useState
+  // inside the hook keeps a draft (null) ineligible after first-send bind, and
+  // keep-alive tab identity (key=tab.id) means active/inactive CSS and reloads
+  // do not recreate the latch.
+  const initialHistoryScrollEligible =
+    useInitialHistoryScrollEligibility(conversationId)
   const t = useTranslations("Folder.conversation")
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -238,7 +253,6 @@ const ConversationTabView = memo(function ConversationTabView({
     appendOptimisticTurn,
     removeOptimisticTurn,
     appendViewerUserTurn,
-    completeTurn,
     refetchDetail,
     syncTurnMetadata,
     removeConversation,
@@ -504,6 +518,8 @@ const ConversationTabView = memo(function ConversationTabView({
     // Drives cross-client viewer discovery: when another client is already
     // live on this conversation, attach to its connection instead of spawning.
     conversationId: dbConversationId ?? undefined,
+    // Memory-only draft override (and reapply after bind uses conversation row).
+    delegationRouteOverride: ownTab?.delegationRouteOverride ?? undefined,
   })
   const { status: connStatus, sessionId: connSessionId } = conn
   const messageQueue = useMessageQueue()
@@ -591,14 +607,12 @@ const ConversationTabView = memo(function ConversationTabView({
     prevConnStatusRef.current = connStatus
     if (!wasPrompting || connStatus === "prompting") return
 
-    // Turn completed — promote liveMessage + optimisticTurns to localTurns.
-    // Don't pass conn.liveMessage: this panel no longer subscribes to it (the
-    // connection snapshot is stable across streaming tokens — see useConnection),
-    // so reading it here would be stale. COMPLETE_TURN falls back to
-    // session.liveMessage, which the connection dispatch's sink wrote
-    // synchronously as the final chunk landed (turn_complete flushes the stream
-    // queue BEFORE the status change), so it already holds the final message.
-    completeTurn(effectiveConversationId)
+    // Turn completed — promote liveMessage + optimisticTurns to localTurns,
+    // and drop the live transcript projection in the same call stack (no
+    // blank/duplicate assistant frame). Don't pass conn.liveMessage: this
+    // panel no longer subscribes to it (see useConnection); COMPLETE_TURN
+    // falls back to session.liveMessage written by the sink before status change.
+    completeLiveTranscriptTurn(effectiveConversationId)
 
     // Cancel previous metadata sync (handles rapid consecutive turns)
     syncCancelRef.current?.()
@@ -611,7 +625,7 @@ const ConversationTabView = memo(function ConversationTabView({
         effectiveConversationId
       )
     }
-  }, [completeTurn, connStatus, effectiveConversationId, syncTurnMetadata])
+  }, [connStatus, effectiveConversationId, syncTurnMetadata])
 
   // Auto-send queued messages when agent finishes responding.
   // Refs are synced via useEffect; the auto-send effect is declared
@@ -682,23 +696,39 @@ const ConversationTabView = memo(function ConversationTabView({
     workingDirForConnection,
   ])
 
-  // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
-  // The connection dispatch invokes this sink synchronously whenever liveMessage
+  // Mirror the connection's liveMessage into the runtime session OUTSIDE React,
+  // and publish incremental live-transcript projection for the UI footer (Task 11).
+  // The connection dispatch invokes these sinks synchronously whenever liveMessage
   // changes (streaming deltas, tool updates, the prompt-start reset), so the
-  // streaming content flows straight to the runtime store — which the message
-  // list renders — WITHOUT this keep-alive panel re-rendering per token (the old
-  // mirror effect required a per-token render just to run). The sink writes
-  // non-null values with isLive = (status === "prompting"), which tells the
-  // runtime reducer to bypass its stale-reconnect-replay guard (matters for the
-  // rekey path: close+reopen mid-turn, where detail.turns may already hold user
-  // turns that would otherwise drop the live assistant stream). Turn-end clearing
-  // is owned by COMPLETE_TURN (nulls liveMessage); unmount clearing by
-  // removeConversation. `tabId` is the connection contextKey.
+  // streaming content flows straight to the runtime / transcript stores WITHOUT
+  // this keep-alive panel re-rendering per token. Canonical writes non-null values
+  // with isLive = (status === "prompting"), which tells the runtime reducer to
+  // bypass its stale-reconnect-replay guard. Turn-end clearing is owned by
+  // COMPLETE_TURN; unmount clearing by removeConversation. `tabId` is the
+  // connection contextKey.
+  const connectionIdForSink = conn.connectionId
   useEffect(() => {
-    return acpActions.registerLiveMessageSink(tabId, (liveMessage, isLive) =>
-      setLiveMessage(effectiveConversationId, liveMessage, isLive)
-    )
-  }, [acpActions, tabId, effectiveConversationId, setLiveMessage])
+    const conversationId = effectiveConversationId
+    return acpActions.registerLiveSinks(tabId, {
+      canonical: (liveMessage, isLive, deliveryIds) => {
+        if (deliveryIds && deliveryIds.length > 0) {
+          setLiveMessage(conversationId, liveMessage, isLive, deliveryIds)
+        } else {
+          setLiveMessage(conversationId, liveMessage, isLive)
+        }
+      },
+      transcript: createLiveTranscriptFrameSink(
+        conversationId,
+        connectionIdForSink || "pending"
+      ),
+    })
+  }, [
+    acpActions,
+    tabId,
+    effectiveConversationId,
+    connectionIdForSink,
+    setLiveMessage,
+  ])
 
   // Cross-client VIEWER (Bug 2): mirror the connection's in-flight user prompt
   // (from a snapshot's `pending_user_message`, captured when we attach
@@ -935,7 +965,8 @@ const ConversationTabView = memo(function ConversationTabView({
             const res = await createChatConversation(
               selectedAgent,
               title,
-              chatExistingDir
+              chatExistingDir,
+              sendOwnTab?.delegationRouteOverride ?? null
             )
             newConversationId = res.conversationId
             sendFolderId = res.folderId
@@ -969,7 +1000,8 @@ const ConversationTabView = memo(function ConversationTabView({
             newConversationId = await createConversation(
               folderId,
               selectedAgent,
-              title
+              title,
+              sendOwnTab?.delegationRouteOverride ?? null
             )
             dbConvIdRef.current = newConversationId
             // Set external ID on the stable virtual session (no migration needed —
@@ -1372,6 +1404,8 @@ const ConversationTabView = memo(function ConversationTabView({
       onNewSession={
         canShowDetailErrorActions ? handleOpenNewSession : undefined
       }
+      initialHistoryScrollEligible={initialHistoryScrollEligible}
+      historyLoadComplete={detail != null}
     />
   )
 
@@ -1407,9 +1441,11 @@ const ConversationTabView = memo(function ConversationTabView({
           <BackgroundTasksChip contextKey={tabId} />
         </>
       }
+      routeNotice={<DelegationRouteNotice contextKey={tabId} />}
       status={connStatus}
       promptCapabilities={conn.promptCapabilities}
       defaultPath={workingDirForConnection}
+      folderId={ownFolderId}
       agentName={AGENT_LABELS[selectedAgent]}
       error={conn.error}
       claudeApiRetry={conn.claudeApiRetry}
@@ -1510,6 +1546,7 @@ const ConversationTabView = memo(function ConversationTabView({
               status={composerConnStatus}
               promptCapabilities={conn.promptCapabilities}
               defaultPath={workingDirForConnection}
+              folderId={ownFolderId}
               agentName={AGENT_LABELS[selectedAgent]}
               onFocus={handleFocus}
               onSend={handleSend}
@@ -1599,18 +1636,22 @@ export function ConversationDetailPanel() {
   const tStatus = useTranslations("Folder.statusLabels")
   const tExport = useTranslations("Folder.conversation.exportLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
-  const {
-    completeTurn: runtimeCompleteTurn,
-    removeConversation: runtimeRemoveConversation,
-  } = useConversationRuntimeActions()
+  const { removeConversation: runtimeRemoveConversation } =
+    useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
   const conversations = useAppWorkspaceStore((s) => s.conversations)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const isTileMode = useTabStore((s) => s.isTileMode)
-  const { openNewConversationTab, closeTab, switchTab, onPreviewTabReplaced } =
-    useTabActions()
+  const {
+    openNewConversationTab,
+    closeTab,
+    switchTab,
+    onPreviewTabReplaced,
+    setDraftDelegationRoute,
+  } = useTabActions()
+  const { getConnection } = useConnectionStore()
   const newConversation = useMemo(() => {
     const activeTab = tabs.find((tab) => tab.id === activeTabId)
     if (!activeTab || activeTab.conversationId != null) return null
@@ -1706,8 +1747,9 @@ export function ConversationDetailPanel() {
         )
         if (isOpenInTabs) return
 
-        // Promote liveMessage + optimisticTurns to localTurns immediately
-        runtimeCompleteTurn(matchedConversationId)
+        // Promote liveMessage + optimisticTurns to localTurns immediately,
+        // coordinating the live-transcript footer handoff in the same stack.
+        completeLiveTranscriptTurn(matchedConversationId)
 
         // If tab was closed while agent was responding, clean up now.
         // Event-time read: fresh via getState(), no reactive subscription.
@@ -1716,7 +1758,7 @@ export function ConversationDetailPanel() {
           runtimeRemoveConversation(matchedConversationId)
         }
       },
-      [tabs, runtimeCompleteTurn, runtimeRemoveConversation]
+      [tabs, runtimeRemoveConversation]
     )
   )
 
@@ -1851,6 +1893,15 @@ export function ConversationDetailPanel() {
     (id) => (id === activeRuntimeId ? activeRuntimeSession : null),
     conversations
   )
+
+  const activeRouteMenuTab = useMemo(
+    () => tabs.find((tab) => tab.id === activeTabId) ?? null,
+    [tabs, activeTabId]
+  )
+  const activeRouteConnectionId =
+    activeRouteMenuTab != null
+      ? (getConnection(activeRouteMenuTab.id)?.connectionId ?? null)
+      : null
 
   const getExportData = useCallback(() => {
     if (!activeConversationTab?.conversationId) return null
@@ -2065,6 +2116,22 @@ export function ConversationDetailPanel() {
             <Info className="h-4 w-4" />
             {tDetails("menuLabel")}
           </ContextMenuItem>
+          {activeRouteMenuTab ? (
+            <DelegationRouteMenu
+              agentType={activeRouteMenuTab.agentType}
+              conversationId={activeRouteMenuTab.conversationId}
+              parentId={activeSessionSummary?.parent_id}
+              connectionId={activeRouteConnectionId}
+              value={
+                activeRouteMenuTab.conversationId != null
+                  ? (activeSessionSummary?.delegation_route_override ?? null)
+                  : (activeRouteMenuTab.delegationRouteOverride ?? null)
+              }
+              onDraftChange={(v) =>
+                setDraftDelegationRoute(activeRouteMenuTab.id, v)
+              }
+            />
+          ) : null}
           <ContextMenuSeparator />
           <ContextMenuItem
             disabled={!activeTabId}

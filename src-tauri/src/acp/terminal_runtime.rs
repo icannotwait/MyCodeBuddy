@@ -11,8 +11,9 @@ use sacp::schema::{
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::terminal_adapter::AcpTerminalAdapter;
 use crate::terminal::shell::{build_command_line, ResolvedShellSpec};
@@ -25,6 +26,14 @@ const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
 /// inherit the pipe handle and keep it open long after the direct child
 /// exits, turning `wait_for_exit` into a silent hang.
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// Session-wide bound for waiting on terminal cleanup tasks. The owned tasks
+/// continue in the background after this deadline so timeout cannot interrupt
+/// kill/wait/drain/exit-status publication midway through its state change.
+const RELEASE_KILL_BOUND: Duration = Duration::from_secs(3);
+/// Upper bound for a waiter that has observed cancel (or a missing child) and
+/// is waiting for the kill path to publish `exit_status`. Prevents infinite
+/// hangs if kill fails to publish.
+const EXIT_STATUS_WAIT_BOUND: Duration = Duration::from_secs(10);
 
 /// How a `terminal/create` request will be executed.
 ///
@@ -96,16 +105,74 @@ struct TerminalInstance {
     child: Mutex<Option<tokio::process::Child>>,
     snapshot: Mutex<TerminalSnapshot>,
     reader_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Signalled by [`Self::kill_command`] so a concurrent
+    /// [`Self::wait_for_exit`] can drop the child mutex and let kill proceed.
+    cancel: CancellationToken,
+    /// Retains the published exit status so waiters cannot miss a notification
+    /// between checking the snapshot and registering for the next change.
+    exit_status_tx: watch::Sender<Option<TerminalExitStatus>>,
 }
 
 impl TerminalInstance {
     fn new(session_id: String, output_limit: Option<u64>, child: tokio::process::Child) -> Self {
+        let (exit_status_tx, _) = watch::channel(None);
         Self {
             session_id,
             output_limit: output_limit.and_then(|v| usize::try_from(v).ok()),
             child: Mutex::new(Some(child)),
             snapshot: Mutex::new(TerminalSnapshot::default()),
             reader_handles: Mutex::new(Vec::new()),
+            cancel: CancellationToken::new(),
+            exit_status_tx,
+        }
+    }
+
+    async fn publish_exit_status(&self, exit_status: TerminalExitStatus) {
+        let published = {
+            let mut snapshot = self.snapshot.lock().await;
+            if snapshot.exit_status.is_none() {
+                snapshot.exit_status = Some(exit_status.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            self.exit_status_tx.send_replace(Some(exit_status));
+        }
+    }
+
+    /// Wait until `exit_status` is published (or a hard bound elapses).
+    async fn await_published_exit_status(
+        &self,
+    ) -> Result<TerminalExitStatus, TerminalRuntimeError> {
+        let deadline = tokio::time::Instant::now() + EXIT_STATUS_WAIT_BOUND;
+        let mut exit_status_rx = self.exit_status_tx.subscribe();
+        loop {
+            if let Some(exit_status) = exit_status_rx.borrow().clone() {
+                return Ok(exit_status);
+            }
+
+            // Opportunistically observe a natural exit if the kill path has
+            // not published yet (e.g. race where the process died first).
+            self.refresh_exit_status().await?;
+            if let Some(exit_status) = exit_status_rx.borrow().clone() {
+                return Ok(exit_status);
+            }
+
+            match tokio::time::timeout_at(deadline, exit_status_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(TerminalRuntimeError::Internal(
+                        "terminal exit status publisher closed unexpectedly".to_string(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(TerminalRuntimeError::Internal(
+                        "timed out waiting for terminal exit status after cancel/kill".to_string(),
+                    ))
+                }
+            }
         }
     }
 
@@ -178,8 +245,7 @@ impl TerminalInstance {
             // snapshot already contains (or has explicitly given up on) all
             // reader output.
             self.drain_readers().await;
-            let mut snapshot = self.snapshot.lock().await;
-            snapshot.exit_status = Some(map_exit_status(status));
+            self.publish_exit_status(map_exit_status(status)).await;
         }
 
         Ok(())
@@ -193,30 +259,56 @@ impl TerminalInstance {
             return Ok(exit_status);
         }
 
-        let exit_status = {
+        // Hold the child mutex only while racing `child.wait()` against cancel.
+        // On cancel we MUST drop the mutex so `kill_command` can acquire it —
+        // previously both paths held the same lock across `wait()`, so cancel
+        // deadlocked behind a long-running agent `waitForExit`.
+        let wait_result = {
             let mut child_guard = self.child.lock().await;
             let Some(child) = child_guard.as_mut() else {
-                return Err(TerminalRuntimeError::Internal(
-                    "terminal process missing while waiting for exit".to_string(),
-                ));
+                // Kill path (or another waiter) already took ownership / finished.
+                drop(child_guard);
+                let exit_status = self.await_published_exit_status().await?;
+                self.drain_readers().await;
+                return Ok(exit_status);
             };
-            let status = child.wait().await.map_err(|err| {
-                TerminalRuntimeError::Internal(format!(
-                    "failed waiting for terminal process to exit: {err}"
-                ))
-            })?;
-            *child_guard = None;
-            map_exit_status(status)
+
+            tokio::select! {
+                status = child.wait() => {
+                    *child_guard = None;
+                    Some(status)
+                }
+                _ = self.cancel.cancelled() => {
+                    // Release the child lock for kill_command before awaiting
+                    // the published exit status.
+                    None
+                }
+            }
         };
 
-        self.drain_readers().await;
-
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.exit_status = Some(exit_status.clone());
-        Ok(exit_status)
+        match wait_result {
+            Some(Ok(status)) => {
+                self.drain_readers().await;
+                let exit_status = map_exit_status(status);
+                self.publish_exit_status(exit_status.clone()).await;
+                Ok(exit_status)
+            }
+            Some(Err(err)) => Err(TerminalRuntimeError::Internal(format!(
+                "failed waiting for terminal process to exit: {err}"
+            ))),
+            None => {
+                let exit_status = self.await_published_exit_status().await?;
+                self.drain_readers().await;
+                Ok(exit_status)
+            }
+        }
     }
 
     async fn kill_command(&self) -> Result<(), TerminalRuntimeError> {
+        // Signal waiters first so any concurrent `wait_for_exit` drops the
+        // child mutex via its cancel branch. Do not acquire `child` before this.
+        self.cancel.cancel();
+
         self.refresh_exit_status().await?;
         let already_exited = self.snapshot.lock().await.exit_status.is_some();
         if already_exited {
@@ -227,6 +319,11 @@ impl TerminalInstance {
         let exit_status = {
             let mut child_guard = self.child.lock().await;
             let Some(child) = child_guard.as_mut() else {
+                // Waiter may still be finishing a natural exit, or another kill
+                // already cleared the child. Wait for the published status.
+                drop(child_guard);
+                let _ = self.await_published_exit_status().await?;
+                self.drain_readers().await;
                 return Ok(());
             };
 
@@ -246,9 +343,7 @@ impl TerminalInstance {
         };
 
         self.drain_readers().await;
-
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.exit_status = Some(exit_status);
+        self.publish_exit_status(exit_status).await;
         Ok(())
     }
 
@@ -348,7 +443,9 @@ impl TerminalRuntime {
         request: &CreateTerminalRequest,
     ) -> Result<ExecutionMode, TerminalRuntimeError> {
         if !request.args.is_empty() {
-            return Ok(ExecutionMode::DirectProgram(PathBuf::from(&request.command)));
+            return Ok(ExecutionMode::DirectProgram(PathBuf::from(
+                &request.command,
+            )));
         }
 
         let cwd = self.effective_cwd(request);
@@ -624,10 +721,32 @@ impl TerminalRuntime {
             removed
         };
 
-        for terminal in removed {
-            if let Err(err) = terminal.kill_command().await {
-                tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+        let cleanup_tasks = removed
+            .into_iter()
+            .map(|terminal| {
+                tokio::spawn(async move {
+                    if let Err(err) = terminal.kill_command().await {
+                        tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = tokio::time::Instant::now() + RELEASE_KILL_BOUND;
+        let mut timed_out = 0usize;
+        for task in cleanup_tasks {
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::error!("[ACP] terminal cleanup task failed: {err}");
+                }
+                Err(_) => timed_out += 1,
             }
+        }
+        if timed_out > 0 {
+            tracing::error!(
+                "[ACP] {timed_out} terminal cleanup task(s) exceeded {RELEASE_KILL_BOUND:?}; continuing in background"
+            );
         }
     }
 
@@ -799,6 +918,16 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn platform_long_running_command() -> String {
+        "Start-Sleep -Seconds 3600".to_string()
+    }
+
+    #[cfg(unix)]
+    fn platform_long_running_command() -> String {
+        "sleep 3600".to_string()
+    }
+
+    #[cfg(windows)]
     fn platform_test_shell() -> ResolvedShellSpec {
         let (executable, display_name) = [
             ("pwsh.exe", "PowerShell 7"),
@@ -940,8 +1069,7 @@ mod tests {
     #[test]
     fn empty_args_existing_executable_with_spaces_is_direct() {
         let temp = tempfile::tempdir().unwrap();
-        let executable =
-            create_test_executable(temp.path().join(test_executable_name("my tool")));
+        let executable = create_test_executable(temp.path().join(test_executable_name("my tool")));
         let runtime = test_runtime(test_shell_spec()).with_default_cwd(Some(temp.path().into()));
         let request = CreateTerminalRequest::new(
             SessionId::new("s"),
@@ -979,12 +1107,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let bin_dir = temp.path().join("bin");
         std::fs::create_dir(&bin_dir).unwrap();
-        let executable =
-            create_test_executable(bin_dir.join(test_executable_name("special-tool")));
+        let executable = create_test_executable(bin_dir.join(test_executable_name("special-tool")));
 
         let runtime = test_runtime(test_shell_spec());
-        let mut request =
-            CreateTerminalRequest::new(SessionId::new("s"), "special-tool");
+        let mut request = CreateTerminalRequest::new(SessionId::new("s"), "special-tool");
         // Prefer the Windows-style `Path` key so classification still matches
         // case-insensitive env layering on Windows (and exact `PATH` on Unix
         // would also work — here we exercise the override path with PATH).
@@ -1011,8 +1137,7 @@ mod tests {
     #[test]
     fn request_cwd_is_used_for_relative_executable_resolution() {
         let temp = tempfile::tempdir().unwrap();
-        let executable =
-            create_test_executable(temp.path().join(test_executable_name("rel-tool")));
+        let executable = create_test_executable(temp.path().join(test_executable_name("rel-tool")));
         let runtime = test_runtime(test_shell_spec());
 
         #[cfg(windows)]
@@ -1113,10 +1238,7 @@ mod tests {
         // `/C` argument, which breaks cmd's nested-quote parsing for
         // `cd /d "path"`. Temp paths have no spaces, so unquoted `cd /d` is
         // still a real CMD builtin line under the snapshotted Cmd strategy.
-        let line = format!(
-            "cd /d {} && where cmd.exe",
-            temp.path().to_string_lossy()
-        );
+        let line = format!("cd /d {} && where cmd.exe", temp.path().to_string_lossy());
         let runtime = test_runtime(windows_cmd_test_shell());
         let session_id = SessionId::new("cmd-builtins");
         let response = runtime
@@ -1174,17 +1296,12 @@ mod tests {
         assert!(!shell_rpc.to_string().contains("test-command-secret"));
 
         let program_runtime = test_runtime(test_shell_spec());
-        let mut direct = CreateTerminalRequest::new(
-            SessionId::new("program-error"),
-            "missing-program-for-test",
-        );
+        let mut direct =
+            CreateTerminalRequest::new(SessionId::new("program-error"), "missing-program-for-test");
         direct.args = vec!["--version".into()];
         let program_error = program_runtime.create_terminal(direct).await.unwrap_err();
         let program_rpc = serde_json::to_value(program_error.into_rpc_error()).unwrap();
-        assert_eq!(
-            program_rpc["data"]["code"],
-            "terminal_program_spawn_failed"
-        );
+        assert_eq!(program_rpc["data"]["code"], "terminal_program_spawn_failed");
         assert_eq!(program_rpc["data"]["mode"], "direct_program");
     }
 
@@ -1266,8 +1383,8 @@ mod tests {
     async fn falls_back_to_default_cwd_when_request_omits_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("cwd-default".to_string());
         // Bare `pwd` (no whitespace) → may be DirectProgram if on PATH;
@@ -1320,8 +1437,7 @@ mod tests {
 
         // Genuine shell operators must evaluate, not be passed as literal args.
         let session_id = SessionId::new("shell-ops".to_string());
-        let request =
-            CreateTerminalRequest::new(session_id.clone(), "true && echo OK".to_string());
+        let request = CreateTerminalRequest::new(session_id.clone(), "true && echo OK".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
         assert!(
             output.contains("OK"),
@@ -1335,8 +1451,8 @@ mod tests {
     async fn shell_wrapped_command_respects_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical = dir.path().canonicalize().expect("canonicalize");
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
 
         let session_id = SessionId::new("shell-cwd".to_string());
         let request =
@@ -1356,8 +1472,7 @@ mod tests {
         let runtime = test_runtime(platform_test_shell());
 
         let session_id = SessionId::new("direct-exec".to_string());
-        let mut request =
-            CreateTerminalRequest::new(session_id.clone(), "/bin/echo".to_string());
+        let mut request = CreateTerminalRequest::new(session_id.clone(), "/bin/echo".to_string());
         request.args = vec!["hello world".into()];
         let output = run_and_capture(&runtime, &session_id, request).await;
         assert!(
@@ -1425,8 +1540,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&exe, perms).expect("chmod");
 
-        let runtime = test_runtime(platform_test_shell())
-            .with_default_cwd(Some(dir.path().to_path_buf()));
+        let runtime =
+            test_runtime(platform_test_shell()).with_default_cwd(Some(dir.path().to_path_buf()));
         let session_id = SessionId::new("rel-space-exe".to_string());
         let request = CreateTerminalRequest::new(session_id.clone(), "./my tool".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
@@ -1434,5 +1549,210 @@ mod tests {
             output.contains("ran-relative"),
             "relative space-containing exe was not run in the effective cwd; got:\n{output}"
         );
+    }
+
+    /// Regression: a concurrent `wait_for_terminal_exit` must not hold the
+    /// child mutex across the whole process lifetime in a way that blocks
+    /// `release_all_for_session` / kill. Without CancellationToken, this
+    /// deadlocks for the full sleep duration (and cancel UI hangs forever).
+    #[tokio::test]
+    async fn concurrent_wait_and_session_release_completes_promptly() {
+        let runtime = Arc::new(test_runtime(platform_test_shell()));
+        let session_id = SessionId::new("wait-release-race");
+
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(
+                session_id.clone(),
+                platform_long_running_command(),
+            ))
+            .await
+            .expect("create long-running terminal");
+        let terminal_id = response.terminal_id.clone();
+        let terminal = runtime
+            .find_terminal(terminal_id.0.as_ref(), session_id.0.as_ref())
+            .await
+            .expect("terminal exists");
+
+        // Capture the child PID before concurrent wait/release so we can assert
+        // the process tree was actually terminated (not just that futures
+        // unblocked).
+        let child_pid = {
+            let guard = terminal.child.lock().await;
+            guard.as_ref().and_then(|child| child.id())
+        };
+        assert!(
+            child_pid.is_some(),
+            "expected a live child pid before release"
+        );
+
+        let wait_runtime = Arc::clone(&runtime);
+        let wait_session = session_id.clone();
+        let wait_terminal = terminal_id.clone();
+        let wait_handle = tokio::spawn(async move {
+            wait_runtime
+                .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                    wait_session,
+                    wait_terminal,
+                ))
+                .await
+        });
+
+        // On this current-thread runtime, try_lock can only fail here if the
+        // waiter yielded from child.wait() while retaining the mutex. The
+        // refresh path never yields while it owns this lock.
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(guard) = terminal.child.try_lock() {
+            drop(guard);
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "waiter never acquired the child mutex"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let release_runtime = Arc::clone(&runtime);
+        let release_session = session_id.0.to_string();
+        let release_handle = tokio::spawn(async move {
+            release_runtime
+                .release_all_for_session(&release_session)
+                .await;
+        });
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            let wait_result = wait_handle.await.expect("wait task join");
+            release_handle.await.expect("release task join");
+            wait_result
+        })
+        .await
+        .expect("wait+release must complete within 5s (cancel/kill deadlock regression)");
+
+        let wait_response = joined.expect("wait_for_terminal_exit after kill");
+        // Killed processes may report signal/non-zero code depending on OS;
+        // the critical property is that wait returned at all with a status.
+        assert!(
+            wait_response.exit_status.exit_code.is_some()
+                || wait_response.exit_status.signal.is_some(),
+            "expected an exit code or signal after kill; got {:?}",
+            wait_response.exit_status
+        );
+
+        if let Some(pid) = child_pid {
+            // Give the OS a brief moment to reap; kill_tree should have
+            // terminated the process already by the time wait returned.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !process_is_alive(pid),
+                "process tree root pid {pid} still alive after session release"
+            );
+        }
+    }
+
+    /// Regression: the release bound must stop waiting for cleanup without
+    /// cancelling the task that owns child-exit publication. The old direct
+    /// `timeout(kill_command())` could drop that future after clearing `child`
+    /// and strand every waiter with no remaining status publisher.
+    #[tokio::test]
+    async fn release_timeout_does_not_cancel_exit_publication() {
+        let runtime = Arc::new(test_runtime(platform_test_shell()));
+        let session_id = SessionId::new("release-timeout-publication");
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(
+                session_id.clone(),
+                platform_long_running_command(),
+            ))
+            .await
+            .expect("create terminal");
+        let terminal = runtime
+            .find_terminal(response.terminal_id.0.as_ref(), session_id.0.as_ref())
+            .await
+            .expect("terminal exists");
+
+        // Keep drain_readers blocked at its mutex after the process exits so
+        // the test can pin kill_command between clearing child and publishing
+        // exit_status without relying on timer scheduling.
+        let reader_handles_guard = terminal.reader_handles.lock().await;
+
+        let release_runtime = Arc::clone(&runtime);
+        let release_session = session_id.0.to_string();
+        let release_started = std::time::Instant::now();
+        let release = tokio::spawn(async move {
+            release_runtime
+                .release_all_for_session(&release_session)
+                .await;
+        });
+
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while terminal.child.lock().await.is_some() {
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "kill did not clear child"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            release_started.elapsed() < RELEASE_KILL_BOUND,
+            "release timed out before the child was cleared"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(RELEASE_KILL_BOUND).await;
+        release.await.expect("release task join");
+        assert!(
+            terminal.snapshot().await.exit_status.is_none(),
+            "test precondition failed: exit status published while reader lock was held"
+        );
+        drop(reader_handles_guard);
+
+        for _ in 0..100 {
+            if terminal.snapshot().await.exit_status.is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("detached kill task did not publish exit status");
+    }
+
+    /// A waiter that subscribes after publication must still observe the exit
+    /// status immediately. An edge-triggered Notify cannot provide this
+    /// contract without a check/register race; a retained signal can.
+    #[tokio::test]
+    async fn exit_status_signal_retains_publication_for_late_subscriber() {
+        let runtime = test_runtime(platform_test_shell());
+        let session_id = SessionId::new("retained-exit-status");
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(session_id.clone(), "exit 0"))
+            .await
+            .expect("create terminal");
+        let terminal = runtime
+            .find_terminal(response.terminal_id.0.as_ref(), session_id.0.as_ref())
+            .await
+            .expect("terminal exists");
+        let expected = terminal.wait_for_exit().await.expect("wait for exit");
+
+        let receiver = terminal.exit_status_tx.subscribe();
+        let observed = receiver.borrow().clone();
+        assert_eq!(observed, Some(expected));
+
+        runtime.release_all_for_session(session_id.0.as_ref()).await;
+    }
+
+    #[cfg(windows)]
+    fn process_is_alive(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout);
+                text.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 }

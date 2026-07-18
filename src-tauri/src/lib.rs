@@ -5,6 +5,7 @@ pub use acp::{
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
+pub mod auto_title;
 pub mod automation;
 pub mod chat_channel;
 pub mod commands;
@@ -18,6 +19,7 @@ mod network;
 pub mod office_watch;
 pub mod parsers;
 pub mod paths;
+pub mod reference_search;
 pub mod pet_sessions;
 pub mod pet_state_mapper;
 pub mod pets;
@@ -46,19 +48,18 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, backup,
-        chat_channel as chat_channel_commands, conversations, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        office_tools as office_tools_commands,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
+        backup, chat_channel as chat_channel_commands, conversations,
+        delegation as delegation_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folders,
+        logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
-        remote_proxy as remote_proxy_commands,
-        remote_workspace as remote_workspace_commands, science as science_commands,
-        session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
-        version_control, windows, workspace_state as workspace_state_commands,
+        remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
+        science as science_commands, session_info as session_info_commands, system_settings,
+        terminal as terminal_commands, version_control, windows,
+        workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -91,8 +92,8 @@ mod tauri_app {
             summarize_web_auto_start_error(err)
         );
         tauri::async_runtime::spawn(async move {
-            let _ =
-                notification::send_notification(app, "Codeg Web service".to_string(), body).await;
+            let _ = notification::send_notification(app, "DrawCode Web service".to_string(), body)
+                .await;
         });
     }
 
@@ -223,6 +224,30 @@ mod tauri_app {
             // same download progress; lets the upgrade UI survive navigation.
             .manage(crate::update::new_update_state_handle())
             .setup(|app| {
+                // Desktop ACP delivery owner — selected once at startup from
+                // normalized streaming-performance flags. Managed before any
+                // manager / background task that can emit ACP events so the
+                // Tauri leg always resolves a stable mode (legacy or batched).
+                {
+                    use tauri::Manager;
+                    let metrics = app
+                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .metrics()
+                        .clone();
+                    let flags = crate::acp::StreamingPerformanceFlags::from_env();
+                    let delivery = crate::acp::DesktopAcpDelivery::start(
+                        app.handle().clone(),
+                        metrics,
+                        flags,
+                    );
+                    tracing::info!(
+                        "[ACP] desktop delivery mode={:?} batching={}",
+                        delivery.mode(),
+                        delivery.capabilities().flags.desktop_acp_event_batching
+                    );
+                    app.manage(delivery);
+                }
+
                 let app_data_dir = app.path().app_data_dir()?;
 
                 // Unify the data root across every consumer:
@@ -296,6 +321,72 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
+
+                // One shared internal-session registry for Tauri commands and the
+                // embedded Axum AppState (cloned into both surfaces).
+                let internal_sessions = {
+                    let db = app.state::<db::AppDatabase>();
+                    tauri::async_runtime::block_on(
+                        crate::auto_title::InternalAgentSessionRegistry::load(
+                            db.conn.clone(),
+                            &effective_data_dir,
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+                };
+                app.manage(internal_sessions.clone());
+
+                // Durable auto-title coordinator (shared with embedded Axum AppState).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    let title_db = std::sync::Arc::new(db::AppDatabase {
+                        conn: db.conn.clone(),
+                    });
+                    let cm = app.state::<ConnectionManager>().clone_ref();
+                    let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let coordinator = crate::auto_title::build_production_coordinator(
+                        title_db,
+                        cm,
+                        internal_sessions.clone(),
+                        effective_data_dir.clone(),
+                        emitter,
+                    );
+                    tauri::async_runtime::block_on(coordinator.recover_and_start())
+                        .map_err(|e| e.to_string())?;
+                    app.manage(coordinator);
+                    app.manage(std::sync::Arc::new(
+                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+                    ));
+                }
+
+                // Process-wide reference-search registry (shared with embedded Axum).
+                // Load the persisted limit before construction so the first start
+                // observes the operator's cap; start one idle sweeper for production.
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    let limit = tauri::async_runtime::block_on(
+                        crate::commands::conversation_experience::load_settings_from(&db.conn),
+                    )
+                    .map(|settings| settings.reference_search_limit)
+                    .unwrap_or(
+                        crate::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+                    );
+                    let registry = crate::reference_search::ReferenceSearchRegistry::new(
+                        limit,
+                        std::sync::Arc::new(
+                            crate::reference_search::ProductionReferenceSourceFactory {
+                                db: db.conn.clone(),
+                            },
+                        ),
+                    );
+                    {
+                        let registry = std::sync::Arc::clone(&registry);
+                        tauri::async_runtime::spawn(
+                            crate::reference_search::run_reference_search_sweeper(registry),
+                        );
+                    }
+                    app.manage(registry);
+                }
 
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
@@ -409,7 +500,130 @@ mod tauri_app {
                     });
                 }
 
-                // Start chat channel background tasks
+                // Delegation broker + UDS listener. Built from the managed
+                // ConnectionManager + DB so spawn / depth-lookup work against
+                // live state. Managed alongside the existing per-resource
+                // states so commands (Tauri + web) can resolve them by type.
+                //
+                // MUST run before:
+                //   * chat-channel / automation startup paths that
+                //     `state::<DelegationRuntimeSettings>()`
+                //   * LifecycleSubscriber spawn so the broker handle is available
+                let broker_for_lifecycle = {
+                    let cm_state = app.state::<ConnectionManager>();
+                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let stack = crate::app_state::build_delegation_stack(
+                        &cm_state,
+                        db_conn.clone(),
+                        effective_data_dir.clone(),
+                    );
+                    app.manage(stack.broker.clone());
+                    app.manage(stack.tokens.clone());
+                    app.manage(stack.leases.clone());
+                    app.manage(stack.feedback.clone());
+                    app.manage(stack.ask.clone());
+                    app.manage(stack.sessions.clone());
+                    app.manage(stack.runtime_settings.clone());
+                    app.manage(stack.metrics.clone());
+                    app.manage(crate::commands::delegation::DelegationSocketPath(
+                        stack.socket_path.clone(),
+                    ));
+
+                    // Push persisted settings into the broker + runtime snapshot
+                    // + feedback + question + session-info config before listener
+                    // accept.
+                    let broker_for_init = stack.broker.clone();
+                    let runtime_for_init = stack.runtime_settings.clone();
+                    let db_for_init = db_conn.clone();
+                    let feedback_for_init = stack.feedback.clone();
+                    let question_for_init = stack.ask.clone();
+                    let session_info_for_init = stack.sessions.clone();
+                    let reconcile_result = tauri::async_runtime::block_on(async move {
+                        delegation_commands::apply_persisted_config(
+                            &db_for_init,
+                            &broker_for_init,
+                            &runtime_for_init,
+                        )
+                        .await;
+                        crate::commands::feedback::apply_persisted_feedback_config(
+                            &db_for_init,
+                            &feedback_for_init,
+                        )
+                        .await;
+                        crate::commands::question::apply_persisted_question_config(
+                            &db_for_init,
+                            &question_for_init,
+                        )
+                        .await;
+                        crate::commands::session_info::apply_persisted_session_info_config(
+                            &db_for_init,
+                            &session_info_for_init,
+                        )
+                        .await;
+                        // After migrations + settings, before the listener accepts:
+                        // fail only orphaned running delegate rows as host_restarted.
+                        // Fail-closed: do not start the listener on reconcile error.
+                        crate::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
+                            broker_for_init.reconcile_running_on_startup().await,
+                        )
+                    });
+                    if let Err(e) = reconcile_result {
+                        tracing::error!("[delegation] {e}");
+                        return Err(e.into());
+                    }
+
+                    // Soft supervisor: after reconcile (fail-closed preserved),
+                    // before/with listener. Observe-only.
+                    crate::app_state::spawn_delegation_supervisor(
+                        stack.broker.clone(),
+                        cm_state.clone_ref(),
+                        &stack.runtime_settings,
+                    );
+
+                    let listener_broker = stack.broker.clone();
+                    let listener = crate::acp::delegation::listener::DelegationListener::new(
+                        listener_broker,
+                        stack.tokens,
+                        stack.leases,
+                        std::sync::Arc::new(
+                            crate::acp::manager::ConnectionManagerParentLookup {
+                                manager: std::sync::Arc::new(cm_state.clone_ref()),
+                            },
+                        ),
+                        std::sync::Arc::new(
+                            crate::acp::manager::ConnectionManagerFeedbackLookup {
+                                manager: std::sync::Arc::new(cm_state.clone_ref()),
+                            },
+                        ),
+                        std::sync::Arc::new(
+                            crate::acp::manager::ConnectionManagerQuestionLookup {
+                                manager: std::sync::Arc::new(cm_state.clone_ref()),
+                            },
+                        ),
+                        std::sync::Arc::new(
+                            crate::commands::session_info::DbSessionInfoLookup::new(
+                                std::sync::Arc::new(db::AppDatabase {
+                                    conn: db_conn.clone(),
+                                }),
+                                app.state::<std::sync::Arc<
+                                    crate::auto_title::InternalAgentSessionRegistry,
+                                >>()
+                                .inner()
+                                .clone(),
+                            ),
+                        ),
+                    );
+                    let socket_path = stack.socket_path;
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = listener.run(socket_path).await {
+                            tracing::info!("[delegation] listener exited: {e}");
+                        }
+                    });
+                    stack.broker
+                };
+
+                // Start chat channel background tasks (needs
+                // DelegationRuntimeSettings managed above).
                 {
                     let ccm = app.state::<ChatChannelManager>();
                     let broadcaster =
@@ -423,8 +637,18 @@ mod tauri_app {
                         .clone();
                     let cm = app.state::<ConnectionManager>().clone_ref();
                     let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let runtime = app
+                        .state::<crate::commands::delegation::DelegationRuntimeSettings>()
+                        .inner()
+                        .clone();
+                    let runtime_ctx = crate::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
+                        runtime,
+                        data_dir: effective_data_dir.clone(),
+                    };
                     tauri::async_runtime::spawn(async move {
-                        ccm_ref.start_background(br, bus, db_conn, cm, emitter).await;
+                        ccm_ref
+                            .start_background(br, bus, db_conn, cm, emitter, runtime_ctx)
+                            .await;
                     });
                 }
 
@@ -487,101 +711,6 @@ mod tauri_app {
                         ),
                     );
                 }
-
-                // Delegation broker + UDS listener. Built from the managed
-                // ConnectionManager + DB so spawn / depth-lookup work against
-                // live state. Managed alongside the existing per-resource
-                // states so commands (Tauri + web) can resolve them by type.
-                // MUST run before the LifecycleSubscriber spawn below so the
-                // broker handle is available to it.
-                let broker_for_lifecycle = {
-                    let cm_state = app.state::<ConnectionManager>();
-                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
-                    let (
-                        broker,
-                        tokens,
-                        socket_path,
-                        feedback_config,
-                        question_config,
-                        session_info_config,
-                    ) = crate::app_state::build_delegation_stack(
-                        &cm_state,
-                        db_conn.clone(),
-                        effective_data_dir.clone(),
-                    );
-                    app.manage(broker.clone());
-                    app.manage(tokens.clone());
-                    app.manage(feedback_config.clone());
-                    app.manage(question_config.clone());
-                    app.manage(session_info_config.clone());
-                    app.manage(crate::commands::delegation::DelegationSocketPath(
-                        socket_path.clone(),
-                    ));
-
-                    // Push persisted settings into the broker + feedback + question
-                    // + session-info config before listener accept.
-                    let broker_for_init = broker.clone();
-                    let db_for_init = db_conn.clone();
-                    let feedback_for_init = feedback_config.clone();
-                    let question_for_init = question_config.clone();
-                    let session_info_for_init = session_info_config.clone();
-                    tauri::async_runtime::block_on(async move {
-                        delegation_commands::apply_persisted_config(
-                            &db_for_init,
-                            &broker_for_init,
-                        )
-                        .await;
-                        crate::commands::feedback::apply_persisted_feedback_config(
-                            &db_for_init,
-                            &feedback_for_init,
-                        )
-                        .await;
-                        crate::commands::question::apply_persisted_question_config(
-                            &db_for_init,
-                            &question_for_init,
-                        )
-                        .await;
-                        crate::commands::session_info::apply_persisted_session_info_config(
-                            &db_for_init,
-                            &session_info_for_init,
-                        )
-                        .await;
-                    });
-
-                    let listener_broker = broker.clone();
-                    let listener = crate::acp::delegation::listener::DelegationListener::new(
-                        listener_broker,
-                        tokens,
-                        std::sync::Arc::new(
-                            crate::acp::manager::ConnectionManagerParentLookup {
-                                manager: std::sync::Arc::new(cm_state.clone_ref()),
-                            },
-                        ),
-                        std::sync::Arc::new(
-                            crate::acp::manager::ConnectionManagerFeedbackLookup {
-                                manager: std::sync::Arc::new(cm_state.clone_ref()),
-                            },
-                        ),
-                        std::sync::Arc::new(
-                            crate::acp::manager::ConnectionManagerQuestionLookup {
-                                manager: std::sync::Arc::new(cm_state.clone_ref()),
-                            },
-                        ),
-                        std::sync::Arc::new(
-                            crate::commands::session_info::DbSessionInfoLookup::new(
-                                std::sync::Arc::new(db::AppDatabase {
-                                    conn: db_conn.clone(),
-                                }),
-                            ),
-                        ),
-                    );
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = listener.run(socket_path).await {
-                            tracing::info!("[delegation] listener exited: {e}");
-                        }
-                    });
-                    broker
-                };
 
                 // Spawn the LifecycleSubscriber: persists cross-connection DB state
                 // (currently `external_id` on conversation rows when SessionStarted fires)
@@ -662,6 +791,9 @@ mod tauri_app {
                         .inner()
                         .clone(),
                     effective_data_dir.clone(),
+                    app.state::<crate::commands::delegation::DelegationRuntimeSettings>()
+                        .inner()
+                        .clone(),
                 ) {
                     tauri::async_runtime::spawn(crate::automation::run_automation_engine(engine));
                 }
@@ -673,9 +805,13 @@ mod tauri_app {
                 if app.get_webview_window("main").is_none() {
                     let url = tauri::WebviewUrl::App("workspace".into());
                     let builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                        .title("Codeg")
+                        .title("DrawCode")
                         .inner_size(1260.0, 860.0)
                         .min_inner_size(400.0, 600.0);
+                    // Perf harness / reference builds only — ordinary release
+                    // binaries must not expose DevTools on the main window.
+                    #[cfg(feature = "test-utils")]
+                    let builder = builder.devtools(true);
                     if let Ok(w) = windows::apply_platform_window_style(builder).build() {
                         windows::post_window_setup(&w);
                     }
@@ -875,9 +1011,12 @@ mod tauri_app {
                 conversations::create_conversation,
                 conversations::create_chat_conversation,
                 conversations::create_chat_dir,
+                conversations::set_conversation_delegation_route,
+                conversations::set_draft_delegation_route_preference,
                 conversations::update_conversation_status,
                 conversations::update_conversation_title,
                 conversations::update_conversation_pinned,
+                conversations::clear_awaiting_reply,
                 conversations::delete_conversation,
                 folders::load_folder_history,
                 folders::get_folder,
@@ -948,6 +1087,8 @@ mod tauri_app {
                 folders::list_directory_entries,
                 folders::list_directory_with_files,
                 folders::get_file_tree,
+                folders::search_workspace_files,
+                folders::cancel_workspace_file_search,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
                 folders::read_file_preview,
@@ -1039,11 +1180,20 @@ mod tauri_app {
                 delegation_commands::get_delegation_settings,
                 delegation_commands::set_delegation_settings,
                 delegation_commands::get_delegation_profiles,
+                delegation_commands::get_delegation_profile_catalog,
                 delegation_commands::set_delegation_profiles,
                 delegation_commands::set_delegation_bundle,
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,
+                crate::commands::conversation_experience::get_conversation_experience_settings,
+                crate::commands::conversation_experience::set_auto_title_agent,
+                crate::commands::conversation_experience::set_reference_search_limit,
+                crate::commands::reference_search::start_reference_search,
+                crate::commands::reference_search::next_reference_search_page,
+                crate::commands::reference_search::cancel_reference_search,
+                crate::commands::reference_search::validate_reference_candidate,
+                crate::commands::reference_search::match_reference_regex,
                 question_commands::get_question_settings,
                 question_commands::set_question_settings,
                 session_info_commands::get_session_info_settings,
@@ -1071,6 +1221,10 @@ mod tauri_app {
                 acp_commands::acp_disconnect,
                 acp_commands::acp_touch_connection,
                 acp_commands::acp_list_connections,
+                acp_commands::acp_get_event_metrics,
+                acp_commands::acp_get_desktop_delivery_capabilities,
+                #[cfg(all(feature = "test-utils", feature = "tauri-runtime"))]
+                acp_commands::acp_replay_streaming_perf_fixture,
                 acp_commands::acp_get_session_snapshot,
                 acp_commands::acp_get_session_snapshot_by_conversation,
                 acp_commands::acp_find_connection_for_conversation,
@@ -1083,6 +1237,7 @@ mod tauri_app {
                 acp_commands::acp_prepare_npx_agent,
                 acp_commands::acp_uninstall_agent,
                 acp_commands::acp_update_agent_preferences,
+                acp_commands::acp_update_agent_display_preferences,
                 acp_commands::acp_update_agent_env,
                 acp_commands::acp_update_agent_config,
                 acp_commands::acp_update_hermes_config,
@@ -1233,7 +1388,18 @@ mod tauri_app {
                     }
                     crate::office_watch::stop_all_office_watches();
                     if let Some(cm) = app.try_state::<ConnectionManager>() {
+                        // Disconnect first so terminal ACP events enter the
+                        // desktop queue before we drain the batcher.
                         tauri::async_runtime::block_on(cm.disconnect_all());
+                    }
+                    if let Some(delivery) =
+                        app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>()
+                    {
+                        if let Err(error) =
+                            tauri::async_runtime::block_on(delivery.shutdown())
+                        {
+                            tracing::error!("[ACP] desktop delivery shutdown failed: {error}");
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]

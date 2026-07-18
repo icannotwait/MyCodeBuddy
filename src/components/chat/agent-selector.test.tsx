@@ -40,6 +40,7 @@ function agent(
     cline_secrets_json: null,
     hermes_config_yaml: null,
     model_provider_id: null,
+    show_thinking: false,
     ...overrides,
   }
 }

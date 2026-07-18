@@ -4,14 +4,14 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
 use serde::Serialize;
 
 use tokio::sync::Semaphore;
-use walkdir::WalkDir;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
@@ -936,12 +936,65 @@ pub struct GitHeadInfo {
     pub detached: bool,
     /// Short commit hash; present when detached and at least one commit exists.
     pub short_sha: Option<String>,
+    /// Stable wire form of the repository root (`git rev-parse --show-toplevel`,
+    /// Windows verbatim prefixes stripped). Present for committed and unborn
+    /// repositories; absent for non-repos.
+    pub canonical_repo: Option<String>,
+    /// Full object ID of `HEAD` when a commit exists; `None` for unborn/non-repo.
+    pub head_sha: Option<String>,
+    /// Opaque commit-source epoch (`v1:<sha256>`) for reference search; present
+    /// for committed and unborn repositories.
+    pub reference_source_epoch: Option<String>,
 }
 
-async fn git_output(
-    path: &str,
-    args: &[&str],
-) -> Result<std::process::Output, AppCommandError> {
+/// Identity of a git tip used as the commit reference-search source epoch.
+///
+/// `head` is the full object ID, or the reserved literal `"unborn"` for a
+/// repository with no commits yet. Both Git-head reporting and commit search
+/// consume this one type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSourceEpoch {
+    pub canonical_repo: String,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub head: String,
+}
+
+impl CommitSourceEpoch {
+    /// Reserved marker when the repository has no commits (`HEAD` is unborn).
+    pub const UNBORN_HEAD: &'static str = "unborn";
+
+    pub fn is_unborn(&self) -> bool {
+        self.head == Self::UNBORN_HEAD
+    }
+
+    /// Collision-free opaque epoch token: `v1:<sha256>` over a versioned
+    /// length-delimited encoding of the epoch fields.
+    pub fn opaque(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        fn put_field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"codeg-reference-commit-v1");
+        put_field(&mut hasher, self.canonical_repo.as_bytes());
+        match &self.branch {
+            None => hasher.update([0]),
+            Some(branch) => {
+                hasher.update([1]);
+                put_field(&mut hasher, branch.as_bytes());
+            }
+        }
+        hasher.update([u8::from(self.detached)]);
+        put_field(&mut hasher, self.head.as_bytes());
+        format!("v1:{:x}", hasher.finalize())
+    }
+}
+
+async fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, AppCommandError> {
     crate::process::tokio_command("git")
         .args(args)
         .current_dir(path)
@@ -950,50 +1003,157 @@ async fn git_output(
         .map_err(AppCommandError::io)
 }
 
+fn git_stdout_trim(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Canonicalize `git rev-parse --show-toplevel` output, require `workspace` to
+/// sit under that root, and return the stable wire form (verbatim prefix
+/// stripped).
+async fn resolve_canonical_repo_wire(
+    workspace_path: &str,
+) -> Result<Option<String>, AppCommandError> {
+    let toplevel = git_output(workspace_path, &["rev-parse", "--show-toplevel"]).await?;
+    if !toplevel.status.success() {
+        return Ok(None);
+    }
+    let raw = git_stdout_trim(&toplevel);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let repo_path = PathBuf::from(&raw);
+    let repo_canonical = std::fs::canonicalize(&repo_path).map_err(AppCommandError::io)?;
+    let workspace = PathBuf::from(workspace_path);
+    let workspace_canonical = std::fs::canonicalize(&workspace).map_err(AppCommandError::io)?;
+    if !workspace_path_is_under_repo(&workspace_canonical, &repo_canonical) {
+        return Err(AppCommandError::new(
+            crate::app_error::AppErrorCode::InvalidRequest,
+            "workspace path is outside the git repository root",
+        ));
+    }
+    Ok(Some(
+        crate::reference_search::matcher::normalize_path_for_uri(&repo_canonical),
+    ))
+}
+
+fn workspace_path_is_under_repo(workspace: &Path, repo: &Path) -> bool {
+    if workspace.starts_with(repo) {
+        return true;
+    }
+    let workspace_key = crate::parsers::normalize_path_for_matching(&workspace.to_string_lossy());
+    let repo_key = crate::parsers::normalize_path_for_matching(&repo.to_string_lossy());
+    if workspace_key == repo_key {
+        return true;
+    }
+    let repo_prefix = if repo_key.ends_with('/') {
+        repo_key
+    } else {
+        format!("{repo_key}/")
+    };
+    workspace_key.starts_with(&repo_prefix)
+}
+
+fn git_head_info_with_epoch(
+    is_repo: bool,
+    branch: Option<String>,
+    detached: bool,
+    short_sha: Option<String>,
+    canonical_repo: Option<String>,
+    head_sha: Option<String>,
+) -> GitHeadInfo {
+    let reference_source_epoch = match (&canonical_repo, &head_sha, is_repo) {
+        (Some(repo), Some(head), true) => Some(
+            CommitSourceEpoch {
+                canonical_repo: repo.clone(),
+                branch: branch.clone(),
+                detached,
+                head: head.clone(),
+            }
+            .opaque(),
+        ),
+        (Some(repo), None, true) => Some(
+            CommitSourceEpoch {
+                canonical_repo: repo.clone(),
+                branch: branch.clone(),
+                detached: false,
+                head: CommitSourceEpoch::UNBORN_HEAD.to_string(),
+            }
+            .opaque(),
+        ),
+        _ => None,
+    };
+    GitHeadInfo {
+        is_repo,
+        branch,
+        detached,
+        short_sha,
+        canonical_repo,
+        head_sha,
+        reference_source_epoch,
+    }
+}
+
 /// Resolve the current `HEAD` state. The common cases (on a branch / detached)
 /// cost a single git invocation; the rarer unborn-branch and non-repository
 /// cases fall through to `symbolic-ref` and `--is-inside-work-tree`.
-async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
+///
+/// Populates full `head_sha`, stable `canonical_repo`, and opaque
+/// `reference_source_epoch` for committed and unborn repositories.
+pub(crate) async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
     // `rev-parse --abbrev-ref HEAD` prints the branch name, the literal "HEAD"
     // when detached, and fails on an unborn branch or a non-repository.
     let head = git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     if head.status.success() {
-        let name = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let name = git_stdout_trim(&head);
+        let canonical_repo = resolve_canonical_repo_wire(path).await?;
+        let head_sha = git_output(path, &["rev-parse", "HEAD"])
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| git_stdout_trim(&o))
+            .filter(|s| !s.is_empty());
         if !name.is_empty() && name != "HEAD" {
-            return Ok(GitHeadInfo {
-                is_repo: true,
-                branch: Some(name),
-                detached: false,
-                short_sha: None,
-            });
+            return Ok(git_head_info_with_epoch(
+                true,
+                Some(name),
+                false,
+                None,
+                canonical_repo,
+                head_sha,
+            ));
         }
         // Detached HEAD — surface the short commit so the UI can label it.
         let short_sha = git_output(path, &["rev-parse", "--short", "HEAD"])
             .await
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .map(|o| git_stdout_trim(&o))
             .filter(|s| !s.is_empty());
-        return Ok(GitHeadInfo {
-            is_repo: true,
-            branch: None,
-            detached: true,
+        return Ok(git_head_info_with_epoch(
+            true,
+            None,
+            true,
             short_sha,
-        });
+            canonical_repo,
+            head_sha,
+        ));
     }
 
     // Unborn branch (after `git init`, before the first commit): `symbolic-ref`
     // still resolves the branch name where `rev-parse` cannot.
     let sym = git_output(path, &["symbolic-ref", "--short", "HEAD"]).await?;
     if sym.status.success() {
-        let name = String::from_utf8_lossy(&sym.stdout).trim().to_string();
+        let name = git_stdout_trim(&sym);
         if !name.is_empty() {
-            return Ok(GitHeadInfo {
-                is_repo: true,
-                branch: Some(name),
-                detached: false,
-                short_sha: None,
-            });
+            let canonical_repo = resolve_canonical_repo_wire(path).await?;
+            return Ok(git_head_info_with_epoch(
+                true,
+                Some(name),
+                false,
+                None,
+                canonical_repo,
+                None,
+            ));
         }
     }
 
@@ -1002,13 +1162,22 @@ async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
     // offers git operations rather than "initialize".
     let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
     let is_repo =
-        inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "true";
-    Ok(GitHeadInfo {
-        is_repo,
-        branch: None,
-        detached: false,
-        short_sha: None,
-    })
+        inside.status.success() && git_stdout_trim(&inside) == "true";
+    if is_repo {
+        let canonical_repo = resolve_canonical_repo_wire(path).await?;
+        // Unborn-like / unusual: no resolvable branch or tip.
+        return Ok(git_head_info_with_epoch(
+            true,
+            None,
+            false,
+            None,
+            canonical_repo,
+            None,
+        ));
+    }
+    Ok(git_head_info_with_epoch(
+        false, None, false, None, None, None,
+    ))
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -2331,8 +2500,7 @@ pub async fn resolve_worktree_folder_core(
     let folder_id = folders
         .into_iter()
         .find(|f| {
-            let canon =
-                std::fs::canonicalize(&f.path).unwrap_or_else(|_| PathBuf::from(&f.path));
+            let canon = std::fs::canonicalize(&f.path).unwrap_or_else(|_| PathBuf::from(&f.path));
             canon == canonical_wt
         })
         .map(|f| f.id);
@@ -2770,6 +2938,460 @@ pub async fn git_continue_operation(
 }
 
 const FILE_TREE_IGNORED_DIRS: &[&str] = &[".git", "__pycache__"];
+/// Ignore-file basenames (gitignore syntax) that we never surface as search hits.
+const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".rgignore"];
+/// Hard ceiling for a single search response (clients request ≤ this).
+const WORKSPACE_FILE_SEARCH_MAX_LIMIT: usize = 500;
+/// Default search limit when the caller omits one (matches `@` mention cap).
+const WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT: usize = 50;
+const WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS: usize = 4;
+const WORKSPACE_FILE_SEARCH_ID_MAX_BYTES: usize = 128;
+
+/// Shared walk options for file-tree builds and workspace file search.
+/// Hard exclusions and visible dotfiles apply in both modes; ignore sources
+/// can be disabled only for the auxiliary file-tree display.
+///
+/// Also used by incremental reference-search file cursors (ignores enabled).
+pub(crate) fn workspace_walk_builder(
+    root: &Path,
+    max_depth: Option<usize>,
+    respect_ignores: bool,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    if let Some(depth) = max_depth {
+        builder.max_depth(Some(depth));
+    }
+    builder
+        // Keep dotfiles like `.env` / `.eslintrc` visible; ignore rules still apply.
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(respect_ignores)
+        .git_global(respect_ignores)
+        .git_exclude(respect_ignores)
+        // Plain `.ignore` files (gitignore syntax).
+        .ignore(respect_ignores)
+        .parents(respect_ignores)
+        // Apply `.gitignore` even when the folder is not a git worktree.
+        .require_git(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            }
+        });
+    if respect_ignores {
+        // `.rgignore` is not covered by `.ignore(true)` in the ignore crate.
+        builder.add_custom_ignore_filename(".rgignore");
+    }
+    builder
+}
+
+/// One hit from [`search_workspace_files_sync`] (flat, ready for `@` / palette).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileHit {
+    pub name: String,
+    /// Relative path from the workspace root (`/` separators).
+    pub path: String,
+    /// `"file"` or `"dir"`.
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileSearchResult {
+    pub files: Vec<WorkspaceFileHit>,
+    /// True when at least one more match exists past `limit` (cheap early-exit
+    /// probe — the walker stops after `limit + 1` matches).
+    pub truncated: bool,
+}
+
+impl WorkspaceFileSearchResult {
+    fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceSearchRegistration {
+    request_id: String,
+    token: Arc<CancellationToken>,
+}
+
+static WORKSPACE_SEARCH_REGISTRY: LazyLock<Mutex<HashMap<String, WorkspaceSearchRegistration>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WORKSPACE_SEARCH_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS)));
+
+fn validate_workspace_search_identity(
+    search_session_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<Option<(String, String)>, AppCommandError> {
+    match (search_session_id, request_id) {
+        (None, None) => Ok(None),
+        (Some(session_id), Some(request_id)) => {
+            if session_id.trim().is_empty() || request_id.trim().is_empty() {
+                return Err(AppCommandError::invalid_input(
+                    "Workspace search identifiers cannot be empty",
+                ));
+            }
+            if session_id.len() > WORKSPACE_FILE_SEARCH_ID_MAX_BYTES
+                || request_id.len() > WORKSPACE_FILE_SEARCH_ID_MAX_BYTES
+            {
+                return Err(AppCommandError::invalid_input(
+                    "Workspace search identifiers are too long",
+                ));
+            }
+            Ok(Some((session_id.to_owned(), request_id.to_owned())))
+        }
+        _ => Err(AppCommandError::invalid_input(
+            "Workspace search requires both searchSessionId and requestId",
+        )),
+    }
+}
+
+struct WorkspaceSearchLease {
+    session_id: Option<String>,
+    request_id: Option<String>,
+    token: Arc<CancellationToken>,
+}
+
+impl WorkspaceSearchLease {
+    fn token(&self) -> Arc<CancellationToken> {
+        Arc::clone(&self.token)
+    }
+}
+
+impl Drop for WorkspaceSearchLease {
+    fn drop(&mut self) {
+        self.token.cancel();
+        let (Some(session_id), Some(request_id)) = (&self.session_id, &self.request_id) else {
+            return;
+        };
+        let Ok(mut registry) = WORKSPACE_SEARCH_REGISTRY.lock() else {
+            return;
+        };
+        let should_remove = registry.get(session_id).is_some_and(|current| {
+            current.request_id == *request_id && Arc::ptr_eq(&current.token, &self.token)
+        });
+        if should_remove {
+            registry.remove(session_id);
+        }
+    }
+}
+
+fn register_workspace_search(
+    search_session_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<WorkspaceSearchLease, AppCommandError> {
+    let identity = validate_workspace_search_identity(search_session_id, request_id)?;
+    let token = Arc::new(CancellationToken::new());
+    let (session_id, request_id, replaced) = match identity {
+        Some((session_id, request_id)) => {
+            let replaced = WORKSPACE_SEARCH_REGISTRY
+                .lock()
+                .map_err(|_| {
+                    AppCommandError::task_execution_failed(
+                        "Failed to lock workspace search registry",
+                    )
+                })?
+                .insert(
+                    session_id.clone(),
+                    WorkspaceSearchRegistration {
+                        request_id: request_id.clone(),
+                        token: Arc::clone(&token),
+                    },
+                );
+            (Some(session_id), Some(request_id), replaced)
+        }
+        None => (None, None, None),
+    };
+    if let Some(previous) = replaced {
+        previous.token.cancel();
+    }
+    Ok(WorkspaceSearchLease {
+        session_id,
+        request_id,
+        token,
+    })
+}
+
+fn cancel_workspace_search_registration(session_id: &str, request_id: &str) -> bool {
+    let registration = {
+        let Ok(mut registry) = WORKSPACE_SEARCH_REGISTRY.lock() else {
+            return false;
+        };
+        if registry
+            .get(session_id)
+            .is_some_and(|current| current.request_id == request_id)
+        {
+            registry.remove(session_id)
+        } else {
+            None
+        }
+    };
+    if let Some(registration) = registration {
+        registration.token.cancel();
+        true
+    } else {
+        false
+    }
+}
+
+/// Search workspace files/dirs under `root` without materializing the full tree.
+/// Applies the same ignore rules as [`build_file_tree_sync`], case-insensitive
+/// substring match on file name and relative path, and stops once `limit + 1`
+/// hits are found so large repos never pay a full walk when results are dense.
+pub(crate) fn search_workspace_files_sync(
+    root: PathBuf,
+    query: &str,
+    limit: usize,
+    token: &CancellationToken,
+) -> Result<WorkspaceFileSearchResult, AppCommandError> {
+    if token.is_cancelled() {
+        return Ok(WorkspaceFileSearchResult::empty());
+    }
+    let limit = limit.clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
+    let q = query.trim().to_lowercase();
+    let mut files: Vec<WorkspaceFileHit> = Vec::with_capacity(limit);
+    let mut truncated = false;
+
+    let mut builder = workspace_walk_builder(&root, None, true);
+    // Stable name order within each directory so empty-query results are
+    // deterministic (same spirit as the nested tree builder).
+    builder.sort_by_file_name(|a, b| a.cmp(b));
+
+    for result in builder.build() {
+        if token.is_cancelled() {
+            return Ok(WorkspaceFileSearchResult::empty());
+        }
+        let entry = result.map_err(|e| {
+            AppCommandError::io_error("Failed to search workspace files").with_detail(e.to_string())
+        })?;
+        let entry_path = entry.path();
+        if entry_path == root {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+        if IGNORE_FILE_NAMES.iter().any(|n| *n == name.as_ref()) {
+            continue;
+        }
+
+        let rel_path = entry_path
+            .strip_prefix(&root)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let matches = if q.is_empty() {
+            true
+        } else {
+            name.to_lowercase().contains(&q) || rel_path.to_lowercase().contains(&q)
+        };
+        if !matches {
+            continue;
+        }
+
+        if files.len() >= limit {
+            truncated = true;
+            break;
+        }
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        files.push(WorkspaceFileHit {
+            name: name.into_owned(),
+            path: rel_path,
+            kind: if is_dir {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            },
+        });
+    }
+
+    if token.is_cancelled() {
+        Ok(WorkspaceFileSearchResult::empty())
+    } else {
+        Ok(WorkspaceFileSearchResult { files, truncated })
+    }
+}
+
+async fn run_workspace_search_task<F>(
+    semaphore: Arc<Semaphore>,
+    token: Arc<CancellationToken>,
+    task: F,
+) -> Result<WorkspaceFileSearchResult, AppCommandError>
+where
+    F: FnOnce(&CancellationToken) -> Result<WorkspaceFileSearchResult, AppCommandError>
+        + Send
+        + 'static,
+{
+    let permit = tokio::select! {
+        _ = token.cancelled() => return Ok(WorkspaceFileSearchResult::empty()),
+        permit = semaphore.acquire_owned() => permit.map_err(|error| {
+            AppCommandError::task_execution_failed(error.to_string())
+        })?,
+    };
+    if token.is_cancelled() {
+        return Ok(WorkspaceFileSearchResult::empty());
+    }
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task(&token)
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::io_error("Workspace file search task failed")
+            .with_detail(error.to_string())
+    })?
+}
+
+/// Build a nested file tree under `root`. Unless `include_ignored` is true, the
+/// walk prunes using the same ignore sources ripgrep honors by default:
+/// - `.gitignore` (always, even outside a git worktree — matches prior frontend
+///   post-filter behavior used by `@` mentions / file search)
+/// - `.ignore`
+/// - `.rgignore`
+/// - global/exclude git rules when present
+///
+/// Hard-skips [`FILE_TREE_IGNORED_DIRS`] and `.DS_Store` regardless of ignore
+/// files. `max_depth` is measured like `walkdir` (root = 0).
+///
+/// Prefer [`search_workspace_files_sync`] for mention/palette queries — this
+/// builds the full nested payload (used by the aux file tree and similar UIs).
+pub(crate) fn build_file_tree_sync(
+    root: PathBuf,
+    max_depth: usize,
+    include_ignored: bool,
+) -> Result<Vec<FileTreeNode>, AppCommandError> {
+    // Collect all entries, skipping ignored directories during the walk so large
+    // trees (node_modules, target, dist, …) never enter the result payload.
+    let mut dir_children: HashMap<PathBuf, Vec<FileTreeNode>> = HashMap::new();
+    let mut dir_order: Vec<PathBuf> = Vec::new();
+    let mut dir_paths_by_rel: HashMap<String, PathBuf> = HashMap::new();
+
+    let mut builder = workspace_walk_builder(&root, Some(max_depth), !include_ignored);
+    // Stable, case-sensitive name order (same spirit as the previous WalkDir
+    // sort); final per-directory sort below is case-insensitive.
+    builder.sort_by_file_name(|a, b| a.cmp(b));
+
+    for result in builder.build() {
+        let entry = result.map_err(|e| {
+            AppCommandError::io_error("Failed to walk file tree").with_detail(e.to_string())
+        })?;
+        let entry_path = entry.path().to_path_buf();
+
+        // Skip the root itself
+        if entry_path == root {
+            dir_children.entry(root.clone()).or_default();
+            dir_order.push(root.clone());
+            continue;
+        }
+
+        let parent = entry_path.parent().unwrap_or(&root).to_path_buf();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry_path
+            .strip_prefix(&root)
+            .unwrap_or(&entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            dir_paths_by_rel.insert(rel_path.clone(), entry_path.clone());
+            dir_children.entry(entry_path.clone()).or_default();
+            dir_order.push(entry_path);
+            // Add a placeholder Dir node to parent (children filled later)
+            dir_children
+                .entry(parent)
+                .or_default()
+                .push(FileTreeNode::Dir {
+                    name,
+                    path: rel_path,
+                    children: vec![],
+                });
+        } else {
+            dir_children
+                .entry(parent)
+                .or_default()
+                .push(FileTreeNode::File {
+                    name,
+                    path: rel_path,
+                });
+        }
+    }
+
+    // Build tree bottom-up: process dirs in reverse order so children are ready
+    for dir_path in dir_order.iter().rev() {
+        let children = dir_children.remove(dir_path).unwrap_or_default();
+
+        // Sort: dirs first, then files, alphabetically within each group
+        let mut dirs: Vec<FileTreeNode> = Vec::new();
+        let mut files: Vec<FileTreeNode> = Vec::new();
+        for child in children {
+            match &child {
+                FileTreeNode::Dir { .. } => dirs.push(child),
+                FileTreeNode::File { .. } => files.push(child),
+            }
+        }
+        dirs.sort_by(|a, b| {
+            let a_name = match a {
+                FileTreeNode::Dir { name, .. } => name,
+                _ => unreachable!(),
+            };
+            let b_name = match b {
+                FileTreeNode::Dir { name, .. } => name,
+                _ => unreachable!(),
+            };
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        });
+        files.sort_by(|a, b| {
+            let a_name = match a {
+                FileTreeNode::File { name, .. } => name,
+                _ => unreachable!(),
+            };
+            let b_name = match b {
+                FileTreeNode::File { name, .. } => name,
+                _ => unreachable!(),
+            };
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        });
+
+        let mut sorted: Vec<FileTreeNode> = Vec::with_capacity(dirs.len() + files.len());
+
+        // Fill dir children from the map
+        for d in dirs {
+            if let FileTreeNode::Dir {
+                name,
+                path: rel_path,
+                ..
+            } = d
+            {
+                let full_path = dir_paths_by_rel
+                    .get(&rel_path)
+                    .cloned()
+                    .unwrap_or_else(|| root.join(Path::new(&rel_path)));
+                let sub_children = dir_children.remove(&full_path).unwrap_or_default();
+                sorted.push(FileTreeNode::Dir {
+                    name,
+                    path: rel_path,
+                    children: sub_children,
+                });
+            }
+        }
+        sorted.extend(files);
+
+        dir_children.insert(dir_path.clone(), sorted);
+    }
+
+    Ok(dir_children.remove(&root).unwrap_or_default())
+}
 
 /// Hard limit: refuse to open files larger than 50 MB in the text editor.
 const FILE_OPEN_HARD_LIMIT: usize = 50_000_000;
@@ -2800,10 +3422,7 @@ fn unquote_git_path(path: &str) -> String {
     }
 }
 
-pub(crate) fn resolve_tree_path(
-    root: &Path,
-    rel_path: &str,
-) -> Result<PathBuf, AppCommandError> {
+pub(crate) fn resolve_tree_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppCommandError> {
     let rel = Path::new(rel_path);
     if rel.is_absolute() {
         return Err(AppCommandError::invalid_input("Path must be relative"));
@@ -3212,136 +3831,61 @@ pub async fn list_directory_with_files(
 pub async fn get_file_tree(
     path: String,
     max_depth: Option<usize>,
+    include_ignored: Option<bool>,
 ) -> Result<Vec<FileTreeNode>, AppCommandError> {
     let root = PathBuf::from(&path);
     let depth = max_depth.unwrap_or(usize::MAX);
+    let include_ignored = include_ignored.unwrap_or(false);
+    // Walk + ignore matching is CPU/IO heavy on large repos; keep it off the
+    // async runtime so concurrent IPC/WebSocket work stays responsive.
+    tokio::task::spawn_blocking(move || build_file_tree_sync(root, depth, include_ignored))
+        .await
+        .map_err(|e| {
+            AppCommandError::io_error("File tree walk task failed").with_detail(e.to_string())
+        })?
+}
 
-    // Collect all entries, skipping ignored directories
-    let mut dir_children: HashMap<PathBuf, Vec<FileTreeNode>> = HashMap::new();
-    let mut dir_order: Vec<PathBuf> = Vec::new();
-    let mut dir_paths_by_rel: HashMap<String, PathBuf> = HashMap::new();
+/// On-demand workspace file search for `@` mentions and the command palette.
+/// Does **not** return a full tree — only up to `limit` flat hits (default 50).
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn search_workspace_files(
+    path: String,
+    query: Option<String>,
+    limit: Option<usize>,
+    search_session_id: Option<String>,
+    request_id: Option<String>,
+) -> Result<WorkspaceFileSearchResult, AppCommandError> {
+    let root = PathBuf::from(&path);
+    let q = query.unwrap_or_default();
+    let lim = limit.unwrap_or(WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT);
+    let lease = register_workspace_search(search_session_id.as_deref(), request_id.as_deref())?;
+    let token = lease.token();
+    let result = run_workspace_search_task(
+        Arc::clone(&WORKSPACE_SEARCH_SEMAPHORE),
+        token,
+        move |token| search_workspace_files_sync(root, &q, lim, token),
+    )
+    .await;
+    drop(lease);
+    result
+}
 
-    for entry in WalkDir::new(&root)
-        .max_depth(depth)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if e.file_type().is_dir() {
-                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
-            } else {
-                name != ".DS_Store"
-            }
-        })
-    {
-        let entry = entry.map_err(|e| {
-            AppCommandError::io_error("Failed to walk file tree").with_detail(e.to_string())
-        })?;
-        let entry_path = entry.path().to_path_buf();
-
-        // Skip the root itself
-        if entry_path == root {
-            dir_children.entry(root.clone()).or_default();
-            dir_order.push(root.clone());
-            continue;
-        }
-
-        let parent = entry_path.parent().unwrap_or(&root).to_path_buf();
-        let name = entry.file_name().to_string_lossy().to_string();
-        let rel_path = entry_path
-            .strip_prefix(&root)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if entry.file_type().is_dir() {
-            dir_paths_by_rel.insert(rel_path.clone(), entry_path.clone());
-            dir_children.entry(entry_path.clone()).or_default();
-            dir_order.push(entry_path);
-            // Add a placeholder Dir node to parent (children filled later)
-            dir_children
-                .entry(parent)
-                .or_default()
-                .push(FileTreeNode::Dir {
-                    name,
-                    path: rel_path,
-                    children: vec![],
-                });
-        } else {
-            dir_children
-                .entry(parent)
-                .or_default()
-                .push(FileTreeNode::File {
-                    name,
-                    path: rel_path,
-                });
-        }
-    }
-
-    // Build tree bottom-up: process dirs in reverse order so children are ready
-    for dir_path in dir_order.iter().rev() {
-        let children = dir_children.remove(dir_path).unwrap_or_default();
-
-        // Sort: dirs first, then files, alphabetically within each group
-        let mut dirs: Vec<FileTreeNode> = Vec::new();
-        let mut files: Vec<FileTreeNode> = Vec::new();
-        for child in children {
-            match &child {
-                FileTreeNode::Dir { .. } => dirs.push(child),
-                FileTreeNode::File { .. } => files.push(child),
-            }
-        }
-        dirs.sort_by(|a, b| {
-            let a_name = match a {
-                FileTreeNode::Dir { name, .. } => name,
-                _ => unreachable!(),
-            };
-            let b_name = match b {
-                FileTreeNode::Dir { name, .. } => name,
-                _ => unreachable!(),
-            };
-            a_name.to_lowercase().cmp(&b_name.to_lowercase())
-        });
-        files.sort_by(|a, b| {
-            let a_name = match a {
-                FileTreeNode::File { name, .. } => name,
-                _ => unreachable!(),
-            };
-            let b_name = match b {
-                FileTreeNode::File { name, .. } => name,
-                _ => unreachable!(),
-            };
-            a_name.to_lowercase().cmp(&b_name.to_lowercase())
-        });
-
-        let mut sorted: Vec<FileTreeNode> = Vec::with_capacity(dirs.len() + files.len());
-
-        // Fill dir children from the map
-        for d in dirs {
-            if let FileTreeNode::Dir {
-                name,
-                path: rel_path,
-                ..
-            } = d
-            {
-                let full_path = dir_paths_by_rel
-                    .get(&rel_path)
-                    .cloned()
-                    .unwrap_or_else(|| root.join(Path::new(&rel_path)));
-                let sub_children = dir_children.remove(&full_path).unwrap_or_default();
-                sorted.push(FileTreeNode::Dir {
-                    name,
-                    path: rel_path,
-                    children: sub_children,
-                });
-            }
-        }
-        sorted.extend(files);
-
-        dir_children.insert(dir_path.clone(), sorted);
-    }
-
-    Ok(dir_children.remove(&root).unwrap_or_default())
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn cancel_workspace_file_search(
+    search_session_id: String,
+    request_id: String,
+) -> Result<bool, AppCommandError> {
+    let Some((session_id, request_id)) = validate_workspace_search_identity(
+        Some(search_session_id.as_str()),
+        Some(request_id.as_str()),
+    )?
+    else {
+        unreachable!("cancel always supplies both workspace search identifiers");
+    };
+    Ok(cancel_workspace_search_registration(
+        &session_id,
+        &request_id,
+    ))
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -3451,17 +3995,14 @@ pub async fn read_workspace_file_base64(
         // read race: the original `target` symlink can't be re-resolved (we use
         // the canonical path), a final-component symlink swapped in after the
         // check makes the open fail, and metadata/read never re-look-up the path.
-        let canonical_root =
-            std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
-        let canonical_target =
-            std::fs::canonicalize(&target).map_err(AppCommandError::io)?;
+        let canonical_root = std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
+        let canonical_target = std::fs::canonicalize(&target).map_err(AppCommandError::io)?;
         if !canonical_target.starts_with(&canonical_root) {
             return Err(AppCommandError::invalid_input(
                 "Path is outside workspace root",
             ));
         }
-        let mut file =
-            open_no_follow(&canonical_target).map_err(AppCommandError::io)?;
+        let mut file = open_no_follow(&canonical_target).map_err(AppCommandError::io)?;
         let metadata = file.metadata().map_err(AppCommandError::io)?;
         if !metadata.is_file() {
             return Err(AppCommandError::invalid_input("Path is not a file"));
@@ -4350,6 +4891,7 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::fresh_in_memory_db;
     use crate::models::agent::AgentType;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn emit_folder_upsert_broadcasts_on_folder_channel() {
@@ -4372,6 +4914,7 @@ mod tests {
                 path: "/home/me/repo-automation-3-run-9".to_string(),
                 git_branch: Some("automation/3/run-9".to_string()),
                 default_agent_type: None,
+                last_agent_type: None,
                 last_opened_at: chrono::Utc::now(),
                 sort_order: 0,
                 color: "inherit".to_string(),
@@ -4416,18 +4959,18 @@ mod tests {
         git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c1"]);
         git_run(dir.path(), &["checkout", "-q", "-b", "feature"]);
 
-        let info = resolve_git_head(dir.path().to_str().unwrap())
-            .await
-            .expect("resolve");
-        assert_eq!(
-            info,
-            GitHeadInfo {
-                is_repo: true,
-                branch: Some("feature".into()),
-                detached: false,
-                short_sha: None,
-            }
-        );
+        let path = dir.path().to_str().unwrap();
+        let info = resolve_git_head(path).await.expect("resolve");
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("feature"));
+        assert!(!info.detached);
+        assert_eq!(info.short_sha, None);
+        assert!(info.head_sha.as_deref().is_some_and(|s| s.len() >= 40));
+        assert!(info.canonical_repo.is_some());
+        assert!(info
+            .reference_source_epoch
+            .as_deref()
+            .is_some_and(|e| e.starts_with("v1:")));
     }
 
     #[tokio::test]
@@ -4449,6 +4992,9 @@ mod tests {
             "detached HEAD should expose a short sha, got {:?}",
             info.short_sha
         );
+        assert!(info.head_sha.as_deref().is_some_and(|s| s.len() >= 40));
+        assert!(info.canonical_repo.is_some());
+        assert!(info.reference_source_epoch.is_some());
     }
 
     #[tokio::test]
@@ -4464,6 +5010,9 @@ mod tests {
                 branch: None,
                 detached: false,
                 short_sha: None,
+                canonical_repo: None,
+                head_sha: None,
+                reference_source_epoch: None,
             }
         );
     }
@@ -4483,6 +5032,20 @@ mod tests {
             "unborn branch should resolve a name, got {:?}",
             info.branch
         );
+        assert_eq!(info.head_sha, None);
+        assert!(info.canonical_repo.is_some());
+        assert!(info
+            .reference_source_epoch
+            .as_deref()
+            .is_some_and(|e| e.starts_with("v1:")));
+        // First commit must change both head_sha and epoch.
+        let epoch_before = info.reference_source_epoch.clone();
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let after = resolve_git_head(dir.path().to_str().unwrap())
+            .await
+            .expect("resolve after commit");
+        assert!(after.head_sha.is_some());
+        assert_ne!(after.reference_source_epoch, epoch_before);
     }
 
     #[tokio::test]
@@ -4742,6 +5305,452 @@ branch refs/heads/main";
             .expect("clear agent");
         assert_eq!(cleared.default_agent_type, None);
     }
+
+    fn collect_tree_paths(nodes: &[FileTreeNode], out: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                FileTreeNode::File { path, .. } => out.push(path.clone()),
+                FileTreeNode::Dir { path, children, .. } => {
+                    out.push(path.clone());
+                    collect_tree_paths(children, out);
+                }
+            }
+        }
+    }
+
+    fn write_tree_fixture(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, contents).expect("write");
+    }
+
+    #[test]
+    fn build_file_tree_prunes_gitignore_ignore_and_rgignore() {
+        // Layout:
+        //   src/a.ts                 kept
+        //   keep/me.ts               kept
+        //   node_modules/pkg/x.js    pruned by .gitignore
+        //   dist/out.js              pruned by .ignore
+        //   target/debug/foo         pruned by .rgignore
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "node_modules/\n");
+        write_tree_fixture(&root.path().join(".ignore"), "dist/\n");
+        write_tree_fixture(&root.path().join(".rgignore"), "target/\n");
+        write_tree_fixture(&root.path().join("src/a.ts"), "export {}\n");
+        write_tree_fixture(&root.path().join("keep/me.ts"), "export {}\n");
+        write_tree_fixture(
+            &root.path().join("node_modules/pkg/x.js"),
+            "module.exports=1\n",
+        );
+        write_tree_fixture(&root.path().join("dist/out.js"), "bundle\n");
+        write_tree_fixture(&root.path().join("target/debug/foo"), "bin\n");
+
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        paths.sort();
+
+        assert!(
+            paths.iter().any(|p| p == "src" || p == "src/a.ts"),
+            "src should remain, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "keep/me.ts"),
+            "keep/me.ts should remain, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("node_modules")),
+            ".gitignore should prune node_modules, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("dist")),
+            ".ignore should prune dist, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("target")),
+            ".rgignore should prune target, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_tree_prunes_gitignore_outside_git_repo() {
+        // require_git(false): a non-git folder with only .gitignore still prunes.
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "vendor/\n");
+        write_tree_fixture(&root.path().join("app.rs"), "fn main(){}\n");
+        write_tree_fixture(&root.path().join("vendor/lib.rs"), "// big\n");
+
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+
+        assert!(paths.iter().any(|p| p == "app.rs"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("vendor")),
+            "vendor must be pruned without a git repo, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_tree_still_skips_git_dir_and_shows_dotfiles() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".env"), "SECRET=1\n");
+        write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
+        write_tree_fixture(&root.path().join("src/main.rs"), "fn main(){}\n");
+
+        let tree =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false).expect("walk tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+
+        assert!(
+            paths.iter().any(|p| p == ".env"),
+            ".env should stay visible, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == ".git" || p.starts_with(".git/")),
+            ".git is a hard skip, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn build_file_tree_can_include_ignored_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "dist/\n");
+        write_tree_fixture(&root.path().join("dist/bundle.js"), "bundle\n");
+        write_tree_fixture(&root.path().join("src/main.ts"), "main\n");
+        write_tree_fixture(&root.path().join(".git/config"), "[core]\n");
+        write_tree_fixture(&root.path().join("__pycache__/module.pyc"), "cache\n");
+        write_tree_fixture(&root.path().join(".DS_Store"), "metadata\n");
+
+        let hidden = build_file_tree_sync(root.path().to_path_buf(), usize::MAX, false)
+            .expect("pruned tree");
+        let shown =
+            build_file_tree_sync(root.path().to_path_buf(), usize::MAX, true).expect("full tree");
+        let mut hidden_paths = Vec::new();
+        let mut shown_paths = Vec::new();
+        collect_tree_paths(&hidden, &mut hidden_paths);
+        collect_tree_paths(&shown, &mut shown_paths);
+
+        assert!(!hidden_paths.iter().any(|path| path.starts_with("dist")));
+        assert!(shown_paths.iter().any(|path| path == "dist/bundle.js"));
+        assert!(!shown_paths.iter().any(|path| {
+            path == ".git"
+                || path.starts_with(".git/")
+                || path == "__pycache__"
+                || path.starts_with("__pycache__/")
+                || path == ".DS_Store"
+        }));
+    }
+
+    #[tokio::test]
+    async fn get_file_tree_async_respects_ignore_files() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".rgignore"), "heavy/\n");
+        write_tree_fixture(&root.path().join("ok.txt"), "hi\n");
+        write_tree_fixture(&root.path().join("heavy/blob.bin"), "x\n");
+
+        let tree = get_file_tree(root.path().to_string_lossy().into_owned(), Some(10), None)
+            .await
+            .expect("async walk");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        assert!(paths.iter().any(|p| p == "ok.txt"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("heavy")),
+            "heavy pruned via .rgignore, got {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_tree_defaults_to_pruned_mode() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".ignore"), "generated/\n");
+        write_tree_fixture(&root.path().join("generated/out.txt"), "out\n");
+
+        let tree = get_file_tree(root.path().to_string_lossy().into_owned(), Some(10), None)
+            .await
+            .expect("tree");
+        let mut paths = Vec::new();
+        collect_tree_paths(&tree, &mut paths);
+        assert!(!paths.iter().any(|path| path.starts_with("generated")));
+    }
+
+    #[test]
+    fn search_workspace_files_matches_and_early_exits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join(".gitignore"), "node_modules/\n");
+        write_tree_fixture(&root.path().join("src/foo.ts"), "a\n");
+        write_tree_fixture(&root.path().join("src/bar.ts"), "b\n");
+        write_tree_fixture(&root.path().join("docs/foo.md"), "c\n");
+        write_tree_fixture(&root.path().join("node_modules/pkg/index.js"), "skip\n");
+        let token = CancellationToken::new();
+
+        let by_name = search_workspace_files_sync(root.path().to_path_buf(), "foo", 50, &token)
+            .expect("search");
+        let paths: Vec<_> = by_name.files.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"src/foo.ts"), "got {paths:?}");
+        assert!(paths.contains(&"docs/foo.md"), "got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules")),
+            "ignored paths must not appear, got {paths:?}"
+        );
+
+        let capped = search_workspace_files_sync(root.path().to_path_buf(), "", 2, &token)
+            .expect("capped empty query");
+        assert_eq!(capped.files.len(), 2);
+        assert!(capped.truncated, "more than 2 entries exist under the root");
+    }
+
+    #[test]
+    fn workspace_search_identity_requires_a_complete_valid_pair() {
+        assert!(validate_workspace_search_identity(None, None)
+            .expect("legacy request")
+            .is_none());
+        assert!(validate_workspace_search_identity(Some("session"), None).is_err());
+        assert!(validate_workspace_search_identity(None, Some("request")).is_err());
+        assert!(validate_workspace_search_identity(Some(""), Some("request")).is_err());
+        assert!(validate_workspace_search_identity(Some("   "), Some("request")).is_err());
+        let longest_valid = "x".repeat(128);
+        assert!(
+            validate_workspace_search_identity(Some(&longest_valid), Some("request"),)
+                .expect("128-byte id")
+                .is_some()
+        );
+        let too_long = "x".repeat(129);
+        assert!(validate_workspace_search_identity(Some(&too_long), Some("request")).is_err());
+    }
+
+    #[test]
+    fn workspace_search_replacement_and_delayed_cancel_are_request_scoped() {
+        let first = register_workspace_search(Some("replace-session"), Some("request-1"))
+            .expect("first registration");
+        let second = register_workspace_search(Some("replace-session"), Some("request-2"))
+            .expect("replacement registration");
+
+        assert!(first.token().is_cancelled());
+        assert!(!second.token().is_cancelled());
+        assert!(!cancel_workspace_search_registration(
+            "replace-session",
+            "request-1",
+        ));
+        assert!(!second.token().is_cancelled());
+
+        drop(first);
+        assert!(cancel_workspace_search_registration(
+            "replace-session",
+            "request-2",
+        ));
+        assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn workspace_search_pre_cancelled_walk_returns_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("src/main.rs"), "fn main() {}\n");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "", 10, &token)
+            .expect("cancelled search");
+
+        assert!(result.files.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn workspace_search_matches_unicode_case() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("Ä.TXT"), "x\n");
+        let token = CancellationToken::new();
+
+        for query in ["ä", "Ä"] {
+            let result = search_workspace_files_sync(root.path().to_path_buf(), query, 10, &token)
+                .expect("search");
+            assert_eq!(result.files.len(), 1, "query {query}");
+            assert_eq!(result.files[0].path, "Ä.TXT");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_search_gate_limits_walks_and_cancels_waiters() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let semaphore = Arc::new(Semaphore::new(4));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut tasks = Vec::new();
+
+        for _ in 0..5 {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(run_workspace_search_task(
+                Arc::clone(&semaphore),
+                Arc::new(CancellationToken::new()),
+                move |_| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    started.fetch_add(1, Ordering::SeqCst);
+
+                    let (lock, wake) = &*release;
+                    let mut released = lock.lock().expect("release lock");
+                    while !*released {
+                        released = wake.wait(released).expect("release wait");
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(WorkspaceFileSearchResult {
+                        files: Vec::new(),
+                        truncated: false,
+                    })
+                },
+            )));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("four searches should enter");
+        assert_eq!(active.load(Ordering::SeqCst), 4);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().expect("release lock") = true;
+            wake.notify_all();
+        }
+        for task in tasks {
+            task.await
+                .expect("search task join")
+                .expect("search task result");
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 5);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        let waiting_semaphore = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&waiting_semaphore)
+            .acquire_owned()
+            .await
+            .expect("held permit");
+        let waiting_token = Arc::new(CancellationToken::new());
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let waiting_task = tokio::spawn(run_workspace_search_task(
+            waiting_semaphore,
+            Arc::clone(&waiting_token),
+            move |_| {
+                ran_in_task.store(true, Ordering::SeqCst);
+                Ok(WorkspaceFileSearchResult {
+                    files: Vec::new(),
+                    truncated: false,
+                })
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!waiting_task.is_finished());
+
+        waiting_token.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), waiting_task)
+            .await
+            .expect("cancelled waiter should finish")
+            .expect("cancelled waiter join")
+            .expect("cancelled waiter result");
+        assert!(cancelled.files.is_empty());
+        assert!(!cancelled.truncated);
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(held_permit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_search_gate_holds_permit_after_caller_abort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_in_task = Arc::clone(&entered);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_in_task = Arc::clone(&release);
+        let task = tokio::spawn(run_workspace_search_task(
+            Arc::clone(&semaphore),
+            Arc::new(CancellationToken::new()),
+            move |_| {
+                entered_in_task.store(true, Ordering::SeqCst);
+                let (lock, wake) = &*release_in_task;
+                let mut released = lock.lock().expect("release lock");
+                while !*released {
+                    released = wake.wait(released).expect("release wait");
+                }
+                Ok(WorkspaceFileSearchResult {
+                    files: Vec::new(),
+                    truncated: false,
+                })
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking search should start");
+
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("caller task should abort")
+            .is_cancelled());
+        let permits_while_detached = semaphore.available_permits();
+        let could_acquire_while_detached = semaphore.try_acquire().is_ok();
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().expect("release lock") = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while semaphore.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permit should return after blocking search exits");
+        assert_eq!(permits_while_detached, 0);
+        assert!(!could_acquire_while_detached);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_workspace_files_async_returns_hits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("lib/util.rs"), "fn x(){}\n");
+        let result = search_workspace_files(
+            root.path().to_string_lossy().into_owned(),
+            Some("util".into()),
+            Some(10),
+            None,
+            None,
+        )
+        .await
+        .expect("async search");
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "lib/util.rs");
+        assert_eq!(result.files[0].kind, "file");
+        assert!(!result.truncated);
+    }
 }
 
 // Symlink confinement that `read_workspace_file_base64` relies on. Unix-only
@@ -4770,8 +5779,7 @@ mod workspace_confinement_tests {
         let root = tempfile::tempdir().expect("root");
         let outside = tempfile::tempdir().expect("outside");
         std::fs::write(outside.path().join("secret"), b"top").expect("write");
-        symlink(outside.path().join("secret"), root.path().join("link"))
-            .expect("symlink");
+        symlink(outside.path().join("secret"), root.path().join("link")).expect("symlink");
         // The canonical target resolves outside the root, so the read is denied
         // even though `root/link` is lexically inside the workspace.
         let res = read_workspace_file_base64(
@@ -4780,7 +5788,10 @@ mod workspace_confinement_tests {
             None,
         )
         .await;
-        assert!(res.is_err(), "symlink escaping the workspace must be rejected");
+        assert!(
+            res.is_err(),
+            "symlink escaping the workspace must be rejected"
+        );
     }
 
     #[test]

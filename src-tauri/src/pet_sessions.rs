@@ -167,6 +167,7 @@ mod tests {
                 session_id: "s".into(),
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
             },
         ];
         for ev in &accepted {

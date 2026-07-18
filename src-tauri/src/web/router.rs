@@ -40,6 +40,10 @@ pub fn build_router(
             "/debug/event_metrics",
             get(handlers::event_metrics::get_event_metrics),
         )
+        .route(
+            "/debug/delegation_metrics",
+            get(handlers::delegation_metrics::get_delegation_metrics),
+        )
         // ─── Conversations ───
         .route(
             "/list_conversations",
@@ -70,6 +74,10 @@ pub fn build_router(
             post(handlers::delegation::get_delegation_profiles),
         )
         .route(
+            "/get_delegation_profile_catalog",
+            post(handlers::delegation::get_delegation_profile_catalog),
+        )
+        .route(
             "/set_delegation_profiles",
             post(handlers::delegation::set_delegation_profiles),
         )
@@ -84,6 +92,42 @@ pub fn build_router(
         .route(
             "/set_feedback_settings",
             post(handlers::feedback::set_feedback_settings),
+        )
+        .route(
+            "/get_conversation_experience_settings",
+            post(handlers::conversation_experience::get_conversation_experience_settings),
+        )
+        .route(
+            "/set_auto_title_agent",
+            post(handlers::conversation_experience::set_auto_title_agent),
+        )
+        .route(
+            "/set_reference_search_limit",
+            post(handlers::conversation_experience::set_reference_search_limit),
+        )
+        .route(
+            "/start_reference_search",
+            post(handlers::reference_search::start_reference_search),
+        )
+        .route(
+            "/next_reference_search_page",
+            post(handlers::reference_search::next_reference_search_page),
+        )
+        .route(
+            "/cancel_reference_search",
+            post(handlers::reference_search::cancel_reference_search),
+        )
+        .route(
+            "/validate_reference_candidate",
+            post(handlers::reference_search::validate_reference_candidate),
+        )
+        .route(
+            "/match_reference_regex",
+            post(handlers::reference_search::match_reference_regex).layer(
+                DefaultBodyLimit::max(
+                    handlers::reference_search::MAX_REFERENCE_REGEX_HTTP_BODY_BYTES,
+                ),
+            ),
         )
         .route(
             "/submit_session_feedback",
@@ -140,6 +184,14 @@ pub fn build_router(
             post(handlers::conversations::create_chat_dir),
         )
         .route(
+            "/set_conversation_delegation_route",
+            post(handlers::conversations::set_conversation_delegation_route),
+        )
+        .route(
+            "/set_draft_delegation_route_preference",
+            post(handlers::conversations::set_draft_delegation_route_preference),
+        )
+        .route(
             "/update_conversation_status",
             post(handlers::conversations::update_conversation_status),
         )
@@ -150,6 +202,10 @@ pub fn build_router(
         .route(
             "/update_conversation_pinned",
             post(handlers::conversations::update_conversation_pinned),
+        )
+        .route(
+            "/clear_awaiting_reply",
+            post(handlers::conversations::clear_awaiting_reply),
         )
         .route(
             "/delete_conversation",
@@ -230,6 +286,14 @@ pub fn build_router(
             post(handlers::folders::list_directory_with_files),
         )
         .route("/get_file_tree", post(handlers::folders::get_file_tree))
+        .route(
+            "/search_workspace_files",
+            post(handlers::folders::search_workspace_files),
+        )
+        .route(
+            "/cancel_workspace_file_search",
+            post(handlers::folders::cancel_workspace_file_search),
+        )
         .route(
             "/start_workspace_state_stream",
             post(handlers::workspace_state::start_workspace_state_stream),
@@ -629,6 +693,10 @@ pub fn build_router(
         .route(
             "/acp_update_agent_preferences",
             post(handlers::acp::acp_update_agent_preferences),
+        )
+        .route(
+            "/acp_update_agent_display_preferences",
+            post(handlers::acp::acp_update_agent_display_preferences),
         )
         .route(
             "/acp_update_agent_env",
@@ -1047,7 +1115,10 @@ pub fn build_router(
             "/automation_list",
             post(handlers::automation::automation_list),
         )
-        .route("/automation_get", post(handlers::automation::automation_get))
+        .route(
+            "/automation_get",
+            post(handlers::automation::automation_get),
+        )
         .route(
             "/automation_runs",
             post(handlers::automation::automation_runs),

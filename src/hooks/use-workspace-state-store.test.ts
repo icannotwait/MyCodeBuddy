@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { getWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
 import * as api from "@/lib/api"
 
+const platformMock = vi.hoisted(() => ({
+  handler: null as ((event: unknown) => void) | null,
+}))
+
 // Token-set state machine for the per-root workspace stream store:
 // full/paths subscription modes, upgrade/downgrade transitions against the
 // backend, idempotent release, and the shutdown-grace lifecycle. Each test
@@ -14,7 +18,12 @@ vi.mock("@/lib/api", () => ({
 }))
 
 vi.mock("@/lib/platform", () => ({
-  subscribe: vi.fn(async () => () => {}),
+  subscribe: vi.fn(
+    async (_event: string, handler: (event: unknown) => void) => {
+      platformMock.handler = handler
+      return () => {}
+    }
+  ),
 }))
 
 const mockedApi = api as unknown as {
@@ -42,6 +51,7 @@ const drain = () => vi.advanceTimersByTimeAsync(0)
 
 beforeEach(() => {
   vi.useFakeTimers()
+  platformMock.handler = null
   mockedApi.startWorkspaceStateStream.mockReset()
   mockedApi.stopWorkspaceStateStream.mockReset()
   mockedApi.getWorkspaceSnapshot.mockReset()
@@ -59,6 +69,37 @@ afterEach(() => {
 })
 
 describe("workspace state store full/paths token machine", () => {
+  it("forwards filesystem operation hints to envelope listeners", async () => {
+    const root = "/machine/fs-event-kind"
+    const store = getWorkspaceStateStore(root)
+    const listener = vi.fn()
+    const unsubscribe = store.subscribeEnvelopes(listener)
+    const token = store.acquire("paths")
+    await drain()
+
+    platformMock.handler?.({
+      root_path: root,
+      seq: 1,
+      version: 1,
+      kind: "meta",
+      fs_event_kind: "create",
+      payload: [{ kind: "meta", reason: "fs_events" }],
+      requires_resync: false,
+      changed_paths: ["dist/new.js"],
+    })
+
+    expect(listener).toHaveBeenCalledWith({
+      seq: 1,
+      kind: "meta",
+      fs_event_kind: "create",
+      changed_paths: ["dist/new.js"],
+    })
+
+    unsubscribe()
+    store.release(token)
+    await vi.advanceTimersByTimeAsync(700)
+  })
+
   it("registers a paths-only subscription without tree/git scanning", async () => {
     const store = getWorkspaceStateStore("/machine/t1")
     const token = store.acquire("paths")

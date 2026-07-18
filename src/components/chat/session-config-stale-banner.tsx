@@ -71,7 +71,9 @@ export function SessionConfigStaleBanner({
       ? t("modelProviderTitle")
       : configStaleKind === "terminal_shell"
         ? t("terminalShellTitle")
-        : t("agentConfigTitle")
+        : configStaleKind === "delegation_route"
+          ? t("delegationRouteTitle")
+          : t("agentConfigTitle")
 
   const handleReconnect = async () => {
     if (actionDisabled) return

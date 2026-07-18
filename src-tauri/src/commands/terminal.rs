@@ -8,9 +8,9 @@ use tauri::State;
 use crate::db::AppDatabase;
 use crate::git_credential;
 use crate::terminal::error::TerminalError;
-use crate::terminal::shell::{resolve_terminal_shell, ResolvedShellSpec};
 #[cfg(feature = "tauri-runtime")]
 use crate::terminal::manager::{SpawnOptions, TerminalManager};
+use crate::terminal::shell::{resolve_terminal_shell, ResolvedShellSpec};
 #[cfg(feature = "tauri-runtime")]
 use crate::terminal::types::TerminalInfo;
 #[cfg(feature = "tauri-runtime")]

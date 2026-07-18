@@ -26,13 +26,14 @@ import { Bubbles, Loader2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
+import { ButtonGroup } from "@/components/ui/button-group"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   type DelegationSettings,
   getDelegationSettings,
-  getDelegationProfiles,
+  getDelegationProfileCatalog,
   setDelegationBundle,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
@@ -40,6 +41,7 @@ import type {
   AgentDelegationDefaults,
   AgentType,
   DelegationProfile,
+  DelegationRoutePolicy,
 } from "@/lib/types"
 import { DelegationAgentDefaultsPanel } from "./delegation-agent-defaults"
 import { DelegationProfilesPanel } from "./delegation-profiles"
@@ -47,6 +49,10 @@ import { DelegationProfilesPanel } from "./delegation-profiles"
 const DEPTH_MIN = 1
 const DEPTH_MAX = 8
 const DEFAULT_CACHE_MB = 512
+const DEFAULT_ROUTE: DelegationRoutePolicy = "codeg"
+const DEFAULT_STALLED_AFTER = 300
+const STALLED_MIN = 60
+const STALLED_MAX = 3600
 
 function clamp(n: number, lo: number, hi: number): number {
   if (!Number.isFinite(n)) return lo
@@ -68,22 +74,33 @@ export function DelegationSettingsSection() {
   const [enabled, setEnabled] = useState(false)
   const [depth, setDepth] = useState<number>(1)
   const [cacheMb, setCacheMb] = useState<number>(DEFAULT_CACHE_MB)
+  const [routePolicy, setRoutePolicy] =
+    useState<DelegationRoutePolicy>(DEFAULT_ROUTE)
+  const [stalledAfterSeconds, setStalledAfterSeconds] = useState<number>(
+    DEFAULT_STALLED_AFTER
+  )
   const [agentDefaults, setAgentDefaults] = useState<
     Partial<Record<AgentType, AgentDelegationDefaults>>
   >({})
   const [profiles, setProfiles] = useState<DelegationProfile[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
 
+  const applySettings = useCallback((s: DelegationSettings) => {
+    setEnabled(s.enabled)
+    setDepth(s.depth_limit)
+    setCacheMb(s.completed_cache_max_mb)
+    setRoutePolicy(s.route_policy ?? DEFAULT_ROUTE)
+    setStalledAfterSeconds(s.stalled_after_seconds ?? DEFAULT_STALLED_AFTER)
+    setAgentDefaults(s.agent_defaults ?? {})
+  }, [])
+
   useEffect(() => {
     let cancelled = false
-    void Promise.all([getDelegationSettings(), getDelegationProfiles()])
-      .then(([s, profileDocument]) => {
+    void Promise.all([getDelegationSettings(), getDelegationProfileCatalog()])
+      .then(([s, catalog]) => {
         if (cancelled) return
-        setEnabled(s.enabled)
-        setDepth(s.depth_limit)
-        setCacheMb(s.completed_cache_max_mb)
-        setAgentDefaults(s.agent_defaults ?? {})
-        setProfiles(profileDocument.profiles)
+        applySettings(s)
+        setProfiles(catalog.profiles)
         setLoadError(null)
       })
       .catch((err: unknown) => {
@@ -97,12 +114,18 @@ export function DelegationSettingsSection() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [applySettings])
 
   const save = useCallback(async () => {
     const payload: DelegationSettings = {
       enabled,
       depth_limit: clamp(depth, DEPTH_MIN, DEPTH_MAX),
+      route_policy: routePolicy,
+      stalled_after_seconds: clamp(
+        stalledAfterSeconds,
+        STALLED_MIN,
+        STALLED_MAX
+      ),
       completed_cache_max_mb: clampCacheMb(cacheMb),
       agent_defaults: agentDefaults,
     }
@@ -114,10 +137,7 @@ export function DelegationSettingsSection() {
       })
       // Mirror any server-side clamps / filter passes back into the UI so the
       // inputs reflect what was actually persisted.
-      setEnabled(saved.settings.enabled)
-      setDepth(saved.settings.depth_limit)
-      setCacheMb(saved.settings.completed_cache_max_mb)
-      setAgentDefaults(saved.settings.agent_defaults ?? {})
+      applySettings(saved.settings)
       setProfiles(saved.profiles.profiles)
       toast.success(t("saved"))
     } catch (err: unknown) {
@@ -127,22 +147,29 @@ export function DelegationSettingsSection() {
       // Re-sync from server so a failed partial attempt never leaves the
       // form claiming dirty state that no longer matches persistence.
       try {
-        const [s, profileDocument] = await Promise.all([
+        const [s, catalog] = await Promise.all([
           getDelegationSettings(),
-          getDelegationProfiles(),
+          getDelegationProfileCatalog(),
         ])
-        setEnabled(s.enabled)
-        setDepth(s.depth_limit)
-        setCacheMb(s.completed_cache_max_mb)
-        setAgentDefaults(s.agent_defaults ?? {})
-        setProfiles(profileDocument.profiles)
+        applySettings(s)
+        setProfiles(catalog.profiles)
       } catch (reloadErr: unknown) {
         toast.error(t("loadFailed", { detail: toErrorMessage(reloadErr) }))
       }
     } finally {
       setSaving(false)
     }
-  }, [enabled, depth, cacheMb, agentDefaults, profiles, t])
+  }, [
+    enabled,
+    depth,
+    routePolicy,
+    stalledAfterSeconds,
+    cacheMb,
+    agentDefaults,
+    profiles,
+    applySettings,
+    t,
+  ])
 
   return (
     <section className="rounded-xl border bg-card p-4 space-y-4">
@@ -235,6 +262,75 @@ export function DelegationSettingsSection() {
                 // 0 (= unlimited). Explicit "0" still means unlimited.
                 setCacheMb(raw === "" ? NaN : Number(raw))
               }}
+              disabled={loading || !enabled}
+              className="w-28 shrink-0"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-1 min-w-0">
+              <span className="text-sm font-medium">{t("routePolicy")}</span>
+              <p className="text-xs text-muted-foreground">
+                {t("routePolicyHint")}
+              </p>
+              {!enabled && (
+                <p className="text-xs text-muted-foreground">
+                  {t("routeEffectiveNative")}
+                </p>
+              )}
+            </div>
+            <ButtonGroup aria-label={t("routePolicy")} className="shrink-0">
+              {(["codeg", "native"] as const).map((policy) => {
+                const selected = routePolicy === policy
+                return (
+                  <Button
+                    key={policy}
+                    type="button"
+                    // `default` (primary fill) vs `outline` — same pattern as
+                    // other segmented toggles. `secondary` was nearly
+                    // indistinguishable from `outline` in this theme.
+                    variant={selected ? "default" : "outline"}
+                    aria-pressed={selected}
+                    disabled={loading || !enabled}
+                    onClick={() => setRoutePolicy(policy)}
+                    size="sm"
+                    className={
+                      selected
+                        ? "relative z-10 shadow-sm ring-1 ring-primary/40"
+                        : undefined
+                    }
+                  >
+                    {t(`route.${policy}`)}
+                  </Button>
+                )
+              })}
+            </ButtonGroup>
+          </div>
+
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-1 min-w-0">
+              <label
+                htmlFor="delegation-stalled-after"
+                className="text-sm font-medium"
+              >
+                {t("softWatchdog")}
+              </label>
+              <p className="text-xs text-muted-foreground">
+                {t("softWatchdogHint", {
+                  min: STALLED_MIN,
+                  max: STALLED_MAX,
+                })}
+              </p>
+            </div>
+            <Input
+              id="delegation-stalled-after"
+              type="number"
+              min={STALLED_MIN}
+              max={STALLED_MAX}
+              step={1}
+              aria-label={t("softWatchdog")}
+              value={stalledAfterSeconds}
+              onChange={(e) => setStalledAfterSeconds(Number(e.target.value))}
               disabled={loading || !enabled}
               className="w-28 shrink-0"
             />

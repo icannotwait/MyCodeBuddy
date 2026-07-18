@@ -8,6 +8,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::route::{
+    DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
+};
 use crate::acp::event_stream::{ConnectionEventStream, RecentEventsBuffer};
 use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::question::PendingQuestionState;
@@ -15,8 +18,57 @@ use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
     PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
 };
+use crate::auto_title::{ConnectionPurpose, TurnCompletionSnapshot};
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
+use crate::models::system::AppLocale;
+
+/// Opaque per-turn token + originating locale for automatic title coordination.
+#[derive(Debug, Clone)]
+pub struct ActiveTurnContext {
+    pub token: String,
+    pub locale: AppLocale,
+}
+
+/// Immutable route plan plus the one mutable post-ready availability bit.
+/// Carried on live snapshots so attach payloads have one stable shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRouteSnapshot {
+    pub requested: DelegationRoutePolicy,
+    pub effective: DelegationRoutePolicy,
+    pub source: DelegationRouteSource,
+    pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<RouteDegradedReason>,
+    pub delegation_available: bool,
+}
+
+impl DelegationRouteSnapshot {
+    /// Build from an immutable launch plan. Availability starts false until
+    /// the authenticated ready lease succeeds (Codeg) or stays false (native).
+    pub fn from_plan(plan: &DelegationRoutePlan, delegation_available: bool) -> Self {
+        Self {
+            requested: plan.requested,
+            effective: plan.effective,
+            source: plan.source,
+            managed: plan.managed,
+            degraded_reason: plan.degraded_reason,
+            delegation_available,
+        }
+    }
+}
+
+/// Serde default for mixed-version clients: unmanaged native, unavailable.
+pub fn legacy_unmanaged_route_snapshot() -> DelegationRouteSnapshot {
+    DelegationRouteSnapshot {
+        requested: DelegationRoutePolicy::Native,
+        effective: DelegationRoutePolicy::Native,
+        source: DelegationRouteSource::FeatureDisabled,
+        managed: false,
+        degraded_reason: None,
+        delegation_available: false,
+    }
+}
 
 /// 当前 streaming 中的 turn 的累积内容。turn 完成后清空。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +240,27 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Durable Broker task id — guards runtime/attention replacements so a
+    /// stale event for a previous task on the same tool id cannot clobber
+    /// the live card.
+    pub task_id: String,
+    /// Authoritative accepted-start timestamp (rebased from durable child row).
+    pub started_at: DateTime<Utc>,
+    /// Latest projected runtime rollup for the visible card.
+    pub runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    /// Open parent-decision request, if any. Cleared by
+    /// `DelegationAttentionChanged { attention_request: None }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request:
+        Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    /// Soft-watchdog health for this still-running card. Absent until the
+    /// supervisor publishes; cleared only when the card is removed on complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<crate::acp::delegation::types::TaskObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_activity_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
 /// The in-flight user prompt for the current turn. Captured from
@@ -312,7 +385,19 @@ pub struct SessionState {
 
     // 事件锚点
     pub event_seq: u64,
+    /// Idle-sweep / general liveness timestamp. Bumped on every emit and
+    /// frontend keepalive. **Not** the soft-watchdog agent activity clock.
     pub last_activity_at: DateTime<Utc>,
+
+    /// Soft-watchdog agent activity clock. Advanced only by normalized Agent
+    /// transcript/thinking, tool start/update/progress, and plan activity (or
+    /// first successful child prompt enqueue). Independent of `last_activity_at`.
+    pub last_agent_activity_at: DateTime<Utc>,
+
+    /// Optional wake handle for the soft supervisor. Default is noop so unit
+    /// tests that never install a wake stay silent. Not serialized / not on
+    /// wire snapshots.
+    pub(crate) supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
 
     /// Per-connection event broadcaster used by the WS attach protocol.
     /// New subscribers register receivers here while holding the SessionState
@@ -390,6 +475,25 @@ pub struct SessionState {
     /// Which settings surface drifted, for the banner's wording. `Some` iff
     /// `config_stale`; reset to `None` when staleness clears.
     pub config_stale_kind: Option<ConfigStaleKind>,
+
+    /// Managed route snapshot: immutable plan fields + mutable
+    /// `delegation_available`. New sessions always supply a real plan-derived
+    /// value; wire default for legacy payloads is unmanaged native unavailable.
+    pub delegation_route: DelegationRouteSnapshot,
+
+    /// Why this connection was launched (user, delegation, internal probe/title).
+    /// Internal purposes bypass title capture on prompt admission.
+    pub purpose: ConnectionPurpose,
+
+    /// Latest resolved title/locale for this connection. Initialized from the
+    /// launch context's inherited locale (English when absent) and refreshed on
+    /// every accepted capture.
+    pub effective_locale: AppLocale,
+
+    /// In-flight turn capture context set only after successful admission
+    /// capture (linked, non-internal). `None` outside an admitted turn or when
+    /// capture was bypassed/failed.
+    pub active_turn: Option<ActiveTurnContext>,
 }
 
 impl SessionState {
@@ -430,6 +534,8 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_agent_activity_at: Utc::now(),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
@@ -440,7 +546,34 @@ impl SessionState {
             turn_in_flight: false,
             config_stale: false,
             config_stale_kind: None,
+            // Placeholder until spawn installs the real plan snapshot; tests
+            // that never set a plan still deserialize/serialize as legacy default.
+            delegation_route: legacy_unmanaged_route_snapshot(),
+            // Test/helper default: User purpose + English. Production spawn paths
+            // overwrite these from `ConnectionLaunchContext` (Task 4B temporary
+            // defaults; Task 4C wires real persisted/channel/parent locales).
+            purpose: ConnectionPurpose::User,
+            effective_locale: AppLocale::En,
+            active_turn: None,
         }
+    }
+
+    /// Mark real agent-side progress for the soft watchdog. Does **not** touch
+    /// `last_activity_at` (idle sweep). Wakes the supervisor when a handle is set.
+    pub fn mark_agent_activity(&mut self, at: DateTime<Utc>) {
+        self.last_agent_activity_at = at;
+        self.supervisor_wake.notify();
+    }
+
+    /// Install the plan-derived route snapshot (availability still false until
+    /// ready lease / native path marks connected without delegation).
+    pub fn set_route_plan_snapshot(&mut self, plan: &DelegationRoutePlan) {
+        self.delegation_route = DelegationRouteSnapshot::from_plan(plan, false);
+    }
+
+    /// Post-ready availability flip only — never mutates plan fields.
+    pub fn set_delegation_available(&mut self, available: bool) {
+        self.delegation_route.delegation_available = available;
     }
 
     /// Clone the broadcaster handle so attach handlers and subscriber tasks
@@ -483,7 +616,12 @@ impl SessionState {
 
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
-    pub fn apply_event(&mut self, payload: &AcpEvent) {
+    ///
+    /// Returns an event-owned [`TurnCompletionSnapshot`] only for `TurnComplete`
+    /// when both `conversation_id` and `active_turn` are present. Built after
+    /// assembling `last_assistant_text` and before clearing `active_turn`.
+    pub fn apply_event(&mut self, payload: &AcpEvent) -> Option<TurnCompletionSnapshot> {
+        let mut completion = None;
         match payload {
             AcpEvent::SessionStarted { session_id } => {
                 if self.external_id.as_deref() != Some(session_id.as_str()) {
@@ -528,6 +666,9 @@ impl SessionState {
                 self.config_stale = *stale;
                 self.config_stale_kind = if *stale { Some(*kind) } else { None };
             }
+            AcpEvent::DelegationAvailabilityChanged { available } => {
+                self.delegation_route.delegation_available = *available;
+            }
             AcpEvent::PromptCapabilities {
                 prompt_capabilities,
             } => {
@@ -571,6 +712,7 @@ impl SessionState {
                     content.as_deref(),
                     raw_input.as_deref(),
                     raw_output.as_deref(),
+                    false,
                     locations.as_ref(),
                     meta.as_ref(),
                     images.as_deref(),
@@ -590,10 +732,10 @@ impl SessionState {
                 content,
                 raw_input,
                 raw_output,
+                raw_output_append,
                 locations,
                 meta,
                 images,
-                ..
             } => {
                 self.upsert_tool_call(
                     tool_call_id,
@@ -603,6 +745,7 @@ impl SessionState {
                     content.as_deref(),
                     raw_input.as_deref(),
                     raw_output.as_deref(),
+                    *raw_output_append == Some(true),
                     locations.as_ref(),
                     meta.as_ref(),
                     images.as_deref(),
@@ -626,6 +769,8 @@ impl SessionState {
                     options: options.clone(),
                     created_at: Utc::now(),
                 });
+                // Waiting-input observation changes — wake soft supervisor.
+                self.supervisor_wake.notify();
             }
             AcpEvent::PermissionResolved { request_id } => {
                 // Drop the snapshot's pending_permission iff the resolved
@@ -638,6 +783,7 @@ impl SessionState {
                     Some(p) if p.request_id == *request_id,
                 ) {
                     self.pending_permission = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::QuestionRequest {
@@ -649,6 +795,7 @@ impl SessionState {
                     questions: questions.clone(),
                     created_at: Utc::now(),
                 });
+                self.supervisor_wake.notify();
             }
             AcpEvent::QuestionResolved { question_id } => {
                 // Mirror `PermissionResolved`: only clear when the resolved id
@@ -659,6 +806,7 @@ impl SessionState {
                     Some(p) if p.question_id == *question_id,
                 ) {
                     self.pending_question = None;
+                    self.supervisor_wake.notify();
                 }
             }
             AcpEvent::TurnComplete { .. } => {
@@ -693,6 +841,25 @@ impl SessionState {
                         Some(assembled)
                     };
                 }
+                // Event-owned completion snapshot: capture under this lock after
+                // text assembly and before clearing active_turn so lifecycle
+                // never re-reads mutable SessionState for title context.
+                completion = match (self.conversation_id, self.active_turn.as_ref()) {
+                    (Some(conversation_id), Some(turn)) => {
+                        let final_text: Arc<str> = match &self.last_assistant_text {
+                            Some(text) => Arc::from(text.as_str()),
+                            None => Arc::from(""),
+                        };
+                        Some(TurnCompletionSnapshot {
+                            conversation_id,
+                            turn_token: turn.token.clone(),
+                            locale: turn.locale,
+                            final_text,
+                        })
+                    }
+                    _ => None,
+                };
+                self.active_turn = None;
                 self.live_message = None;
                 self.active_tool_calls.clear();
                 // The turn's user prompt is no longer "in flight" — the
@@ -712,12 +879,17 @@ impl SessionState {
                 // turn completes; clearing it would drop the running binding from
                 // the snapshot the instant the parent turn ends (the original
                 // web-only bug). It's removed per-entry by `DelegationCompleted`.
+                let had_waiting =
+                    self.pending_permission.is_some() || self.pending_question.is_some();
                 self.pending_permission = None;
                 // A blocked `ask_user_question` can't outlive its turn: if the
                 // turn ends (cancel / stop) the card is moot. The backend's
                 // answer one-shot is cleaned via the listener's peer-close race;
                 // this just keeps the snapshot honest.
                 self.pending_question = None;
+                if had_waiting {
+                    self.supervisor_wake.notify();
+                }
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
@@ -739,7 +911,10 @@ impl SessionState {
                 // window before this next prompt arrives.
                 self.feedback.clear();
                 // A new user turn supersedes any stale pending question.
-                self.pending_question = None;
+                if self.pending_question.is_some() {
+                    self.pending_question = None;
+                    self.supervisor_wake.notify();
+                }
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -793,9 +968,13 @@ impl SessionState {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_id,
+                started_at,
+                runtime_stats,
+                attention_request,
                 ..
             } => {
-                // Record the running delegation so the binding is snapshot-
+                // Record the full running card so the binding is snapshot-
                 // recoverable (survives this connection's TurnComplete and any
                 // re-attach on the snapshot path). The broker only emits this for
                 // a REAL (non-synthetic) parent_tool_use_id, so synthetic-fallback
@@ -808,20 +987,76 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        task_id: task_id.clone(),
+                        started_at: *started_at,
+                        runtime_stats: runtime_stats.clone(),
+                        attention_request: attention_request.clone(),
+                        observation: None,
+                        last_agent_activity_at: None,
+                        stalled_since: None,
                     },
                 );
             }
-            AcpEvent::DelegationCompleted {
-                parent_tool_use_id, ..
+            AcpEvent::DelegationRuntimeStatsChanged {
+                parent_tool_use_id,
+                task_id,
+                runtime_stats,
             } => {
-                // A running delegation finished: drop it from the live set. Its
-                // terminal status/result reaches the LLM via
-                // `get_delegation_status` and the UI via the live
-                // `DelegationCompleted` event (DelegationProvider) or, on a cold
-                // load, the child's persisted DB row (`inject_delegation_meta`).
-                // Retaining it would turn this map into an unbounded history log;
-                // it is deliberately only the in-flight set.
-                self.active_delegations.remove(parent_tool_use_id);
+                // Replace-only: update an existing card whose task_id matches.
+                // Unknown tool id or mismatched task id is ignored (replay-safe
+                // for reordered / stale events).
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        card.runtime_stats = runtime_stats.clone();
+                    }
+                }
+            }
+            AcpEvent::DelegationAttentionChanged {
+                parent_tool_use_id,
+                task_id,
+                attention_request,
+            } => {
+                // Replace-only (including clear when attention_request is None).
+                // Task-id guarded like runtime replacements.
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        card.attention_request = attention_request.clone();
+                    }
+                }
+            }
+            AcpEvent::DelegationObservationChanged {
+                parent_tool_use_id,
+                task_id,
+                observation,
+                last_agent_activity_at,
+                stalled_since,
+            } => {
+                // Observe-only: update an existing card. Never insert, remove,
+                // or synthesize Completion from a health transition. Task-id
+                // guarded so a stale observation cannot clobber a new task.
+                if let Some(card) = self.active_delegations.get_mut(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        card.observation = Some(*observation);
+                        card.last_agent_activity_at = Some(*last_agent_activity_at);
+                        card.stalled_since = *stalled_since;
+                    }
+                }
+            }
+            AcpEvent::DelegationCompleted {
+                parent_tool_use_id,
+                task_id,
+                ..
+            } => {
+                // A running delegation finished: drop it from the live set only
+                // when the task_id matches (guards against a late complete for a
+                // prior task on a recycled tool id). Terminal state reaches the
+                // LLM via `get_delegation_status` and the UI via the live event
+                // or, on a cold load, the child's DB row (`inject_delegation_meta`).
+                if let Some(card) = self.active_delegations.get(parent_tool_use_id) {
+                    if card.task_id == *task_id {
+                        self.active_delegations.remove(parent_tool_use_id);
+                    }
+                }
             }
             AcpEvent::FeedbackSubmitted { item } => {
                 // Idempotent by id (replay / double-attach safe): append only if
@@ -861,6 +1096,7 @@ impl SessionState {
             }
         }
         self.last_activity_at = Utc::now();
+        completion
     }
 
     /// Whether this connection has launched background work (async sub-agent /
@@ -1046,6 +1282,10 @@ impl SessionState {
     /// when present. Partial-update preservation: a `None` value passed in
     /// from a `ToolCallUpdate` (which typically carries only the fields that
     /// changed) must NOT clobber a previously-set value on the entry.
+    ///
+    /// When `raw_output_append` is true and both the prior and incoming
+    /// outputs are text, the strings are concatenated (mirrors the frontend
+    /// reducer and agent delta emission with `raw_output_append=true`).
     #[allow(clippy::too_many_arguments)]
     fn upsert_tool_call(
         &mut self,
@@ -1056,6 +1296,7 @@ impl SessionState {
         content: Option<&str>,
         raw_input: Option<&str>,
         raw_output: Option<&str>,
+        raw_output_append: bool,
         locations: Option<&serde_json::Value>,
         meta: Option<&serde_json::Value>,
         images: Option<&[ToolCallImageInfo]>,
@@ -1101,7 +1342,27 @@ impl SessionState {
             }
         }
         if let Some(text) = raw_output {
-            entry.output = Some(parse_tool_call_output_text(text));
+            let next = parse_tool_call_output_text(text);
+            if raw_output_append {
+                match (&mut entry.output, next) {
+                    (
+                        Some(ToolCallOutput::Text { content }),
+                        ToolCallOutput::Text { content: add },
+                    ) => {
+                        content.push_str(&add);
+                    }
+                    (None, next) => {
+                        entry.output = Some(next);
+                    }
+                    (_, next) => {
+                        // Type change under append: fall back to replace so
+                        // structured/error outputs still land.
+                        entry.output = Some(next);
+                    }
+                }
+            } else {
+                entry.output = Some(next);
+            }
         }
         if let Some(loc) = locations {
             entry.locations = Some(loc.clone());
@@ -1145,6 +1406,7 @@ impl SessionState {
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
+            delegation_route: self.delegation_route.clone(),
             event_seq: self.event_seq,
         }
     }
@@ -1236,6 +1498,10 @@ pub struct LiveSessionSnapshot {
     /// byte-identical with the pre-feature wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_stale_kind: Option<ConfigStaleKind>,
+    /// Managed route + availability (see [`DelegationRouteSnapshot`]).
+    /// Default preserves mixed-version clients and Rust deserialization tests.
+    #[serde(default = "legacy_unmanaged_route_snapshot")]
+    pub delegation_route: DelegationRouteSnapshot,
     pub event_seq: u64,
 }
 
@@ -1342,6 +1608,119 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    fn codeg_plan(agent_type: AgentType) -> crate::acp::delegation::route::DelegationRoutePlan {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let _ = agent_type;
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "task10-route".into(),
+        }
+    }
+
+    fn state_with_route(plan: crate::acp::delegation::route::DelegationRoutePlan) -> SessionState {
+        let mut s = fresh_state();
+        s.agent_type = AgentType::Codex;
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        s
+    }
+
+    #[test]
+    fn snapshot_keeps_route_immutable_while_availability_changes() {
+        let mut state = state_with_route(codeg_plan(AgentType::Codex));
+        let original = state.to_snapshot().delegation_route;
+        state.apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+        let changed = state.to_snapshot().delegation_route;
+        assert_eq!(original.requested, changed.requested);
+        assert_eq!(original.effective, changed.effective);
+        assert_eq!(original.source, changed.source);
+        assert!(!changed.delegation_available);
+    }
+
+    #[test]
+    fn observation_changed_updates_active_card_without_completing() {
+        let mut s = fresh_state();
+        s.apply_event(&delegation_started("pt-1", 99));
+        assert!(s.active_delegations.contains_key("pt-1"));
+        let at = Utc::now();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "pt-1".into(),
+            task_id: "task-1".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Stalled,
+            last_agent_activity_at: at,
+            stalled_since: Some(at + chrono::Duration::seconds(300)),
+        });
+        let card = s.active_delegations.get("pt-1").expect("card remains");
+        assert_eq!(
+            card.observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        assert_eq!(card.last_agent_activity_at, Some(at));
+        assert!(card.stalled_since.is_some());
+        // Snapshot recovers observation + route availability bit together.
+        let snap = s.to_snapshot();
+        assert_eq!(snap.active_delegations.len(), 1);
+        assert_eq!(
+            snap.active_delegations[0].observation,
+            Some(crate::acp::delegation::types::TaskObservation::Stalled)
+        );
+        // Never synthesizes completion.
+        assert!(s.active_delegations.contains_key("pt-1"));
+    }
+
+    #[test]
+    fn observation_changed_unknown_tool_use_does_not_create_card() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::DelegationObservationChanged {
+            parent_tool_use_id: "ghost".into(),
+            task_id: "t".into(),
+            observation: crate::acp::delegation::types::TaskObservation::Active,
+            last_agent_activity_at: Utc::now(),
+            stalled_since: None,
+        });
+        assert!(s.active_delegations.is_empty());
+    }
+
+    #[test]
+    fn delegation_route_snapshot_round_trips_on_live_snapshot() {
+        let mut s = state_with_route(codeg_plan(AgentType::Codex));
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert!(snap.delegation_route.delegation_available);
+        let json = serde_json::to_value(&snap).unwrap();
+        let back: LiveSessionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.delegation_route, snap.delegation_route);
+    }
+
+    #[test]
+    fn mark_agent_activity_does_not_advance_idle_sweep_timestamp() {
+        let mut s = fresh_state();
+        let idle_before = s.last_activity_at;
+        let agent_before = s.last_agent_activity_at;
+        // Ensure a distinct later instant for agent activity.
+        let later = agent_before + chrono::Duration::seconds(42);
+        s.mark_agent_activity(later);
+        assert_eq!(
+            s.last_agent_activity_at, later,
+            "agent activity clock advances"
+        );
+        assert_eq!(
+            s.last_activity_at, idle_before,
+            "idle-sweep last_activity_at must stay unchanged"
+        );
     }
 
     #[test]
@@ -1453,6 +1832,7 @@ mod tests {
             session_id: "sess".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         assert!(
             s.pending_user_message.is_none(),
@@ -1950,6 +2330,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         assert!(s.live_message.is_none());
         assert!(s.active_tool_calls.is_empty());
@@ -1959,28 +2340,219 @@ mod tests {
 
     // --- active_delegations: running-only, snapshot-recoverable binding ---
 
+    fn dt(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339")
+            .with_timezone(&Utc)
+    }
+
+    fn empty_stats(started: DateTime<Utc>) -> crate::acp::delegation::runtime_stats::DelegationRuntimeStats {
+        crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started)
+    }
+
     fn delegation_started(parent_tool_use_id: &str, child_conv: i32) -> AcpEvent {
+        let started = dt("2026-07-17T10:00:00Z");
         AcpEvent::DelegationStarted {
             parent_connection_id: "conn-test".into(),
             parent_tool_use_id: parent_tool_use_id.into(),
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_id: "task-1".into(),
+            started_at: started,
+            runtime_stats: empty_stats(started),
+            attention_request: None,
+        }
+    }
+
+    fn delegation_started_with(
+        parent_tool_use_id: &str,
+        task_id: &str,
+        child_conv: i32,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    ) -> AcpEvent {
+        AcpEvent::DelegationStarted {
+            parent_connection_id: "conn-test".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
+            child_connection_id: "child-conn-1".into(),
+            child_conversation_id: child_conv,
+            agent_type: AgentType::Codex,
+            task_id: task_id.into(),
+            started_at: runtime_stats.started_at,
+            runtime_stats,
+            attention_request: None,
         }
     }
 
     fn delegation_completed(parent_tool_use_id: &str, child_conv: i32) -> AcpEvent {
+        let started = dt("2026-07-17T10:00:00Z");
         AcpEvent::DelegationCompleted {
             parent_connection_id: "conn-test".into(),
             parent_tool_use_id: parent_tool_use_id.into(),
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_id: "task-1".into(),
+            runtime_stats: empty_stats(started),
             result: DelegationResultSummary::Ok {
                 duration_ms: 1,
                 text_preview: None,
             },
         }
+    }
+
+    fn delegation_completed_with(
+        parent_tool_use_id: &str,
+        task_id: &str,
+        child_conv: i32,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    ) -> AcpEvent {
+        AcpEvent::DelegationCompleted {
+            parent_connection_id: "conn-test".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
+            child_connection_id: "child-conn-1".into(),
+            child_conversation_id: child_conv,
+            agent_type: AgentType::Codex,
+            task_id: task_id.into(),
+            runtime_stats,
+            result: DelegationResultSummary::Ok {
+                duration_ms: 1,
+                text_preview: None,
+            },
+        }
+    }
+
+    #[test]
+    fn delegation_projection_events_replace_idempotently_and_snapshot_latest_state() {
+        let mut state = fresh_state();
+        let initial = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with(
+            "tool-1",
+            "task-1",
+            99,
+            initial.clone(),
+        ));
+
+        let mut changed = initial.clone();
+        changed.tool_call_count = 3;
+        let runtime_event = AcpEvent::DelegationRuntimeStatsChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            runtime_stats: changed.clone(),
+        };
+        state.apply_event(&runtime_event);
+        state.apply_event(&runtime_event);
+
+        let request = crate::acp::delegation::attention::AttentionRequestSummary {
+            request_id: "req-1".into(),
+            task_id: "task-1".into(),
+            message: "Choose A or B".into(),
+            created_at: dt("2026-07-17T10:01:00Z"),
+        };
+        let open = AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: Some(request.clone()),
+        };
+        state.apply_event(&open);
+        state.apply_event(&open);
+        let card = state.active_delegations.get("tool-1").unwrap();
+        assert_eq!(card.runtime_stats, changed);
+        assert_eq!(card.attention_request.as_ref().unwrap().request_id, "req-1");
+
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: None,
+        });
+        let snapshot = state.to_snapshot();
+        assert_eq!(snapshot.active_delegations[0].task_id, "task-1");
+        assert_eq!(snapshot.active_delegations[0].runtime_stats.tool_call_count, 3);
+        assert_eq!(snapshot.active_delegations[0].attention_request, None);
+
+        state.apply_event(&delegation_completed_with(
+            "tool-1",
+            "task-1",
+            99,
+            changed,
+        ));
+        assert!(state.active_delegations.is_empty());
+    }
+
+    #[test]
+    fn delegation_attention_changed_none_omits_field_on_wire_and_replays_as_clear() {
+        let clear = AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: None,
+        };
+        let json = serde_json::to_value(&clear).expect("serialize");
+        assert!(
+            json.get("attention_request").is_none(),
+            "optional clear must omit the field on the wire (Task 10 maps missing → null)"
+        );
+        let back: AcpEvent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            AcpEvent::DelegationAttentionChanged {
+                attention_request: None,
+                ..
+            } => {}
+            other => panic!("expected clear attention, got {other:?}"),
+        }
+
+        let mut state = fresh_state();
+        let started = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with("tool-1", "task-1", 1, started));
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-1".into(),
+            attention_request: Some(
+                crate::acp::delegation::attention::AttentionRequestSummary {
+                    request_id: "req-1".into(),
+                    task_id: "task-1".into(),
+                    message: "q".into(),
+                    created_at: dt("2026-07-17T10:01:00Z"),
+                },
+            ),
+        });
+        state.apply_event(&back);
+        assert_eq!(
+            state
+                .active_delegations
+                .get("tool-1")
+                .unwrap()
+                .attention_request,
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_and_attention_events_ignore_mismatched_task_id() {
+        let mut state = fresh_state();
+        let started = empty_stats(dt("2026-07-17T10:00:00Z"));
+        state.apply_event(&delegation_started_with("tool-1", "task-1", 1, started.clone()));
+        let mut other = started;
+        other.tool_call_count = 9;
+        state.apply_event(&AcpEvent::DelegationRuntimeStatsChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-other".into(),
+            runtime_stats: other,
+        });
+        state.apply_event(&AcpEvent::DelegationAttentionChanged {
+            parent_tool_use_id: "tool-1".into(),
+            task_id: "task-other".into(),
+            attention_request: Some(
+                crate::acp::delegation::attention::AttentionRequestSummary {
+                    request_id: "x".into(),
+                    task_id: "task-other".into(),
+                    message: "no".into(),
+                    created_at: dt("2026-07-17T10:01:00Z"),
+                },
+            ),
+        });
+        let card = state.active_delegations.get("tool-1").unwrap();
+        assert_eq!(card.runtime_stats.tool_call_count, 0);
+        assert!(card.attention_request.is_none());
     }
 
     #[test]
@@ -2037,6 +2609,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
 
         assert!(
@@ -2153,6 +2726,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -2178,6 +2752,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("part 1 part 2"));
     }
@@ -2204,6 +2779,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -2237,6 +2813,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text.as_deref(), Some("the answer is 42"));
     }
@@ -2264,6 +2841,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
         });
         assert_eq!(s.last_assistant_text, None);
     }
@@ -2961,6 +3539,7 @@ mod tests {
             session_id: "ext".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+            mark_awaiting_reply: false,
         });
         // The existing `live_message = None` clear handles the new block kinds
         // automatically — they live inside live_message, not as siblings.
@@ -3073,5 +3652,73 @@ mod tests {
             !empty.contains("\"feedback\":"),
             "no-feedback snapshot must omit the notes array"
         );
+    }
+
+    #[test]
+    fn live_session_snapshot_legacy_default_is_unmanaged_native_unavailable() {
+        // Missing delegation_route field deserializes to legacy default.
+        let json = r#"{
+            "connection_id": "c1",
+            "conversation_id": null,
+            "folder_id": null,
+            "status": "connecting",
+            "external_id": null,
+            "live_message": null,
+            "active_tool_calls": [],
+            "pending_permission": null,
+            "modes": null,
+            "current_mode": null,
+            "config_options": null,
+            "prompt_capabilities": null,
+            "usage": null,
+            "fork_supported": false,
+            "available_commands": [],
+            "selectors_ready": false,
+            "event_seq": 0
+        }"#;
+        let snap: LiveSessionSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snap.delegation_route, legacy_unmanaged_route_snapshot());
+        assert!(!snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            crate::acp::delegation::route::DelegationRoutePolicy::Native
+        );
+        assert!(!snap.delegation_route.delegation_available);
+    }
+
+    #[test]
+    fn new_session_state_supplies_real_plan_snapshot_not_only_legacy_default() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "snap-test".into(),
+        };
+        let mut s = fresh_state();
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        let snap = s.to_snapshot();
+        assert!(snap.delegation_route.managed);
+        assert_eq!(
+            snap.delegation_route.effective,
+            DelegationRoutePolicy::Codeg
+        );
+        assert!(snap.delegation_route.delegation_available);
+        // Wire uses snake_case; no secret token fields.
+        let json = serde_json::to_value(&snap).unwrap();
+        let route = &json["delegation_route"];
+        assert_eq!(route["effective"], "codeg");
+        assert_eq!(route["requested"], "codeg");
+        assert_eq!(route["source"], "global_default");
+        assert!(route.get("token").is_none());
     }
 }

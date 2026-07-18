@@ -46,11 +46,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
+      - name: Stage desktop sidecars
+        run: pnpm tauri:prepare-sidecars --target \${{ matrix.target }}
       - name: Verify sidecars
-        run: Test-Path src-tauri/binaries/codex-acp-x86_64-pc-windows-msvc.exe
+        run: Test-Path src-tauri/binaries/codeg-mcp-x86_64-pc-windows-msvc.exe
       - uses: tauri-apps/tauri-action@v0.6.1
         with:
           prerelease: false

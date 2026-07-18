@@ -517,6 +517,7 @@
   "AcpAgentSettings": {
     "title": "Agent SDK管理",
     "description": "统一管理 Agent 的连接SDK、启用状态、环境变量、配置管理与版本预检信息。",
+    "showThinking": "显示思考",
     "loadingAgents": "加载 Agent 列表中...",
     "agentList": "Agent 列表",
     "emptyNoAgent": "暂无可用 Agent。",
@@ -562,7 +563,16 @@
       "noConfigAvailable": "该智能体没有可配置项。",
       "modeLabel": "模式",
       "agentDefaultHint": "智能体默认：{value}",
-      "defaultOptionLabel": "默认（{value}）"
+      "defaultOptionLabel": "默认（{value}）",
+      "routePolicy": "默认路由",
+      "routePolicyHint": "会话未设置覆盖时，受管智能体使用此路由。",
+      "routeEffectiveNative": "委托已关闭 — 有效路由为 Native。",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "软看门狗（秒）",
+      "softWatchdogHint": "仅观察的停滞阈值（{min}–{max}）。不会取消或切换路由。"
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -921,6 +931,7 @@
       "localVersionRemoved": "本地版本已移除",
       "saveAgentOrderFailed": "保存 Agent 排序失败",
       "saveAgentSwitchFailed": "保存 Agent 开关失败",
+      "saveThinkingVisibilityFailed": "保存思考显示设置失败",
       "saveEnvFailed": "保存环境变量失败",
       "grokSaved": "Grok 配置已保存",
       "saveGrokNativeFailed": "保存 Grok 原生配置失败",
@@ -977,7 +988,7 @@
       "remoteUnavailable": "{versionText}。远程版本暂不可用。",
       "latest": "{versionText}。已是最新版本。",
       "bundled": "内置版本：{version}",
-      "bundledMissing": "内置适配器缺失，请重新安装或更新 MyCodeBuddy。"
+      "bundledMissing": "内置适配器缺失，请重新安装或更新 DrawCode。"
     },
     "cline": {
       "configDescription": "配置 Cline API 提供商和凭证。设置将保存到 ~/.cline/data/。"
@@ -1085,11 +1096,22 @@
     "restartRequired": "已保存，重启应用后生效。",
     "restartNow": "立即重启",
     "restartFailed": "重启失败：{message}",
-    "loadFailed": "加载失败：{message}"
+    "loadFailed": "加载失败：{message}",
+    "conversationExperienceTitle": "对话体验",
+    "conversationExperienceDescription": "配置自动标题和引用搜索行为。",
+    "autoTitleAgent": "自动标题智能体",
+    "autoTitleOff": "关闭",
+    "autoTitleUnavailable": "{agent}（不可用）",
+    "autoTitleSaveFailed": "保存自动标题智能体失败：{message}",
+    "autoTitleLoading": "正在加载自动标题设置...",
+    "referenceSearchLimit": "引用结果上限",
+    "referenceSearchLimitHint": "每个资源来源最多缓存和搜索的结果数（10-500）。",
+    "referenceSearchLimitSave": "保存引用上限",
+    "referenceSearchLimitSaveFailed": "保存引用结果上限失败：{message}"
   },
   "LoginPage": {
-    "documentTitle": "登录 - codeg",
-    "brand": "Codeg",
+    "documentTitle": "登录 - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "输入访问 Token 以连接到桌面端",
     "tokenPlaceholder": "Access Token",
     "connect": "连接",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "聊天在上",
       "statusRunningBadge": "运行中",
       "statusCancelledBadge": "已取消",
+      "statusAwaitingReplyBadge": "待回复",
       "conversationCountUnit": "{count} 条",
       "emptyFolderHint": "暂无会话",
       "noMatchingConversations": "未找到匹配的会话",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "添加到会话",
       "compareWithBranch": "与分支比较...",
       "reloadFromDisk": "从磁盘重新加载",
+      "showIgnoredFiles": "显示忽略的文件",
       "new": "新建",
       "newFile": "文件",
       "newDirectory": "目录",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "下载 {name} 失败",
         "downloadSaved": "已下载 {name}",
         "pathCopied": "已复制路径",
-        "copyPathFailed": "复制路径失败"
+        "copyPathFailed": "复制路径失败",
+        "loadIgnoredFilesFailed": "无法加载忽略的文件"
       },
       "createDialog": {
         "newFile": "新建文件",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "{agent} 连接失败",
         "toolFallbackTitle": "工具",
         "eventErrorTitle": "Agent 错误",
+        "desktopDeliveryNegotiateFailed": "无法协商桌面事件投递。请重启应用。",
+        "desktopDeliverySubscribeFailed": "订阅桌面 ACP 事件失败。请重启应用。",
+        "desktopDeliveryFailedRestart": "桌面事件投递失败。请重启整个应用以继续——仅重新加载会话不够。",
         "notificationTurnComplete": "{agent} 已完成响应",
         "notificationError": "{agent} 错误：{message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "智能体",
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionInvalidPattern": "正则表达式无效",
+        "mentionSourceError": "无法刷新此来源",
+        "mentionProfileError": "无法加载委托配置"
       },
       "messageQueue": {
         "addToQueue": "加入队列",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "子智能体",
         "collapsedSummary": "子智能体 {count}",
-        "collapseAria": "折叠子智能体"
+        "collapseAria": "折叠子智能体",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "计划任务",
@@ -2414,7 +2448,10 @@
             "child_empty": "子代理无响应",
             "child_unknown": "子代理未知错误",
             "unknown": "未知任务"
-          }
+          },
+          "active": "活动中",
+          "waitingInput": "等待输入",
+          "stalled": "近期无智能体活动"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "忽略",
         "reconnectFailed": "重连会话失败",
         "applied": "新配置已应用",
-        "terminalShellTitle": "终端 Shell 已更新"
+        "terminalShellTitle": "终端 Shell 已更新",
+        "delegationRouteTitle": "委托路由已更新"
       },
       "collabAgent": {
         "title": "子智能体",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "后台任务已完成",
         "cardFinishedWithStatus": "后台任务已结束（{status}）",
         "cardResultPending": "结果尚未返回"
+      },
+      "delegationRoute": {
+        "menuLabel": "委托路由",
+        "inheritGlobal": "继承全局",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg（继承）",
+        "updateFailed": "更新路由失败"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "已回退到 Native（{reason}）。重新连接以重试 Codeg。",
+        "delegationUnavailable": "Codeg 路由已生效，但委托不可用。",
+        "reconnect": "重新连接",
+        "reconnecting": "正在重新连接…",
+        "reconnected": "已重新连接",
+        "reconnectFailed": "重新连接失败",
+        "reason": {
+          "native_suppression_unsupported": "不支持原生抑制",
+          "native_suppression_invalid": "原生抑制无效",
+          "companion_binary_unavailable": "伴生二进制不可用",
+          "agent_mcp_unsupported": "智能体不支持 MCP",
+          "companion_initialization_failed": "伴生进程初始化失败",
+          "unknown": "已降级"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "切换只改变这里显示和打开的地址；服务监听所有网卡，每个地址都可访问。",
     "sectionTitle": "Web 服务",
-    "sectionDescription": "启用后可通过浏览器远程访问 Codeg",
+    "sectionDescription": "启用后可通过浏览器远程访问 DrawCode",
     "port": "端口",
     "status": "状态",
     "autoStart": "自动启动",
-    "autoStartHint": "Codeg 启动时自动开启 Web 服务",
+    "autoStartHint": "DrawCode 启动时自动开启 Web 服务",
     "running": "运行中",
     "stopped": "已停止",
     "processing": "处理中...",
@@ -2782,7 +2844,7 @@
     "copy": "复制",
     "qrcode": "二维码",
     "qrcodeTitle": "扫码打开",
-    "qrcodeHint": "用手机扫描，在浏览器中打开 Codeg",
+    "qrcodeHint": "用手机扫描，在浏览器中打开 DrawCode",
     "addressLabel": "访问地址",
     "tokenLabel": "访问 Token",
     "tokenHint": "Web 客户端首次访问时需输入此 Token",
@@ -2790,7 +2852,7 @@
     "regenerate": "重新生成",
     "stalePortOccupiedTitle": "端口 {port} 已被其他进程占用",
     "stalePortUnknownTitle": "端口 {port} 状态未知",
-    "stalePortHint": "在端口释放前 Codeg 无法绑定。可以更换上方的端口，或结束占用该端口的进程。",
+    "stalePortHint": "在端口释放前 DrawCode 无法绑定。可以更换上方的端口，或结束占用该端口的进程。",
     "errors": {
       "alreadyRunning": "Web 服务已在运行",
       "invalidAddress": "主机或端口格式无效",
@@ -3102,7 +3164,7 @@
   },
   "ScienceSettings": {
     "title": "科学研究技能",
-    "description": "为你的 AI 编码智能体启用精选的科学研究技能：假设生成、实验设计、统计、可视化、批判性评估与文献检索。MyCodeBuddy 管理中央副本，并将每个技能链接到你选择的智能体。",
+    "description": "为你的 AI 编码智能体启用精选的科学研究技能：假设生成、实验设计、统计、可视化、批判性评估与文献检索。DrawCode 管理中央副本，并将每个技能链接到你选择的智能体。",
     "loading": "正在加载科学研究技能…",
     "emptySkills": "没有可用的科学研究技能。请检查应用日志。",
     "searchPlaceholder": "按名称、ID 或描述搜索科学研究技能",

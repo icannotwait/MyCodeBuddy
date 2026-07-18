@@ -37,7 +37,10 @@ import type {
 export type BadgeStatus =
   | "starting"
   | "running"
+  | "active"
   | "waiting"
+  | "waiting_input"
+  | "stalled"
   | "ok"
   | "err"
   | "checked"
@@ -62,6 +65,8 @@ export type StatusReport = {
   errorCode: string | null
   /** Task execution time in ms — set only for terminal cached results. */
   durationMs: number | null
+  /** Soft-watchdog observation for a still-running report (never terminal). */
+  observation?: import("@/lib/types").TaskObservation | null
 }
 
 /**
@@ -338,12 +343,18 @@ export function parseStatusReport(
   }
 
   if (report) {
+    const obsRaw = str(report, "observation")
+    const observation =
+      obsRaw === "active" || obsRaw === "stalled" || obsRaw === "waiting_input"
+        ? obsRaw
+        : null
     return {
       status: validStatus(report),
       taskId: str(report, "task_id"),
       text: displayText ?? str(report, "text") ?? str(report, "message"),
       errorCode: str(report, "error_code"),
       durationMs: num(report, "duration_ms"),
+      observation,
     }
   }
 
@@ -361,12 +372,18 @@ export function parseStatusReport(
  *  of a `tasks` batch. The element IS the report, so display text comes from
  *  its own `text` / `message` (there's no separate content envelope to show). */
 function reportFromObject(report: Record<string, unknown>): StatusReport {
+  const obsRaw = str(report, "observation")
+  const observation =
+    obsRaw === "active" || obsRaw === "stalled" || obsRaw === "waiting_input"
+      ? obsRaw
+      : null
   return {
     status: validStatus(report),
     taskId: str(report, "task_id"),
     text: str(report, "text") ?? str(report, "message"),
     errorCode: str(report, "error_code"),
     durationMs: num(report, "duration_ms"),
+    observation,
   }
 }
 
@@ -447,6 +464,17 @@ export function deriveBadge(
     case "completed":
       return { status: "ok" }
     case "running":
+      // Soft-watchdog observations distinguish health for a still-running task.
+      // These are never terminal / destructive — stalled is warning-neutral.
+      if (report.observation === "waiting_input") {
+        return { status: "waiting_input" }
+      }
+      if (report.observation === "stalled") {
+        return { status: "stalled" }
+      }
+      if (report.observation === "active") {
+        return { status: "active" }
+      }
       // The poll RETURNED while the task was still running — a settled
       // snapshot, not live work. Show a neutral state, not an endless spinner.
       return { status: "checked" }

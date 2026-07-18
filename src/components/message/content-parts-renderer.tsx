@@ -1,6 +1,11 @@
 import { memo, useMemo, useState, type ReactNode } from "react"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import {
+  joinStreamingMarkdown,
+  takeCompletedStreamingPartition,
+} from "@/lib/markdown/incremental-stream-blocks"
+import { StreamingMarkdownDocument } from "@/components/message/streaming-markdown-document"
+import {
   classifyToolKind,
   TOOL_KIND_ORDER,
   type ToolKindLabel,
@@ -33,6 +38,7 @@ import { Terminal } from "@/components/ai-elements/terminal"
 import { CodeBlock } from "@/components/ai-elements/code-block"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { generateUnifiedDiff } from "@/lib/unified-diff-generator"
+import { tryParseJson } from "@/lib/try-parse-json"
 import { FilePathLink } from "@/components/ai-elements/link-safety"
 import {
   Reasoning,
@@ -76,15 +82,8 @@ import {
 
 // ── helpers ────────────────────────────────────────────────────────────
 
-/** Try JSON.parse; return null on failure. */
-export function tryParseJson(s: string): Record<string, unknown> | null {
-  try {
-    const v = JSON.parse(s)
-    return typeof v === "object" && v !== null && !Array.isArray(v) ? v : null
-  } catch {
-    return null
-  }
-}
+/** Re-export for callers/tests that import tryParseJson from this module. */
+export { tryParseJson } from "@/lib/try-parse-json"
 
 /** Regex-extract a JSON string value for a given key (works on truncated JSON). */
 export function extractJsonField(input: string, key: string): string | null {
@@ -875,13 +874,18 @@ function deriveToolTitle(
   const name = toolName.toLowerCase()
   const titleSource = input ?? output ?? null
   if (!titleSource) return null
-  const parsedInput = input ? tryParseJson(input) : null
-  const parsedOutput = output ? tryParseJson(output) : null
-  const parsed = parsedInput ?? parsedOutput
+  // Prefer cheap regex field extraction for header titles so collapsed cards
+  // avoid full JSON.parse. Lazy-parse only when nested / complex fields need it.
+  let parsedCache: Record<string, unknown> | null | undefined
+  const getParsed = (): Record<string, unknown> | null => {
+    if (parsedCache !== undefined) return parsedCache
+    parsedCache =
+      (input ? tryParseJson(input) : null) ??
+      (output ? tryParseJson(output) : null)
+    return parsedCache
+  }
 
   const getField = (key: string): string | null => {
-    const nested = findStringFieldDeep(parsed, key)
-    if (nested) return nested
     if (input) {
       const fromInput = extractJsonField(input, key)
       if (fromInput) return fromInput
@@ -890,6 +894,8 @@ function deriveToolTitle(
       const fromOutput = extractJsonField(output, key)
       if (fromOutput) return fromOutput
     }
+    const nested = findStringFieldDeep(getParsed(), key)
+    if (nested) return nested
     return null
   }
 
@@ -927,7 +933,8 @@ function deriveToolTitle(
       return ellipsis(description, 80)
     }
     const direct = getField("command") ?? getField("cmd") ?? getField("script")
-    const parsedCommand = commandFromUnknownValue(parsed)
+    // Prefer field/regex extraction; only full-parse when command is nested.
+    const parsedCommand = direct ? null : commandFromUnknownValue(getParsed())
     const fallback = extractCommandFromUnknownInput(titleSource)
     const command = direct ?? parsedCommand ?? fallback
     if (command) {
@@ -937,7 +944,7 @@ function deriveToolTitle(
   }
 
   if (name === "apply_patch") {
-    const files = parseApplyPatchFilesFromUnknownInput(titleSource, parsed)
+    const files = parseApplyPatchFilesFromUnknownInput(titleSource, getParsed())
     if (files.length === 0) return "Edit"
     if (files.length === 1) {
       const file = files[0]
@@ -951,7 +958,12 @@ function deriveToolTitle(
   }
 
   if (name === "edit") {
-    const patchFiles = parseApplyPatchFilesFromUnknownInput(titleSource, parsed)
+    // Canonical edit payload already resolved file_path via getField above.
+    // Only parse when we need multi-file / patch-shaped titles.
+    const patchFiles = parseApplyPatchFilesFromUnknownInput(
+      titleSource,
+      getParsed()
+    )
     if (patchFiles.length === 1) {
       const file = patchFiles[0]
       const targetPath =
@@ -962,7 +974,10 @@ function deriveToolTitle(
     }
     if (patchFiles.length > 1) return `Edit (${patchFiles.length} files)`
 
-    const changedPaths = extractEditPathsFromChangesPayload(titleSource, parsed)
+    const changedPaths = extractEditPathsFromChangesPayload(
+      titleSource,
+      getParsed()
+    )
     if (changedPaths.length === 1) return `Edit ${shortPath(changedPaths[0])}`
     if (changedPaths.length > 1) return `Edit (${changedPaths.length} files)`
 
@@ -974,7 +989,7 @@ function deriveToolTitle(
   // Command-like fallback: if input looks like a shell command payload,
   // keep title behavior consistent with historical command tool rendering.
   const commandLike =
-    (parsed ? commandFromUnknownValue(parsed) : null) ??
+    commandFromUnknownValue(getParsed()) ??
     extractCommandFromUnknownInput(titleSource)
   if (commandLike && commandLike.trim().length > 0) {
     return ellipsis(simplifyShellCommand(commandLike).split("\n")[0], 80)
@@ -1027,6 +1042,7 @@ function deriveToolTitle(
 
   // TodoWrite
   if (name === "todowrite") {
+    const parsed = getParsed()
     if (parsed) {
       const todos = parsed.todos
       if (Array.isArray(todos)) {
@@ -1066,6 +1082,7 @@ function deriveToolTitle(
   }
 
   // Generic: try to show the first string field as context
+  const parsed = getParsed()
   if (parsed) {
     for (const [k, v] of Object.entries(parsed)) {
       if (isLikelyIdField(k)) {
@@ -2077,11 +2094,13 @@ function parseCliExecutionEnvelope(text: string): {
 const TextPart = memo(function TextPart({
   text,
   isUser = false,
+  autolinkLocalPaths = false,
 }: {
   text: string
   // User messages render as plain text + inline reference badges (no Markdown),
   // matching the plain-text composer. Assistant / system text keeps full Markdown.
   isUser?: boolean
+  autolinkLocalPaths?: boolean
 }) {
   if (isUser) {
     return (
@@ -2090,18 +2109,112 @@ const TextPart = memo(function TextPart({
       </div>
     )
   }
+  // One-shot live→history handoff: consume a completed incremental partition when
+  // the joined source matches the canonical TextPart text exactly.
+  const partition = takeCompletedStreamingPartition(text)
+  if (
+    partition &&
+    partition.valid &&
+    joinStreamingMarkdown(partition) === text
+  ) {
+    return (
+      <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
+        {/* History handoff uses complete so Mermaid/math can upgrade. */}
+        <StreamingMarkdownDocument
+          document={partition}
+          richContentState="complete"
+          autolinkLocalPaths={autolinkLocalPaths}
+        />
+      </div>
+    )
+  }
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-      <MessageResponse>{text}</MessageResponse>
+      <MessageResponse autolinkLocalPaths={autolinkLocalPaths}>
+        {text}
+      </MessageResponse>
     </div>
   )
 })
 
-const ToolCallPart = memo(function ToolCallPart({
+/** Max plain terminal chars while a command tool is still running. */
+export const RUNNING_COMMAND_OUTPUT_TAIL_CHARS = 24_000
+
+/**
+ * Generic tool body: structured input / terminal / output. Mounted only while
+ * the card is open so collapsed tools never parse JSON/diff/Markdown.
+ */
+const ToolCallBody = memo(function ToolCallBody({
   part,
+  normalizedToolName,
+  toolNameLower,
+  isCommandTool,
+  isRunning,
+  liveOutputTruncated,
+  shouldRenderCommandTerminal,
+  terminalOutput,
+  shouldHideDuplicateResult,
 }: {
   part: Extract<AdaptedContentPart, { type: "tool-call" }>
+  normalizedToolName: string
+  toolNameLower: string
+  isCommandTool: boolean
+  isRunning: boolean
+  liveOutputTruncated: boolean
+  shouldRenderCommandTerminal: boolean
+  terminalOutput: string
+  shouldHideDuplicateResult: boolean
 }) {
+  const t = useTranslations("Folder.chat.contentParts")
+  return (
+    <>
+      {part.input && (!isCommandTool || !shouldRenderCommandTerminal) && (
+        <StructuredToolInput
+          toolName={normalizedToolName}
+          input={part.input}
+          output={part.output}
+        />
+      )}
+      {toolNameLower === "task" && part.output ? (
+        <div className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
+          <MessageResponse>{part.output}</MessageResponse>
+        </div>
+      ) : (
+        <>
+          {shouldRenderCommandTerminal ? (
+            <div role={isRunning ? "log" : undefined}>
+              <Terminal
+                output={terminalOutput}
+                isStreaming={isRunning}
+                className="max-h-80"
+              />
+              {liveOutputTruncated && (
+                <div className="text-[11px] text-muted-foreground">
+                  {t("showingTailOutput")}
+                </div>
+              )}
+            </div>
+          ) : (
+            !shouldHideDuplicateResult &&
+            (part.output || part.errorText) && (
+              <ToolOutput output={part.output} errorText={part.errorText} />
+            )
+          )}
+        </>
+      )}
+    </>
+  )
+})
+
+export const ToolCallPart = memo(function ToolCallPart({
+  part,
+  live = false,
+}: {
+  part: Extract<AdaptedContentPart, { type: "tool-call" }>
+  /** Live-footer path marker (reserved for future live-only body variants). */
+  live?: boolean
+}) {
+  void live
   const t = useTranslations("Folder.chat.contentParts")
   const [manualOpen, setManualOpen] = useState(false)
   const normalizedToolName = useMemo(
@@ -2226,16 +2339,45 @@ const ToolCallPart = memo(function ToolCallPart({
     () => getToolIcon(normalizedToolName, part.input),
     [normalizedToolName, part.input]
   )
+  // displayCommand is only needed for the open terminal body / running tail.
   const displayCommand = useMemo(() => {
     if (!isCommandTool) return null
+    // Running tools auto-open; completed need an expand first.
+    if (
+      !isRunning &&
+      part.state !== "output-available" &&
+      part.state !== "output-error"
+    ) {
+      return null
+    }
+    // Defer completed-command input scraping until expanded.
+    if (!isRunning && !manualOpen) return null
     return (
       extractDisplayCommandFromToolInput(part.input) ??
       extractDisplayCommandFromToolInput(part.output) ??
       extractDisplayCommandFromToolInput(part.errorText)
     )
-  }, [isCommandTool, part.input, part.output, part.errorText])
+  }, [
+    isCommandTool,
+    isRunning,
+    manualOpen,
+    part.state,
+    part.input,
+    part.output,
+    part.errorText,
+  ])
   const commandOutput = useMemo(() => {
     if (!isCommandLikeTool) return null
+    // Running command: always need the plain tail. Completed: only when open
+    // — computed below after `open` is known would be ideal, but open depends
+    // on hasLiveOutput which depends on commandOutput for running tools only.
+    if (!isRunning && !isCommandTool) return null
+    if (!isRunning && isCommandTool) {
+      // Defer full parse until body opens; header doesn't need the stream.
+      // We still need a cheap null check for auto-open decisions:
+      // completed command cards stay collapsed until the user expands them.
+      return null
+    }
     const source =
       typeof part.output === "string"
         ? part.output
@@ -2246,16 +2388,16 @@ const ToolCallPart = memo(function ToolCallPart({
     const normalized = commandOutputFromJsonString(source) ?? source
     const envelope = parseCliExecutionEnvelope(normalized)
     return stripMarkdownCodeFence(envelope.output)
-  }, [isCommandLikeTool, part.output, part.errorText])
+  }, [isCommandLikeTool, isCommandTool, isRunning, part.output, part.errorText])
+
   const hasLiveOutput =
     isRunning && isCommandTool && typeof commandOutput === "string"
   const liveOutput = useMemo(() => {
     if (!hasLiveOutput || typeof commandOutput !== "string") {
       return null
     }
-    const maxChars = 24000
-    return commandOutput.length > maxChars
-      ? commandOutput.slice(-maxChars)
+    return commandOutput.length > RUNNING_COMMAND_OUTPUT_TAIL_CHARS
+      ? commandOutput.slice(-RUNNING_COMMAND_OUTPUT_TAIL_CHARS)
       : commandOutput
   }, [hasLiveOutput, commandOutput])
   const liveOutputTruncated =
@@ -2263,11 +2405,36 @@ const ToolCallPart = memo(function ToolCallPart({
     typeof commandOutput === "string" &&
     typeof liveOutput === "string" &&
     liveOutput.length < commandOutput.length
+
+  const open = (isRunning && (isCommandTool || hasLiveOutput)) || manualOpen
+
+  // Completed command output is parsed only while the body is open.
+  const completedCommandOutput = useMemo(() => {
+    if (!isCommandTool || isRunning || !open) return null
+    const source =
+      typeof part.output === "string"
+        ? part.output
+        : typeof part.errorText === "string"
+          ? part.errorText
+          : null
+    if (!source) return null
+    const normalized = commandOutputFromJsonString(source) ?? source
+    const envelope = parseCliExecutionEnvelope(normalized)
+    return stripMarkdownCodeFence(envelope.output)
+  }, [isCommandTool, isRunning, open, part.output, part.errorText])
+
+  const resolvedCommandOutput = isRunning
+    ? commandOutput
+    : completedCommandOutput
   const shouldRenderCommandTerminal =
     isCommandTool &&
+    open &&
     (isRunning ||
-      (typeof commandOutput === "string" && commandOutput.length > 0) ||
-      (typeof displayCommand === "string" && displayCommand.length > 0))
+      (typeof resolvedCommandOutput === "string" &&
+        resolvedCommandOutput.length > 0) ||
+      typeof part.output === "string" ||
+      typeof part.input === "string" ||
+      typeof part.errorText === "string")
   const terminalOutput = useMemo(() => {
     if (!shouldRenderCommandTerminal) return ""
     if (backgroundLaunch) {
@@ -2279,7 +2446,9 @@ const ToolCallPart = memo(function ToolCallPart({
         false
       )
     }
-    const output = hasLiveOutput ? (liveOutput ?? "") : (commandOutput ?? "")
+    const output = hasLiveOutput
+      ? (liveOutput ?? "")
+      : (resolvedCommandOutput ?? "")
     return buildCommandTerminalOutput(displayCommand, output, isRunning)
   }, [
     shouldRenderCommandTerminal,
@@ -2287,7 +2456,7 @@ const ToolCallPart = memo(function ToolCallPart({
     t,
     hasLiveOutput,
     liveOutput,
-    commandOutput,
+    resolvedCommandOutput,
     displayCommand,
     isRunning,
   ])
@@ -2468,8 +2637,6 @@ const ToolCallPart = memo(function ToolCallPart({
     )
   }
 
-  const open = (isRunning && (isCommandTool || hasLiveOutput)) || manualOpen
-
   return (
     <Tool open={open} onOpenChange={setManualOpen}>
       <ToolHeader
@@ -2480,42 +2647,22 @@ const ToolCallPart = memo(function ToolCallPart({
         titleSuffix={titleSuffix ?? undefined}
         icon={icon}
       />
-      <ToolContent>
-        {part.input && (!isCommandTool || !shouldRenderCommandTerminal) && (
-          <StructuredToolInput
-            toolName={normalizedToolName}
-            input={part.input}
-            output={part.output}
+      {/* Genuinely unmount bodies when collapsed — no force-mount. */}
+      {open ? (
+        <ToolContent>
+          <ToolCallBody
+            part={part}
+            normalizedToolName={normalizedToolName}
+            toolNameLower={toolNameLower}
+            isCommandTool={isCommandTool}
+            isRunning={isRunning}
+            liveOutputTruncated={liveOutputTruncated}
+            shouldRenderCommandTerminal={shouldRenderCommandTerminal}
+            terminalOutput={terminalOutput}
+            shouldHideDuplicateResult={shouldHideDuplicateResult}
           />
-        )}
-        {toolNameLower === "task" && part.output ? (
-          <div className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
-            <MessageResponse>{part.output}</MessageResponse>
-          </div>
-        ) : (
-          <>
-            {shouldRenderCommandTerminal ? (
-              <div>
-                <Terminal
-                  output={terminalOutput}
-                  isStreaming={isRunning}
-                  className="max-h-80"
-                />
-                {liveOutputTruncated && (
-                  <div className="text-[11px] text-muted-foreground">
-                    {t("showingTailOutput")}
-                  </div>
-                )}
-              </div>
-            ) : (
-              !shouldHideDuplicateResult &&
-              (part.output || part.errorText) && (
-                <ToolOutput output={part.output} errorText={part.errorText} />
-              )
-            )}
-          </>
-        )}
-      </ToolContent>
+        </ToolContent>
+      ) : null}
     </Tool>
   )
 })
@@ -2634,45 +2781,64 @@ const ToolGroupPart = memo(function ToolGroupPart({
           )}
         </span>
       </CollapsibleTrigger>
-      <CollapsibleContent
-        className={cn(
-          "w-full outline-none",
-          "data-[state=open]:animate-in data-[state=closed]:animate-out",
-          "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
-          "data-[state=closed]:slide-out-to-top-1 data-[state=open]:slide-in-from-top-1"
-        )}
-      >
-        <div className="mt-3 w-full space-y-3">
-          {part.items.map((item, idx) => (
-            <ToolCallPart
-              key={`grouped-tc-${item.toolCallId ?? idx}-${idx}`}
-              part={item}
-            />
-          ))}
-        </div>
-      </CollapsibleContent>
+      {/* Unmount children when collapsed so large groups stay cheap. */}
+      {open ? (
+        <CollapsibleContent
+          className={cn(
+            "w-full outline-none",
+            "data-[state=open]:animate-in data-[state=closed]:animate-out",
+            "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+            "data-[state=closed]:slide-out-to-top-1 data-[state=open]:slide-in-from-top-1"
+          )}
+        >
+          <div className="mt-3 w-full space-y-3">
+            {part.items.map((item, idx) => (
+              <ToolCallPart
+                key={`grouped-tc-${item.toolCallId ?? idx}-${idx}`}
+                part={item}
+              />
+            ))}
+          </div>
+        </CollapsibleContent>
+      ) : null}
     </Collapsible>
   )
 })
 
 // ── Main renderer ─────────────────────────────────────────────────────
 
+type AutolinkableTextPart = Extract<AdaptedContentPart, { type: "text" }>
+
 interface ContentPartsRendererProps {
   parts: AdaptedContentPart[]
   role?: MessageRole
+  autolinkLocalPathParts?: ReadonlySet<AutolinkableTextPart>
+  /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
+  showThinking?: boolean
 }
 
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
+  autolinkLocalPathParts,
+  showThinking = true,
 }: ContentPartsRendererProps) {
-  const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
+  const renderPart = (
+    part: AdaptedContentPart,
+    keyId: string,
+    isTopLevel: boolean
+  ): ReactNode => {
     if (part.type === "text") {
       return (
         <TextPart
           key={`text-${keyId}`}
           text={part.text}
           isUser={role === "user"}
+          autolinkLocalPaths={
+            isTopLevel &&
+            role === "assistant" &&
+            (autolinkLocalPathParts?.has(part) ?? false)
+          }
         />
       )
     }
@@ -2690,7 +2856,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
         <GoalRunPart
           key={`goal-${keyId}`}
           part={part}
-          renderPart={(child, childKey) => renderPart(child, childKey)}
+          renderPart={(child, childKey) => renderPart(child, childKey, false)}
         />
       )
     }
@@ -2712,7 +2878,9 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     if (part.type === "reasoning") {
-      return <ReasoningPart key={`reasoning-${keyId}`} part={part} />
+      return showThinking ? (
+        <ReasoningPart key={`reasoning-${keyId}`} part={part} />
+      ) : null
     }
 
     if (part.type === "plan") {
@@ -2735,7 +2903,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
 
   return (
     <div className="space-y-4">
-      {parts.map((part, i) => renderPart(part, `${i}`))}
+      {parts.map((part, i) => renderPart(part, `${i}`, true))}
     </div>
   )
 })

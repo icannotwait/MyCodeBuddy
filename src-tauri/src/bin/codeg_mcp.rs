@@ -1,9 +1,12 @@
 //! `codeg-mcp` — the per-launch stdio MCP companion that an agent CLI runs
 //! to surface codeg's tools to its LLM: the multi-agent delegation tools
-//! (`delegate_to_agent` etc.), `check_user_feedback` (pull the user's mid-turn
-//! steering notes), `ask_user_question` (block on a multiple-choice card), and
+//! (`delegate_to_agent` etc.), coordination decision tools
+//! (`request_parent_decision` / `reply_to_delegation`, role-gated),
+//! `check_user_feedback` (pull the user's mid-turn steering notes),
+//! `ask_user_question` (block on a multiple-choice card), and
 //! `get_session_info` (resolve a referenced session by id), gated by the
-//! `--features` groups (`delegation` / `feedback` / `ask` / `sessions`).
+//! `--features` groups (`delegation` / `coordination_v1` / `feedback` /
+//! `ask` / `sessions`) and `--role` (`root` | `delegation_child`).
 //!
 //! The agent's MCP config (injected by codeg via `load_mcp_servers_for_agent`)
 //! spawns this binary with three required flags:
@@ -35,7 +38,8 @@ use codeg_lib::acp::delegation::companion::{
     JsonRpcResponse, LineAction, SpawnResult,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
+use codeg_lib::acp::delegation::transport::{client_establish_ready_lease, CompanionRole};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 struct Args {
@@ -49,10 +53,22 @@ struct Args {
     /// from. Omitted by older parents — backward compatible.
     parent_pid: Option<u32>,
     /// Comma-joined tool groups to expose (e.g.
-    /// `delegation,feedback,ask,sessions`). Omitted by parents that predate
-    /// feature gating; see `CompanionFeatures::parse` (defaults to
-    /// delegation-only).
+    /// `delegation,coordination_v1,feedback,ask,sessions`). Omitted by
+    /// parents that predate feature gating; see `CompanionFeatures::parse`
+    /// (defaults to delegation-only without Join).
     features: Option<String>,
+    /// Launch role. Omitted by older launchers → Root.
+    role: CompanionRole,
+}
+
+fn parse_role(raw: &str) -> Result<CompanionRole, String> {
+    match raw {
+        "root" => Ok(CompanionRole::Root),
+        "delegation_child" => Ok(CompanionRole::DelegationChild),
+        other => Err(format!(
+            "--role must be root or delegation_child, got {other}"
+        )),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
     let mut token = None;
     let mut parent_pid = None;
     let mut features = None;
+    let mut role = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -98,9 +115,15 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or_else(|| "--features requires a value".to_string())?,
                 );
             }
+            "--role" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--role requires a value".to_string())?;
+                role = Some(parse_role(&raw)?);
+            }
             "--help" | "-h" => {
                 println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,feedback,ask,sessions]"
+                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions] [--role root|delegation_child]"
                 );
                 std::process::exit(0);
             }
@@ -114,21 +137,23 @@ fn parse_args() -> Result<Args, String> {
         token: token.ok_or_else(|| "missing --token".to_string())?,
         parent_pid,
         features,
+        // Older launchers omit --role; default Root for backward compatibility.
+        role: role.unwrap_or(CompanionRole::Root),
     })
 }
 
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
 /// inline so the write-mutex critical section stays tight.
-async fn write_response(
-    stdout: &Arc<Mutex<Stdout>>,
+async fn write_response<W: AsyncWrite + Unpin>(
+    stdout: &Arc<Mutex<W>>,
     resp: &JsonRpcResponse,
 ) -> std::io::Result<()> {
-    let serialized = serde_json::to_string(resp).map_err(|e| {
+    let mut frame = serde_json::to_vec(resp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
     })?;
+    frame.push(b'\n');
     let mut guard = stdout.lock().await;
-    guard.write_all(serialized.as_bytes()).await?;
-    guard.write_all(b"\n").await?;
+    guard.write_all(&frame).await?;
     guard.flush().await?;
     Ok(())
 }
@@ -146,11 +171,35 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let features = CompanionFeatures::parse(args.features.as_deref());
     let ctx = CompanionContext {
         parent_connection_id: args.parent_connection_id,
-        socket_path: args.socket_path,
-        token: args.token,
-        features: CompanionFeatures::parse(args.features.as_deref()),
+        socket_path: args.socket_path.clone(),
+        token: args.token.clone(),
+        features,
+        role: args.role,
+    };
+
+    // When delegation is enabled, establish the authenticated ready lease
+    // BEFORE serving stdio tools. Failure exits non-zero so the agent never
+    // sees a half-ready companion.
+    let _ready_hold = if features.delegation {
+        match client_establish_ready_lease(&args.socket_path, &args.token).await {
+            Ok(hold) => {
+                // Keep the socket open in the background until peer close /
+                // process exit; dropping it on shutdown marks the lease closed.
+                let hold_task = tokio::spawn(async move {
+                    hold.wait_until_closed().await;
+                });
+                Some(hold_task)
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "codeg-mcp: ready lease failed: {e}");
+                return ExitCode::from(3);
+            }
+        }
+    } else {
+        None
     };
 
     let stdin = tokio::io::stdin();
@@ -264,4 +313,62 @@ async fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use serde_json::json;
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_response_emits_one_complete_jsonl_write() {
+        let stdout = Arc::new(Mutex::new(RecordingWriter::default()));
+        let response =
+            codeg_lib::acp::delegation::companion::ok(json!(7), json!({ "ready": true }));
+
+        write_response(&stdout, &response).await.unwrap();
+
+        let writer = stdout.lock().await;
+        assert_eq!(writer.writes.len(), 1, "response must use one write");
+        assert_eq!(writer.flushes, 1, "response must flush once");
+        let frame = &writer.writes[0];
+        assert_eq!(frame.last(), Some(&b'\n'));
+        let decoded: JsonRpcResponse = serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
+        assert_eq!(decoded.id, json!(7));
+        assert_eq!(decoded.result, Some(json!({ "ready": true })));
+    }
 }

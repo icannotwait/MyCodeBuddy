@@ -24,6 +24,12 @@ mod m20260611_000001_folder_is_chat;
 mod m20260612_000001_conversation_folder_kind;
 mod m20260621_000001_automation;
 mod m20260630_000001_conversation_parent_id_index;
+mod m20260716_000001_agent_show_thinking;
+mod m20260716_000001_conversation_awaiting_reply_token;
+mod m20260716_000001_auto_title;
+mod m20260716_000002_folder_last_agent;
+mod m20260716_000003_delegation_route_reliability;
+mod m20260717_000001_event_driven_delegation_join;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -54,6 +60,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260612_000001_conversation_folder_kind::Migration),
             Box::new(m20260621_000001_automation::Migration),
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
+            Box::new(m20260716_000001_conversation_awaiting_reply_token::Migration),
+            Box::new(m20260716_000001_agent_show_thinking::Migration),
+            Box::new(m20260716_000001_auto_title::Migration),
+            Box::new(m20260716_000002_folder_last_agent::Migration),
+            Box::new(m20260716_000003_delegation_route_reliability::Migration),
+            Box::new(m20260717_000001_event_driven_delegation_join::Migration),
         ]
     }
 }

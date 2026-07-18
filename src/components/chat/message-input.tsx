@@ -2,6 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { isDesktop } from "@/lib/platform"
+import {
+  probeInputToPaint,
+  streamingPerfRecorder,
+} from "@/lib/perf/streaming-perf-recorder"
 import Image from "next/image"
 import { useLocale, useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
@@ -170,7 +174,7 @@ import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-ac
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
-  useReferenceSearch,
+  useReferenceSearchController,
   type ReferenceGroupLabels,
 } from "@/components/chat/composer/use-reference-search"
 import type { MentionUiLabels } from "@/components/chat/composer/suggestion/types"
@@ -195,6 +199,12 @@ interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   placeholder?: string
   defaultPath?: string
+  /**
+   * Authoritative workspace folder for reference search commit identity.
+   * `null` keeps commit identity unscoped while agents/profiles/global
+   * conversations (and files with a non-null path) still work.
+   */
+  folderId?: number | null
   disabled?: boolean
   autoFocus?: boolean
   onFocus?: () => void
@@ -482,6 +492,7 @@ export function MessageInput({
   onSend,
   placeholder,
   defaultPath,
+  folderId = null,
   disabled = false,
   autoFocus = false,
   onFocus,
@@ -623,6 +634,29 @@ export function MessageInput({
     }
   }, [isActive, disabled, isPrompting])
 
+  // Non-mutating input-latency probe while a streaming-perf replay is active.
+  // Uses MessageChannel → rAF; never synthesizes InputEvents against Tiptap.
+  useEffect(() => {
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    const sync = (active: boolean) => {
+      if (active) {
+        if (intervalId == null) {
+          intervalId = setInterval(() => {
+            probeInputToPaint(streamingPerfRecorder)
+          }, 100)
+        }
+      } else if (intervalId != null) {
+        clearInterval(intervalId)
+        intervalId = null
+      }
+    }
+    const unsubscribe = streamingPerfRecorder.subscribeActive(sync)
+    return () => {
+      unsubscribe()
+      if (intervalId != null) clearInterval(intervalId)
+    }
+  }, [])
+
   useEffect(() => {
     disabledRef.current = disabled
   }, [disabled])
@@ -658,13 +692,17 @@ export function MessageInput({
       listbox: t("mentionListLabel"),
       more: t("mentionMore"),
       count: (count: number) => t("mentionCount", { count }),
+      invalidPattern: t("mentionInvalidPattern"),
+      sourceError: t("mentionSourceError"),
+      profileError: t("mentionProfileError"),
     }),
     [t]
   )
 
-  // Live data sources for the unified `@` mention panel. Pre-warmed only while
-  // this composer is the active one (`enabled`). Referentially stable.
-  const referenceSearch = useReferenceSearch({
+  // Independent-source `@` mention controller. Null until the shared agent +
+  // profile catalog is ready; the editor stays mounted and the extension inert.
+  const referenceController = useReferenceSearchController({
+    folderId: folderId ?? null,
     defaultPath: defaultPath ?? null,
     enabled: isActive,
     labels: referenceGroupLabels,
@@ -2996,7 +3034,7 @@ export function MessageInput({
                 placeholder={resolvedPlaceholder}
                 ariaLabel={resolvedPlaceholder}
                 autoFocus={autoFocus}
-                referenceSearch={referenceSearch}
+                referenceController={referenceController}
                 mentionUiLabels={mentionUiLabels}
                 tabLabels={referenceGroupLabels}
                 onChange={handleComposerChange}

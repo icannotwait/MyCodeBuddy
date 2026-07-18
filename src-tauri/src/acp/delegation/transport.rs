@@ -29,6 +29,13 @@
 //!     batch wait wakes as soon as ANY requested task reaches a terminal state.
 //!   * `cancel_task` — [`BrokerCancelTaskRequest`] for `cancel_delegation`;
 //!     returns a task report.
+//!   * `parent_decision` — [`BrokerParentDecisionRequest`] for
+//!     `request_parent_decision`. Blocking, peer-close-safe: dropping the
+//!     companion socket abandons only this waiter; the durable attention row
+//!     stays open for replay with the same internal `child_tool_call_id`.
+//!   * `reply_delegation` — [`BrokerReplyDelegationRequest`] for
+//!     `reply_to_delegation`. Immediate (no long-poll): first durable reply wins;
+//!     identical replay is idempotent.
 //!   * `cancel` — fire-and-forget [`BrokerCancelRequest`] from MCP
 //!     `notifications/cancelled`, targeting an in-flight `delegate_to_agent`
 //!     call by `external_handle`; gets a `Value::Null` ack.
@@ -55,7 +62,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::acp::delegation::types::DelegationReturnWhen;
 use crate::acp::question::QuestionSpec;
+
+/// Immutable companion launch role. Root sessions may Join; forced
+/// delegation children are marked so later tasks can gate decision tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionRole {
+    Root,
+    DelegationChild,
+}
 
 /// One delegation call's worth of input forwarded from the companion to the
 /// main process. The main process re-validates `token` and maps
@@ -109,15 +126,21 @@ pub struct BrokerStatusRequest {
     /// `task_ids` array into this list (trimmed, de-duplicated, order-preserving).
     /// The listener returns one report per id, in this order.
     pub task_ids: Vec<String>,
-    /// How long the listener may block waiting for a task to reach a terminal
-    /// state before returning the current (possibly still-running) snapshot.
-    /// `None` (omitted) returns an immediate snapshot; an explicit `0` blocks
-    /// with no timeout until a task finishes (long-running children); any
-    /// positive value is a long-poll the listener clamps to a hard ceiling so a
-    /// single bounded call can't hang unbounded. For a batch the wait resolves as
-    /// soon as ANY requested task reaches a terminal state.
+    /// Wait mode for `get_delegation_status` (mapped by the listener):
+    /// - `None` (omitted) → immediate snapshot (never parks).
+    /// - `Some(0)` → terminal-only wait with no timeout (observation ignored).
+    /// - `Some(ms > 0)` → supervised wait, clamped to **60000** ms; returns on
+    ///   terminal, stalled, waiting_input, a requested observation transition,
+    ///   or the deadline (a still-running snapshot at deadline is success).
+    ///
+    /// Batch waits resolve when ANY requested id meets the mode condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// Opt-in Join mode. Only meaningful when the connection advertised
+    /// `coordination_v1`; requires explicit `wait_ms = 0`. Omitted on every
+    /// legacy request so serialization stays a tasks-only (+ wait_ms) object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_when: Option<DelegationReturnWhen>,
 }
 
 /// Cancel a previously-issued delegation task by its broker `task_id`. Backs
@@ -210,12 +233,49 @@ pub struct BrokerSessionRequest {
     pub max_messages: Option<u32>,
 }
 
+/// Child asks its direct parent for one blocking decision. Backs
+/// `request_parent_decision`. `child_tool_call_id` is an internal correlation
+/// id derived from MCP metadata/request identity — never accepted from LLM
+/// arguments. Peer-close drops only the socket waiter; the durable row remains
+/// open for the same call id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerParentDecisionRequest {
+    pub token: String,
+    /// Internal correlation only. Never accepted from the LLM arguments.
+    pub child_tool_call_id: String,
+    pub message: String,
+}
+
+/// Direct parent replies to an open child decision request. Backs
+/// `reply_to_delegation`. Immediate (no long-poll); first durable reply wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerReplyDelegationRequest {
+    pub token: String,
+    pub request_id: String,
+    pub reply: String,
+}
+
+/// Companion → listener ready-lease request. First frame of the two-frame
+/// ready handshake: listener authenticates `token`, acks, then both keep the
+/// socket open until peer EOF or revoke.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionReadyRequest {
+    pub token: String,
+}
+
+/// Ready-lease acknowledgement body written after authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionReadyAck {
+    pub ready: bool,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrokerMessage {
+    Ready(CompanionReadyRequest),
     Call(BrokerRequest),
     Cancel(BrokerCancelRequest),
     Status(BrokerStatusRequest),
@@ -224,6 +284,8 @@ pub enum BrokerMessage {
     CommitFeedback(BrokerCommitFeedbackRequest),
     Ask(BrokerAskRequest),
     SessionInfo(BrokerSessionRequest),
+    ParentDecision(BrokerParentDecisionRequest),
+    ReplyDelegation(BrokerReplyDelegationRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -301,6 +363,81 @@ async fn message_round_trip(socket_path: &str, msg: &BrokerMessage) -> io::Resul
     read_frame(&mut stream).await
 }
 
+/// Establish the authenticated ready lease and hold the socket open until
+/// the returned [`ReadyLeaseHold`] is dropped (or the peer closes).
+///
+/// Connects, writes [`BrokerMessage::Ready`], reads [`CompanionReadyAck`],
+/// and returns a hold that owns the open stream. Used by the companion before
+/// exposing tools when delegation is enabled.
+#[cfg(unix)]
+pub async fn client_establish_ready_lease(
+    socket_path: &str,
+    token: &str,
+) -> io::Result<ReadyLeaseHold> {
+    use tokio::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path).await?;
+    let msg = BrokerMessage::Ready(CompanionReadyRequest {
+        token: token.to_string(),
+    });
+    write_frame(&mut stream, &msg).await?;
+    let ack: CompanionReadyAck = read_frame(&mut stream).await?;
+    if !ack.ready {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ready lease rejected",
+        ));
+    }
+    Ok(ReadyLeaseHold::Unix(stream))
+}
+
+#[cfg(windows)]
+pub async fn client_establish_ready_lease(
+    socket_path: &str,
+    token: &str,
+) -> io::Result<ReadyLeaseHold> {
+    let mut stream = open_named_pipe_with_retry(socket_path)
+        .await
+        .map_err(|e| io::Error::other(format!("open pipe: {e}")))?;
+    let msg = BrokerMessage::Ready(CompanionReadyRequest {
+        token: token.to_string(),
+    });
+    write_frame(&mut stream, &msg).await?;
+    let ack: CompanionReadyAck = read_frame(&mut stream).await?;
+    if !ack.ready {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ready lease rejected",
+        ));
+    }
+    Ok(ReadyLeaseHold::Windows(stream))
+}
+
+/// Owns the open ready-lease stream so peer-close is observed by the listener.
+pub enum ReadyLeaseHold {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    Windows(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+impl ReadyLeaseHold {
+    /// Park until the peer closes the socket (or an error occurs).
+    pub async fn wait_until_closed(self) {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(mut stream) => {
+                let mut buf = [0u8; 1];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            }
+            #[cfg(windows)]
+            Self::Windows(mut stream) => {
+                let mut buf = [0u8; 1];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            }
+        }
+    }
+}
+
 /// Dispatch a `delegate_to_agent` call and read back the broker's
 /// [`super::types::DelegationTaskReport`] (a `Running` ack, or a terminal
 /// report when the child finished during setup / setup failed).
@@ -371,6 +508,25 @@ pub async fn client_session_round_trip(
     req: &BrokerSessionRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::SessionInfo(req.clone())).await
+}
+
+/// Dispatch a blocking `request_parent_decision` and read back the
+/// [`crate::acp::delegation::types::ParentDecisionResult`] outcome. Peer-close
+/// (cancel) drops this future and the listener abandons only the waiter.
+pub async fn client_parent_decision_round_trip(
+    socket_path: &str,
+    req: &BrokerParentDecisionRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::ParentDecision(req.clone())).await
+}
+
+/// Dispatch an immediate `reply_to_delegation` and read back the
+/// [`crate::acp::delegation::types::DelegationReplyResult`] outcome.
+pub async fn client_reply_delegation_round_trip(
+    socket_path: &str,
+    req: &BrokerReplyDelegationRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::ReplyDelegation(req.clone())).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be

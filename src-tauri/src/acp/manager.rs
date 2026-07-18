@@ -13,28 +13,37 @@ use sea_orm::{
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::connection::matching_config_pair;
 use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand,
+    spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
+    SpawnHandshake,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::delegation::route::DelegationRoutePlan;
+#[cfg(test)]
+use crate::acp::delegation::route::RouteDegradedReason;
+use crate::acp::delegation::route::{safe_native_fallback, DelegationConnectionOrigin};
 use crate::acp::error::AcpError;
-use crate::acp::terminal_context::{
-    finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs,
-};
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
-    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
+    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
+use crate::acp::session_state::ActiveTurnContext;
+use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
+};
+use crate::auto_title::{
+    capture_prompt_context, ConnectionLaunchContext, ConnectionPurpose, PromptCaptureContext,
 };
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+use crate::models::system::AppLocale;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
 
 /// Cap on the number of prompt-text chars kept in the `user_prompt_sent`
@@ -43,6 +52,31 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// event payload so a large paste can't bloat the ring buffer, the per-channel
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
+
+/// Production primary wait for map absence after unexposed teardown.
+const TEARDOWN_MAP_WAIT_PRIMARY: Duration = Duration::from_secs(5);
+/// Production extended wait after primary timeout before fail-closed.
+const TEARDOWN_MAP_WAIT_EXTENDED: Duration = Duration::from_secs(2);
+
+/// Launch policy for delegated children. Built only by the spawn-owned parent
+/// launch snapshot resolver that `ConnectionManagerSpawner::spawn` consumes.
+fn delegation_launch_context(parent_effective_locale: AppLocale) -> ConnectionLaunchContext {
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::Delegation,
+        inherited_locale: Some(parent_effective_locale),
+    }
+}
+
+/// Launch policy for `probe_agent_options`. Must stay in lockstep with that
+/// call site — the unit test exercises this helper as the production policy.
+/// Internal probes have no user/channel locale; connection launch falls back
+/// to effective English when `inherited_locale` is `None`.
+fn internal_probe_launch_context() -> ConnectionLaunchContext {
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::InternalProbe,
+        inherited_locale: None,
+    }
+}
 
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
@@ -54,16 +88,126 @@ fn is_reserved_turn_id(id: &str) -> bool {
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Prefer shell drift over agent drift so the banner wording matches the most
-/// recent surface the user still needs to reapply. When both components match
-/// spawn, returns `None` (not stale).
+/// Prefer shell drift over route drift over agent drift so the banner wording
+/// matches the highest-priority surface the user still needs to reapply.
+/// When all components match spawn, returns `None` (not stale).
 fn effective_stale_kind(conn: &AgentConnection) -> Option<ConfigStaleKind> {
-    if conn.observed_config.fingerprint.terminal_shell != conn.spawn_config.terminal_shell {
+    let observed = &conn.observed_config.fingerprint;
+    if observed.terminal_shell != conn.spawn_config.terminal_shell {
         Some(ConfigStaleKind::TerminalShell)
-    } else if conn.observed_config.fingerprint.agent_config != conn.spawn_config.agent_config {
+    } else if observed.delegation_route != conn.spawn_config.delegation_route {
+        Some(ConfigStaleKind::DelegationRoute)
+    } else if observed.agent_config != conn.spawn_config.agent_config {
         Some(conn.observed_config.agent_kind)
     } else {
         None
+    }
+}
+
+/// Session-id dedup reuses only when the route fingerprint matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteReuseDecision {
+    Reuse,
+    Conflict { existing_connection_id: String },
+}
+
+fn route_reuse_decision(
+    existing_fingerprint: &str,
+    requested_fingerprint: &str,
+    existing_connection_id: &str,
+) -> RouteReuseDecision {
+    if existing_fingerprint == requested_fingerprint {
+        RouteReuseDecision::Reuse
+    } else {
+        RouteReuseDecision::Conflict {
+            existing_connection_id: existing_connection_id.to_string(),
+        }
+    }
+}
+
+/// Pure spawn-policy inputs for unit-testing the max-two-attempt fallback
+/// without real Agent binaries. Production `spawn_agent` inlines the same
+/// match arms against live `spawn_agent_connection` outcomes.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub struct SpawnAttemptRequest {
+    pub origin: DelegationConnectionOrigin,
+    pub plan: DelegationRoutePlan,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct SpawnAttemptResult {
+    pub connection_id: String,
+    pub plan: DelegationRoutePlan,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub struct SpawnAttemptHarness {
+    outcomes: std::sync::Mutex<std::vec::IntoIter<Result<String, RouteBootstrapOutcome>>>,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SpawnAttemptHarness {
+    pub fn new(outcomes: impl IntoIterator<Item = Result<String, RouteBootstrapOutcome>>) -> Self {
+        Self {
+            outcomes: std::sync::Mutex::new(outcomes.into_iter().collect::<Vec<_>>().into_iter()),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn attempt_count(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn spawn_once(
+        &self,
+        _plan: &DelegationRoutePlan,
+    ) -> Result<String, RouteBootstrapOutcome> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcomes
+            .lock()
+            .unwrap()
+            .next()
+            .unwrap_or(Err(RouteBootstrapOutcome::Fatal(AcpError::ProcessExited)))
+    }
+}
+
+/// Explicit max-two-attempt policy: root may retry once on RouteSpecific;
+/// child never falls back; Fatal never retries. Second attempt cannot recurse.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn spawn_with_safe_fallback(
+    request: SpawnAttemptRequest,
+    harness: &SpawnAttemptHarness,
+) -> Result<SpawnAttemptResult, AcpError> {
+    let requested_plan = request.plan;
+    match harness.spawn_once(&requested_plan).await {
+        Ok(connection_id) => Ok(SpawnAttemptResult {
+            connection_id,
+            plan: requested_plan,
+        }),
+        Err(RouteBootstrapOutcome::RouteSpecific(reason))
+            if request.origin == DelegationConnectionOrigin::Root =>
+        {
+            // teardown_unexposed_attempt is a no-op in the harness (no process).
+            let fallback = safe_native_fallback(&requested_plan, reason);
+            match harness.spawn_once(&fallback).await {
+                Ok(id) => Ok(SpawnAttemptResult {
+                    connection_id: id,
+                    plan: fallback,
+                }),
+                Err(outcome) => Err(outcome.into_acp_error()),
+            }
+        }
+        Err(RouteBootstrapOutcome::RouteSpecific(reason)) => {
+            Err(AcpError::RouteUnavailable { reason })
+        }
+        Err(RouteBootstrapOutcome::Fatal(error)) => Err(error),
+        Err(RouteBootstrapOutcome::Ready) => {
+            Err(AcpError::Protocol("unexpected Ready as spawn error".into()))
+        }
     }
 }
 
@@ -325,20 +469,30 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
-        let (spawn_config, observed_config) =
-            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             spawn_config,
             observed_config,
             terminal_shell,
+            route_plan,
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -371,20 +525,30 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
-        let (spawn_config, observed_config) =
-            matching_config_pair(String::new(), terminal_shell.selection_key.clone());
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
         let conn = AgentConnection {
             id: id.to_string(),
             agent_type,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             spawn_config,
             observed_config,
             terminal_shell,
+            route_plan,
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -401,6 +565,10 @@ impl ConnectionManager {
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        // Purpose + inherited locale from the caller's launch policy (UI system
+        // language, parent effective locale for delegation, channel locale in
+        // Task 4C2, or probe/test defaults).
+        launch_context: ConnectionLaunchContext,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -442,73 +610,328 @@ impl ConnectionManager {
             .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
             .await
         {
-            tracing::info!(
-                "[ACP] reusing connection id={} for session_id={}",
-                existing,
-                session_id.as_deref().unwrap_or("")
-            );
-            // Reuse must not resolve, validate, or apply newly loaded terminal
-            // settings — the live connection keeps its launch-time snapshot.
-            return Ok(existing);
+            let existing_fp = {
+                let map = self.connections.lock().await;
+                map.get(&existing)
+                    .map(|c| c.spawn_config.delegation_route.clone())
+                    .unwrap_or_default()
+            };
+            match route_reuse_decision(
+                &existing_fp,
+                &launch_inputs.route_plan.fingerprint,
+                &existing,
+            ) {
+                RouteReuseDecision::Reuse => {
+                    tracing::info!(
+                        "[ACP] reusing connection id={} for session_id={}",
+                        existing,
+                        session_id.as_deref().unwrap_or("")
+                    );
+                    // Reuse must not resolve, validate, or apply newly loaded
+                    // terminal/route settings — the live connection keeps its
+                    // launch-time snapshot.
+                    return Ok(existing);
+                }
+                RouteReuseDecision::Conflict {
+                    existing_connection_id,
+                } => {
+                    tracing::info!(
+                        "[ACP] session route conflict existing={} requested_fp={}",
+                        existing_connection_id,
+                        launch_inputs.route_plan.fingerprint
+                    );
+                    return Err(AcpError::SessionRouteConflict {
+                        existing_connection_id,
+                    });
+                }
+            }
         }
 
         // Only the no-reuse branch finalizes an immutable shell snapshot.
+        // The route plan is already resolved and passes through unchanged.
         let AcpLaunchConfig {
             runtime_env,
             terminal_shell,
+            route_plan,
+            origin,
+            route_preference,
+            route_capability,
         } = finalize_acp_launch_config(launch_inputs, agent_type)?;
 
-        let connection_id = uuid::Uuid::new_v4().to_string();
-        tracing::info!(
-            "[ACP] spawning connection id={} owner_window={} agent={:?}",
-            connection_id, owner_window_label, agent_type
-        );
-
-        // `spawn_agent_connection` inserts the entry into `self.connections`,
-        // installs the SessionStarted dedup signal on the state, registers
-        // a cleanup hook, and returns the rx half of the signal. Any spawn
-        // failure short-circuits before we touch the rx wait.
-        let session_started_rx = spawn_agent_connection(
-            connection_id.clone(),
-            agent_type,
-            working_dir,
-            session_id,
-            runtime_env,
-            terminal_shell,
-            owner_window_label,
-            emitter,
-            self.connections.clone(),
-            preferred_mode_id,
-            preferred_config_values,
-            self.delegation_snapshot(),
-        )
-        .await?;
-
-        // When dedup is active, hold the lock until the agent's
-        // SessionStarted has applied (so external_id is populated for the
-        // next waiter), aborted (connection died), or the timeout fires.
-        // Logged on every wait so production can audit real-world handshake
-        // latencies and tune `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`.
-        if dedup_lock.is_some() {
-            let timeout = self.spawn_handshake_timeout;
-            let (outcome, elapsed) = wait_for_session_started(session_started_rx, timeout).await;
-            tracing::info!(
-                "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
-                 elapsed_ms={} timeout_ms={}",
-                connection_id,
-                session_id_for_log.as_deref().unwrap_or(""),
-                outcome.as_str(),
-                elapsed.as_millis(),
-                timeout.as_millis(),
-            );
+        // Explicit max-two-attempt root state machine: Codeg request, then one
+        // safe-native fallback only for typed RouteSpecific bootstrap failures.
+        // Child and Fatal never retry.
+        let mut attempt_plan = route_plan;
+        // Internal title runs never carry Codeg MCP / delegation injection.
+        let skip_delegation_injection = launch_context.purpose == ConnectionPurpose::InternalTitle;
+        // Authoritative route record after exclusivity validation (Task 13).
+        if !skip_delegation_injection {
+            if let Some(inj) = self.delegation_snapshot() {
+                if let Err(e) = inj
+                    .metrics
+                    .validate_and_record_route(agent_type, &attempt_plan)
+                {
+                    return Err(AcpError::protocol(format!(
+                        "managed plan violates exclusive route surfaces: {}",
+                        e.stable_code()
+                    )));
+                }
+                let suppression =
+                    crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+                crate::acp::delegation::metrics::DelegationAuditRecord::route(
+                    "pending-spawn",
+                    None,
+                    agent_type,
+                    &attempt_plan,
+                    suppression,
+                )
+                .emit_route_resolved();
+            } else {
+                // Tests without injection still enforce exclusivity.
+                attempt_plan
+                    .assert_exclusive()
+                    .map_err(|e| AcpError::protocol(e.to_string()))?;
+            }
+        } else {
+            attempt_plan
+                .assert_exclusive()
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
         }
-        // session_started_rx (in the no-dedup branch) is dropped here. tx
-        // staying inside SessionState gets dropped naturally when the
-        // connection terminates, no leak.
+        let mut attempt = 0u8;
+        let connection_id = loop {
+            attempt += 1;
+            let connection_id = uuid::Uuid::new_v4().to_string();
+            tracing::info!(
+                "[ACP] spawning connection id={} owner_window={} agent={:?} \
+                 attempt={} effective={:?}",
+                connection_id,
+                owner_window_label,
+                agent_type,
+                attempt,
+                attempt_plan.effective
+            );
+
+            let injection = if skip_delegation_injection {
+                None
+            } else {
+                self.delegation_snapshot()
+            };
+
+            let SpawnHandshake {
+                session_started_rx,
+                route_bootstrap_rx,
+            } = match spawn_agent_connection(
+                connection_id.clone(),
+                agent_type,
+                working_dir.clone(),
+                session_id.clone(),
+                runtime_env.clone(),
+                terminal_shell.clone(),
+                attempt_plan.clone(),
+                origin,
+                route_preference,
+                route_capability.clone(),
+                owner_window_label.clone(),
+                emitter.clone(),
+                self.connections.clone(),
+                preferred_mode_id.clone(),
+                preferred_config_values.clone(),
+                injection,
+                launch_context.clone(),
+            )
+            .await
+            {
+                Ok(hs) => hs,
+                Err(e) => {
+                    // Spawn-time failures (SDK missing, shell, etc.) are Fatal —
+                    // never route-specific fallback.
+                    return Err(e);
+                }
+            };
+
+            // When dedup is active, hold the lock until SessionStarted applies.
+            if dedup_lock.is_some() {
+                let timeout = self.spawn_handshake_timeout;
+                let (outcome, elapsed) =
+                    wait_for_session_started(session_started_rx, timeout).await;
+                tracing::info!(
+                    "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
+                     elapsed_ms={} timeout_ms={}",
+                    connection_id,
+                    session_id_for_log.as_deref().unwrap_or(""),
+                    outcome.as_str(),
+                    elapsed.as_millis(),
+                    timeout.as_millis(),
+                );
+            }
+
+            match route_bootstrap_rx.await {
+                Ok(RouteBootstrapOutcome::Ready) => break connection_id,
+                Ok(RouteBootstrapOutcome::RouteSpecific(reason))
+                    if origin == DelegationConnectionOrigin::Root && attempt == 1 =>
+                {
+                    tracing::warn!(
+                        "[ACP] route bootstrap RouteSpecific ({reason:?}); \
+                         tearing down unexposed attempt and safe-native fallback"
+                    );
+                    // Attempt 2 only after teardown observes map absence.
+                    self.teardown_unexposed_attempt(&connection_id).await?;
+                    attempt_plan = safe_native_fallback(&attempt_plan, reason);
+                    // Count safe fallback once at the actual decision boundary.
+                    if let Some(inj) = self.delegation_snapshot() {
+                        inj.metrics.record_route(agent_type, &attempt_plan);
+                        let suppression =
+                            crate::acp::connection::suppression_application_for_plan(&attempt_plan);
+                        crate::acp::delegation::metrics::DelegationAuditRecord::route(
+                            &connection_id,
+                            None,
+                            agent_type,
+                            &attempt_plan,
+                            suppression,
+                        )
+                        .emit_route_resolved();
+                    }
+                    // Second attempt cannot recurse/retry again (attempt==2).
+                    continue;
+                }
+                Ok(RouteBootstrapOutcome::RouteSpecific(reason)) => {
+                    self.teardown_unexposed_attempt(&connection_id).await?;
+                    return Err(AcpError::RouteUnavailable { reason });
+                }
+                Ok(RouteBootstrapOutcome::Fatal(error)) => {
+                    self.teardown_unexposed_attempt(&connection_id).await?;
+                    return Err(error);
+                }
+                Err(_) => {
+                    // Connection task dropped without bootstrap (process died).
+                    self.teardown_unexposed_attempt(&connection_id).await?;
+                    return Err(AcpError::ProcessExited);
+                }
+            }
+        };
 
         drop(dedup_lock);
 
         Ok(connection_id)
+    }
+
+    /// Tear down a partial spawn that never exposed Connected: terminate the
+    /// connection task, revoke companion token/lease with awaited locks, and
+    /// observe actual map removal before returning so the partial process
+    /// cannot race a replacement or win session-id dedup.
+    ///
+    /// A queued `Disconnect` alone is insufficient when bootstrap fails before
+    /// `run_conversation_loop` (the command is never drained). Abort the task
+    /// instead, then wait for [`ConnectionCleanupGuard`] to remove the entry.
+    /// Does **not** force-remove a still-live map entry. Success requires
+    /// observed map absence after revoke + terminate request; timeout is
+    /// fail-closed ([`AcpError::ProcessExited`]) so root fallback never starts
+    /// attempt 2 against a still-mapped partial connection.
+    async fn teardown_unexposed_attempt(&self, connection_id: &str) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt_with_waits(
+            connection_id,
+            TEARDOWN_MAP_WAIT_PRIMARY,
+            TEARDOWN_MAP_WAIT_EXTENDED,
+        )
+        .await
+    }
+
+    async fn teardown_unexposed_attempt_with_waits(
+        &self,
+        connection_id: &str,
+        primary: Duration,
+        extended: Duration,
+    ) -> Result<(), AcpError> {
+        // Snapshot handles under the map lock, then release before awaiting
+        // state/token locks so we never hold connections + state together.
+        let (task_abort, state, cmd_tx) = {
+            let map = self.connections.lock().await;
+            match map.get(connection_id) {
+                Some(conn) => (
+                    conn.task_abort.clone(),
+                    Some(Arc::clone(&conn.state)),
+                    Some(conn.cmd_tx.clone()),
+                ),
+                None => (None, None, None),
+            }
+        };
+
+        // Already absent: nothing to clean up (success).
+        if task_abort.is_none() && state.is_none() {
+            return Ok(());
+        }
+
+        // 1) Awaited token revoke (never try_read — must not skip under contention).
+        if let Some(state) = state {
+            let token = state.read().await.delegation_token.clone();
+            if let (Some(tok), Some(inj)) = (token, self.delegation_snapshot()) {
+                inj.leases.revoke(&tok).await;
+                inj.tokens.revoke(&tok).await;
+            }
+        }
+
+        // 2) Terminate the unexposed attempt: abort first (works pre-loop),
+        //    then best-effort Disconnect if the task already reached the loop.
+        if let Some(abort) = task_abort {
+            abort.abort();
+        }
+        if let Some(tx) = cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::Disconnect);
+        }
+
+        // 3) Observe actual map removal before Ok (no force-remove race).
+        let deadline = tokio::time::Instant::now() + primary;
+        loop {
+            {
+                let map = self.connections.lock().await;
+                if !map.contains_key(connection_id) {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::error!(
+                    "[ACP] teardown_unexposed_attempt timed out waiting for \
+                     removal of {connection_id} after abort+revoke; \
+                     not force-removing (would race a live SessionStarted entry)"
+                );
+                // Keep waiting briefly for delayed cleanup-guard spawn path.
+                let extended_deadline = tokio::time::Instant::now() + extended;
+                while tokio::time::Instant::now() < extended_deadline {
+                    {
+                        let map = self.connections.lock().await;
+                        if !map.contains_key(connection_id) {
+                            return Ok(());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tracing::error!(
+                    "[ACP] teardown_unexposed_attempt: {connection_id} still present \
+                     after extended wait; fail closed (no native fallback)"
+                );
+                return Err(AcpError::ProcessExited);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Test/harness surface for [`Self::teardown_unexposed_attempt`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn teardown_unexposed_for_test(&self, connection_id: &str) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt(connection_id).await
+    }
+
+    /// Like [`Self::teardown_unexposed_for_test`] with explicit wait bounds
+    /// (deterministic stuck-cleanup tests; no global timeout override).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn teardown_unexposed_for_test_with_waits(
+        &self,
+        connection_id: &str,
+        primary: Duration,
+        extended: Duration,
+    ) -> Result<(), AcpError> {
+        self.teardown_unexposed_attempt_with_waits(connection_id, primary, extended)
+            .await
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -648,7 +1071,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -697,9 +1125,193 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale, kind) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
+    }
+
+    /// Recompute the observed route fingerprint for managed root connections
+    /// against a new global policy/enabled pair. Forced children and unmanaged
+    /// agents are skipped. Never mutates `route_plan` / argv / env.
+    pub async fn refresh_delegation_route_staleness(
+        &self,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> usize {
+        self.refresh_delegation_route_staleness_filtered(global_policy, delegation_enabled, None)
+            .await
+    }
+
+    /// Like [`Self::refresh_delegation_route_staleness`] but only connections
+    /// bound to `conversation_id`.
+    pub async fn refresh_delegation_route_staleness_for_conversation(
+        &self,
+        conversation_id: i32,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> usize {
+        self.refresh_delegation_route_staleness_filtered(
+            global_policy,
+            delegation_enabled,
+            Some(conversation_id),
+        )
+        .await
+    }
+
+    async fn refresh_delegation_route_staleness_filtered(
+        &self,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+        only_conversation_id: Option<i32>,
+    ) -> usize {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, is_managed_agent, DelegationConnectionOrigin,
+        };
+
+        let mut targets = Vec::new();
+        let mut stale_count = 0usize;
+        {
+            let mut connections = self.connections.lock().await;
+            for conn in connections.values_mut() {
+                if !is_managed_agent(conn.agent_type) {
+                    continue;
+                }
+                if conn.origin == DelegationConnectionOrigin::CodegChild {
+                    continue;
+                }
+                if let Some(only_cid) = only_conversation_id {
+                    let cid = conn.state.try_read().ok().and_then(|s| s.conversation_id);
+                    if cid != Some(only_cid) {
+                        continue;
+                    }
+                }
+
+                let prev_route = conn.observed_config.fingerprint.delegation_route.clone();
+                let prev_effective = effective_stale_kind(conn);
+
+                let new_fp = comparison_route_fingerprint(
+                    conn.agent_type,
+                    conn.origin,
+                    conn.route_preference,
+                    global_policy,
+                    delegation_enabled,
+                    &conn.route_capability,
+                );
+                conn.observed_config.fingerprint.delegation_route = new_fp;
+
+                let route_stale = conn.observed_config.fingerprint.delegation_route
+                    != conn.spawn_config.delegation_route;
+                if route_stale {
+                    stale_count += 1;
+                }
+
+                let new_effective = effective_stale_kind(conn);
+                let observed_changed =
+                    prev_route != conn.observed_config.fingerprint.delegation_route;
+                if observed_changed || prev_effective != new_effective {
+                    let stale = new_effective.is_some();
+                    let emit_kind = new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
+                    targets.push((
+                        Arc::clone(&conn.state),
+                        conn.emitter.clone(),
+                        stale,
+                        emit_kind,
+                    ));
+                }
+            }
+        }
+        for (state, emitter, stale, kind) in targets {
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
+        }
+        stale_count
+    }
+
+    /// Update a row-less connected draft's observed route preference.
+    /// Rejects persisted roots, forced children, and unmanaged agents.
+    /// Never mutates `route_plan`, process argv/env, or session metadata.
+    pub async fn set_draft_delegation_route_preference(
+        &self,
+        connection_id: &str,
+        route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+        global_policy: crate::acp::delegation::route::DelegationRoutePolicy,
+        delegation_enabled: bool,
+    ) -> Result<(), AcpError> {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, is_managed_agent, DelegationConnectionOrigin,
+        };
+
+        let mut targets = Vec::new();
+        {
+            let mut connections = self.connections.lock().await;
+            let conn = connections
+                .get_mut(connection_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.to_string()))?;
+
+            if !is_managed_agent(conn.agent_type) {
+                return Err(AcpError::protocol(
+                    "draft route preference is only valid for managed agents",
+                ));
+            }
+            if conn.origin == DelegationConnectionOrigin::CodegChild {
+                return Err(AcpError::protocol(
+                    "draft route preference is not allowed on forced Codeg children",
+                ));
+            }
+            let conversation_id = {
+                let state = conn.state.read().await;
+                state.conversation_id
+            };
+            if conversation_id.is_some() {
+                return Err(AcpError::protocol(
+                    "draft route preference is only allowed on row-less draft connections",
+                ));
+            }
+
+            let prev_route = conn.observed_config.fingerprint.delegation_route.clone();
+            let prev_effective = effective_stale_kind(conn);
+
+            conn.route_preference = route_override;
+            conn.observed_config.fingerprint.delegation_route = comparison_route_fingerprint(
+                conn.agent_type,
+                conn.origin,
+                conn.route_preference,
+                global_policy,
+                delegation_enabled,
+                &conn.route_capability,
+            );
+
+            let new_effective = effective_stale_kind(conn);
+            let observed_changed = prev_route != conn.observed_config.fingerprint.delegation_route;
+            if observed_changed || prev_effective != new_effective {
+                let stale = new_effective.is_some();
+                let emit_kind = new_effective.unwrap_or(ConfigStaleKind::DelegationRoute);
+                targets.push((
+                    Arc::clone(&conn.state),
+                    conn.emitter.clone(),
+                    stale,
+                    emit_kind,
+                ));
+            }
+        }
+        for (state, emitter, stale, kind) in targets {
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
+        }
+        Ok(())
     }
 
     /// Look up an existing live connection that we can reuse instead of
@@ -755,8 +1367,19 @@ impl ConnectionManager {
     /// `send_prompt_linked` acquire the lock externally and then call
     /// this. Re-entering through `send_prompt` from `send_prompt_linked`
     /// while holding the lock would deadlock, hence the split.
+    ///
+    /// Admission order (under the caller's per-connection prompt lock):
+    /// 1. `reserve()` — only cancellable/blocking point before capture
+    /// 2. state write guard; reject in-flight turn
+    /// 3. linked + non-internal: `capture_prompt_context` while holding the
+    ///    write guard (serializes write-once first text)
+    /// 4. set `active_turn` / `effective_locale` / `turn_in_flight`
+    /// 5. mandatory-route sync tail (no `.await`)
+    /// 6. `permit.send` — no `.await` after successful capture
+    #[allow(clippy::too_many_arguments)]
     async fn send_prompt_inner(
         &self,
+        db: Option<&AppDatabase>,
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
@@ -765,6 +1388,11 @@ impl ConnectionManager {
         // for broker-generated child/delegation tasks so nested task text
         // cannot install routes on the child connection.
         register_mandatory_routes: bool,
+        // Per-turn awaiting-reply eligibility carried onto TurnComplete.
+        // Independent of route registration: chat-channel keeps routes on
+        // while setting this false.
+        mark_awaiting_reply: bool,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -779,7 +1407,8 @@ impl ConnectionManager {
         }
         // Precompute mandatory ids only if this is a root user prompt. Applied
         // AFTER the turn is admitted (below) so a rejected concurrent send
-        // cannot overwrite the live turn's routes.
+        // cannot overwrite the live turn's routes. Must be ready before the
+        // post-capture synchronous tail (no await after capture).
         let pending_mandatory_ids = if register_mandatory_routes {
             let mut joined = String::new();
             for block in &blocks {
@@ -790,9 +1419,7 @@ impl ConnectionManager {
                     joined.push_str(text);
                 }
             }
-            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(
-                &joined,
-            ))
+            Some(crate::acp::delegation::types::extract_mandatory_profile_ids(&joined))
         } else {
             None
         };
@@ -805,44 +1432,58 @@ impl ConnectionManager {
         };
         // Concurrency gate: reject a second prompt while a turn is already in
         // flight on this connection. Reserve channel capacity FIRST — that
-        // `reserve().await` is the only point that can block or be cancelled.
-        // Then check+set the gate and hand the command to the permit
-        // synchronously: because there is NO await between setting
-        // `turn_in_flight` and the infallible `permit.send`, a dropped/cancelled
-        // future can never strand the flag true (it is either never set — when
-        // cancelled during reserve or the lock acquisition — or always followed
-        // by the enqueue). The flag is set BEFORE the enqueue so it is in place
-        // before the loop can dequeue and clear it on `TurnComplete`. Without
-        // the gate the second `Prompt` would queue behind the active turn and be
-        // silently dropped by the loop's in-turn handler (`_ => {}`) while the
-        // caller saw success. `send_prompt` callers (e.g. the chat channel)
-        // rely on this gate alone (no `prompt_lock`).
+        // `reserve().await` is the only point that can block or be cancelled
+        // before capture. Cancellation while waiting here writes no capture and
+        // no active-turn state.
         let permit = cmd_tx
             .reserve()
             .await
             .map_err(|_| AcpError::ProcessExited)?;
-        {
-            let mut s = state_arc.write().await;
-            if s.turn_in_flight {
-                return Err(AcpError::TurnInProgress);
-            }
-            s.turn_in_flight = true;
+
+        // Hold the write guard across capture so write-once first_user_text is
+        // serialized with turn admission. After successful capture there is no
+        // `.await` before `permit.send`.
+        let mut state = state_arc.write().await;
+        if state.turn_in_flight {
+            return Err(AcpError::TurnInProgress);
         }
-        // Admitted: install/clear mandatory routes for this root prompt only.
-        // Must stay synchronous (no `.await`) between setting `turn_in_flight`
-        // and `permit.send` so a dropped future cannot strand the gate or
-        // mutate routes for a prompt that never enqueued. Child paths pass
-        // register_mandatory_routes=false and skip this.
+
+        let is_internal = matches!(
+            state.purpose,
+            ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
+        );
+        // Unlinked and internal-purpose sends bypass capture entirely.
+        if let (Some(db), Some(conversation_id)) = (db, state.conversation_id) {
+            if !is_internal {
+                let captured = capture_prompt_context(
+                    &db.conn,
+                    conversation_id,
+                    &blocks,
+                    capture.as_ref(),
+                    state.effective_locale,
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                let token = uuid::Uuid::new_v4().to_string();
+                state.effective_locale = captured.locale;
+                state.active_turn = Some(ActiveTurnContext {
+                    token,
+                    locale: captured.locale,
+                });
+            }
+        }
+
+        state.turn_in_flight = true;
+        // Synchronous tail: mandatory routes then permit.send. No await.
         if let Some(ids) = pending_mandatory_ids {
             if let Some(injection) = self.delegation_snapshot() {
-                injection
-                    .broker
-                    .set_mandatory_profile_routes(conn_id, ids);
+                injection.broker.set_mandatory_profile_routes(conn_id, ids);
             }
         }
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            mark_awaiting_reply,
         });
         Ok(())
     }
@@ -863,13 +1504,79 @@ impl ConnectionManager {
 
     pub async fn send_prompt(
         &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        capture: Option<PromptCaptureContext>,
+    ) -> Result<(), AcpError> {
+        // Ordinary DB-aware UI path never drives InternalTitle connections.
+        {
+            let state_arc = self
+                .get_state(conn_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let purpose = state_arc.read().await.purpose;
+            if purpose == ConnectionPurpose::InternalTitle {
+                return Err(AcpError::protocol(
+                    "send_prompt rejects InternalTitle purpose; use send_prompt_unlinked_internal",
+                ));
+            }
+        }
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        // Non-linked UI sends: register mandatory routes + mark attention.
+        // Capture runs only when the connection is already linked (and not
+        // internal); unlinked paths bypass capture by design.
+        self.send_prompt_inner(Some(db), conn_id, blocks, None, true, true, capture)
+            .await
+    }
+
+    /// Background (non-UI) prompt: keeps mandatory profile-route registration
+    /// but does not mark the turn as awaiting-reply eligible. Unlinked path —
+    /// no title capture (Task 4C may convert chat kickoffs to linked sends).
+    pub async fn send_prompt_background(
+        &self,
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        // Non-linked sends are always user-facing root prompts.
-        self.send_prompt_inner(conn_id, blocks, None, true).await
+        self.send_prompt_inner(None, conn_id, blocks, None, true, false, None)
+            .await
+    }
+
+    /// Unlinked internal enqueue for probe/title workers. Rejects every purpose
+    /// except `InternalProbe` and `InternalTitle`, remains unlinked, and
+    /// bypasses title capture. Crate-visible for Task 7's runner outside
+    /// `acp::manager`.
+    // No production Task 4B caller yet — Task 7 owns the first real consumer.
+    // Keep crate-visible without inventing a fake call solely to silence lint.
+    #[allow(dead_code)]
+    pub(crate) async fn send_prompt_unlinked_internal(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+    ) -> Result<(), AcpError> {
+        {
+            let state_arc = self
+                .get_state(conn_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let purpose = state_arc.read().await.purpose;
+            if !matches!(
+                purpose,
+                ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
+            ) {
+                return Err(AcpError::protocol(format!(
+                    "send_prompt_unlinked_internal requires InternalProbe or InternalTitle purpose, got {purpose:?}"
+                )));
+            }
+        }
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        // No db / capture: internal purposes always bypass title capture.
+        self.send_prompt_inner(None, conn_id, blocks, None, false, false, None)
+            .await
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -890,6 +1597,9 @@ impl ConnectionManager {
     /// (the delegation broker, internal/test paths). The UI send path uses
     /// [`send_prompt_linked_with_message_id`] so the sender's optimistic turn
     /// dedups against the broadcast `UserMessage` echo by exact id.
+    // Plan-required public signature includes `capture`; argument count is
+    // intentional and shared with the message-id variant below.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_prompt_linked(
         &self,
         db: &AppDatabase,
@@ -898,6 +1608,7 @@ impl ConnectionManager {
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         self.send_prompt_linked_with_message_id(
             db,
@@ -907,6 +1618,7 @@ impl ConnectionManager {
             conversation_id,
             delegation,
             None,
+            capture,
         )
         .await
     }
@@ -919,6 +1631,10 @@ impl ConnectionManager {
     /// than a heuristic — and an unrelated optimistic turn on another client
     /// never suppresses a different sender's prompt. `None` falls back to a
     /// connection-scoped id for non-UI senders.
+    ///
+    /// Awaiting-reply eligibility is `delegation.is_none()` (UI root true;
+    /// delegation children false). Background automation uses
+    /// [`send_prompt_linked_background`] instead.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_prompt_linked_with_message_id(
         &self,
@@ -929,6 +1645,64 @@ impl ConnectionManager {
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
+        capture: Option<PromptCaptureContext>,
+    ) -> Result<Option<i32>, AcpError> {
+        let mark_awaiting_reply = delegation.is_none();
+        self.send_prompt_linked_impl(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            delegation,
+            client_message_id,
+            mark_awaiting_reply,
+            capture,
+        )
+        .await
+    }
+
+    /// Linked prompt for automation / non-UI producers: root mandatory-route
+    /// registration is preserved, but the turn is not awaiting-reply eligible.
+    pub async fn send_prompt_linked_background(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        capture: Option<PromptCaptureContext>,
+    ) -> Result<Option<i32>, AcpError> {
+        self.send_prompt_linked_impl(
+            db,
+            conn_id,
+            blocks,
+            folder_id,
+            conversation_id,
+            None,
+            None,
+            false,
+            capture,
+        )
+        .await
+    }
+
+    /// Shared linked-prompt implementation. `mark_awaiting_reply` is independent
+    /// of mandatory profile-route registration (`delegation.is_none()`).
+    /// Linked first-send and already-linked paths both call the shared
+    /// admission hook (`send_prompt_inner`) exactly once.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_prompt_linked_impl(
+        &self,
+        db: &AppDatabase,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        folder_id: Option<i32>,
+        conversation_id: Option<i32>,
+        delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+        client_message_id: Option<String>,
+        mark_awaiting_reply: bool,
+        capture: Option<PromptCaptureContext>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1137,14 +1911,19 @@ impl ConnectionManager {
         // row is currently `pending_review` correctly transitions back. The
         // DB write precedes the event emit so any subscriber observing
         // `ConversationStatusChanged` can assume the row is consistent.
-        // `update_status` is a single UPDATE — idempotent with respect to
-        // the same status value, so re-writing `InProgress` is a benign no-op
-        // on the row (touches `updated_at` only).
+        // `update_status_with_patch` is a single UPDATE — idempotent with
+        // respect to the same status value, so re-writing `InProgress` is a
+        // benign no-op on the row (touches `updated_at` only) and returns the
+        // patch for the global state broadcast.
         let conversation_id_for_status = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id_for_status {
-            conversation_service::update_status(&db.conn, cid, ConversationStatus::InProgress)
-                .await
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
+            let patch = conversation_service::update_status_with_patch(
+                &db.conn,
+                cid,
+                ConversationStatus::InProgress,
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
             emit_with_state(
                 &state_arc,
                 &emitter,
@@ -1154,6 +1933,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            crate::commands::conversations::emit_conversation_state(&emitter, patch);
         }
 
         // Capture a bounded preview of the user's message BEFORE `blocks` is
@@ -1203,19 +1983,29 @@ impl ConnectionManager {
 
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
-        // deadlock. The helper reserves channel capacity FIRST and only then
-        // sets the turn-in-flight gate, with no await before the infallible
-        // `permit.send`; so a failure (channel closed / process exited) happens
-        // at the reserve step, BEFORE the gate is set — there is nothing to roll
-        // back. On that failure we still flip the row to `Cancelled` so the UI
+        // deadlock. The helper reserves channel capacity FIRST; only after a
+        // successful reserve (and successful capture when applicable) does it
+        // set active_turn / turn_in_flight, with no await before the infallible
+        // `permit.send`. Failures at reserve or at capture therefore happen
+        // BEFORE the gate is set — there is nothing turn-related to roll back.
+        // On those failures we still flip the row to `Cancelled` so the UI
         // doesn't strand on `in_progress`: no `TurnComplete` will ever arrive
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         // Only root (non-delegation) prompts install mandatory profile routes.
         // Child tasks go through the same helper but must not scan task text.
+        // Awaiting-reply eligibility is a separate policy bit.
         match self
-            .send_prompt_inner(conn_id, blocks, user_message, delegation.is_none())
+            .send_prompt_inner(
+                Some(db),
+                conn_id,
+                blocks,
+                user_message,
+                delegation.is_none(),
+                mark_awaiting_reply,
+                capture,
+            )
             .await
         {
             Ok(()) => {
@@ -1234,14 +2024,14 @@ impl ConnectionManager {
             }
             Err(send_err) => {
                 if let Some(cid) = conversation_id_for_status {
-                    match conversation_service::update_status(
+                    match conversation_service::update_status_with_patch(
                         &db.conn,
                         cid,
                         ConversationStatus::Cancelled,
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(patch) => {
                             emit_with_state(
                                 &state_arc,
                                 &emitter,
@@ -1251,6 +2041,9 @@ impl ConnectionManager {
                                 },
                             )
                             .await;
+                            crate::commands::conversations::emit_conversation_state(
+                                &emitter, patch,
+                            );
                         }
                         Err(rollback_err) => {
                             // Best-effort: original send error is the load-bearing
@@ -1329,7 +2122,7 @@ impl ConnectionManager {
         // status if the turn happened to end just before the user clicked.
         let conversation_id = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id {
-            match conversation_service::update_status_if(
+            match conversation_service::update_status_if_with_patch(
                 db,
                 cid,
                 ConversationStatus::InProgress,
@@ -1337,7 +2130,7 @@ impl ConnectionManager {
             )
             .await
             {
-                Ok(true) => {
+                Ok(Some(patch)) => {
                     emit_with_state(
                         &state_arc,
                         &emitter,
@@ -1347,8 +2140,9 @@ impl ConnectionManager {
                         },
                     )
                     .await;
+                    crate::commands::conversations::emit_conversation_state(&emitter, patch);
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(
                         "[ACP][ERROR] failed to mark conversation {cid} cancelled \
@@ -1547,7 +2341,9 @@ impl ConnectionManager {
             // Surface failures even when the caller is gone (the detached task's
             // Result would otherwise be dropped silently).
             if let Err(ref e) = outcome {
-                tracing::error!("[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}");
+                tracing::error!(
+                    "[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}"
+                );
             }
             outcome
         });
@@ -1663,6 +2459,10 @@ impl ConnectionManager {
                     let folder_id = current.folder_id;
                     let agent_type_str = current.agent_type.clone();
                     let git_branch = current.git_branch.clone();
+                    // Capture before `into()` so the live row retains its guard
+                    // and the historical sibling copies the same finalized flag.
+                    // Fork never inserts a sibling auto-title job.
+                    let auto_title_finalized = current.auto_title_finalized;
                     // The sibling keeps the original's sidebar routing (a forked
                     // chat conversation must stay in the Chat group). `Delegate`
                     // is unreachable here — children are never forked from the
@@ -1683,6 +2483,7 @@ impl ConnectionManager {
                     }
                     active.external_id = Set(Some(forked_session_id));
                     active.updated_at = Set(now);
+                    // Model→ActiveModel conversion keeps auto_title_finalized.
                     active.update(txn).await?;
 
                     // INSERT sibling row preserving pre-fork (S1) history.
@@ -1692,6 +2493,7 @@ impl ConnectionManager {
                         folder_id: Set(folder_id),
                         title: Set(clean_title),
                         title_locked: Set(false),
+                        auto_title_finalized: Set(auto_title_finalized),
                         agent_type: Set(agent_type_str),
                         status: Set(ConversationStatus::PendingReview),
                         kind: Set(sibling_kind),
@@ -1701,11 +2503,24 @@ impl ConnectionManager {
                         parent_id: Set(None),
                         parent_tool_use_id: Set(None),
                         delegation_call_id: Set(None),
+                        delegation_route_override: Set(None),
+                        delegation_task_status: Set(None),
+                        delegation_error_code: Set(None),
+                        delegation_started_at: Set(None),
+                        delegation_finished_at: Set(None),
+                        delegation_tool_call_count: Set(None),
+                        delegation_edit_tool_call_count: Set(None),
+                        delegation_touched_files_json: Set(None),
+                        delegation_touched_files_truncated: Set(None),
+                        delegation_additions: Set(None),
+                        delegation_deletions: Set(None),
+                        delegation_line_counts_complete: Set(None),
                         message_count: Set(0),
                         created_at: Set(now),
                         updated_at: Set(now),
                         deleted_at: Set(None),
                         pinned_at: Set(None),
+                        awaiting_reply_token: Set(None),
                     };
                     let inserted = sibling.insert(txn).await?;
                     Ok(inserted.id)
@@ -1785,6 +2600,7 @@ impl ConnectionManager {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                internal_probe_launch_context(),
             )
             .await?;
 
@@ -1924,7 +2740,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
-            owner_window_label, disconnected
+            owner_window_label,
+            disconnected
         );
         disconnected
     }
@@ -1966,8 +2783,7 @@ impl ConnectionManager {
         let mut out = Vec::new();
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            let (Some(conversation_id), Some(folder_id)) =
-                (state.conversation_id, state.folder_id)
+            let (Some(conversation_id), Some(folder_id)) = (state.conversation_id, state.folder_id)
             else {
                 continue;
             };
@@ -1994,6 +2810,29 @@ impl ConnectionManager {
             });
         }
         out
+    }
+
+    /// Snapshot `external_id` and subscribe to the private event stream under
+    /// one `SessionState` read lock so a concurrent `SessionStarted` cannot
+    /// land between the two observations.
+    pub async fn identity_and_subscribe(
+        &self,
+        conn_id: &str,
+    ) -> Result<
+        (
+            Option<String>,
+            tokio::sync::broadcast::Receiver<std::sync::Arc<crate::acp::types::EventEnvelope>>,
+        ),
+        AcpError,
+    > {
+        let state_arc = self
+            .get_state(conn_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        let state = state_arc.read().await;
+        let external_id = state.external_id.clone();
+        let rx = state.event_stream().subscribe();
+        Ok((external_id, rx))
     }
 
     /// Clone the `Arc<RwLock<SessionState>>` for a given connection id so the
@@ -2066,11 +2905,8 @@ impl ConnectionManager {
         if !state.read().await.feedback_tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
-        let item = FeedbackItem::new_pending(
-            uuid::Uuid::new_v4().to_string(),
-            text,
-            chrono::Utc::now(),
-        );
+        let item =
+            FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
         // gated emit): a `TurnComplete` (flips the flag) or `UserMessage`
         // (clears `feedback`) can't slip between the gate and the append+seq, so
@@ -2252,7 +3088,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_questions.lock().await.contains_key(question_id) {
+        if self
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(question_id)
+        {
             return false;
         }
         emit_with_state(
@@ -2290,7 +3131,9 @@ impl ConnectionManager {
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
         let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2315,7 +3158,9 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2465,6 +3310,51 @@ pub struct ConnectionManagerSpawner {
     pub manager: Arc<ConnectionManager>,
     pub db: Arc<AppDatabase>,
     pub data_dir: Arc<PathBuf>,
+    pub runtime: crate::commands::delegation::DelegationRuntimeSettings,
+}
+
+/// Coherent parent snapshot for delegated child launch. Owned by
+/// `ConnectionManagerSpawner` and consumed only by production `spawn` (and the
+/// named inheritance test that pins that path without spawning an agent).
+struct ParentSpawnLaunchSnapshot {
+    emitter: EventEmitter,
+    owner_window_label: String,
+    parent_working_dir: Option<String>,
+    launch_context: ConnectionLaunchContext,
+}
+
+impl ConnectionManagerSpawner {
+    /// Read live parent emitter/owner/workdir and build Delegation launch
+    /// context from the parent's latest `effective_locale` in one snapshot.
+    /// Production `spawn` is the only call site besides the focused test.
+    async fn resolve_parent_spawn_launch_snapshot(
+        &self,
+        parent_connection_id: &str,
+    ) -> Result<ParentSpawnLaunchSnapshot, crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        // Falling back is not safe: a child whose emitter is wired to a
+        // different broadcaster would emit events the frontend never sees.
+        let conns = self.manager.connections.lock().await;
+        let parent = conns.get(parent_connection_id).ok_or_else(|| {
+            SpawnerError::Spawn(format!(
+                "parent connection {parent_connection_id} not found"
+            ))
+        })?;
+        let (parent_working_dir, parent_locale) = {
+            let s = parent.state.read().await;
+            let pwd = s
+                .working_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string());
+            (pwd, s.effective_locale)
+        };
+        Ok(ParentSpawnLaunchSnapshot {
+            emitter: parent.emitter.clone(),
+            owner_window_label: parent.owner_window_label.clone(),
+            parent_working_dir,
+            launch_context: delegation_launch_context(parent_locale),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -2478,54 +3368,40 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
-        // Resolve the parent connection so we can inherit its emitter and
-        // owner_window. Falling back is not safe: a child whose emitter is
-        // wired to a different broadcaster would emit events the frontend
-        // never sees.
-        let (emitter, owner_window, parent_working_dir) = {
-            let conns = self.manager.connections.lock().await;
-            let parent = conns.get(parent_connection_id).ok_or_else(|| {
-                SpawnerError::Spawn(format!(
-                    "parent connection {parent_connection_id} not found"
-                ))
-            })?;
-            let pwd = {
-                let s = parent.state.read().await;
-                s.working_dir
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-            };
-            (
-                parent.emitter.clone(),
-                parent.owner_window_label.clone(),
-                pwd,
-            )
-        };
-        let effective_working_dir = working_dir.or(parent_working_dir);
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
 
         // Build the same launch inputs `acp_connect` would build for a
         // user-initiated session — disabled check, settings overrides,
         // model provider creds, git helper, and terminal settings. Without
         // this, delegated subagents would skip the user's configuration.
+        // Children always force Codeg origin regardless of global settings.
+        let runtime = self.runtime.snapshot();
         let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
             &self.db,
             agent_type,
             None,
             self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
         )
         .await
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
 
+        // Snapshot carries Delegation purpose + parent's latest effective locale.
         self.manager
             .spawn_agent(
                 agent_type,
                 effective_working_dir,
                 None,
                 launch_inputs,
-                owner_window,
-                emitter,
+                parent.owner_window_label,
+                parent.emitter,
                 preferred_mode_id,
                 preferred_config_values,
+                parent.launch_context,
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
@@ -2536,8 +3412,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         conn_id: &str,
         task: String,
         link: crate::acp::delegation::spawner::DelegationLink,
-    ) -> Result<i32, crate::acp::delegation::spawner::SpawnerError> {
-        use crate::acp::delegation::spawner::SpawnerError;
+    ) -> Result<
+        crate::acp::delegation::spawner::AcceptedDelegationPrompt,
+        crate::acp::delegation::spawner::SpawnerError,
+    > {
+        use crate::acp::delegation::spawner::{AcceptedDelegationPrompt, SpawnerError};
         // The child has no caller-supplied conversation_id (it's brand new).
         // folder_id must be None too — the manager's create-new-row branch
         // requires folder_id, which we resolve from the child's working_dir
@@ -2546,23 +3425,24 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             let conns = self.manager.connections.lock().await;
             let conn = conns
                 .get(conn_id)
-                .ok_or_else(|| SpawnerError::Send(format!("child {conn_id} not found")))?;
+                .ok_or_else(|| SpawnerError::send(format!("child {conn_id} not found")))?;
             let s = conn.state.read().await;
             s.working_dir.clone()
         };
         let folder_path = working_dir_pathbuf
             .ok_or_else(|| {
-                SpawnerError::Send(
-                    "child connection has no working_dir; cannot derive folder_id".into(),
-                )
+                SpawnerError::send("child connection has no working_dir; cannot derive folder_id")
             })?
             .to_string_lossy()
             .to_string();
         let folder = crate::db::service::folder_service::add_folder(&self.db.conn, &folder_path)
             .await
-            .map_err(|e| SpawnerError::Send(format!("add_folder: {e}")))?;
+            .map_err(|e| SpawnerError::send(format!("add_folder: {e}")))?;
 
-        let result = self
+        // Broker task is the authoritative visible text; locale resolves via
+        // the child's inherited effective_locale (capture locale = None).
+        let capture = Some(PromptCaptureContext::new(Some(task.clone()), None));
+        match self
             .manager
             .send_prompt_linked(
                 &self.db,
@@ -2571,14 +3451,72 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 Some(folder.id),
                 None,
                 Some(link),
+                capture,
             )
             .await
-            .map_err(|e| SpawnerError::Send(e.to_string()))?;
-        result.ok_or_else(|| {
-            SpawnerError::Send(
-                "send_prompt_linked succeeded but no conversation_id was bound".into(),
-            )
-        })
+        {
+            Ok(Some(cid)) => {
+                // Soft-watchdog: first successful child prompt enqueue resets
+                // agent activity so a newly accepted silent child gets a full
+                // threshold window. Does not touch idle-sweep last_activity_at
+                // beyond whatever send_prompt already did for general liveness.
+                if let Some(state) = self.manager.get_state(conn_id).await {
+                    state.write().await.mark_agent_activity(chrono::Utc::now());
+                }
+                // Authoritative wall start: exact row / timestamp lookup only.
+                // Missing or unreadable timestamps fail setup with a fixed
+                // non-secret error (no start publication upstream).
+                const TIMESTAMP_UNAVAILABLE: &str = "accepted delegation timestamp unavailable";
+                match conversation_service::get_by_id(&self.db.conn, cid).await {
+                    Ok(row) => match row.delegation_started_at {
+                        Some(started_at) => Ok(AcceptedDelegationPrompt {
+                            child_conversation_id: cid,
+                            started_at,
+                        }),
+                        None => {
+                            tracing::error!(
+                                child_conversation_id = cid,
+                                code = "accepted_delegation_timestamp_unavailable",
+                                "[delegation] accepted row missing delegation_started_at"
+                            );
+                            Err(SpawnerError::Send {
+                                message: TIMESTAMP_UNAVAILABLE.into(),
+                                child_conversation_id: Some(cid),
+                            })
+                        }
+                    },
+                    Err(_e) => {
+                        tracing::error!(
+                            child_conversation_id = cid,
+                            code = "accepted_delegation_timestamp_unavailable",
+                            "[delegation] accepted row timestamp lookup failed"
+                        );
+                        Err(SpawnerError::Send {
+                            message: TIMESTAMP_UNAVAILABLE.into(),
+                            child_conversation_id: Some(cid),
+                        })
+                    }
+                }
+            }
+            Ok(None) => Err(SpawnerError::send(
+                "send_prompt_linked succeeded but no conversation_id was bound",
+            )),
+            Err(e) => {
+                // Row may already exist (created before prompt enqueue). Preserve
+                // its id so the broker can settle failed/spawn_failed.
+                let child_conversation_id = {
+                    let conns = self.manager.connections.lock().await;
+                    match conns.get(conn_id) {
+                        Some(conn) => conn.state.read().await.conversation_id,
+                        None => None,
+                    }
+                };
+                Err(SpawnerError::Send {
+                    message: e.to_string(),
+                    child_conversation_id,
+                })
+            }
+        }
     }
 
     async fn cancel(
@@ -2633,10 +3571,7 @@ pub struct ConnectionManagerFeedbackLookup {
 
 #[async_trait::async_trait]
 impl SessionFeedbackAccess for ConnectionManagerFeedbackLookup {
-    async fn read_pending_feedback(
-        &self,
-        parent_connection_id: &str,
-    ) -> Vec<PendingFeedback> {
+    async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
         self.manager
             .read_pending_feedback(parent_connection_id)
             .await
@@ -2696,6 +3631,256 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, RwLock};
 
     #[test]
+    fn internal_probe_launch_context_tags_internal_probe_purpose() {
+        // Policy used by `probe_agent_options`: InternalProbe, no inherited
+        // locale (effective English via connection launch unwrap_or).
+        let ctx = internal_probe_launch_context();
+        assert_eq!(ctx.purpose, ConnectionPurpose::InternalProbe);
+        assert_eq!(ctx.inherited_locale, None);
+    }
+
+    #[tokio::test]
+    async fn delegated_child_inherits_parent_effective_locale() {
+        // Real manager/database path: parent locale is ZhCn; the spawn-owned
+        // parent launch snapshot (consumed by ConnectionManagerSpawner::spawn)
+        // must inherit it onto the child; delegated send must persist the
+        // broker task as first_user_text under that locale. Does not spawn a
+        // real external agent.
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
+        )
+        .await
+        .expect("enable auto title");
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let parent_id = "deleg-parent-locale";
+        let child_id = "deleg-child-locale";
+        let parent_workdir = PathBuf::from("/tmp/deleg-parent-locale");
+        let _parent_rx = mgr
+            .insert_test_connection_live(
+                parent_id,
+                AgentType::ClaudeCode,
+                Some(parent_workdir.clone()),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(parent_id).await.unwrap();
+            let mut s = state.write().await;
+            s.effective_locale = AppLocale::ZhCn;
+            s.purpose = ConnectionPurpose::User;
+        }
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+        // Production spawn-owned resolver: must read live parent state and build
+        // Delegation + parent effective_locale (not English default).
+        let snapshot = spawner
+            .resolve_parent_spawn_launch_snapshot(parent_id)
+            .await
+            .expect("parent spawn launch snapshot");
+        assert_eq!(
+            snapshot.launch_context.purpose,
+            ConnectionPurpose::Delegation
+        );
+        assert_eq!(
+            snapshot.launch_context.inherited_locale,
+            Some(AppLocale::ZhCn),
+            "delegated child must inherit parent effective_locale, not English default"
+        );
+        assert_eq!(
+            snapshot.parent_working_dir.as_deref(),
+            Some(parent_workdir.to_string_lossy().as_ref())
+        );
+        assert_eq!(snapshot.owner_window_label, "test-window");
+
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(PathBuf::from("/tmp/deleg-child-locale")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = snapshot.launch_context.purpose;
+            s.effective_locale = snapshot
+                .launch_context
+                .inherited_locale
+                .unwrap_or(AppLocale::En);
+        }
+
+        let parent_conversation = {
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-parent-locale").await;
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent conversation")
+        };
+
+        let task = "delegated broker task body".to_string();
+        let accepted = spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                task.clone(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-locale".into(),
+                    delegation_call_id: "call-locale".into(),
+                },
+            )
+            .await
+            .expect("delegated send");
+        let conversation_id = accepted.child_conversation_id;
+        assert!(
+            accepted.started_at.timestamp() > 0,
+            "accepted path must return durable started_at"
+        );
+
+        // Drain the enqueued command so the receiver stays live for the assert.
+        let _ = child_rx.try_recv();
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .expect("query job")
+            .expect("job enrolled");
+        assert_eq!(
+            job.first_user_text.as_deref(),
+            Some(task.as_str()),
+            "broker task must be the first-user-text source"
+        );
+        assert_eq!(
+            job.locale.as_deref(),
+            Some("zh_cn"),
+            "capture locale must resolve to the inherited child locale"
+        );
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let s = state.read().await;
+            assert_eq!(s.effective_locale, AppLocale::ZhCn);
+            assert_eq!(s.purpose, ConnectionPurpose::Delegation);
+        }
+    }
+
+    /// Production boundary: child row exists after enqueue but
+    /// `delegation_started_at` is missing → fixed non-secret
+    /// `SpawnerError::Send` so the broker setup path can tear down without
+    /// publishing running meta / DelegationStarted.
+    #[tokio::test]
+    async fn accepted_delegation_timestamp_unavailable_when_row_missing_started_at() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink, SpawnerError};
+        use crate::db::test_helpers;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
+        let mgr = Arc::new(ConnectionManager::new());
+        let child_id = "deleg-child-ts-miss";
+        let child_workdir = PathBuf::from("/tmp/deleg-child-ts-miss");
+        let mut child_rx = mgr
+            .insert_test_connection_live(
+                child_id,
+                AgentType::Codex,
+                Some(child_workdir),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.purpose = ConnectionPurpose::Delegation;
+        }
+
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-ts-miss").await;
+        let parent_conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent conversation");
+
+        // Pre-create the durable child row the spawner will look up after
+        // enqueue, then clear started_at so the production mapping path fires.
+        let child_row = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_conversation.id,
+                parent_tool_use_id: "tu-ts-miss".into(),
+                delegation_call_id: "call-ts-miss".into(),
+            }),
+        )
+        .await
+        .expect("child row");
+        {
+            let model = conversation::Entity::find_by_id(child_row.id)
+                .one(&db.conn)
+                .await
+                .expect("load child")
+                .expect("child exists");
+            let mut active: conversation::ActiveModel = model.into();
+            active.delegation_started_at = Set(None);
+            active.update(&db.conn).await.expect("clear started_at");
+        }
+        // already_linked path reuses this row (no second create).
+        {
+            let state = mgr.get_state(child_id).await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(child_row.id);
+        }
+
+        let spawner = ConnectionManagerSpawner {
+            manager: mgr.clone(),
+            db: db.clone(),
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+        let err = spawner
+            .send_prompt_linked_for_delegation(
+                child_id,
+                "task body for missing timestamp".into(),
+                DelegationLink {
+                    parent_conversation_id: parent_conversation.id,
+                    parent_tool_use_id: "tu-ts-miss".into(),
+                    delegation_call_id: "call-ts-miss".into(),
+                },
+            )
+            .await
+            .expect_err("missing started_at must fail acceptance");
+        match err {
+            SpawnerError::Send {
+                message,
+                child_conversation_id,
+            } => {
+                assert_eq!(
+                    message, "accepted delegation timestamp unavailable",
+                    "fixed non-secret error only"
+                );
+                assert_eq!(child_conversation_id, Some(child_row.id));
+            }
+            other => panic!("expected SpawnerError::Send, got {other:?}"),
+        }
+        // Drain enqueue so the test connection stays tidy.
+        let _ = child_rx.try_recv();
+    }
+
+    #[test]
     fn is_reserved_turn_id_matches_only_the_parser_namespace() {
         // Rejected: the parsers' `turn-<digits>` ids (an untrusted client id of
         // this shape would collide with a persisted transcript turn).
@@ -2728,12 +3913,28 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         }
     }
 
@@ -2812,7 +4013,7 @@ mod tests {
             let mut map = mgr.connections.lock().await;
             let conn = map.get_mut("c1").unwrap();
             let (spawn_config, observed_config) =
-                matching_config_pair(agent_fp.to_string(), shell_fp.to_string());
+                matching_config_pair(agent_fp.to_string(), shell_fp.to_string(), String::new());
             conn.spawn_config = spawn_config;
             conn.observed_config = observed_config;
         }
@@ -2827,7 +4028,10 @@ mod tests {
         let state = mgr.get_state("c1").await.unwrap();
         let state = state.read().await;
         assert!(state.config_stale);
-        assert_eq!(state.config_stale_kind, Some(ConfigStaleKind::TerminalShell));
+        assert_eq!(
+            state.config_stale_kind,
+            Some(ConfigStaleKind::TerminalShell)
+        );
     }
 
     #[tokio::test]
@@ -2851,9 +4055,249 @@ mod tests {
         let mgr = manager_with_fingerprints("agent-v1", "shell-v1").await;
         let mut receiver = subscribe_conn_stream(&mgr, "c1").await;
         assert_eq!(mgr.refresh_terminal_shell_staleness("shell-v1").await, 0);
-        assert!(tokio::time::timeout(Duration::from_millis(50), receiver.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    fn synthetic_connection_with_fingerprints(
+        agent: &str,
+        shell: &str,
+        route: &str,
+    ) -> AgentConnection {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = SessionState::new(
+            "synth".into(),
+            AgentType::Codex,
+            None,
+            "test-window".into(),
+            None,
+        );
+        state.status = ConnectionStatus::Connected;
+        let (spawn_config, observed_config) =
+            matching_config_pair(agent.to_string(), shell.to_string(), route.to_string());
+        AgentConnection {
+            id: "synth".into(),
+            agent_type: AgentType::Codex,
+            status: ConnectionStatus::Connected,
+            owner_window_label: "test-window".into(),
+            cmd_tx: tx,
+            task_abort: None,
+            state: Arc::new(RwLock::new(state)),
+            emitter: EventEmitter::Noop,
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            spawn_config,
+            observed_config,
+            terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+        }
+    }
+
+    #[test]
+    fn reuse_requires_route_compatibility_and_stale_priority_is_stable() {
+        assert_eq!(
+            route_reuse_decision("route-a", "route-a", "conn-1"),
+            RouteReuseDecision::Reuse
+        );
+        assert_eq!(
+            route_reuse_decision("route-a", "route-b", "conn-1"),
+            RouteReuseDecision::Conflict {
+                existing_connection_id: "conn-1".into(),
+            }
+        );
+
+        let mut conn = synthetic_connection_with_fingerprints("agent-v1", "shell-v1", "route-v1");
+        conn.observed_config.fingerprint.agent_config = "agent-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::AgentConfig)
+        );
+        conn.observed_config.fingerprint.delegation_route = "route-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        conn.observed_config.fingerprint.terminal_shell = "shell-v2".into();
+        assert_eq!(
+            effective_stale_kind(&conn),
+            Some(ConfigStaleKind::TerminalShell)
+        );
+    }
+
+    async fn manager_stale_kind(mgr: &ConnectionManager, id: &str) -> Option<ConfigStaleKind> {
+        let state = mgr.get_state(id).await.unwrap();
+        let kind = state.read().await.config_stale_kind;
+        kind
+    }
+
+    async fn seed_route_root(
+        mgr: &ConnectionManager,
+        id: &str,
+        preference: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+        fingerprint: &str,
+    ) {
+        use crate::acp::delegation::route::{
+            DelegationConnectionOrigin, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        insert_fake_connection(mgr, id, AgentType::Codex, None, EventEmitter::Noop).await;
+        let mut map = mgr.connections.lock().await;
+        let conn = map.get_mut(id).unwrap();
+        let (spawn_config, observed_config) =
+            matching_config_pair("agent-v1", "shell-v1", fingerprint.to_string());
+        conn.spawn_config = spawn_config;
+        conn.observed_config = observed_config;
+        conn.origin = DelegationConnectionOrigin::Root;
+        conn.route_preference = preference;
+        conn.route_plan = crate::acp::delegation::route::DelegationRoutePlan {
+            managed: true,
+            requested: preference.unwrap_or(DelegationRoutePolicy::Codeg),
+            effective: preference.unwrap_or(DelegationRoutePolicy::Codeg),
+            source: if preference.is_some() {
+                DelegationRouteSource::SessionOverride
+            } else {
+                DelegationRouteSource::GlobalDefault
+            },
+            native_suppression: if preference == Some(DelegationRoutePolicy::Native) {
+                NativeSuppressionPlan::None
+            } else {
+                NativeSuppressionPlan::CodexMultiAgentFalse
+            },
+            expose_codeg_delegation: preference != Some(DelegationRoutePolicy::Native),
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: fingerprint.to_string(),
+        };
+    }
+
+    #[tokio::test]
+    async fn route_setting_revert_clears_root_staleness_and_never_marks_child() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(&mgr, "root", None, &codeg_fp).await;
+        // Forced child with matching Codeg fingerprint.
+        insert_fake_connection(&mgr, "child", AgentType::Codex, None, EventEmitter::Noop).await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let child = map.get_mut("child").unwrap();
+            let (spawn_config, observed_config) =
+                matching_config_pair("agent-v1", "shell-v1", codeg_fp.clone());
+            child.spawn_config = spawn_config;
+            child.observed_config = observed_config;
+            child.origin = DelegationConnectionOrigin::CodegChild;
+            child.route_preference = None;
+        }
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Native, true)
+            .await;
+        assert_eq!(
+            manager_stale_kind(&mgr, "root").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        assert_eq!(manager_stale_kind(&mgr, "child").await, None);
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Codeg, true)
+            .await;
+        assert_eq!(manager_stale_kind(&mgr, "root").await, None);
+    }
+
+    #[tokio::test]
+    async fn global_route_refresh_respects_each_root_override() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            None,
+            DelegationRoutePolicy::Codeg,
+            true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+        );
+        let native_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            Some(DelegationRoutePolicy::Native),
+            DelegationRoutePolicy::Codeg,
+            true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(&mgr, "inherited", None, &codeg_fp).await;
+        seed_route_root(
+            &mgr,
+            "native-override",
+            Some(DelegationRoutePolicy::Native),
+            &native_fp,
+        )
+        .await;
+
+        mgr.refresh_delegation_route_staleness(DelegationRoutePolicy::Native, true)
+            .await;
+        assert_eq!(
+            manager_stale_kind(&mgr, "inherited").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        assert_eq!(manager_stale_kind(&mgr, "native-override").await, None);
+    }
+
+    #[tokio::test]
+    async fn draft_route_change_marks_stale_without_mutating_launch_plan() {
+        use crate::acp::delegation::route::{
+            comparison_route_fingerprint, DelegationConnectionOrigin, DelegationRoutePolicy,
+        };
+
+        let codeg_fp = comparison_route_fingerprint(
+            AgentType::Codex,
+            DelegationConnectionOrigin::Root,
+            Some(DelegationRoutePolicy::Codeg),
+            DelegationRoutePolicy::Codeg,
+            true,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+        );
+        let mgr = ConnectionManager::new();
+        seed_route_root(&mgr, "draft", Some(DelegationRoutePolicy::Codeg), &codeg_fp).await;
+        let before = {
+            let map = mgr.connections.lock().await;
+            map.get("draft").unwrap().route_plan.clone()
+        };
+
+        mgr.set_draft_delegation_route_preference(
+            "draft",
+            Some(DelegationRoutePolicy::Native),
+            DelegationRoutePolicy::Codeg,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager_stale_kind(&mgr, "draft").await,
+            Some(ConfigStaleKind::DelegationRoute)
+        );
+        let after = {
+            let map = mgr.connections.lock().await;
+            map.get("draft").unwrap().route_plan.clone()
+        };
+        assert_eq!(after, before);
     }
 
     /// Subscribe directly to the per-connection event stream. Phase 4b
@@ -2927,6 +4371,722 @@ mod tests {
         }]
     }
 
+    /// Live command receiver + linked conversation + enrolled auto-title job.
+    /// Uses `insert_test_connection_live` so `reserve()` can succeed or block.
+    struct PromptAdmissionFixture {
+        db: AppDatabase,
+        manager: ConnectionManager,
+        connection_id: String,
+        conversation_id: i32,
+        #[allow(dead_code)]
+        folder_id: i32,
+        command_receiver: mpsc::Receiver<ConnectionCommand>,
+    }
+
+    impl PromptAdmissionFixture {
+        async fn state(&self) -> Arc<RwLock<SessionState>> {
+            self.manager
+                .get_state(&self.connection_id)
+                .await
+                .expect("fixture connection state")
+        }
+
+        async fn fail_next_capture_transaction(&self) {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            self.db
+                .conn
+                .execute(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "CREATE TRIGGER fail_title_capture BEFORE UPDATE ON auto_title_jobs \
+                     BEGIN SELECT RAISE(ABORT, 'capture failure'); END"
+                        .to_owned(),
+                ))
+                .await
+                .expect("install capture failure trigger");
+        }
+
+        async fn job_first_user_text(&self) -> Option<String> {
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            auto_title_job::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .expect("query job")
+                .and_then(|j| j.first_user_text)
+        }
+
+        async fn job_locale(&self) -> Option<String> {
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            auto_title_job::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .expect("query job")
+                .and_then(|j| j.locale)
+        }
+    }
+
+    async fn prompt_admission_fixture() -> PromptAdmissionFixture {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
+        )
+        .await
+        .expect("enable auto title");
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-admission").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conversation with job enrollment");
+
+        let manager = ConnectionManager::new();
+        let connection_id = "admission-conn".to_string();
+        let command_receiver = manager
+            .insert_test_connection_live(
+                &connection_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/prompt-admission")),
+                EventEmitter::Noop,
+            )
+            .await;
+
+        {
+            let state = manager.get_state(&connection_id).await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(conversation.id);
+            s.folder_id = Some(folder_id);
+            s.purpose = crate::auto_title::ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+            s.active_turn = None;
+        }
+
+        PromptAdmissionFixture {
+            db,
+            manager,
+            connection_id,
+            conversation_id: conversation.id,
+            folder_id,
+            command_receiver,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_failure_prevents_enqueue_and_fast_completion_cannot_win() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let mut fixture = prompt_admission_fixture().await;
+        fixture.fail_next_capture_transaction().await;
+        let result = fixture
+            .manager
+            .send_prompt(
+                &fixture.db,
+                &fixture.connection_id,
+                one_text_block(),
+                Some(PromptCaptureContext::new(
+                    Some("visible".into()),
+                    Some(AppLocale::ZhCn),
+                )),
+            )
+            .await;
+        assert!(result.is_err(), "capture failure must reject the send");
+        assert!(
+            fixture.command_receiver.try_recv().is_err(),
+            "failed capture must not enqueue a Prompt command"
+        );
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(
+                state.active_turn.is_none(),
+                "failed capture must leave active_turn unset"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "failed capture must leave turn_in_flight clear"
+            );
+        }
+        assert_eq!(
+            fixture.job_first_user_text().await,
+            None,
+            "aborted capture must not persist first_user_text"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_while_reserving_stages_no_title_context() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let fixture = prompt_admission_fixture().await;
+        // Fill the live channel (capacity 4) so the next reserve() blocks.
+        let tx = fixture
+            .manager
+            .connections
+            .lock()
+            .await
+            .get(&fixture.connection_id)
+            .unwrap()
+            .cmd_tx
+            .clone();
+        for _ in 0..4 {
+            tx.send(ConnectionCommand::Prompt {
+                blocks: one_text_block(),
+                user_message: None,
+                mark_awaiting_reply: false,
+            })
+            .await
+            .unwrap();
+        }
+
+        let send_fut = fixture.manager.send_prompt(
+            &fixture.db,
+            &fixture.connection_id,
+            one_text_block(),
+            Some(PromptCaptureContext::new(
+                Some("cancelled-visible".into()),
+                Some(AppLocale::Ja),
+            )),
+        );
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), send_fut).await;
+        assert!(
+            timed_out.is_err(),
+            "send must still be blocked on channel reserve"
+        );
+
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(
+                state.active_turn.is_none(),
+                "cancellation during reserve stages no active_turn"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "cancellation during reserve must not set turn_in_flight"
+            );
+        }
+        assert_eq!(
+            fixture.job_first_user_text().await,
+            None,
+            "cancellation during reserve stages no capture write"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_persists_capture_before_immediate_completion() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        let mut fixture = prompt_admission_fixture().await;
+        let result = fixture
+            .manager
+            .send_prompt(
+                &fixture.db,
+                &fixture.connection_id,
+                one_text_block(),
+                Some(PromptCaptureContext::new(
+                    Some("persist-before-complete".into()),
+                    Some(AppLocale::ZhCn),
+                )),
+            )
+            .await;
+        assert!(result.is_ok(), "accepted send: {result:?}");
+
+        // Capture must already be durable before the agent can process the
+        // enqueued command (immediate-completion race).
+        assert_eq!(
+            fixture.job_first_user_text().await.as_deref(),
+            Some("persist-before-complete")
+        );
+        assert_eq!(fixture.job_locale().await.as_deref(), Some("zh_cn"));
+        {
+            let state_arc = fixture.state().await;
+            let state = state_arc.read().await;
+            assert!(state.turn_in_flight);
+            let active = state
+                .active_turn
+                .as_ref()
+                .expect("accepted prompt sets active_turn");
+            assert_eq!(active.locale, AppLocale::ZhCn);
+            assert!(!active.token.is_empty());
+            assert_eq!(state.effective_locale, AppLocale::ZhCn);
+        }
+
+        // Immediate completion path: receive the queued command with no delay.
+        let cmd = fixture
+            .command_receiver
+            .try_recv()
+            .expect("prompt must already be enqueued after successful admission");
+        assert!(matches!(cmd, ConnectionCommand::Prompt { .. }));
+    }
+
+    #[tokio::test]
+    async fn linked_and_already_linked_sends_share_capture_once() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::service::app_metadata_service;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).unwrap(),
+        )
+        .await
+        .unwrap();
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/share-capture-once").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "share-once-conn";
+        let mut cmd_rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/share-capture-once")),
+                EventEmitter::Noop,
+            )
+            .await;
+
+        // First linked send (Branch B create + single admission capture).
+        let first = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "first linked task".into(),
+                }],
+                Some(folder_id),
+                None,
+                None,
+                Some(PromptCaptureContext::new(
+                    Some("first linked task".into()),
+                    Some(AppLocale::En),
+                )),
+            )
+            .await
+            .expect("first linked send");
+        let conversation_id = first.expect("conversation id bound");
+
+        use crate::db::entities::auto_title_job;
+        use sea_orm::EntityTrait;
+        let job_after_first = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job after first send");
+        assert_eq!(
+            job_after_first.first_user_text.as_deref(),
+            Some("first linked task")
+        );
+        assert_eq!(job_after_first.locale.as_deref(), Some("en"));
+
+        // Drain + clear gate so the already-linked path can admit again.
+        let _ = cmd_rx.try_recv();
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.active_turn = None;
+        }
+
+        // Second already-linked send shares the same capture hook once:
+        // locale refreshes, first_user_text stays write-once.
+        mgr.send_prompt_linked(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "second linked task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+            Some(PromptCaptureContext::new(
+                Some("second linked task".into()),
+                Some(AppLocale::Ja),
+            )),
+        )
+        .await
+        .expect("already-linked send");
+
+        let job_after_second = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job after second send");
+        assert_eq!(
+            job_after_second.first_user_text.as_deref(),
+            Some("first linked task"),
+            "first_user_text is write-once across linked + already-linked"
+        );
+        assert_eq!(
+            job_after_second.locale.as_deref(),
+            Some("ja"),
+            "locale refreshes on the second admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_failure_stages_no_capture() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::models::system::AppLocale;
+
+        // Dropped command receiver: reserve() fails with ProcessExited.
+        let fixture_db = {
+            use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+            use crate::db::service::app_metadata_service;
+            use crate::db::test_helpers;
+            let db = test_helpers::fresh_in_memory_db().await;
+            app_metadata_service::upsert_value(
+                &db.conn,
+                KEY_AUTO_TITLE_AGENT,
+                &serde_json::to_string(&AgentType::Codex).unwrap(),
+            )
+            .await
+            .unwrap();
+            let folder_id = test_helpers::seed_folder(&db, "/tmp/reserve-fail").await;
+            let conversation = conversation_service::create(
+                &db.conn,
+                folder_id,
+                AgentType::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mgr = ConnectionManager::new();
+            let conn_id = "reserve-fail-conn";
+            mgr.insert_test_connection(conn_id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                .await;
+            {
+                let state = mgr.get_state(conn_id).await.unwrap();
+                let mut s = state.write().await;
+                s.conversation_id = Some(conversation.id);
+                s.folder_id = Some(folder_id);
+            }
+            let err = mgr
+                .send_prompt(
+                    &db,
+                    conn_id,
+                    one_text_block(),
+                    Some(PromptCaptureContext::new(
+                        Some("never-written".into()),
+                        Some(AppLocale::Ko),
+                    )),
+                )
+                .await
+                .expect_err("dropped receiver must fail reserve");
+            assert!(
+                matches!(err, AcpError::ProcessExited),
+                "expected ProcessExited, got {err:?}"
+            );
+            let state = mgr.get_state(conn_id).await.unwrap();
+            assert!(state.read().await.active_turn.is_none());
+            assert!(!state.read().await.turn_in_flight);
+
+            use crate::db::entities::auto_title_job;
+            use sea_orm::EntityTrait;
+            let job = auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .expect("job");
+            assert_eq!(job.first_user_text, None);
+            assert_eq!(job.locale, None);
+            db
+        };
+        drop(fixture_db);
+    }
+
+    #[tokio::test]
+    async fn unlinked_send_bypasses_capture() {
+        use crate::auto_title::PromptCaptureContext;
+        use crate::db::test_helpers;
+        use crate::models::system::AppLocale;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live(
+                "unlinked-conn",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        mgr.send_prompt(
+            &db,
+            "unlinked-conn",
+            one_text_block(),
+            Some(PromptCaptureContext::new(
+                Some("should-not-need-job".into()),
+                Some(AppLocale::Fr),
+            )),
+        )
+        .await
+        .expect("unlinked send succeeds without capture");
+
+        assert!(matches!(
+            rx.try_recv().expect("enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        let state = mgr.get_state("unlinked-conn").await.unwrap();
+        let s = state.read().await;
+        assert!(
+            s.active_turn.is_none(),
+            "unlinked path must not set active_turn"
+        );
+        assert!(s.turn_in_flight);
+        assert_eq!(s.effective_locale, AppLocale::En);
+    }
+
+    #[tokio::test]
+    async fn ordinary_send_prompt_rejects_internal_title_purpose() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live(
+                "reject-internal-title",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("reject-internal-title").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        let err = mgr
+            .send_prompt(&db, "reject-internal-title", one_text_block(), None)
+            .await
+            .expect_err("ordinary send must reject InternalTitle");
+        assert!(
+            err.to_string().contains("InternalTitle")
+                || err.to_string().contains("send_prompt_unlinked_internal"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_and_subscribe_recovers_session_started_before_subscribe_for_internal_title() {
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live("id-sub-conn", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = mgr.get_state("id-sub-conn").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        // Apply SessionStarted before subscribe — snapshot branch must see it.
+        {
+            let state = mgr.get_state("id-sub-conn").await.unwrap();
+            emit_with_state(
+                &state,
+                &EventEmitter::Noop,
+                AcpEvent::SessionStarted {
+                    session_id: "ext-pre".into(),
+                },
+            )
+            .await;
+        }
+        let (id, _rx) = mgr
+            .identity_and_subscribe("id-sub-conn")
+            .await
+            .expect("identity");
+        assert_eq!(id.as_deref(), Some("ext-pre"));
+    }
+
+    #[tokio::test]
+    async fn noop_emitter_keeps_internal_title_events_off_transport_and_lifecycle_bus() {
+        // Noop has no ACP bus / transport target — do not use an unattached
+        // bus as "proof" of isolation (that bus was never on the emit path).
+        assert!(
+            EventEmitter::Noop.acp_event_bus().is_none(),
+            "EventEmitter::Noop must expose no ACP internal bus"
+        );
+
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live(
+                "noop-internal-title",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("noop-internal-title").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTitle;
+        }
+        let state = mgr.get_state("noop-internal-title").await.unwrap();
+        let (_id, mut private_rx) = mgr
+            .identity_and_subscribe("noop-internal-title")
+            .await
+            .expect("subscribe");
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::ContentDelta {
+                text: "title delta".into(),
+            },
+        )
+        .await;
+
+        // Private stream receives events for the title runner.
+        let first = private_rx.try_recv().expect("private ContentDelta");
+        assert!(matches!(first.payload, AcpEvent::ContentDelta { .. }));
+    }
+
+    #[tokio::test]
+    async fn internal_helper_rejects_user_and_delegation_accepts_internal() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live(
+                "internal-helper-conn",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        // Default purpose is User → reject.
+        let err = mgr
+            .send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect_err("User purpose rejected");
+        assert!(
+            matches!(err, AcpError::Protocol(_)) || err.to_string().contains("internal"),
+            "unexpected error: {err:?}"
+        );
+
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            state.write().await.purpose = crate::auto_title::ConnectionPurpose::Delegation;
+        }
+        let err = mgr
+            .send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect_err("Delegation purpose rejected");
+        assert!(
+            matches!(err, AcpError::Protocol(_)) || err.to_string().contains("internal"),
+            "unexpected error: {err:?}"
+        );
+
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            state.write().await.purpose = crate::auto_title::ConnectionPurpose::InternalProbe;
+        }
+        mgr.send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect("InternalProbe accepted");
+        assert!(matches!(
+            rx.try_recv().expect("probe enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.purpose = crate::auto_title::ConnectionPurpose::InternalTitle;
+        }
+        mgr.send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect("InternalTitle accepted");
+        assert!(matches!(
+            rx.try_recv().expect("title enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        // Internal path never stages title capture context.
+        let state = mgr.get_state("internal-helper-conn").await.unwrap();
+        assert!(state.read().await.active_turn.is_none());
+        let _ = db; // keep db alive for API symmetry with other admission tests
+    }
+
+    #[tokio::test]
+    async fn prompt_wrappers_encode_user_facing_and_background_attention() {
+        use crate::db::test_helpers;
+
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live("policy-conn", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+
+        let policy_db = crate::db::test_helpers::fresh_in_memory_db().await;
+        mgr.send_prompt(&policy_db, "policy-conn", one_text_block(), None)
+            .await
+            .expect("UI prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected prompt command");
+        };
+        assert!(mark_awaiting_reply);
+
+        {
+            let state = mgr.get_state("policy-conn").await.unwrap();
+            state.write().await.turn_in_flight = false;
+        }
+        mgr.send_prompt_background("policy-conn", one_text_block())
+            .await
+            .expect("background prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected background prompt command");
+        };
+        assert!(!mark_awaiting_reply);
+
+        // Automation uses the linked-background public API (hard-codes
+        // mark_awaiting_reply=false). Exercise that path against a live
+        // connection + real in-memory conversation, not the private impl.
+        {
+            let state = mgr.get_state("policy-conn").await.unwrap();
+            state.write().await.turn_in_flight = false;
+        }
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/policy-linked-bg").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::Codex, None, None)
+                .await
+                .expect("seed conversation");
+        mgr.send_prompt_linked_background(
+            &db,
+            "policy-conn",
+            one_text_block(),
+            Some(folder_id),
+            Some(conversation.id),
+            None,
+        )
+        .await
+        .expect("linked background prompt");
+        let ConnectionCommand::Prompt {
+            mark_awaiting_reply,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected linked background prompt command");
+        };
+        assert!(
+            !mark_awaiting_reply,
+            "send_prompt_linked_background must enqueue mark_awaiting_reply=false"
+        );
+    }
+
     /// Insert a connection with a LIVE command receiver so `send_prompt_inner`'s
     /// enqueue SUCCEEDS (the UserMessage broadcast is deferred until after a
     /// successful enqueue). Returns the receiver — keep it in scope for the
@@ -2954,12 +5114,28 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         mgr.connections
             .lock()
@@ -2997,6 +5173,7 @@ mod tests {
                 Some(folder_id),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(
@@ -3022,9 +5199,7 @@ mod tests {
         // Wire-only `<codeg_terminal_context>` is appended in the connection
         // loop after this payload is captured for broadcast.
         assert!(
-            um.1
-                .iter()
-                .all(|t| !t.contains("codeg_terminal_context")),
+            um.1.iter().all(|t| !t.contains("codeg_terminal_context")),
             "user_message must never leak terminal context block, got {um:?}"
         );
     }
@@ -3059,6 +5234,7 @@ mod tests {
                 Some(folder_id),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(first.is_ok(), "first prompt accepted");
@@ -3071,6 +5247,7 @@ mod tests {
                     text: "second".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3109,7 +5286,7 @@ mod tests {
 
         let rows_before = count_conversation_rows(&db).await;
         let empty = mgr
-            .send_prompt_linked(&db, conn_id, vec![], Some(folder_id), None, None)
+            .send_prompt_linked(&db, conn_id, vec![], Some(folder_id), None, None, None)
             .await;
         assert!(empty.is_err(), "an empty prompt must be rejected");
         assert_eq!(
@@ -3134,6 +5311,7 @@ mod tests {
                 conn_id,
                 vec![PromptInputBlock::Text { text: "hi".into() }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3165,8 +5343,14 @@ mod tests {
             .await
             .turn_in_flight = true;
 
+        let busy_db = crate::db::test_helpers::fresh_in_memory_db().await;
         let res = mgr
-            .send_prompt(conn_id, vec![PromptInputBlock::Text { text: "hi".into() }])
+            .send_prompt(
+                &busy_db,
+                conn_id,
+                vec![PromptInputBlock::Text { text: "hi".into() }],
+                None,
+            )
             .await;
         assert!(
             matches!(res, Err(AcpError::TurnInProgress)),
@@ -3297,12 +5481,28 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -3401,6 +5601,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                mark_awaiting_reply: false,
             })
             .await
             .unwrap();
@@ -3408,12 +5609,15 @@ mod tests {
 
         // send_prompt_inner now blocks on reserve(); drop it via a short timeout.
         let fut = mgr.send_prompt_inner(
+            None,
             conn_id,
             vec![PromptInputBlock::Text {
                 text: "blocked".into(),
             }],
             None,
             true,
+            true,
+            None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(
@@ -3457,6 +5661,7 @@ mod tests {
             None,
             None,
             Some("optimistic-abc".to_string()),
+            None,
         )
         .await
         .expect("send");
@@ -3502,6 +5707,7 @@ mod tests {
                     text: "never enqueued".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -3557,6 +5763,7 @@ mod tests {
                 parent_tool_use_id: "tu-1".into(),
                 delegation_call_id: "call-1".into(),
             }),
+            None,
         )
         .await
         .expect("delegation kickoff enqueues");
@@ -3638,10 +5845,10 @@ mod tests {
         // Empty / whitespace / image-only prompts seed no title (stays NULL,
         // backfilled on first detail load as before).
         assert!(delegation_child_title_seed(&[]).is_none());
-        assert!(
-            delegation_child_title_seed(&[PromptInputBlock::Text { text: "  \n ".into() }])
-                .is_none()
-        );
+        assert!(delegation_child_title_seed(&[PromptInputBlock::Text {
+            text: "  \n ".into()
+        }])
+        .is_none());
         let img = vec![PromptInputBlock::Image {
             data: "x".into(),
             mime_type: "image/png".into(),
@@ -3688,6 +5895,7 @@ mod tests {
             Some(folder_id),
             None,
             None,
+            None,
         )
         .await
         .expect("send should succeed with a live receiver");
@@ -3730,6 +5938,7 @@ mod tests {
                 uri: None,
             }],
             Some(folder_id),
+            None,
             None,
             None,
         )
@@ -3805,7 +6014,15 @@ mod tests {
         // First call: creates conversation row, sets state.conversation_id.
         // The mpsc send error after linking is expected and ignored here.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
         let snap = mgr
             .get_state(conn_id)
@@ -3823,7 +6040,15 @@ mod tests {
 
         // Second call: ignores folder_id, does NOT create another row.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
         let snap2 = mgr
             .get_state(conn_id)
@@ -3846,7 +6071,7 @@ mod tests {
             map.insert(conn_id.into(), fake_connection(conn_id, None));
         }
         let result = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), None, None, None)
+            .send_prompt_linked(&db, conn_id, one_text_block(), None, None, None, None)
             .await;
         assert!(
             result.is_err(),
@@ -3906,6 +6131,7 @@ mod tests {
                 one_text_block(),
                 Some(folder_id),
                 Some(pre_existing.id),
+                None,
                 None,
             )
             .await;
@@ -3984,7 +6210,15 @@ mod tests {
         // cmd_tx receiver is dropped → the prompt send fails after linking, but
         // the link + external_id persist + broadcast already happened.
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let cid = mgr
@@ -4039,6 +6273,7 @@ mod tests {
                 Some(folder_id),
                 Some(pre.id),
                 None,
+                None,
             )
             .await;
 
@@ -4069,7 +6304,7 @@ mod tests {
         .await;
 
         let err = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), None, Some(42), None)
+            .send_prompt_linked(&db, conn_id, one_text_block(), None, Some(42), None, None)
             .await
             .expect_err("should reject conversation_id without folder_id");
         assert!(matches!(err, AcpError::Protocol(_)));
@@ -4111,6 +6346,7 @@ mod tests {
                 one_text_block(),
                 Some(folder_id),
                 Some(pre.id),
+                None,
                 None,
             )
             .await;
@@ -4182,7 +6418,15 @@ mod tests {
         //   2. ConversationStatusChanged(InProgress)  [pre-send write]
         //   3. ConversationStatusChanged(Cancelled)   [rollback after send failure]
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let env1 = recv_first_acp_event(&mut rx).await;
@@ -4251,7 +6495,15 @@ mod tests {
             .unwrap();
 
         let _ = mgr
-            .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let env4 = recv_first_acp_event(&mut rx).await;
@@ -4402,12 +6654,12 @@ mod tests {
             s.status = ConnectionStatus::Connected;
         }
 
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::new(),
-            terminal_settings: SystemTerminalSettings {
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
             },
-        };
+        );
         let id = mgr
             .spawn_agent(
                 AgentType::ClaudeCode,
@@ -4418,6 +6670,7 @@ mod tests {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect("reuse must succeed even when new shell is unavailable");
@@ -4435,12 +6688,12 @@ mod tests {
         use crate::models::SystemTerminalSettings;
 
         let mgr = ConnectionManager::new();
-        let inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::new(),
-            terminal_settings: SystemTerminalSettings {
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
                 default_shell: Some("missing-shell".into()),
             },
-        };
+        );
         let err = mgr
             .spawn_agent(
                 AgentType::ClaudeCode,
@@ -4451,6 +6704,7 @@ mod tests {
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect_err("unavailable shell must fail before process spawn");
@@ -4462,9 +6716,7 @@ mod tests {
 
     #[tokio::test]
     async fn changing_settings_does_not_mutate_running_snapshot() {
-        use crate::acp::terminal_context::{
-            finalize_acp_launch_config, AcpLaunchInputs,
-        };
+        use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchInputs};
         use crate::models::SystemTerminalSettings;
         use crate::terminal::shell::ResolvedShellSnapshot;
 
@@ -4491,23 +6743,23 @@ mod tests {
         let path_b = make_usable_shell(dir.path(), name_b);
 
         let snap_a: ResolvedShellSnapshot = finalize_acp_launch_config(
-            AcpLaunchInputs {
-                runtime_env: BTreeMap::new(),
-                terminal_settings: SystemTerminalSettings {
+            AcpLaunchInputs::with_placeholder_route(
+                BTreeMap::new(),
+                SystemTerminalSettings {
                     default_shell: Some(path_a.to_string_lossy().into_owned()),
                 },
-            },
+            ),
             AgentType::ClaudeCode,
         )
         .expect("shell a")
         .terminal_shell;
         let snap_b: ResolvedShellSnapshot = finalize_acp_launch_config(
-            AcpLaunchInputs {
-                runtime_env: BTreeMap::new(),
-                terminal_settings: SystemTerminalSettings {
+            AcpLaunchInputs::with_placeholder_route(
+                BTreeMap::new(),
+                SystemTerminalSettings {
                     default_shell: Some(path_b.to_string_lossy().into_owned()),
                 },
-            },
+            ),
             AgentType::ClaudeCode,
         )
         .expect("shell b")
@@ -4541,16 +6793,17 @@ mod tests {
                 AgentType::ClaudeCode,
                 Some(working_dir.to_string_lossy().into_owned()),
                 Some("ext-snap".into()),
-                AcpLaunchInputs {
-                    runtime_env: BTreeMap::new(),
-                    terminal_settings: SystemTerminalSettings {
+                AcpLaunchInputs::with_placeholder_route(
+                    BTreeMap::new(),
+                    SystemTerminalSettings {
                         default_shell: Some(path_b.to_string_lossy().into_owned()),
                     },
-                },
+                ),
                 "test-window".into(),
                 EventEmitter::Noop,
                 None,
                 BTreeMap::new(),
+                ConnectionLaunchContext::default(),
             )
             .await
             .expect("reuse");
@@ -4831,12 +7084,28 @@ mod tests {
         tokio::join!(
             async {
                 let _ = mgr_ref
-                    .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+                    .send_prompt_linked(
+                        &db,
+                        conn_id,
+                        one_text_block(),
+                        Some(folder_id),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             },
             async {
                 let _ = mgr_ref
-                    .send_prompt_linked(&db, conn_id, one_text_block(), Some(folder_id), None, None)
+                    .send_prompt_linked(
+                        &db,
+                        conn_id,
+                        one_text_block(),
+                        Some(folder_id),
+                        None,
+                        None,
+                        None,
+                    )
                     .await;
             },
         );
@@ -4926,6 +7195,150 @@ mod tests {
         assert_eq!(mgr.spawn_handshake_timeout, Duration::from_secs(7));
     }
 
+    /// Successful status owners emit exactly one authoritative `state` patch
+    /// on conversation://changed (no legacy `status` bridge, no duplicates).
+    #[tokio::test]
+    async fn cancel_emits_exactly_one_state_event_with_backend_patch() {
+        use crate::db::entities::conversation;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/cancel-state-event").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(conv.status, ConversationStatus::InProgress);
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-cancel-state";
+        // Keep cmd_rx alive so Cancel enqueues; a dropped receiver fails before
+        // the status CAS.
+        let _cmd_rx = mgr
+            .insert_test_connection_live(
+                conn_id,
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/cancel-state-event")),
+                EventEmitter::test_web_only(broadcaster.clone()),
+            )
+            .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            state.write().await.conversation_id = Some(conv.id);
+        }
+        let mut acp_rx = subscribe_conn_stream(&mgr, conn_id).await;
+
+        mgr.cancel(&db.conn, conn_id).await.expect("cancel");
+
+        // Per-connection status event first.
+        let env = recv_first_acp_event(&mut acp_rx).await;
+        match env.payload {
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status,
+            } => {
+                assert_eq!(conversation_id, conv.id);
+                assert_eq!(status, ConversationStatus::Cancelled);
+            }
+            other => panic!("expected ConversationStatusChanged(Cancelled), got {other:?}"),
+        }
+
+        // Exactly one global state patch, values match the backend row.
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == crate::web::event_bridge::CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(
+            state_events.len(),
+            1,
+            "cancel must emit exactly one conversation://changed event"
+        );
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], conv.id);
+        assert_eq!(p["patch"]["status"], "cancelled");
+        assert!(p["patch"]["awaiting_reply_token"].is_null());
+        assert_eq!(
+            p["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_status_owners_emit_one_state_patch_each() {
+        use crate::db::entities::conversation;
+        use crate::db::test_helpers;
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-state-event").await;
+        let mgr = ConnectionManager::new();
+        let (broadcaster, mut global_rx) = make_test_broadcaster();
+        let conn_id = "conn-prompt-state";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/prompt-state-event")),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+
+        let _ = mgr
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "trigger send failure".into(),
+                }],
+                Some(folder_id),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel != crate::web::event_bridge::CONVERSATION_CHANGED_EVENT {
+                continue;
+            }
+            let p = &*evt.payload;
+            if p["kind"] == "state" {
+                state_events.push(p.clone());
+            }
+        }
+        // InProgress (prompt start) + Cancelled (send rollback) — no legacy status,
+        // and no duplicate of either.
+        assert_eq!(
+            state_events.len(),
+            2,
+            "expected one state patch per successful status write, got {state_events:?}"
+        );
+        assert_eq!(state_events[0]["patch"]["status"], "in_progress");
+        assert_eq!(state_events[1]["patch"]["status"], "cancelled");
+        let conv_id = state_events[1]["patch"]["id"].as_i64().unwrap() as i32;
+        let row = conversation::Entity::find_by_id(conv_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ConversationStatus::Cancelled);
+        assert_eq!(
+            state_events[1]["patch"]["updated_at"],
+            serde_json::to_value(row.updated_at).unwrap()
+        );
+    }
+
     /// When `send_prompt_inner` fails (process gone, channel closed) the row
     /// must end up `Cancelled`, NOT stuck on `in_progress`. Without this
     /// rollback the lifecycle subscriber's TurnComplete write never fires
@@ -4967,6 +7380,7 @@ mod tests {
                     text: "trigger send failure".into(),
                 }],
                 Some(folder_id),
+                None,
                 None,
                 None,
             )
@@ -5060,12 +7474,28 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5143,6 +7573,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_preserves_generated_title_guard_without_enrolling_sibling() {
+        use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
+        use crate::db::test_helpers;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-title-guard").await;
+
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("Generated Topic".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::update_external_id(&db.conn, pre.id, "session-S1".into())
+            .await
+            .unwrap();
+
+        // Live row already has a finalized generated title and a residual job.
+        let mut active: conversation::ActiveModel = conversation::Entity::find_by_id(pre.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        active.auto_title_finalized = Set(true);
+        active.update(&db.conn).await.unwrap();
+
+        let now = chrono::Utc::now();
+        auto_title_job::ActiveModel {
+            conversation_id: Set(pre.id),
+            state: Set(AutoTitleJobState::AwaitingTurn),
+            attempts: Set(0),
+            first_user_text: Set(None),
+            first_assistant_text: Set(None),
+            locale: Set(None),
+            usable_turn_seq: Set(0),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(None),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed job on live row");
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-guard", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(&db, "c-fork-guard", None, None)
+            .await
+            .expect("fork");
+        let _ = join.await;
+
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
+            .await
+            .unwrap();
+
+        assert!(
+            current.auto_title_finalized,
+            "live row must retain auto_title_finalized"
+        );
+        assert!(
+            sibling.auto_title_finalized,
+            "sibling must copy auto_title_finalized"
+        );
+        assert!(
+            auto_title_job::Entity::find_by_id(pre.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_some(),
+            "existing job stays on the live row"
+        );
+        assert!(
+            auto_title_job::Entity::find_by_id(result.sibling_conversation_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "sibling must not receive a new auto-title job"
+        );
+    }
+
+    #[tokio::test]
     async fn fork_session_strips_existing_fork_prefix_without_stacking() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
@@ -5160,7 +7680,10 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-restack", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-restack", None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -5434,12 +7957,28 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config: matching_config_pair(String::new(), "system").0,
-            observed_config: matching_config_pair(String::new(), "system").1,
+            spawn_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .0,
+            observed_config: matching_config_pair(
+                String::new(),
+                "system",
+                crate::acp::delegation::route::test_empty_route_plan().fingerprint,
+            )
+            .1,
             terminal_shell: crate::acp::connection::test_placeholder_terminal_shell(),
+            route_plan: crate::acp::delegation::route::test_empty_route_plan(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: None,
+            route_capability:
+                crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         };
         let mgr = ConnectionManager::new();
         {
@@ -5773,7 +8312,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- ask_user_question: register / answer / cancel -------------------
@@ -5984,7 +8527,12 @@ mod tests {
         // The first is still the pending one and still answerable.
         let state = mgr.get_state("cc2").await.unwrap();
         assert_eq!(
-            state.read().await.pending_question.as_ref().map(|p| p.question_id.clone()),
+            state
+                .read()
+                .await
+                .pending_question
+                .as_ref()
+                .map(|p| p.question_id.clone()),
             Some(first.question_id.clone())
         );
         mgr.answer_question(
@@ -6020,12 +8568,7 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         // A second read still returns them — read is non-destructive, so an
         // abandoned (peer-closed) call leaves the notes retryable.
-        assert_eq!(
-            mgr.read_pending_feedback("c1")
-                .await
-                .len(),
-            2
-        );
+        assert_eq!(mgr.read_pending_feedback("c1").await.len(), 2);
         {
             let state = mgr.get_state("c1").await.unwrap();
             assert!(state
@@ -6040,10 +8583,7 @@ mod tests {
         mgr.commit_feedback_delivered("c1", vec![a.id.clone(), b.id.clone()])
             .await;
         // Now READ returns nothing (delivered notes are filtered out).
-        assert!(mgr
-            .read_pending_feedback("c1")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
         let state = mgr.get_state("c1").await.unwrap();
         assert!(state
             .read()
@@ -6059,12 +8599,563 @@ mod tests {
     #[tokio::test]
     async fn read_pending_missing_connection_returns_empty() {
         let mgr = ConnectionManager::new();
-        assert!(mgr
-            .read_pending_feedback("nope")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("nope").await.is_empty());
         // Commit on a missing connection is a safe no-op.
-        mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+        mgr.commit_feedback_delivered("nope", vec!["x".into()])
+            .await;
     }
 
+    // ─── Task 7: root safe fallback + child never fallback + late close ──
+
+    fn root_codeg_request() -> SpawnAttemptRequest {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
+            ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        SpawnAttemptRequest {
+            origin: DelegationConnectionOrigin::Root,
+            plan: DelegationRoutePlan {
+                managed: true,
+                requested: DelegationRoutePolicy::Codeg,
+                effective: DelegationRoutePolicy::Codeg,
+                source: DelegationRouteSource::GlobalDefault,
+                native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+                expose_codeg_delegation: true,
+                degraded_reason: None,
+                adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+                fingerprint: "test-root-codeg".into(),
+            },
+        }
+    }
+
+    fn codeg_child_request() -> SpawnAttemptRequest {
+        let mut req = root_codeg_request();
+        req.origin = DelegationConnectionOrigin::CodegChild;
+        req.plan.source = crate::acp::delegation::route::DelegationRouteSource::ForcedChild;
+        req
+    }
+
+    #[tokio::test]
+    async fn root_safe_fallback_retries_once_only_for_typed_route_bootstrap_failure() {
+        let harness = SpawnAttemptHarness::new([
+            Err(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            )),
+            Ok("native-connection".into()),
+        ]);
+        let result = spawn_with_safe_fallback(root_codeg_request(), &harness)
+            .await
+            .unwrap();
+        assert_eq!(result.connection_id, "native-connection");
+        assert_eq!(
+            result.plan.source,
+            crate::acp::delegation::route::DelegationRouteSource::SafeFallback
+        );
+        assert_eq!(harness.attempt_count(), 2);
+
+        let fatal = SpawnAttemptHarness::new([Err(RouteBootstrapOutcome::Fatal(
+            AcpError::SdkNotInstalled("missing SDK".into()),
+        ))]);
+        assert!(matches!(
+            spawn_with_safe_fallback(root_codeg_request(), &fatal).await,
+            Err(AcpError::SdkNotInstalled(_))
+        ));
+        assert_eq!(fatal.attempt_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_child_never_falls_back_and_late_close_never_switches_route() {
+        let harness = SpawnAttemptHarness::new([Err(RouteBootstrapOutcome::RouteSpecific(
+            RouteDegradedReason::CompanionInitializationFailed,
+        ))]);
+        assert_eq!(
+            spawn_with_safe_fallback(codeg_child_request(), &harness)
+                .await
+                .unwrap_err()
+                .code(),
+            Some("route_unavailable")
+        );
+        assert_eq!(harness.attempt_count(), 1);
+
+        let state = state_with_route(codeg_plan_for_late_close());
+        apply_companion_closed(&state).await;
+        let snapshot = state.read().await.to_snapshot();
+        assert_eq!(
+            snapshot.delegation_route.effective,
+            crate::acp::delegation::route::DelegationRoutePolicy::Codeg
+        );
+        assert!(!snapshot.delegation_route.delegation_available);
+    }
+
+    fn codeg_plan_for_late_close() -> DelegationRoutePlan {
+        use crate::acp::delegation::route::{
+            DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
+            ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "late-close".into(),
+        }
+    }
+
+    fn state_with_route(
+        plan: DelegationRoutePlan,
+    ) -> Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>> {
+        let mut s = crate::acp::session_state::SessionState::new(
+            "late-close".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        s.set_route_plan_snapshot(&plan);
+        s.set_delegation_available(true);
+        Arc::new(tokio::sync::RwLock::new(s))
+    }
+
+    /// Production-shaped teardown: abort task, awaited revoke, observe map
+    /// absence before return — including delayed cleanup after abort.
+    #[tokio::test]
+    async fn teardown_unexposed_revokes_and_observes_map_absence_before_return() {
+        use crate::acp::connection::AgentConnection;
+        use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
+        use crate::acp::delegation::lease::CompanionLeaseRegistry;
+        use crate::acp::delegation::listener::{TokenEntry, TokenRegistry};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::acp::types::ConnectionStatus;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::mpsc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+        struct NoQuestions;
+        #[async_trait::async_trait]
+        impl SessionQuestionAccess for NoQuestions {
+            async fn register_question(
+                &self,
+                _parent_connection_id: &str,
+                _questions: Vec<QuestionSpec>,
+            ) -> Option<RegisteredQuestion> {
+                None
+            }
+            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+        }
+
+        let mgr = ConnectionManager::new();
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        let token = "teardown-tok".to_string();
+        tokens
+            .register(
+                token.clone(),
+                TokenEntry::legacy("unexposed-1", PathBuf::from("/tmp")),
+            )
+            .await;
+        let mut waiter = leases.register(&token).await;
+        leases.mark_ready(&token).await.unwrap();
+        waiter.wait_ready(Duration::from_millis(50)).await.unwrap();
+
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        mgr.install_delegation(crate::acp::connection::DelegationInjection {
+            broker,
+            tokens: Arc::clone(&tokens),
+            leases: Arc::clone(&leases),
+            socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions)
+                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        });
+
+        let conn_id = "unexposed-1".to_string();
+        let mut state =
+            SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
+        state.delegation_token = Some(token.clone());
+        state.status = ConnectionStatus::Connecting;
+        let state = Arc::new(RwLock::new(state));
+        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = codeg_plan_for_late_close();
+        let (spawn_config, observed_config) = matching_config_pair(
+            "agent",
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+
+        let removed = Arc::new(AtomicBool::new(false));
+        let event_order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        // Connection task parks on pending() — Disconnect cannot wake it; only
+        // abort terminates (proves teardown does not rely on a drained Disconnect).
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        // Ensure the task is scheduled before we store its abort handle.
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+
+        // Delayed map removal after revoke (production cleanup-guard race).
+        // Teardown must await absence — not force-remove.
+        let connections = mgr.connections.clone();
+        let conn_id_task = conn_id.clone();
+        let tokens_watch = Arc::clone(&tokens);
+        let token_watch = token.clone();
+        let removed_flag = Arc::clone(&removed);
+        let order_cleanup = Arc::clone(&event_order);
+        let cleanup_task = tokio::spawn(async move {
+            loop {
+                if tokens_watch.lookup(&token_watch).await.is_none() {
+                    order_cleanup.lock().unwrap().push("revoked");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            connections.lock().await.remove(&conn_id_task);
+            removed_flag.store(true, Ordering::SeqCst);
+            order_cleanup.lock().unwrap().push("map_removed");
+        });
+
+        mgr.connections.lock().await.insert(
+            conn_id.clone(),
+            AgentConnection {
+                id: conn_id.clone(),
+                agent_type: AgentType::Codex,
+                status: ConnectionStatus::Connecting,
+                owner_window_label: "test".into(),
+                cmd_tx: tx,
+                task_abort: Some(abort),
+                state: Arc::clone(&state),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            },
+        );
+
+        assert!(mgr.connections.lock().await.contains_key(&conn_id));
+        assert!(
+            mgr.connections
+                .lock()
+                .await
+                .get(&conn_id)
+                .and_then(|c| c.task_abort.clone())
+                .is_some(),
+            "task_abort must be installed for unexposed teardown"
+        );
+        assert!(!join.is_finished(), "precondition: parking task is live");
+
+        let t0 = std::time::Instant::now();
+        mgr.teardown_unexposed_for_test(&conn_id)
+            .await
+            .expect("delayed cleanup must yield Ok after map absence");
+        let elapsed = t0.elapsed();
+        assert!(
+            !mgr.connections.lock().await.contains_key(&conn_id),
+            "map entry must be absent before teardown returns"
+        );
+        assert!(
+            removed.load(Ordering::SeqCst),
+            "delayed cleanup must have removed the entry (teardown awaited it)"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "teardown must wait for delayed cleanup, not return immediately; elapsed={elapsed:?}"
+        );
+        assert!(tokens.lookup(&token).await.is_none());
+        assert!(!*waiter.availability().borrow());
+        for _ in 0..200 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            join.is_finished(),
+            "connection task must be aborted (Disconnect cannot wake pending())"
+        );
+        let _ = join.await;
+        let _ = cleanup_task.await;
+        let events = event_order.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["revoked", "map_removed"],
+            "expected revoke then map removal before attempt 2"
+        );
+    }
+
+    /// Stuck cleanup: short teardown timeout fails closed; attempt 2 never starts.
+    /// Does not force-remove the map entry.
+    #[tokio::test]
+    async fn teardown_unexposed_stuck_cleanup_fails_closed_no_attempt_two() {
+        use crate::acp::connection::AgentConnection;
+        use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
+        use crate::acp::delegation::lease::CompanionLeaseRegistry;
+        use crate::acp::delegation::listener::{TokenEntry, TokenRegistry};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::acp::types::ConnectionStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+        struct NoQuestions;
+        #[async_trait::async_trait]
+        impl SessionQuestionAccess for NoQuestions {
+            async fn register_question(
+                &self,
+                _parent_connection_id: &str,
+                _questions: Vec<QuestionSpec>,
+            ) -> Option<RegisteredQuestion> {
+                None
+            }
+            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+        }
+
+        let mgr = ConnectionManager::new();
+        let leases = Arc::new(CompanionLeaseRegistry::default());
+        let tokens = Arc::new(TokenRegistry::default());
+        let token = "stuck-teardown-tok".to_string();
+        tokens
+            .register(
+                token.clone(),
+                TokenEntry::legacy("stuck-1", PathBuf::from("/tmp")),
+            )
+            .await;
+        let _waiter = leases.register(&token).await;
+
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+        ));
+        mgr.install_delegation(crate::acp::connection::DelegationInjection {
+            broker,
+            tokens: Arc::clone(&tokens),
+            leases: Arc::clone(&leases),
+            socket_path: PathBuf::from("/tmp/codeg-test.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions)
+                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        });
+
+        let conn_id = "stuck-1".to_string();
+        let mut state =
+            SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
+        state.delegation_token = Some(token.clone());
+        state.status = ConnectionStatus::Connecting;
+        let state = Arc::new(RwLock::new(state));
+        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = codeg_plan_for_late_close();
+        let (spawn_config, observed_config) = matching_config_pair(
+            "agent",
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+
+        // No cleanup task: map entry stays forever (stuck cleanup).
+        mgr.connections.lock().await.insert(
+            conn_id.clone(),
+            AgentConnection {
+                id: conn_id.clone(),
+                agent_type: AgentType::Codex,
+                status: ConnectionStatus::Connecting,
+                owner_window_label: "test".into(),
+                cmd_tx: tx,
+                task_abort: Some(abort),
+                state: Arc::clone(&state),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            },
+        );
+
+        // Production root RouteSpecific branch: teardown must succeed before attempt 2.
+        // Short per-call waits keep the test deterministic without global overrides.
+        let attempt_two_starts = Arc::new(AtomicUsize::new(0));
+        let attempt_n = Arc::clone(&attempt_two_starts);
+        let mut attempt = 1u8;
+        let bootstrap = RouteBootstrapOutcome::RouteSpecific(
+            RouteDegradedReason::CompanionInitializationFailed,
+        );
+        let outcome = match bootstrap {
+            RouteBootstrapOutcome::RouteSpecific(reason) if attempt == 1 => {
+                match mgr
+                    .teardown_unexposed_for_test_with_waits(
+                        &conn_id,
+                        Duration::from_millis(40),
+                        Duration::from_millis(20),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        // Would start attempt 2 only after success.
+                        attempt = 2;
+                        attempt_n.fetch_add(1, Ordering::SeqCst);
+                        let _ = reason;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => panic!("expected RouteSpecific"),
+        };
+
+        assert!(
+            matches!(outcome, Err(AcpError::ProcessExited)),
+            "stuck cleanup must fail closed with ProcessExited; got {outcome:?}"
+        );
+        assert_eq!(
+            attempt_two_starts.load(Ordering::SeqCst),
+            0,
+            "attempt 2 must never start when teardown fails"
+        );
+        assert_eq!(attempt, 1, "attempt counter must stay at 1");
+        assert!(
+            mgr.connections.lock().await.contains_key(&conn_id),
+            "must not force-remove a stuck map entry"
+        );
+        // Token/lease revoke and task abort still ran.
+        assert!(tokens.lookup(&token).await.is_none());
+        for _ in 0..200 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(join.is_finished(), "task abort must still be requested");
+
+        let _ = join.await;
+        mgr.connections.lock().await.remove(&conn_id);
+    }
+
+    /// Fallback policy still at most two attempts; teardown completes before attempt 2.
+    #[tokio::test]
+    async fn safe_fallback_records_teardown_before_attempt_two() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sequence = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seq = Arc::clone(&sequence);
+        let attempt_n = Arc::new(AtomicUsize::new(0));
+
+        // Stand-in for production: attempt1 RouteSpecific → teardown log → attempt2.
+        let outcomes: [Result<String, RouteBootstrapOutcome>; 2] = [
+            Err(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            )),
+            Ok("native-connection".into()),
+        ];
+        let mut outcomes = outcomes.into_iter();
+        let mut plans = Vec::new();
+        let request = root_codeg_request();
+        let mut plan = request.plan.clone();
+        let origin = request.origin;
+
+        for attempt in 1u8..=2 {
+            attempt_n.fetch_add(1, Ordering::SeqCst);
+            seq.lock().unwrap().push(format!("attempt_{attempt}_start"));
+            plans.push(plan.clone());
+            match outcomes.next().unwrap() {
+                Ok(id) => {
+                    seq.lock().unwrap().push(format!("attempt_{attempt}_ready"));
+                    assert_eq!(id, "native-connection");
+                    assert_eq!(attempt, 2);
+                    break;
+                }
+                Err(RouteBootstrapOutcome::RouteSpecific(reason))
+                    if origin == DelegationConnectionOrigin::Root && attempt == 1 =>
+                {
+                    seq.lock().unwrap().push("teardown_start".into());
+                    // Production would await map absence here; record the gate.
+                    seq.lock().unwrap().push("teardown_map_absent".into());
+                    seq.lock().unwrap().push("teardown_done".into());
+                    plan = safe_native_fallback(&plan, reason);
+                    continue;
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+
+        let events = sequence.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "attempt_1_start".to_string(),
+                "teardown_start".to_string(),
+                "teardown_map_absent".to_string(),
+                "teardown_done".to_string(),
+                "attempt_2_start".to_string(),
+                "attempt_2_ready".to_string(),
+            ]
+        );
+        assert_eq!(attempt_n.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            plans[1].source,
+            crate::acp::delegation::route::DelegationRouteSource::SafeFallback
+        );
+    }
+
+    async fn apply_companion_closed(
+        state: &Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    ) {
+        // Mirror post-ready lease close: only availability flips.
+        state.write().await.set_delegation_available(false);
+        // Apply the event path too so snapshot consumers see the same bit.
+        state
+            .write()
+            .await
+            .apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+    }
 }

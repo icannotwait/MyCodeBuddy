@@ -71,12 +71,8 @@ pub async fn open_worktree_folder(
     Json(params): Json<OpenWorktreeFolderParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
     Ok(Json(
-        folder_commands::open_worktree_folder_core(
-            &state.db,
-            params.path,
-            params.source_folder_id,
-        )
-        .await?,
+        folder_commands::open_worktree_folder_core(&state.db, params.path, params.source_folder_id)
+            .await?,
     ))
 }
 
@@ -143,12 +139,8 @@ pub async fn remove_folder_from_workspace(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<FolderIdParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::remove_folder_from_workspace_core(
-        &state.emitter,
-        &state.db,
-        params.folder_id,
-    )
-    .await?;
+    folder_commands::remove_folder_from_workspace_core(&state.emitter, &state.db, params.folder_id)
+        .await?;
     Ok(Json(()))
 }
 
@@ -254,13 +246,56 @@ pub async fn list_directory_with_files(
 pub struct GetFileTreeParams {
     pub path: String,
     pub max_depth: Option<usize>,
+    pub include_ignored: Option<bool>,
 }
 
 pub async fn get_file_tree(
     Json(params): Json<GetFileTreeParams>,
 ) -> Result<Json<Vec<folder_commands::FileTreeNode>>, AppCommandError> {
-    let result = folder_commands::get_file_tree(params.path, params.max_depth).await?;
+    let result =
+        folder_commands::get_file_tree(params.path, params.max_depth, params.include_ignored)
+            .await?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceFilesParams {
+    pub path: String,
+    pub query: Option<String>,
+    pub limit: Option<usize>,
+    pub search_session_id: Option<String>,
+    pub request_id: Option<String>,
+}
+
+pub async fn search_workspace_files(
+    Json(params): Json<SearchWorkspaceFilesParams>,
+) -> Result<Json<folder_commands::WorkspaceFileSearchResult>, AppCommandError> {
+    let result = folder_commands::search_workspace_files(
+        params.path,
+        params.query,
+        params.limit,
+        params.search_session_id,
+        params.request_id,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelWorkspaceFileSearchParams {
+    pub search_session_id: String,
+    pub request_id: String,
+}
+
+pub async fn cancel_workspace_file_search(
+    Json(params): Json<CancelWorkspaceFileSearchParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    Ok(Json(
+        folder_commands::cancel_workspace_file_search(params.search_session_id, params.request_id)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]

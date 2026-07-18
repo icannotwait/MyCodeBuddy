@@ -4,6 +4,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react"
 import type { ComponentProps } from "react"
 import { cjk } from "@streamdown/cjk"
 import type { Streamdown } from "streamdown"
+import { scheduleIdleWork } from "@/lib/scheduling/idle-work"
 
 // Streamdown's `plugins` prop config: `{ code?, mermaid?, math?, cjk? }`.
 type PluginConfig = NonNullable<ComponentProps<typeof Streamdown>["plugins"]>
@@ -11,6 +12,34 @@ type CodePlugin = NonNullable<PluginConfig["code"]>
 type MathPlugin = NonNullable<PluginConfig["math"]>
 type MermaidPlugin = NonNullable<PluginConfig["mermaid"]>
 export type HeavyKind = "code" | "math" | "mermaid"
+
+export type RichContentState = "complete" | "sealed-streaming"
+
+export interface RichContentPolicy {
+  code: "disabled" | "idle"
+  math: boolean
+  mermaid: boolean
+}
+
+/**
+ * Explicit rich-engine policy for a message body.
+ * - sealed-streaming: math + idle code; never Mermaid (live sealed blocks).
+ * - complete: math + idle code; Mermaid only when near the viewport.
+ */
+export function policyFor(
+  state: RichContentState,
+  nearViewport: boolean
+): RichContentPolicy {
+  return state === "sealed-streaming"
+    ? { code: "idle", math: true, mermaid: false }
+    : { code: "idle", math: true, mermaid: nearViewport }
+}
+
+const DEFAULT_POLICY: RichContentPolicy = {
+  code: "idle",
+  math: true,
+  mermaid: true,
+}
 
 // --- Why this module exists --------------------------------------------------
 //
@@ -49,6 +78,13 @@ const loaded: {
 const inflight = new Set<HeavyKind>()
 const listeners = new Set<() => void>()
 let version = 0
+
+/** Content-free per-kind ensure() request counts (tests / diagnostics). */
+const ensureRequests: Record<HeavyKind, number> = {
+  code: 0,
+  math: 0,
+  mermaid: 0,
+}
 
 function emit(): void {
   version += 1
@@ -93,9 +129,60 @@ function makeSafeCode(code: CodePlugin): CodePlugin {
   }
 }
 
+type HighlightCallback = Parameters<CodePlugin["highlight"]>[1]
+
+/**
+ * Defer the first real highlight to idle time so completed/sealed messages paint
+ * raw code immediately and upgrade later. Share pending work by code/lang/theme.
+ */
+function makeIdleHighlightCode(code: CodePlugin): CodePlugin {
+  const pending = new Map<
+    string,
+    {
+      callbacks: Set<HighlightCallback>
+    }
+  >()
+
+  return {
+    ...code,
+    highlight(options, callback) {
+      const themesKey = JSON.stringify(options.themes ?? null)
+      const key = `${themesKey}\0${String(options.language)}\0${options.code}`
+
+      const existing = pending.get(key)
+      if (existing) {
+        if (callback) existing.callbacks.add(callback)
+        return null
+      }
+
+      const callbacks = new Set<HighlightCallback>()
+      if (callback) callbacks.add(callback)
+      pending.set(key, { callbacks })
+
+      scheduleIdleWork(
+        () => {
+          const entry = pending.get(key)
+          pending.delete(key)
+          if (!entry) return
+          code.highlight(options, (result) => {
+            for (const cb of entry.callbacks) {
+              cb?.(result)
+            }
+          })
+        },
+        { timeoutMs: 1_000 }
+      )
+
+      // Immediate raw/unhighlighted paint; idle path upgrades via callback.
+      return null
+    },
+  }
+}
+
 function ensure(kind: HeavyKind): void {
   if (loaded[kind] || inflight.has(kind)) return
   inflight.add(kind)
+  ensureRequests[kind] += 1
   const settle = () => {
     inflight.delete(kind)
     emit()
@@ -103,7 +190,7 @@ function ensure(kind: HeavyKind): void {
   if (kind === "code") {
     import("@streamdown/code")
       .then((mod) => {
-        loaded.code = makeSafeCode(mod.code)
+        loaded.code = makeIdleHighlightCode(makeSafeCode(mod.code))
       })
       .catch(() => {})
       .finally(settle)
@@ -180,11 +267,13 @@ const CJK_ONLY: PluginConfig = { cjk }
 
 /**
  * Returns the Streamdown `plugins` config for `text`, loading the heavy engines
- * lazily and only when `text` needs them. Pass `null`/`undefined` (e.g. for
- * non-string children, or a non-preview mode) to request the light config only.
+ * lazily and only when `text` needs them AND `policy` permits them. Pass
+ * `null`/`undefined` (e.g. for non-string children, or a non-preview mode) to
+ * request the light config only.
  */
 export function useStreamdownPlugins(
-  text: string | null | undefined
+  text: string | null | undefined,
+  policy: RichContentPolicy = DEFAULT_POLICY
 ): PluginConfig {
   const needs = useMemo(
     () => (typeof text === "string" ? detectHeavyPlugins(text) : NO_NEEDS),
@@ -196,7 +285,10 @@ export function useStreamdownPlugins(
   // rarely change; keying the effect and memo on the booleans avoids re-running
   // the effect and — crucially — avoids handing Streamdown a new `plugins`
   // object on every token, which would churn its plugin-dependent memos.
-  const { code: needCode, math: needMath, mermaid: needMermaid } = needs
+  // Loader requires BOTH syntax detection AND policy permission.
+  const needCode = needs.code && policy.code !== "disabled"
+  const needMath = needs.math && policy.math
+  const needMermaid = needs.mermaid && policy.mermaid
 
   // Re-render this consumer whenever a lazily-imported engine resolves.
   const currentVersion = useSyncExternalStore(subscribe, getVersion, getVersion)
@@ -222,6 +314,15 @@ export function useStreamdownPlugins(
   }, [needCode, needMath, needMermaid, currentVersion])
 }
 
+/** Test-only: content-free ensure request counts and load flags. */
+export function __getStreamdownPluginDebugStateForTest(): {
+  requests: Record<HeavyKind, number>
+} {
+  return {
+    requests: { ...ensureRequests },
+  }
+}
+
 /** Test-only: reset the module-level plugin cache between test cases. */
 export function __resetStreamdownPluginsForTest(): void {
   loaded.code = undefined
@@ -230,4 +331,7 @@ export function __resetStreamdownPluginsForTest(): void {
   inflight.clear()
   listeners.clear()
   version = 0
+  ensureRequests.code = 0
+  ensureRequests.math = 0
+  ensureRequests.mermaid = 0
 }

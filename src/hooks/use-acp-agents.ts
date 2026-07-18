@@ -192,6 +192,27 @@ export function useAcpAgents(): UseAcpAgentsResult {
   return { agents, fresh, refresh }
 }
 
+/**
+ * Narrow selector for per-conversation thinking visibility. Fail-closed:
+ * returns `false` until a matching agent row is loaded. Subscribes only to the
+ * boolean for this agent type, not the full agent array.
+ */
+export function useAgentThinkingVisibility(
+  agentType: AcpAgentInfo["agent_type"]
+): boolean {
+  useEffect(() => acquireSharedSubscription(), [])
+  return useAcpAgentsStore(
+    (state) =>
+      state.agents.find((agent) => agent.agent_type === agentType)
+        ?.show_thinking ?? false
+  )
+}
+
+/** Non-React selector: whether a successful agents reload has committed. */
+export function selectAcpAgentsFresh(): boolean {
+  return useAcpAgentsStore.getState().fresh
+}
+
 /** Test-only: reset the shared store + module race/refcount state to a clean
  *  slate (disposing any live subscription). */
 export function resetAcpAgentsStore(): void {

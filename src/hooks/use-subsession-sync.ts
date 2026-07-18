@@ -10,6 +10,7 @@ import { onTransportReconnect, subscribe } from "@/lib/platform"
 import {
   CONVERSATION_CHANGED_EVENT,
   type ConversationChange,
+  type ConversationStatePatch,
   type DbConversationSummary,
 } from "@/lib/types"
 
@@ -94,22 +95,31 @@ export function useSubsessionSync(params: {
       })
     }
 
-    // Route a child status event (it carries only `{ id, status }`, no
-    // parent_id) into whichever loaded parent holds it — found by scanning the
-    // latest state INSIDE the updater, so there is no separate reverse index to
-    // drift and no ref read during render. Unknown ids (a root, or a child whose
-    // parent isn't loaded) leave the map untouched (identity stable).
-    const applyChildStatus = (id: number, status: string) => {
+    // Route a child state event (`status` + `awaiting_reply_token` + backend
+    // `updated_at`, no parent_id) into whichever loaded parent holds it — found
+    // by scanning the latest state INSIDE the updater, so there is no separate
+    // reverse index to drift and no ref read during render. Unknown ids (a root,
+    // or a child whose parent isn't loaded) leave the map untouched (identity
+    // stable). Never invents client timestamps — backend `updated_at` is authoritative.
+    const applyChildState = (patch: ConversationStatePatch) => {
       setChildrenByParent((prev) => {
         for (const [parentId, kids] of prev) {
-          const idx = kids.findIndex((c) => c.id === id)
+          const idx = kids.findIndex((c) => c.id === patch.id)
           if (idx < 0) continue
-          if (kids[idx].status === status) return prev
+          const cur = kids[idx]
+          if (
+            cur.status === patch.status &&
+            cur.awaiting_reply_token === patch.awaiting_reply_token &&
+            cur.updated_at === patch.updated_at
+          ) {
+            return prev
+          }
           const nextArr = kids.slice()
           nextArr[idx] = {
-            ...kids[idx],
-            status,
-            updated_at: new Date().toISOString(),
+            ...cur,
+            status: patch.status,
+            awaiting_reply_token: patch.awaiting_reply_token,
+            updated_at: patch.updated_at,
           }
           const next = new Map(prev)
           next.set(parentId, nextArr)
@@ -170,8 +180,8 @@ export function useSubsessionSync(params: {
         (change) => {
           if (change.kind === "upsert") {
             applyChildUpsert(change.summary)
-          } else if (change.kind === "status") {
-            applyChildStatus(change.id, change.status)
+          } else if (change.kind === "state") {
+            applyChildState(change.patch)
           } else {
             applyChildRemove(change.id)
           }

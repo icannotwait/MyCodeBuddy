@@ -17,8 +17,10 @@ import {
 import type {
   AgentType,
   ConversationChange,
+  ConversationStatePatch,
   ConversationStatus,
   DbConversationSummary,
+  DelegationRoutePolicy,
   OpenedTab,
   TabsChanged,
 } from "@/lib/types"
@@ -79,6 +81,13 @@ export interface TabItemInternal {
    * composer hides the branch picker and shows the "no-folder" chip.
    */
   isChat?: boolean
+  /**
+   * Memory-only draft route override for managed agents (`null` = inherit
+   * global). Participates in sameDerivedTab / binding / actions. Cleared on
+   * bind (persisted override lives on the conversation row). Not written to
+   * opened_tabs.
+   */
+  delegationRouteOverride?: DelegationRoutePolicy | null
 }
 
 export type TabItem = TabItemInternal
@@ -151,12 +160,22 @@ export interface TabStoreState {
     options?: {
       inheritFromActive?: boolean
       folderDefaultAgent?: AgentType | null
+      folderRecentAgent?: AgentType | null
     }
   ) => void
   openChatModeTab: () => void
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: AgentType) => void
   setDraftAgentFromFallback: (tabId: string, agentType: AgentType) => void
+  /**
+   * Memory-only draft route override. Cleared when the draft binds to a
+   * persisted conversation. Does not reconnect — connected drafts mark stale
+   * via `setDraftDelegationRoutePreference` separately.
+   */
+  setDraftDelegationRoute: (
+    tabId: string,
+    routeOverride: DelegationRoutePolicy | null
+  ) => void
   bindConversationTab: (
     tabId: string,
     conversationId: number,
@@ -251,7 +270,12 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 const childSummaryInFlight = new Set<number>()
 const childSeedBuffer = new Map<
   number,
-  { summary?: DbConversationSummary; status?: string; deleted?: boolean }
+  {
+    summary?: DbConversationSummary
+    /** Full state patch buffered while seed fetch is in flight. */
+    state?: ConversationStatePatch
+    deleted?: boolean
+  }
 >()
 let seedEpoch = 0
 const previewReplacedCallbacks = new Set<(tabId: string) => void>()
@@ -308,7 +332,8 @@ function sameDerivedTab(a: TabItemInternal, b: TabItemInternal): boolean {
     a.workingDir === b.workingDir &&
     a.status === b.status &&
     a.agentTypeProvisional === b.agentTypeProvisional &&
-    a.isChat === b.isChat
+    a.isChat === b.isChat &&
+    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null)
   )
 }
 
@@ -389,21 +414,30 @@ function recomputeTabs() {
 
 /** Pick the agent + provisional flag for a new draft tab. Wraps the pure
  *  `resolveDefaultAgent` helper with tab-store-scoped lookups (folder default
- *  from the live app-workspace store, latest sorted types, fresh flag). */
+ *  and recent agent from the live app-workspace store, latest sorted types,
+ *  fresh flag). */
 function resolveAgentForFolder(
   folderId: number,
   inherit: AgentType | null,
   // `undefined` = look the folder default up; `null` = explicitly none.
-  folderDefaultOverride?: AgentType | null
+  folderDefaultOverride?: AgentType | null,
+  folderRecentOverride?: AgentType | null
 ): { agentType: AgentType; provisional: boolean } {
+  const folder = useAppWorkspaceStore
+    .getState()
+    .folders.find((item) => item.id === folderId)
   const folderDefault =
     folderDefaultOverride !== undefined
       ? folderDefaultOverride
-      : (useAppWorkspaceStore.getState().folders.find((f) => f.id === folderId)
-          ?.default_agent_type ?? null)
+      : (folder?.default_agent_type ?? null)
+  const folderRecent =
+    folderRecentOverride !== undefined
+      ? folderRecentOverride
+      : (folder?.last_agent_type ?? null)
   return resolveDefaultAgent({
     folderDefault,
     inherit,
+    folderRecent,
     sortedTypes: runtime.sortedAvailableAgents,
     fresh: runtime.agentsFresh,
   })
@@ -716,7 +750,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const { agentType: targetAgent, provisional } = resolveAgentForFolder(
       folderId,
       inherit,
-      options?.folderDefaultAgent
+      options?.folderDefaultAgent,
+      options?.folderRecentAgent
     )
 
     const tabId = makeNewConversationTabId()
@@ -904,6 +939,21 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     recomputeTabs()
   },
 
+  setDraftDelegationRoute: (tabId, routeOverride) => {
+    const prev = get().rawTabs
+    const next = prev.map((t) => {
+      if (t.id !== tabId) return t
+      if (t.conversationId != null) return t // only drafts
+      if ((t.delegationRouteOverride ?? null) === (routeOverride ?? null)) {
+        return t
+      }
+      return { ...t, delegationRouteOverride: routeOverride }
+    })
+    if (next.every((t, i) => t === prev[i])) return
+    set({ rawTabs: next })
+    recomputeTabs()
+  },
+
   bindConversationTab: (
     tabId,
     conversationId,
@@ -923,6 +973,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           title: formatConversationTitle(title) || tab.title,
           runtimeConversationId,
           agentTypeProvisional: false,
+          // Override is now on the conversation row; drop the memory-only flag.
+          delegationRouteOverride: undefined,
           ...(folderId != null ? { folderId } : {}),
           ...(workingDir != null ? { workingDir } : {}),
         }
@@ -1153,9 +1205,16 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           const buffered = childSeedBuffer.get(id)
           if (buffered?.deleted) return
           if (!get().rawTabs.some((tb) => tb.conversationId === id)) return
+          // Prefer a live upsert summary over the fetch snapshot; then apply any
+          // later state patch on top so the newest three fields win.
           let summary = buffered?.summary ?? detail.summary
-          if (buffered?.status != null) {
-            summary = { ...summary, status: buffered.status }
+          if (buffered?.state != null) {
+            summary = {
+              ...summary,
+              status: buffered.state.status,
+              awaiting_reply_token: buffered.state.awaiting_reply_token,
+              updated_at: buffered.state.updated_at,
+            }
           }
           const nextChild = new Map(get().childSummaries)
           nextChild.set(id, summary)
@@ -1174,7 +1233,12 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
   },
 
   handleChildConversationChange: (change) => {
-    const id = change.kind === "upsert" ? change.summary.id : change.id
+    const id =
+      change.kind === "upsert"
+        ? change.summary.id
+        : change.kind === "state"
+          ? change.patch.id
+          : change.id
     if (get().childSummaries.has(id)) {
       if (change.kind === "upsert") {
         const summary = change.summary
@@ -1184,12 +1248,24 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         next.set(summary.id, summary)
         set({ childSummaries: next })
         recomputeTabs()
-      } else if (change.kind === "status") {
+      } else if (change.kind === "state") {
         const prev = get().childSummaries
-        const cur = prev.get(change.id)
-        if (!cur || cur.status === change.status) return
+        const cur = prev.get(change.patch.id)
+        if (!cur) return
+        if (
+          cur.status === change.patch.status &&
+          cur.awaiting_reply_token === change.patch.awaiting_reply_token &&
+          cur.updated_at === change.patch.updated_at
+        ) {
+          return
+        }
         const next = new Map(prev)
-        next.set(change.id, { ...cur, status: change.status })
+        next.set(change.patch.id, {
+          ...cur,
+          status: change.patch.status,
+          awaiting_reply_token: change.patch.awaiting_reply_token,
+          updated_at: change.patch.updated_at,
+        })
         set({ childSummaries: next })
         recomputeTabs()
       } else {
@@ -1203,6 +1279,8 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       return
     }
     // Seed for this id is still in flight — accumulate into the pending buffer.
+    // Ordering: upsert supersedes a prior buffered state; a later state applies
+    // on top of a buffered upsert; deleted remains terminal for any late event.
     if (childSummaryInFlight.has(id)) {
       const pending = childSeedBuffer.get(id) ?? {}
       if (change.kind === "deleted") {
@@ -1210,9 +1288,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       } else if (!pending.deleted) {
         if (change.kind === "upsert") {
           pending.summary = change.summary
-          pending.status = undefined
+          pending.state = undefined
         } else {
-          pending.status = change.status
+          pending.state = change.patch
         }
       }
       childSeedBuffer.set(id, pending)
@@ -1510,6 +1588,7 @@ export function useTabActions() {
       setChatDraftWorkingDir: s.setChatDraftWorkingDir,
       confirmDraftAgent: s.confirmDraftAgent,
       setDraftAgentFromFallback: s.setDraftAgentFromFallback,
+      setDraftDelegationRoute: s.setDraftDelegationRoute,
       bindConversationTab: s.bindConversationTab,
       setTabRuntimeConversationId: s.setTabRuntimeConversationId,
       reorderTabs: s.reorderTabs,

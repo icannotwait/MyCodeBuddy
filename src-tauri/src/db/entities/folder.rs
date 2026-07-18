@@ -26,6 +26,7 @@ pub struct Model {
     pub path: String,
     pub git_branch: Option<String>,
     pub default_agent_type: Option<String>,
+    pub last_agent_type: Option<String>,
     pub last_opened_at: DateTimeUtc,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

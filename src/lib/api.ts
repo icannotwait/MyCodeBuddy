@@ -13,8 +13,20 @@ import { TurnBusyError, isTurnInProgressRejection } from "./turn-busy"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
+  AcpPromptContext,
   AgentDelegationDefaults,
+  CancelReferenceSearchRequest,
+  ConversationExperienceSettings,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
+  ReferenceCandidateValidation,
+  ReferenceRegexMatch,
+  ReferenceSearchPage,
+  StartReferenceSearchRequest,
+  ValidateReferenceCandidateRequest,
+  DelegationProfileCatalog,
   DelegationProfileDocument,
+  DelegationRoutePolicy,
   AgentOptionsSnapshot,
   Automation,
   AutomationRun,
@@ -27,7 +39,11 @@ import type {
   SidebarData,
   ConnectionInfo,
   ConversationConnectionInfo,
+  DesktopDeliveryCapabilities,
+  EventBusMetricsSnapshot,
   LiveSessionSnapshot,
+  PerfReplayRequest,
+  PerfReplayResult,
   FeedbackItem,
   QuestionAnswer,
   AcpAgentInfo,
@@ -112,6 +128,7 @@ import type {
   OfficecliInfo,
   OfficecliSkill,
   SkillSyncReport,
+  ConversationStatePatch,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -154,7 +171,9 @@ export async function acpConnect(
   workingDir?: string,
   sessionId?: string,
   preferredModeId?: string | null,
-  preferredConfigValues?: Record<string, string> | null
+  preferredConfigValues?: Record<string, string> | null,
+  conversationId?: number | null,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<string> {
   return getTransport().call("acp_connect", {
     agentType,
@@ -162,6 +181,8 @@ export async function acpConnect(
     sessionId: sessionId ?? null,
     preferredModeId: preferredModeId ?? null,
     preferredConfigValues: preferredConfigValues ?? null,
+    conversationId: conversationId ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
   })
 }
 
@@ -170,7 +191,8 @@ export async function acpPrompt(
   blocks: PromptInputBlock[],
   folderId: number | null = null,
   conversationId: number | null = null,
-  clientMessageId: string | null = null
+  clientMessageId: string | null = null,
+  context: AcpPromptContext = { visibleText: null, locale: null }
 ): Promise<void> {
   try {
     await getTransport().call("acp_prompt", {
@@ -179,6 +201,8 @@ export async function acpPrompt(
       folderId,
       conversationId,
       clientMessageId,
+      visibleText: context.visibleText,
+      locale: context.locale,
     })
   } catch (e) {
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
@@ -285,6 +309,30 @@ export async function acpListConnections(): Promise<ConnectionInfo[]> {
   return getTransport().call("acp_list_connections")
 }
 
+export function acpGetEventMetrics(): Promise<EventBusMetricsSnapshot> {
+  return getTransport().call("acp_get_event_metrics")
+}
+
+/**
+ * Startup-selected desktop ACP delivery mode and performance flags.
+ * Mode is fixed for the process lifetime (never hot-switched).
+ * Desktop/Tauri only — absent from pure server builds.
+ */
+export function acpGetDesktopDeliveryCapabilities(): Promise<DesktopDeliveryCapabilities> {
+  return getTransport().call("acp_get_desktop_delivery_capabilities")
+}
+
+/** Test-utils builds only; absent from release desktop/server command surfaces. */
+export function acpReplayStreamingPerfFixture(
+  connectionId: string,
+  request: PerfReplayRequest
+): Promise<PerfReplayResult> {
+  return getTransport().call("acp_replay_streaming_perf_fixture", {
+    connectionId,
+    request,
+  })
+}
+
 export async function acpGetSessionSnapshot(
   connectionId: string
 ): Promise<LiveSessionSnapshot | null> {
@@ -313,6 +361,16 @@ export async function acpFindConnectionForConversation(
 
 export async function acpListAgents(): Promise<AcpAgentInfo[]> {
   return getTransport().call("acp_list_agents")
+}
+
+export async function acpUpdateAgentDisplayPreferences(
+  agentType: AgentType,
+  showThinking: boolean
+): Promise<void> {
+  return getTransport().call("acp_update_agent_display_preferences", {
+    agentType,
+    showThinking,
+  })
 }
 
 export async function acpGetAgentStatus(
@@ -1918,12 +1976,14 @@ export async function createHyperframesProject(params: {
 export async function createConversation(
   folderId: number,
   agentType: AgentType,
-  title?: string
+  title?: string,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<number> {
   return getTransport().call("create_conversation", {
     folderId,
     agentType,
     title: title ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
   })
 }
 
@@ -1938,12 +1998,39 @@ export async function createChatConversation(
   title?: string,
   // Reuse a scratch dir already minted by `createChatDir` (eager connect) so the
   // ACP cwd never moves across the first send; omit to let the backend mint one.
-  existingDir?: string
+  existingDir?: string,
+  delegationRouteOverride?: DelegationRoutePolicy | null
 ): Promise<CreateChatConversationResult> {
   return getTransport().call("create_chat_conversation", {
     agentType,
     title: title ?? null,
     existingDir: existingDir ?? null,
+    delegationRouteOverride: delegationRouteOverride ?? null,
+  })
+}
+
+/** Persist a root-only session route override (`null` = inherit global). */
+export async function setConversationDelegationRoute(
+  conversationId: number,
+  routeOverride: DelegationRoutePolicy | null
+): Promise<DbConversationSummary> {
+  return getTransport().call("set_conversation_delegation_route", {
+    conversationId,
+    routeOverride,
+  })
+}
+
+/**
+ * Mark a row-less connected draft's observed route preference stale without
+ * mutating the running process. The next explicit reconnect applies it.
+ */
+export async function setDraftDelegationRoutePreference(
+  connectionId: string,
+  routeOverride: DelegationRoutePolicy | null
+): Promise<void> {
+  return getTransport().call("set_draft_delegation_route_preference", {
+    connectionId,
+    routeOverride,
   })
 }
 
@@ -1954,6 +2041,16 @@ export async function createChatConversation(
  */
 export async function createChatDir(): Promise<CreateChatDirResult> {
   return getTransport().call("create_chat_dir", {})
+}
+
+export async function clearAwaitingReply(
+  conversationId: number,
+  expectedToken: string
+): Promise<ConversationStatePatch> {
+  return getTransport().call("clear_awaiting_reply", {
+    conversationId,
+    expectedToken,
+  })
 }
 
 export async function updateConversationStatus(
@@ -2734,12 +2831,59 @@ async function downloadWorkspaceViaRemoteProxy(opts: {
 
 export async function getFileTree(
   path: string,
-  maxDepth?: number
+  maxDepth?: number,
+  includeIgnored = false
 ): Promise<FileTreeNode[]> {
   return getTransport().call("get_file_tree", {
     path,
     maxDepth: maxDepth ?? null,
+    includeIgnored,
   })
+}
+
+/** Flat hit from on-demand workspace file search (no full tree payload). */
+export interface WorkspaceFileHit {
+  name: string
+  /** Relative path from the workspace root. */
+  path: string
+  kind: "file" | "dir"
+}
+
+export interface WorkspaceFileSearchResult {
+  files: WorkspaceFileHit[]
+  /** True when more matches exist past `limit`. */
+  truncated: boolean
+}
+
+export interface WorkspaceFileSearchIdentity {
+  searchSessionId: string
+  requestId: string
+}
+
+/**
+ * Search workspace files on demand (ignore-aware walk with early exit).
+ * Prefer this over `getFileTree` for `@` mentions and the command palette —
+ * it never materializes the full tree on the client.
+ */
+export async function searchWorkspaceFiles(
+  path: string,
+  query = "",
+  limit = 50,
+  identity?: WorkspaceFileSearchIdentity
+): Promise<WorkspaceFileSearchResult> {
+  return getTransport().call("search_workspace_files", {
+    path,
+    query,
+    limit,
+    searchSessionId: identity?.searchSessionId ?? null,
+    requestId: identity?.requestId ?? null,
+  })
+}
+
+export async function cancelWorkspaceFileSearch(
+  identity: WorkspaceFileSearchIdentity
+): Promise<boolean> {
+  return getTransport().call("cancel_workspace_file_search", { ...identity })
 }
 
 export async function startWorkspaceStateStream(
@@ -3193,6 +3337,10 @@ export async function deleteModelProvider(id: number): Promise<void> {
 export interface DelegationSettings {
   enabled: boolean
   depth_limit: number
+  /** Global default managed route when a root has no session override. */
+  route_policy?: DelegationRoutePolicy
+  /** Soft-watchdog stall threshold in seconds (clamped 60..=3600). */
+  stalled_after_seconds?: number
   /** Per-parent byte budget (in MB) for the broker's in-memory cache of
    * completed sub-agent result text. `0` = unlimited. */
   completed_cache_max_mb: number
@@ -3211,8 +3359,8 @@ export async function setDelegationSettings(
   return getTransport().call("set_delegation_settings", { settings })
 }
 
-export async function getDelegationProfiles(): Promise<DelegationProfileDocument> {
-  return getTransport().call("get_delegation_profiles")
+export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
+  return getTransport().call("get_delegation_profile_catalog")
 }
 
 export async function setDelegationProfiles(
@@ -3247,6 +3395,104 @@ export async function setFeedbackSettings(
   settings: FeedbackSettings
 ): Promise<FeedbackSettings> {
   return getTransport().call("set_feedback_settings", { settings })
+}
+
+// ─── Conversation experience (automatic titles) ────────────────────────────
+
+export async function getConversationExperienceSettings(): Promise<ConversationExperienceSettings> {
+  return getTransport().call("get_conversation_experience_settings")
+}
+
+export async function setAutoTitleAgent(
+  agent: AgentType | null
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call("set_auto_title_agent", { agent })
+}
+
+export async function setReferenceSearchLimit(
+  limit: number
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call("set_reference_search_limit", { limit })
+}
+
+// ─── Incremental reference search ───────────────────────────────────────────
+// Flat protocol payloads (no nested `request`). Start/page use 35s so the
+// backend's 30s page deadline remains authoritative.
+
+export type {
+  CancelReferenceSearchRequest,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
+  ReferenceCandidate,
+  ReferenceCandidateValidation,
+  ReferenceDescriptor,
+  ReferenceDoneReason,
+  ReferenceRegexMatch,
+  ReferenceRegexRank,
+  ReferenceSearchPage,
+  ReferenceSearchSource,
+  StartReferenceSearchRequest,
+  ValidateReferenceCandidateRequest,
+} from "./types"
+
+export async function startReferenceSearch(
+  request: StartReferenceSearchRequest,
+  signal?: AbortSignal
+): Promise<ReferenceSearchPage> {
+  return getTransport().call(
+    "start_reference_search",
+    { ...request },
+    {
+      timeoutMs: 35_000,
+      signal,
+    }
+  )
+}
+
+export async function nextReferenceSearchPage(
+  request: NextReferenceSearchPageRequest,
+  signal?: AbortSignal
+): Promise<ReferenceSearchPage> {
+  return getTransport().call(
+    "next_reference_search_page",
+    { ...request },
+    {
+      timeoutMs: 35_000,
+      signal,
+    }
+  )
+}
+
+export async function cancelReferenceSearch(
+  request: CancelReferenceSearchRequest
+): Promise<boolean> {
+  return getTransport().call("cancel_reference_search", { ...request })
+}
+
+export async function validateReferenceCandidate(
+  request: ValidateReferenceCandidateRequest,
+  signal?: AbortSignal
+): Promise<ReferenceCandidateValidation> {
+  return getTransport().call(
+    "validate_reference_candidate",
+    { ...request },
+    {
+      signal,
+    }
+  )
+}
+
+export async function matchReferenceRegex(
+  request: MatchReferenceRegexRequest,
+  signal?: AbortSignal
+): Promise<ReferenceRegexMatch[]> {
+  return getTransport().call(
+    "match_reference_regex",
+    { ...request },
+    {
+      signal,
+    }
+  )
 }
 
 /**
@@ -3418,7 +3664,7 @@ export async function exportBackupDesktop(
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")
   const destPath = await save({
     defaultPath: `codeg-backup-${stamp}.${ext}`,
-    filters: [{ name: "Codeg backup", extensions: [ext] }],
+    filters: [{ name: "DrawCode backup", extensions: [ext] }],
   })
   if (!destPath) return null
   return getTransport().call<BackupManifest>("backup_create", {

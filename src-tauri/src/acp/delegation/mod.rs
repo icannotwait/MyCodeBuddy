@@ -30,14 +30,21 @@
 //! to the child, and returns. v2 will introduce `continue_with_session` /
 //! `close_session` tools without protocol breakage.
 
+pub mod attention;
 pub mod broker;
 pub mod companion;
 pub mod depth;
 pub mod event_emitter;
+pub mod lease;
 pub mod listener;
 pub mod live_reply;
 pub mod meta_writer;
+pub mod metrics;
 pub mod parent_watcher;
+pub mod route;
+pub mod runtime_stats;
 pub mod spawner;
+pub mod store;
+pub mod supervisor;
 pub mod transport;
 pub mod types;

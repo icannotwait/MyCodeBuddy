@@ -17,7 +17,8 @@ import type {
   ConversationStatus,
   DbConversationSummary,
 } from "@/lib/types"
-import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
+import type { FlatFileEntry } from "@/hooks/use-file-tree"
+import { useWorkspaceFileSearch } from "@/hooks/use-workspace-file-search"
 import { AGENT_LABELS, compareAgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
@@ -70,36 +71,19 @@ export function SearchCommandDialog({
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const folderPath = folder?.path ?? ""
-
-  // File search via shared hook (lazy-loaded when files tab is active)
-  const {
-    allFiles,
-    loading: filesLoading,
-    reset: resetFileTree,
-  } = useFileTree({
-    folderPath: folderPath || undefined,
-    enabled: activeTab === "files",
-  })
+  const { files: filteredFiles, loading: filesLoading } =
+    useWorkspaceFileSearch({
+      folderPath,
+      query,
+      enabled: open && activeTab === "files",
+      limit: 100,
+      debounceMs: 200,
+    })
 
   // Compute which agent types exist in current folder
   const availableAgents = Array.from(
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
-
-  // Filter files by query using pre-computed lowercase fields
-  const filteredFiles = useMemo(() => {
-    const trimmed = query.trim()
-    if (!trimmed) return allFiles.slice(0, 100)
-    const lower = trimmed.toLowerCase()
-    const matched: FlatFileEntry[] = []
-    for (const f of allFiles) {
-      if (f.lowerName.includes(lower) || f.lowerPath.includes(lower)) {
-        matched.push(f)
-        if (matched.length >= 100) break
-      }
-    }
-    return matched
-  }, [allFiles, query])
 
   const doSearch = useCallback(
     async (q: string, agent: AgentType | null) => {
@@ -144,9 +128,8 @@ export function SearchCommandDialog({
       setAgentFilter(null)
       setResults([])
       setActiveTab("conversations")
-      resetFileTree()
     }
-  }, [open, resetFileTree])
+  }, [open])
 
   const handleSelectConversation = useCallback(
     (conv: DbConversationSummary) => {

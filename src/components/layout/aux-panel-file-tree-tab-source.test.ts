@@ -40,6 +40,13 @@ describe("aux-panel-file-tree-tab no longer owns tab watching", () => {
   })
 })
 
+describe("aux-panel-file-tree-tab ignored-file display option", () => {
+  it("wires the checkbox into both the root and background context menus", () => {
+    expect(auxSource.match(/<ContextMenuCheckboxItem/g)).toHaveLength(2)
+    expect(auxSource).toContain('t("showIgnoredFiles")')
+  })
+})
+
 describe("use-open-file-tabs-watch external-change coverage", () => {
   it("destructures the background-reload, stale, and prefetched-apply APIs", () => {
     // Catching external changes for non-active tabs requires these APIs;

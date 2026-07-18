@@ -562,7 +562,16 @@
       "noConfigAvailable": "Este agente no tiene opciones configurables.",
       "modeLabel": "Modo",
       "agentDefaultHint": "Predeterminado del agente: {value}",
-      "defaultOptionLabel": "Predeterminado ({value})"
+      "defaultOptionLabel": "Predeterminado ({value})",
+      "routePolicy": "Ruta predeterminada",
+      "routePolicyHint": "Los agentes administrados usan esta ruta cuando la conversacion no tiene anulacion.",
+      "routeEffectiveNative": "La delegacion esta desactivada: la ruta efectiva es Native.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "Watchdog suave (segundos)",
+      "softWatchdogHint": "Umbral de inactividad solo observacional ({min}–{max}). No cancela ni cambia la ruta."
     },
     "actions": {
       "dragSort": "Arrastrar para reordenar",
@@ -963,7 +972,8 @@
       "piBinaryInstallFailed": "Error al instalar pi",
       "piBinaryUninstalled": "pi desinstalado",
       "piBinaryUninstallFailed": "Error al desinstalar pi",
-      "savePiTrustFailed": "Error al guardar la confianza del espacio de trabajo"
+      "savePiTrustFailed": "Error al guardar la confianza del espacio de trabajo",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "Estado de versión",
@@ -977,7 +987,7 @@
       "remoteUnavailable": "{versionText}. La versión remota no está disponible por ahora.",
       "latest": "{versionText}. Ya está en la última versión.",
       "bundled": "Integrado: {version}",
-      "bundledMissing": "Falta el adaptador integrado. Reinstala o actualiza MyCodeBuddy."
+      "bundledMissing": "Falta el adaptador integrado. Reinstala o actualiza DrawCode."
     },
     "cline": {
       "configDescription": "Configure el proveedor de API y las credenciales de Cline. La configuración se guarda en ~/.cline/data/."
@@ -1049,10 +1059,11 @@
       "installing": "Instalando…",
       "recheck": "Volver a comprobar",
       "trustTitle": "Confiar automáticamente en los espacios de trabajo abiertos",
-      "trustDescription": "Cuando codeg conecta pi a una carpeta, marca esa carpeta como de confianza para que pi cargue la configuración y las habilidades locales del proyecto sin una confirmación aparte.",
+      "trustDescription": "Cuando DrawCode conecta pi a una carpeta, marca esa carpeta como de confianza para que pi cargue la configuración y las habilidades locales del proyecto sin una confirmación aparte.",
       "trustHint": "Solo se confía en las carpetas que abres aquí, nunca en todo tu equipo, y esto afecta únicamente a la carga de configuración, no a lo que pi puede ejecutar.",
       "configDirSkillsNote": "Con un directorio de configuración personalizado, las habilidades, los expertos y las herramientas de oficina gestionados en Ajustes no se aplican a este pi; gestiona sus habilidades directamente en esa carpeta."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "Cargando configuración de agentes...",
@@ -1085,11 +1096,22 @@
     "restartRequired": "Guardado. Reinicia la aplicación para aplicar el cambio.",
     "restartNow": "Reiniciar ahora",
     "restartFailed": "No se pudo reiniciar: {message}",
-    "loadFailed": "Error al cargar: {message}"
+    "loadFailed": "Error al cargar: {message}",
+    "conversationExperienceTitle": "Experiencia de conversación",
+    "conversationExperienceDescription": "Configura los títulos automáticos y el comportamiento de la búsqueda de referencias.",
+    "autoTitleAgent": "Agente de títulos automáticos",
+    "autoTitleOff": "Desactivado",
+    "autoTitleUnavailable": "{agent} (No disponible)",
+    "autoTitleSaveFailed": "No se pudo guardar el agente de títulos automáticos: {message}",
+    "autoTitleLoading": "Cargando la configuración de títulos automáticos...",
+    "referenceSearchLimit": "Límite de resultados de referencia",
+    "referenceSearchLimitHint": "Máximo de resultados en caché y buscados por cada fuente de recursos (10-500).",
+    "referenceSearchLimitSave": "Guardar límite de referencias",
+    "referenceSearchLimitSaveFailed": "No se pudo guardar el límite de resultados de referencia: {message}"
   },
   "LoginPage": {
-    "documentTitle": "Iniciar sesión - codeg",
-    "brand": "Codeg",
+    "documentTitle": "Iniciar sesión - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "Introduce tu token de acceso para conectarte a la aplicación de escritorio",
     "tokenPlaceholder": "Token de acceso",
     "connect": "Conectar",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "Chat arriba",
       "statusRunningBadge": "Ejecutando",
       "statusCancelledBadge": "Cancelado",
+      "statusAwaitingReplyBadge": "Esperando tu respuesta",
       "conversationCountUnit": "{count, plural, one {# conversación} other {# conversaciones}}",
       "emptyFolderHint": "Sin conversaciones",
       "noMatchingConversations": "No hay conversaciones coincidentes",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "Agregar a la sesión",
       "compareWithBranch": "Comparar con rama...",
       "reloadFromDisk": "Recargar desde disco",
+      "showIgnoredFiles": "Mostrar archivos ignorados",
       "new": "Nuevo",
       "newFile": "Archivo",
       "newDirectory": "Directorio",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "No se pudo descargar {name}",
         "downloadSaved": "{name} descargado",
         "pathCopied": "Ruta copiada",
-        "copyPathFailed": "No se pudo copiar la ruta"
+        "copyPathFailed": "No se pudo copiar la ruta",
+        "loadIgnoredFilesFailed": "No se pudieron cargar los archivos ignorados"
       },
       "createDialog": {
         "newFile": "Nuevo archivo",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "Falló la conexión de {agent}",
         "toolFallbackTitle": "Herramienta",
         "eventErrorTitle": "Error del agente",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} ha terminado de responder",
         "notificationError": "{agent} error: {message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "Agentes",
         "mentionGroupSession": "Sesiones",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Habilidades"
+        "mentionGroupSkill": "Habilidades",
+        "mentionInvalidPattern": "Expresión regular no válida",
+        "mentionSourceError": "No se pudo actualizar esta fuente",
+        "mentionProfileError": "No se pudieron cargar los perfiles de delegación"
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",
@@ -2182,7 +2213,7 @@
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> alterna el panel derecho para ver los archivos tocados y los cambios de Git de esta sesión.",
           "shortcutsTerminalSidebar": "<shortcut>{toggleTerminal}</shortcut> abre la terminal integrada, <shortcut>{toggleSidebar}</shortcut> alterna la barra lateral.",
           "customShortcuts": "Todos los atajos se pueden reasignar en Ajustes → Atajos.",
-          "webService": "Activa Ajustes → Servicio web para que tu equipo acceda al mismo codeg desde un navegador.",
+          "webService": "Activa Ajustes → Servicio web para que tu equipo acceda al mismo DrawCode desde un navegador.",
           "fusionMode": "Abre un archivo o diff para mostrarlo automáticamente junto a la conversación.",
           "quickMessages": "Abre el botón + junto a la entrada y elige Mensajes rápidos para insertar un fragmento guardado (gestiónalos en Ajustes → Mensajes rápidos).",
           "experts": "El botón + tiene un menú Habilidades expertas: carga roles como Depuración o Planificación con un clic."
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "Subagentes",
         "collapsedSummary": "Subagentes {count}",
-        "collapseAria": "Contraer subagentes"
+        "collapseAria": "Contraer subagentes",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "Plan del agente",
@@ -2414,7 +2448,10 @@
             "child_empty": "subagente sin salida",
             "child_unknown": "subagente: error",
             "unknown": "tarea desconocida"
-          }
+          },
+          "active": "Activo",
+          "waitingInput": "Esperando entrada",
+          "stalled": "Sin actividad reciente del agente"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "Descartar",
         "reconnectFailed": "No se pudo reconectar la sesión",
         "applied": "Nueva configuración aplicada",
-        "terminalShellTitle": "Shell del terminal actualizado"
+        "terminalShellTitle": "Shell del terminal actualizado",
+        "delegationRouteTitle": "Ruta de delegacion actualizada"
       },
       "collabAgent": {
         "title": "Subagente",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "Tarea en segundo plano completada",
         "cardFinishedWithStatus": "Tarea en segundo plano finalizada ({status})",
         "cardResultPending": "El resultado aún no ha llegado"
+      },
+      "delegationRoute": {
+        "menuLabel": "Ruta de delegacion",
+        "inheritGlobal": "Heredar global",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg (heredada)",
+        "updateFailed": "Error al actualizar la ruta"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Se volvio a Native ({reason}). Vuelve a conectar para reintentar Codeg.",
+        "delegationUnavailable": "La ruta Codeg esta activa, pero la delegacion no esta disponible.",
+        "reconnect": "Volver a conectar",
+        "reconnecting": "Reconectando…",
+        "reconnected": "Reconectado",
+        "reconnectFailed": "Error al reconectar",
+        "reason": {
+          "native_suppression_unsupported": "supresion nativa no admitida",
+          "native_suppression_invalid": "supresion nativa no valida",
+          "companion_binary_unavailable": "binario companero no disponible",
+          "agent_mcp_unsupported": "MCP del agente no admitido",
+          "companion_initialization_failed": "fallo la inicializacion del companero",
+          "unknown": "degradado"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "Cambiar solo modifica la dirección que se muestra y se abre aquí; el servicio escucha en todas las interfaces y sigue accesible en cada dirección.",
     "sectionTitle": "Servicio Web",
-    "sectionDescription": "Habilitar para acceder a Codeg de forma remota a través del navegador",
+    "sectionDescription": "Habilitar para acceder a DrawCode de forma remota a través del navegador",
     "port": "Puerto",
     "status": "Estado",
     "autoStart": "Inicio automático",
-    "autoStartHint": "Iniciar el servicio web al abrir Codeg",
+    "autoStartHint": "Iniciar el servicio web al abrir DrawCode",
     "running": "En ejecución",
     "stopped": "Detenido",
     "processing": "Procesando...",
@@ -2782,7 +2844,7 @@
     "copy": "Copiar",
     "qrcode": "Código QR",
     "qrcodeTitle": "Escanear para abrir",
-    "qrcodeHint": "Escanea con tu teléfono para abrir Codeg en el navegador",
+    "qrcodeHint": "Escanea con tu teléfono para abrir DrawCode en el navegador",
     "addressLabel": "Dirección de acceso",
     "tokenLabel": "Token de acceso",
     "tokenHint": "Ingrese este token al acceder al cliente Web por primera vez",
@@ -2790,7 +2852,7 @@
     "regenerate": "Regenerar",
     "stalePortOccupiedTitle": "El puerto {port} está en uso por otro proceso",
     "stalePortUnknownTitle": "Estado del puerto {port} indeterminado",
-    "stalePortHint": "Codeg no puede vincularse hasta que se libere el puerto. Cambia el puerto arriba o cierra el proceso que lo retiene.",
+    "stalePortHint": "DrawCode no puede vincularse hasta que se libere el puerto. Cambia el puerto arriba o cierra el proceso que lo retiene.",
     "errors": {
       "alreadyRunning": "El servicio Web ya está en ejecución",
       "invalidAddress": "Formato de host o puerto no válido",
@@ -3090,7 +3152,7 @@
   },
   "ScienceSettings": {
     "title": "Habilidades de investigación científica",
-    "description": "Habilita habilidades de investigación científica seleccionadas para tus agentes de código con IA: generación de hipótesis, diseño experimental, estadística, visualización, evaluación crítica y búsqueda bibliográfica. MyCodeBuddy gestiona una copia central y enlaza cada habilidad a los agentes que elijas.",
+    "description": "Habilita habilidades de investigación científica seleccionadas para tus agentes de código con IA: generación de hipótesis, diseño experimental, estadística, visualización, evaluación crítica y búsqueda bibliográfica. DrawCode gestiona una copia central y enlaza cada habilidad a los agentes que elijas.",
     "loading": "Cargando habilidades científicas…",
     "emptySkills": "No hay habilidades científicas disponibles. Revisa los registros de la aplicación.",
     "searchPlaceholder": "Buscar habilidades científicas por nombre, id o descripción",
@@ -3404,7 +3466,7 @@
   },
   "BackupSettings": {
     "title": "Copia de seguridad y restauración",
-    "description": "Exporta una copia de seguridad portátil de tus datos de codeg, o restaura desde una.",
+    "description": "Exporta una copia de seguridad portátil de tus datos de DrawCode, o restaura desde una.",
     "tabs": {
       "backup": "Copia de seguridad",
       "restore": "Restaurar"
@@ -3434,9 +3496,9 @@
         "incompatible": "Incompatible",
         "createdAt": "Creada: {value}",
         "appVersion": "Versión de la app: {value}",
-        "incompatibleHint": "Esta copia fue creada por una versión más reciente de codeg y no se puede restaurar."
+        "incompatibleHint": "Esta copia fue creada por una versión más reciente de DrawCode y no se puede restaurar."
       },
-      "replaceWarning": "Restaurar reemplaza todos los datos actuales de codeg (base de datos y subidas). Tus datos actuales se guardan primero en una instantánea para poder recuperarlos.",
+      "replaceWarning": "Restaurar reemplaza todos los datos actuales de DrawCode (base de datos y subidas). Tus datos actuales se guardan primero en una instantánea para poder recuperarlos.",
       "keyringNote": "Los tokens de GitHub/chat del escritorio están en el llavero del sistema y no se incluyen; vuelve a introducirlos tras restaurar.",
       "button": "Restaurar",
       "staging": "Preparando la restauración…",
@@ -3445,7 +3507,7 @@
       "restartTimeout": "El servidor no volvió a tiempo. Recarga la página cuando esté activo.",
       "externalSideLocation": "Las transcripciones de conversaciones se restauraron en {path}",
       "confirmTitle": "¿Reemplazar todos los datos?",
-      "confirmBody": "Esto reemplazará tu base de datos y subidas actuales de codeg con la copia y luego reiniciará. Tus datos actuales se guardan primero en una instantánea.",
+      "confirmBody": "Esto reemplazará tu base de datos y subidas actuales de DrawCode con la copia y luego reiniciará. Tus datos actuales se guardan primero en una instantánea.",
       "cancel": "Cancelar",
       "confirmAction": "Reemplazar y reiniciar",
       "external": {
@@ -3470,7 +3532,7 @@
       "error": {
         "badPassphrase": "Frase de contraseña incorrecta o copia dañada.",
         "corrupted": "El archivo de copia de seguridad está dañado.",
-        "unknownFormat": "Este archivo no es una copia de seguridad de codeg reconocida.",
+        "unknownFormat": "Este archivo no es una copia de seguridad de DrawCode reconocida.",
         "newerVersion": "Esta copia fue creada por codeg {backupVersion}, más reciente que esta versión ({appVersion}).",
         "alreadyPending": "Ya hay una restauración preparada. Reinicia para aplicarla antes de preparar otra."
       }

@@ -562,7 +562,16 @@
       "noConfigAvailable": "이 에이전트에는 구성 가능한 옵션이 없습니다.",
       "modeLabel": "모드",
       "agentDefaultHint": "에이전트 기본값: {value}",
-      "defaultOptionLabel": "기본값 ({value})"
+      "defaultOptionLabel": "기본값 ({value})",
+      "routePolicy": "기본 라우트",
+      "routePolicyHint": "대화에 재정의가 없을 때 관리 에이전트가 사용하는 라우트입니다.",
+      "routeEffectiveNative": "위임이 꺼져 있습니다 — 유효 라우트는 Native입니다.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "소프트 워치독(초)",
+      "softWatchdogHint": "관찰 전용 정체 임계값({min}–{max}). 취소하거나 라우트를 바꾸지 않습니다."
     },
     "actions": {
       "dragSort": "드래그하여 순서 변경",
@@ -771,7 +780,7 @@
     },
     "hermes": {
       "configManagement": "Hermes 구성",
-      "configDescription": "Hermes는 자격 증명을 ~/.hermes/.env에, 설정을 ~/.hermes/config.yaml에 직접 관리합니다. 공급자를 선택한 다음 API 키와 모델을 설정하세요. codeg가 두 파일을 모두 작성해 줍니다.",
+      "configDescription": "Hermes는 자격 증명을 ~/.hermes/.env에, 설정을 ~/.hermes/config.yaml에 직접 관리합니다. 공급자를 선택한 다음 API 키와 모델을 설정하세요. DrawCode가 두 파일을 모두 작성해 줍니다.",
       "providerLabel": "공급자",
       "providerHint": "공급자에 따라 Hermes가 사용하는 API 키 변수와 model.provider가 결정됩니다. OAuth 공급자는 아래 터미널 설정을 통해 구성합니다.",
       "groupApiKey": "API 키 제공자",
@@ -963,7 +972,8 @@
       "piBinaryInstallFailed": "pi 설치 실패",
       "piBinaryUninstalled": "pi 제거됨",
       "piBinaryUninstallFailed": "pi 제거 실패",
-      "savePiTrustFailed": "작업 공간 신뢰 저장 실패"
+      "savePiTrustFailed": "작업 공간 신뢰 저장 실패",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "버전 상태",
@@ -977,7 +987,7 @@
       "remoteUnavailable": "{versionText}. 현재 원격 버전을 사용할 수 없습니다.",
       "latest": "{versionText}. 이미 최신입니다.",
       "bundled": "내장 버전: {version}",
-      "bundledMissing": "내장 어댑터가 없습니다. MyCodeBuddy를 다시 설치하거나 업데이트하세요."
+      "bundledMissing": "내장 어댑터가 없습니다. DrawCode를 다시 설치하거나 업데이트하세요."
     },
     "cline": {
       "configDescription": "Cline API 제공자와 자격 증명을 구성합니다. 설정은 ~/.cline/data/에 저장됩니다."
@@ -1049,10 +1059,11 @@
       "installing": "설치 중…",
       "recheck": "다시 확인",
       "trustTitle": "열린 작업 공간 자동 신뢰",
-      "trustDescription": "codeg가 pi를 폴더에 연결할 때 해당 폴더를 신뢰됨으로 표시하여 pi가 별도 확인 없이 프로젝트의 로컬 설정과 스킬을 로드하도록 합니다.",
+      "trustDescription": "DrawCode가 pi를 폴더에 연결할 때 해당 폴더를 신뢰됨으로 표시하여 pi가 별도 확인 없이 프로젝트의 로컬 설정과 스킬을 로드하도록 합니다.",
       "trustHint": "여기서 여는 폴더만 신뢰되며 전체 컴퓨터는 신뢰되지 않습니다. 또한 설정 로드에만 영향을 주며 pi가 실행할 수 있는 작업에는 영향을 주지 않습니다.",
       "configDirSkillsNote": "사용자 지정 구성 디렉터리를 설정하면 설정에서 관리하는 스킬, 전문가, 오피스 도구가 이 pi에 적용되지 않습니다. 해당 폴더에서 스킬을 직접 관리하세요."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "에이전트 설정을 불러오는 중...",
@@ -1085,11 +1096,22 @@
     "restartRequired": "저장되었습니다. 변경 사항을 적용하려면 앱을 다시 시작하세요.",
     "restartNow": "지금 다시 시작",
     "restartFailed": "다시 시작 실패: {message}",
-    "loadFailed": "불러오기 실패: {message}"
+    "loadFailed": "불러오기 실패: {message}",
+    "conversationExperienceTitle": "대화 환경",
+    "conversationExperienceDescription": "자동 제목 및 참조 검색 동작을 설정합니다.",
+    "autoTitleAgent": "자동 제목 에이전트",
+    "autoTitleOff": "끄기",
+    "autoTitleUnavailable": "{agent} (사용할 수 없음)",
+    "autoTitleSaveFailed": "자동 제목 에이전트를 저장하지 못했습니다: {message}",
+    "autoTitleLoading": "자동 제목 설정을 불러오는 중...",
+    "referenceSearchLimit": "참조 결과 한도",
+    "referenceSearchLimitHint": "리소스 소스별로 캐시하고 검색할 최대 결과 수(10~500).",
+    "referenceSearchLimitSave": "참조 한도 저장",
+    "referenceSearchLimitSaveFailed": "참조 결과 한도를 저장하지 못했습니다: {message}"
   },
   "LoginPage": {
-    "documentTitle": "로그인 - codeg",
-    "brand": "Codeg",
+    "documentTitle": "로그인 - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "데스크톱 앱에 연결하려면 액세스 토큰을 입력하세요",
     "tokenPlaceholder": "액세스 토큰",
     "connect": "연결",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "채팅을 위로",
       "statusRunningBadge": "실행 중",
       "statusCancelledBadge": "취소됨",
+      "statusAwaitingReplyBadge": "답변 대기 중",
       "conversationCountUnit": "{count}개",
       "emptyFolderHint": "대화 없음",
       "noMatchingConversations": "일치하는 대화가 없습니다",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "세션에 추가",
       "compareWithBranch": "브랜치와 비교...",
       "reloadFromDisk": "디스크에서 다시 불러오기",
+      "showIgnoredFiles": "무시된 파일 표시",
       "new": "새로 만들기",
       "newFile": "파일",
       "newDirectory": "디렉터리",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "{name} 다운로드 실패",
         "downloadSaved": "{name} 다운로드 완료",
         "pathCopied": "경로가 복사되었습니다",
-        "copyPathFailed": "경로 복사에 실패했습니다"
+        "copyPathFailed": "경로 복사에 실패했습니다",
+        "loadIgnoredFilesFailed": "무시된 파일을 불러오지 못했습니다"
       },
       "createDialog": {
         "newFile": "새 파일",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "{agent} 연결 실패",
         "toolFallbackTitle": "도구",
         "eventErrorTitle": "에이전트 오류",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} 응답이 완료되었습니다",
         "notificationError": "{agent} 오류: {message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "에이전트",
         "mentionGroupSession": "세션",
         "mentionGroupCommit": "커밋",
-        "mentionGroupSkill": "스킬"
+        "mentionGroupSkill": "스킬",
+        "mentionInvalidPattern": "잘못된 정규식",
+        "mentionSourceError": "이 소스를 새로 고치지 못했습니다",
+        "mentionProfileError": "위임 프로필을 불러오지 못했습니다"
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "서브 에이전트",
         "collapsedSummary": "서브 에이전트 {count}",
-        "collapseAria": "서브 에이전트 접기"
+        "collapseAria": "서브 에이전트 접기",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "에이전트 계획",
@@ -2414,7 +2448,10 @@
             "child_empty": "서브에이전트 응답 없음",
             "child_unknown": "서브에이전트: 오류",
             "unknown": "알 수 없는 작업"
-          }
+          },
+          "active": "활성",
+          "waitingInput": "입력 대기",
+          "stalled": "최근 에이전트 활동 없음"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "닫기",
         "reconnectFailed": "세션 다시 연결 실패",
         "applied": "새 설정이 적용되었습니다",
-        "terminalShellTitle": "터미널 셸 업데이트됨"
+        "terminalShellTitle": "터미널 셸 업데이트됨",
+        "delegationRouteTitle": "위임 라우트가 업데이트됨"
       },
       "collabAgent": {
         "title": "서브 에이전트",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "백그라운드 작업 완료",
         "cardFinishedWithStatus": "백그라운드 작업 종료 ({status})",
         "cardResultPending": "결과가 아직 반환되지 않았습니다"
+      },
+      "delegationRoute": {
+        "menuLabel": "위임 라우트",
+        "inheritGlobal": "전역 상속",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg(상속)",
+        "updateFailed": "라우트 업데이트 실패"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "Native로 대체됨({reason}). 다시 연결해 Codeg를 재시도하세요.",
+        "delegationUnavailable": "Codeg 라우트가 활성화되었지만 위임을 사용할 수 없습니다.",
+        "reconnect": "다시 연결",
+        "reconnecting": "다시 연결 중…",
+        "reconnected": "다시 연결됨",
+        "reconnectFailed": "다시 연결 실패",
+        "reason": {
+          "native_suppression_unsupported": "네이티브 억제 미지원",
+          "native_suppression_invalid": "네이티브 억제 무효",
+          "companion_binary_unavailable": "컴패니언 바이너리 사용 불가",
+          "agent_mcp_unsupported": "에이전트 MCP 미지원",
+          "companion_initialization_failed": "컴패니언 초기화 실패",
+          "unknown": "저하됨"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "전환해도 여기에 표시되고 열리는 주소만 바뀝니다. 서비스는 모든 인터페이스에서 수신하며 어떤 주소로도 접속할 수 있습니다.",
     "sectionTitle": "웹 서비스",
-    "sectionDescription": "활성화하면 브라우저를 통해 Codeg에 원격으로 접속할 수 있습니다",
+    "sectionDescription": "활성화하면 브라우저를 통해 DrawCode에 원격으로 접속할 수 있습니다",
     "port": "포트",
     "status": "상태",
     "autoStart": "자동 시작",
-    "autoStartHint": "Codeg가 시작될 때 웹 서비스를 시작합니다",
+    "autoStartHint": "DrawCode가 시작될 때 웹 서비스를 시작합니다",
     "running": "실행 중",
     "stopped": "중지됨",
     "processing": "처리 중...",
@@ -2782,7 +2844,7 @@
     "copy": "복사",
     "qrcode": "QR 코드",
     "qrcodeTitle": "스캔하여 열기",
-    "qrcodeHint": "휴대폰으로 스캔하여 브라우저에서 Codeg를 엽니다",
+    "qrcodeHint": "휴대폰으로 스캔하여 브라우저에서 DrawCode를 엽니다",
     "addressLabel": "접속 주소",
     "tokenLabel": "접속 토큰",
     "tokenHint": "웹 클라이언트 첫 접속 시 이 토큰을 입력하세요",
@@ -2790,7 +2852,7 @@
     "regenerate": "재생성",
     "stalePortOccupiedTitle": "포트 {port}이(가) 다른 프로세스에 의해 사용 중입니다",
     "stalePortUnknownTitle": "포트 {port}의 상태를 확인할 수 없습니다",
-    "stalePortHint": "포트가 해제될 때까지 Codeg은 바인딩할 수 없습니다. 위의 포트를 변경하거나 사용 중인 프로세스를 종료하세요.",
+    "stalePortHint": "포트가 해제될 때까지 DrawCode은 바인딩할 수 없습니다. 위의 포트를 변경하거나 사용 중인 프로세스를 종료하세요.",
     "errors": {
       "alreadyRunning": "웹 서비스가 이미 실행 중입니다",
       "invalidAddress": "호스트 또는 포트 형식이 올바르지 않습니다",
@@ -3024,7 +3086,7 @@
     },
     "confirm": {
       "disableTitle": "이 링크를 비활성화할까요?",
-      "disableBody": "codeg가 관리하는 스킬 링크 {count}개를 제거합니다. 사용자 지정 디렉터리를 차지한 스킬은 그대로 유지됩니다. 언제든지 다시 활성화할 수 있습니다.",
+      "disableBody": "DrawCode가 관리하는 스킬 링크 {count}개를 제거합니다. 사용자 지정 디렉터리를 차지한 스킬은 그대로 유지됩니다. 언제든지 다시 활성화할 수 있습니다.",
       "cancel": "취소",
       "confirm": "비활성화"
     },
@@ -3045,7 +3107,7 @@
   },
   "ExpertsSettings": {
     "title": "전문가 스킬",
-    "description": "AI 코딩 에이전트를 위해 엄선되고 실전 검증된 스킬 워크플로를 활성화하세요. 각 전문가는 superpowers 프로젝트의 독립 실행형 스킬이며 — codeg가 중앙 복사본을 관리하고 선택한 에이전트에 연결합니다.",
+    "description": "AI 코딩 에이전트를 위해 엄선되고 실전 검증된 스킬 워크플로를 활성화하세요. 각 전문가는 superpowers 프로젝트의 독립 실행형 스킬이며 — DrawCode가 중앙 복사본을 관리하고 선택한 에이전트에 연결합니다.",
     "loading": "전문가 로딩 중…",
     "loadingContent": "콘텐츠 로딩 중…",
     "emptyExperts": "사용 가능한 전문가가 없습니다. 애플리케이션 로그를 확인하세요.",
@@ -3090,7 +3152,7 @@
   },
   "ScienceSettings": {
     "title": "과학 연구 스킬",
-    "description": "AI 코딩 에이전트를 위한 엄선된 과학 연구 스킬(가설 생성, 실험 설계, 통계, 시각화, 비판적 평가, 문헌 검색)을 활성화합니다. MyCodeBuddy가 중앙 복사본을 관리하고 선택한 에이전트에 각 스킬을 연결합니다.",
+    "description": "AI 코딩 에이전트를 위한 엄선된 과학 연구 스킬(가설 생성, 실험 설계, 통계, 시각화, 비판적 평가, 문헌 검색)을 활성화합니다. DrawCode가 중앙 복사본을 관리하고 선택한 에이전트에 각 스킬을 연결합니다.",
     "loading": "과학 연구 스킬 불러오는 중…",
     "emptySkills": "사용 가능한 과학 연구 스킬이 없습니다. 애플리케이션 로그를 확인하세요.",
     "searchPlaceholder": "이름, ID 또는 설명으로 과학 연구 스킬 검색",
@@ -3184,7 +3246,7 @@
   },
   "SkillPacksSettings": {
     "title": "스킬 팩",
-    "description": "codeg가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
+    "description": "DrawCode가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
     "tabs": {
       "experts": "전문가",
       "science": "과학 연구",

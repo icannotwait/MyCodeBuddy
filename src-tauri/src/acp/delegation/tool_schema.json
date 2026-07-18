@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id, reason). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. A codeg://delegation-profile/<uuid> mention is an explicit route: pass that UUID as profile_id, call once for every distinct mentioned profile, and fan those calls out before collecting results. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
+    "description": "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work, then Join every still-required returned task_id with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0) before ending the turn. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task"],
@@ -20,30 +20,30 @@
             "pi",
             "grok"
           ],
-          "description": "Which local agent runs the sub-task. Pick the one best suited to the work."
+          "description": "Local agent to run the task."
         },
         "profile_id": {
           "type": "string",
-          "description": "Optional immutable delegation-profile UUID. When supplied, the broker runs exactly this profile and never falls back to the base agent defaults."
+          "description": "Optional immutable profile UUID. Runs exactly that profile without falling back to agent defaults."
         },
         "profile_label": {
           "type": "string",
-          "description": "Display label from the matching explicit profile mention, for example CodeBuddy:GLM5.2. It does not affect routing."
+          "description": "Display label for the explicit profile mention; does not affect routing."
         },
         "task": {
           "type": "string",
-          "description": "The complete, self-contained prompt for the sub-agent. It has no access to this conversation or your context, so spell out everything: the goal, the relevant background and absolute file paths, any constraints, and exactly what to return."
+          "description": "Complete prompt: goal, context, absolute paths, constraints, and expected output."
         },
         "working_dir": {
           "type": "string",
-          "description": "Absolute path the sub-agent runs in. Defaults to this session's working directory."
+          "description": "Absolute working directory; defaults to the parent session directory."
         }
       }
     }
   },
   {
     "name": "get_delegation_status",
-    "description": "Collect delegated task results — or check on them — by the task_ids from delegate_to_agent. Pass a single id in the array to poll one task, or many at once to poll a whole fan-out in a single call. The response is ALWAYS a JSON object {\"tasks\":[...]} with one entry per id, in the order you asked — one entry for a single id, several for a fan-out; every entry carries that task's task_id and status, so you can always tell which task it is and where it stands. The wait_ms argument picks the mode: omit it for a non-blocking snapshot (poll), or pass wait_ms to wait — wait_ms>0 blocks up to that many ms (capped at 60000; re-call to keep waiting), wait_ms=0 blocks with no timeout for as long as the sub-agent runs. When polling several, the wait returns as soon as ANY requested task reaches a terminal state, so re-call to keep collecting the rest. When you just need the results, prefer blocking over repeated polling. Each task reports its current state — running, or a terminal completed / failed / canceled (or unknown if the id isn't recognized); a finished task includes its full result text. While tasks are still running and you are simply waiting, do NOT emit any user-facing message between calls — just call again silently. Skip status narration like \"still running\", \"not returned yet\", or \"continuing to wait\"; it fragments the conversation. Speak to the user only when there is a terminal result to report or something genuinely needs their input.",
+    "description": "Get status or results for task_ids. Omit wait_ms for an immediate snapshot. To block, Join with return_when=all_terminal_or_attention and explicit wait_ms=0; positive wait_ms is rejected on coordination_v1. Join returns when all requested tasks are terminal, requested-child attention is required, or the Broker is unavailable. Answer every attention request, then re-Join only still-running required task ids. Returns {\"tasks\":[...]} in input order; Join responses also include wake_reason and attention_requests.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -52,38 +52,44 @@
           "type": "array",
           "items": { "type": "string" },
           "minItems": 1,
-          "description": "One or more task_ids returned by delegate_to_agent — pass a single id to poll one task, or several to poll them together in one call. The response is always a JSON object {\"tasks\":[...]} with one entry per id (in this order) — one entry for a single id — and each entry carries that task's task_id and status. With wait_ms set, the call returns as soon as ANY of these tasks reaches a terminal state."
+          "description": "One or more task IDs. One checks a single task; several check a fan-out together."
         },
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
-          "description": "How long to wait. Omit for an immediate snapshot (poll). A positive value blocks up to that many milliseconds (capped at 60000). 0 means no timeout — block until a task reaches a terminal state, however long it takes. When several ids are given, the wait resolves as soon as ANY requested task becomes terminal."
+          "maximum": 0,
+          "description": "Omit wait_ms for an immediate snapshot. Use 0 with return_when=all_terminal_or_attention for canonical Join. Positive wait_ms is rejected on coordination_v1."
+        },
+        "return_when": {
+          "type": "string",
+          "enum": ["all_terminal_or_attention"],
+          "description": "Canonical Join condition. Requires explicit wait_ms=0; returns for all terminal, attention required, or unavailable."
         }
       }
     }
   },
   {
     "name": "cancel_delegation",
-    "description": "Stop a running delegated task by its task_id and tear down its sub-agent — use this only when you no longer want the result. You must provide a reason. Use timeout only when you are tempted to cancel because the child is still running too long; timeout will not cancel and will tell you to keep waiting. Don't cancel just because a task is taking a while: substantial work can legitimately run for a long time, so prefer waiting on it (get_delegation_status with wait_ms) over canceling. If the task has already finished, nothing is canceled and its final result is returned instead.",
+    "description": "Cancel a running task only when its result is no longer wanted. timeout is non-canceling and returns guidance to keep waiting. Prefer get_delegation_status with wait_ms for slow work. If the task already finished, return its final result.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "reason"],
       "properties": {
         "task_id": {
           "type": "string",
-          "description": "The task_id returned by delegate_to_agent."
+          "description": "Task ID returned by delegate_to_agent."
         },
         "reason": {
           "type": "string",
           "enum": ["timeout", "taskfail", "usercancel", "others"],
-          "description": "Why this task should be canceled. timeout is non-canceling and returns guidance to keep waiting; taskfail, usercancel, and others cancel the task."
+          "description": "Reason: timeout is non-canceling; taskfail, usercancel, and others cancel."
         }
       }
     }
   },
   {
     "name": "check_user_feedback",
-    "description": "IMPORTANT: This tool gives you the ability to receive the user's real-time guidance while you work, preventing you from going down the wrong path and wasting effort. The user can type corrections, new requirements, or hints at any time during your turn — but you will NEVER see them unless you call this tool. Without it, you could spend minutes on work the user has already tried to redirect.\n\nWhen to call:\n- After thinking through your approach but BEFORE starting implementation — the user may have clarified requirements.\n- Before making a significant decision (choosing an architecture, picking which files to modify, deciding on an approach) — the user may prefer a different direction.\n- After completing a sub-task and before moving to the next step — the user may want to adjust priorities.\n- When you pause to plan or organize your next steps — a natural checkpoint to read any pending guidance.\n\nThis is a quick, non-blocking snapshot that returns instantly. It either returns the user's messages (treat as HIGH-PRIORITY steering and adjust immediately) or an empty result (continue your current plan). Call it proactively — do not wait to be asked.",
+    "description": "Read pending user guidance during this turn; messages are available only through this tool. Non-blocking and immediate. Call before starting implementation, before a significant decision, and after a meaningful sub-task. Treat returned messages as HIGH-PRIORITY steering; an empty result means continue.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -91,7 +97,7 @@
   },
   {
     "name": "ask_user_question",
-    "description": "Ask the user one or more multiple-choice questions and BLOCK until they answer. The questions render as interactive cards above the user's input box; this call returns only once the user submits their choices (or dismisses the card). Use ONLY when you are blocked on a decision that is genuinely the user's to make — one you cannot resolve from the request, the code, or sensible defaults (e.g. which approach, which format, which library, which of several files). Do NOT use it to ask 'should I proceed?' or to confirm an obvious default, and do NOT use it for open-ended questions that aren't a small set of discrete choices. The user can always pick 'Other' and type a custom answer, so don't add your own 'Other' option. If you want to recommend a choice, put it first and append ' (Recommended)' to its label. Prefer ONE call with a few related questions over many sequential calls.",
+    "description": "Render interactive cards for 1-4 related multiple-choice questions and BLOCK until submitted or dismissed. Use only for a genuinely user-owned discrete decision that cannot be resolved from the request, code, or sensible defaults. Do not ask merely whether to proceed, confirm an obvious default, or collect open-ended input. Other is added automatically. Put a recommended choice first and append ' (Recommended)' to its label. Prefer one call for related questions.",
     "inputSchema": {
       "type": "object",
       "required": ["questions"],
@@ -100,40 +106,40 @@
           "type": "array",
           "minItems": 1,
           "maxItems": 4,
-          "description": "1-4 questions to ask in this single call.",
+          "description": "Questions in this call.",
           "items": {
             "type": "object",
             "required": ["question", "header", "multiSelect", "options"],
             "properties": {
               "question": {
                 "type": "string",
-                "description": "The full question shown to the user."
+                "description": "Question shown to the user."
               },
               "header": {
                 "type": "string",
                 "maxLength": 12,
-                "description": "Short category label (≤ 12 chars) shown as a chip, e.g. 'Approach', 'Format'."
+                "description": "Chip label, at most 12 characters."
               },
               "multiSelect": {
                 "type": "boolean",
-                "description": "If true, the user may select multiple options; otherwise it's a single choice."
+                "description": "Whether multiple options may be selected."
               },
               "options": {
                 "type": "array",
                 "minItems": 2,
                 "maxItems": 4,
-                "description": "2-4 selectable choices.",
+                "description": "Selectable choices.",
                 "items": {
                   "type": "object",
                   "required": ["label", "description"],
                   "properties": {
                     "label": {
                       "type": "string",
-                      "description": "Concise choice text. Append ' (Recommended)' to the first option to recommend it."
+                      "description": "Short choice text; append ' (Recommended)' to the first recommended choice."
                     },
                     "description": {
                       "type": "string",
-                      "description": "What this choice means or its trade-off."
+                      "description": "Meaning or trade-off of this choice."
                     }
                   }
                 }
@@ -146,19 +152,56 @@
   },
   {
     "name": "get_session_info",
-    "description": "Look up a session/conversation the user referenced in their message and return what it is: its title, which agent ran it, its status, workspace folder, git branch, model, message count, and token-usage stats — and, on request, a compact view of its most recent messages. Call this whenever the user's message contains a `codeg://session/<number>` reference (a mentioned session) and you need to know what that session is about or what happened in it (e.g. to continue its work or summarize it). Pass the NUMBER from the reference as `session_id` (it is codeg's internal conversation id, NOT the agent's own session id). The result is read-only and never modifies the session. A session that no longer exists returns a `found: false` result you can act on — it is not an error.",
+    "description": "Resolve a codeg://session/<number> reference to read-only metadata and optional recent messages. Call when a mentioned session is needed to continue or summarize its work. Pass Codeg's internal conversation ID as session_id, not the agent session ID. A missing session returns found: false, not an error.",
     "inputSchema": {
       "type": "object",
       "required": ["session_id"],
       "properties": {
         "session_id": {
           "type": "integer",
-          "description": "The number in the `codeg://session/<number>` reference from the user's message (codeg's internal conversation id). For example, given `[Fix auth](codeg://session/214)`, pass 214."
+          "description": "Number from codeg://session/<number>; Codeg's internal conversation ID."
         },
         "max_messages": {
           "type": "integer",
           "minimum": 0,
-          "description": "How many of the session's most recent turns to include as compact text. Defaults to 20; pass 0 for metadata only (faster, no transcript read). Capped at 200."
+          "description": "Recent turns to include. Defaults to 20; 0 returns metadata only; max 200."
+        }
+      }
+    }
+  },
+  {
+    "name": "request_parent_decision",
+    "description": "Ask the direct parent for a blocking decision. Blocks until reply or closure; not for progress, logs, or warnings.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message"],
+      "properties": {
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Decision needed; max 16 KiB UTF-8."
+        }
+      }
+    }
+  },
+  {
+    "name": "reply_to_delegation",
+    "description": "Reply to an open direct-child Join decision. First reply wins; same reply is idempotent.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "reply"],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Open Join attention request id."
+        },
+        "reply": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Decision; max 16 KiB UTF-8."
         }
       }
     }

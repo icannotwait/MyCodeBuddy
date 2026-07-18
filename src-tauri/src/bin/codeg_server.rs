@@ -213,9 +213,7 @@ async fn async_main() -> ExitCode {
         // bearer credential and must never enter the durable log files or the
         // in-app log viewer. `eprintln!` bypasses the tracing sinks (file +
         // ring buffer); only the local terminal / Docker stderr sees it.
-        eprintln!(
-            "[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}"
-        );
+        eprintln!("[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}");
         eprintln!("[SERVER] Pin your own by setting the CODEG_TOKEN environment variable.");
     }
 
@@ -257,18 +255,60 @@ async fn async_main() -> ExitCode {
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
     let connection_manager = codeg_lib::app_state::default_connection_manager();
-    let (
-        delegation_broker,
-        delegation_tokens,
-        delegation_socket_path,
-        feedback_config,
-        question_config,
-        session_info_config,
-    ) = codeg_lib::app_state::build_delegation_stack(
+    let stack = codeg_lib::app_state::build_delegation_stack(
         &connection_manager,
         db.conn.clone(),
         data_dir.clone(),
     );
+    let internal_sessions =
+        match codeg_lib::auto_title::InternalAgentSessionRegistry::load(db.conn.clone(), &data_dir)
+            .await
+        {
+            Ok(reg) => reg,
+            Err(e) => {
+                tracing::error!("[SERVER] failed to load internal session registry: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let title_db = Arc::new(codeg_lib::db::AppDatabase {
+        conn: db.conn.clone(),
+    });
+    let auto_title_coordinator = codeg_lib::auto_title::build_production_coordinator(
+        title_db,
+        connection_manager.clone_ref(),
+        Arc::clone(&internal_sessions),
+        data_dir.clone(),
+        emitter.clone(),
+    );
+    if let Err(e) = auto_title_coordinator.recover_and_start().await {
+        tracing::error!("[SERVER] auto-title recovery failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let conversation_experience_gate = Arc::new(
+        codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+    );
+    // Load the persisted reference-search limit before constructing the
+    // production registry so the first start observes the operator's cap.
+    let reference_search_limit = codeg_lib::commands::conversation_experience::load_settings_from(
+        &db.conn,
+    )
+    .await
+    .map(|settings| settings.reference_search_limit)
+    .unwrap_or(
+        codeg_lib::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+    );
+    let reference_search_registry = codeg_lib::reference_search::ReferenceSearchRegistry::new(
+        reference_search_limit,
+        Arc::new(codeg_lib::reference_search::ProductionReferenceSourceFactory {
+            db: db.conn.clone(),
+        }),
+    );
+    {
+        let registry = Arc::clone(&reference_search_registry);
+        tokio::spawn(codeg_lib::reference_search::run_reference_search_sweeper(
+            registry,
+        ));
+    }
     let state = Arc::new(AppState {
         db,
         connection_manager,
@@ -277,18 +317,25 @@ async fn async_main() -> ExitCode {
         acp_event_bus: acp_event_bus.clone(),
         emitter,
         data_dir,
+        internal_sessions: internal_sessions.clone(),
+        auto_title_coordinator: auto_title_coordinator.clone(),
+        conversation_experience_gate,
+        reference_search_registry,
         web_server_state: WebServerState::new(),
         chat_channel_manager: codeg_lib::app_state::default_chat_channel_manager(),
         workspace_transfer: Arc::new(
             codeg_lib::workspace_transfer::WorkspaceTransferManager::new_from_env(),
         ),
         pet_state: pet_state_handle.clone(),
-        delegation_broker: delegation_broker.clone(),
-        delegation_tokens: delegation_tokens.clone(),
-        delegation_socket_path: delegation_socket_path.clone(),
-        feedback_config: feedback_config.clone(),
-        question_config: question_config.clone(),
-        session_info_config: session_info_config.clone(),
+        delegation_broker: stack.broker.clone(),
+        delegation_metrics: stack.metrics.clone(),
+        delegation_runtime_settings: stack.runtime_settings.clone(),
+        delegation_tokens: stack.tokens.clone(),
+        delegation_leases: stack.leases.clone(),
+        delegation_socket_path: stack.socket_path.clone(),
+        feedback_config: stack.feedback.clone(),
+        question_config: stack.ask.clone(),
+        session_info_config: stack.sessions.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
@@ -299,40 +346,58 @@ async fn async_main() -> ExitCode {
         hub.set_emitter(state.emitter.clone());
     }
 
-    // Apply persisted delegation settings (depth, enabled) before
-    // the listener starts accepting so even the first companion request
-    // sees the operator's configured behavior. Cancellation is handled
+    // Apply persisted delegation settings (depth, enabled, route, watchdog)
+    // before the listener starts accepting so even the first companion request
+    // sees the operator's configured behavior. Broker config and the runtime
+    // watch snapshot come from one clamped load. Cancellation is handled
     // out-of-band via MCP `notifications/cancelled` — no broker-side
     // timeout to apply here.
-    codeg_lib::commands::delegation::apply_persisted_config(&state.db.conn, &delegation_broker)
-        .await;
+    codeg_lib::commands::delegation::apply_persisted_config(
+        &state.db.conn,
+        &stack.broker,
+        &stack.runtime_settings,
+    )
+    .await;
     // Same for the live-feedback enable flag, so the first companion launch
     // sees the operator's configured behavior.
-    codeg_lib::commands::feedback::apply_persisted_feedback_config(
-        &state.db.conn,
-        &feedback_config,
-    )
-    .await;
+    codeg_lib::commands::feedback::apply_persisted_feedback_config(&state.db.conn, &stack.feedback)
+        .await;
     // Same for the ask-user-question enable flag.
-    codeg_lib::commands::question::apply_persisted_question_config(
-        &state.db.conn,
-        &question_config,
-    )
-    .await;
+    codeg_lib::commands::question::apply_persisted_question_config(&state.db.conn, &stack.ask)
+        .await;
     // Same for the get-session-info enable flag.
     codeg_lib::commands::session_info::apply_persisted_session_info_config(
         &state.db.conn,
-        &session_info_config,
+        &stack.sessions,
     )
     .await;
+
+    // After migrations + settings, before the listener accepts: fail only
+    // orphaned running delegate rows as host_restarted. Fail-closed: do not
+    // start the listener (or continue accepting work) when reconcile fails.
+    if let Err(e) = codeg_lib::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
+        stack.broker.reconcile_running_on_startup().await,
+    ) {
+        tracing::error!("[delegation][FATAL] {e}; aborting startup.");
+        return ExitCode::from(2);
+    }
+
+    // Soft supervisor: after reconcile (fail-closed preserved), before/with
+    // the listener. Observe-only — no cancel/settle/route capability.
+    codeg_lib::app_state::spawn_delegation_supervisor(
+        stack.broker.clone(),
+        state.connection_manager.clone_ref(),
+        &stack.runtime_settings,
+    );
 
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.
     {
         let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
-            delegation_broker,
-            delegation_tokens,
+            stack.broker,
+            stack.tokens,
+            stack.leases,
             Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
                 manager: Arc::new(state.connection_manager.clone_ref()),
             }),
@@ -346,9 +411,10 @@ async fn async_main() -> ExitCode {
                 Arc::new(codeg_lib::db::AppDatabase {
                     conn: state.db.conn.clone(),
                 }),
+                state.internal_sessions.clone(),
             )),
         );
-        let socket = delegation_socket_path.clone();
+        let socket = stack.socket_path.clone();
         tokio::spawn(async move {
             if let Err(e) = listener.run(socket).await {
                 tracing::info!("[delegation] listener exited: {e}");
@@ -406,6 +472,10 @@ async fn async_main() -> ExitCode {
             state.db.conn.clone(),
             state.connection_manager.clone_ref(),
             state.emitter.clone(),
+            codeg_lib::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
+                runtime: state.delegation_runtime_settings.clone(),
+                data_dir: state.data_dir.clone(),
+            },
         )
         .await;
 
@@ -462,6 +532,7 @@ async fn async_main() -> ExitCode {
         state.emitter.clone(),
         state.acp_event_bus.clone(),
         state.data_dir.clone(),
+        state.delegation_runtime_settings.clone(),
     ) {
         tokio::spawn(codeg_lib::automation::run_automation_engine(engine));
     }
@@ -507,9 +578,11 @@ async fn async_main() -> ExitCode {
     // Publish runtime state so the settings page (served by us) shows
     // the truth — running on `actual_port` with this token — instead of
     // the placeholder "stopped" that triggers the stale-port banner.
-    state
-        .web_server_state
-        .mark_externally_running(advertised_host.clone(), actual_port, token.clone());
+    state.web_server_state.mark_externally_running(
+        advertised_host.clone(),
+        actual_port,
+        token.clone(),
+    );
     let addresses = addresses_for_bind(&advertised_host, actual_port);
 
     // Token on stderr ONLY (bearer credential — keep it out of the log files

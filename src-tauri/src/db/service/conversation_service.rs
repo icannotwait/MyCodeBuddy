@@ -1,13 +1,42 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
+use crate::acp::delegation::route::{is_managed_agent, DelegationRoutePolicy};
+use crate::auto_title::{cancel_job, enroll_new_conversation};
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
-use crate::models::{AgentType, DbConversationSummary};
+use crate::models::{AgentType, ConversationStatePatch, DbConversationSummary};
+
+#[derive(Debug, Clone)]
+pub struct ClearAwaitingReplyOutcome {
+    pub patch: ConversationStatePatch,
+    pub changed: bool,
+}
+
+fn status_string(status: &conversation::ConversationStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{status:?}"))
+}
+
+fn state_patch(
+    id: i32,
+    status: conversation::ConversationStatus,
+    awaiting_reply_token: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> ConversationStatePatch {
+    ConversationStatePatch {
+        id,
+        status: status_string(&status),
+        awaiting_reply_token,
+        updated_at,
+    }
+}
 
 pub async fn create(
     conn: &DatabaseConnection,
@@ -16,14 +45,37 @@ pub async fn create(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create`] but persists a root session route override in the same
+/// INSERT. Rejects a non-null override for unmanaged Agent types.
+pub async fn create_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Regular,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Regular,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -39,14 +91,36 @@ pub async fn create_chat(
     title: Option<String>,
     git_branch: Option<String>,
 ) -> Result<conversation::Model, DbError> {
+    create_chat_with_route_override(conn, folder_id, agent_type, title, git_branch, None).await
+}
+
+/// Like [`create_chat`] but persists a route override in the same INSERT.
+pub async fn create_chat_with_route_override(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    agent_type: AgentType,
+    title: Option<String>,
+    git_branch: Option<String>,
+    delegation_route_override: Option<DelegationRoutePolicy>,
+) -> Result<conversation::Model, DbError> {
+    if delegation_route_override.is_some() && !is_managed_agent(agent_type) {
+        return Err(DbError::Validation(
+            "delegation_route_override is only valid for managed agents \
+             (Codex, Grok, CodeBuddy, ClaudeCode)"
+                .into(),
+        ));
+    }
     create_inner(
         conn,
         folder_id,
         agent_type,
         title,
         git_branch,
-        None,
-        ConversationKind::Chat,
+        CreateInnerOptions {
+            delegation: None,
+            kind: ConversationKind::Chat,
+            delegation_route_override,
+        },
     )
     .await
 }
@@ -56,7 +130,8 @@ pub async fn create_chat(
 /// `parent_id` / `parent_tool_use_id` / `delegation_call_id` so the lifecycle
 /// subscriber and frontend can rebuild the parent ↔ child binding without
 /// inspecting the live broker state. `kind` follows the invariant
-/// `delegate ⟺ parent_id set`.
+/// `delegate ⟺ parent_id set`. Broker children always store a null route
+/// override (connection origin forces Codeg later).
 pub async fn create_with_delegation(
     conn: &DatabaseConnection,
     folder_id: i32,
@@ -70,7 +145,28 @@ pub async fn create_with_delegation(
     } else {
         ConversationKind::Regular
     };
-    create_inner(conn, folder_id, agent_type, title, git_branch, delegation, kind).await
+    create_inner(
+        conn,
+        folder_id,
+        agent_type,
+        title,
+        git_branch,
+        CreateInnerOptions {
+            delegation,
+            kind,
+            delegation_route_override: None,
+        },
+    )
+    .await
+}
+
+/// Private options for [`create_inner`]: kind, optional broker linkage, and
+/// optional managed route override. Bundled so the private insert helper stays
+/// under the clippy argument threshold.
+struct CreateInnerOptions {
+    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
+    kind: ConversationKind,
+    delegation_route_override: Option<DelegationRoutePolicy>,
 }
 
 async fn create_inner(
@@ -79,27 +175,70 @@ async fn create_inner(
     agent_type: AgentType,
     title: Option<String>,
     git_branch: Option<String>,
-    delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
-    kind: ConversationKind,
+    options: CreateInnerOptions,
 ) -> Result<conversation::Model, DbError> {
+    let CreateInnerOptions {
+        delegation,
+        kind,
+        delegation_route_override,
+    } = options;
+    let is_delegate = delegation.is_some();
+    let rollup_defaults = if is_delegate {
+        (
+            Some(0_i64),
+            Some(0_i64),
+            Some("[]".to_string()),
+            Some(false),
+            None::<i64>,
+            None::<i64>,
+            Some(false),
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
+    let (
+        delegation_tool_call_count,
+        delegation_edit_tool_call_count,
+        delegation_touched_files_json,
+        delegation_touched_files_truncated,
+        delegation_additions,
+        delegation_deletions,
+        delegation_line_counts_complete,
+    ) = rollup_defaults;
     let at_str = serde_json::to_value(agent_type)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     let now = Utc::now();
-    let (parent_id, parent_tool_use_id, delegation_call_id) = match delegation {
+    let (parent_id, parent_tool_use_id, delegation_call_id, task_fields) = match delegation {
         Some(link) => (
             Some(link.parent_conversation_id),
             Some(link.parent_tool_use_id),
             Some(link.delegation_call_id),
+            // Accepted boundary: linked delegate rows are born running. Normal
+            // root/chat rows keep all four task fields null.
+            (
+                Some(conversation::DelegationTaskStatus::Running),
+                None::<String>,
+                Some(now),
+                None,
+            ),
         ),
-        None => (None, None, None),
+        None => (None, None, None, (None, None, None, None)),
     };
+    let (
+        delegation_task_status,
+        delegation_error_code,
+        delegation_started_at,
+        delegation_finished_at,
+    ) = task_fields;
+    let txn = conn.begin().await?;
     let model = conversation::ActiveModel {
         id: NotSet,
         folder_id: Set(folder_id),
         title: Set(title),
         title_locked: Set(false),
+        auto_title_finalized: Set(false),
         agent_type: Set(at_str),
         status: Set(conversation::ConversationStatus::InProgress),
         kind: Set(kind),
@@ -109,13 +248,74 @@ async fn create_inner(
         parent_id: Set(parent_id),
         parent_tool_use_id: Set(parent_tool_use_id),
         delegation_call_id: Set(delegation_call_id),
+        delegation_route_override: Set(route_policy_to_storage(delegation_route_override)),
+        delegation_task_status: Set(delegation_task_status),
+        delegation_error_code: Set(delegation_error_code),
+        delegation_started_at: Set(delegation_started_at),
+        delegation_finished_at: Set(delegation_finished_at),
+        delegation_tool_call_count: Set(delegation_tool_call_count),
+        delegation_edit_tool_call_count: Set(delegation_edit_tool_call_count),
+        delegation_touched_files_json: Set(delegation_touched_files_json),
+        delegation_touched_files_truncated: Set(delegation_touched_files_truncated),
+        delegation_additions: Set(delegation_additions),
+        delegation_deletions: Set(delegation_deletions),
+        delegation_line_counts_complete: Set(delegation_line_counts_complete),
         message_count: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
         pinned_at: Set(None),
-    };
-    Ok(model.insert(conn).await?)
+        awaiting_reply_token: Set(None),
+    }
+    .insert(&txn)
+    .await?;
+    enroll_new_conversation(&txn, model.id, now).await?;
+    txn.commit().await?;
+    Ok(model)
+}
+
+fn route_policy_to_storage(policy: Option<DelegationRoutePolicy>) -> Option<String> {
+    policy.map(|p| match p {
+        DelegationRoutePolicy::Codeg => "codeg".to_string(),
+        DelegationRoutePolicy::Native => "native".to_string(),
+    })
+}
+
+/// Map a stored route override string to the typed policy. Malformed legacy
+/// values log and become `None` — never panic.
+fn parse_route_override(raw: Option<String>) -> Option<DelegationRoutePolicy> {
+    match raw.as_deref() {
+        None => None,
+        Some("codeg") => Some(DelegationRoutePolicy::Codeg),
+        Some("native") => Some(DelegationRoutePolicy::Native),
+        Some(other) => {
+            tracing::warn!(
+                "[conversation_service] malformed delegation_route_override {other:?}, treating as None"
+            );
+            None
+        }
+    }
+}
+
+/// Unconditional status write: sets `status`, clears `awaiting_reply_token`,
+/// and bumps `updated_at` atomically. Returns the resulting state patch so
+/// callers can broadcast without a second read.
+pub async fn update_status_with_patch(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    status: conversation::ConversationStatus,
+) -> Result<ConversationStatePatch, DbError> {
+    let conv = conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
+    let now = Utc::now();
+    let mut active: conversation::ActiveModel = conv.into();
+    active.status = Set(status.clone());
+    active.awaiting_reply_token = Set(None);
+    active.updated_at = Set(now);
+    active.update(conn).await?;
+    Ok(state_patch(conversation_id, status, None, now))
 }
 
 pub async fn update_status(
@@ -123,57 +323,171 @@ pub async fn update_status(
     conversation_id: i32,
     status: conversation::ConversationStatus,
 ) -> Result<(), DbError> {
-    let conv = conversation::Entity::find_by_id(conversation_id)
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
-    let mut active: conversation::ActiveModel = conv.into();
-    active.status = Set(status);
-    active.updated_at = Set(Utc::now());
-    active.update(conn).await?;
-    Ok(())
+    update_status_with_patch(conn, conversation_id, status)
+        .await
+        .map(|_| ())
 }
 
 /// Conditional status transition (CAS): write `new_status` only if the row's
-/// current `status` equals `expected`. Returns `true` when the row was
-/// updated. Used by the lifecycle subscriber on disconnect/error so a
+/// current `status` equals `expected`. Returns the state patch when the row was
+/// updated, `None` when the CAS lost. Clears `awaiting_reply_token` on a
+/// successful write. Used by the lifecycle subscriber on disconnect/error so a
 /// concurrent user-driven `completed` (or a prior `pending_review` from
 /// `TurnComplete`) cannot be silently overwritten.
-pub async fn update_status_if(
-    conn: &DatabaseConnection,
+pub async fn update_status_if_with_patch<C: ConnectionTrait>(
+    conn: &C,
     conversation_id: i32,
     expected: conversation::ConversationStatus,
     new_status: conversation::ConversationStatus,
-) -> Result<bool, DbError> {
+) -> Result<Option<ConversationStatePatch>, DbError> {
     use sea_orm::sea_query::Expr;
+    let now = Utc::now();
     let result = conversation::Entity::update_many()
-        .col_expr(conversation::Column::Status, Expr::value(new_status))
-        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
+        .col_expr(
+            conversation::Column::Status,
+            Expr::value(new_status.clone()),
+        )
+        .col_expr(
+            conversation::Column::AwaitingReplyToken,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::Status.eq(expected))
         .exec(conn)
         .await?;
-    Ok(result.rows_affected > 0)
+    Ok((result.rows_affected > 0).then(|| state_patch(conversation_id, new_status, None, now)))
+}
+
+pub async fn update_status_if<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+    expected: conversation::ConversationStatus,
+    new_status: conversation::ConversationStatus,
+) -> Result<bool, DbError> {
+    Ok(
+        update_status_if_with_patch(conn, conversation_id, expected, new_status)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Atomic end-of-turn CAS: transition `in_progress → pending_review` and
+/// optionally mint an `awaiting_reply_token` for eligible root conversations.
+/// Returns `None` when the CAS loses (row not in_progress / not found / deleted).
+///
+/// Token is minted only when `parent_id IS NULL` AND `mark_awaiting_reply`.
+/// Child and background transitions never receive a generation.
+pub async fn finish_end_turn_if_in_progress<C: ConnectionTrait>(
+    conn: &C,
+    conversation_id: i32,
+    mark_awaiting_reply: bool,
+) -> Result<Option<ConversationStatePatch>, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let row = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
+    let token =
+        (row.parent_id.is_none() && mark_awaiting_reply).then(|| uuid::Uuid::new_v4().to_string());
+    let now = Utc::now();
+    let result = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::Status,
+            Expr::value(conversation::ConversationStatus::PendingReview),
+        )
+        .col_expr(
+            conversation::Column::AwaitingReplyToken,
+            Expr::value(token.clone()),
+        )
+        .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::Status.eq(conversation::ConversationStatus::InProgress))
+        .exec(conn)
+        .await?;
+    Ok((result.rows_affected == 1).then(|| {
+        state_patch(
+            conversation_id,
+            conversation::ConversationStatus::PendingReview,
+            token,
+            now,
+        )
+    }))
+}
+
+/// Expected-token CAS clear: write `awaiting_reply_token = NULL` only when the
+/// stored token matches `expected_token`. Never mutates `status` or
+/// `updated_at`. Always fetches and returns the current backend state so stale
+/// clears still surface the live generation.
+pub async fn clear_awaiting_reply(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    expected_token: &str,
+) -> Result<ClearAwaitingReplyOutcome, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let result = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::AwaitingReplyToken,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::AwaitingReplyToken.eq(expected_token))
+        .exec(conn)
+        .await?;
+    let changed = result.rows_affected == 1;
+
+    let row = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
+
+    Ok(ClearAwaitingReplyOutcome {
+        patch: state_patch(
+            conversation_id,
+            row.status,
+            row.awaiting_reply_token,
+            row.updated_at,
+        ),
+        changed,
+    })
 }
 
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
 /// auto-title backfill ([`refresh_auto_title`]) leaves this row alone, so the
 /// user's hand-picked name survives every subsequent session-file parse.
+///
+/// Returns `true` when a pending auto-title job was removed and active work
+/// must be cancelled after commit (wired in Task 8).
 pub async fn update_title(
     conn: &DatabaseConnection,
     conversation_id: i32,
     title: String,
-) -> Result<(), DbError> {
-    let conv = conversation::Entity::find_by_id(conversation_id)
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
-    let mut active: conversation::ActiveModel = conv.into();
-    active.title = Set(Some(title));
-    active.title_locked = Set(true);
-    active.updated_at = Set(Utc::now());
-    active.update(conn).await?;
-    Ok(())
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let txn = conn.begin().await?;
+    let changed = conversation::Entity::update_many()
+        .col_expr(conversation::Column::Title, Expr::value(title))
+        .col_expr(conversation::Column::TitleLocked, Expr::value(true))
+        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .exec(&txn)
+        .await?;
+    if changed.rows_affected == 0 {
+        return Err(DbError::Migration(format!(
+            "Conversation not found: {conversation_id}"
+        )));
+    }
+    let removed = cancel_job(&txn, conversation_id).await?;
+    txn.commit().await?;
+    Ok(removed)
 }
 
 /// Auto-derive counterpart to [`update_title`]: write `title` ONLY when the row
@@ -204,6 +518,7 @@ pub async fn refresh_auto_title(
         .col_expr(conversation::Column::Title, Expr::value(title))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(conversation::Column::AutoTitleFinalized.eq(false))
         .filter(
             sea_orm::Condition::any()
                 .add(conversation::Column::Title.is_null())
@@ -267,16 +582,29 @@ pub async fn update_external_id(
     Ok(())
 }
 
-pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<(), DbError> {
-    let conv = conversation::Entity::find_by_id(conversation_id)
+/// Soft-delete a conversation. Returns `true` when a pending auto-title job
+/// was removed and active work must be cancelled after commit.
+pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let txn = conn.begin().await?;
+    let changed = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DeletedAt,
+            Expr::value(Some(Utc::now())),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null())
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
-    let mut active: conversation::ActiveModel = conv.into();
-    active.deleted_at = Set(Some(Utc::now()));
-    active.update(conn).await?;
-    Ok(())
+        .exec(&txn)
+        .await?;
+    if changed.rows_affected == 0 {
+        return Err(DbError::Migration(format!(
+            "Conversation not found: {conversation_id}"
+        )));
+    }
+    let removed = cancel_job(&txn, conversation_id).await?;
+    txn.commit().await?;
+    Ok(removed)
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
@@ -295,17 +623,46 @@ fn parse_agent_type(s: &str) -> AgentType {
 }
 
 fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
+    use crate::acp::delegation::runtime_stats::{
+        decode_persisted_runtime_stats, PersistedRuntimeStatsColumns,
+    };
+
     let status = serde_json::to_value(&r.status)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", r.status));
+    let conversation_id = r.id;
+    let delegation_runtime_stats =
+        match decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
+            started_at: r.delegation_started_at,
+            finished_at: r.delegation_finished_at,
+            tool_call_count: r.delegation_tool_call_count,
+            edit_tool_call_count: r.delegation_edit_tool_call_count,
+            touched_files_json: r.delegation_touched_files_json.as_deref(),
+            touched_files_truncated: r.delegation_touched_files_truncated,
+            additions: r.delegation_additions,
+            deletions: r.delegation_deletions,
+            line_counts_complete: r.delegation_line_counts_complete,
+        }) {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %err,
+                    "[conversation_service] failed to decode delegation_runtime_stats"
+                );
+                None
+            }
+        };
     DbConversationSummary {
         id: r.id,
         folder_id: r.folder_id,
         title: r.title,
         title_locked: r.title_locked,
+        auto_title_finalized: r.auto_title_finalized,
         agent_type: parse_agent_type(&r.agent_type),
         status,
+        awaiting_reply_token: r.awaiting_reply_token,
         kind: r.kind.clone(),
         model: r.model,
         git_branch: r.git_branch,
@@ -320,7 +677,71 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         parent_id: r.parent_id,
         parent_tool_use_id: r.parent_tool_use_id,
         delegation_call_id: r.delegation_call_id,
+        delegation_route_override: parse_route_override(r.delegation_route_override),
+        delegation_task_status: r.delegation_task_status,
+        delegation_error_code: r.delegation_error_code,
+        delegation_started_at: r.delegation_started_at,
+        delegation_finished_at: r.delegation_finished_at,
+        delegation_runtime_stats,
+        // Pure mapper: open attention is bulk-filled by
+        // `fill_open_delegation_attention` over the returned set.
+        delegation_attention_request: None,
     }
+}
+
+/// Attach at most one open attention request per summary that carries a
+/// non-empty `delegation_call_id`. ONE SeaORM query over all task ids —
+/// never N+1. Ordered by `CreatedAt ASC, RequestId ASC` so the earliest open
+/// request wins when duplicates exist.
+pub async fn fill_open_delegation_attention(
+    conn: &DatabaseConnection,
+    summaries: &mut [DbConversationSummary],
+) -> Result<(), DbError> {
+    use crate::acp::delegation::attention::AttentionRequestSummary;
+    use crate::db::entities::delegation_attention_request;
+
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    let task_ids: Vec<String> = summaries
+        .iter()
+        .filter_map(|s| {
+            s.delegation_call_id
+                .as_ref()
+                .filter(|id| !id.is_empty())
+                .cloned()
+        })
+        .collect();
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+    let rows = delegation_attention_request::Entity::find()
+        .filter(delegation_attention_request::Column::TaskId.is_in(task_ids))
+        .filter(delegation_attention_request::Column::Status.eq("open"))
+        .order_by_asc(delegation_attention_request::Column::CreatedAt)
+        .order_by_asc(delegation_attention_request::Column::RequestId)
+        .all(conn)
+        .await?;
+    let mut by_task: std::collections::HashMap<String, AttentionRequestSummary> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_task.entry(row.task_id.clone()).or_insert_with(|| {
+            AttentionRequestSummary {
+                request_id: row.request_id,
+                task_id: row.task_id,
+                message: row.message,
+                created_at: row.created_at,
+            }
+        });
+    }
+    for summary in summaries.iter_mut() {
+        if let Some(task_id) = summary.delegation_call_id.as_ref() {
+            if let Some(req) = by_task.get(task_id) {
+                summary.delegation_attention_request = Some(req.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Backfill each summary's `child_count` with its number of direct, non-deleted
@@ -548,6 +969,7 @@ pub async fn list_children(
         .await?;
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_child_counts(conn, &mut summaries).await?;
+    fill_open_delegation_attention(conn, &mut summaries).await?;
     Ok(summaries)
 }
 
@@ -640,12 +1062,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fill_open_delegation_attention_attaches_at_most_one_open_per_task() {
+        use crate::db::entities::delegation_attention_request;
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-fill-open-attention").await;
+        let (parent_a, child_a) = seed_parent_with_child(&db.conn, folder).await;
+        // Second parent/child uses the same seed helper → call-1 again would
+        // collide; create an extra sibling with a distinct task id.
+        let parent_b = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("P2".into()),
+            None,
+        )
+        .await
+        .expect("parent_b");
+        let child_b = create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("C2".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_b.id,
+                parent_tool_use_id: "tu-2".into(),
+                delegation_call_id: "call-2".into(),
+            }),
+        )
+        .await
+        .expect("child_b");
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // One open row per task (schema UNIQUE on open task_id).
+        for (req_id, task_id, p, c) in [
+            ("req-a", "call-1", parent_a, child_a),
+            ("req-b", "call-2", parent_b.id, child_b.id),
+        ] {
+            let row = delegation_attention_request::ActiveModel {
+                request_id: Set(req_id.into()),
+                task_id: Set(task_id.into()),
+                parent_conversation_id: Set(p),
+                child_conversation_id: Set(c),
+                child_tool_call_id: Set(format!("tc-{req_id}")),
+                status: Set("open".into()),
+                message: Set(format!("msg-{req_id}")),
+                reply: Set(None),
+                resolution_code: Set(None),
+                created_at: Set(t0),
+                resolved_at: Set(None),
+            };
+            row.insert(&db.conn).await.expect("insert attention");
+        }
+        // Bulk fill over two unrelated parent lists proves one query path per
+        // list_children call (not N+1 per child).
+        let rows_a = list_children(&db.conn, parent_a).await.expect("list a");
+        let rows_b = list_children(&db.conn, parent_b.id).await.expect("list b");
+        assert_eq!(
+            rows_a[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-a"
+        );
+        assert_eq!(
+            rows_b[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .message,
+            "msg-req-b"
+        );
+
+        // Explicit fill over a mixed slice still attaches by task id once.
+        let mut mixed = vec![rows_a[0].clone(), rows_b[0].clone()];
+        // Clear then refill.
+        mixed[0].delegation_attention_request = None;
+        mixed[1].delegation_attention_request = None;
+        fill_open_delegation_attention(&db.conn, &mut mixed)
+            .await
+            .expect("bulk fill");
+        assert_eq!(
+            mixed[0]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-a"
+        );
+        assert_eq!(
+            mixed[1]
+                .delegation_attention_request
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "req-b"
+        );
+    }
+
+    #[tokio::test]
     async fn list_children_orders_newest_first() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-list-children-order").await;
-        let parent = create(&db.conn, folder, AgentType::ClaudeCode, Some("P".into()), None)
-            .await
-            .expect("parent");
+        let parent = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("P".into()),
+            None,
+        )
+        .await
+        .expect("parent");
         // Two children created oldest → newest under the same parent.
         let first = create_with_delegation(
             &db.conn,
@@ -744,7 +1275,9 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-child-count-deleted").await;
         let (parent, child) = seed_parent_with_child(&db.conn, folder).await;
 
-        soft_delete(&db.conn, child).await.expect("soft delete child");
+        soft_delete(&db.conn, child)
+            .await
+            .expect("soft delete child");
 
         // A removed sub-session must not keep the parent's chevron alive: the
         // aggregate filters deleted_at IS NULL, matching list_children.
@@ -762,9 +1295,15 @@ mod tests {
     async fn update_pin_sets_and_clears_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-update-pin").await;
-        let conv = create(&db.conn, folder, AgentType::ClaudeCode, Some("c".into()), None)
-            .await
-            .expect("create");
+        let conv = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("c".into()),
+            None,
+        )
+        .await
+        .expect("create");
 
         // Freshly created rows are unpinned, and the summary projection carries
         // the field through (conv_to_summary mapping).
@@ -779,7 +1318,10 @@ mod tests {
         // preference, not activity).
         update_pin(&db.conn, conv.id, true).await.expect("pin");
         let pinned = get_by_id(&db.conn, conv.id).await.expect("get pinned");
-        assert!(pinned.pinned_at.is_some(), "pinned_at must be set after pin");
+        assert!(
+            pinned.pinned_at.is_some(),
+            "pinned_at must be set after pin"
+        );
         assert_eq!(
             pinned.updated_at, updated_at_before,
             "pinning must not bump updated_at"
@@ -817,11 +1359,20 @@ mod tests {
     async fn create_leaves_title_unlocked() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-title-unlocked").await;
-        let row = create(&db.conn, folder, AgentType::ClaudeCode, Some("hi".into()), None)
-            .await
-            .expect("create");
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("hi".into()),
+            None,
+        )
+        .await
+        .expect("create");
         let summary = get_by_id(&db.conn, row.id).await.expect("get");
-        assert!(!summary.title_locked, "new conversation must start unlocked");
+        assert!(
+            !summary.title_locked,
+            "new conversation must start unlocked"
+        );
     }
 
     #[tokio::test]
@@ -1042,6 +1593,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_with_delegation_initializes_runtime_rollup() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/rollup-init").await;
+
+        let regular = create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("regular");
+        let delegated = create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: regular.id,
+                parent_tool_use_id: "tu-rollup".into(),
+                delegation_call_id: "call-rollup".into(),
+            }),
+        )
+        .await
+        .expect("delegate");
+
+        assert!(regular.delegation_tool_call_count.is_none());
+        assert_eq!(delegated.delegation_tool_call_count, Some(0));
+        assert_eq!(delegated.delegation_edit_tool_call_count, Some(0));
+        assert_eq!(
+            delegated.delegation_touched_files_json.as_deref(),
+            Some("[]")
+        );
+        assert_eq!(delegated.delegation_touched_files_truncated, Some(false));
+        assert_eq!(delegated.delegation_line_counts_complete, Some(false));
+    }
+
+    #[tokio::test]
+    async fn create_create_chat_and_delegation_enroll_exactly_one_job_when_enabled() {
+        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::db::entities::auto_title_job;
+        use crate::db::service::app_metadata_service;
+
+        let db = fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable");
+        let folder_id = seed_folder(&db, "/tmp/create-enroll").await;
+
+        let regular = create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("regular");
+        let chat = create_chat(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("chat");
+        let child = create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: regular.id,
+                parent_tool_use_id: "tu-enroll".into(),
+                delegation_call_id: "call-enroll".into(),
+            }),
+        )
+        .await
+        .expect("delegate");
+
+        for id in [regular.id, chat.id, child.id] {
+            assert_eq!(
+                auto_title_job::Entity::find_by_id(id)
+                    .all(&db.conn)
+                    .await
+                    .expect("jobs")
+                    .len(),
+                1,
+                "enabled create path must enroll exactly one job for {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn list_all_excludes_loop_kind_rows() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/loop-filter").await;
@@ -1077,5 +1712,175 @@ mod tests {
             !rows.iter().any(|r| r.title.as_deref() == Some("hide")),
             "loop row must be excluded"
         );
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_eligible_root_end_turn_sets_one_generation_atomically() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-root").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("create root");
+
+        let patch = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .expect("finish")
+            .expect("CAS changed row");
+        assert_eq!(patch.status, "pending_review");
+        assert!(patch.awaiting_reply_token.is_some());
+
+        let duplicate = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .expect("duplicate finish");
+        assert!(duplicate.is_none(), "duplicate end_turn must lose the CAS");
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_background_root_and_child_never_get_a_generation() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-ineligible").await;
+        let root = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("root");
+        let root_patch = finish_end_turn_if_in_progress(&db.conn, root.id, false)
+            .await
+            .expect("background finish")
+            .expect("root transition");
+        assert!(root_patch.awaiting_reply_token.is_none());
+
+        let (parent_id, child_id) = seed_parent_with_child(&db.conn, folder).await;
+        let child_patch = finish_end_turn_if_in_progress(&db.conn, child_id, true)
+            .await
+            .expect("child finish")
+            .expect("child transition");
+        assert_eq!(child_patch.status, "pending_review");
+        assert!(child_patch.awaiting_reply_token.is_none());
+        assert_ne!(parent_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_terminal_status_wins_over_delayed_end_turn() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-terminal-race").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("root");
+        update_status(
+            &db.conn,
+            row.id,
+            conversation::ConversationStatus::Completed,
+        )
+        .await
+        .expect("complete first");
+
+        assert!(finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .expect("delayed finish")
+            .is_none());
+        let current = get_by_id(&db.conn, row.id).await.expect("current row");
+        assert_eq!(current.status, "completed");
+        assert!(current.awaiting_reply_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_stale_clear_cannot_remove_a_newer_generation() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-stale-clear").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("root");
+        let first = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let token_a = first.awaiting_reply_token.expect("token A");
+
+        update_status(
+            &db.conn,
+            row.id,
+            conversation::ConversationStatus::InProgress,
+        )
+        .await
+        .expect("next prompt");
+        let second = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let token_b = second.awaiting_reply_token.clone().expect("token B");
+        assert_ne!(token_a, token_b);
+
+        let stale = clear_awaiting_reply(&db.conn, row.id, &token_a)
+            .await
+            .expect("stale clear");
+        assert!(!stale.changed);
+        assert_eq!(
+            stale.patch.awaiting_reply_token.as_deref(),
+            Some(token_b.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_matching_clear_preserves_status_and_updated_at() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-clear").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("root");
+        let before = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = before.awaiting_reply_token.clone().unwrap();
+
+        let cleared = clear_awaiting_reply(&db.conn, row.id, &token)
+            .await
+            .expect("clear");
+        assert!(cleared.changed);
+        assert_eq!(cleared.patch.status, "pending_review");
+        assert!(cleared.patch.awaiting_reply_token.is_none());
+        assert_eq!(cleared.patch.updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn awaiting_reply_metadata_preserves_token_but_manual_status_clears_it() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/await-metadata").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("root");
+        let marked = finish_end_turn_if_in_progress(&db.conn, row.id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = marked.awaiting_reply_token.clone().unwrap();
+
+        update_title(&db.conn, row.id, "renamed".into())
+            .await
+            .unwrap();
+        update_pin(&db.conn, row.id, true).await.unwrap();
+        update_external_id(&db.conn, row.id, "external-1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_by_id(&db.conn, row.id)
+                .await
+                .unwrap()
+                .awaiting_reply_token
+                .as_deref(),
+            Some(token.as_str())
+        );
+
+        update_status(
+            &db.conn,
+            row.id,
+            conversation::ConversationStatus::PendingReview,
+        )
+        .await
+        .expect("manual review status");
+        assert!(get_by_id(&db.conn, row.id)
+            .await
+            .unwrap()
+            .awaiting_reply_token
+            .is_none());
     }
 }

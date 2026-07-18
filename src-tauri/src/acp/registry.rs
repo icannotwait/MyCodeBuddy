@@ -164,33 +164,24 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
     }
 }
 
-/// All platforms default CLI exec on; user Agent env can set `CODEX_ACP_USE_CLI=0`.
-const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "1")];
+/// All platforms default app-server (`CODEX_ACP_USE_CLI=0`); Agent Settings
+/// can pin `CODEX_ACP_USE_CLI=1` for CLI exec (`codex exec --json`).
+const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "0")];
 
-fn codex_distribution_for(platform: &str) -> AgentDistribution {
-    if platform == "windows-x86_64" {
-        // Bundled MyCodeBuddy fork keeps custom ACP behavior. Host Codex is
-        // injected as CODEX_PATH at launch. Defaults to CLI exec runtime
-        // (`codex exec --json`) to avoid ChatGPT "official clients only" 403s
-        // on app-server; Agent Settings can override with CODEX_ACP_USE_CLI=0
-        // (user env wins over this distribution pin).
-        AgentDistribution::Bundled {
-            version: "1.1.2-mycodebuddy.3",
-            cmd: "codex-acp",
-            args: &[],
-            env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
-            override_env: crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV,
-            platforms: &["windows-x86_64"],
-        }
-    } else {
-        AgentDistribution::Npx {
-            version: "1.1.2",
-            package: "@agentclientprotocol/codex-acp@1.1.2",
-            cmd: "codex-acp",
-            args: &[],
-            env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
-            node_required: Some("20.0.0"),
-        }
+/// Official npm package for Codex ACP on every platform (including Windows).
+///
+/// Windows previously shipped a sibling `codex-acp.exe` MyCodeBuddy fork; that
+/// path is retired so launch always resolves through npm/npx the same way as
+/// macOS/Linux. The package embeds `@openai/codex` for app-server; host
+/// `CODEX_PATH` is only required when the user opts into CLI exec mode.
+fn codex_distribution() -> AgentDistribution {
+    AgentDistribution::Npx {
+        version: "1.1.2",
+        package: "@agentclientprotocol/codex-acp@1.1.2",
+        cmd: "codex-acp",
+        args: &[],
+        env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
+        node_required: Some("20.0.0"),
     }
 }
 
@@ -223,15 +214,17 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
             // 1.1.2 depends on `@openai/codex` ^0.144.0 and can drive either
             // `codex app-server` or (when `CODEX_ACP_USE_CLI=1`) `codex exec`.
-            // All platforms default CLI on via distribution env; opt out with
-            // CODEX_ACP_USE_CLI=0 in Agent Settings. Since 1.0.1 it also resolves
-            // the resumed `model_provider` from `~/.codex/config.toml` (#224), so
-            // codeg no longer injects `MODEL_PROVIDER` to keep resumed sessions
-            // on the custom provider. 1.1.0 (#263) also reports `/goal`
+            // All platforms (including Windows) use the same npm package —
+            // no bundled sibling `codex-acp.exe`. Default app-server via
+            // distribution env; opt in with CODEX_ACP_USE_CLI=1 in Agent
+            // Settings. Since 1.0.1 it also resolves the resumed
+            // `model_provider` from `~/.codex/config.toml` (#224), so codeg
+            // no longer injects `MODEL_PROVIDER` to keep resumed sessions on
+            // the custom provider. 1.1.0 (#263) also reports `/goal`
             // transitions as a structured `session_info_update`
             // (`_meta.codex.goal`) rather than live agent text — see
             // `crate::acp::codex_goal`.
-            distribution: codex_distribution_for(current_platform()),
+            distribution: codex_distribution(),
         },
         AgentType::Gemini => AcpAgentMeta {
             agent_type,
@@ -401,12 +394,16 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 package: "@xai-official/grok@0.2.98",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
-                // flags (`--no-auto-update` always, `--always-approve` only when
-                // the user picked that permission mode) MUST precede this
-                // subcommand — `grok agent stdio` itself rejects them (verified
-                // against 0.2.94; still applies on 0.2.98: it only accepts
-                // --debug/--debug-file/--leader-socket) — so `build_agent`
-                // inserts them ahead of these args rather than appending after.
+                // flags (`--no-auto-update` always, `--disallowed-tools
+                // ask_user_question` as headless-only best-effort, and
+                // `--always-approve` only when the user picked that permission
+                // mode) MUST precede this subcommand — `grok agent stdio`
+                // itself rejects them (verified against 0.2.94; still applies
+                // on 0.2.98: it only accepts --debug/--debug-file/
+                // --leader-socket) — so `build_agent` inserts them ahead of
+                // these args rather than appending after. Native ask-user
+                // disable for ACP is `_meta.askUserQuestion: false` on
+                // session new/load/resume (pager `--no-ask-user` parity).
                 args: &["agent", "stdio"],
                 env: &[],
                 // `@xai-official/grok@0.2.98` declares `engines.node: ">=20"`;
@@ -552,41 +549,26 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_bundled_only_on_windows_x64() {
-        match codex_distribution_for("windows-x86_64") {
-            AgentDistribution::Bundled {
-                version,
-                override_env,
-                env,
-                ..
-            } => {
-                assert_eq!(version, "1.1.2-mycodebuddy.3");
-                assert_eq!(override_env, "CODEG_CODEX_ACP_BIN");
-                // All platforms default CLI exec runtime (opt-out via user env).
-                assert_eq!(
-                    env, CODEX_CLI_RUNTIME_DEFAULT_ENV,
-                    "Windows bundled codex-acp must default CLI runtime on, got {env:?}"
-                );
-            }
-            other => panic!("expected bundled Codex on windows-x86_64, got {other:?}"),
-        }
-        match codex_distribution_for("darwin-aarch64") {
+    fn codex_is_npx_on_all_platforms() {
+        match codex_distribution() {
             AgentDistribution::Npx {
                 version,
                 package,
                 node_required,
                 env,
+                cmd,
                 ..
             } => {
                 assert_eq!(version, "1.1.2");
                 assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
+                assert_eq!(cmd, "codex-acp");
                 assert_eq!(node_required, Some("20.0.0"));
                 assert_eq!(
                     env, CODEX_CLI_RUNTIME_DEFAULT_ENV,
-                    "npx codex-acp must default CLI runtime on, got {env:?}"
+                    "npx codex-acp must default CLI runtime off, got {env:?}"
                 );
             }
-            other => panic!("expected npx Codex distribution on macOS, got {other:?}"),
+            other => panic!("expected npx Codex distribution on all platforms, got {other:?}"),
         }
     }
 

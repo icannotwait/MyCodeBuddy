@@ -10,6 +10,37 @@ export type AgentType =
   | "pi"
   | "grok"
 
+/**
+ * Read-only sub-agent activity projection.
+ * Native views are informational only (`authoritative: false`); they never enter
+ * DelegationBroker and never expose Broker cancel actions.
+ */
+export type DelegationActivityOperation =
+  | "spawn"
+  | "status"
+  | "wait"
+  | "cancel"
+  | "unknown"
+
+export type DelegationObservedStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "unknown"
+
+export interface DelegationActivityView {
+  origin: "codeg" | "native"
+  authoritative: boolean
+  platform: AgentType
+  task_id?: string
+  operation: DelegationActivityOperation
+  observed_status: DelegationObservedStatus
+  started_at?: string
+  updated_at?: string
+  finished_at?: string
+}
+
 export type AppErrorCode =
   | "invalid_input"
   | "configuration_missing"
@@ -261,6 +292,7 @@ export interface FolderDetail {
   path: string
   git_branch: string | null
   default_agent_type: AgentType | null
+  last_agent_type: AgentType | null
   last_opened_at: string
   sort_order: number
   color: string
@@ -319,6 +351,7 @@ export interface DbConversationSummary {
   title_locked: boolean
   agent_type: AgentType
   status: string
+  awaiting_reply_token: string | null
   /** Mirrors `conversation.kind` — drives sidebar visibility and grouping. */
   kind: ConversationKind
   model: string | null
@@ -338,6 +371,20 @@ export interface DbConversationSummary {
   parent_id?: number | null
   parent_tool_use_id?: string | null
   delegation_call_id?: string | null
+  /** Root-only managed route override; null/omit = inherit global. */
+  delegation_route_override?: DelegationRoutePolicy | null
+  /** Latest Broker task status for this conversation (sidebar health). */
+  delegation_task_status?: string | null
+  delegation_error_code?: string | null
+  delegation_started_at?: string | null
+  delegation_finished_at?: string | null
+}
+
+export interface ConversationStatePatch {
+  id: number
+  status: string
+  awaiting_reply_token: string | null
+  updated_at: string
 }
 
 /** Payload for the global `conversation://changed` side-channel that keeps
@@ -346,7 +393,7 @@ export interface DbConversationSummary {
 export type ConversationChange =
   | { kind: "upsert"; summary: DbConversationSummary }
   | { kind: "deleted"; id: number }
-  | { kind: "status"; id: number; status: string }
+  | { kind: "state"; patch: ConversationStatePatch }
 
 export const CONVERSATION_CHANGED_EVENT = "conversation://changed"
 
@@ -365,6 +412,26 @@ export const FOLDER_CHANGED_EVENT = "folder://changed"
  *  conversation feedback bar converges on this backend broadcast rather than a
  *  frontend-only cache. Mirrors the Rust `FEEDBACK_SETTINGS_CHANGED_EVENT`. */
 export const FEEDBACK_SETTINGS_CHANGED_EVENT = "feedback-settings://changed"
+
+/** Full conversation-experience settings document (automatic titles + reference
+ *  search). Mirrors Rust `ConversationExperienceSettings`. */
+export interface ConversationExperienceSettings {
+  auto_title_agent: AgentType | null
+  reference_search_limit: number
+  revision: number
+}
+
+/** Backend side-channel for conversation-experience settings. Mirrors Rust
+ *  `CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT`. */
+export const CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT =
+  "conversation-experience-settings://changed"
+
+/** Visible UI context for ACP prompt capture (automatic titles). Flattened on
+ *  the wire as `visibleText` + `locale`. */
+export interface AcpPromptContext {
+  visibleText: string | null
+  locale: AppLocale | null
+}
 
 /** Payload for the global `tabs://changed` side-channel that keeps every
  *  client's open-tab set in sync across desktop + browsers. Mirrors the Rust
@@ -453,7 +520,7 @@ export const STATUS_COLORS: Record<ConversationStatus, string> = {
   in_progress: "bg-yellow-400",
   pending_review: "bg-blue-500",
   completed: "bg-green-500",
-  cancelled: "bg-red-500",
+  cancelled: "bg-gray-400 dark:bg-gray-500",
 }
 
 export const AGENT_DISPLAY_ORDER: AgentType[] = [
@@ -950,6 +1017,19 @@ export interface DelegationProfileDocument {
   profiles: DelegationProfile[]
 }
 
+/** Revisioned delegation profile catalog for mention bootstrap. Mirrors Rust
+ *  `DelegationProfileCatalog`. */
+export interface DelegationProfileCatalog {
+  profiles: DelegationProfile[]
+  delegation_enabled: boolean
+  revision: number
+}
+
+/** Backend side-channel for the revisioned profile catalog. Mirrors Rust
+ *  `DELEGATION_PROFILE_CATALOG_CHANGED_EVENT`. */
+export const DELEGATION_PROFILE_CATALOG_CHANGED_EVENT =
+  "delegation-profile-catalog://changed"
+
 // ─── Automations ───────────────────────────────────────────────────────────
 // Mirrors src-tauri/src/models/automation.rs. Wire form is snake_case (serde
 // default), matching AgentDelegationDefaults.
@@ -1136,6 +1216,7 @@ export type AcpEvent =
       type: "turn_complete"
       session_id: string
       stop_reason: string
+      mark_awaiting_reply: boolean
     }
   | {
       // Synthetic notification-only event (chat-channel "user message" push).
@@ -1242,6 +1323,13 @@ export type AcpEvent =
       child_connection_id: string
       child_conversation_id: number
       agent_type: AgentType
+      /**
+       * Soft-watchdog health when re-seeding from snapshot `active_delegations`.
+       * Live broker starts omit this (frontend defaults to active).
+       */
+      observation?: TaskObservation | null
+      last_agent_activity_at?: string | null
+      stalled_since?: string | null
     }
   /**
    * The child sub-session has finished (or errored / timed out / been
@@ -1259,6 +1347,27 @@ export type AcpEvent =
        *  snapshot replay) can bind the correct agent instead of a default. */
       agent_type: AgentType
       result: DelegationResultSummary
+    }
+  /**
+   * Soft-supervisor observation transition for a still-running Broker task.
+   * Updates the existing active-delegation card only — never creates,
+   * removes, or completes a task.
+   */
+  | {
+      type: "delegation_observation_changed"
+      parent_tool_use_id: string
+      task_id: string
+      observation: TaskObservation
+      last_agent_activity_at: string
+      stalled_since?: string | null
+    }
+  /**
+   * Post-ready companion lease closed/opened: only the mutable
+   * `delegation_available` bit flips; route plan is immutable.
+   */
+  | {
+      type: "delegation_availability_changed"
+      available: boolean
     }
   /**
    * The user's submitted prompt, broadcast on the connection stream so OTHER
@@ -1329,6 +1438,42 @@ export type ConfigStaleKind =
   | "agent_config"
   | "model_provider"
   | "terminal_shell"
+  | "delegation_route"
+
+/** Managed delegation route preference (mirror of Rust `DelegationRoutePolicy`). */
+export type DelegationRoutePolicy = "codeg" | "native"
+
+/** How the effective route was chosen (mirror of Rust `DelegationRouteSource`). */
+export type DelegationRouteSource =
+  | "forced_child"
+  | "session_override"
+  | "global_default"
+  | "feature_disabled"
+  | "safe_fallback"
+
+/** Typed preflight/bootstrap degradation that triggered a safe fallback. */
+export type RouteDegradedReason =
+  | "native_suppression_unsupported"
+  | "native_suppression_invalid"
+  | "companion_binary_unavailable"
+  | "agent_mcp_unsupported"
+  | "companion_initialization_failed"
+
+/** Soft-watchdog health for a still-running Broker task (never terminal). */
+export type TaskObservation = "active" | "stalled" | "waiting_input"
+
+/**
+ * Immutable launch plan plus post-ready availability bit, carried on live
+ * snapshots so attach payloads have one stable shape.
+ */
+export interface DelegationRouteSnapshot {
+  requested: DelegationRoutePolicy
+  effective: DelegationRoutePolicy
+  source: DelegationRouteSource
+  managed: boolean
+  degraded_reason?: RouteDegradedReason | null
+  delegation_available: boolean
+}
 
 /** A block of a broadcast user prompt (mirror of Rust `UserMessageBlock`).
  *  Narrower than the persisted `ContentBlock`: only what a viewer needs to
@@ -1367,6 +1512,173 @@ export type EventEnvelope = {
   seq: number
   connection_id: string
 } & AcpEvent
+
+/**
+ * Predefined ACP streaming performance fixture IDs.
+ * Mirrors `PerfFixtureId` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export type PerfFixtureId = "grok_rich_v1"
+
+/**
+ * Fixed envelope-rate profiles for timed fixture replay.
+ * Mirrors `PerfRateProfile` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export type PerfRateProfile = "eps_100" | "eps_500" | "eps_1000"
+
+/**
+ * Request for `acp_replay_streaming_perf_fixture` (test-utils builds only).
+ * Mirrors `PerfReplayRequest` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export interface PerfReplayRequest {
+  fixture_id: PerfFixtureId
+  seed: number
+  rate_profile: PerfRateProfile
+}
+
+/**
+ * Result of a timed ACP streaming fixture replay.
+ * Mirrors `PerfReplayResult` in `src-tauri/src/acp/perf_fixture.rs`.
+ */
+export interface PerfReplayResult {
+  version: string
+  event_count: number
+  tool_call_count: number
+  final_text_sha256: string
+  final_event_seq: number
+  elapsed_ms: number
+}
+
+/**
+ * Snapshot of ACP event-bus + desktop-delivery counters.
+ * Mirrors `EventBusMetricsSnapshot` in `src-tauri/src/acp/internal_bus.rs`.
+ * Desktop fields stay zero under WebOnly/server delivery.
+ */
+export interface EventBusMetricsSnapshot {
+  emitted_count: number
+  lagged_count: number
+  ring_buffer_evict_count: number
+  replay_count: number
+  replay_event_total: number
+  snapshot_fallback_count: number
+  snapshot_cold_count: number
+  forwarder_lagged_count: number
+  worker_queue_full_count: number
+  critical_lane_emit_count: number
+  critical_lane_full_count: number
+  desktop_raw_envelope_count: number
+  desktop_raw_bytes: number
+  desktop_emit_attempt_count: number
+  desktop_serialization_failure_count: number
+  desktop_emit_failure_count: number
+  desktop_legacy_emit_count: number
+  desktop_batch_count: number
+  desktop_batch_event_count: number
+  desktop_batch_bytes: number
+  desktop_batch_max_events: number
+  desktop_batch_max_bytes: number
+  desktop_batch_latency_total_us: number
+  desktop_batch_latency_max_us: number
+  desktop_queue_full_count: number
+  desktop_startup_fallback_count: number
+  desktop_runtime_failure_count: number
+}
+
+/**
+ * Startup-selected desktop ACP delivery path for the local Tauri webview.
+ * Mirrors `DesktopDeliveryMode` in `src-tauri/src/acp/streaming_performance.rs`.
+ * Selected once at process start; never hot-switched.
+ */
+export type DesktopDeliveryMode = "legacy" | "batched"
+
+/**
+ * Three internal streaming-performance controls.
+ * Mirrors `StreamingPerformanceFlags` in
+ * `src-tauri/src/acp/streaming_performance.rs`.
+ */
+export interface StreamingPerformanceFlags {
+  desktop_acp_event_batching: boolean
+  incremental_live_transcript: boolean
+  deferred_streaming_rich_content: boolean
+}
+
+/**
+ * Capability snapshot for desktop ACP delivery diagnostics.
+ * Mirrors `DesktopDeliveryCapabilities` in
+ * `src-tauri/src/acp/streaming_performance.rs`.
+ */
+export interface DesktopDeliveryCapabilities {
+  mode: DesktopDeliveryMode
+  flags: StreamingPerformanceFlags
+  perf_replay_available: boolean
+  failure_event: "acp://delivery-failed"
+}
+
+/**
+ * One flushed desktop batch of unmodified envelopes.
+ * Mirrors `DesktopAcpEventBatch` in
+ * `src-tauri/src/acp/desktop_event_batcher.rs`.
+ */
+export interface DesktopAcpEventBatch {
+  batch_id: number
+  events: EventEnvelope[]
+}
+
+/**
+ * Inclusive outstanding seq range for one connection after terminal failure.
+ * Mirrors `DesktopConnectionSeqRange`.
+ */
+export interface DesktopConnectionSeqRange {
+  connection_id: string
+  first_seq: number
+  last_seq: number
+}
+
+/**
+ * Terminal desktop delivery failure (ranges + reason only; no content).
+ * Mirrors `DesktopDeliveryFailure`.
+ */
+export interface DesktopDeliveryFailure {
+  generation: number
+  reason: "batch_emit_failed" | "batch_task_stopped"
+  affected: DesktopConnectionSeqRange[]
+}
+
+/** Handlers for the single desktop ACP data subscription. */
+export interface DesktopAcpEventHandlers {
+  onBatch: (batch: DesktopAcpEventBatch) => void
+  onFailure: (failure: DesktopDeliveryFailure) => void
+}
+
+/**
+ * Per-connection slice of one accepted ingestor frame.
+ * `applyEvents` may be compacted; `rawEvents` preserves originals.
+ */
+export interface AcceptedConnectionFrame {
+  contextKey: string
+  connectionId: string
+  deliveryIds: readonly number[]
+  applyEvents: readonly EventEnvelope[]
+  rawEvents: readonly EventEnvelope[]
+  highestSeq: number
+}
+
+/**
+ * Immutable frame committed once per browser animation frame.
+ * Raw order is global delivery order across connections.
+ */
+export interface AcceptedEventFrame {
+  deliveryIds: readonly number[]
+  connections: readonly AcceptedConnectionFrame[]
+  rawEventsInDeliveryOrder: readonly EventEnvelope[]
+}
+
+/** Unexpected per-connection sequence discontinuity. */
+export interface SequenceGap {
+  contextKey: string
+  connectionId: string
+  expectedSeq: number
+  receivedSeq: number
+}
 
 // --- LiveSessionSnapshot wire types (mirror src-tauri/src/acp/session_state.rs) ---
 
@@ -1451,6 +1763,10 @@ export interface ActiveDelegationState {
   child_connection_id: string
   child_conversation_id: number
   agent_type: AgentType
+  /** Soft-watchdog health for this still-running card. */
+  observation?: TaskObservation | null
+  last_agent_activity_at?: string | null
+  stalled_since?: string | null
 }
 
 /** Lifecycle of a live-feedback note (mirror of Rust `FeedbackStatus`). */
@@ -1515,6 +1831,11 @@ export interface LiveSessionSnapshot {
   config_stale?: boolean
   /** Which settings surface drifted; present only while `config_stale`. */
   config_stale_kind?: ConfigStaleKind | null
+  /**
+   * Managed route snapshot (immutable plan + mutable availability). Absent on
+   * older payloads — denormalized to `null`, never derived from live settings.
+   */
+  delegation_route?: DelegationRouteSnapshot
   event_seq: number
 }
 
@@ -1546,6 +1867,7 @@ export interface AcpAgentInfo {
   /** Backend distribution: npx, binary, uvx, or bundled. */
   distribution_type: string
   enabled: boolean
+  show_thinking: boolean
   sort_order: number
   installed_version: string | null
   env: Record<string, string>
@@ -2033,6 +2355,152 @@ export interface GitHeadInfo {
   detached: boolean
   /** Short commit hash, present when detached. */
   short_sha: string | null
+  /**
+   * Stable wire form of the repo toplevel. Optional so a window attached to
+   * an older remote backend degrades to no commit preview instead of failing
+   * structural fixtures. Always serialized by current backends as a value or
+   * `null` (snake_case wire).
+   */
+  canonical_repo?: string | null
+  /** Full HEAD SHA when committed; null for unborn / non-repo. */
+  head_sha?: string | null
+  /** Opaque commit-source epoch (`v1:<sha256>`) for reference search. */
+  reference_source_epoch?: string | null
+}
+
+// ─── Incremental reference search (wire protocol mirrors) ───────────────────
+// Camel-case field names match Rust `#[serde(rename_all = "camelCase")]`.
+// Backend source `"conversation"` is adapted to frontend group kind `"session"`
+// by consumers; the wire enum value remains `"conversation"`.
+
+export type ReferenceSearchSource = "file" | "conversation" | "commit"
+
+export type ReferenceDoneReason = "exhausted" | "limit"
+
+export type ReferenceFileKind = "file" | "directory"
+
+export interface StartReferenceSearchRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+  query: string
+  workspacePath?: string | null
+}
+
+export interface NextReferenceSearchPageRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+  pageIndex: number
+}
+
+export interface CancelReferenceSearchRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+}
+
+export interface ValidateReferenceCandidateRequest {
+  validationRequestId: string
+  source: ReferenceSearchSource
+  uri: string
+  query: string
+  workspacePath?: string | null
+  sourceEpoch?: string | null
+}
+
+export interface ReferenceRegexRank {
+  fieldTier: number
+  start: number
+  length: number
+}
+
+export type ReferenceCandidateMetadata =
+  | {
+      kind: "file"
+      canonicalWorkspaceRoot: string
+      relativePath: string
+      entryKind: ReferenceFileKind
+    }
+  | {
+      kind: "conversation"
+      conversationId: number
+      agentType: AgentType
+      status: string
+      branch: string | null
+      projectName: string
+      projectPath: string
+    }
+  | {
+      kind: "commit"
+      canonicalRepo: string
+      fullHash: string
+      shortHash: string
+      subject: string
+      message: string
+      author: string
+      authoredAt: string
+    }
+
+export interface ReferenceCandidate {
+  source: ReferenceSearchSource
+  uri: string
+  id: string
+  label: string
+  detail: string | null
+  keywords: string
+  metadata: ReferenceCandidateMetadata
+  sourceOrdinal: number
+  regexRank: ReferenceRegexRank | null
+}
+
+export interface ReferenceSearchPage {
+  sourceSequence: number
+  requestId: string
+  pageIndex: number
+  items: ReferenceCandidate[]
+  sourceEpoch: string | null
+  done: boolean
+  doneReason: ReferenceDoneReason | null
+}
+
+export type ReferenceCandidateValidation =
+  | {
+      status: "match"
+      validationRequestId: string
+      candidate: ReferenceCandidate
+      regexRank: ReferenceRegexRank | null
+    }
+  | {
+      status: "not_match"
+      validationRequestId: string
+      candidate: ReferenceCandidate
+      regexRank: ReferenceRegexRank | null
+    }
+  | {
+      status: "not_found"
+      validationRequestId: string
+    }
+
+export interface ReferenceDescriptor {
+  id: string
+  sourceOrdinal: number
+  primary: string[]
+  secondary: string[]
+}
+
+export interface MatchReferenceRegexRequest {
+  query: string
+  descriptors: ReferenceDescriptor[]
+}
+
+export interface ReferenceRegexMatch {
+  id: string
+  sourceOrdinal: number
+  rank: ReferenceRegexRank
 }
 
 /**
@@ -2167,6 +2635,7 @@ export type WorkspaceDelta =
 export interface WorkspaceDeltaEnvelope {
   seq: number
   kind: "fs_delta" | "git_delta" | "meta" | "resync_hint" | string
+  fs_event_kind?: "create" | "remove" | "modify" | string
   payload: WorkspaceDelta[]
   requires_resync: boolean
   changed_paths?: string[]
@@ -2177,6 +2646,7 @@ export interface WorkspaceStateEvent {
   seq: number
   version: number
   kind: "fs_delta" | "git_delta" | "meta" | "resync_hint" | string
+  fs_event_kind?: "create" | "remove" | "modify" | string
   payload: WorkspaceDelta[]
   requires_resync: boolean
   changed_paths?: string[]

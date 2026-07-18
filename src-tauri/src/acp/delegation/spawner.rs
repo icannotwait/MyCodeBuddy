@@ -13,8 +13,32 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::models::agent::AgentType;
+
+/// Result of a successful linked prompt enqueue for a delegation child.
+///
+/// `started_at` is read from the accepted durable child row's
+/// `delegation_started_at` and is the authoritative wall-clock start for
+/// runtime projection (not a provisional clock sample).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedDelegationPrompt {
+    pub child_conversation_id: i32,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Test/fixture helper for an accepted prompt with an explicit durable start.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn accepted(
+    child_conversation_id: i32,
+    started_at: DateTime<Utc>,
+) -> AcceptedDelegationPrompt {
+    AcceptedDelegationPrompt {
+        child_conversation_id,
+        started_at,
+    }
+}
 
 /// Identifies a delegation call across the broker, the ACP layer, and the DB.
 ///
@@ -34,12 +58,35 @@ pub struct DelegationLink {
 pub enum SpawnerError {
     #[error("spawn failed: {0}")]
     Spawn(String),
-    #[error("send prompt failed: {0}")]
-    Send(String),
+    /// Prompt enqueue failed. When the linked child row was already created,
+    /// `child_conversation_id` carries its id so the broker can settle that
+    /// row `failed/spawn_failed` before reporting.
+    #[error("send failed: {message}")]
+    Send {
+        message: String,
+        child_conversation_id: Option<i32>,
+    },
     #[error("disconnect failed: {0}")]
     Disconnect(String),
     #[error("cancel failed: {0}")]
     Cancel(String),
+}
+
+impl SpawnerError {
+    /// Convenience constructor for a send failure with no child row yet.
+    pub fn send(message: impl Into<String>) -> Self {
+        Self::Send {
+            message: message.into(),
+            child_conversation_id: None,
+        }
+    }
+
+    pub fn send_with_child(message: impl Into<String>, child_conversation_id: i32) -> Self {
+        Self::Send {
+            message: message.into(),
+            child_conversation_id: Some(child_conversation_id),
+        }
+    }
 }
 
 /// Capabilities the delegation broker needs from whatever owns the ACP
@@ -82,13 +129,15 @@ pub trait ConnectionSpawner: Send + Sync {
     /// `DelegationLink` is persisted onto the new conversation row so the
     /// lifecycle subscriber can later notify the broker on `TurnComplete`.
     ///
-    /// Returns the new child conversation row id (i32).
+    /// Returns the accepted child conversation id plus its durable
+    /// `delegation_started_at`. Success without a readable timestamp is not
+    /// an accepted delegation.
     async fn send_prompt_linked_for_delegation(
         &self,
         conn_id: &str,
         task: String,
         link: DelegationLink,
-    ) -> Result<i32, SpawnerError>;
+    ) -> Result<AcceptedDelegationPrompt, SpawnerError>;
 
     /// Cancel any in-flight prompt on the child connection. Idempotent:
     /// calling on a connection with nothing in flight is a no-op success.
@@ -116,7 +165,7 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockSpawner {
         pub spawn_results: Mutex<VecDeque<Result<String, SpawnerError>>>,
-        pub send_results: Mutex<VecDeque<Result<i32, SpawnerError>>>,
+        pub send_results: Mutex<VecDeque<Result<AcceptedDelegationPrompt, SpawnerError>>>,
         pub cancels: Mutex<Vec<String>>,
         pub disconnects: Mutex<Vec<String>>,
         pub spawn_args: Mutex<Vec<SpawnCallArgs>>,
@@ -152,7 +201,7 @@ pub mod mock {
             self.spawn_results.lock().await.push_back(r);
         }
 
-        pub async fn queue_send(&self, r: Result<i32, SpawnerError>) {
+        pub async fn queue_send(&self, r: Result<AcceptedDelegationPrompt, SpawnerError>) {
             self.send_results.lock().await.push_back(r);
         }
 
@@ -213,7 +262,7 @@ pub mod mock {
             _conn_id: &str,
             _task: String,
             _link: DelegationLink,
-        ) -> Result<i32, SpawnerError> {
+        ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
             // Honor a test-installed gate: block here (after the broker has
             // reserved the child, before it parks the pending entry) until the
             // test releases it.
@@ -225,7 +274,7 @@ pub mod mock {
                 .lock()
                 .await
                 .pop_front()
-                .unwrap_or_else(|| Err(SpawnerError::Send("no queued send result".into())))
+                .unwrap_or_else(|| Err(SpawnerError::send("no queued send result")))
         }
 
         async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {

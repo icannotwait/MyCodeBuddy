@@ -562,7 +562,16 @@
       "noConfigAvailable": "該智慧體沒有可設定項。",
       "modeLabel": "模式",
       "agentDefaultHint": "智慧體預設：{value}",
-      "defaultOptionLabel": "預設（{value}）"
+      "defaultOptionLabel": "預設（{value}）",
+      "routePolicy": "預設路由",
+      "routePolicyHint": "工作階段未設定覆寫時，受管代理使用此路由。",
+      "routeEffectiveNative": "委派已關閉 — 有效路由為 Native。",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "軟看門狗（秒）",
+      "softWatchdogHint": "僅觀察的停滯閾值（{min}–{max}）。不會取消或切換路由。"
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -963,7 +972,8 @@
       "piBinaryInstallFailed": "pi 安裝失敗",
       "piBinaryUninstalled": "pi 已解除安裝",
       "piBinaryUninstallFailed": "pi 解除安裝失敗",
-      "savePiTrustFailed": "儲存工作區信任失敗"
+      "savePiTrustFailed": "儲存工作區信任失敗",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "版本狀態",
@@ -977,7 +987,7 @@
       "remoteUnavailable": "{versionText}。遠端版本暫不可用。",
       "latest": "{versionText}。已是最新版本。",
       "bundled": "內建版本：{version}",
-      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 MyCodeBuddy。"
+      "bundledMissing": "內建介面卡遺失，請重新安裝或更新 DrawCode。"
     },
     "cline": {
       "configDescription": "配置 Cline API 提供商和憑證。設定將儲存到 ~/.cline/data/。"
@@ -1052,7 +1062,8 @@
       "trustDescription": "codeg 連線 pi 到某個目錄時，將該目錄標記為信任，使 pi 無需另行確認即可載入該專案的本機設定與技能。",
       "trustHint": "僅信任你在此開啟的目錄，絕不涉及整台機器；且只影響設定載入，不影響 pi 能執行什麼。",
       "configDirSkillsNote": "設定自訂組態目錄後，設定頁中管理的技能、專家與辦公工具將不會套用至該 pi；請直接在該目錄中管理其技能。"
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "載入 Agent 設定中...",
@@ -1085,11 +1096,22 @@
     "restartRequired": "已儲存，需重新啟動應用程式才會生效。",
     "restartNow": "立即重新啟動",
     "restartFailed": "重新啟動失敗：{message}",
-    "loadFailed": "載入失敗：{message}"
+    "loadFailed": "載入失敗：{message}",
+    "conversationExperienceTitle": "對話體驗",
+    "conversationExperienceDescription": "設定自動標題與參照搜尋行為。",
+    "autoTitleAgent": "自動標題智慧體",
+    "autoTitleOff": "關閉",
+    "autoTitleUnavailable": "{agent}（無法使用）",
+    "autoTitleSaveFailed": "儲存自動標題智慧體失敗：{message}",
+    "autoTitleLoading": "正在載入自動標題設定...",
+    "referenceSearchLimit": "參照結果上限",
+    "referenceSearchLimitHint": "每個資源來源最多快取與搜尋的結果數（10-500）。",
+    "referenceSearchLimitSave": "儲存參照上限",
+    "referenceSearchLimitSaveFailed": "儲存參照結果上限失敗：{message}"
   },
   "LoginPage": {
-    "documentTitle": "登入 - codeg",
-    "brand": "Codeg",
+    "documentTitle": "登入 - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "輸入存取 Token 以連接到桌面端",
     "tokenPlaceholder": "Access Token",
     "connect": "連接",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "聊天在上",
       "statusRunningBadge": "運行中",
       "statusCancelledBadge": "已取消",
+      "statusAwaitingReplyBadge": "待回覆",
       "conversationCountUnit": "{count} 條",
       "emptyFolderHint": "暫無對話",
       "noMatchingConversations": "找不到符合的對話",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "添加到會話",
       "compareWithBranch": "與分支比較...",
       "reloadFromDisk": "從磁碟重新載入",
+      "showIgnoredFiles": "顯示已忽略的檔案",
       "new": "新建",
       "newFile": "檔案",
       "newDirectory": "目錄",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "下載 {name} 失敗",
         "downloadSaved": "已下載 {name}",
         "pathCopied": "已複製路徑",
-        "copyPathFailed": "複製路徑失敗"
+        "copyPathFailed": "複製路徑失敗",
+        "loadIgnoredFilesFailed": "無法載入已忽略的檔案"
       },
       "createDialog": {
         "newFile": "新建檔案",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "{agent} 連線失敗",
         "toolFallbackTitle": "工具",
         "eventErrorTitle": "Agent 錯誤",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} 已完成回應",
         "notificationError": "{agent} 錯誤：{message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "智能體",
         "mentionGroupSession": "工作階段",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionInvalidPattern": "規則運算式無效",
+        "mentionSourceError": "無法重新整理此來源",
+        "mentionProfileError": "無法載入委派設定檔"
       },
       "messageQueue": {
         "addToQueue": "加入佇列",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "子智能體",
         "collapsedSummary": "子智能體 {count}",
-        "collapseAria": "摺疊子智能體"
+        "collapseAria": "摺疊子智能體",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "計畫任務",
@@ -2414,7 +2448,10 @@
             "child_empty": "子代理無回應",
             "child_unknown": "子代理未知錯誤",
             "unknown": "未知任務"
-          }
+          },
+          "active": "活動中",
+          "waitingInput": "等待輸入",
+          "stalled": "近期無代理活動"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "忽略",
         "reconnectFailed": "重新連線工作階段失敗",
         "applied": "已套用新設定",
-        "terminalShellTitle": "終端 Shell 已更新"
+        "terminalShellTitle": "終端 Shell 已更新",
+        "delegationRouteTitle": "委派路由已更新"
       },
       "collabAgent": {
         "title": "子智能體",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "背景任務已完成",
         "cardFinishedWithStatus": "背景任務已結束（{status}）",
         "cardResultPending": "結果尚未返回"
+      },
+      "delegationRoute": {
+        "menuLabel": "委派路由",
+        "inheritGlobal": "繼承全域",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg（繼承）",
+        "updateFailed": "更新路由失敗"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "已回退到 Native（{reason}）。重新連線以重試 Codeg。",
+        "delegationUnavailable": "Codeg 路由已生效，但委派不可用。",
+        "reconnect": "重新連線",
+        "reconnecting": "正在重新連線…",
+        "reconnected": "已重新連線",
+        "reconnectFailed": "重新連線失敗",
+        "reason": {
+          "native_suppression_unsupported": "不支援原生抑制",
+          "native_suppression_invalid": "原生抑制無效",
+          "companion_binary_unavailable": "伴生二進位不可用",
+          "agent_mcp_unsupported": "代理不支援 MCP",
+          "companion_initialization_failed": "伴生處理程序初始化失敗",
+          "unknown": "已降級"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "切換只會改變這裡顯示與開啟的位址；服務會監聽所有網路介面，每個位址都可存取。",
     "sectionTitle": "Web 服務",
-    "sectionDescription": "啟用後可透過瀏覽器遠端存取 Codeg",
+    "sectionDescription": "啟用後可透過瀏覽器遠端存取 DrawCode",
     "port": "連接埠",
     "status": "狀態",
     "autoStart": "自動啟動",
-    "autoStartHint": "Codeg 啟動時自動開啟 Web 服務",
+    "autoStartHint": "DrawCode 啟動時自動開啟 Web 服務",
     "running": "執行中",
     "stopped": "已停止",
     "processing": "處理中...",
@@ -2782,7 +2844,7 @@
     "copy": "複製",
     "qrcode": "QR 碼",
     "qrcodeTitle": "掃碼開啟",
-    "qrcodeHint": "用手機掃描，在瀏覽器中開啟 Codeg",
+    "qrcodeHint": "用手機掃描，在瀏覽器中開啟 DrawCode",
     "addressLabel": "存取位址",
     "tokenLabel": "存取 Token",
     "tokenHint": "Web 用戶端首次存取時需輸入此 Token",
@@ -2790,7 +2852,7 @@
     "regenerate": "重新產生",
     "stalePortOccupiedTitle": "連接埠 {port} 已被其他行程佔用",
     "stalePortUnknownTitle": "連接埠 {port} 狀態不明",
-    "stalePortHint": "在連接埠釋放前 Codeg 無法繫結。可以更換上方的連接埠，或結束佔用該連接埠的行程。",
+    "stalePortHint": "在連接埠釋放前 DrawCode 無法繫結。可以更換上方的連接埠，或結束佔用該連接埠的行程。",
     "errors": {
       "alreadyRunning": "Web 服務已在執行",
       "invalidAddress": "主機或連接埠格式無效",
@@ -3090,7 +3152,7 @@
   },
   "ScienceSettings": {
     "title": "科學研究技能",
-    "description": "為你的 AI 編碼智能體啟用精選的科學研究技能：假設生成、實驗設計、統計、視覺化、批判性評估與文獻檢索。MyCodeBuddy 管理中央副本，並將每個技能連結到你選擇的智能體。",
+    "description": "為你的 AI 編碼智能體啟用精選的科學研究技能：假設生成、實驗設計、統計、視覺化、批判性評估與文獻檢索。DrawCode 管理中央副本，並將每個技能連結到你選擇的智能體。",
     "loading": "正在載入科學研究技能…",
     "emptySkills": "沒有可用的科學研究技能。請檢查應用程式日誌。",
     "searchPlaceholder": "依名稱、ID 或描述搜尋科學研究技能",

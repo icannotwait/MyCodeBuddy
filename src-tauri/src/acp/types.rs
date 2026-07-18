@@ -127,6 +127,10 @@ pub enum AcpEvent {
         session_id: String,
         stop_reason: String,
         agent_type: String,
+        /// Whether this turn is eligible for awaiting-reply attention (UI root
+        /// prompts only). Automation, chat-channel, and delegation turns pass
+        /// `false`. Consumed by the lifecycle subscriber on `end_turn`.
+        mark_awaiting_reply: bool,
     },
     /// Session established with agent-assigned session ID
     SessionStarted { session_id: String },
@@ -248,13 +252,42 @@ pub enum AcpEvent {
     /// A `delegate_to_agent` MCP tool call from the parent agent has spawned a
     /// child sub-session and the child's prompt is in flight. Emitted as soon
     /// as the broker registers the pending call. The frontend uses this to
-    /// build the parent ↔ child mapping for inline rendering.
+    /// build the parent ↔ child mapping for inline rendering. Carries the
+    /// authoritative accepted-start snapshot (rebased `started_at`, projected
+    /// runtime stats, any already-open attention) so attach/replay recovers
+    /// the visible card without provisional timestamps.
     DelegationStarted {
         parent_connection_id: String,
         parent_tool_use_id: String,
         child_connection_id: String,
         child_conversation_id: i32,
         agent_type: crate::models::agent::AgentType,
+        task_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention_request:
+            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    },
+    /// Live replacement for the active card's runtime rollup. Idempotent: clients
+    /// replace (do not accumulate) the prior `runtime_stats` when `task_id`
+    /// matches the card. Parent-stream operational event only — not a chat
+    /// message.
+    DelegationRuntimeStatsChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
+    },
+    /// Live replacement for the active card's open attention summary.
+    /// `attention_request: None` clears the card (wire omits the field;
+    /// deserializing/replaying still means clear — Task 10 must map missing to
+    /// `null`, not "preserve prior"). Parent-stream operational event only.
+    DelegationAttentionChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention_request:
+            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.
@@ -269,6 +302,8 @@ pub enum AcpEvent {
         /// can synthesize the binding with the correct agent instead of a
         /// hardcoded default. Mirrors `DelegationStarted.agent_type`.
         agent_type: crate::models::agent::AgentType,
+        task_id: String,
+        runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
         result: DelegationResultSummary,
     },
     /// A human submitted a prompt from the Codeg conversation UI (desktop or
@@ -332,9 +367,21 @@ pub enum AcpEvent {
     /// clear its "restart to apply" banner. Carried into `SessionState` so a
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
-    SessionConfigStale {
-        stale: bool,
-        kind: ConfigStaleKind,
+    SessionConfigStale { stale: bool, kind: ConfigStaleKind },
+    /// Post-ready companion lease closed: Codeg delegation is no longer
+    /// available. Does **not** change route plan, suppression, fingerprint,
+    /// process lifetime, or Broker tasks — only the mutable availability bit.
+    DelegationAvailabilityChanged { available: bool },
+    /// Soft-supervisor observation transition for a still-running Broker task.
+    /// Updates the existing active-delegation card only — never creates,
+    /// removes, or completes a task.
+    DelegationObservationChanged {
+        parent_tool_use_id: String,
+        task_id: String,
+        observation: crate::acp::delegation::types::TaskObservation,
+        last_agent_activity_at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_since: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
 
@@ -364,6 +411,8 @@ pub enum ConfigStaleKind {
     ModelProvider,
     /// Global terminal shell selection changed after this connection spawned.
     TerminalShell,
+    /// Managed delegation route preference drifted from the launch-time plan.
+    DelegationRoute,
 }
 
 /// A block of the user's submitted prompt, broadcast via [`AcpEvent::UserMessage`]
@@ -544,6 +593,7 @@ pub struct AcpAgentInfo {
     pub available: bool,
     pub distribution_type: String,
     pub enabled: bool,
+    pub show_thinking: bool,
     pub sort_order: i32,
     pub installed_version: Option<String>,
     pub env: BTreeMap<String, String>,
@@ -770,5 +820,20 @@ mod envelope_tests {
             }
             other => panic!("expected ConversationStatusChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn turn_complete_serializes_mark_awaiting_reply() {
+        let event = AcpEvent::TurnComplete {
+            session_id: "session-1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            mark_awaiting_reply: true,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["mark_awaiting_reply"], true);
+        assert_eq!(json["type"], "turn_complete");
+        assert_eq!(json["session_id"], "session-1");
+        assert_eq!(json["stop_reason"], "end_turn");
     }
 }

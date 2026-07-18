@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,13 +9,85 @@ use tokio::sync::Mutex;
 use super::i18n::{self, Lang};
 use super::session_bridge::{ActiveSession, SessionBridge};
 use super::types::{MessageLevel, RichMessage};
+use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::registry::all_acp_agents;
 use crate::acp::types::PromptInputBlock;
+use crate::auto_title::{
+    user_launch_context_from_db, ConnectionLaunchContext, ConnectionPurpose, PromptCaptureContext,
+};
+use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::entities::conversation;
-use crate::db::service::{conversation_service, folder_service, sender_context_service};
+use crate::db::service::{
+    app_metadata_service, conversation_service, folder_service, sender_context_service,
+};
+use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+use crate::models::system::AppLocale;
 use crate::web::event_bridge::EventEmitter;
+
+const MESSAGE_LANGUAGE_KEY: &str = "chat_message_language";
+
+/// Resolve the channel's `AppLocale`: configured chat message language when
+/// valid, otherwise persisted system language (then English via settings load).
+pub(crate) async fn resolve_channel_app_locale(db: &DatabaseConnection) -> AppLocale {
+    if let Ok(Some(raw)) = app_metadata_service::get_value(db, MESSAGE_LANGUAGE_KEY).await {
+        if let Some(lang) = Lang::parse_strict(&raw) {
+            return i18n::lang_to_app_locale(lang);
+        }
+    }
+    user_launch_context_from_db(db)
+        .await
+        .inherited_locale
+        .unwrap_or(AppLocale::En)
+}
+
+/// Chat root/resume launch context: User purpose + resolved channel locale.
+pub(crate) async fn channel_launch_context_from_db(
+    db: &DatabaseConnection,
+) -> ConnectionLaunchContext {
+    ConnectionLaunchContext {
+        purpose: ConnectionPurpose::User,
+        inherited_locale: Some(resolve_channel_app_locale(db).await),
+    }
+}
+
+/// Database-aware linked send for chat producers: authoritative conversation
+/// folder, exact visible text, and resolved channel locale.
+///
+/// Uses [`ConnectionManager::send_prompt_linked_background`] so chat keeps
+/// mandatory routes on while `mark_awaiting_reply=false` (same policy as the
+/// former unlinked `send_prompt_background` path).
+pub(crate) async fn send_prompt_linked_for_chat(
+    db: &DatabaseConnection,
+    conn_mgr: &ConnectionManager,
+    connection_id: &str,
+    conversation_id: i32,
+    text: &str,
+) -> Result<(), AcpError> {
+    let conv = conversation_service::get_by_id(db, conversation_id)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let locale = resolve_channel_app_locale(db).await;
+    let app_db = AppDatabase { conn: db.clone() };
+    let blocks = vec![PromptInputBlock::Text {
+        text: text.to_string(),
+    }];
+    conn_mgr
+        .send_prompt_linked_background(
+            &app_db,
+            connection_id,
+            blocks,
+            Some(conv.folder_id),
+            Some(conversation_id),
+            Some(PromptCaptureContext::new(
+                Some(text.to_string()),
+                Some(locale),
+            )),
+        )
+        .await
+        .map(|_| ())
+}
 
 pub struct FollowupRequest<'a> {
     pub db: &'a DatabaseConnection,
@@ -259,6 +332,8 @@ pub async fn handle_task(
     bridge: &Arc<Mutex<SessionBridge>>,
     lang: Lang,
     prefix: &str,
+    runtime: &DelegationRuntimeSettings,
+    data_dir: &Path,
 ) -> RichMessage {
     if task_description.is_empty() {
         return RichMessage::info(i18n::task_usage(lang, prefix));
@@ -314,21 +389,27 @@ pub async fn handle_task(
         }
     };
 
-    // 5. Spawn ACP agent
-    let terminal_settings =
-        match crate::commands::system_settings::load_system_terminal_settings(db).await {
-            Ok(s) => s,
-            Err(e) => {
-                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
-            }
-        };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
-        // Chat-channel historically launched without agent credentials; keep
-        // that shape while still snapshotting the global terminal selection.
-        runtime_env: BTreeMap::new(),
-        terminal_settings,
+    // 5. Spawn ACP agent with a real one-shot route resolution against the
+    // live runtime snapshot and the just-created conversation row.
+    let app_db = AppDatabase { conn: db.clone() };
+    let runtime_snap = runtime.snapshot();
+    let launch_inputs = match crate::acp::terminal_context::build_acp_launch_inputs(
+        &app_db,
+        agent_type,
+        None,
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(Some(conv.id), None),
+        &runtime_snap,
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+        }
     };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
+    let launch_context = channel_launch_context_from_db(db).await;
     let connection_id = match conn_mgr
         .spawn_agent(
             agent_type,
@@ -339,23 +420,29 @@ pub async fn handle_task(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            launch_context,
         )
         .await
     {
         Ok(id) => id,
         Err(e) => {
-            // Clean up the conversation record
-            if let Err(cleanup_err) = conversation_service::update_status(
+            // Clean up the conversation record and broadcast the exact patch.
+            match conversation_service::update_status_with_patch(
                 db,
                 conv.id,
                 conversation::ConversationStatus::Cancelled,
             )
             .await
             {
-                tracing::warn!(
-                    "[ChatChannel] failed to mark conversation {} cancelled after spawn failure: {cleanup_err}",
-                    conv.id
-                );
+                Ok(patch) => {
+                    crate::commands::conversations::emit_conversation_state(emitter, patch);
+                }
+                Err(cleanup_err) => {
+                    tracing::warn!(
+                        "[ChatChannel] failed to mark conversation {} cancelled after spawn failure: {cleanup_err}",
+                        conv.id
+                    );
+                }
             }
             return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
         }
@@ -491,6 +578,8 @@ pub async fn handle_resume(
     bridge: &Arc<Mutex<SessionBridge>>,
     lang: Lang,
     prefix: &str,
+    runtime: &DelegationRuntimeSettings,
+    data_dir: &Path,
 ) -> RichMessage {
     if args.is_empty() {
         return list_recent_sessions(db, lang, prefix).await;
@@ -517,19 +606,27 @@ pub async fn handle_resume(
         }
     };
 
-    // Spawn agent with session_id for resume
-    let terminal_settings =
-        match crate::commands::system_settings::load_system_terminal_settings(db).await {
-            Ok(s) => s,
-            Err(e) => {
-                return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
-            }
-        };
-    let launch_inputs = crate::acp::terminal_context::AcpLaunchInputs {
-        runtime_env: BTreeMap::new(),
-        terminal_settings,
+    // Spawn agent with session_id for resume; resolve route once against the
+    // live runtime and the persisted conversation row (agent-type validated).
+    let app_db = AppDatabase { conn: db.clone() };
+    let runtime_snap = runtime.snapshot();
+    let launch_inputs = match crate::acp::terminal_context::build_acp_launch_inputs(
+        &app_db,
+        conv.agent_type,
+        conv.external_id.as_deref(),
+        data_dir,
+        crate::acp::terminal_context::AcpRouteRequest::root(Some(conv.id), None),
+        &runtime_snap,
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
+        }
     };
     let owner_label = format!("chat_channel:{}:{}", channel_id, sender_id);
+    let launch_context = channel_launch_context_from_db(db).await;
     let connection_id = match conn_mgr
         .spawn_agent(
             conv.agent_type,
@@ -540,6 +637,7 @@ pub async fn handle_resume(
             emitter.clone(),
             None,
             BTreeMap::new(),
+            launch_context,
         )
         .await
     {
@@ -618,27 +716,16 @@ pub async fn handle_cancel(
         }
     };
 
-    // Cancel the ACP connection (also CAS-updates the row to Cancelled and
-    // emits ConversationStatusChanged when the row is still InProgress).
+    // Cancel the ACP connection (CAS-updates InProgress → Cancelled, emits
+    // per-connection ConversationStatusChanged + global State patch when the
+    // CAS wins). Do not write status again here — a second unconditional write
+    // would emit a duplicate/out-of-order patch for the same user cancel.
     if let Err(e) = conn_mgr.cancel(db, &connection_id).await {
         tracing::warn!("[ChatChannel] failed to cancel connection {connection_id}: {e}");
     }
 
     // Remove from bridge
     bridge.lock().await.remove(&connection_id);
-
-    // Update conversation status
-    if let Some(conv_id) = ctx.current_conversation_id {
-        if let Err(e) = conversation_service::update_status(
-            db,
-            conv_id,
-            conversation::ConversationStatus::Cancelled,
-        )
-        .await
-        {
-            tracing::warn!("[ChatChannel] failed to mark conversation {conv_id} cancelled: {e}");
-        }
-    }
 
     // Clear session from context
     if let Err(e) = sender_context_service::clear_session(db, channel_id, sender_id).await {
@@ -767,27 +854,35 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         }
     };
 
-    // Check connection exists in bridge
-    {
+    // Check connection exists in bridge; take the pre-created conversation id
+    // so folder lookup is authoritative (not the sender's current folder).
+    let conversation_id = {
         let bridge_guard = req.bridge.lock().await;
-        if bridge_guard.get(&connection_id).is_none() {
-            // Connection lost, clear context
-            drop(bridge_guard);
-            if let Err(e) =
-                sender_context_service::clear_session(req.db, req.channel_id, req.sender_id).await
-            {
-                tracing::warn!("[ChatChannel] failed to clear lost session: {e}");
+        match bridge_guard.get(&connection_id) {
+            Some(session) => session.conversation_id,
+            None => {
+                // Connection lost, clear context
+                drop(bridge_guard);
+                if let Err(e) =
+                    sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
+                        .await
+                {
+                    tracing::warn!("[ChatChannel] failed to clear lost session: {e}");
+                }
+                return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
             }
-            return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
         }
-    }
+    };
 
-    // Send prompt to agent
-    let blocks = vec![PromptInputBlock::Text {
-        text: req.text.to_string(),
-    }];
-
-    if let Err(e) = req.conn_mgr.send_prompt(&connection_id, blocks).await {
+    if let Err(e) = send_prompt_linked_for_chat(
+        req.db,
+        req.conn_mgr,
+        &connection_id,
+        conversation_id,
+        req.text,
+    )
+    .await
+    {
         // A turn is already in flight on this (shared) connection — another
         // client, or a previous prompt still running. This is transient: the
         // connection is alive, so do NOT tear down the bridge/session. Tell the
@@ -882,5 +977,345 @@ fn truncate_title(s: &str) -> String {
     } else {
         let truncated: String = s.chars().take(77).collect();
         format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::manager::ConnectionManager;
+    use crate::auto_title::{ConnectionPurpose, PromptCaptureContext};
+    use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+    use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
+    use crate::db::entities::auto_title_job;
+    use crate::db::service::{app_metadata_service, conversation_service, sender_context_service};
+    use crate::db::test_helpers;
+    use crate::models::system::{AppLocale, LanguageMode, SystemLanguageSettings};
+    use crate::web::event_bridge::EventEmitter;
+    use sea_orm::EntityTrait;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn lang_to_app_locale_maps_all_ten_languages() {
+        let cases = [
+            (Lang::En, AppLocale::En),
+            (Lang::ZhCn, AppLocale::ZhCn),
+            (Lang::ZhTw, AppLocale::ZhTw),
+            (Lang::Ja, AppLocale::Ja),
+            (Lang::Ko, AppLocale::Ko),
+            (Lang::Es, AppLocale::Es),
+            (Lang::De, AppLocale::De),
+            (Lang::Fr, AppLocale::Fr),
+            (Lang::Pt, AppLocale::Pt),
+            (Lang::Ar, AppLocale::Ar),
+        ];
+        for (lang, expected) in cases {
+            assert_eq!(
+                i18n::lang_to_app_locale(lang),
+                expected,
+                "lang {lang:?} → AppLocale"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_locale_prefers_configured_message_language() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&SystemLanguageSettings {
+                mode: LanguageMode::Manual,
+                language: AppLocale::Ko,
+            })
+            .expect("serialize"),
+        )
+        .await
+        .expect("system language");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "zh-cn")
+            .await
+            .expect("channel language");
+
+        let locale = resolve_channel_app_locale(&db.conn).await;
+        assert_eq!(locale, AppLocale::ZhCn);
+
+        let launch = channel_launch_context_from_db(&db.conn).await;
+        assert_eq!(launch.purpose, ConnectionPurpose::User);
+        assert_eq!(launch.inherited_locale, Some(AppLocale::ZhCn));
+    }
+
+    #[tokio::test]
+    async fn channel_locale_falls_back_to_system_when_missing_or_invalid() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&SystemLanguageSettings {
+                mode: LanguageMode::Manual,
+                language: AppLocale::Fr,
+            })
+            .expect("serialize"),
+        )
+        .await
+        .expect("system language");
+
+        // Missing channel language → system Fr.
+        assert_eq!(
+            resolve_channel_app_locale(&db.conn).await,
+            AppLocale::Fr,
+            "missing channel language falls back to system language"
+        );
+
+        // Invalid channel language → system Fr (not forced English).
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "klingon")
+            .await
+            .expect("invalid channel language");
+        assert_eq!(
+            resolve_channel_app_locale(&db.conn).await,
+            AppLocale::Fr,
+            "invalid channel language falls back to system language"
+        );
+    }
+
+    /// Resume launch policy loads channel locale and does not enroll a new job.
+    #[tokio::test]
+    async fn resume_launch_gets_channel_locale_without_enrolling_title_job() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(
+            &db.conn,
+            SYSTEM_LANGUAGE_SETTINGS_KEY,
+            &serde_json::to_string(&SystemLanguageSettings {
+                mode: LanguageMode::Manual,
+                language: AppLocale::En,
+            })
+            .expect("serialize"),
+        )
+        .await
+        .expect("system language");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "ko")
+            .await
+            .expect("channel language");
+
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/chat-resume-locale").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("existing".into()),
+            None,
+        )
+        .await
+        .expect("existing conversation");
+        let jobs_before = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("jobs");
+        assert_eq!(jobs_before.len(), 1, "create enrolls exactly one job");
+
+        // Production resume/task launch helper — no create, no enroll.
+        let launch = channel_launch_context_from_db(&db.conn).await;
+        assert_eq!(launch.purpose, ConnectionPurpose::User);
+        assert_eq!(
+            launch.inherited_locale,
+            Some(AppLocale::Ko),
+            "resume/root launch must inherit channel locale"
+        );
+
+        let jobs_after = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("jobs");
+        assert_eq!(
+            jobs_after.len(),
+            1,
+            "launch context resolution must not enroll a new title job"
+        );
+        assert_eq!(jobs_after[0].conversation_id, conv.id);
+    }
+
+    /// Follow-up uses the conversation row's folder, not the sender's current folder.
+    #[tokio::test]
+    async fn followup_uses_conversation_folder_not_sender_current_folder() {
+        use crate::db::entities::chat_channel;
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, ActiveValue::NotSet, Set};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_AGENT,
+            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
+        )
+        .await
+        .expect("enable auto title");
+        app_metadata_service::upsert_value(&db.conn, "chat_message_language", "de")
+            .await
+            .expect("channel language");
+
+        let auth_folder = test_helpers::seed_folder(&db, "/tmp/chat-auth-folder").await;
+        let other_folder = test_helpers::seed_folder(&db, "/tmp/chat-other-folder").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            auth_folder,
+            AgentType::ClaudeCode,
+            Some("linked".into()),
+            None,
+        )
+        .await
+        .expect("conversation in auth folder");
+
+        let now = Utc::now();
+        let channel = chat_channel::ActiveModel {
+            id: NotSet,
+            name: Set("test-channel".into()),
+            channel_type: Set("telegram".into()),
+            enabled: Set(true),
+            config_json: Set("{}".into()),
+            event_filter_json: Set(None),
+            daily_report_enabled: Set(false),
+            daily_report_time: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed chat channel");
+        let channel_id = channel.id;
+        let sender_id = "sender-1";
+        // Sender switched to a different folder after the conversation was created.
+        sender_context_service::update_folder(&db.conn, channel_id, sender_id, Some(other_folder))
+            .await
+            .expect("sender folder");
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            sender_id,
+            Some(conv.id),
+            Some("follow-conn".into()),
+        )
+        .await
+        .expect("sender session");
+
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "follow-conn".into(),
+            ActiveSession {
+                channel_id,
+                sender_id: sender_id.into(),
+                conversation_id: conv.id,
+                connection_id: "follow-conn".into(),
+                agent_type: AgentType::ClaudeCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: HashMap::new(),
+                delegation_rendered: HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: None,
+                permission_pending: None,
+            },
+        );
+
+        let mgr = ConnectionManager::new();
+        let mut cmd_rx = mgr
+            .insert_test_connection_live(
+                "follow-conn",
+                AgentType::ClaudeCode,
+                Some(PathBuf::from("/tmp/chat-auth-folder")),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("follow-conn").await.unwrap();
+            let mut s = state.write().await;
+            // Unlinked until first linked send (resume-style).
+            s.conversation_id = None;
+            s.folder_id = None;
+            s.purpose = ConnectionPurpose::User;
+            s.effective_locale = AppLocale::En;
+        }
+
+        let follow_text = "continue with the plan";
+        let msg = handle_followup(FollowupRequest {
+            db: &db.conn,
+            text: follow_text,
+            channel_id,
+            sender_id,
+            conn_mgr: &mgr,
+            bridge: &bridge,
+            lang: Lang::De,
+            prefix: "/",
+        })
+        .await;
+        assert_eq!(
+            msg.level,
+            MessageLevel::Info,
+            "follow-up should succeed, got {msg:?}"
+        );
+
+        {
+            let state = mgr.get_state("follow-conn").await.unwrap();
+            let s = state.read().await;
+            assert_eq!(s.conversation_id, Some(conv.id));
+            assert_eq!(
+                s.folder_id,
+                Some(auth_folder),
+                "conversation row folder wins over sender current folder {other_folder}"
+            );
+            assert_ne!(s.folder_id, Some(other_folder));
+        }
+
+        let job = auto_title_job::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("job");
+        assert_eq!(job.first_user_text.as_deref(), Some(follow_text));
+        assert_eq!(job.locale.as_deref(), Some("de"));
+
+        // Drain: ensure a prompt was enqueued (send reached manager).
+        let mut saw_prompt = false;
+        let mut mark_awaiting_reply = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let crate::acp::connection::ConnectionCommand::Prompt {
+                mark_awaiting_reply: mark,
+                ..
+            } = cmd
+            {
+                saw_prompt = true;
+                mark_awaiting_reply = Some(mark);
+            }
+        }
+        assert!(saw_prompt, "follow-up must enqueue a Prompt command");
+        assert_eq!(
+            mark_awaiting_reply,
+            Some(false),
+            "chat follow-up must keep mark_awaiting_reply=false (background linked send)"
+        );
+
+        // No conversation should have been created in the sender's other folder.
+        let in_other =
+            conversation_service::list_by_folder(&db.conn, other_folder, None, None, None, None)
+                .await
+                .expect("list other folder");
+        assert!(
+            in_other.is_empty(),
+            "sender current folder must not receive a redirected conversation"
+        );
+
+        // Capture constructor shape required by chat producers.
+        let capture = PromptCaptureContext::new(Some(follow_text.into()), Some(AppLocale::De));
+        assert_eq!(capture.visible_text.as_deref(), Some(follow_text));
+        assert_eq!(capture.locale, Some(AppLocale::De));
     }
 }

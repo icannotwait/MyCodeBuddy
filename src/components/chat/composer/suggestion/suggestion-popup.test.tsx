@@ -1,13 +1,26 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react"
-import { createRef } from "react"
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react"
+import { createRef, useState } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { SuggestionPopup } from "./suggestion-popup"
+import type { ReferenceAttrs } from "../types"
 import type {
-  ReferenceSearch,
-  SuggestionGroup,
-  SuggestionPopupHandle,
-} from "./types"
+  ReferenceGroupKind,
+  ReferenceGroupSnapshot,
+  ReferenceSearchController,
+  ReferenceSearchSnapshot,
+} from "../reference-search-controller"
+import { FakeReferenceSearchController } from "./fake-reference-search-controller"
+import { SuggestionPopup } from "./suggestion-popup"
+import type { SuggestionItem, SuggestionPopupHandle } from "./types"
+
+export { FakeReferenceSearchController }
 
 const BASELINE_REFERENCE_TEXT =
   "2026-07-06-simple-packaging-storage-ballistic-throw-design.md"
@@ -22,14 +35,170 @@ function expectedMiddleTruncate(text: string): string {
     : `${text.slice(0, edgeChars)}...${text.slice(-edgeChars)}`
 }
 
-// Distinct, non-colliding text: a row's label must differ from its detail and
-// from the agent icon's <title> ("Codex") so findByText is unambiguous.
+function emptyGroup(
+  kind: ReferenceGroupKind,
+  label: string,
+  over: Partial<ReferenceGroupSnapshot> = {}
+): ReferenceGroupSnapshot {
+  return {
+    kind,
+    label,
+    items: [],
+    loading: false,
+    truncated: false,
+    error: null,
+    ...over,
+  }
+}
+
+function makeSnapshot(
+  over: Partial<ReferenceSearchSnapshot> & {
+    groups?: Partial<Record<ReferenceGroupKind, ReferenceGroupSnapshot>>
+  } = {}
+): ReferenceSearchSnapshot {
+  const baseGroups = {
+    agent: emptyGroup("agent", "Agents"),
+    file: emptyGroup("file", "Files"),
+    session: emptyGroup("session", "Sessions"),
+    commit: emptyGroup("commit", "Commits"),
+  }
+  return {
+    query: over.query ?? "",
+    generation: over.generation ?? 1,
+    patternError: over.patternError ?? false,
+    groups: { ...baseGroups, ...over.groups },
+  }
+}
+
+function item(
+  reference: ReferenceAttrs & { uri: string },
+  detail?: string | null,
+  sourceOrdinal = 0,
+  over: Partial<SuggestionItem> = {}
+): SuggestionItem {
+  return {
+    reference,
+    detail,
+    selectable: true,
+    freshness: "fresh",
+    sourceOrdinal,
+    regexRank: null,
+    ...over,
+  }
+}
+
+function file(
+  name: string,
+  over: Partial<SuggestionItem> = {}
+): SuggestionItem {
+  return item(
+    {
+      refType: "file",
+      id: name,
+      label: name,
+      uri: `file:///repo/${name}`,
+      meta: { fileKind: "file" },
+    },
+    // Detail differs from the label so getByText/name queries stay unambiguous.
+    `path/${name}`,
+    0,
+    over
+  )
+}
+
+function session(
+  id: string,
+  over: Partial<SuggestionItem> = {}
+): SuggestionItem {
+  return item(
+    {
+      refType: "session",
+      id,
+      label: `Session ${id}`,
+      uri: `codeg://session/${id}`,
+      meta: { agentType: "codex", status: "idle", branch: null },
+    },
+    null,
+    Number(id) || 0,
+    over
+  )
+}
+
+function agent(
+  id: string,
+  label: string,
+  over: Partial<SuggestionItem> = {}
+): SuggestionItem {
+  return item(
+    {
+      refType: "agent",
+      id,
+      label,
+      uri: `codeg://agent/${id}`,
+      meta: { agentType: id as "codex" },
+    },
+    null,
+    0,
+    over
+  )
+}
+
+function snapshotWithFiles(
+  files: SuggestionItem[],
+  query = "a"
+): ReferenceSearchSnapshot {
+  return makeSnapshot({
+    query,
+    groups: {
+      file: emptyGroup("file", "Files", { items: files }),
+    },
+  })
+}
+
+function snapshotWithSessions(
+  sessions: SuggestionItem[],
+  query = "s"
+): ReferenceSearchSnapshot {
+  return makeSnapshot({
+    query,
+    groups: {
+      session: emptyGroup("session", "Sessions", { items: sessions }),
+    },
+  })
+}
+
+function snapshotWithAgents(
+  agents: SuggestionItem[],
+  query = ""
+): ReferenceSearchSnapshot {
+  return makeSnapshot({
+    query,
+    groups: {
+      agent: emptyGroup("agent", "Agents", { items: agents }),
+    },
+  })
+}
+
+function fakeController(
+  snapshot: ReferenceSearchSnapshot
+): FakeReferenceSearchController {
+  return new FakeReferenceSearchController(snapshot)
+}
+
+function validatingController(
+  seed: SuggestionItem
+): FakeReferenceSearchController {
+  return new FakeReferenceSearchController(snapshotWithFiles([seed]), {
+    autoResolveConfirm: false,
+  })
+}
+
 const fileRef = {
   refType: "file" as const,
   id: "alpha.md",
   label: "alpha.md",
   uri: "file:///docs/alpha.md",
-  meta: null,
+  meta: { fileKind: "file" as const },
 }
 const agentRef = {
   refType: "agent" as const,
@@ -41,72 +210,92 @@ const agentRef = {
 const agentRef2 = {
   refType: "agent" as const,
   id: "claude_code",
-  // Label must differ from the AgentIcon's <title> ("Claude Code") so a plain
-  // text query is unambiguous (the title text is in the DOM even when decorative).
   label: "Claude Helper",
   uri: "codeg://agent/claude_code",
   meta: { agentType: "claude_code" as const },
 }
 
-// The provider keeps file-first order; the panel reorders to agent-first tabs.
-const groups: SuggestionGroup[] = [
-  {
-    kind: "file",
-    label: "Files",
-    items: [{ reference: fileRef, detail: "docs/alpha.md" }],
+const defaultSnapshot = makeSnapshot({
+  query: "a",
+  groups: {
+    file: emptyGroup("file", "Files", {
+      items: [item(fileRef, "docs/alpha.md", 0)],
+    }),
+    agent: emptyGroup("agent", "Agents", {
+      items: [item(agentRef, null, 0), item(agentRef2, null, 1)],
+    }),
   },
-  {
-    kind: "agent",
-    label: "Agents",
-    items: [{ reference: agentRef }, { reference: agentRef2 }],
-  },
-]
+})
 
-const search: ReferenceSearch = () => groups
-const emptySearch: ReferenceSearch = () => []
+const emptySnapshot = makeSnapshot({ query: "a" })
 
-const state = {
+const defaultState = {
   query: "a",
   range: { from: 1, to: 3 },
   getClientRect: () => null,
 }
 
 function mountPopup(
-  overrides: Partial<Parameters<typeof SuggestionPopup>[0]> = {}
+  overrides: {
+    controller?: ReferenceSearchController | FakeReferenceSearchController
+    state?: typeof defaultState
+    onSelect?: ReturnType<typeof vi.fn>
+    onClose?: ReturnType<typeof vi.fn>
+    emptyLabel?: string
+    loadingLabel?: string
+    listboxLabel?: string
+    moreLabel?: string
+    countLabel?: (count: number) => string
+    tabLabels?: Partial<Record<string, string>>
+    onActiveOptionChange?: (optionId: string | null) => void
+  } = {}
 ) {
   const ref = createRef<SuggestionPopupHandle>()
-  const onSelect = vi.fn()
-  const onClose = vi.fn()
+  const onSelect = overrides.onSelect ?? vi.fn()
+  const onClose = overrides.onClose ?? vi.fn()
+  const controller = overrides.controller ?? fakeController(defaultSnapshot)
+  controller.markActive?.()
   render(
     <SuggestionPopup
       ref={ref}
-      state={state}
-      search={search}
+      state={overrides.state ?? defaultState}
+      controller={controller as ReferenceSearchController}
       onSelect={onSelect}
       onClose={onClose}
-      {...overrides}
+      emptyLabel={overrides.emptyLabel}
+      loadingLabel={overrides.loadingLabel}
+      listboxLabel={overrides.listboxLabel}
+      moreLabel={overrides.moreLabel}
+      countLabel={overrides.countLabel}
+      tabLabels={overrides.tabLabels}
+      onActiveOptionChange={overrides.onActiveOptionChange}
     />
   )
-  return { ref, onSelect, onClose }
+  return { ref, onSelect, onClose, controller }
 }
 
 function key(name: string, shiftKey = false): KeyboardEvent {
   return { key: name, shiftKey } as KeyboardEvent
 }
 
+function activeUri(): string | null {
+  const active = document.querySelector(
+    '[role="option"][aria-selected="true"]'
+  ) as HTMLElement | null
+  return active?.dataset.uri ?? null
+}
+
 describe("SuggestionPopup", () => {
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.useRealTimers()
   })
 
   it("renders the active (agent-first) tab's options plus a four-tab strip", async () => {
     mountPopup()
-    // Agent is the first non-empty tab, so its options show by default.
     expect(await screen.findByText("Codex Helper")).toBeInTheDocument()
     expect(screen.getByText("Claude Helper")).toBeInTheDocument()
-    // The file tab's option is hidden until that tab is active.
     expect(screen.queryByText("alpha.md")).toBeNull()
-    // Four fixed tabs (no skill tab), agent selected.
     expect(screen.getAllByRole("tab")).toHaveLength(4)
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Agents/
@@ -115,25 +304,20 @@ describe("SuggestionPopup", () => {
 
   it("widens file suggestions and middle-shortens over-limit labels and paths", async () => {
     const longPath = `Client/Docs/AllWorkDocs/${LONG_REFERENCE_TEXT}`
-    const fileSearch: ReferenceSearch = () => [
-      {
-        kind: "file",
-        label: "Files",
-        items: [
+    const controller = fakeController(
+      snapshotWithFiles([
+        item(
           {
-            reference: {
-              ...fileRef,
-              id: LONG_REFERENCE_TEXT,
-              label: LONG_REFERENCE_TEXT,
-              uri: `file:///repo/${LONG_REFERENCE_TEXT}`,
-            },
-            detail: longPath,
+            ...fileRef,
+            id: LONG_REFERENCE_TEXT,
+            label: LONG_REFERENCE_TEXT,
+            uri: `file:///repo/${LONG_REFERENCE_TEXT}`,
           },
-        ],
-      },
-    ]
-
-    mountPopup({ search: fileSearch })
+          longPath
+        ),
+      ])
+    )
+    mountPopup({ controller })
     const panel = screen.getByTestId("mention-popup")
     expect(panel).toHaveClass("w-[52rem]")
     expect(
@@ -147,7 +331,10 @@ describe("SuggestionPopup", () => {
   })
 
   it("shows an empty state (but keeps the tabs) when there are no matches", async () => {
-    mountPopup({ search: emptySearch, emptyLabel: "Nothing" })
+    mountPopup({
+      controller: fakeController(emptySnapshot),
+      emptyLabel: "Nothing",
+    })
     const panel = screen.getByTestId("mention-popup")
     expect(await within(panel).findByText("Nothing")).toBeInTheDocument()
     expect(screen.getAllByRole("tab")).toHaveLength(4)
@@ -159,7 +346,9 @@ describe("SuggestionPopup", () => {
     act(() => {
       expect(ref.current?.onKeyDown(key("Enter"))).toBe(true)
     })
-    expect(onSelect).toHaveBeenCalledWith(agentRef, state.range)
+    await waitFor(() =>
+      expect(onSelect).toHaveBeenCalledWith(agentRef, defaultState.range)
+    )
   })
 
   it("moves the selection with ArrowDown within the active tab", async () => {
@@ -167,7 +356,9 @@ describe("SuggestionPopup", () => {
     await screen.findByText("Codex Helper")
     act(() => ref.current?.onKeyDown(key("ArrowDown")))
     act(() => ref.current?.onKeyDown(key("Enter")))
-    expect(onSelect).toHaveBeenCalledWith(agentRef2, state.range)
+    await waitFor(() =>
+      expect(onSelect).toHaveBeenCalledWith(agentRef2, defaultState.range)
+    )
   })
 
   it("wraps the selection with ArrowUp from the first row", async () => {
@@ -175,7 +366,9 @@ describe("SuggestionPopup", () => {
     await screen.findByText("Codex Helper")
     act(() => ref.current?.onKeyDown(key("ArrowUp")))
     act(() => ref.current?.onKeyDown(key("Enter")))
-    expect(onSelect).toHaveBeenCalledWith(agentRef2, state.range)
+    await waitFor(() =>
+      expect(onSelect).toHaveBeenCalledWith(agentRef2, defaultState.range)
+    )
   })
 
   it("switches to the next tab with Tab and reveals its options", async () => {
@@ -184,13 +377,11 @@ describe("SuggestionPopup", () => {
     act(() => {
       expect(ref.current?.onKeyDown(key("Tab"))).toBe(true)
     })
-    // agent → file; the file option appears and the agent options are gone.
     expect(await screen.findByText("alpha.md")).toBeInTheDocument()
     expect(screen.queryByText("Codex Helper")).toBeNull()
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Files/
     )
-    // Tab does not select.
     expect(onSelect).not.toHaveBeenCalled()
   })
 
@@ -198,7 +389,6 @@ describe("SuggestionPopup", () => {
     const { ref } = mountPopup()
     await screen.findByText("Codex Helper")
     act(() => ref.current?.onKeyDown(key("Tab", true)))
-    // agent (first) wraps backwards to commit (last in tab order); it's empty.
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
       /Commits/
     )
@@ -208,7 +398,6 @@ describe("SuggestionPopup", () => {
     mountPopup()
     await screen.findByText("Codex Helper")
     const filesTab = screen.getByRole("tab", { name: /Files/ })
-    // mousedown preventDefault keeps focus in the editor (no blur)...
     const down = new MouseEvent("mousedown", {
       bubbles: true,
       cancelable: true,
@@ -217,7 +406,6 @@ describe("SuggestionPopup", () => {
       filesTab.dispatchEvent(down)
     })
     expect(down.defaultPrevented).toBe(true)
-    // ...and the click performs the switch (so AT / synthetic click works too).
     act(() => {
       fireEvent.click(filesTab)
     })
@@ -242,48 +430,35 @@ describe("SuggestionPopup", () => {
     expect(ref.current?.onKeyDown(key("x"))).toBe(false)
   })
 
-  it("does not select stale results after the query changes", async () => {
-    const ref = createRef<SuggestionPopupHandle>()
-    const onSelect = vi.fn()
-    const view = (query: string, to: number) => (
-      <SuggestionPopup
-        ref={ref}
-        state={{ query, range: { from: 1, to }, getClientRect: () => null }}
-        search={search}
-        onSelect={onSelect}
-        onClose={vi.fn()}
-        loadingLabel="Loading"
-      />
+  it("does not insert a non-selectable continuity row on Enter", async () => {
+    const controller = fakeController(
+      snapshotWithAgents([
+        agent("codex", "Codex Helper", {
+          selectable: false,
+          freshness: "cache",
+        }),
+      ])
     )
-    const { rerender } = render(view("a", 2))
-    await screen.findByText("Codex Helper") // fresh results for "a"
-
-    // Query advances; the shown results now answer the *previous* query.
-    rerender(view("ab", 3))
-    expect(screen.queryByText("Codex Helper")).toBeNull()
-    expect(
-      within(screen.getByTestId("mention-popup")).getByText("Loading")
-    ).toBeInTheDocument()
-
+    const { ref, onSelect } = mountPopup({ controller })
+    await screen.findByText("Codex Helper")
     act(() => ref.current?.onKeyDown(key("Enter")))
     expect(onSelect).not.toHaveBeenCalled()
   })
 
   it("selects on click (mousedown) and prevents default to keep editor focus", async () => {
     const { onSelect } = mountPopup()
-    const label = await screen.findByText("Codex Helper")
-    const button = label.closest("button")
-    expect(button).not.toBeNull()
+    const option = await screen.findByRole("option", { name: "Codex Helper" })
     const event = new MouseEvent("mousedown", {
       bubbles: true,
       cancelable: true,
     })
     act(() => {
-      button?.dispatchEvent(event)
+      option.dispatchEvent(event)
     })
-    expect(onSelect).toHaveBeenCalledWith(agentRef, state.range)
-    // preventDefault keeps focus in the editor rather than the popup button.
     expect(event.defaultPrevented).toBe(true)
+    await waitFor(() =>
+      expect(onSelect).toHaveBeenCalledWith(agentRef, defaultState.range)
+    )
   })
 
   it("positions and reveals the caret-anchored panel once measured", async () => {
@@ -296,7 +471,9 @@ describe("SuggestionPopup", () => {
           getClientRect: () =>
             ({ left: 100, top: 600, bottom: 620 }) as DOMRect,
         }}
-        search={search}
+        controller={
+          fakeController(defaultSnapshot) as ReferenceSearchController
+        }
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -304,14 +481,12 @@ describe("SuggestionPopup", () => {
     await screen.findByText("Codex Helper")
     const container = screen.getByTestId("mention-popup")
       .parentElement as HTMLElement
-    // The layout effect measured the panel and clamped/flipped it into view.
     expect(container.style.visibility).toBe("visible")
     expect(container.style.position).toBe("fixed")
     expect(container.dataset.placement).toBeTruthy()
   })
 
   it("clamps the rendered panel coordinates into the viewport", async () => {
-    // A real (nonzero) panel size lets the viewport clamp actually bite.
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
       width: 320,
       height: 288,
@@ -322,11 +497,12 @@ describe("SuggestionPopup", () => {
         state={{
           query: "a",
           range: { from: 1, to: 3 },
-          // Caret hard against the right edge of the jsdom 1024px viewport.
           getClientRect: () =>
             ({ left: 1000, top: 600, bottom: 620 }) as DOMRect,
         }}
-        search={search}
+        controller={
+          fakeController(defaultSnapshot) as ReferenceSearchController
+        }
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -334,9 +510,7 @@ describe("SuggestionPopup", () => {
     await screen.findByText("Codex Helper")
     const container = screen.getByTestId("mention-popup")
       .parentElement as HTMLElement
-    // left clamps to 1024 - 320 - 8 = 696 (not the raw caret x of 1000).
     expect(container.style.left).toBe("696px")
-    // Room above (600px) fits → placed above: 600 - 4 - 288 = 308.
     expect(container.style.top).toBe("308px")
     expect(container.dataset.placement).toBe("above")
   })
@@ -354,7 +528,9 @@ describe("SuggestionPopup", () => {
       <SuggestionPopup
         ref={createRef<SuggestionPopupHandle>()}
         state={{ query: "a", range: { from: 1, to: 3 }, getClientRect }}
-        search={search}
+        controller={
+          fakeController(defaultSnapshot) as ReferenceSearchController
+        }
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -363,7 +539,6 @@ describe("SuggestionPopup", () => {
     const container = screen.getByTestId("mention-popup")
       .parentElement as HTMLElement
     expect(container.style.left).toBe("100px")
-    // The caret reflows; a resize must re-read the live getter, not a snapshot.
     const before = getClientRect.mock.calls.length
     caretLeft = 300
     act(() => {
@@ -376,13 +551,13 @@ describe("SuggestionPopup", () => {
   it("exposes listbox + option roles with the active option selected", async () => {
     mountPopup({ listboxLabel: "Mentions" })
     await screen.findByText("Codex Helper")
-    // The listbox names the active tab and owns only that tab's options.
     const listbox = screen.getByRole("listbox", { name: "Mentions: Agents" })
     expect(listbox).toHaveAttribute("id", "mention-listbox")
     const options = within(listbox).getAllByRole("option")
     expect(options).toHaveLength(2)
     expect(options[0]).toHaveAttribute("aria-selected", "true")
     expect(options[0]).toHaveAttribute("id", "mention-option-agent-0")
+    expect(options[0]).toHaveAttribute("data-uri", agentRef.uri)
     expect(options[1]).toHaveAttribute("aria-selected", "false")
     expect(options[1]).toHaveAttribute("id", "mention-option-agent-1")
   })
@@ -390,8 +565,6 @@ describe("SuggestionPopup", () => {
   it("keeps the decorative icon out of the option's accessible name", async () => {
     mountPopup()
     await screen.findByText("Codex Helper")
-    // The agent row's AgentIcon is a titled <svg>; if it weren't decorative the
-    // option would be named "Codex Codex Helper". The name must be just label.
     expect(
       screen.getByRole("option", { name: "Codex Helper" })
     ).toBeInTheDocument()
@@ -428,7 +601,7 @@ describe("SuggestionPopup", () => {
   it("reports a null active option while loading or empty", async () => {
     const onActiveOptionChange = vi.fn()
     mountPopup({
-      search: emptySearch,
+      controller: fakeController(emptySnapshot),
       onActiveOptionChange,
       emptyLabel: "None",
     })
@@ -438,23 +611,199 @@ describe("SuggestionPopup", () => {
   })
 
   it("shows a non-selectable, aria-hidden hint for a truncated active tab", async () => {
-    const truncatedSearch: ReferenceSearch = () => [
-      {
-        kind: "agent",
-        label: "Agents",
-        items: [{ reference: agentRef }],
-        truncated: true,
-      },
-    ]
-    mountPopup({ search: truncatedSearch, moreLabel: "More — keep typing" })
+    const controller = fakeController(
+      makeSnapshot({
+        query: "a",
+        groups: {
+          agent: emptyGroup("agent", "Agents", {
+            items: [item(agentRef)],
+            truncated: true,
+          }),
+        },
+      })
+    )
+    mountPopup({ controller, moreLabel: "More — keep typing" })
     await screen.findByText("Codex Helper")
     const panel = screen.getByTestId("mention-popup")
     const hint = within(panel).getByText("More — keep typing")
-    // Decorative: hidden from AT (the live region announces truncation) and not
-    // an option, so arrow/Enter can never land on it.
     expect(hint).toHaveAttribute("aria-hidden", "true")
     expect(panel.querySelectorAll('[role="option"]')).toHaveLength(1)
-    // The polite live region also conveys truncation to screen readers.
     expect(screen.getByRole("status")).toHaveTextContent("More — keep typing")
+  })
+
+  it("keeps the selected URI when pages insert and rerank around it", async () => {
+    const controller = fakeController(
+      snapshotWithFiles([file("b.ts"), file("c.ts")])
+    )
+    const { ref } = mountPopup({ controller })
+    await screen.findByRole("option", { name: /^b\.ts/ })
+    // File tab is first non-empty when agents are empty.
+    act(() => ref.current?.onKeyDown(key("ArrowDown")))
+    expect(activeUri()).toBe("file:///repo/c.ts")
+    act(() => {
+      controller.publish(
+        snapshotWithFiles([file("a.ts"), file("b.ts"), file("c.ts")])
+      )
+    })
+    expect(activeUri()).toBe("file:///repo/c.ts")
+  })
+
+  it("moves explicit invalidation to same index then previous then none", () => {
+    const controller = fakeController(
+      snapshotWithSessions([session("1"), session("2"), session("3")])
+    )
+    const { ref } = mountPopup({
+      controller,
+      state: {
+        query: "s",
+        range: { from: 1, to: 3 },
+        getClientRect: () => null,
+      },
+    })
+    act(() => ref.current?.onKeyDown(key("ArrowDown")))
+    expect(activeUri()).toBe("codeg://session/2")
+    act(() => {
+      controller.publish(snapshotWithSessions([session("1"), session("3")]))
+    })
+    expect(activeUri()).toBe("codeg://session/3")
+    act(() => {
+      controller.publish(snapshotWithSessions([session("1")]))
+    })
+    expect(activeUri()).toBe("codeg://session/1")
+    act(() => {
+      controller.publish(snapshotWithSessions([]))
+    })
+    expect(activeUri()).toBeNull()
+  })
+
+  it("consumes Enter while validation is pending and inserts only a permitted result", async () => {
+    const controller = validatingController(file("cached.ts"))
+    const { ref, onSelect } = mountPopup({ controller })
+    await screen.findByRole("option", { name: /^cached\.ts/ })
+    act(() => expect(ref.current?.onKeyDown(key("Enter"))).toBe(true))
+    act(() => expect(ref.current?.onKeyDown(key("Enter"))).toBe(true))
+    expect(controller.confirmCallCount()).toBe(1)
+    expect(onSelect).not.toHaveBeenCalled()
+    act(() => {
+      controller.resolveConfirmation(file("cached.ts").reference)
+    })
+    await waitFor(() => expect(onSelect).toHaveBeenCalledOnce())
+    expect(onSelect).toHaveBeenCalledWith(
+      file("cached.ts").reference,
+      defaultState.range
+    )
+  })
+
+  it("known_negative_confirmation_keeps_picker_open_on_nearest_survivor", async () => {
+    const seed = [file("a.ts"), file("b.ts"), file("c.ts")]
+    const controller = new FakeReferenceSearchController(
+      snapshotWithFiles(seed),
+      { autoResolveConfirm: false }
+    )
+    const { ref, onSelect, onClose } = mountPopup({ controller })
+    await screen.findByRole("option", { name: /^b\.ts/ })
+    act(() => ref.current?.onKeyDown(key("ArrowDown")))
+    expect(activeUri()).toBe("file:///repo/b.ts")
+    act(() => {
+      expect(ref.current?.onKeyDown(key("Enter"))).toBe(true)
+    })
+    act(() => {
+      controller.publish(snapshotWithFiles([file("a.ts"), file("c.ts")]))
+    })
+    act(() => {
+      controller.resolveConfirmation(null)
+    })
+    await waitFor(() => expect(controller.confirmCallCount()).toBe(1))
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(activeUri()).toBe("file:///repo/c.ts")
+    // Can confirm the survivor next.
+    controller.enableAutoResolveConfirm()
+    act(() => {
+      expect(ref.current?.onKeyDown(key("Enter"))).toBe(true)
+    })
+    await waitFor(() => expect(onSelect).toHaveBeenCalledOnce())
+    expect(onSelect.mock.calls[0][0].uri).toBe("file:///repo/c.ts")
+  })
+
+  it("settled_confirmation_cannot_insert_after_the_same_query_moves_range", async () => {
+    const controller = validatingController(file("cached.ts"))
+    const onSelect = vi.fn()
+    const onClose = vi.fn()
+    const ref = createRef<SuggestionPopupHandle>()
+
+    function Harness() {
+      const [state, setState] = useState({
+        query: "a",
+        range: { from: 1, to: 3 },
+        getClientRect: () => null,
+      })
+      return (
+        <>
+          <button
+            type="button"
+            data-testid="remap-range"
+            onClick={() =>
+              setState((s) => ({ ...s, range: { from: 5, to: 7 } }))
+            }
+          >
+            remap
+          </button>
+          <SuggestionPopup
+            ref={ref}
+            state={state}
+            controller={controller as ReferenceSearchController}
+            onSelect={onSelect}
+            onClose={onClose}
+          />
+        </>
+      )
+    }
+
+    render(<Harness />)
+    await screen.findByRole("option", { name: /^cached\.ts/ })
+    act(() => {
+      expect(ref.current?.onKeyDown(key("Enter"))).toBe(true)
+    })
+    act(() => {
+      fireEvent.click(screen.getByTestId("remap-range"))
+    })
+    act(() => {
+      controller.resolveConfirmation(file("cached.ts").reference)
+    })
+    await waitFor(() => expect(controller.confirmCallCount()).toBe(1))
+    // Allow the settled confirmation microtask to run.
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it("bare_query_publishes_catalog_without_the_legacy_fetch_debounce", async () => {
+    vi.useFakeTimers()
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout")
+    const controller = fakeController(
+      snapshotWithAgents([agent("codex", "Codex Helper")], "")
+    )
+    // Start empty; setQuery("") will re-publish (fake keeps items).
+    controller.publish(snapshotWithAgents([agent("codex", "Codex Helper")], ""))
+    mountPopup({
+      controller,
+      state: {
+        query: "",
+        range: { from: 1, to: 2 },
+        getClientRect: () => null,
+      },
+    })
+    expect(screen.getByText("Codex Helper")).toBeInTheDocument()
+    expect(controller.queries).toContain("")
+    // Legacy 150ms search debounce must not be scheduled.
+    const delays = setTimeoutSpy.mock.calls.map((call) => call[1])
+    expect(delays).not.toContain(150)
+    act(() => {
+      vi.advanceTimersByTime(200)
+    })
+    expect(screen.getByText("Codex Helper")).toBeInTheDocument()
   })
 })

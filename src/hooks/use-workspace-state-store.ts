@@ -50,6 +50,7 @@ export interface WorkspaceStateView {
 export type WorkspaceEnvelopeListener = (envelope: {
   seq: number
   kind: string
+  fs_event_kind?: string
   changed_paths: string[]
 }) => void
 
@@ -356,6 +357,7 @@ class WorkspaceStateStore {
             this.notifyEnvelope({
               seq: envelope.seq,
               kind: envelope.kind,
+              fs_event_kind: envelope.fs_event_kind,
               changed_paths: envelope.changed_paths ?? [],
             })
           }
@@ -612,6 +614,7 @@ class WorkspaceStateStore {
     this.notifyEnvelope({
       seq: event.seq,
       kind: event.kind,
+      fs_event_kind: event.fs_event_kind,
       changed_paths: event.changed_paths ?? [],
     })
   }
@@ -619,6 +622,7 @@ class WorkspaceStateStore {
   private notifyEnvelope = (envelope: {
     seq: number
     kind: string
+    fs_event_kind?: string
     changed_paths: string[]
   }) => {
     for (const listener of this.envelopeListeners) {

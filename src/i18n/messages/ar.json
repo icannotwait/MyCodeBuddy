@@ -562,7 +562,16 @@
       "noConfigAvailable": "لا يحتوي هذا الوكيل على خيارات قابلة للضبط.",
       "modeLabel": "الوضع",
       "agentDefaultHint": "افتراضي الوكيل: {value}",
-      "defaultOptionLabel": "افتراضي ({value})"
+      "defaultOptionLabel": "افتراضي ({value})",
+      "routePolicy": "المسار الافتراضي",
+      "routePolicyHint": "تستخدم الوكلاء المدارة هذا المسار عندما لا يكون للمحادثة تجاوز.",
+      "routeEffectiveNative": "التفويض متوقف — المسار الفعلي هو Native.",
+      "route": {
+        "codeg": "Codeg",
+        "native": "Native"
+      },
+      "softWatchdog": "مراقب مرن (ثوان)",
+      "softWatchdogHint": "عتبة توقف للمراقبة فقط ({min}–{max}). لا تلغي ولا تغير المسار."
     },
     "actions": {
       "dragSort": "اسحب لإعادة الترتيب",
@@ -963,7 +972,8 @@
       "piBinaryInstallFailed": "فشل تثبيت pi",
       "piBinaryUninstalled": "تم إلغاء تثبيت pi",
       "piBinaryUninstallFailed": "فشل إلغاء تثبيت pi",
-      "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل"
+      "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل",
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
     },
     "version": {
       "statusLabel": "حالة الإصدار",
@@ -977,7 +987,7 @@
       "remoteUnavailable": "{versionText}. الإصدار البعيد غير متاح حاليًا.",
       "latest": "{versionText}. أنت على أحدث إصدار.",
       "bundled": "مدمج: {version}",
-      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت MyCodeBuddy أو حدّثه."
+      "bundledMissing": "المحول المدمج مفقود. أعد تثبيت DrawCode أو حدّثه."
     },
     "cline": {
       "configDescription": "تكوين مزود واجهة برمجة التطبيقات وبيانات اعتماد Cline. يتم حفظ الإعدادات في ~/.cline/data/."
@@ -1052,7 +1062,8 @@
       "trustDescription": "عندما يربط codeg أداة pi بمجلد، يضع علامة موثوق على ذلك المجلد ليحمّل pi إعدادات المشروع المحلية ومهاراته دون تأكيد منفصل.",
       "trustHint": "يُوثَق فقط بالمجلدات التي تفتحها هنا، وليس جهازك بالكامل، كما أن ذلك يؤثر على تحميل الإعدادات فقط، لا على ما يُسمح لـ pi بتشغيله.",
       "configDirSkillsNote": "عند تحديد دليل إعدادات مخصص، لن تنطبق المهارات والخبراء وأدوات المكتب المُدارة في الإعدادات على pi هذا — أدِر مهاراته مباشرةً في ذلك المجلد."
-    }
+    },
+    "showThinking": "Show thinking"
   },
   "SettingsPages": {
     "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
@@ -1085,11 +1096,22 @@
     "restartRequired": "تم الحفظ. أعد تشغيل التطبيق ليصبح التغيير نافذًا.",
     "restartNow": "إعادة التشغيل الآن",
     "restartFailed": "فشل إعادة التشغيل: {message}",
-    "loadFailed": "فشل التحميل: {message}"
+    "loadFailed": "فشل التحميل: {message}",
+    "conversationExperienceTitle": "تجربة المحادثة",
+    "conversationExperienceDescription": "اضبط العناوين التلقائية وسلوك البحث عن المراجع.",
+    "autoTitleAgent": "وكيل العنوان التلقائي",
+    "autoTitleOff": "إيقاف",
+    "autoTitleUnavailable": "{agent} (غير متاح)",
+    "autoTitleSaveFailed": "تعذر حفظ وكيل العنوان التلقائي: {message}",
+    "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي...",
+    "referenceSearchLimit": "حد نتائج المراجع",
+    "referenceSearchLimitHint": "الحد الأقصى للنتائج المخزنة مؤقتًا والتي يجري البحث عنها لكل مصدر موارد (10-500).",
+    "referenceSearchLimitSave": "حفظ حد المراجع",
+    "referenceSearchLimitSaveFailed": "تعذر حفظ حد نتائج المراجع: {message}"
   },
   "LoginPage": {
-    "documentTitle": "تسجيل الدخول - codeg",
-    "brand": "Codeg",
+    "documentTitle": "تسجيل الدخول - DrawCode",
+    "brand": "DrawCode",
     "subtitle": "أدخل رمز الوصول للاتصال بتطبيق سطح المكتب",
     "tokenPlaceholder": "رمز الوصول",
     "connect": "اتصال",
@@ -1210,6 +1232,7 @@
       "sectionOrderChatsFirst": "المحادثة في الأعلى",
       "statusRunningBadge": "قيد التشغيل",
       "statusCancelledBadge": "ملغى",
+      "statusAwaitingReplyBadge": "بانتظار ردك",
       "conversationCountUnit": "{count} محادثة",
       "emptyFolderHint": "لا توجد محادثات",
       "noMatchingConversations": "لا توجد محادثات مطابقة",
@@ -1841,6 +1864,7 @@
       "attachToCurrentSession": "إضافة إلى الجلسة",
       "compareWithBranch": "المقارنة مع الفرع...",
       "reloadFromDisk": "إعادة التحميل من القرص",
+      "showIgnoredFiles": "إظهار الملفات المتجاهلة",
       "new": "جديد",
       "newFile": "ملف",
       "newDirectory": "مجلد",
@@ -1882,7 +1906,8 @@
         "downloadFailed": "فشل تنزيل {name}",
         "downloadSaved": "تم تنزيل {name}",
         "pathCopied": "تم نسخ المسار",
-        "copyPathFailed": "فشل نسخ المسار"
+        "copyPathFailed": "فشل نسخ المسار",
+        "loadIgnoredFilesFailed": "تعذر تحميل الملفات المتجاهلة"
       },
       "createDialog": {
         "newFile": "ملف جديد",
@@ -2059,6 +2084,9 @@
         "connectFailedTitle": "فشل اتصال {agent}",
         "toolFallbackTitle": "أداة",
         "eventErrorTitle": "خطأ الوكيل",
+        "desktopDeliveryNegotiateFailed": "Could not negotiate desktop event delivery. Restart the application.",
+        "desktopDeliverySubscribeFailed": "Failed to subscribe to desktop ACP events. Restart the application.",
+        "desktopDeliveryFailedRestart": "Desktop event delivery failed. Restart the application to continue — reloading the conversation is not enough.",
         "notificationTurnComplete": "{agent} أنهى الاستجابة",
         "notificationError": "{agent} خطأ: {message}",
         "claudeApiRetry": {
@@ -2148,7 +2176,10 @@
         "mentionGroupAgent": "الوكلاء",
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
-        "mentionGroupSkill": "المهارات"
+        "mentionGroupSkill": "المهارات",
+        "mentionInvalidPattern": "تعبير نمطي غير صالح",
+        "mentionSourceError": "تعذر تحديث هذا المصدر",
+        "mentionProfileError": "تعذر تحميل ملفات تعريف التفويض"
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",
@@ -2269,7 +2300,10 @@
       "subAgentOverlay": {
         "title": "الوكلاء الفرعيون",
         "collapsedSummary": "الوكلاء الفرعيون {count}",
-        "collapseAria": "طي الوكلاء الفرعيين"
+        "collapseAria": "طي الوكلاء الفرعيين",
+        "originCodeg": "Codeg",
+        "originNative": "Native",
+        "operation": "{op}"
       },
       "agentPlanOverlay": {
         "title": "خطة الوكيل",
@@ -2414,7 +2448,10 @@
             "child_empty": "الوكيل الفرعي بدون استجابة",
             "child_unknown": "الوكيل الفرعي: خطأ",
             "unknown": "مهمة غير معروفة"
-          }
+          },
+          "active": "نشط",
+          "waitingInput": "بانتظار الإدخال",
+          "stalled": "لا نشاط حديث للوكيل"
         }
       },
       "contentParts": {
@@ -2613,7 +2650,8 @@
         "dismiss": "تجاهل",
         "reconnectFailed": "فشل في إعادة الاتصال بالجلسة",
         "applied": "تم تطبيق الإعدادات الجديدة",
-        "terminalShellTitle": "تم تحديث صدفة الطرفية"
+        "terminalShellTitle": "تم تحديث صدفة الطرفية",
+        "delegationRouteTitle": "تم تحديث مسار التفويض"
       },
       "collabAgent": {
         "title": "وكيل فرعي",
@@ -2640,6 +2678,30 @@
         "cardCompleted": "اكتملت مهمة الخلفية",
         "cardFinishedWithStatus": "انتهت مهمة الخلفية ({status})",
         "cardResultPending": "لم تصل النتيجة بعد"
+      },
+      "delegationRoute": {
+        "menuLabel": "مسار التفويض",
+        "inheritGlobal": "وراثة العام",
+        "codeg": "Codeg",
+        "native": "Native",
+        "codegInherited": "Codeg (موروث)",
+        "updateFailed": "فشل تحديث المسار"
+      },
+      "delegationRouteNotice": {
+        "safeFallback": "تم الرجوع إلى Native ({reason}). أعد الاتصال لإعادة محاولة Codeg.",
+        "delegationUnavailable": "مسار Codeg نشط لكن التفويض غير متاح.",
+        "reconnect": "إعادة الاتصال",
+        "reconnecting": "جار إعادة الاتصال…",
+        "reconnected": "تمت إعادة الاتصال",
+        "reconnectFailed": "فشلت إعادة الاتصال",
+        "reason": {
+          "native_suppression_unsupported": "كبت أصلي غير مدعوم",
+          "native_suppression_invalid": "كبت أصلي غير صالح",
+          "companion_binary_unavailable": "ثنائي المرافق غير متاح",
+          "agent_mcp_unsupported": "MCP الوكيل غير مدعوم",
+          "companion_initialization_failed": "فشل تهيئة المرافق",
+          "unknown": "متدهور"
+        }
       }
     },
     "diffPreview": {
@@ -2763,11 +2825,11 @@
   "WebServiceSettings": {
     "addressSwitchHint": "التبديل يغيّر فقط العنوان المعروض والمفتوح هنا؛ تستمع الخدمة على جميع الواجهات وتبقى قابلة للوصول من كل عنوان.",
     "sectionTitle": "خدمة الويب",
-    "sectionDescription": "تفعيل للوصول إلى Codeg عن بُعد عبر المتصفح",
+    "sectionDescription": "تفعيل للوصول إلى DrawCode عن بُعد عبر المتصفح",
     "port": "المنفذ",
     "status": "الحالة",
     "autoStart": "تشغيل تلقائي",
-    "autoStartHint": "تشغيل خدمة الويب عند بدء Codeg",
+    "autoStartHint": "تشغيل خدمة الويب عند بدء DrawCode",
     "running": "قيد التشغيل",
     "stopped": "متوقف",
     "processing": "جارٍ المعالجة...",
@@ -2782,7 +2844,7 @@
     "copy": "نسخ",
     "qrcode": "رمز QR",
     "qrcodeTitle": "امسح للفتح",
-    "qrcodeHint": "امسح بهاتفك لفتح Codeg في المتصفح",
+    "qrcodeHint": "امسح بهاتفك لفتح DrawCode في المتصفح",
     "addressLabel": "عنوان الوصول",
     "tokenLabel": "رمز الوصول",
     "tokenHint": "أدخل هذا الرمز عند الوصول إلى عميل الويب لأول مرة",
@@ -2790,7 +2852,7 @@
     "regenerate": "إعادة التوليد",
     "stalePortOccupiedTitle": "المنفذ {port} مستخدم من قبل عملية أخرى",
     "stalePortUnknownTitle": "حالة المنفذ {port} غير واضحة",
-    "stalePortHint": "لا يستطيع Codeg الربط قبل تحرير المنفذ. غيّر المنفذ أعلاه، أو أغلق العملية التي تحتفظ به.",
+    "stalePortHint": "لا يستطيع DrawCode الربط قبل تحرير المنفذ. غيّر المنفذ أعلاه، أو أغلق العملية التي تحتفظ به.",
     "errors": {
       "alreadyRunning": "خدمة الويب قيد التشغيل بالفعل",
       "invalidAddress": "تنسيق المضيف أو المنفذ غير صالح",
@@ -3090,7 +3152,7 @@
   },
   "ScienceSettings": {
     "title": "مهارات البحث العلمي",
-    "description": "فعّل مهارات البحث العلمي المنسّقة لوكلاء البرمجة بالذكاء الاصطناعي: توليد الفرضيات، وتصميم التجارب، والإحصاء، والتصور، والتقييم النقدي، والبحث في الأدبيات. يدير MyCodeBuddy نسخة مركزية ويربط كل مهارة بالوكلاء الذين تختارهم.",
+    "description": "فعّل مهارات البحث العلمي المنسّقة لوكلاء البرمجة بالذكاء الاصطناعي: توليد الفرضيات، وتصميم التجارب، والإحصاء، والتصور، والتقييم النقدي، والبحث في الأدبيات. يدير DrawCode نسخة مركزية ويربط كل مهارة بالوكلاء الذين تختارهم.",
     "loading": "جارٍ تحميل مهارات البحث العلمي…",
     "emptySkills": "لا توجد مهارات بحث علمي متاحة. تحقّق من سجلات التطبيق.",
     "searchPlaceholder": "ابحث في مهارات البحث العلمي بالاسم أو المعرّف أو الوصف",

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::sync::{broadcast, RwLock};
 
+#[cfg(feature = "tauri-runtime")]
+use crate::acp::{desktop_event_batcher, DesktopAcpDelivery};
 use crate::acp::{AcpEvent, EventBusMetrics, EventEnvelope, InternalEventBus, SessionState};
 
 /// Broadcast-delivered event.
@@ -195,11 +197,14 @@ pub enum ConversationChange {
     },
     /// Remove by id (soft delete).
     Deleted { id: i32 },
-    /// Lightweight running-state change. Emitted centrally from
-    /// [`emit_with_state`] whenever a `ConversationStatusChanged` ACP event
-    /// flows through, so the sidebar's status reaches every client (not just
-    /// those attached to the connection).
-    Status { id: i32, status: String },
+    /// Authoritative conversation state patch from a successful DB status
+    /// transition. Emitted explicitly by status owners (not auto-bridged from
+    /// per-connection `ConversationStatusChanged`) so every client converges
+    /// on backend `status` / `awaiting_reply_token` / `updated_at` without a
+    /// re-fetch.
+    State {
+        patch: crate::models::ConversationStatePatch,
+    },
 }
 
 /// Global side-channel for cross-client folder list sync. Mirrors
@@ -332,6 +337,30 @@ pub async fn emit_with_state(
     emit_with_state_gated(state, emitter, payload, |_| true).await;
 }
 
+/// Estimate serialized byte size of a desktop ACP payload for metrics only.
+///
+/// On failure, logs the error (no payload contents) and bumps
+/// `desktop_serialization_failure_count`, returning 0.
+///
+/// Compiled for the Tauri desktop emit path and for unit tests; server-only
+/// builds do not take the desktop leg and omit this helper.
+#[cfg(any(test, feature = "tauri-runtime"))]
+pub(crate) fn estimate_desktop_payload_bytes<T: Serialize>(
+    payload: &T,
+    metrics: &EventBusMetrics,
+) -> usize {
+    match serde_json::to_vec(payload) {
+        Ok(value) => value.len(),
+        Err(error) => {
+            tracing::error!("[ACP] desktop envelope size serialization failed: {error}");
+            metrics
+                .desktop_serialization_failure_count
+                .fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
 /// Like [`emit_with_state`], but a `gate` predicate — evaluated under the SAME
 /// write lock, BEFORE `apply_event` — can veto the emit: returning `false`
 /// aborts with no mutation, no seq bump, no broadcast, and returns `false`.
@@ -351,25 +380,31 @@ pub async fn emit_with_state_gated<F>(
 where
     F: FnOnce(&SessionState) -> bool,
 {
-    let (envelope_arc, stream, evicted) = {
+    let (envelope_arc, completion, stream, evicted) = {
         let mut s = state.write().await;
         if !gate(&s) {
             return false;
         }
-        s.apply_event(&payload);
+        // Capture optional completion under the same write lock that mutates
+        // SessionState, then build exactly one public envelope for all
+        // transport/replay paths. Only the internal bus retains the sidecar.
+        let completion = match (&payload, s.apply_event(&payload)) {
+            (AcpEvent::TurnComplete { .. }, Some(snapshot)) => Some(Arc::new(snapshot)),
+            _ => None,
+        };
         s.event_seq += 1;
-        let envelope = Arc::new(EventEnvelope {
+        let public = Arc::new(EventEnvelope {
             seq: s.event_seq,
             connection_id: s.connection_id.clone(),
             payload,
         });
-        let evicted = s.push_recent_event(Arc::clone(&envelope));
-        (envelope, s.event_stream(), evicted)
+        let evicted = s.push_recent_event(Arc::clone(&public));
+        (public, completion, s.event_stream(), evicted)
     };
 
     // Per-connection broadcaster — primary delivery path for web/remote-
     // desktop transports (they use Subscribe-with-Snapshot attach for ACP
-    // events).
+    // events). Public envelope only — never the completion sidecar.
     stream.send(Arc::clone(&envelope_arc));
 
     // In-process consumers (lifecycle, pet, chat-channel). Typed envelope —
@@ -378,62 +413,76 @@ where
     match emitter {
         #[cfg(feature = "tauri-runtime")]
         EventEmitter::Tauri(app) => {
-            use tauri::{Emitter, Manager};
-            // Tauri webview listener is the desktop frontend's only ACP path
-            // (it subscribes via `app.listen`, not the WS attach protocol).
-            let _ = app.emit("acp://event", envelope_arc.as_ref());
+            use tauri::Manager;
+            // In-process consumers first so lifecycle / pet / chat-channel keep
+            // immediate per-envelope delivery even when the desktop queue
+            // applies backpressure on the awaited delivery branch below.
             if let Some(bus) = app.try_state::<Arc<InternalEventBus>>() {
-                bus.send(Arc::clone(&envelope_arc));
+                bus.send_with_completion(Arc::clone(&envelope_arc), completion);
                 if evicted > 0 {
                     bus.metrics()
                         .ring_buffer_evict_count
                         .fetch_add(evicted as u64, Ordering::Relaxed);
                 }
             }
+
+            // Tauri webview listener is the desktop frontend's only ACP path
+            // (it subscribes via `app.listen`, not the WS attach protocol).
+            // Desktop delivery counters are scoped to this arm only — WebOnly
+            // and Noop must not report desktop traffic.
+            let estimated_bytes = emitter
+                .metrics()
+                .map(|metrics| {
+                    estimate_desktop_payload_bytes(envelope_arc.as_ref(), metrics.as_ref())
+                })
+                .unwrap_or_default();
+
+            // Offer is recorded exactly once here — never again inside
+            // DesktopAcpDelivery::deliver or emit_legacy.
+            if let Some(metrics) = emitter.metrics() {
+                metrics.record_desktop_offer(estimated_bytes);
+            }
+
+            if let Some(delivery) = app.try_state::<Arc<DesktopAcpDelivery>>() {
+                if let Err(error) = delivery
+                    .deliver(Arc::clone(&envelope_arc), estimated_bytes)
+                    .await
+                {
+                    tracing::error!("[ACP] desktop delivery stopped: {error}");
+                }
+            } else {
+                desktop_event_batcher::emit_legacy(app, envelope_arc.as_ref(), emitter.metrics());
+            }
         }
         EventEmitter::WebOnly { bus, .. } => {
-            bus.send(Arc::clone(&envelope_arc));
+            bus.send_with_completion(Arc::clone(&envelope_arc), completion);
             if evicted > 0 {
                 bus.metrics()
                     .ring_buffer_evict_count
                     .fetch_add(evicted as u64, Ordering::Relaxed);
             }
         }
+        // Noop still publishes the ordinary public envelope to the private
+        // connection stream (above) but sends neither internal-bus nor
+        // transport delivery.
         EventEmitter::Noop => {}
     }
 
-    // Bridge conversation status transitions onto the global
-    // `conversation://changed` side-channel so clients NOT attached to this
-    // connection (only showing the sidebar, or a different browser entirely)
-    // still observe running-state changes live — the per-connection delivery
-    // above only reaches attached clients. One central hook here covers every
-    // `ConversationStatusChanged` emit site (manager + lifecycle). `status`
-    // serializes to the same snake_case string the DB stores (e.g.
-    // "in_progress"), matching `DbConversationSummary.status`.
-    if let AcpEvent::ConversationStatusChanged {
-        conversation_id,
-        status,
-    } = &envelope_arc.payload
-    {
-        if let Ok(serde_json::Value::String(status_str)) = serde_json::to_value(status) {
-            emit_event(
-                emitter,
-                CONVERSATION_CHANGED_EVENT,
-                ConversationChange::Status {
-                    id: *conversation_id,
-                    status: status_str,
-                },
-            );
-        }
-    }
+    // Intentionally no global conversation://changed bridge here.
+    // Status owners emit ConversationChange::State with the exact backend
+    // ConversationStatePatch after a successful DB write (see
+    // emit_conversation_state). Per-connection ACP delivery above is unchanged.
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_state::ActiveTurnContext;
     use crate::db::entities::conversation::ConversationStatus;
+    use crate::models::system::AppLocale;
     use crate::models::AgentType;
+    use serde::Serializer;
 
     fn fresh_state() -> Arc<RwLock<SessionState>> {
         Arc::new(RwLock::new(SessionState::new(
@@ -445,11 +494,246 @@ mod tests {
         )))
     }
 
+    /// Real SessionState + private stream + InternalEventBus fixture for
+    /// event-owned completion sidecar tests.
+    struct CompletionFixture {
+        state: Arc<RwLock<SessionState>>,
+        emitter: EventEmitter,
+        bus: Arc<InternalEventBus>,
+    }
+
+    async fn completion_fixture() -> CompletionFixture {
+        let mut session = SessionState::new(
+            "conn-sidecar".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "win-sidecar".to_string(),
+            None,
+        );
+        session.conversation_id = Some(42);
+        let state = Arc::new(RwLock::new(session));
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::web_only(broadcaster, Arc::clone(&bus));
+        CompletionFixture {
+            state,
+            emitter,
+            bus,
+        }
+    }
+
+    impl CompletionFixture {
+        async fn private_stream(&self) -> tokio::sync::broadcast::Receiver<Arc<EventEnvelope>> {
+            self.state.read().await.event_stream().subscribe()
+        }
+
+        async fn emit_end_turn(&self, text: &str, token: &str, locale: AppLocale) {
+            {
+                let mut s = self.state.write().await;
+                s.active_turn = Some(ActiveTurnContext {
+                    token: token.to_string(),
+                    locale,
+                });
+                s.effective_locale = locale;
+            }
+            emit_with_state(
+                &self.state,
+                &self.emitter,
+                AcpEvent::ContentDelta {
+                    text: text.to_string(),
+                },
+            )
+            .await;
+            emit_with_state(
+                &self.state,
+                &self.emitter,
+                AcpEvent::TurnComplete {
+                    session_id: "sess-1".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                    mark_awaiting_reply: false,
+                },
+            )
+            .await;
+        }
+
+        async fn overwrite_live_state(&self, text: &str, token: &str, locale: AppLocale) {
+            let mut s = self.state.write().await;
+            s.last_assistant_text = Some(text.to_string());
+            s.active_turn = Some(ActiveTurnContext {
+                token: token.to_string(),
+                locale,
+            });
+            s.effective_locale = locale;
+        }
+    }
+
     #[tokio::test]
-    async fn emit_with_state_bridges_status_change_to_global_channel() {
-        // A ConversationStatusChanged ACP event must ALSO surface on the global
-        // `conversation://changed` channel so clients NOT attached to this
-        // connection (e.g. only viewing the sidebar) still observe the flip.
+    async fn completion_sidecar_is_internal_only_and_event_owned() {
+        let fixture = completion_fixture().await;
+        let mut stream = fixture.private_stream().await;
+        let mut bus = fixture.bus.subscribe();
+        fixture
+            .emit_end_turn("first answer", "token-1", AppLocale::Fr)
+            .await;
+        fixture
+            .overwrite_live_state("second answer", "token-2", AppLocale::Ja)
+            .await;
+
+        // Drain content delta then take TurnComplete.
+        let _delta = stream.recv().await.expect("public delta");
+        let public = stream.recv().await.expect("public event");
+        let _bus_delta = bus.recv().await.expect("internal delta");
+        let internal = bus.recv().await.expect("internal event");
+        assert_eq!(
+            internal.completion.as_ref().expect("sidecar").turn_token,
+            "token-1"
+        );
+        assert_eq!(
+            internal
+                .completion
+                .as_ref()
+                .expect("sidecar")
+                .final_text
+                .as_ref(),
+            "first answer"
+        );
+        assert_eq!(internal.event.seq, public.seq);
+        assert!(!serde_json::to_string(&public)
+            .expect("json")
+            .contains("token-1"));
+        assert!(!serde_json::to_string(&internal.event)
+            .expect("json")
+            .contains("token-1"));
+    }
+
+    #[tokio::test]
+    async fn two_queued_completions_keep_distinct_sidecars() {
+        let fixture = completion_fixture().await;
+        let mut bus = fixture.bus.subscribe();
+        fixture
+            .emit_end_turn("answer-one", "token-a", AppLocale::En)
+            .await;
+        fixture
+            .emit_end_turn("answer-two", "token-b", AppLocale::ZhCn)
+            .await;
+
+        // ContentDelta + TurnComplete for each turn.
+        let mut completions = Vec::new();
+        for _ in 0..4 {
+            let internal = bus.recv().await.expect("internal event");
+            if let Some(snap) = internal.completion.as_ref() {
+                completions.push((
+                    snap.turn_token.clone(),
+                    snap.final_text.as_ref().to_string(),
+                    snap.locale,
+                ));
+            }
+        }
+        assert_eq!(
+            completions,
+            vec![
+                ("token-a".into(), "answer-one".into(), AppLocale::En),
+                ("token-b".into(), "answer-two".into(), AppLocale::ZhCn),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_sidecar_never_enters_recent_event_replay() {
+        let fixture = completion_fixture().await;
+        fixture
+            .emit_end_turn("replay answer", "token-replay", AppLocale::De)
+            .await;
+
+        let recent = fixture
+            .state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("ring has events");
+        assert!(!recent.is_empty());
+        for envelope in &recent {
+            let json = serde_json::to_string(envelope).expect("json");
+            assert!(
+                !json.contains("token-replay"),
+                "replay ring must not carry completion token: {json}"
+            );
+            assert!(
+                !json.contains("final_text") && !json.contains("turn_token"),
+                "replay ring must not carry completion sidecar fields: {json}"
+            );
+            // Public envelope shape only — no InternalEventEnvelope wrapper keys.
+            let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+            assert!(value.get("completion").is_none());
+            assert!(value.get("event").is_none());
+        }
+    }
+
+    #[cfg(any(test, feature = "tauri-runtime"))]
+    #[test]
+    fn serialization_failure_is_counted_without_payload_logging() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(serde::ser::Error::custom("injected"))
+            }
+        }
+        let metrics = EventBusMetrics::default();
+        assert_eq!(estimate_desktop_payload_bytes(&Fails, &metrics), 0);
+        assert_eq!(
+            metrics
+                .desktop_serialization_failure_count
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webonly_emit_does_not_increment_desktop_metrics() {
+        let state = fresh_state();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(Arc::clone(&metrics)));
+        let emitter = EventEmitter::web_only(broadcaster, bus);
+
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ContentDelta {
+                text: "hello".to_string(),
+            },
+        )
+        .await;
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.desktop_raw_envelope_count, 0);
+        assert_eq!(snap.desktop_raw_bytes, 0);
+        assert_eq!(snap.desktop_emit_attempt_count, 0);
+        assert_eq!(snap.desktop_serialization_failure_count, 0);
+        assert_eq!(snap.desktop_emit_failure_count, 0);
+        assert_eq!(snap.desktop_legacy_emit_count, 0);
+        assert_eq!(snap.desktop_batch_count, 0);
+        assert_eq!(snap.desktop_batch_event_count, 0);
+        assert_eq!(snap.desktop_batch_bytes, 0);
+        assert_eq!(snap.desktop_batch_max_events, 0);
+        assert_eq!(snap.desktop_batch_max_bytes, 0);
+        assert_eq!(snap.desktop_batch_latency_total_us, 0);
+        assert_eq!(snap.desktop_batch_latency_max_us, 0);
+        assert_eq!(snap.desktop_queue_full_count, 0);
+        assert_eq!(snap.desktop_startup_fallback_count, 0);
+        assert_eq!(snap.desktop_runtime_failure_count, 0);
+    }
+
+    #[tokio::test]
+    async fn conversation_status_changed_does_not_bridge_globally() {
+        // Per-connection ConversationStatusChanged must NOT auto-bridge onto
+        // conversation://changed; status owners emit ConversationChange::State
+        // explicitly with the backend patch after a successful DB write.
         let state = fresh_state();
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let mut rx = broadcaster.subscribe();
@@ -465,20 +749,16 @@ mod tests {
         )
         .await;
 
-        let evt = rx
-            .try_recv()
-            .expect("status change should bridge to the global channel");
-        let p = &*evt.payload;
-        assert_eq!(evt.channel, CONVERSATION_CHANGED_EVENT);
-        assert_eq!(p["kind"], "status");
-        assert_eq!(p["id"], 7);
-        assert_eq!(p["status"], "pending_review");
+        assert!(
+            rx.try_recv().is_err(),
+            "ConversationStatusChanged must not emit on conversation://changed"
+        );
     }
 
     #[tokio::test]
     async fn emit_with_state_non_status_event_does_not_touch_global_channel() {
         // High-frequency stream events (deltas, etc.) must NOT spam the global
-        // sidebar channel — only status transitions bridge.
+        // sidebar channel. Status transitions also do not auto-bridge.
         let state = fresh_state();
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let mut rx = broadcaster.subscribe();
@@ -549,6 +829,7 @@ mod tests {
                     path: "/home/me/repo".to_string(),
                     git_branch: Some("main".to_string()),
                     default_agent_type: None,
+                    last_agent_type: None,
                     last_opened_at: chrono::Utc::now(),
                     sort_order: 0,
                     color: "inherit".to_string(),

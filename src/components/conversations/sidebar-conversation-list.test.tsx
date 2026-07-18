@@ -4,9 +4,10 @@ import {
   type Ref,
   useEffect,
   useImperativeHandle,
+  useRef,
   useState,
 } from "react"
-import { act, fireEvent, render } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -77,6 +78,27 @@ const stableTerminal = vi.hoisted(() => ({
   createTerminalInDirectory: () => {},
 }))
 
+// Task 8: capture the animation-hook wiring without running WAAPI. The spy is
+// the contract the Virtua onScroll path must call before sticky coalescing.
+const reorderAnimationCtl = vi.hoisted(() => ({
+  handleUserScroll: vi.fn(),
+  lastOptions: null as null | {
+    rows: unknown
+    activitySequence: number
+    activityConversationId: number | null
+    viewportEl: HTMLElement | null
+    dragging: boolean
+  },
+}))
+
+// Hangable children fetch so an expanded root can keep its loading placeholder
+// long enough for ownership metadata assertions.
+const apiMocks = vi.hoisted(() => ({
+  listChildConversations: vi.fn(
+    async (): Promise<DbConversationSummary[]> => []
+  ),
+}))
+
 vi.mock("@/components/agent-icon", () => ({
   AgentIcon: () => {
     probes.card++
@@ -90,6 +112,10 @@ const virtuaCtl = vi.hoisted(() => ({
   scrollOffset: 0,
   onScroll: null as ((offset: number) => void) | null,
   scrollToIndex: vi.fn(),
+  lastProps: null as null | {
+    itemSize?: number
+    bufferSize?: number
+  },
 }))
 
 // Render EVERY row (data.map) rather than only a window, so the render-count
@@ -104,13 +130,18 @@ vi.mock("virtua", () => ({
     children,
     onScroll,
     ref,
+    itemSize,
+    bufferSize,
   }: {
     data: unknown[]
     children: (row: unknown, index: number) => ReactNode
     onScroll?: (offset: number) => void
     ref?: Ref<unknown>
+    itemSize?: number
+    bufferSize?: number
   }) => {
     virtuaCtl.onScroll = onScroll ?? null
+    virtuaCtl.lastProps = { itemSize, bufferSize }
     useImperativeHandle(ref, () => ({
       get scrollOffset() {
         return virtuaCtl.scrollOffset
@@ -153,7 +184,8 @@ vi.mock("lucide-react", async (importOriginal) => {
 })
 
 // The list mounts the Virtualizer only once OverlayScrollbars surfaces its
-// viewport; the mock fires that bridge synchronously after mount.
+// viewport; the mock forwards a real mounted element (not a detached node) so
+// the animation hook receives a queryable container for [data-sidebar-row-key].
 vi.mock("@/components/ui/scroll-area", () => ({
   ScrollArea: ({
     children,
@@ -162,12 +194,41 @@ vi.mock("@/components/ui/scroll-area", () => ({
     children?: ReactNode
     onViewportRef?: (el: HTMLElement | null) => void
   }) => {
+    const viewportLocalRef = useRef<HTMLDivElement | null>(null)
     useEffect(() => {
-      onViewportRef?.(document.createElement("div"))
+      onViewportRef?.(viewportLocalRef.current)
+      return () => onViewportRef?.(null)
     }, [onViewportRef])
-    return <>{children}</>
+    return (
+      <div ref={viewportLocalRef} data-testid="sidebar-scroll-viewport">
+        {children}
+      </div>
+    )
   },
 }))
+
+vi.mock("./use-sidebar-reorder-animation", () => ({
+  useSidebarReorderAnimation: (options: {
+    rows: unknown
+    activitySequence: number
+    activityConversationId: number | null
+    viewportEl: HTMLElement | null
+    dragging: boolean
+  }) => {
+    reorderAnimationCtl.lastOptions = options
+    return { handleUserScroll: reorderAnimationCtl.handleUserScroll }
+  },
+}))
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    listChildConversations: (
+      ...args: Parameters<typeof actual.listChildConversations>
+    ) => apiMocks.listChildConversations(...args),
+  }
+})
 
 vi.mock("next-themes", () => ({
   useTheme: () => ({ resolvedTheme: "light" }),
@@ -256,6 +317,7 @@ function conv(
     title_locked: false,
     agent_type: "claude_code",
     status: "pending",
+    awaiting_reply_token: null,
     kind: "regular",
     model: null,
     git_branch: null,
@@ -280,6 +342,7 @@ function folder(
     path: `/p/${id}`,
     color: "blue",
     default_agent_type: null,
+    last_agent_type: null,
     parent_id: parentId,
   } as unknown as FolderDetail
 }
@@ -294,7 +357,7 @@ function Harness() {
   useEffect(() => {
     harness.rerender = () => setTick((n) => n + 1)
   }, [])
-  return <SidebarConversationList showCompleted sortMode="created" />
+  return <SidebarConversationList showCompleted />
 }
 
 function tree() {
@@ -321,6 +384,10 @@ beforeEach(() => {
   virtuaCtl.scrollOffset = 0
   virtuaCtl.onScroll = null
   virtuaCtl.scrollToIndex.mockClear()
+  reorderAnimationCtl.handleUserScroll.mockClear()
+  reorderAnimationCtl.lastOptions = null
+  apiMocks.listChildConversations.mockReset()
+  apiMocks.listChildConversations.mockResolvedValue([])
 })
 
 describe("SidebarConversationList — single status event re-render scope", () => {
@@ -748,7 +815,7 @@ describe("SidebarConversationList — scrollToActive across a worktree merge", (
     const ref = createRef<SidebarConversationListHandle>()
     render(
       <NextIntlClientProvider locale="en" messages={enMessages}>
-        <SidebarConversationList showCompleted sortMode="created" ref={ref} />
+        <SidebarConversationList showCompleted ref={ref} />
       </NextIntlClientProvider>
     )
 
@@ -797,5 +864,263 @@ describe("SidebarConversationList — folder ⋯ opens the same menu as right-cl
 
     // The identical menu is now open — assert a label unique to the folder menu.
     expect(document.body.textContent).toContain("Manage conversations")
+  })
+})
+
+describe("SidebarConversationList — activity order and optimistic labels", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+    probes.card = 0
+    probes.folder = 0
+    const folders = [folder(1, "Folder 1")]
+    // created_at and updated_at disagree: conv-11 is newer by created_at, but
+    // conv-12 is newer by updated_at. Order and labels must follow activity.
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [
+        conv(11, 1, {
+          created_at: new Date(FIXED - 1 * MINUTE).toISOString(),
+          updated_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+        }),
+        conv(12, 1, {
+          created_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+          updated_at: new Date(FIXED - 5 * MINUTE).toISOString(),
+        }),
+      ],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("orders by updated activity when created_at would reverse the order", () => {
+    render(tree())
+    const text = document.body.textContent ?? ""
+    // conv-12 has the more recent updated_at → must render above conv-11.
+    expect(text.indexOf("conv-12")).toBeLessThan(text.indexOf("conv-11"))
+    expect(text).toContain("5m")
+  })
+
+  it("promotes a real optimistic activity and labels it now", () => {
+    // Seed id 12 with an older authoritative updated_at so promotion comes from
+    // the optimistic overlay, not the initial data order.
+    const folders = [folder(1, "Folder 1")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [
+        conv(11, 1, {
+          updated_at: new Date(FIXED - 5 * MINUTE).toISOString(),
+        }),
+        conv(12, 1, {
+          updated_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+        }),
+      ],
+    })
+
+    render(tree())
+    const before = document.body.textContent ?? ""
+    expect(before.indexOf("conv-12")).toBeGreaterThan(before.indexOf("conv-11"))
+
+    act(() => {
+      useAppWorkspaceStore.getState().beginConversationActivity(12)
+    })
+
+    const after = document.body.textContent ?? ""
+    expect(after.indexOf("conv-12")).toBeLessThan(after.indexOf("conv-11"))
+    const row = document.querySelector('[data-conversation-id="12"]')
+    expect(row?.textContent).toContain("now")
+  })
+})
+
+describe("SidebarConversationList — Virtua animation integration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+    probes.card = 0
+    probes.folder = 0
+    const folders = [folder(1, "Folder 1")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [conv(11, 1), conv(12, 1)],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it("passes a real mounted OverlayScrollbars viewport into the animation hook", () => {
+    render(tree())
+
+    const viewport = screen.getByTestId("sidebar-scroll-viewport")
+    expect(viewport).toBeInstanceOf(HTMLElement)
+    // Rows must live under the mounted viewport (not a detached createElement).
+    expect(
+      viewport.querySelector('[data-sidebar-row-key="conv-claude_code-11"]')
+    ).not.toBeNull()
+    expect(reorderAnimationCtl.lastOptions?.viewportEl).toBe(viewport)
+    expect(reorderAnimationCtl.lastOptions?.dragging).toBe(false)
+  })
+
+  it("configures Virtualizer with itemSize 32 and bufferSize 400", () => {
+    render(tree())
+    expect(virtuaCtl.lastProps).toEqual({ itemSize: 32, bufferSize: 400 })
+  })
+
+  it("forwards dragging=true into the animation hook while a folder drag is active", () => {
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        top: 0,
+        bottom: 600,
+        left: 0,
+        right: 200,
+        width: 200,
+        height: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect)
+    try {
+      render(tree())
+      expect(reorderAnimationCtl.lastOptions?.dragging).toBe(false)
+
+      const grip = (
+        document.querySelector('[data-folder-id="1"]') as HTMLElement
+      ).parentElement as HTMLElement
+      act(() => firePointer(grip, "pointerdown", { clientY: 100 }))
+      act(() => firePointer(window, "pointermove", { clientY: 120 }))
+
+      // While dragging, Virtualizer unmounts but the hook still receives
+      // dragging=true so active waves cancel/rebase without animating.
+      expect(reorderAnimationCtl.lastOptions?.dragging).toBe(true)
+
+      act(() => firePointer(window, "pointercancel", { clientY: 120 }))
+    } finally {
+      rectSpy.mockRestore()
+    }
+  })
+
+  it("puts stable ownership metadata on conversation Virtua child wrappers", () => {
+    render(tree())
+
+    expect(
+      document.querySelector('[data-sidebar-row-key="conv-claude_code-11"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "11",
+        sidebarBucketKey: "folder:1",
+        conversationId: "11",
+      }),
+    })
+    expect(
+      document.querySelector('[data-sidebar-row-key="conv-claude_code-12"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "12",
+        sidebarBucketKey: "folder:1",
+        conversationId: "12",
+      }),
+    })
+  })
+
+  it("marks non-owned structural wrappers with a key but no root/bucket/conversation ownership", () => {
+    render(tree())
+
+    const section = document.querySelector(
+      '[data-sidebar-row-key="section-folders"]'
+    ) as HTMLElement | null
+    expect(section).not.toBeNull()
+    expect(section?.dataset.sidebarRowKey).toBe("section-folders")
+    expect(section?.getAttribute("data-sidebar-root-id")).toBeNull()
+    expect(section?.getAttribute("data-sidebar-bucket-key")).toBeNull()
+    expect(section?.getAttribute("data-conversation-id")).toBeNull()
+
+    const folderRow = document.querySelector(
+      '[data-sidebar-row-key="folder-1"]'
+    ) as HTMLElement | null
+    expect(folderRow).not.toBeNull()
+    expect(folderRow?.dataset.sidebarRowKey).toBe("folder-1")
+    expect(folderRow?.getAttribute("data-sidebar-root-id")).toBeNull()
+    expect(folderRow?.getAttribute("data-sidebar-bucket-key")).toBeNull()
+    expect(folderRow?.getAttribute("data-conversation-id")).toBeNull()
+  })
+
+  it("marks subsession loading placeholders with the owning root metadata", async () => {
+    // Never resolves → loading placeholder stays mounted under the expanded root.
+    apiMocks.listChildConversations.mockImplementation(
+      () => new Promise(() => {})
+    )
+    useAppWorkspaceStore.setState({
+      conversations: [conv(11, 1, { child_count: 1 })],
+    })
+
+    render(tree())
+
+    const expand = screen.getByRole("button", {
+      name: "Expand sub-conversations",
+    })
+    await act(async () => {
+      fireEvent.click(expand)
+    })
+
+    expect(
+      document.querySelector('[data-sidebar-row-key="subloading-11"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "11",
+        sidebarBucketKey: "folder:1",
+      }),
+    })
+  })
+
+  it("calls handleUserScroll at the start of Virtua onScroll before sticky rAF", () => {
+    const order: string[] = []
+    reorderAnimationCtl.handleUserScroll.mockImplementation(() => {
+      order.push("handleUserScroll")
+    })
+    vi.stubGlobal("requestAnimationFrame", (() => {
+      order.push("stickyRaf")
+      return 1
+    }) as typeof requestAnimationFrame)
+
+    render(tree())
+    expect(virtuaCtl.onScroll).toEqual(expect.any(Function))
+
+    order.length = 0
+    act(() => {
+      virtuaCtl.onScroll?.(40)
+    })
+
+    expect(order[0]).toBe("handleUserScroll")
+    expect(order).toContain("stickyRaf")
+    expect(reorderAnimationCtl.handleUserScroll).toHaveBeenCalledTimes(1)
+  })
+
+  it("forwards activity sequence/id and live rows into the animation hook", () => {
+    render(tree())
+
+    act(() => {
+      useAppWorkspaceStore.getState().beginConversationActivity(12)
+    })
+    act(() => harness.rerender())
+
+    const state = useAppWorkspaceStore.getState()
+    expect(reorderAnimationCtl.lastOptions?.activitySequence).toBe(
+      state.conversationActivitySequence
+    )
+    expect(reorderAnimationCtl.lastOptions?.activityConversationId).toBe(12)
+    expect(Array.isArray(reorderAnimationCtl.lastOptions?.rows)).toBe(true)
+    expect(
+      (reorderAnimationCtl.lastOptions?.rows as unknown[]).length
+    ).toBeGreaterThan(0)
   })
 })

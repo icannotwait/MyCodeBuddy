@@ -10,8 +10,8 @@ use crate::models::{
 };
 
 use super::{
-    compute_session_stats, folder_name_from_path, title_from_user_text, truncate_str, visible_title,
-    visible_user_text, AgentParser, ParseError,
+    compute_session_stats, folder_name_from_path, title_from_user_text, truncate_str,
+    visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 // ---------------------------------------------------------------------------
@@ -757,6 +757,8 @@ earlier terminal context records.\n\
             .iter()
             .any(|text| text.contains("Selected shell:")));
         assert!(visible_user_texts.iter().any(|text| text == "real prompt"));
-        assert!(visible_user_texts.iter().any(|text| text.contains("partial")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
     }
 }

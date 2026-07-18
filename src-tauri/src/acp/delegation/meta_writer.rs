@@ -4,14 +4,17 @@
 //! follows the convention documented at
 //! [`crate::acp::session_state::ToolCallState::meta`].
 //!
-//! The broker calls this at three lifecycle points:
+//! The broker calls this at three lifecycle points (always **after** the
+//! durable store CAS in `settle_task` has elected a winner — losers must not
+//! write a second terminal meta):
 //!
-//! 1. After `send_prompt_linked_for_delegation` returns Ok — sets
-//!    `status: "running"` with the child's connection / conversation ids.
-//! 2. In `complete_call` — sets `status: "completed"` (ok branch) or
-//!    `status: "failed"` + `error_code` (err branch).
-//! 3. In `cancel_by_parent` / `cancel_by_child_connection` — sets
-//!    `status: "failed"` + `error_code: "canceled"`.
+//! 1. After accepted start publication — sets `status: "running"` with the
+//!    child's connection / conversation ids, authoritative timestamps, and
+//!    optional open attention / runtime snapshot.
+//! 2. On durable terminal win (completion) — sets `status: "completed"` (ok)
+//!    or `status: "failed"` + `error_code` (err) with final runtime stats.
+//! 3. On durable terminal win (cancel) — sets `status: "failed"` +
+//!    `error_code: "canceled"`.
 //!
 //! Writes are skipped when the broker is operating on a synthetic
 //! `parent_tool_use_id` (the `"delegation-*"` UUID fallback) because
@@ -19,8 +22,12 @@
 //! frontend's snapshot path will still recover via `parseInput(input)`.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::sync::Arc;
 
+use crate::acp::delegation::attention::AttentionRequestSummary;
+use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::AcpEvent;
 use crate::web::event_bridge::emit_with_state;
@@ -29,6 +36,30 @@ use crate::web::event_bridge::emit_with_state;
 /// `meta` object. Single source of truth — both the writer and the
 /// frontend reader must spell it the same way.
 pub const DELEGATION_META_KEY: &str = "codeg.delegation";
+
+/// Canonical typed snapshot for `meta["codeg.delegation"]` — one shape drives
+/// live broker writes and cold-load reconstruction.
+#[derive(Debug, Clone, Serialize)]
+pub struct DelegationMetaSnapshot {
+    pub status: String,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_connection_id: Option<String>,
+    pub child_conversation_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Optional only for pre-feature cold history. Every newly accepted live
+    /// task supplies it (never fabricate zero counts for historical nulls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_stats: Option<DelegationRuntimeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_request: Option<AttentionRequestSummary>,
+}
 
 /// Capability the broker uses to patch `meta["codeg.delegation"]` on
 /// the parent connection's active `delegate_to_agent` tool call.
@@ -159,67 +190,14 @@ pub mod mock {
     }
 }
 
-/// Helper to construct the canonical `meta["codeg.delegation"]` value.
-/// Keeps the schema in one place so the writer impls and the broker
-/// callsites can't drift apart on field naming.
-pub fn build_delegation_meta(
-    status: &str,
-    child_connection_id: Option<&str>,
-    child_conversation_id: Option<i32>,
-    error_code: Option<&str>,
-    text_preview: Option<&str>,
-    duration_ms: Option<u64>,
-) -> serde_json::Value {
-    let mut inner = serde_json::Map::new();
-    inner.insert(
-        "status".to_string(),
-        serde_json::Value::String(status.to_string()),
-    );
-    if let Some(id) = child_connection_id {
-        inner.insert(
-            "child_connection_id".to_string(),
-            serde_json::Value::String(id.to_string()),
-        );
-    }
-    if let Some(id) = child_conversation_id {
-        inner.insert(
-            "child_conversation_id".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(id)),
-        );
-    }
-    if let Some(code) = error_code {
-        inner.insert(
-            "error_code".to_string(),
-            serde_json::Value::String(code.to_string()),
-        );
-    }
-    // Inline result preview so a parent-side snapshot replay after a refresh can
-    // render the completed result without the live `delegation_completed` event
-    // (which carries the same preview). Only set on the terminal `completed`
-    // write; `None` everywhere else.
-    if let Some(preview) = text_preview {
-        inner.insert(
-            "text_preview".to_string(),
-            serde_json::Value::String(preview.to_string()),
-        );
-    }
-    // Carry the broker-measured elapsed time so a parent-side snapshot replay
-    // after a refresh shows the execution duration without the live
-    // `delegation_completed` event. Set on the terminal writes (completed /
-    // failed / canceled); `None` for the running write — same survival semantics
-    // as `text_preview` above. NOTE: the live event only carries duration on its
-    // `Ok` summary, so for failed/canceled the duration is meta-only (the live
-    // card shows none until refresh, when this meta supplies it).
-    if let Some(ms) = duration_ms {
-        inner.insert(
-            "duration_ms".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(ms)),
-        );
-    }
+/// Helper to construct the canonical `meta["codeg.delegation"]` value from
+/// the typed snapshot. Keeps the schema in one place so the writer impls,
+/// broker callsites, and cold-load reconstruction cannot drift.
+pub fn build_delegation_meta(snapshot: &DelegationMetaSnapshot) -> serde_json::Value {
     let mut outer = serde_json::Map::new();
     outer.insert(
         DELEGATION_META_KEY.to_string(),
-        serde_json::Value::Object(inner),
+        serde_json::to_value(snapshot).expect("delegation meta is serializable"),
     );
     serde_json::Value::Object(outer)
 }
@@ -236,11 +214,48 @@ pub fn is_synthetic_parent_tool_use_id(id: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn snap(
+        status: &str,
+        task_id: &str,
+        child_connection_id: Option<&str>,
+        child_conversation_id: i32,
+        error_code: Option<&str>,
+        runtime_stats: Option<DelegationRuntimeStats>,
+    ) -> DelegationMetaSnapshot {
+        DelegationMetaSnapshot {
+            status: status.into(),
+            task_id: task_id.into(),
+            child_connection_id: child_connection_id.map(str::to_string),
+            child_conversation_id,
+            error_code: error_code.map(str::to_string),
+            text_preview: None,
+            started_at: DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            finished_at: None,
+            runtime_stats,
+            attention_request: None,
+        }
+    }
+
     #[test]
     fn build_meta_includes_provided_fields() {
-        let v = build_delegation_meta("running", Some("conn-1"), Some(42), None, None, None);
+        let stats = DelegationRuntimeStats::empty(
+            DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let v = build_delegation_meta(&snap(
+            "running",
+            "task-1",
+            Some("conn-1"),
+            42,
+            None,
+            Some(stats),
+        ));
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
         assert_eq!(inner.get("status").unwrap().as_str().unwrap(), "running");
+        assert_eq!(inner.get("task_id").unwrap().as_str().unwrap(), "task-1");
         assert_eq!(
             inner.get("child_connection_id").unwrap().as_str().unwrap(),
             "conn-1"
@@ -254,13 +269,20 @@ mod tests {
             42
         );
         assert!(inner.get("error_code").is_none());
-        // No duration on the running write.
+        assert!(inner.get("runtime_stats").is_some());
         assert!(inner.get("duration_ms").is_none());
     }
 
     #[test]
     fn build_meta_with_error_code() {
-        let v = build_delegation_meta("failed", None, Some(7), Some("timeout"), None, None);
+        let v = build_delegation_meta(&snap(
+            "failed",
+            "task-7",
+            None,
+            7,
+            Some("timeout"),
+            None,
+        ));
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
         assert_eq!(inner.get("status").unwrap().as_str().unwrap(), "failed");
         assert_eq!(
@@ -268,13 +290,25 @@ mod tests {
             "timeout"
         );
         assert!(inner.get("child_connection_id").is_none());
+        assert!(
+            inner.get("runtime_stats").is_none(),
+            "pre-feature / absent stats must omit the field"
+        );
     }
 
     #[test]
-    fn build_meta_includes_duration_on_terminal_write() {
-        let v = build_delegation_meta("completed", Some("conn-1"), Some(42), None, None, Some(1234));
+    fn build_meta_serializes_finished_at_and_preview() {
+        let mut snapshot = snap("completed", "task-1", Some("conn-1"), 42, None, None);
+        snapshot.finished_at = Some(
+            DateTime::parse_from_rfc3339("2026-07-17T10:05:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        snapshot.text_preview = Some("done".into());
+        let v = build_delegation_meta(&snapshot);
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
-        assert_eq!(inner.get("duration_ms").unwrap().as_u64().unwrap(), 1234);
+        assert!(inner.get("finished_at").unwrap().is_string());
+        assert_eq!(inner.get("text_preview").unwrap().as_str().unwrap(), "done");
     }
 
     #[test]
