@@ -629,7 +629,8 @@ async fn handle_acp_envelope(
                         );
                     }
                 }
-                if let Err(e) = sender_context_service::clear_session(db, channel_id, &sender_id).await
+                if let Err(e) =
+                    sender_context_service::clear_session(db, channel_id, &sender_id).await
                 {
                     tracing::warn!("[SessionEventSub] failed to clear session after error: {e}");
                 }
