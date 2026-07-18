@@ -5076,6 +5076,14 @@ async fn run_conversation_loop<'a>(
                         .send_request_to(Agent, prompt_request)
                         .block_task(),
                 );
+                tracing::info!(
+                    connection_id = %conn_id,
+                    session_id = %sid.0,
+                    agent = %agent_type,
+                    mark_awaiting_reply,
+                    "[ACP] session/prompt sent; awaiting turn completion \
+                     (prompt_response | StopReason | extension turn_completed)"
+                );
                 let mut tracked_terminal_tool_calls: HashMap<String, TrackedTerminalToolCall> =
                     HashMap::new();
                 let mut terminal_poll_interval = tokio::time::interval(
@@ -5122,6 +5130,100 @@ async fn run_conversation_loop<'a>(
                                     let session_id = sid.clone();
                                     let cwd_opt = Some(cwd);
                                     let dispatch = fix_usage_update_nulls(dispatch);
+                                    // Grok `_x.ai/session/update` + turn_completed
+                                    // is not a typed SessionNotification — handle
+                                    // it before MatchDispatch so a stalled
+                                    // session/prompt RPC cannot leave the row
+                                    // stuck in `in_progress`.
+                                    if let Some(ext_reason) =
+                                        parse_extension_turn_completed(&dispatch)
+                                    {
+                                        let _ = merge_terminal_assoc_binds(
+                                            sid.0.as_ref(),
+                                            terminal_assoc.as_ref(),
+                                            &mut tracked_terminal_tool_calls,
+                                        );
+                                        if !tracked_terminal_tool_calls.is_empty() {
+                                            poll_tracked_terminal_tool_calls(
+                                                terminal_runtime.as_ref(),
+                                                &sid,
+                                                state,
+                                                emitter,
+                                                &mut tracked_terminal_tool_calls,
+                                            )
+                                            .await;
+                                        }
+                                        let mut reason_str = ext_reason;
+                                        if reason_str == "end_turn" && !turn_had_agent_output {
+                                            reason_str = "empty".into();
+                                        }
+                                        tracing::info!(
+                                            connection_id = %conn_id,
+                                            session_id = %sid.0,
+                                            agent = %agent_type,
+                                            stop_reason = %reason_str,
+                                            turn_had_agent_output,
+                                            source = "extension_turn_completed",
+                                            "[ACP] completing turn from extension \
+                                             turn_completed (prompt_response may still \
+                                             be pending; draining in background)"
+                                        );
+                                        if let Some(err_event) =
+                                            turn_failure_error_event(&reason_str, agent_type)
+                                        {
+                                            emit_with_state(state, emitter, err_event).await;
+                                        }
+                                        emit_with_state(
+                                            state,
+                                            emitter,
+                                            AcpEvent::TurnComplete {
+                                                session_id: sid.0.to_string(),
+                                                stop_reason: reason_str.clone(),
+                                                agent_type: agent_type.to_string(),
+                                                mark_awaiting_reply,
+                                            },
+                                        )
+                                        .await;
+                                        tracing::info!(
+                                            connection_id = %conn_id,
+                                            session_id = %sid.0,
+                                            stop_reason = %reason_str,
+                                            source = "extension_turn_completed",
+                                            "[ACP] TurnComplete emitted (state+bus+desktop path returned)"
+                                        );
+                                        if let Some(inj) = delegation_injection {
+                                            inj.broker
+                                                .cancel_by_parent_turn(
+                                                    conn_id,
+                                                    parent_turn_end_reason(&reason_str),
+                                                )
+                                                .await;
+                                        }
+                                        // Prompt RPC may still complete later;
+                                        // drain so sacp does not warn about a
+                                        // dropped receiver.
+                                        tokio::spawn(async move {
+                                            match prompt_response.await {
+                                                Ok(resp) => {
+                                                    tracing::info!(
+                                                        stop_reason = ?resp.stop_reason,
+                                                        "[ACP] drained late prompt_response \
+                                                         after extension turn_completed"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "[ACP] late prompt_response after \
+                                                         extension turn_completed failed \
+                                                         (benign if agent already closed \
+                                                         the turn)"
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        break;
+                                    }
                                     if let Err(e) = MatchDispatch::new(dispatch)
                                         .if_notification(
                                             async |notif: SessionNotification| {
@@ -5205,6 +5307,15 @@ async fn run_conversation_loop<'a>(
                                     } else {
                                         raw_reason_str
                                     };
+                                    tracing::info!(
+                                        connection_id = %conn_id,
+                                        session_id = %sid.0,
+                                        agent = %agent_type,
+                                        stop_reason = %reason_str,
+                                        turn_had_agent_output,
+                                        source = "stop_reason_message",
+                                        "[ACP] completing turn from SessionMessage::StopReason"
+                                    );
                                     if let Some(err_event) =
                                         turn_failure_error_event(reason_str, agent_type)
                                     {
@@ -5215,12 +5326,19 @@ async fn run_conversation_loop<'a>(
                                         emitter,
                                         AcpEvent::TurnComplete {
                                             session_id: sid.0.to_string(),
-                                            stop_reason: reason_str.into(),
+                                            stop_reason: reason_str.to_string(),
                                             agent_type: agent_type.to_string(),
                                             mark_awaiting_reply,
                                         },
                                     )
                                     .await;
+                                    tracing::info!(
+                                        connection_id = %conn_id,
+                                        session_id = %sid.0,
+                                        stop_reason = %reason_str,
+                                        source = "stop_reason_message",
+                                        "[ACP] TurnComplete emitted (state+bus+desktop path returned)"
+                                    );
                                     // Join-only ownership: every parent stop
                                     // reason (including clean `end_turn`) drains
                                     // live Codeg descendants under a stable root
@@ -5282,6 +5400,15 @@ async fn run_conversation_loop<'a>(
                             } else {
                                 raw_reason_str
                             };
+                            tracing::info!(
+                                connection_id = %conn_id,
+                                session_id = %sid.0,
+                                agent = %agent_type,
+                                stop_reason = %reason_str,
+                                turn_had_agent_output,
+                                source = "prompt_response",
+                                "[ACP] completing turn from session/prompt response"
+                            );
                             if let Some(err_event) =
                                 turn_failure_error_event(reason_str, agent_type)
                             {
@@ -5292,12 +5419,23 @@ async fn run_conversation_loop<'a>(
                                 emitter,
                                 AcpEvent::TurnComplete {
                                     session_id: sid.0.to_string(),
-                                    stop_reason: reason_str.into(),
+                                    stop_reason: reason_str.to_string(),
                                     agent_type: agent_type.to_string(),
                                     mark_awaiting_reply,
                                 },
                             )
                             .await;
+                            // If this line never appears after "completing turn",
+                            // emit_with_state hung (SessionState write lock or
+                            // desktop delivery) before the lifecycle bus publish
+                            // finished — the row will stay in_progress.
+                            tracing::info!(
+                                connection_id = %conn_id,
+                                session_id = %sid.0,
+                                stop_reason = %reason_str,
+                                source = "prompt_response",
+                                "[ACP] TurnComplete emitted (state+bus+desktop path returned)"
+                            );
                             // Mirror the StopReason-message branch above:
                             // join-only ownership drains live Codeg children
                             // on every stop reason (including clean end_turn).
@@ -6465,6 +6603,66 @@ async fn maybe_emit_claude_sdk_ext_notification(
         return false;
     }
     false
+}
+
+/// Grok (and potentially other hosts) emit turn completion as an extension
+/// session notification rather than only via the `session/prompt` response:
+///
+/// ```text
+/// method: "_x.ai/session/update" | "session/update"
+/// update.sessionUpdate: "turn_completed"
+/// update.stop_reason: "end_turn" | ...
+/// ```
+///
+/// Historically the live ACP loop ignored this and waited only on
+/// `prompt_response` / [`SessionMessage::StopReason`]. When the RPC response
+/// stalls after the agent has already finished, the conversation row stays
+/// `in_progress` forever even though the full answer streamed. Treat the
+/// extension notification as a first-class turn-completion signal.
+fn parse_extension_turn_completed(dispatch: &Dispatch) -> Option<String> {
+    let Dispatch::Notification(notification) = dispatch else {
+        return None;
+    };
+    parse_extension_turn_completed_notification(notification)
+}
+
+fn parse_extension_turn_completed_notification(
+    notification: &UntypedMessage,
+) -> Option<String> {
+    let method = notification.method();
+    if method != "_x.ai/session/update" && method != "session/update" {
+        return None;
+    }
+    let update = notification.params().get("update")?;
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("turn_completed") {
+        return None;
+    }
+    let raw = update
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("end_turn");
+    Some(normalize_extension_stop_reason(raw))
+}
+
+/// Normalize host-provided stop_reason strings to the stable lowercase set
+/// consumed by lifecycle (`end_turn` / `cancelled` / …).
+fn normalize_extension_stop_reason(raw: &str) -> String {
+    match raw {
+        "end_turn" | "cancelled" | "refusal" | "max_tokens" | "max_turn_requests"
+        | "empty" | "unknown" => raw.to_string(),
+        "EndTurn" => "end_turn".into(),
+        "Cancelled" | "canceled" | "Canceled" => "cancelled".into(),
+        "Refusal" => "refusal".into(),
+        "MaxTokens" => "max_tokens".into(),
+        "MaxTurnRequests" => "max_turn_requests".into(),
+        other => {
+            tracing::warn!(
+                stop_reason = %other,
+                "[ACP] unknown extension turn_completed stop_reason; treating as end_turn"
+            );
+            "end_turn".into()
+        }
+    }
 }
 
 /// Fix null fields in `usage_update` notifications that would otherwise fail deserialization.
@@ -8277,6 +8475,81 @@ mod tests {
             }
             _ => panic!("expected ClaudeSdkMessage"),
         }
+    }
+
+    #[test]
+    fn parse_extension_turn_completed_accepts_grok_xai_method() {
+        let notif = UntypedMessage::new(
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionId": "019f74ba-af84-7a11-afd4-d7685a9a599d",
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "prompt_id": "b1d064c3-39df-4885-8d0a-cc52fa26d75a",
+                    "stop_reason": "end_turn"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_extension_turn_completed_notification(&notif).as_deref(),
+            Some("end_turn")
+        );
+        let dispatch = Dispatch::Notification(notif);
+        assert_eq!(
+            parse_extension_turn_completed(&dispatch).as_deref(),
+            Some("end_turn")
+        );
+    }
+
+    #[test]
+    fn parse_extension_turn_completed_accepts_session_update_method() {
+        let notif = UntypedMessage::new(
+            "session/update",
+            serde_json::json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "stop_reason": "max_tokens"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_extension_turn_completed_notification(&notif).as_deref(),
+            Some("max_tokens")
+        );
+    }
+
+    #[test]
+    fn parse_extension_turn_completed_ignores_other_updates() {
+        let notif = UntypedMessage::new(
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "hi"}
+                }
+            }),
+        )
+        .unwrap();
+        assert!(parse_extension_turn_completed_notification(&notif).is_none());
+        assert!(parse_extension_turn_completed_notification(
+            &UntypedMessage::new("_x.ai/sessions/changed", serde_json::json!({})).unwrap()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn normalize_extension_stop_reason_maps_pascal_case() {
+        assert_eq!(normalize_extension_stop_reason("EndTurn"), "end_turn");
+        assert_eq!(normalize_extension_stop_reason("Cancelled"), "cancelled");
+        assert_eq!(normalize_extension_stop_reason("canceled"), "cancelled");
+        assert_eq!(
+            normalize_extension_stop_reason("totally_unknown_reason"),
+            "end_turn"
+        );
     }
 
     #[test]

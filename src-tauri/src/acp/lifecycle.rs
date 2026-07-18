@@ -228,13 +228,36 @@ async fn handle_turn_complete_internal(
     };
 
     let Some(cid) = conversation_id else {
+        tracing::warn!(
+            connection_id = %connection_id,
+            stop_reason = %stop_reason,
+            has_completion_sidecar = completion.is_some(),
+            live_state_present = live.is_some(),
+            "[lifecycle] TurnComplete skipped: no conversation_id bound \
+             (row will stay in_progress if still InProgress)"
+        );
         return Ok(());
     };
+
+    tracing::info!(
+        connection_id = %connection_id,
+        conversation_id = cid,
+        stop_reason = %stop_reason,
+        mark_awaiting_reply,
+        has_completion_sidecar = completion.is_some(),
+        "[lifecycle] handling TurnComplete"
+    );
 
     match conversation_is_delegate(db_conn, cid).await {
         Ok(true) => {
             // Delegate ConversationStatus is broker-owned, but auto-title jobs
             // still advance on usable completions from the event-owned sidecar.
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                "[lifecycle] TurnComplete on delegate row; broker owns status CAS"
+            );
             if let Some(snapshot) = completion.as_ref() {
                 let txn = db_conn.begin().await?;
                 let transition =
@@ -300,7 +323,16 @@ async fn handle_turn_complete_internal(
             )
             .await?
         }
-        _ => None,
+        _ => {
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                "[lifecycle] TurnComplete stop_reason has no status CAS \
+                 (e.g. cancelled already written by manager.cancel)"
+            );
+            None
+        }
     };
     let mut became_ready = false;
     if let Some(snapshot) = completion.as_ref() {
@@ -313,23 +345,55 @@ async fn handle_turn_complete_internal(
         crate::auto_title::notify_live_coordinator_ready();
     }
 
+    match &cas_patch {
+        Some(patch) => {
+            tracing::info!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                new_status = %patch.status,
+                became_ready,
+                "[lifecycle] TurnComplete status CAS won"
+            );
+        }
+        None => {
+            tracing::warn!(
+                connection_id = %connection_id,
+                conversation_id = cid,
+                stop_reason = %stop_reason,
+                became_ready,
+                "[lifecycle] TurnComplete status CAS lost or no-op \
+                 (row may already be terminal / not in_progress)"
+            );
+        }
+    }
+
     if let Some(patch) = cas_patch {
         let status = if stop_reason == "end_turn" {
             ConversationStatus::PendingReview
         } else {
             ConversationStatus::Cancelled
         };
+        // DB status is already committed. Fan-out to SessionState + desktop
+        // must not stall this worker — a hung `app.emit` / delivery path would
+        // leave later TurnCompletes sitting in the per-connection mailbox and
+        // strand the row at `in_progress` (seen on Grok multi-turn sessions).
         if let Some((state_arc, emitter)) = live.as_ref() {
-            emit_with_state(
-                state_arc,
-                emitter,
-                AcpEvent::ConversationStatusChanged {
-                    conversation_id: cid,
-                    status,
-                },
-            )
-            .await;
-            crate::commands::conversations::emit_conversation_state(emitter, patch);
+            let state_arc = Arc::clone(state_arc);
+            let emitter = emitter.clone();
+            let patch = patch.clone();
+            tokio::spawn(async move {
+                emit_with_state(
+                    &state_arc,
+                    &emitter,
+                    AcpEvent::ConversationStatusChanged {
+                        conversation_id: cid,
+                        status,
+                    },
+                )
+                .await;
+                crate::commands::conversations::emit_conversation_state(&emitter, patch);
+            });
         }
     }
 
@@ -1675,14 +1739,46 @@ pub fn lifecycle_subscriber_task(
 
                     let conn_id = envelope_arc.connection_id.clone();
                     let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
+                    let payload_kind = match &envelope_arc.payload {
+                        AcpEvent::TurnComplete { stop_reason, .. } => {
+                            format!("TurnComplete({stop_reason})")
+                        }
+                        AcpEvent::SessionStarted { .. } => "SessionStarted".into(),
+                        AcpEvent::ConversationLinked { .. } => "ConversationLinked".into(),
+                        AcpEvent::StatusChanged { status, .. } => {
+                            format!("StatusChanged({status:?})")
+                        }
+                        AcpEvent::Error { terminal, .. } => {
+                            format!("Error(terminal={terminal})")
+                        }
+                        other => format!("{other:?}")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("Other")
+                            .to_string(),
+                    };
 
-                    let tx = workers.entry(conn_id.clone()).or_insert_with(|| {
+                    // Drop closed senders so `or_insert_with` can respawn.
+                    if workers
+                        .get(&conn_id)
+                        .is_some_and(|tx| tx.is_closed())
+                    {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            event = %payload_kind,
+                            "[lifecycle][WARN] worker channel closed; respawning \
+                             before enqueue (prior worker likely panicked)"
+                        );
+                        workers.remove(&conn_id);
+                    }
+
+                    let spawn_worker = |conn_id: &str| {
                         let (tx, worker_rx) =
                             mpsc::channel::<Arc<InternalEventEnvelope>>(WORKER_QUEUE_CAPACITY);
                         let db_clone = db_conn.clone();
                         let mgr_clone = manager.clone_ref();
                         let broker_clone = broker.clone();
-                        let id_clone = conn_id.clone();
+                        let id_clone = conn_id.to_string();
                         tokio::spawn(connection_worker_loop(
                             id_clone,
                             db_clone,
@@ -1691,13 +1787,30 @@ pub fn lifecycle_subscriber_task(
                             worker_rx,
                         ));
                         tx
-                    });
+                    };
+
+                    let tx = workers
+                        .entry(conn_id.clone())
+                        .or_insert_with(|| spawn_worker(&conn_id));
+
+                    if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+                        tracing::info!(
+                            connection_id = %conn_id,
+                            event = %payload_kind,
+                            "[lifecycle] enqueue TurnComplete to worker"
+                        );
+                    }
 
                     // Two-phase send: try non-blocking first (the common
                     // case), only `await` when the mailbox is actually full.
                     // Counts queue-full as back-pressure observation rather
                     // than a drop event — nothing is dropped, the dispatcher
                     // just waits for the worker to make room.
+                    //
+                    // On Closed: prior code removed the worker and `continue`d
+                    // without re-enqueue — silently dropping TurnComplete and
+                    // leaving the conversation row stuck at `in_progress`.
+                    // Always respawn + re-send correctness-critical events.
                     let send_result = match tx.try_send(envelope_arc) {
                         Ok(()) => Ok(()),
                         Err(mpsc::error::TrySendError::Full(env)) => {
@@ -1705,17 +1818,37 @@ pub fn lifecycle_subscriber_task(
                                 .worker_queue_full_count
                                 .fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
-                                "[lifecycle][WARN] worker queue full for \
-                                 {conn_id}, awaiting drain (back-pressure)"
+                                connection_id = %conn_id,
+                                event = %payload_kind,
+                                "[lifecycle][WARN] worker queue full, \
+                                 awaiting drain (back-pressure)"
                             );
                             tx.send(env).await.map_err(|_| ())
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+                        Err(mpsc::error::TrySendError::Closed(env)) => {
+                            tracing::error!(
+                                connection_id = %conn_id,
+                                event = %payload_kind,
+                                "[lifecycle][ERROR] worker channel closed mid-send; \
+                                 respawning and re-enqueueing (must not drop \
+                                 TurnComplete / SessionStarted)"
+                            );
+                            workers.remove(&conn_id);
+                            let tx2 = workers
+                                .entry(conn_id.clone())
+                                .or_insert_with(|| spawn_worker(&conn_id));
+                            tx2.send(env).await.map_err(|_| ())
+                        }
                     };
 
                     if send_result.is_err() {
-                        // Worker exited unexpectedly (panic). Clean up the
-                        // stale entry so the next relevant event respawns.
+                        tracing::error!(
+                            connection_id = %conn_id,
+                            event = %payload_kind,
+                            "[lifecycle][ERROR] DROPPED lifecycle event after \
+                             worker respawn failed — conversation status may \
+                             stay wrong until reconnect"
+                        );
                         workers.remove(&conn_id);
                         continue;
                     }
