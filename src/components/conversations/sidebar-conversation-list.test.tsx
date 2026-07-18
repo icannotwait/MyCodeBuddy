@@ -296,7 +296,7 @@ function Harness() {
   useEffect(() => {
     harness.rerender = () => setTick((n) => n + 1)
   }, [])
-  return <SidebarConversationList showCompleted sortMode="created" />
+  return <SidebarConversationList showCompleted />
 }
 
 function tree() {
@@ -750,7 +750,7 @@ describe("SidebarConversationList — scrollToActive across a worktree merge", (
     const ref = createRef<SidebarConversationListHandle>()
     render(
       <NextIntlClientProvider locale="en" messages={enMessages}>
-        <SidebarConversationList showCompleted sortMode="created" ref={ref} />
+        <SidebarConversationList showCompleted ref={ref} />
       </NextIntlClientProvider>
     )
 
@@ -802,19 +802,23 @@ describe("SidebarConversationList — folder ⋯ opens the same menu as right-cl
   })
 })
 
-describe("SidebarConversationList — card time label always uses updated_at", () => {
+describe("SidebarConversationList — activity order and optimistic labels", () => {
   beforeEach(() => {
     vi.useFakeTimers({ now: FIXED })
     probes.card = 0
     probes.folder = 0
     const folders = [folder(1, "Folder 1")]
-    // Old created_at (2d) vs five-minute-old updated_at — with sortMode="created"
-    // the list must still render the updated_at label ("5m"), not "2d".
+    // created_at and updated_at disagree: conv-11 is newer by created_at, but
+    // conv-12 is newer by updated_at. Order and labels must follow activity.
     useAppWorkspaceStore.setState({
       folders,
       allFolders: folders,
       conversations: [
         conv(11, 1, {
+          created_at: new Date(FIXED - 1 * MINUTE).toISOString(),
+          updated_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+        }),
+        conv(12, 1, {
           created_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
           updated_at: new Date(FIXED - 5 * MINUTE).toISOString(),
         }),
@@ -828,10 +832,42 @@ describe("SidebarConversationList — card time label always uses updated_at", (
     vi.useRealTimers()
   })
 
-  it("shows updated_at relative time under created sort mode", () => {
+  it("orders by updated activity when created_at would reverse the order", () => {
     render(tree())
     const text = document.body.textContent ?? ""
+    // conv-12 has the more recent updated_at → must render above conv-11.
+    expect(text.indexOf("conv-12")).toBeLessThan(text.indexOf("conv-11"))
     expect(text).toContain("5m")
-    expect(text).not.toContain("2d")
+  })
+
+  it("promotes a real optimistic activity and labels it now", () => {
+    // Seed id 12 with an older authoritative updated_at so promotion comes from
+    // the optimistic overlay, not the initial data order.
+    const folders = [folder(1, "Folder 1")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [
+        conv(11, 1, {
+          updated_at: new Date(FIXED - 5 * MINUTE).toISOString(),
+        }),
+        conv(12, 1, {
+          updated_at: new Date(FIXED - 2 * 24 * 60 * MINUTE).toISOString(),
+        }),
+      ],
+    })
+
+    render(tree())
+    const before = document.body.textContent ?? ""
+    expect(before.indexOf("conv-12")).toBeGreaterThan(before.indexOf("conv-11"))
+
+    act(() => {
+      useAppWorkspaceStore.getState().beginConversationActivity(12)
+    })
+
+    const after = document.body.textContent ?? ""
+    expect(after.indexOf("conv-12")).toBeLessThan(after.indexOf("conv-11"))
+    const row = document.querySelector('[data-conversation-id="12"]')
+    expect(row?.textContent).toContain("now")
   })
 })

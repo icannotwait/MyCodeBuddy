@@ -68,9 +68,9 @@ import {
   loadConversationExpanded,
   saveConversationExpanded,
   type SidebarSectionCollapsed,
-  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
+import { getEffectiveConversationUpdatedAt } from "@/lib/conversation-activity"
 import {
   FOLDER_THEME_COLOR_INHERIT,
   THEME_COLOR_PREVIEW,
@@ -553,15 +553,12 @@ export interface SidebarConversationListHandle {
 
 export interface SidebarConversationListProps {
   showCompleted?: boolean
-  sortMode?: SidebarSortMode
   sectionOrder?: SidebarSectionOrder
 }
 
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  // sortMode is kept on the public props type so Task-4-owned parents still
-  // typecheck, but ordering is now activity-only in the grouping selectors.
   sectionOrder = "folders-first",
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>
@@ -577,6 +574,9 @@ export function SidebarConversationList({
   const folders = useAppWorkspaceStore((s) => s.folders)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const conversations = useAppWorkspaceStore((s) => s.conversations)
+  const optimisticActivityById = useAppWorkspaceStore(
+    (state) => state.optimisticActivityById
+  )
   const loading = useAppWorkspaceStore((s) => s.conversationsLoading)
   const error = useAppWorkspaceStore((s) => s.conversationsError)
   const refreshConversations = useAppWorkspaceStore(
@@ -861,21 +861,27 @@ export function SidebarConversationList({
     const next = selectChatConversationsWithReuse(
       conversations,
       showCompleted,
-      chatConvsRef.current
+      chatConvsRef.current,
+      optimisticActivityById
     )
     chatConvsRef.current = next
     return next
-  }, [conversations, showCompleted])
+  }, [conversations, showCompleted, optimisticActivityById])
 
   // Pinned bucket: the FULL conversation list (ignores "Show completed" — a
-  // pinned conversation stays visible regardless), sorted most-recently-pinned
-  // first, with reference reuse so an unrelated status event doesn't rebuild it.
+  // pinned conversation stays visible regardless), sorted by effective activity,
+  // then pinned_at, then id, with reference reuse so an unrelated status event
+  // doesn't rebuild it.
   const pinnedRef = useRef<DbConversationSummary[]>([])
   const pinned = useMemo(() => {
-    const next = selectPinnedWithReuse(conversations, pinnedRef.current)
+    const next = selectPinnedWithReuse(
+      conversations,
+      pinnedRef.current,
+      optimisticActivityById
+    )
     pinnedRef.current = next
     return next
-  }, [conversations])
+  }, [conversations, optimisticActivityById])
 
   // Maps each open worktree child folder → its (open) root folder. A child is
   // only redirected when its parent is also open, so a worktree whose root was
@@ -901,11 +907,12 @@ export function SidebarConversationList({
     const grouped = groupByFolderWithReuse(
       folderConversations,
       byFolderRef.current,
-      childToParent
+      childToParent,
+      optimisticActivityById
     )
     byFolderRef.current = grouped
     return grouped
-  }, [folderConversations, childToParent])
+  }, [folderConversations, childToParent, optimisticActivityById])
 
   // Counts the unfiltered-but-non-pinned conversations per display group, so the
   // empty-hint renderer distinguishes a truly empty folder from one whose rows
@@ -1956,26 +1963,33 @@ export function SidebarConversationList({
     const groupId = childToParent.get(conv.folder_id) ?? conv.folder_id
     return themeWrap(
       groupId,
-      <SidebarConversationCard
-        conversation={conv}
-        isSelected={
-          selectedConversation?.agentType === conv.agent_type &&
-          selectedConversation?.id === conv.id
-        }
-        isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
-        timeLabel={formatRelative(conv.updated_at, now)}
-        onSelect={handleSelect}
-        onDoubleClick={handleDoubleClick}
-        onRename={handleRename}
-        onDelete={handleDelete}
-        onStatusChange={handleStatusChange}
-        onNewConversation={handleNewConversationForFolder}
-        onTogglePin={handleTogglePin}
-        depth={row.depth}
-        hasChildren={conv.child_count > 0}
-        expanded={conversationExpanded.has(conv.id)}
-        onToggleExpand={toggleConversation}
-      />
+      // data-conversation-id on this wrapper (not only the card button) so tests
+      // and mobile close-on-select can read the full row, including the time label.
+      <div data-conversation-id={conv.id}>
+        <SidebarConversationCard
+          conversation={conv}
+          isSelected={
+            selectedConversation?.agentType === conv.agent_type &&
+            selectedConversation?.id === conv.id
+          }
+          isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
+          timeLabel={formatRelative(
+            getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
+            now
+          )}
+          onSelect={handleSelect}
+          onDoubleClick={handleDoubleClick}
+          onRename={handleRename}
+          onDelete={handleDelete}
+          onStatusChange={handleStatusChange}
+          onNewConversation={handleNewConversationForFolder}
+          onTogglePin={handleTogglePin}
+          depth={row.depth}
+          hasChildren={conv.child_count > 0}
+          expanded={conversationExpanded.has(conv.id)}
+          onToggleExpand={toggleConversation}
+        />
+      </div>
     )
   }
 
