@@ -11,6 +11,9 @@
 //      `src-tauri/binaries/codeg-mcp-<triple>{.exe}` so Tauri's externalBin
 //      bundler picks it up under the bare name `codeg-mcp` at install time.
 //
+// Codex ACP is **not** a sidecar: every platform launches the official npm
+// package `@agentclientprotocol/codex-acp` via npx / global install.
+//
 // Why a separate script (not inline in beforeBuildCommand / GitHub Actions):
 //   - Cross-compile in release.yml passes `--target <triple>` so we honour
 //     the matrix triple rather than rebuilding for the host.
@@ -20,20 +23,11 @@
 //     and you don't care about delegation.
 //
 // Intentionally Node-only: runs identically on macOS, Linux, and Windows
-// GitHub runners. Windows npm.cmd invocations go through cmd.exe because Node
-// cannot execute command scripts directly there.
+// GitHub runners.
 
 import { execFileSync } from "node:child_process"
-import {
-  existsSync,
-  copyFileSync,
-  mkdirSync,
-  chmodSync,
-  readFileSync,
-  rmSync,
-  statSync,
-} from "node:fs"
-import { delimiter, dirname, join, resolve } from "node:path"
+import { existsSync, copyFileSync, mkdirSync, chmodSync } from "node:fs"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import process from "node:process"
 
@@ -41,89 +35,10 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const SRC_TAURI = resolve(SCRIPT_DIR, "..")
 const BINARIES_DIR = join(SRC_TAURI, "binaries")
 const BIN_NAME = "codeg-mcp"
-const CODEX_ACP_VERSION = "1.1.2-mycodebuddy.3"
-const CODEX_ACP_DIR = join(SRC_TAURI, "vendor", "codex-acp")
-const CODEX_COMPILE_RUNTIME_PACKAGE = "bun-windows-x64-baseline"
-const CODEX_COMPILE_RUNTIME = `${CODEX_COMPILE_RUNTIME_PACKAGE}-v1.3.14`
-
-export function codexBundleScript(target) {
-  return target === "x86_64-pc-windows-msvc" ? "bundle:win-x64" : null
-}
 
 export function sidecarDestination(name, target) {
   const ext = target.includes("windows") ? ".exe" : ""
   return `${name}-${target}${ext}`
-}
-
-export function npmCommandInvocation(
-  args,
-  platform = process.platform,
-  comSpec = process.env.ComSpec
-) {
-  if (platform === "win32") {
-    return {
-      command: comSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", "npm.cmd", ...args],
-    }
-  }
-  return { command: "npm", args }
-}
-
-export function readCodexAcpVersion(sourceDir) {
-  const manifest = join(sourceDir, "package.json")
-  const lockfile = join(sourceDir, "package-lock.json")
-  if (!existsSync(manifest) || !existsSync(lockfile)) {
-    throw new Error(`codex-acp submodule is not initialized at ${sourceDir}`)
-  }
-  return JSON.parse(readFileSync(manifest, "utf8")).version
-}
-
-export function stageCodexCompileRuntime(sourceDir, target) {
-  if (target !== "x86_64-pc-windows-msvc") {
-    return null
-  }
-  const runtime = join(
-    sourceDir,
-    "node_modules",
-    "@oven",
-    CODEX_COMPILE_RUNTIME_PACKAGE,
-    "bin",
-    "bun.exe"
-  )
-  if (!existsSync(runtime)) {
-    throw new Error(
-      `locked Bun compile runtime is missing at ${runtime}; run npm ci on Windows`
-    )
-  }
-  const staged = join(sourceDir, CODEX_COMPILE_RUNTIME)
-  copyFileSync(runtime, staged)
-  return staged
-}
-
-export function codexBundleEnv(
-  sourceDir,
-  target,
-  env = process.env,
-  pathSeparator = delimiter
-) {
-  if (target !== "x86_64-pc-windows-msvc") return env
-
-  const pathKey =
-    Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH"
-  const runtimeBinDir = join(
-    sourceDir,
-    "node_modules",
-    "@oven",
-    CODEX_COMPILE_RUNTIME_PACKAGE,
-    "bin"
-  )
-  const existingPath = env[pathKey]
-  return {
-    ...env,
-    [pathKey]: existingPath
-      ? `${runtimeBinDir}${pathSeparator}${existingPath}`
-      : runtimeBinDir,
-  }
 }
 
 function log(msg) {
@@ -213,53 +128,6 @@ function main() {
     chmodSync(dest, 0o755)
   }
   log(`sidecar staged at ${dest}`)
-
-  const codexScript = codexBundleScript(target)
-  if (!codexScript || process.env.CODEG_SKIP_CODEX_ACP_SIDECAR === "1") {
-    return
-  }
-  const version = readCodexAcpVersion(CODEX_ACP_DIR)
-  if (version !== CODEX_ACP_VERSION) {
-    die(`expected codex-acp ${CODEX_ACP_VERSION}, found ${version}`)
-  }
-  for (const args of [["ci"], ["run", "typecheck"], ["test"]]) {
-    const invocation = npmCommandInvocation(args)
-    execFileSync(invocation.command, invocation.args, {
-      stdio: "inherit",
-      cwd: CODEX_ACP_DIR,
-    })
-  }
-  const compileRuntime = stageCodexCompileRuntime(CODEX_ACP_DIR, target)
-  try {
-    const invocation = npmCommandInvocation(["run", codexScript])
-    execFileSync(invocation.command, invocation.args, {
-      stdio: "inherit",
-      cwd: CODEX_ACP_DIR,
-      env: codexBundleEnv(CODEX_ACP_DIR, target),
-    })
-  } finally {
-    rmSync(compileRuntime, { force: true })
-  }
-  const codexBuilt = join(
-    CODEX_ACP_DIR,
-    "dist",
-    "bin",
-    "codex-acp-x64-windows.exe"
-  )
-  const codexDest = join(BINARIES_DIR, sidecarDestination("codex-acp", target))
-  rmSync(codexDest, { force: true })
-  copyFileSync(codexBuilt, codexDest)
-  if (statSync(codexDest).size <= 0) {
-    die(`staged codex-acp is empty: ${codexDest}`)
-  }
-  const reported = execFileSync(codexDest, ["--version"], {
-    encoding: "utf8",
-  }).trim()
-  const expected = `@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}`
-  if (reported !== expected) {
-    die(`codex-acp version mismatch: expected ${expected}, got ${reported}`)
-  }
-  log(`sidecar staged at ${codexDest}`)
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

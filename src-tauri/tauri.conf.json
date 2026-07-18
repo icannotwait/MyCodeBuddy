@@ -38,7 +38,7 @@
       "../NOTICE": "licenses/NOTICE",
       "resources/THIRD_PARTY_LICENSES.txt": "licenses/THIRD_PARTY_LICENSES.txt"
     },
-    "externalBin": ["binaries/codeg-mcp", "binaries/codex-acp"],
+    "externalBin": ["binaries/codeg-mcp"],
     "windows": {
       "nsis": {
         "installerHooks": "./windows/installer-hooks.nsh"

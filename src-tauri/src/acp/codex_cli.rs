@@ -1,9 +1,9 @@
 //! Host Codex binary path resolution for `CODEX_PATH`.
 //!
-//! Windows ships a bundled `codex-acp` adapter that cannot resolve the npm-packaged
-//! `@openai/codex` dependency, so it always needs a host Codex binary to spawn
-//! `codex app-server` (and, when `CODEX_ACP_USE_CLI=1`, `codex exec`). Non-Windows
-//! npx packages embed `@openai/codex` and only need `CODEX_PATH` when CLI mode is on.
+//! The official npm `@agentclientprotocol/codex-acp` package embeds
+//! `@openai/codex` and drives app-server without a host binary. When the user
+//! opts into experimental `CODEX_ACP_USE_CLI=1`, the adapter spawns
+//! `codex exec` and needs a host Codex on `CODEX_PATH`.
 //!
 //! Pure selection prefers: explicit path → PATH hit → npm global `@openai/codex` entry.
 //! Auto-detect never overwrites an existing non-empty `CODEX_PATH`.
@@ -84,8 +84,8 @@ fn default_npm_global_prefix() -> Option<PathBuf> {
 fn missing_codex_cli_message() -> &'static str {
     "Codex CLI is not installed. Install with `npm install -g @openai/codex`, \
      or set CODEX_PATH to your codex executable (or codex.js). \
-     DrawCode's bundled codex-acp adapter requires a host Codex CLI \
-     to run `codex app-server`."
+     CLI runtime mode (CODEX_ACP_USE_CLI=1) requires a host Codex CLI \
+     to run `codex exec`."
 }
 
 pub fn ensure_codex_path_in_env(env: &mut BTreeMap<String, String>) -> Result<(), String> {
@@ -130,10 +130,11 @@ pub fn cli_mode_enabled(env: &BTreeMap<String, String>) -> bool {
 
 /// True when this Codex launch must resolve a host Codex binary into `CODEX_PATH`.
 ///
-/// - Windows: always (bundled adapter spawns host `codex app-server`).
-/// - Elsewhere: only when experimental `CODEX_ACP_USE_CLI` is enabled.
+/// Required only when experimental `CODEX_ACP_USE_CLI` is enabled. The npm
+/// `@agentclientprotocol/codex-acp` package embeds `@openai/codex` for the
+/// default app-server path on every platform (including Windows).
 pub fn host_codex_required(env: &BTreeMap<String, String>) -> bool {
-    cfg!(windows) || cli_mode_enabled(env)
+    cli_mode_enabled(env)
 }
 
 /// Prepare env for a Codex ACP launch: inject host `CODEX_PATH` when required.
@@ -295,13 +296,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
-    fn prepare_skips_when_cli_mode_off_on_non_windows() {
+    fn prepare_skips_when_cli_mode_off() {
         let temp = tempfile::tempdir().unwrap();
         let fake = touch_file(temp.path(), "codex.cmd");
         let fake_str = fake.to_string_lossy().into_owned();
 
-        // Non-Windows app-server uses the npm-packaged codex; no host inject.
+        // App-server uses the npm-packaged codex; no host inject on any platform.
         temp_env::with_vars(
             [
                 (CODEX_PATH_ENV, Some(fake_str.as_str())),
@@ -311,30 +311,6 @@ mod tests {
                 let env = BTreeMap::new();
                 let out = prepare_codex_launch_env(env).unwrap();
                 assert!(!out.contains_key(CODEX_PATH_ENV));
-            },
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn prepare_injects_on_windows_even_without_cli_mode() {
-        let temp = tempfile::tempdir().unwrap();
-        let fake = touch_file(temp.path(), "codex.cmd");
-        let fake_str = fake.to_string_lossy().into_owned();
-
-        // Windows bundled adapter always needs host codex for app-server.
-        temp_env::with_vars(
-            [
-                (CODEX_PATH_ENV, Some(fake_str.as_str())),
-                ("CODEX_ACP_USE_CLI", None),
-            ],
-            || {
-                let env = BTreeMap::new();
-                let out = prepare_codex_launch_env(env).unwrap();
-                assert_eq!(
-                    out.get(CODEX_PATH_ENV).map(String::as_str),
-                    Some(fake_str.as_str())
-                );
             },
         );
     }
@@ -376,22 +352,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
-    fn host_codex_not_required_for_true_on_non_windows() {
+    fn host_codex_not_required_for_true_string() {
         let env = BTreeMap::from([("CODEX_ACP_USE_CLI".into(), "true".into())]);
         assert!(!host_codex_required(&env));
     }
 
     #[test]
-    #[cfg(not(windows))]
-    fn host_codex_not_required_off_cli_non_windows() {
+    fn host_codex_not_required_when_cli_mode_off() {
         assert!(!host_codex_required(&BTreeMap::new()));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn host_codex_required_on_windows_without_cli() {
-        assert!(host_codex_required(&BTreeMap::new()));
     }
 
     #[test]

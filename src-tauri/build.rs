@@ -34,12 +34,15 @@ fn configure_common_controls_v6_manifest() {
 }
 
 /// Tauri's bundler validates that every `bundle.externalBin` path resolves
-/// to an existing file at build.rs time. The real `codeg-mcp` and
-/// `codex-acp` sidecars are produced by `pnpm tauri:prepare-sidecars` (invoked from
+/// to an existing file at build.rs time. The real `codeg-mcp` sidecar is
+/// produced by `pnpm tauri:prepare-sidecars` (invoked from
 /// `beforeBuildCommand` / `beforeDevCommand` and the CI release matrix) —
 /// but plain `cargo check --features tauri-runtime` doesn't go through that
 /// path, so without a backstop every contributor would hit
 /// `resource path ... doesn't exist` on first compile.
+///
+/// Codex ACP is launched from npm (`@agentclientprotocol/codex-acp`), not as
+/// a Tauri externalBin sidecar.
 ///
 /// We write a zero-byte placeholder when the sidecar is missing so
 /// `cargo check` / clippy / rust-analyzer succeed. Production paths
@@ -66,7 +69,7 @@ fn ensure_sidecar_placeholder() {
         ""
     };
     let dir = PathBuf::from("binaries");
-    for sidecar in ["codeg-mcp", "codex-acp"] {
+    for sidecar in ["codeg-mcp"] {
         let path = dir.join(format!("{sidecar}-{triple}{ext}"));
 
         println!("cargo:rerun-if-changed={}", path.display());

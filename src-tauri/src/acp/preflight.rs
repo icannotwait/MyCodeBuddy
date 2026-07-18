@@ -83,13 +83,11 @@ pub async fn run_preflight(
         } => check_uv_environment(*uv_required, *system_cmd).await,
     };
 
-    // Host Codex CLI is required when the effective launch env enables CLI mode
-    // (distribution defaults to CODEX_ACP_USE_CLI=0; user env can set 1),
-    // and always on Windows (bundled adapter spawns host `codex app-server`).
+    // Host Codex CLI is required only when the effective launch env enables
+    // CLI mode (distribution defaults to CODEX_ACP_USE_CLI=0; user env can
+    // set 1). The npm codex-acp package embeds Codex for app-server.
     let effective_env = merge_distribution_env(meta.distribution.env(), runtime_env);
-    if agent_type == AgentType::Codex
-        && codex_host_preflight_required(cfg!(windows), &effective_env)
-    {
+    if agent_type == AgentType::Codex && codex_host_preflight_required(&effective_env) {
         checks.push(check_codex_cli_host(&effective_env));
     }
 
@@ -119,11 +117,8 @@ fn merge_distribution_env(
 }
 
 /// Whether preflight must verify a host Codex CLI binary is available.
-fn codex_host_preflight_required(
-    is_windows: bool,
-    effective_env: &BTreeMap<String, String>,
-) -> bool {
-    is_windows || crate::acp::codex_cli::cli_mode_enabled(effective_env)
+fn codex_host_preflight_required(effective_env: &BTreeMap<String, String>) -> bool {
+    crate::acp::codex_cli::cli_mode_enabled(effective_env)
 }
 
 /// Prefer a non-empty saved `CODEX_PATH`. An invalid saved path is an explicit
@@ -168,7 +163,7 @@ fn codex_cli_host_check_item(path: Option<PathBuf>) -> CheckItem {
             check_id: "codex_cli".into(),
             label: "Codex CLI".into(),
             status: CheckStatus::Fail,
-            message: "Host Codex CLI not found. The built-in codex-acp adapter needs a local Codex CLI to run app-server (install @openai/codex or set CODEX_PATH).".into(),
+            message: "Host Codex CLI not found. CLI runtime mode needs a local Codex CLI to run `codex exec` (install @openai/codex or set CODEX_PATH).".into(),
             fixes: vec![FixAction {
                 label: "Install Codex CLI".into(),
                 kind: FixActionKind::OpenUrl,
@@ -814,25 +809,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_distribution_cli_default_requires_host_on_non_windows() {
+    fn codex_cli_mode_requires_host() {
         let runtime_env = BTreeMap::new();
         let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
 
-        assert!(codex_host_preflight_required(false, &effective));
+        assert!(codex_host_preflight_required(&effective));
     }
 
     #[test]
-    fn codex_user_opt_out_overrides_distribution_default_on_non_windows() {
+    fn codex_user_opt_out_overrides_distribution_cli_default() {
         let runtime_env = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
         let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
 
-        assert!(!codex_host_preflight_required(false, &effective));
+        assert!(!codex_host_preflight_required(&effective));
     }
 
     #[test]
-    fn codex_windows_requires_host_after_cli_opt_out() {
+    fn codex_app_server_does_not_require_host() {
         let effective = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
 
-        assert!(codex_host_preflight_required(true, &effective));
+        assert!(!codex_host_preflight_required(&effective));
     }
 }

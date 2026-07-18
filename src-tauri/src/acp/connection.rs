@@ -56,8 +56,8 @@ use crate::web::event_bridge::{emit_with_state, EventEmitter};
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
 
 /// Inject host `CODEX_PATH` into Codex launch env when a host binary is required
-/// (always on Windows bundled adapter; also when experimental CLI mode is on).
-/// No-ops for non-Codex agents; maps prepare failures to `SdkNotInstalled`.
+/// (only when experimental `CODEX_ACP_USE_CLI=1` is on). No-ops for non-Codex
+/// agents; maps prepare failures to `SdkNotInstalled`.
 fn apply_codex_cli_path_env(
     agent_type: AgentType,
     merged_env: Vec<(String, String)>,
@@ -615,9 +615,9 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
-            // Inject host CODEX_PATH when required (Windows host always, or
-            // CODEX_ACP_USE_CLI). Never overwrites an explicit user value;
-            // fails with SdkNotInstalled if host Codex is missing.
+            // Inject host CODEX_PATH when CODEX_ACP_USE_CLI=1 requires it.
+            // Never overwrites an explicit user value; fails with
+            // SdkNotInstalled if host Codex is missing in CLI mode.
             merged_env = apply_codex_cli_path_env(agent_type, merged_env)?;
             let mut env_map: BTreeMap<String, String> = merged_env.into_iter().collect();
             // Build complete agent argv first (command + base flags + registry
