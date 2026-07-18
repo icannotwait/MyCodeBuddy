@@ -17,6 +17,7 @@ import {
   nextOptimisticActivityTimestamp,
   parseActivityTimestamp,
   type OptimisticActivityById,
+  type OptimisticConversationActivity,
 } from "@/lib/conversation-activity"
 import type {
   AgentStats,
@@ -191,6 +192,67 @@ const deletedIds = new Set<number>()
 // switches never inherit a prior session clock.
 let lastOptimisticActivityMs = 0
 
+// Monotonic conversation-array revision: advanced whenever an event or local
+// patch mutates `conversations`. In-flight refreshes compare this against the
+// revision captured at request start to decide snapshot-replace vs merge.
+let conversationRevision = 0
+// Only the latest refresh request may commit conversations, errors, or
+// `conversationsLoading=false`. Earlier responses that resolve late are ignored.
+let latestConversationRefreshRequest = 0
+
+function advanceConversationRevision() {
+  conversationRevision += 1
+}
+
+/**
+ * Merge an incoming summary into the current row. Newer/equal activity
+ * timestamps take the full incoming row; older timestamps still apply
+ * metadata but preserve the newer state tuple (`status`,
+ * `awaiting_reply_token`, `updated_at`).
+ */
+function mergeConversationSummary(
+  current: DbConversationSummary,
+  incoming: DbConversationSummary
+): DbConversationSummary {
+  if (
+    parseActivityTimestamp(incoming.updated_at) >=
+    parseActivityTimestamp(current.updated_at)
+  ) {
+    return incoming
+  }
+  return {
+    ...incoming,
+    status: current.status,
+    awaiting_reply_token: current.awaiting_reply_token,
+    updated_at: current.updated_at,
+  }
+}
+
+/**
+ * Drop optimistic overlays whose conversation is gone, tombstoned, or whose
+ * authoritative `updated_at` has advanced past the optimistic baseline.
+ * Returns the existing map reference when nothing changes.
+ */
+function reconcileOptimisticActivity(
+  rows: readonly DbConversationSummary[],
+  current: OptimisticActivityById
+): OptimisticActivityById {
+  const rowsById = new Map(rows.map((row) => [row.id, row]))
+  let next: Map<number, OptimisticConversationActivity> | null = null
+  for (const [id, activity] of current) {
+    const row = rowsById.get(id)
+    const acknowledged =
+      row !== undefined &&
+      parseActivityTimestamp(row.updated_at) >
+        parseActivityTimestamp(activity.baselineUpdatedAt)
+    if (!row || acknowledged || deletedIds.has(id)) {
+      next ??= new Map(current)
+      next.delete(id)
+    }
+  }
+  return next ?? current
+}
+
 export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
   (set, get) => ({
     folders: [],
@@ -232,14 +294,59 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     },
 
     refreshConversations: async () => {
+      const requestId = ++latestConversationRefreshRequest
+      const revisionAtStart = conversationRevision
       set({ conversationsLoading: true })
       try {
         const list = await listAllConversations()
-        set({ ...withConversations(list), conversationsError: null })
+        // Only the latest request may commit. Late responses from superseded
+        // refreshes must not clobber newer state or flip loading off early.
+        if (requestId !== latestConversationRefreshRequest) return
+
+        const snapshot = list.filter((row) => !deletedIds.has(row.id))
+        let nextRows: DbConversationSummary[]
+        if (revisionAtStart === conversationRevision) {
+          // No concurrent mutations while the fetch was in flight: replace
+          // with the non-tombstoned snapshot (rows omitted by the server go away).
+          nextRows = snapshot
+        } else {
+          // Concurrent state/upsert/remove/local patches advanced the revision:
+          // merge snapshot rows against current authority and keep current-only
+          // non-tombstoned rows that the snapshot has not yet observed.
+          const current = get().conversations
+          const currentById = new Map(current.map((row) => [row.id, row]))
+          const snapshotIds = new Set<number>()
+          nextRows = []
+          for (const incoming of snapshot) {
+            snapshotIds.add(incoming.id)
+            const existing = currentById.get(incoming.id)
+            nextRows.push(
+              existing ? mergeConversationSummary(existing, incoming) : incoming
+            )
+          }
+          for (const row of current) {
+            if (!snapshotIds.has(row.id) && !deletedIds.has(row.id)) {
+              nextRows.push(row)
+            }
+          }
+        }
+
+        const nextOptimistic = reconcileOptimisticActivity(
+          nextRows,
+          get().optimisticActivityById
+        )
+        set({
+          ...withConversations(nextRows),
+          conversationsError: null,
+          optimisticActivityById: nextOptimistic,
+          conversationsLoading: false,
+        })
       } catch (err) {
-        set({ conversationsError: toErrorMessage(err) })
-      } finally {
-        set({ conversationsLoading: false })
+        if (requestId !== latestConversationRefreshRequest) return
+        set({
+          conversationsError: toErrorMessage(err),
+          conversationsLoading: false,
+        })
       }
     },
 
@@ -272,6 +379,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       // ever widened to include a stat input (it recomputes then); today it is
       // always false, i.e. always reuse.
       const statsAffecting = "message_count" in patch || "agent_type" in patch
+      advanceConversationRevision()
       set(
         statsAffecting
           ? withConversations(next)
@@ -316,6 +424,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
         updated_at: patch.updated_at,
       }
 
+      advanceConversationRevision()
       set({
         conversations: next,
         stats: get().stats,
@@ -368,23 +477,37 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
 
     // Insert-or-replace a conversation by id (create + field updates). Root-only:
     // delegation children (parent_id set) are not sidebar rows. New rows prepend
-    // (most-recent-first); existing rows replace in place to keep their position.
+    // (most-recent-first); existing rows merge in place to keep their position
+    // and preserve a newer state tuple against stale metadata upserts.
     applyConversationUpsert: (summary) => {
       if (summary.parent_id != null) return
       if (deletedIds.has(summary.id)) return
       const prev = get().conversations
       const idx = prev.findIndex((c) => c.id === summary.id)
+      let next: DbConversationSummary[]
       if (idx < 0) {
-        set(withConversations([summary, ...prev]))
-        return
+        next = [summary, ...prev]
+      } else {
+        next = prev.slice()
+        next[idx] = mergeConversationSummary(prev[idx], summary)
       }
-      const next = prev.slice()
-      next[idx] = summary
-      set(withConversations(next))
+      advanceConversationRevision()
+      // Merge first so a stale-timestamp upsert cannot falsely acknowledge the
+      // optimistic overlay with an older authoritative `updated_at`.
+      const nextOptimistic = reconcileOptimisticActivity(
+        next,
+        get().optimisticActivityById
+      )
+      set({
+        ...withConversations(next),
+        optimisticActivityById: nextOptimistic,
+      })
     },
 
-    // Remove a conversation by id. Idempotent: an unknown id leaves state
-    // untouched (no re-render; keeps `stats` stable).
+    // Remove a conversation by id. Idempotent for the conversation array: an
+    // unknown id leaves `conversations`/`stats` untouched. Always tombstones
+    // the id and reconciles optimistic overlay (cleanup only — never advances
+    // `conversationActivitySequence`).
     applyConversationRemove: (id) => {
       deletedIds.add(id)
       if (deletedIds.size > DELETED_TOMBSTONE_CAP) {
@@ -394,10 +517,27 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       }
       const prev = get().conversations
       const idx = prev.findIndex((c) => c.id === id)
-      if (idx < 0) return
+      if (idx < 0) {
+        const nextOptimistic = reconcileOptimisticActivity(
+          prev,
+          get().optimisticActivityById
+        )
+        if (nextOptimistic !== get().optimisticActivityById) {
+          set({ optimisticActivityById: nextOptimistic })
+        }
+        return
+      }
       const next = prev.slice()
       next.splice(idx, 1)
-      set(withConversations(next))
+      advanceConversationRevision()
+      const nextOptimistic = reconcileOptimisticActivity(
+        next,
+        get().optimisticActivityById
+      )
+      set({
+        ...withConversations(next),
+        optimisticActivityById: nextOptimistic,
+      })
     },
 
     getBranch: (folderId) => get().branches.get(folderId),
@@ -577,6 +717,8 @@ export function resetAppWorkspaceStore() {
   // would need per-store fetch epochs. See `RemoteConnectionGate`.
   deletedIds.clear()
   lastOptimisticActivityMs = 0
+  conversationRevision = 0
+  latestConversationRefreshRequest = 0
   useAppWorkspaceStore.setState(useAppWorkspaceStore.getInitialState(), true)
 }
 

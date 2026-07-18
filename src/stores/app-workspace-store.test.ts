@@ -1,9 +1,33 @@
-import { beforeEach, describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "./app-workspace-store"
 import type { DbConversationSummary } from "@/lib/types"
+
+const api = vi.hoisted(() => ({
+  listAllConversations: vi.fn(),
+}))
+
+vi.mock("@/lib/api", () => ({
+  getFolder: vi.fn(),
+  listAllConversations: api.listAllConversations,
+  listAllFolderDetails: vi.fn(async () => []),
+  listOpenFolderDetails: vi.fn(async () => []),
+  openFolder: vi.fn(),
+  openFolderById: vi.fn(),
+  openWorktreeFolder: vi.fn(),
+  removeFolderFromWorkspace: vi.fn(),
+  reorderFolders: vi.fn(),
+}))
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
 
 function makeSummary(
   overrides: Partial<DbConversationSummary> & { id: number }
@@ -33,6 +57,7 @@ function makeSummary(
 
 beforeEach(() => {
   resetAppWorkspaceStore()
+  api.listAllConversations.mockReset()
 })
 
 describe("updateConversationLocal — stats reference stability", () => {
@@ -249,5 +274,222 @@ describe("optimistic conversation activity", () => {
     expect(
       useAppWorkspaceStore.getState().beginConversationActivity(2)
     ).toBeNull()
+  })
+})
+
+describe("monotonic upsert and refresh reconciliation", () => {
+  it("merges old upsert metadata without regressing the state tuple", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({
+        id: 1,
+        title: "Current",
+        status: "pending_review",
+        awaiting_reply_token: "g2",
+        updated_at: "2026-07-18T03:00:00.000Z",
+      })
+    )
+    store.applyConversationUpsert(
+      makeSummary({
+        id: 1,
+        title: "Metadata from old upsert",
+        status: "in_progress",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-18T02:00:00.000Z",
+      })
+    )
+
+    expect(useAppWorkspaceStore.getState().conversations[0]).toMatchObject({
+      title: "Metadata from old upsert",
+      status: "pending_review",
+      awaiting_reply_token: "g2",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    })
+  })
+
+  it("does not let an in-flight refresh overwrite a newer event patch", async () => {
+    const pending = deferred<DbConversationSummary[]>()
+    api.listAllConversations.mockReturnValueOnce(pending.promise)
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T01:00:00.000Z" })
+    )
+
+    const refresh = store.refreshConversations()
+    store.applyConversationStatePatch({
+      id: 1,
+      status: "pending_review",
+      awaiting_reply_token: "g2",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    })
+    store.applyConversationUpsert(
+      makeSummary({ id: 2, updated_at: "2026-07-18T03:01:00.000Z" })
+    )
+    pending.resolve([
+      makeSummary({ id: 1, updated_at: "2026-07-18T01:00:00.000Z" }),
+    ])
+    await refresh
+
+    const rows = useAppWorkspaceStore.getState().conversations
+    expect(rows.find((row) => row.id === 1)).toMatchObject({
+      status: "pending_review",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    })
+    expect(rows.some((row) => row.id === 2)).toBe(true)
+  })
+
+  it("ignores an older refresh that resolves after a newer one", async () => {
+    const first = deferred<DbConversationSummary[]>()
+    const second = deferred<DbConversationSummary[]>()
+    api.listAllConversations
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+
+    const store = useAppWorkspaceStore.getState()
+    const refresh1 = store.refreshConversations()
+    const refresh2 = store.refreshConversations()
+
+    second.resolve([
+      makeSummary({
+        id: 2,
+        title: "From second",
+        updated_at: "2026-07-18T02:00:00.000Z",
+      }),
+    ])
+    await refresh2
+
+    first.resolve([
+      makeSummary({
+        id: 1,
+        title: "From first",
+        updated_at: "2026-07-18T01:00:00.000Z",
+      }),
+    ])
+    await refresh1
+
+    const rows = useAppWorkspaceStore.getState().conversations
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ id: 2, title: "From second" })
+    expect(useAppWorkspaceStore.getState().conversationsLoading).toBe(false)
+  })
+
+  it("removes rows omitted by a later uncontended refresh snapshot", async () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T01:00:00.000Z" })
+    )
+    store.applyConversationUpsert(
+      makeSummary({ id: 2, updated_at: "2026-07-18T01:00:00.000Z" })
+    )
+
+    api.listAllConversations.mockResolvedValueOnce([
+      makeSummary({ id: 1, updated_at: "2026-07-18T01:00:00.000Z" }),
+    ])
+    await store.refreshConversations()
+
+    const rows = useAppWorkspaceStore.getState().conversations
+    expect(rows.map((row) => row.id)).toEqual([1])
+    expect(rows.some((row) => row.id === 2)).toBe(false)
+  })
+
+  it("clears optimistic activity from a newer upsert without advancing the activity sequence", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T02:00:00.000Z" })
+    )
+    expect(store.beginConversationActivity(1)).not.toBeNull()
+    const sequence =
+      useAppWorkspaceStore.getState().conversationActivitySequence
+
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T03:00:00.000Z" })
+    )
+
+    const after = useAppWorkspaceStore.getState()
+    expect(after.optimisticActivityById.has(1)).toBe(false)
+    expect(after.conversationActivitySequence).toBe(sequence)
+  })
+
+  it("clears optimistic activity from a newer refresh without advancing the activity sequence", async () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T02:00:00.000Z" })
+    )
+    expect(store.beginConversationActivity(1)).not.toBeNull()
+    const sequence =
+      useAppWorkspaceStore.getState().conversationActivitySequence
+
+    api.listAllConversations.mockResolvedValueOnce([
+      makeSummary({ id: 1, updated_at: "2026-07-18T03:00:00.000Z" }),
+    ])
+    await store.refreshConversations()
+
+    const after = useAppWorkspaceStore.getState()
+    expect(after.optimisticActivityById.has(1)).toBe(false)
+    expect(after.conversationActivitySequence).toBe(sequence)
+    expect(after.conversations[0].updated_at).toBe("2026-07-18T03:00:00.000Z")
+  })
+
+  it("prunes optimistic activity on remove without advancing the activity sequence", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T02:00:00.000Z" })
+    )
+    expect(store.beginConversationActivity(1)).not.toBeNull()
+    const sequence =
+      useAppWorkspaceStore.getState().conversationActivitySequence
+
+    store.applyConversationRemove(1)
+
+    const after = useAppWorkspaceStore.getState()
+    expect(after.optimisticActivityById.has(1)).toBe(false)
+    expect(after.conversationActivitySequence).toBe(sequence)
+    expect(after.conversations).toHaveLength(0)
+  })
+
+  it("never resurrects tombstoned ids from a refresh", async () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T01:00:00.000Z" })
+    )
+    store.applyConversationRemove(1)
+
+    api.listAllConversations.mockResolvedValueOnce([
+      makeSummary({
+        id: 1,
+        title: "Stale resurrection",
+        updated_at: "2026-07-18T04:00:00.000Z",
+      }),
+    ])
+    await store.refreshConversations()
+
+    expect(useAppWorkspaceStore.getState().conversations).toHaveLength(0)
+  })
+
+  it("does not let a stale-timestamp upsert clear optimistic activity", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({
+        id: 1,
+        title: "Current",
+        updated_at: "2026-07-18T03:00:00.000Z",
+      })
+    )
+    expect(store.beginConversationActivity(1)).not.toBeNull()
+
+    store.applyConversationUpsert(
+      makeSummary({
+        id: 1,
+        title: "Stale metadata",
+        updated_at: "2026-07-18T02:00:00.000Z",
+      })
+    )
+
+    const after = useAppWorkspaceStore.getState()
+    expect(after.conversations[0]).toMatchObject({
+      title: "Stale metadata",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    })
+    expect(after.optimisticActivityById.has(1)).toBe(true)
   })
 })
