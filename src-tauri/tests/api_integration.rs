@@ -683,3 +683,149 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
         .expect("load");
     assert_eq!(loaded.auto_title_agent, Some(AgentType::ClaudeCode));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Incremental reference search (Task 6 transport surface)
+// ────────────────────────────────────────────────────────────────────────────
+
+use codeg_lib::db::test_helpers::seed_folder as seed_folder_path;
+use codeg_lib::reference_search::types::{ReferenceDoneReason, ReferenceSearchPage};
+use uuid::Uuid;
+
+struct ReferenceApiFixture {
+    server: TestServer,
+    _workspace: tempfile::TempDir,
+    _data: tempfile::TempDir,
+    _static: tempfile::TempDir,
+    workspace_path: String,
+    search_session_id: String,
+    request_id: String,
+}
+
+impl ReferenceApiFixture {
+    fn auth_post(&self, path: &str) -> axum_test::TestRequest {
+        self.server
+            .post(path)
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+    }
+
+    fn start_payload(&self) -> Value {
+        json!({
+            "searchSessionId": self.search_session_id,
+            "sourceSequence": 1,
+            "requestId": self.request_id,
+            "source": "file",
+            "query": ".ts",
+            "workspacePath": self.workspace_path,
+        })
+    }
+
+    fn next_payload(&self, page_index: u32) -> Value {
+        json!({
+            "searchSessionId": self.search_session_id,
+            "sourceSequence": 1,
+            "requestId": self.request_id,
+            "source": "file",
+            "pageIndex": page_index,
+        })
+    }
+}
+
+async fn reference_api_fixture(limit: u16) -> ReferenceApiFixture {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let static_dir = tempfile::tempdir().expect("static dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path().to_string_lossy().to_string();
+
+    // More than ten matching files so a backend limit of 10 is observable.
+    for i in 0..15 {
+        let name = format!("match{i:02}.ts");
+        std::fs::write(workspace.path().join(&name), b"x").expect("write match file");
+    }
+    std::fs::write(workspace.path().join("other.rs"), b"x").expect("write other");
+
+    let db = fresh_in_memory_db().await;
+    seed_folder_path(&db, &workspace_path).await;
+
+    let state = AppState::new_for_test(db, data_dir.path().to_path_buf());
+    state.reference_search_registry.set_limit(limit).await;
+    let state = Arc::new(state);
+    let shutdown = Arc::new(ShutdownSignal::new());
+    let router = build_router(
+        state,
+        TEST_TOKEN.to_string(),
+        static_dir.path().to_path_buf(),
+        shutdown,
+    );
+    let server = TestServer::new(router).expect("test server");
+
+    ReferenceApiFixture {
+        server,
+        _workspace: workspace,
+        _data: data_dir,
+        _static: static_dir,
+        workspace_path,
+        search_session_id: Uuid::new_v4().hyphenated().to_string(),
+        request_id: Uuid::new_v4().hyphenated().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn direct_http_client_cannot_raise_the_backend_limit() {
+    let app = reference_api_fixture(10).await;
+    let mut payload = app.start_payload();
+    payload["resultLimit"] = json!(500);
+    let start = app
+        .auth_post("/api/start_reference_search")
+        .json(&payload)
+        .await;
+    assert_eq!(start.status_code(), 200, "body={}", start.text());
+    let mut page: ReferenceSearchPage = start.json();
+    let mut count = page.items.len();
+    while !page.done {
+        let next = app
+            .auth_post("/api/next_reference_search_page")
+            .json(&app.next_payload(page.page_index + 1))
+            .await;
+        assert_eq!(next.status_code(), 200, "body={}", next.text());
+        page = next.json();
+        count += page.items.len();
+    }
+    assert_eq!(count, 10);
+    assert_eq!(page.done_reason, Some(ReferenceDoneReason::Limit));
+}
+
+#[tokio::test]
+async fn regex_helper_http_route_accepts_a_valid_body_above_axum_default() {
+    let (server, _data, _static) = build_test_server().await;
+
+    // 100 descriptors × 4096 NUL scalars → JSON-escaped well above 2 MiB.
+    let field = "\u{0000}".repeat(4096);
+    let mut descriptors = Vec::with_capacity(100);
+    for i in 0..100 {
+        descriptors.push(json!({
+            "id": format!("d{i}"),
+            "sourceOrdinal": i,
+            "primary": [field],
+            "secondary": [],
+        }));
+    }
+    let body = json!({
+        "query": "re:nomatchpatternxyz",
+        "descriptors": descriptors,
+    });
+
+    let resp = server
+        .post("/api/match_reference_regex")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        200,
+        "large but valid body must clear the raised route limit; body={}",
+        resp.text()
+    );
+    let matches: Vec<Value> = resp.json();
+    assert!(matches.is_empty(), "non-matching regex yields empty result");
+}

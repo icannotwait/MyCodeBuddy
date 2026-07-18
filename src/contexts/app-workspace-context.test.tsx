@@ -5,6 +5,7 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
+import { getActiveBackendCacheKey } from "@/lib/transport"
 import type {
   ConversationChange,
   DbConversationSummary,
@@ -29,6 +30,19 @@ const h = vi.hoisted(() => ({
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
   conversationExperienceBootstrap: vi.fn(),
+  delegationProfileBootstrap: vi.fn(),
+  useAcpAgents: vi.fn(() => ({ agents: [], fresh: false, refresh: vi.fn() })),
+  markConversationUpsert: vi.fn(),
+  markConversationStatus: vi.fn(),
+  markConversationDelete: vi.fn(),
+}))
+
+vi.mock("@/lib/reference-search-cache", () => ({
+  referenceSearchCache: {
+    markConversationUpsert: h.markConversationUpsert,
+    markConversationStatus: h.markConversationStatus,
+    markConversationDelete: h.markConversationDelete,
+  },
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -80,6 +94,19 @@ vi.mock("@/lib/api", () => ({
 // overwriting this suite's intentionally narrow conversation/folder handler capture.
 vi.mock("@/stores/conversation-experience-store", () => ({
   useConversationExperienceBootstrap: h.conversationExperienceBootstrap,
+}))
+
+// Same for the profile-catalog bootstrap: keep one handler per channel.
+vi.mock("@/stores/delegation-profile-store", () => ({
+  useDelegationProfileBootstrap: h.delegationProfileBootstrap,
+  useDelegationProfileStore: {
+    getState: () => ({ ready: false }),
+  },
+}))
+
+vi.mock("@/hooks/use-acp-agents", () => ({
+  useAcpAgents: h.useAcpAgents,
+  selectAcpAgentsFresh: () => false,
 }))
 
 function makeSummary(
@@ -196,6 +223,11 @@ beforeEach(() => {
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
   h.conversationExperienceBootstrap.mockClear()
+  h.delegationProfileBootstrap.mockClear()
+  h.useAcpAgents.mockClear()
+  h.markConversationUpsert.mockClear()
+  h.markConversationStatus.mockClear()
+  h.markConversationDelete.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -208,9 +240,55 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
     expect(h.reconnect).toBeTypeOf("function")
   })
 
+  it("forwards_conversation_changes_to_the_reference_cache_once", async () => {
+    await mountProvider()
+    // Seed an existing row so the status path mutates workspace state.
+    const existing = makeSummary({ id: 10, status: "in_progress" })
+    emit({ kind: "upsert", summary: existing })
+    h.markConversationUpsert.mockClear()
+
+    const upsert = makeSummary({
+      id: 10,
+      title: "Renamed",
+      status: "in_progress",
+    })
+    emit({ kind: "upsert", summary: upsert })
+    emit({
+      kind: "state",
+      patch: {
+        id: 10,
+        status: "pending_review",
+        awaiting_reply_token: "tok",
+        updated_at: "2026-07-16T02:00:00.000Z",
+      },
+    })
+    emit({ kind: "deleted", id: 10 })
+
+    const backend = getActiveBackendCacheKey()
+    expect(h.markConversationUpsert).toHaveBeenCalledTimes(1)
+    expect(h.markConversationUpsert).toHaveBeenCalledWith(backend, upsert)
+    expect(h.markConversationStatus).toHaveBeenCalledTimes(1)
+    expect(h.markConversationStatus).toHaveBeenCalledWith(
+      backend,
+      10,
+      "pending_review"
+    )
+    expect(h.markConversationDelete).toHaveBeenCalledTimes(1)
+    expect(h.markConversationDelete).toHaveBeenCalledWith(backend, 10)
+
+    // Original workspace-store behavior still occurs.
+    expect(screen.getByTestId("count")).toHaveTextContent("0")
+  })
+
   it("mounts conversation experience bootstrap on provider mount", async () => {
     await mountProvider()
     expect(h.conversationExperienceBootstrap).toHaveBeenCalled()
+  })
+
+  it("mounts acp agents and delegation profile bootstrap on provider mount", async () => {
+    await mountProvider()
+    expect(h.useAcpAgents).toHaveBeenCalled()
+    expect(h.delegationProfileBootstrap).toHaveBeenCalled()
   })
 
   it("inserts a new root conversation, prepending most-recent-first", async () => {

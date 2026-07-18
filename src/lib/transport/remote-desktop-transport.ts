@@ -165,6 +165,9 @@ export class RemoteDesktopTransport implements Transport {
     args?: Record<string, unknown>,
     options?: CallOptions
   ): Promise<T> {
+    // Remote-desktop proxies through Tauri IPC and cannot cancel an
+    // already-dispatched request. Honor a pre-dispatch abort only.
+    options?.signal?.throwIfAborted()
     try {
       // Forward `timeoutMs` through to `remote_http_call`. Without this,
       // the Rust client's 30s default fires before the backend can answer

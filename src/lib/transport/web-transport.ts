@@ -143,6 +143,13 @@ export class WebTransport implements Transport {
     options?: CallOptions
   ): Promise<T> {
     const token = getToken()
+    // Normalize an already-aborted caller signal before any network work so
+    // the controller treats it as silent cancellation, not a timeout.
+    const callerSignal = options?.signal
+    if (callerSignal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError")
+    }
+
     const controller = new AbortController()
     // Per-call override beats the transport-wide default. Used for
     // commands whose backend handler has its own long deadline that
@@ -150,10 +157,24 @@ export class WebTransport implements Transport {
     // "Request timed out" before the backend can return a structured
     // error. See `describeAgentOptions` in `lib/api.ts`.
     const effectiveTimeoutMs = options?.timeoutMs ?? WEB_CALL_TIMEOUT_MS
-    const timeout = window.setTimeout(
-      () => controller.abort(),
-      effectiveTimeoutMs
-    )
+    let timedOut = false
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, effectiveTimeoutMs)
+
+    const onCallerAbort = () => {
+      controller.abort()
+    }
+    // Register before fetch and recheck immediately after to close the
+    // check/listener race with a concurrent abort.
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true })
+    if (callerSignal?.aborted) {
+      window.clearTimeout(timeout)
+      callerSignal.removeEventListener("abort", onCallerAbort)
+      throw new DOMException("The operation was aborted.", "AbortError")
+    }
+
     let res: Response
     try {
       res = await fetch(`${this.baseUrl}/api/${command}`, {
@@ -167,11 +188,15 @@ export class WebTransport implements Transport {
       })
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        throw new Error("Request timed out")
+        if (timedOut) {
+          throw new Error("Request timed out")
+        }
+        throw new DOMException("The operation was aborted.", "AbortError")
       }
       throw err
     } finally {
       window.clearTimeout(timeout)
+      callerSignal?.removeEventListener("abort", onCallerAbort)
     }
     if (res.status === 401) {
       // Definitive auth failure. Surface the unified unauthorized dialog

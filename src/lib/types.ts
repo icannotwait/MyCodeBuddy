@@ -1017,6 +1017,19 @@ export interface DelegationProfileDocument {
   profiles: DelegationProfile[]
 }
 
+/** Revisioned delegation profile catalog for mention bootstrap. Mirrors Rust
+ *  `DelegationProfileCatalog`. */
+export interface DelegationProfileCatalog {
+  profiles: DelegationProfile[]
+  delegation_enabled: boolean
+  revision: number
+}
+
+/** Backend side-channel for the revisioned profile catalog. Mirrors Rust
+ *  `DELEGATION_PROFILE_CATALOG_CHANGED_EVENT`. */
+export const DELEGATION_PROFILE_CATALOG_CHANGED_EVENT =
+  "delegation-profile-catalog://changed"
+
 // ─── Automations ───────────────────────────────────────────────────────────
 // Mirrors src-tauri/src/models/automation.rs. Wire form is snake_case (serde
 // default), matching AgentDelegationDefaults.
@@ -2340,6 +2353,152 @@ export interface GitHeadInfo {
   detached: boolean
   /** Short commit hash, present when detached. */
   short_sha: string | null
+  /**
+   * Stable wire form of the repo toplevel. Optional so a window attached to
+   * an older remote backend degrades to no commit preview instead of failing
+   * structural fixtures. Always serialized by current backends as a value or
+   * `null` (snake_case wire).
+   */
+  canonical_repo?: string | null
+  /** Full HEAD SHA when committed; null for unborn / non-repo. */
+  head_sha?: string | null
+  /** Opaque commit-source epoch (`v1:<sha256>`) for reference search. */
+  reference_source_epoch?: string | null
+}
+
+// ─── Incremental reference search (wire protocol mirrors) ───────────────────
+// Camel-case field names match Rust `#[serde(rename_all = "camelCase")]`.
+// Backend source `"conversation"` is adapted to frontend group kind `"session"`
+// by consumers; the wire enum value remains `"conversation"`.
+
+export type ReferenceSearchSource = "file" | "conversation" | "commit"
+
+export type ReferenceDoneReason = "exhausted" | "limit"
+
+export type ReferenceFileKind = "file" | "directory"
+
+export interface StartReferenceSearchRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+  query: string
+  workspacePath?: string | null
+}
+
+export interface NextReferenceSearchPageRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+  pageIndex: number
+}
+
+export interface CancelReferenceSearchRequest {
+  searchSessionId: string
+  sourceSequence: number
+  requestId: string
+  source: ReferenceSearchSource
+}
+
+export interface ValidateReferenceCandidateRequest {
+  validationRequestId: string
+  source: ReferenceSearchSource
+  uri: string
+  query: string
+  workspacePath?: string | null
+  sourceEpoch?: string | null
+}
+
+export interface ReferenceRegexRank {
+  fieldTier: number
+  start: number
+  length: number
+}
+
+export type ReferenceCandidateMetadata =
+  | {
+      kind: "file"
+      canonicalWorkspaceRoot: string
+      relativePath: string
+      entryKind: ReferenceFileKind
+    }
+  | {
+      kind: "conversation"
+      conversationId: number
+      agentType: AgentType
+      status: string
+      branch: string | null
+      projectName: string
+      projectPath: string
+    }
+  | {
+      kind: "commit"
+      canonicalRepo: string
+      fullHash: string
+      shortHash: string
+      subject: string
+      message: string
+      author: string
+      authoredAt: string
+    }
+
+export interface ReferenceCandidate {
+  source: ReferenceSearchSource
+  uri: string
+  id: string
+  label: string
+  detail: string | null
+  keywords: string
+  metadata: ReferenceCandidateMetadata
+  sourceOrdinal: number
+  regexRank: ReferenceRegexRank | null
+}
+
+export interface ReferenceSearchPage {
+  sourceSequence: number
+  requestId: string
+  pageIndex: number
+  items: ReferenceCandidate[]
+  sourceEpoch: string | null
+  done: boolean
+  doneReason: ReferenceDoneReason | null
+}
+
+export type ReferenceCandidateValidation =
+  | {
+      status: "match"
+      validationRequestId: string
+      candidate: ReferenceCandidate
+      regexRank: ReferenceRegexRank | null
+    }
+  | {
+      status: "not_match"
+      validationRequestId: string
+      candidate: ReferenceCandidate
+      regexRank: ReferenceRegexRank | null
+    }
+  | {
+      status: "not_found"
+      validationRequestId: string
+    }
+
+export interface ReferenceDescriptor {
+  id: string
+  sourceOrdinal: number
+  primary: string[]
+  secondary: string[]
+}
+
+export interface MatchReferenceRegexRequest {
+  query: string
+  descriptors: ReferenceDescriptor[]
+}
+
+export interface ReferenceRegexMatch {
+  id: string
+  sourceOrdinal: number
+  rank: ReferenceRegexRank
 }
 
 /**

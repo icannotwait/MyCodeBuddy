@@ -2,9 +2,16 @@
 
 import { useEffect, type ReactNode } from "react"
 import { getGitHead } from "@/lib/api"
+import { selectAcpAgentsFresh, useAcpAgents } from "@/hooks/use-acp-agents"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
+import { referenceSearchCache } from "@/lib/reference-search-cache"
+import { getActiveBackendCacheKey } from "@/lib/transport"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useConversationExperienceBootstrap } from "@/stores/conversation-experience-store"
+import {
+  useDelegationProfileBootstrap,
+  useDelegationProfileStore,
+} from "@/stores/delegation-profile-store"
 import {
   CONVERSATION_CHANGED_EVENT,
   FOLDER_CHANGED_EVENT,
@@ -17,6 +24,15 @@ interface AppWorkspaceProviderProps {
 }
 
 /**
+ * True once ACP agents are fresh and the profile catalog store has finished
+ * its first bootstrap attempt (success or error). A profile error still
+ * permits agent-only mentions because `ready` latches true on failure.
+ */
+export function selectReferenceCatalogReady(): boolean {
+  return selectAcpAgentsFresh() && useDelegationProfileStore.getState().ready
+}
+
+/**
  * Event wiring for `useAppWorkspaceStore` — state itself lives in the store
  * (components subscribe to slices via selectors, not through a context value).
  * This component owns the pieces that need a React lifecycle: initial fetches,
@@ -25,6 +41,10 @@ interface AppWorkspaceProviderProps {
  */
 export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
   useConversationExperienceBootstrap()
+  // Keep the shared ACP agent subscription alive for reference search, and
+  // bootstrap the revisioned profile catalog outside mention opening.
+  useAcpAgents()
+  useDelegationProfileBootstrap()
 
   useEffect(() => {
     const { fetchFolders, refreshConversations } =
@@ -45,12 +65,20 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
         CONVERSATION_CHANGED_EVENT,
         (change) => {
           const store = useAppWorkspaceStore.getState()
+          const backend = getActiveBackendCacheKey()
           if (change.kind === "upsert") {
             store.applyConversationUpsert(change.summary)
+            referenceSearchCache.markConversationUpsert(backend, change.summary)
           } else if (change.kind === "deleted") {
             store.applyConversationRemove(change.id)
+            referenceSearchCache.markConversationDelete(backend, change.id)
           } else {
             store.applyConversationStatePatch(change.patch)
+            referenceSearchCache.markConversationStatus(
+              backend,
+              change.patch.id,
+              change.patch.status
+            )
           }
         }
       )

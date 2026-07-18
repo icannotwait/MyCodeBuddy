@@ -1103,7 +1103,11 @@
     "autoTitleOff": "끄기",
     "autoTitleUnavailable": "{agent} (사용할 수 없음)",
     "autoTitleSaveFailed": "자동 제목 에이전트를 저장하지 못했습니다: {message}",
-    "autoTitleLoading": "자동 제목 설정을 불러오는 중..."
+    "autoTitleLoading": "자동 제목 설정을 불러오는 중...",
+    "referenceSearchLimit": "참조 결과 한도",
+    "referenceSearchLimitHint": "리소스 소스별로 캐시하고 검색할 최대 결과 수(10~500).",
+    "referenceSearchLimitSave": "참조 한도 저장",
+    "referenceSearchLimitSaveFailed": "참조 결과 한도를 저장하지 못했습니다: {message}"
   },
   "LoginPage": {
     "documentTitle": "로그인 - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "에이전트",
         "mentionGroupSession": "세션",
         "mentionGroupCommit": "커밋",
-        "mentionGroupSkill": "스킬"
+        "mentionGroupSkill": "스킬",
+        "mentionInvalidPattern": "잘못된 정규식",
+        "mentionSourceError": "이 소스를 새로 고치지 못했습니다",
+        "mentionProfileError": "위임 프로필을 불러오지 못했습니다"
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",

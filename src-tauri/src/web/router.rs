@@ -74,6 +74,10 @@ pub fn build_router(
             post(handlers::delegation::get_delegation_profiles),
         )
         .route(
+            "/get_delegation_profile_catalog",
+            post(handlers::delegation::get_delegation_profile_catalog),
+        )
+        .route(
             "/set_delegation_profiles",
             post(handlers::delegation::set_delegation_profiles),
         )
@@ -96,6 +100,34 @@ pub fn build_router(
         .route(
             "/set_auto_title_agent",
             post(handlers::conversation_experience::set_auto_title_agent),
+        )
+        .route(
+            "/set_reference_search_limit",
+            post(handlers::conversation_experience::set_reference_search_limit),
+        )
+        .route(
+            "/start_reference_search",
+            post(handlers::reference_search::start_reference_search),
+        )
+        .route(
+            "/next_reference_search_page",
+            post(handlers::reference_search::next_reference_search_page),
+        )
+        .route(
+            "/cancel_reference_search",
+            post(handlers::reference_search::cancel_reference_search),
+        )
+        .route(
+            "/validate_reference_candidate",
+            post(handlers::reference_search::validate_reference_candidate),
+        )
+        .route(
+            "/match_reference_regex",
+            post(handlers::reference_search::match_reference_regex).layer(
+                DefaultBodyLimit::max(
+                    handlers::reference_search::MAX_REFERENCE_REGEX_HTTP_BODY_BYTES,
+                ),
+            ),
         )
         .route(
             "/submit_session_feedback",

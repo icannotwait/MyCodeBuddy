@@ -1103,7 +1103,11 @@
     "autoTitleOff": "Off",
     "autoTitleUnavailable": "{agent} (Unavailable)",
     "autoTitleSaveFailed": "Failed to save automatic title agent: {message}",
-    "autoTitleLoading": "Loading automatic title settings..."
+    "autoTitleLoading": "Loading automatic title settings...",
+    "referenceSearchLimit": "Reference result limit",
+    "referenceSearchLimitHint": "Maximum cached and searched results per resource source (10-500).",
+    "referenceSearchLimitSave": "Save reference limit",
+    "referenceSearchLimitSaveFailed": "Failed to save reference limit: {message}"
   },
   "LoginPage": {
     "documentTitle": "Login - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Skills"
+        "mentionGroupSkill": "Skills",
+        "mentionInvalidPattern": "Invalid regular expression",
+        "mentionSourceError": "This source could not be refreshed",
+        "mentionProfileError": "Delegation profiles could not be loaded"
       },
       "messageQueue": {
         "addToQueue": "Queue message",

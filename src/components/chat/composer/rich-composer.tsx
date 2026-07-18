@@ -29,11 +29,8 @@ import {
   MENTION_LISTBOX_ID,
   SuggestionPopup,
 } from "./suggestion/suggestion-popup"
-import type {
-  MentionUiLabels,
-  ReferenceSearch,
-  SuggestionPopupHandle,
-} from "./suggestion/types"
+import type { ReferenceSearchController } from "./reference-search-controller"
+import type { MentionUiLabels, SuggestionPopupHandle } from "./suggestion/types"
 import type { ReferenceAttrs, ReferenceKind } from "./types"
 
 /**
@@ -111,12 +108,12 @@ export interface RichComposerProps {
    */
   onReady?: () => void
   /**
-   * Enables the unified `@` mention panel. Resolves the typed query into
-   * grouped suggestions (files/agents/sessions/commits/skills). MUST be
-   * referentially stable (memoize it) — it is a dependency of the panel's fetch
-   * effect. Omit to disable mentions.
+   * Independent-source `@` mention controller. `null`/omit keeps the mention
+   * extension installed but inert (so a later non-null value does not rebuild
+   * the editor). When the instance identity changes while a picker is open the
+   * previous controller is closed idempotently.
    */
-  referenceSearch?: ReferenceSearch
+  referenceController?: ReferenceSearchController | null
   /**
    * Localized chrome for the `@` panel (empty / loading / listbox name / "more
    * results" hint / result-count announcement). English fallbacks apply when
@@ -169,8 +166,8 @@ export interface RichComposerProps {
 /**
  * Plain-text message composer: a Tiptap editor with IME-safe Enter-to-submit,
  * inline reference badges (the five built-in reference kinds), and an optional
- * unified `@` mention panel (enabled by `referenceSearch`). No Markdown — typed
- * formatting stays literal; see {@link buildComposerExtensions}.
+ * unified `@` mention panel (enabled by `referenceController`). No Markdown —
+ * typed formatting stays literal; see {@link buildComposerExtensions}.
  */
 export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
   function RichComposer(
@@ -187,7 +184,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onFocus,
       onBlur,
       onReady,
-      referenceSearch,
+      referenceController = null,
       mentionUiLabels,
       tabLabels,
       submitShortcut,
@@ -206,10 +203,13 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const onFocusRef = useRef(onFocus)
     const onBlurRef = useRef(onBlur)
     const onReadyRef = useRef(onReady)
-    // Latest referenceSearch, read at event time so the mention plugin (always
-    // installed) is gated on whether mentions are currently enabled — robust to
-    // the prop being added/removed after the editor is created once.
-    const referenceSearchRef = useRef(referenceSearch)
+    // Latest reference controller, read at event time so the mention plugin
+    // (always installed) is gated on catalog readiness without rebuilding the
+    // editor when the prop later becomes non-null.
+    const referenceControllerRef = useRef(referenceController)
+    // Controller that owns the currently open picker (may differ from the latest
+    // prop during a replacement). onExit closes exactly this instance.
+    const owningControllerRef = useRef<ReferenceSearchController | null>(null)
     const submitShortcutRef = useRef(submitShortcut)
     const newlineShortcutRef = useRef(newlineShortcut)
     const isExternalMenuOpenRef = useRef(isExternalMenuOpen)
@@ -225,7 +225,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onFocusRef.current = onFocus
       onBlurRef.current = onBlur
       onReadyRef.current = onReady
-      referenceSearchRef.current = referenceSearch
+      referenceControllerRef.current = referenceController
       submitShortcutRef.current = submitShortcut
       newlineShortcutRef.current = newlineShortcut
       isExternalMenuOpenRef.current = isExternalMenuOpen
@@ -244,23 +244,29 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     // (so Enter defers to the panel without waiting for a re-render).
     const mentionOpenRef = useRef(false)
     const popupRef = useRef<SuggestionPopupHandle>(null)
-    // Stable controller created once (refs/setState are stable), so the editor
-    // is built a single time with it.
+    // Stable Tiptap controller created once (refs/setState are stable), so the
+    // editor is built a single time with it.
     const mentionController = useMemo<MentionController>(
       () => ({
         onStart: (mention) => {
-          // Inert unless mentions are enabled (no referenceSearch → no panel).
-          if (!referenceSearchRef.current) return
+          // Inert while the catalog/controller is not ready.
+          const live = referenceControllerRef.current
+          if (!live) return
+          owningControllerRef.current = live
           mentionOpenRef.current = true
           setMentionState(mention)
         },
         onUpdate: (mention) => {
-          if (!referenceSearchRef.current) return
+          if (!referenceControllerRef.current) return
           setMentionState(mention)
         },
         onExit: () => {
           mentionOpenRef.current = false
           setMentionState(null)
+          // Close exactly the instance that owned this picker session.
+          const owned = owningControllerRef.current
+          owningControllerRef.current = null
+          owned?.close()
         },
         onKeyDown: (event) => popupRef.current?.onKeyDown(event) ?? false,
       }),
@@ -271,11 +277,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       // Static export / SSR safety: never render on the server.
       immediatelyRender: false,
       // The mention plugin is always installed (the editor is created once);
-      // it stays inert until `referenceSearch` is set (checked at runtime in the
-      // controller). `mentionController` (stable, from useMemo) captures refs
-      // but only dereferences them inside event-time callbacks, never during
-      // render — the React Compiler lint can't prove that. Mirrors Tiptap's own
-      // React suggestion pattern (render() → component.ref.onKeyDown).
+      // it stays inert until `referenceController` is non-null (checked at
+      // runtime). `mentionController` (stable, from useMemo) captures refs but
+      // only dereferences them inside event-time callbacks, never during render
+      // — the React Compiler lint can't prove that. Mirrors Tiptap's own React
+      // suggestion pattern (render() → component.ref.onKeyDown).
       // eslint-disable-next-line react-hooks/refs
       extensions: buildComposerExtensions({ placeholder, mentionController }),
       editable: !disabled,
@@ -288,6 +294,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           ...(ariaLabel ? { "aria-label": ariaLabel } : {}),
         },
         handleKeyDown: (view, event) => {
+          // IME: never route submit/newline/menu keys while a composition is in
+          // flight (isComposing, legacy keyCode 229, or ProseMirror composing).
+          if (event.isComposing || event.keyCode === 229 || view.composing) {
+            return false
+          }
           // The internal `@` panel's suggestion plugin owns its navigation keys;
           // never submit/break while it is open.
           if (mentionOpenRef.current) return false
@@ -433,20 +444,35 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       mentionOpenRef.current = false
       setMentionState(null)
       // Also dismiss the Tiptap suggestion plugin so its state can't stay active
-      // while React thinks the panel is closed (onExit will also fire).
+      // while React thinks the panel is closed (onExit will also fire and close
+      // the owning controller idempotently).
       const view = editor?.view
       if (view) exitSuggestion(view)
     }, [editor])
 
-    // If mentions get disabled while a panel is open, actively dismiss it so the
-    // editor's Enter handling and the plugin state return to normal (the popup
-    // also unmounts via the render guard below).
+    // When the controller prop is replaced or cleared while a picker is open,
+    // close the previous owner, clear mention state/ARIA, and let a later
+    // trigger use the new ref. close() is idempotent so hook cleanup + this
+    // path + onExit never double-cancel.
+    const previousControllerRef = useRef(referenceController)
     useEffect(() => {
-      if (!referenceSearch && mentionOpenRef.current) closeMention()
-    }, [referenceSearch, closeMention])
+      const previous = previousControllerRef.current
+      previousControllerRef.current = referenceController
+      if (previous === referenceController) return
+      if (!mentionOpenRef.current) return
+      if (previous) {
+        if (owningControllerRef.current === previous) {
+          owningControllerRef.current = null
+        }
+        previous.close()
+      }
+      closeMention()
+    }, [referenceController, closeMention])
 
     const handleReferenceSelect = useCallback(
       (reference: ReferenceAttrs, range: { from: number; to: number }) => {
+        // Pointer confirmation has no KeyboardEvent — block while IME is live.
+        if (editor?.view.composing) return
         editor
           ?.chain()
           .focus()
@@ -457,6 +483,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         closeMention()
       },
       [editor, closeMention]
+    )
+
+    const isEditorComposing = useCallback(
+      () => editor?.view.composing === true,
+      [editor]
     )
 
     // Combobox ARIA on the editing surface: DOM focus stays in the editor while
@@ -501,7 +532,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           editor={editor}
           className="codeg-composer-scroll min-h-0 flex-1 overflow-y-auto px-3 py-2 text-base md:text-sm"
         />
-        {referenceSearch && mentionState && (
+        {referenceController && mentionState && (
           <SuggestionPopup
             // Remount per `@` session so panel state (active/pinned tab,
             // selection) never leaks when one suggestion exits and another
@@ -509,15 +540,19 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             key={mentionState.range.from}
             ref={popupRef}
             state={mentionState}
-            search={referenceSearch}
+            controller={referenceController}
             onSelect={handleReferenceSelect}
             onClose={closeMention}
             onActiveOptionChange={handleActiveOptionChange}
+            isEditorComposing={isEditorComposing}
             emptyLabel={mentionUiLabels?.empty}
             loadingLabel={mentionUiLabels?.loading}
             listboxLabel={mentionUiLabels?.listbox}
             moreLabel={mentionUiLabels?.more}
             countLabel={mentionUiLabels?.count}
+            invalidPatternLabel={mentionUiLabels?.invalidPattern}
+            sourceErrorLabel={mentionUiLabels?.sourceError}
+            profileErrorLabel={mentionUiLabels?.profileError}
             tabLabels={tabLabels}
           />
         )}

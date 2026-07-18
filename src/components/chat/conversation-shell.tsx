@@ -28,6 +28,8 @@ interface ConversationShellProps {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   defaultPath?: string
+  /** Authoritative folder scope for mention search (`ownFolderId`, not `0`). */
+  folderId?: number | null
   agentName?: string
   error: string | null
   claudeApiRetry: ClaudeApiRetryState | null
@@ -95,6 +97,7 @@ export function ConversationShell({
   status,
   promptCapabilities,
   defaultPath,
+  folderId = null,
   agentName,
   error,
   claudeApiRetry,
@@ -234,6 +237,7 @@ export function ConversationShell({
               status={status}
               promptCapabilities={promptCapabilities}
               defaultPath={defaultPath}
+              folderId={folderId}
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}

@@ -1,54 +1,20 @@
 "use client"
 
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 
 import { useAcpAgents } from "@/hooks/use-acp-agents"
-import type { FlatFileEntry } from "@/hooks/use-file-tree"
-import {
-  cancelWorkspaceFileSearch,
-  getDelegationProfiles,
-  gitLog,
-  listAllConversations,
-  searchWorkspaceFiles,
-  type WorkspaceFileSearchIdentity,
-} from "@/lib/api"
-import { randomUUID } from "@/lib/utils"
-import type {
-  AcpAgentInfo,
-  DbConversationSummary,
-  GitLogEntry,
-  DelegationProfile,
-} from "@/lib/types"
+import { getGitHead } from "@/lib/api"
+import { referenceSearchCache } from "@/lib/reference-search-cache"
+import { getActiveBackendCacheKey } from "@/lib/transport"
+import type { GitHeadInfo } from "@/lib/types"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useConversationExperienceStore } from "@/stores/conversation-experience-store"
+import { useDelegationProfileStore } from "@/stores/delegation-profile-store"
 
 import {
-  agentToSuggestion,
-  commitToSuggestion,
-  fileToSuggestion,
-  profileToSuggestion,
-  sessionToSuggestion,
-} from "./suggestion/adapters"
-import type {
-  ReferenceSearch,
-  SuggestionGroup,
-  SuggestionItem,
-} from "./suggestion/types"
-
-// Commit-synchronous on the client (so the guard-critical refs are updated
-// during commit, before any later macrotask/microtask can resolve a stale
-// in-flight fetch), but a no-op-safe passive effect during the static-export
-// prerender where `useLayoutEffect` would warn.
-const useIsomorphicLayoutEffect =
-  typeof window !== "undefined" ? useLayoutEffect : useEffect
-
-/** Max rows surfaced per group (mirrors the textarea `@` menu's file cap). */
-const MAX_PER_GROUP = 50
-/** How many commits the git-log group pulls (client-filtered down from here). */
-const GIT_LOG_LIMIT = 100
-const EMPTY_COMMITS: Promise<GitLogEntry[]> = Promise.resolve([])
-
-function cancelFileSearchSilently(identity: WorkspaceFileSearchIdentity): void {
-  void cancelWorkspaceFileSearch(identity).catch(() => undefined)
-}
+  ReferenceSearchController,
+  type ReferenceSearchControllerInputs,
+} from "./reference-search-controller"
 
 /** Display headings for each group; injected so the host can localize them. */
 export interface ReferenceGroupLabels {
@@ -71,380 +37,108 @@ export const DEFAULT_GROUP_LABELS: ReferenceGroupLabels = {
   skill: "Skills",
 }
 
-/** Raw, already-loaded data the pure group builder turns into suggestions. */
-export interface ReferenceSearchSources {
-  files: FlatFileEntry[]
-  /**
-   * When true, `files` were already filtered/capped by the backend search
-   * (or a test fixture) for the current query — do not re-filter on the client.
-   */
-  filesAlreadyFiltered?: boolean
-  /** Server-side (or fixture) truncated flag when `filesAlreadyFiltered`. */
-  filesTruncated?: boolean
-  /** Workspace root the `files` were loaded under; null disables the group. */
-  workspaceRoot: string | null
-  agents: AcpAgentInfo[]
-  profiles?: DelegationProfile[]
-  sessions: DbConversationSummary[]
-  commits: GitLogEntry[]
-  /** Repo identity for commit URIs; null disables the commit group. */
-  repoKey: string | null
-}
-
-/** Case-insensitive substring match against an adapted item's searchable text. */
-function suggestionMatches(item: SuggestionItem, lowerQuery: string): boolean {
-  if (!lowerQuery) return true
-  const ref = item.reference
-  return (
-    ref.label.toLowerCase().includes(lowerQuery) ||
-    ref.id.toLowerCase().includes(lowerQuery) ||
-    (item.keywords ?? "").toLowerCase().includes(lowerQuery) ||
-    (item.detail ?? "").toLowerCase().includes(lowerQuery)
-  )
+export interface UseReferenceSearchControllerOptions {
+  folderId: number | null
+  defaultPath: string | null
+  enabled: boolean
+  labels: ReferenceGroupLabels
 }
 
 /**
- * Pure: filter + adapt the raw sources into the fixed-order grouped suggestions
- * the `@` panel renders (files → agents → sessions → commits). Each group is
- * independently capped at {@link MAX_PER_GROUP}; empty groups are kept
- * (the popup hides them) so the order is always stable. Extracted from the hook
- * so the matching/ordering/dedup logic is testable without React.
+ * Constructs one independent-source {@link ReferenceSearchController} per
+ * backend/folder/path after the shared agent+profile catalog is ready. Returns
+ * null before readiness so the mention extension stays inert without rebuilding
+ * the editor.
  */
-export function buildReferenceGroups(
-  query: string,
-  sources: ReferenceSearchSources,
-  labels: ReferenceGroupLabels = DEFAULT_GROUP_LABELS
-): SuggestionGroup[] {
-  const q = query.trim().toLowerCase()
-
-  // Files: either already filtered by backend search (on-demand path) or a local
-  // list that still needs client-side substring matching (unit tests / legacy).
-  const fileItems: SuggestionItem[] = []
-  let fileTruncated = false
-  const root = sources.workspaceRoot
-  if (root) {
-    if (sources.filesAlreadyFiltered) {
-      for (const entry of sources.files) {
-        if (fileItems.length >= MAX_PER_GROUP) {
-          fileTruncated = true
-          break
-        }
-        fileItems.push(fileToSuggestion(entry, root))
-      }
-      fileTruncated = fileTruncated || Boolean(sources.filesTruncated)
-    } else {
-      for (const entry of sources.files) {
-        if (q && !entry.lowerName.includes(q) && !entry.lowerPath.includes(q)) {
-          continue
-        }
-        if (fileItems.length >= MAX_PER_GROUP) {
-          fileTruncated = true
-          break
-        }
-        fileItems.push(fileToSuggestion(entry, root))
-      }
-    }
-  }
-
-  // Only enabled agents are mentionable — a disabled agent (toggled off in
-  // settings) can't be referenced, so it never appears in the `@` panel (its
-  // tab count and `truncated` flag follow from this filtered set too).
-  const profiles = (sources.profiles ?? []).filter((profile) => profile.enabled)
-  const agentMatches = sources.agents
-    .filter((agent) => agent.enabled)
-    .flatMap((agent) => [
-      agentToSuggestion(agent),
-      ...profiles
-        .filter((profile) => profile.agent_type === agent.agent_type)
-        .map(profileToSuggestion),
-    ])
-    .filter((item) => suggestionMatches(item, q))
-  const agentItems = agentMatches.slice(0, MAX_PER_GROUP)
-
-  const sessionMatches = sources.sessions
-    .map(sessionToSuggestion)
-    .filter((item) => suggestionMatches(item, q))
-  const sessionItems = sessionMatches.slice(0, MAX_PER_GROUP)
-
-  const commitItems: SuggestionItem[] = []
-  let commitTruncated = false
-  if (sources.repoKey) {
-    const repoKey = sources.repoKey
-    for (const entry of sources.commits) {
-      const item = commitToSuggestion(entry, repoKey)
-      if (!suggestionMatches(item, q)) continue
-      if (commitItems.length >= MAX_PER_GROUP) {
-        commitTruncated = true
-        break
-      }
-      commitItems.push(item)
-    }
-  }
-
-  return [
-    {
-      kind: "file",
-      label: labels.file,
-      items: fileItems,
-      truncated: fileTruncated,
-    },
-    {
-      kind: "agent",
-      label: labels.agent,
-      items: agentItems,
-      truncated: agentMatches.length > MAX_PER_GROUP,
-    },
-    {
-      kind: "session",
-      label: labels.session,
-      items: sessionItems,
-      truncated: sessionMatches.length > MAX_PER_GROUP,
-    },
-    {
-      kind: "commit",
-      label: labels.commit,
-      items: commitItems,
-      truncated: commitTruncated,
-    },
-  ]
-}
-
-export interface UseReferenceSearchOptions {
-  /**
-   * Workspace root for the file + commit groups (and the commit `repoKey`).
-   * When empty/null those two groups stay empty while agents/sessions still
-   * resolve, so a brand-new draft tab degrades gracefully (R8).
-   */
-  defaultPath?: string | null
-  /**
-   * Gates searching. When false the search resolves to empty groups and no
-   * network / workspace file search is issued.
-   */
-  enabled?: boolean
-  /** Localized group headings; English fallbacks when omitted. */
-  labels?: ReferenceGroupLabels
-}
-
-function hitToFlatEntry(hit: {
-  name: string
-  path: string
-  kind: string
-}): FlatFileEntry {
-  const kind: "file" | "dir" = hit.kind === "dir" ? "dir" : "file"
-  return {
-    name: hit.name,
-    relativePath: hit.path,
-    kind,
-    lowerPath: hit.path.toLowerCase(),
-    lowerName: hit.name.toLowerCase(),
-  }
-}
-
-/**
- * Compose the live data sources (workspace file search, ACP agents, conversations,
- * git log) into a single {@link ReferenceSearch} for the composer's `@` panel.
- *
- * Referential stability is the contract: the suggestion popup re-runs its fetch
- * whenever the `search` identity changes (`suggestion-popup.tsx`), so the
- * returned function is an empty-dependency `useCallback` that reads every source
- * from a ref. A background refresh of any source (e.g. the agent list reloading
- * on window focus) updates the refs but leaves `search` identity untouched — the
- * open panel keeps its results and the user's selection (R7).
- *
- * **Files are never pre-warmed.** Opening `@` (or typing a filter) calls
- * `search_workspace_files` with limit {@link MAX_PER_GROUP}; the backend walks
- * with ignore rules and early-exits once enough hits are found. Sessions and
- * the git log stay lazily fetched on the first `@`, key-cached in a ref;
- * window focus busts those caches so they stay fresh.
- */
-export function useReferenceSearch({
+export function useReferenceSearchController({
+  folderId,
   defaultPath,
-  enabled = true,
+  enabled,
   labels,
-}: UseReferenceSearchOptions): ReferenceSearch {
+}: UseReferenceSearchControllerOptions): ReferenceSearchController | null {
+  const { agents, fresh: agentsFresh } = useAcpAgents()
+  const profileReady = useDelegationProfileStore((s) => s.ready)
+  const profileCatalog = useDelegationProfileStore((s) => s.catalog)
+  const profileError = useDelegationProfileStore((s) => s.error)
+  const catalogReady = agentsFresh && profileReady
+  const referenceLimit =
+    useConversationExperienceStore((s) => s.settings?.reference_search_limit) ??
+    50
+  const gitHead = useAppWorkspaceStore((s) =>
+    folderId != null ? (s.gitHeads.get(folderId) ?? null) : null
+  )
+
+  const backendKey = getActiveBackendCacheKey()
   const path = defaultPath || null
 
-  const { agents } = useAcpAgents()
-
-  const agentsRef = useRef(agents)
-  const pathRef = useRef(path)
-  const enabledRef = useRef(enabled)
-  const labelsRef = useRef(labels)
-  const fileSearchSessionIdRef = useRef<string | null>(null)
-  const activeFileSearchRef = useRef<WorkspaceFileSearchIdentity | null>(null)
-
-  // `pathRef` and `enabledRef` gate the post-await freshness check in `search`,
-  // so they must reflect the *committed* folder/enabled state synchronously at
-  // commit — a passive effect can lag behind a stale in-flight fetch that
-  // resolves in the post-commit / pre-effect window, leaking the old folder's
-  // commits into the new panel. A layout effect (not a render-phase write) keeps
-  // them commit-accurate without updating from an uncommitted transition render.
-  useIsomorphicLayoutEffect(() => {
-    pathRef.current = path
-    enabledRef.current = enabled
-    return () => {
-      const active = activeFileSearchRef.current
-      if (active) {
-        activeFileSearchRef.current = null
-        cancelFileSearchSilently(active)
+  const fetchGitHead = useCallback(async (): Promise<GitHeadInfo> => {
+    if (!path) {
+      return {
+        is_repo: false,
+        branch: null,
+        detached: false,
+        short_sha: null,
+        canonical_repo: null,
+        head_sha: null,
+        reference_source_epoch: null,
       }
     }
-  }, [path, enabled])
+    return getGitHead(path)
+  }, [path])
 
+  const applyGitHead = useCallback(
+    (head: GitHeadInfo) => {
+      if (folderId == null) return
+      useAppWorkspaceStore.getState().applyGitHead(folderId, head)
+    },
+    [folderId]
+  )
+
+  const [controller, setController] =
+    useState<ReferenceSearchController | null>(null)
+
+  // Stable constructor identity: backend / folder / path / enabled / ready.
   useEffect(() => {
-    agentsRef.current = agents
-    labelsRef.current = labels
-  }, [agents, labels])
-
-  // Lazily-fetched network sources, key-cached so repeat searches reuse the
-  // in-flight/resolved promise while a folder switch refetches.
-  const sessionsRef = useRef<{
-    key: string
-    promise: Promise<DbConversationSummary[]>
-  } | null>(null)
-  const commitsRef = useRef<{
-    key: string
-    promise: Promise<GitLogEntry[]>
-  } | null>(null)
-  const profilesRef = useRef<Promise<DelegationProfile[]> | null>(null)
-
-  // Bust the lazy caches when the window regains focus so a session created in
-  // another window (or new commits) show up on the next `@` — matching the
-  // focus-refresh idiom of the other data hooks, without per-keystroke fetches.
-  // File search is always live (query-keyed); no file cache to bust.
-  useEffect(() => {
-    const onFocus = () => {
-      sessionsRef.current = null
-      commitsRef.current = null
-      profilesRef.current = null
-    }
-    window.addEventListener("focus", onFocus)
-    return () => window.removeEventListener("focus", onFocus)
-  }, [])
-
-  return useCallback<ReferenceSearch>(async (query, signal) => {
-    if (!enabledRef.current || signal?.aborted) return []
-
-    const path = pathRef.current
-
-    // Lazy session fetch. On rejection the cache entry is cleared (not cached as
-    // an empty result) so the next `@` retries instead of wedging on `[]`.
-    const sessionsKey = "all"
-    let sessionsEntry = sessionsRef.current
-    if (sessionsEntry?.key !== sessionsKey) {
-      const created: NonNullable<typeof sessionsRef.current> = {
-        key: sessionsKey,
-        promise: listAllConversations().catch(() => {
-          if (sessionsRef.current === created) sessionsRef.current = null
-          return [] as DbConversationSummary[]
-        }),
-      }
-      sessionsRef.current = created
-      sessionsEntry = created
-    }
-
-    // Lazy git-log fetch, keyed by path with the same retry-on-rejection policy.
-    let commitsPromise = EMPTY_COMMITS
-    if (path) {
-      let commitsEntry = commitsRef.current
-      if (commitsEntry?.key !== path) {
-        const created: NonNullable<typeof commitsRef.current> = {
-          key: path,
-          promise: gitLog(path, GIT_LOG_LIMIT)
-            .then((result) => result.entries)
-            .catch(() => {
-              if (commitsRef.current === created) commitsRef.current = null
-              return [] as GitLogEntry[]
-            }),
-        }
-        commitsRef.current = created
-        commitsEntry = created
-      }
-      commitsPromise = commitsEntry.promise
-    } else {
-      commitsRef.current = null
-    }
-
-    profilesRef.current ??= getDelegationProfiles()
-      .then((document) => document.profiles)
-      .catch(() => {
-        profilesRef.current = null
-        return []
+    if (!enabled || !catalogReady) {
+      setController((prev) => {
+        prev?.close()
+        return null
       })
+      return
+    }
 
-    // On-demand file search — only when there is a workspace path. No pre-warm:
-    // the popup already debounces (~150ms) before calling `search`.
-    let filesPromise: ReturnType<typeof searchWorkspaceFiles> = Promise.resolve({
-      files: [],
-      truncated: false,
+    const next = new ReferenceSearchController({
+      backendKey,
+      folderId,
+      defaultPath: path,
+      cache: referenceSearchCache,
+      fetchGitHead,
+      applyGitHead,
     })
-    if (path) {
-      const searchSessionId =
-        fileSearchSessionIdRef.current ??
-        (fileSearchSessionIdRef.current = randomUUID())
-      const identity: WorkspaceFileSearchIdentity = {
-        searchSessionId,
-        requestId: randomUUID(),
-      }
-      const previous = activeFileSearchRef.current
-      if (previous) {
-        activeFileSearchRef.current = null
-        cancelFileSearchSilently(previous)
-      }
-      activeFileSearchRef.current = identity
-
-      const onAbort = () => {
-        if (activeFileSearchRef.current === identity) {
-          activeFileSearchRef.current = null
-        }
-        cancelFileSearchSilently(identity)
-      }
-      signal?.addEventListener("abort", onAbort, { once: true })
-      filesPromise = searchWorkspaceFiles(
-        path,
-        query,
-        MAX_PER_GROUP,
-        identity
-      )
-        .catch(() => ({ files: [], truncated: false }))
-        .finally(() => {
-          signal?.removeEventListener("abort", onAbort)
-          if (activeFileSearchRef.current === identity) {
-            activeFileSearchRef.current = null
-          }
-        })
+    setController(next)
+    return () => {
+      next.close()
     }
+    // fetchGitHead/applyGitHead are recreated when path/folderId change, which
+    // is already covered by those deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, catalogReady, backendKey, folderId, path])
 
-    const [sessions, commits, profiles, fileSearch] = await Promise.all([
-      sessionsEntry.promise,
-      commitsPromise,
-      profilesRef.current,
-      filesPromise,
-    ])
-    // Discard this result if it can no longer be trusted for the live panel: a
-    // newer query aborted us, the composer was disabled, or the workspace folder
-    // changed while the network fetch was in flight (the popup only aborts on a
-    // query change, so a folder switch would otherwise leak the old repo's
-    // commits — built against `path` — into the new folder's panel). The next
-    // keystroke re-runs the search against the current folder.
-    if (signal?.aborted || !enabledRef.current || pathRef.current !== path) {
-      return []
-    }
+  const inputs: ReferenceSearchControllerInputs = useMemo(
+    () => ({
+      agents,
+      profileCatalog,
+      profileCatalogError: Boolean(profileError),
+      referenceLimit,
+      gitHead,
+      labels,
+    }),
+    [agents, profileCatalog, profileError, referenceLimit, gitHead, labels]
+  )
 
-    return buildReferenceGroups(
-      query,
-      {
-        files: fileSearch.files.map(hitToFlatEntry),
-        filesAlreadyFiltered: true,
-        filesTruncated: fileSearch.truncated,
-        workspaceRoot: path,
-        agents: agentsRef.current,
-        profiles,
-        sessions,
-        commits,
-        repoKey: path,
-      },
-      labelsRef.current ?? DEFAULT_GROUP_LABELS
-    )
-  }, [])
+  useEffect(() => {
+    controller?.updateInputs(inputs)
+  }, [controller, inputs])
+
+  return controller
 }

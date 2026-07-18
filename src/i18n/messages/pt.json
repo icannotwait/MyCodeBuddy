@@ -1103,7 +1103,11 @@
     "autoTitleOff": "Desativado",
     "autoTitleUnavailable": "{agent} (Indisponível)",
     "autoTitleSaveFailed": "Falha ao salvar o agente de títulos automáticos: {message}",
-    "autoTitleLoading": "Carregando configurações de títulos automáticos..."
+    "autoTitleLoading": "Carregando configurações de títulos automáticos...",
+    "referenceSearchLimit": "Limite de resultados de referência",
+    "referenceSearchLimitHint": "Máximo de resultados armazenados em cache e pesquisados por fonte de recursos (10-500).",
+    "referenceSearchLimitSave": "Salvar limite de referências",
+    "referenceSearchLimitSaveFailed": "Falha ao salvar o limite de resultados de referência: {message}"
   },
   "LoginPage": {
     "documentTitle": "Entrar - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "Agentes",
         "mentionGroupSession": "Sessões",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Habilidades"
+        "mentionGroupSkill": "Habilidades",
+        "mentionInvalidPattern": "Expressão regular inválida",
+        "mentionSourceError": "Não foi possível atualizar esta fonte",
+        "mentionProfileError": "Não foi possível carregar os perfis de delegação"
       },
       "messageQueue": {
         "addToQueue": "Adicionar à fila",

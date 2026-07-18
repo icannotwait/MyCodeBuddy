@@ -1103,7 +1103,11 @@
     "autoTitleOff": "إيقاف",
     "autoTitleUnavailable": "{agent} (غير متاح)",
     "autoTitleSaveFailed": "تعذر حفظ وكيل العنوان التلقائي: {message}",
-    "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي..."
+    "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي...",
+    "referenceSearchLimit": "حد نتائج المراجع",
+    "referenceSearchLimitHint": "الحد الأقصى للنتائج المخزنة مؤقتًا والتي يجري البحث عنها لكل مصدر موارد (10-500).",
+    "referenceSearchLimitSave": "حفظ حد المراجع",
+    "referenceSearchLimitSaveFailed": "تعذر حفظ حد نتائج المراجع: {message}"
   },
   "LoginPage": {
     "documentTitle": "تسجيل الدخول - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "الوكلاء",
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
-        "mentionGroupSkill": "المهارات"
+        "mentionGroupSkill": "المهارات",
+        "mentionInvalidPattern": "تعبير نمطي غير صالح",
+        "mentionSourceError": "تعذر تحديث هذا المصدر",
+        "mentionProfileError": "تعذر تحميل ملفات تعريف التفويض"
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",

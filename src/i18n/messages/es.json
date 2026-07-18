@@ -1103,7 +1103,11 @@
     "autoTitleOff": "Desactivado",
     "autoTitleUnavailable": "{agent} (No disponible)",
     "autoTitleSaveFailed": "No se pudo guardar el agente de títulos automáticos: {message}",
-    "autoTitleLoading": "Cargando la configuración de títulos automáticos..."
+    "autoTitleLoading": "Cargando la configuración de títulos automáticos...",
+    "referenceSearchLimit": "Límite de resultados de referencia",
+    "referenceSearchLimitHint": "Máximo de resultados en caché y buscados por cada fuente de recursos (10-500).",
+    "referenceSearchLimitSave": "Guardar límite de referencias",
+    "referenceSearchLimitSaveFailed": "No se pudo guardar el límite de resultados de referencia: {message}"
   },
   "LoginPage": {
     "documentTitle": "Iniciar sesión - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "Agentes",
         "mentionGroupSession": "Sesiones",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Habilidades"
+        "mentionGroupSkill": "Habilidades",
+        "mentionInvalidPattern": "Expresión regular no válida",
+        "mentionSourceError": "No se pudo actualizar esta fuente",
+        "mentionProfileError": "No se pudieron cargar los perfiles de delegación"
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",

@@ -936,6 +936,62 @@ pub struct GitHeadInfo {
     pub detached: bool,
     /// Short commit hash; present when detached and at least one commit exists.
     pub short_sha: Option<String>,
+    /// Stable wire form of the repository root (`git rev-parse --show-toplevel`,
+    /// Windows verbatim prefixes stripped). Present for committed and unborn
+    /// repositories; absent for non-repos.
+    pub canonical_repo: Option<String>,
+    /// Full object ID of `HEAD` when a commit exists; `None` for unborn/non-repo.
+    pub head_sha: Option<String>,
+    /// Opaque commit-source epoch (`v1:<sha256>`) for reference search; present
+    /// for committed and unborn repositories.
+    pub reference_source_epoch: Option<String>,
+}
+
+/// Identity of a git tip used as the commit reference-search source epoch.
+///
+/// `head` is the full object ID, or the reserved literal `"unborn"` for a
+/// repository with no commits yet. Both Git-head reporting and commit search
+/// consume this one type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSourceEpoch {
+    pub canonical_repo: String,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub head: String,
+}
+
+impl CommitSourceEpoch {
+    /// Reserved marker when the repository has no commits (`HEAD` is unborn).
+    pub const UNBORN_HEAD: &'static str = "unborn";
+
+    pub fn is_unborn(&self) -> bool {
+        self.head == Self::UNBORN_HEAD
+    }
+
+    /// Collision-free opaque epoch token: `v1:<sha256>` over a versioned
+    /// length-delimited encoding of the epoch fields.
+    pub fn opaque(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        fn put_field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"codeg-reference-commit-v1");
+        put_field(&mut hasher, self.canonical_repo.as_bytes());
+        match &self.branch {
+            None => hasher.update([0]),
+            Some(branch) => {
+                hasher.update([1]);
+                put_field(&mut hasher, branch.as_bytes());
+            }
+        }
+        hasher.update([u8::from(self.detached)]);
+        put_field(&mut hasher, self.head.as_bytes());
+        format!("v1:{:x}", hasher.finalize())
+    }
 }
 
 async fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, AppCommandError> {
@@ -947,50 +1003,157 @@ async fn git_output(path: &str, args: &[&str]) -> Result<std::process::Output, A
         .map_err(AppCommandError::io)
 }
 
+fn git_stdout_trim(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Canonicalize `git rev-parse --show-toplevel` output, require `workspace` to
+/// sit under that root, and return the stable wire form (verbatim prefix
+/// stripped).
+async fn resolve_canonical_repo_wire(
+    workspace_path: &str,
+) -> Result<Option<String>, AppCommandError> {
+    let toplevel = git_output(workspace_path, &["rev-parse", "--show-toplevel"]).await?;
+    if !toplevel.status.success() {
+        return Ok(None);
+    }
+    let raw = git_stdout_trim(&toplevel);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let repo_path = PathBuf::from(&raw);
+    let repo_canonical = std::fs::canonicalize(&repo_path).map_err(AppCommandError::io)?;
+    let workspace = PathBuf::from(workspace_path);
+    let workspace_canonical = std::fs::canonicalize(&workspace).map_err(AppCommandError::io)?;
+    if !workspace_path_is_under_repo(&workspace_canonical, &repo_canonical) {
+        return Err(AppCommandError::new(
+            crate::app_error::AppErrorCode::InvalidRequest,
+            "workspace path is outside the git repository root",
+        ));
+    }
+    Ok(Some(
+        crate::reference_search::matcher::normalize_path_for_uri(&repo_canonical),
+    ))
+}
+
+fn workspace_path_is_under_repo(workspace: &Path, repo: &Path) -> bool {
+    if workspace.starts_with(repo) {
+        return true;
+    }
+    let workspace_key = crate::parsers::normalize_path_for_matching(&workspace.to_string_lossy());
+    let repo_key = crate::parsers::normalize_path_for_matching(&repo.to_string_lossy());
+    if workspace_key == repo_key {
+        return true;
+    }
+    let repo_prefix = if repo_key.ends_with('/') {
+        repo_key
+    } else {
+        format!("{repo_key}/")
+    };
+    workspace_key.starts_with(&repo_prefix)
+}
+
+fn git_head_info_with_epoch(
+    is_repo: bool,
+    branch: Option<String>,
+    detached: bool,
+    short_sha: Option<String>,
+    canonical_repo: Option<String>,
+    head_sha: Option<String>,
+) -> GitHeadInfo {
+    let reference_source_epoch = match (&canonical_repo, &head_sha, is_repo) {
+        (Some(repo), Some(head), true) => Some(
+            CommitSourceEpoch {
+                canonical_repo: repo.clone(),
+                branch: branch.clone(),
+                detached,
+                head: head.clone(),
+            }
+            .opaque(),
+        ),
+        (Some(repo), None, true) => Some(
+            CommitSourceEpoch {
+                canonical_repo: repo.clone(),
+                branch: branch.clone(),
+                detached: false,
+                head: CommitSourceEpoch::UNBORN_HEAD.to_string(),
+            }
+            .opaque(),
+        ),
+        _ => None,
+    };
+    GitHeadInfo {
+        is_repo,
+        branch,
+        detached,
+        short_sha,
+        canonical_repo,
+        head_sha,
+        reference_source_epoch,
+    }
+}
+
 /// Resolve the current `HEAD` state. The common cases (on a branch / detached)
 /// cost a single git invocation; the rarer unborn-branch and non-repository
 /// cases fall through to `symbolic-ref` and `--is-inside-work-tree`.
-async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
+///
+/// Populates full `head_sha`, stable `canonical_repo`, and opaque
+/// `reference_source_epoch` for committed and unborn repositories.
+pub(crate) async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
     // `rev-parse --abbrev-ref HEAD` prints the branch name, the literal "HEAD"
     // when detached, and fails on an unborn branch or a non-repository.
     let head = git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     if head.status.success() {
-        let name = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let name = git_stdout_trim(&head);
+        let canonical_repo = resolve_canonical_repo_wire(path).await?;
+        let head_sha = git_output(path, &["rev-parse", "HEAD"])
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| git_stdout_trim(&o))
+            .filter(|s| !s.is_empty());
         if !name.is_empty() && name != "HEAD" {
-            return Ok(GitHeadInfo {
-                is_repo: true,
-                branch: Some(name),
-                detached: false,
-                short_sha: None,
-            });
+            return Ok(git_head_info_with_epoch(
+                true,
+                Some(name),
+                false,
+                None,
+                canonical_repo,
+                head_sha,
+            ));
         }
         // Detached HEAD — surface the short commit so the UI can label it.
         let short_sha = git_output(path, &["rev-parse", "--short", "HEAD"])
             .await
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .map(|o| git_stdout_trim(&o))
             .filter(|s| !s.is_empty());
-        return Ok(GitHeadInfo {
-            is_repo: true,
-            branch: None,
-            detached: true,
+        return Ok(git_head_info_with_epoch(
+            true,
+            None,
+            true,
             short_sha,
-        });
+            canonical_repo,
+            head_sha,
+        ));
     }
 
     // Unborn branch (after `git init`, before the first commit): `symbolic-ref`
     // still resolves the branch name where `rev-parse` cannot.
     let sym = git_output(path, &["symbolic-ref", "--short", "HEAD"]).await?;
     if sym.status.success() {
-        let name = String::from_utf8_lossy(&sym.stdout).trim().to_string();
+        let name = git_stdout_trim(&sym);
         if !name.is_empty() {
-            return Ok(GitHeadInfo {
-                is_repo: true,
-                branch: Some(name),
-                detached: false,
-                short_sha: None,
-            });
+            let canonical_repo = resolve_canonical_repo_wire(path).await?;
+            return Ok(git_head_info_with_epoch(
+                true,
+                Some(name),
+                false,
+                None,
+                canonical_repo,
+                None,
+            ));
         }
     }
 
@@ -999,13 +1162,22 @@ async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppCommandError> {
     // offers git operations rather than "initialize".
     let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
     let is_repo =
-        inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "true";
-    Ok(GitHeadInfo {
-        is_repo,
-        branch: None,
-        detached: false,
-        short_sha: None,
-    })
+        inside.status.success() && git_stdout_trim(&inside) == "true";
+    if is_repo {
+        let canonical_repo = resolve_canonical_repo_wire(path).await?;
+        // Unborn-like / unusual: no resolvable branch or tip.
+        return Ok(git_head_info_with_epoch(
+            true,
+            None,
+            false,
+            None,
+            canonical_repo,
+            None,
+        ));
+    }
+    Ok(git_head_info_with_epoch(
+        false, None, false, None, None, None,
+    ))
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -2778,7 +2950,9 @@ const WORKSPACE_FILE_SEARCH_ID_MAX_BYTES: usize = 128;
 /// Shared walk options for file-tree builds and workspace file search.
 /// Hard exclusions and visible dotfiles apply in both modes; ignore sources
 /// can be disabled only for the auxiliary file-tree display.
-fn workspace_walk_builder(
+///
+/// Also used by incremental reference-search file cursors (ignores enabled).
+pub(crate) fn workspace_walk_builder(
     root: &Path,
     max_depth: Option<usize>,
     respect_ignores: bool,
@@ -4785,18 +4959,18 @@ mod tests {
         git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c1"]);
         git_run(dir.path(), &["checkout", "-q", "-b", "feature"]);
 
-        let info = resolve_git_head(dir.path().to_str().unwrap())
-            .await
-            .expect("resolve");
-        assert_eq!(
-            info,
-            GitHeadInfo {
-                is_repo: true,
-                branch: Some("feature".into()),
-                detached: false,
-                short_sha: None,
-            }
-        );
+        let path = dir.path().to_str().unwrap();
+        let info = resolve_git_head(path).await.expect("resolve");
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("feature"));
+        assert!(!info.detached);
+        assert_eq!(info.short_sha, None);
+        assert!(info.head_sha.as_deref().is_some_and(|s| s.len() >= 40));
+        assert!(info.canonical_repo.is_some());
+        assert!(info
+            .reference_source_epoch
+            .as_deref()
+            .is_some_and(|e| e.starts_with("v1:")));
     }
 
     #[tokio::test]
@@ -4818,6 +4992,9 @@ mod tests {
             "detached HEAD should expose a short sha, got {:?}",
             info.short_sha
         );
+        assert!(info.head_sha.as_deref().is_some_and(|s| s.len() >= 40));
+        assert!(info.canonical_repo.is_some());
+        assert!(info.reference_source_epoch.is_some());
     }
 
     #[tokio::test]
@@ -4833,6 +5010,9 @@ mod tests {
                 branch: None,
                 detached: false,
                 short_sha: None,
+                canonical_repo: None,
+                head_sha: None,
+                reference_source_epoch: None,
             }
         );
     }
@@ -4852,6 +5032,20 @@ mod tests {
             "unborn branch should resolve a name, got {:?}",
             info.branch
         );
+        assert_eq!(info.head_sha, None);
+        assert!(info.canonical_repo.is_some());
+        assert!(info
+            .reference_source_epoch
+            .as_deref()
+            .is_some_and(|e| e.starts_with("v1:")));
+        // First commit must change both head_sha and epoch.
+        let epoch_before = info.reference_source_epoch.clone();
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let after = resolve_git_head(dir.path().to_str().unwrap())
+            .await
+            .expect("resolve after commit");
+        assert!(after.head_sha.is_some());
+        assert_ne!(after.reference_source_epoch, epoch_before);
     }
 
     #[tokio::test]

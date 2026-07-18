@@ -6,6 +6,8 @@ import type {
 } from "./api"
 import type {
   AgentType,
+  CancelReferenceSearchRequest,
+  ConversationExperienceSettings,
   ConversationSummary,
   ConversationDetail,
   DbConversationDetail,
@@ -40,8 +42,14 @@ import type {
   GitCommitResult,
   GitRemote,
   GitStashEntry,
+  MatchReferenceRegexRequest,
+  NextReferenceSearchPageRequest,
   PreflightResult,
   FolderCommand,
+  ReferenceCandidateValidation,
+  ReferenceRegexMatch,
+  ReferenceSearchPage,
+  StartReferenceSearchRequest,
   TerminalInfo,
   PromptInputBlock,
   FileTreeNode,
@@ -49,6 +57,7 @@ import type {
   FilePreviewContent,
   FileEditContent,
   FileSaveResult,
+  ValidateReferenceCandidateRequest,
   WorkspaceSnapshotResponse,
   GitLogResult,
   AvailableTerminalShells,
@@ -67,6 +76,7 @@ import type {
   McpMarketplaceProvider,
   McpMarketplaceItem,
   McpMarketplaceServerDetail,
+  DelegationProfileCatalog,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -1123,6 +1133,44 @@ export async function cancelWorkspaceFileSearch(
   return invoke("cancel_workspace_file_search", { ...identity })
 }
 
+// ─── Incremental reference search (flat protocol payloads) ──────────────────
+
+export async function startReferenceSearch(
+  request: StartReferenceSearchRequest
+): Promise<ReferenceSearchPage> {
+  return invoke("start_reference_search", { ...request })
+}
+
+export async function nextReferenceSearchPage(
+  request: NextReferenceSearchPageRequest
+): Promise<ReferenceSearchPage> {
+  return invoke("next_reference_search_page", { ...request })
+}
+
+export async function cancelReferenceSearch(
+  request: CancelReferenceSearchRequest
+): Promise<boolean> {
+  return invoke("cancel_reference_search", { ...request })
+}
+
+export async function validateReferenceCandidate(
+  request: ValidateReferenceCandidateRequest
+): Promise<ReferenceCandidateValidation> {
+  return invoke("validate_reference_candidate", { ...request })
+}
+
+export async function matchReferenceRegex(
+  request: MatchReferenceRegexRequest
+): Promise<ReferenceRegexMatch[]> {
+  return invoke("match_reference_regex", { ...request })
+}
+
+export async function setReferenceSearchLimit(
+  limit: number
+): Promise<ConversationExperienceSettings> {
+  return invoke("set_reference_search_limit", { limit })
+}
+
 export async function startWorkspaceStateStream(
   rootPath: string
 ): Promise<WorkspaceSnapshotResponse> {
@@ -1280,4 +1328,9 @@ export async function terminalKill(terminalId: string): Promise<void> {
 
 export async function terminalList(): Promise<TerminalInfo[]> {
   return invoke("terminal_list")
+}
+
+/** Desktop invoke facade for the revisioned delegation profile catalog. */
+export async function getDelegationProfileCatalog(): Promise<DelegationProfileCatalog> {
+  return invoke("get_delegation_profile_catalog")
 }

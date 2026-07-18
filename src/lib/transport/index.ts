@@ -57,6 +57,20 @@ export function getActiveRemoteConnectionId(): number | null {
   return _remoteConfig?.id ?? null
 }
 
+/**
+ * Stable key identifying the active backend for client-side caches.
+ * Changes when the shell switches between local Tauri, a web origin, or a
+ * remote-desktop connection so generation-scoped stores can reset cleanly.
+ */
+export function getActiveBackendCacheKey(): string {
+  const remote = getActiveRemoteConnectionId()
+  if (remote != null) return `remote:${remote}`
+  if (typeof window !== "undefined" && detectEnvironment() === "web") {
+    return `web:${window.location.origin}`
+  }
+  return "local:tauri"
+}
+
 export function getTransport(): Transport {
   return _remoteTransport ?? getShellTransport()
 }
@@ -112,4 +126,20 @@ export function __resetTransportForTests(): void {
   _shellTransport = null
   _remoteTransport = null
   _remoteConfig = null
+}
+
+/**
+ * Test-only: install a remote-desktop binding without dynamically requiring
+ * the real transport class (Node `require` cannot resolve the TS module under
+ * Vitest). Production code must use `configureRemoteDesktopTransport`.
+ * @internal
+ */
+export function __setRemoteDesktopForTests(
+  config: RemoteTransportConfig,
+  transport: Transport
+): void {
+  if (process.env.NODE_ENV !== "test") return
+  _remoteTransport?.destroy?.()
+  _remoteConfig = config
+  _remoteTransport = transport
 }

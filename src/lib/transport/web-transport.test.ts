@@ -289,3 +289,70 @@ describe("WebTransport connection state machine", () => {
     expect(localStorage.getItem("codeg_token")).toBe("tok") // token preserved
   })
 })
+
+describe("WebTransport call abort + timeout", () => {
+  it("throws AbortError for a pre-aborted caller signal without calling fetch", async () => {
+    const t = new WebTransport("http://localhost")
+    const controller = new AbortController()
+    controller.abort()
+    await expect(
+      t.call("noop", {}, { signal: controller.signal })
+    ).rejects.toMatchObject({ name: "AbortError" })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("throws AbortError when the caller aborts mid-fetch (not timeout)", async () => {
+    const t = new WebTransport("http://localhost")
+    const controller = new AbortController()
+    fetchMock.mockImplementation(
+      (_url: string, opts: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"))
+          })
+        })
+    )
+    const pending = t.call("noop", {}, { signal: controller.signal })
+    // Let the listener register, then abort the caller.
+    await Promise.resolve()
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" })
+  })
+
+  it("throws Error('Request timed out') when the internal timer fires", async () => {
+    const t = new WebTransport("http://localhost")
+    fetchMock.mockImplementation(
+      (_url: string, opts: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"))
+          })
+        })
+    )
+    const pending = t.call("noop", {}, { timeoutMs: 100 })
+    // Attach the rejection handler before advancing timers so the timeout
+    // abort is not an unhandled rejection.
+    const expectation = expect(pending).rejects.toThrow("Request timed out")
+    await vi.advanceTimersByTimeAsync(100)
+    await expectation
+  })
+
+  it("removes the caller abort listener after the call settles", async () => {
+    const t = new WebTransport("http://localhost")
+    const controller = new AbortController()
+    const addSpy = vi.spyOn(controller.signal, "addEventListener")
+    const removeSpy = vi.spyOn(controller.signal, "removeEventListener")
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ ok: true }),
+    })
+    await t.call("noop", {}, { signal: controller.signal })
+    expect(addSpy).toHaveBeenCalledWith(
+      "abort",
+      expect.any(Function),
+      expect.objectContaining({ once: true })
+    )
+    expect(removeSpy).toHaveBeenCalled()
+  })
+})

@@ -25,17 +25,27 @@ use std::path::PathBuf;
 #[cfg(any(test, feature = "tauri-runtime"))]
 use std::sync::Arc;
 
-use sea_orm::DatabaseConnection;
+use chrono::Utc;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ActiveValue::NotSet, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Set,
+    Statement, TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
 use crate::acp::delegation::route::DelegationRoutePolicy;
 use crate::acp::delegation::types::{
-    AgentDelegationDefaults, DelegationProfile, DelegationProfileDocument,
+    AgentDelegationDefaults, DelegationMutation, DelegationProfile, DelegationProfileCatalog,
+    DelegationProfileDocument,
 };
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, AppErrorCode};
+use crate::db::entities::app_metadata;
+use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
 use crate::models::AgentType;
+#[cfg(feature = "tauri-runtime")]
+use crate::web::event_bridge::{emit_event, EventEmitter};
 
 pub const KEY_DELEGATION_ENABLED: &str = "delegation.enabled";
 pub const KEY_DELEGATION_DEPTH: &str = "delegation.depth_limit";
@@ -50,6 +60,10 @@ pub const KEY_DELEGATION_PROFILES_V1: &str = "delegation.profiles.v1";
 pub const KEY_DELEGATION_ROUTE_POLICY: &str = "delegation.route_policy";
 /// Soft-watchdog stall threshold in seconds (observe-only consumers).
 pub const KEY_DELEGATION_STALLED_AFTER_SECONDS: &str = "delegation.stalled_after_seconds";
+/// Monotonic catalog revision advanced by every settings/profiles/bundle write.
+pub const KEY_DELEGATION_PROFILE_REVISION: &str = "delegation.profile_catalog_revision";
+/// Side-channel payload: full [`DelegationProfileCatalog`] after a catalog write.
+pub const DELEGATION_PROFILE_CATALOG_CHANGED_EVENT: &str = "delegation-profile-catalog://changed";
 
 pub const DEPTH_MIN: u32 = 1;
 pub const DEPTH_MAX: u32 = 8;
@@ -232,28 +246,42 @@ fn route_policy_to_storage(policy: DelegationRoutePolicy) -> &'static str {
     }
 }
 
-/// Read all persisted keys from `app_metadata`, falling back to defaults
-/// for any missing or malformed value. Never errors hard — corrupt
-/// persistence is treated as "no preference yet."
-pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSettings {
+fn parse_catalog_revision(raw: Option<&str>) -> u64 {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    if raw.chars().all(|c| c.is_ascii_digit()) {
+        raw.parse::<u64>().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Read all persisted keys from `app_metadata`, falling back to defaults for
+/// any missing or malformed preference value. Propagates genuine database
+/// failures so catalog transactions can fail closed.
+pub async fn load_delegation_settings_from<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<DelegationSettings, DbError> {
     let mut settings = DelegationSettings::default();
-    if let Ok(Some(raw)) = app_metadata_service::get_value(conn, KEY_DELEGATION_ENABLED).await {
+    if let Some(raw) = app_metadata_service::get_value_conn(conn, KEY_DELEGATION_ENABLED).await? {
         if let Ok(v) = raw.parse::<bool>() {
             settings.enabled = v;
         }
     }
-    if let Ok(Some(raw)) = app_metadata_service::get_value(conn, KEY_DELEGATION_DEPTH).await {
+    if let Some(raw) = app_metadata_service::get_value_conn(conn, KEY_DELEGATION_DEPTH).await? {
         if let Ok(v) = raw.parse::<u32>() {
             settings.depth_limit = v;
         }
     }
-    if let Ok(Some(raw)) = app_metadata_service::get_value(conn, KEY_DELEGATION_ROUTE_POLICY).await
+    if let Some(raw) =
+        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_ROUTE_POLICY).await?
     {
         // Malformed route strings fall back to Codeg (not a parse-then-clamp).
         settings.route_policy = parse_route_policy(&raw);
     }
-    if let Ok(Some(raw)) =
-        app_metadata_service::get_value(conn, KEY_DELEGATION_STALLED_AFTER_SECONDS).await
+    if let Some(raw) =
+        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_STALLED_AFTER_SECONDS).await?
     {
         // Numeric parse first; non-numeric keeps product default (300). Out-of
         // range values are clamped below, not rejected.
@@ -261,25 +289,41 @@ pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSe
             settings.stalled_after_seconds = v;
         }
     }
-    if let Ok(Some(raw)) =
-        app_metadata_service::get_value(conn, KEY_DELEGATION_COMPLETED_CACHE_MB).await
+    if let Some(raw) =
+        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_COMPLETED_CACHE_MB).await?
     {
         if let Ok(v) = raw.parse::<u32>() {
             settings.completed_cache_max_mb = v;
         }
     }
-    if let Ok(Some(raw)) =
-        app_metadata_service::get_value(conn, KEY_DELEGATION_AGENT_DEFAULTS).await
+    if let Some(raw) =
+        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_AGENT_DEFAULTS).await?
     {
         // Corrupt JSON → keep defaults (empty map). Matches the "never errors
-        // hard" contract on the other two keys above.
+        // hard" contract on preference parse failures.
         if let Ok(parsed) =
             serde_json::from_str::<BTreeMap<AgentType, AgentDelegationDefaults>>(&raw)
         {
             settings.agent_defaults = parsed;
         }
     }
-    settings.clamped()
+    Ok(settings.clamped())
+}
+
+/// Soft wrapper for standalone settings reads: missing/malformed prefs fall
+/// back to defaults; operational DB errors also resolve to defaults so the
+/// settings UI never hard-fails on a transient read (matches the historical
+/// contract). Catalog loads use [`load_delegation_settings_from`] directly.
+pub async fn load_delegation_settings(conn: &DatabaseConnection) -> DelegationSettings {
+    load_delegation_settings_from(conn)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "failed to load delegation settings; using defaults"
+            );
+            DelegationSettings::default()
+        })
 }
 
 /// Pull settings from the DB and push Broker config + the runtime watch
@@ -363,33 +407,131 @@ async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
     Ok(())
 }
 
+/// Write-first catalog revision advance inside an open transaction.
+///
+/// 1. Insert the revision row at `0` with `ON CONFLICT(key) DO NOTHING`.
+/// 2. Unconditionally advance revision with the signed-64-bit-safe CASE update.
+/// Returns the new revision only via a subsequent catalog load from the same txn.
+async fn advance_catalog_revision_in_txn(
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<(), AppCommandError> {
+    let now = Utc::now();
+    app_metadata::Entity::insert(app_metadata::ActiveModel {
+        id: NotSet,
+        key: Set(KEY_DELEGATION_PROFILE_REVISION.to_string()),
+        value: Set("0".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: NotSet,
+    })
+    .on_conflict(
+        OnConflict::column(app_metadata::Column::Key)
+            .do_nothing()
+            .to_owned(),
+    )
+    .do_nothing()
+    .exec(txn)
+    .await
+    .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    let updated_at = now.to_rfc3339();
+    let result = txn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+UPDATE app_metadata
+SET value = CASE
+        WHEN value <> ''
+          AND value NOT GLOB '*[^0-9]*'
+          AND length(value) <= 19
+          AND CAST(value AS INTEGER) BETWEEN 0 AND 9223372036854775806
+        THEN CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+        ELSE '1'
+    END,
+    updated_at = ?,
+    deleted_at = NULL
+WHERE key = ?
+  AND value <> '9223372036854775807'
+"#,
+            [updated_at.into(), KEY_DELEGATION_PROFILE_REVISION.into()],
+        ))
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    if result.rows_affected() != 1 {
+        return Err(AppCommandError::new(
+            AppErrorCode::DatabaseError,
+            "Delegation profile catalog revision exhausted",
+        ));
+    }
+    Ok(())
+}
+
+/// Load the revisioned profile catalog from a single connection/transaction
+/// snapshot (settings + profiles + revision).
+pub async fn load_delegation_profile_catalog_from<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<DelegationProfileCatalog, AppCommandError> {
+    let settings = load_delegation_settings_from(conn)
+        .await
+        .map_err(AppCommandError::from)?;
+    let document = load_delegation_profiles_from(conn).await?;
+    let revision_raw =
+        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_PROFILE_REVISION)
+            .await
+            .map_err(AppCommandError::from)?;
+    Ok(DelegationProfileCatalog {
+        profiles: document.profiles,
+        delegation_enabled: settings.enabled,
+        revision: parse_catalog_revision(revision_raw.as_deref()),
+    })
+}
+
+/// Read-only catalog snapshot for Tauri/HTTP getters (single read transaction).
+pub async fn load_delegation_profile_catalog(
+    conn: &DatabaseConnection,
+) -> Result<DelegationProfileCatalog, AppCommandError> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    let catalog = load_delegation_profile_catalog_from(&txn).await?;
+    txn.commit()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    Ok(catalog)
+}
+
 /// Persist + apply. Used by both the Tauri command and the HTTP handler so
 /// the clamp / re-apply chain is in exactly one place. Settings keys are
 /// written in one DB transaction so a mid-write failure does not leave a
 /// partial settings document. The runtime watch channel is updated **only
 /// after** a successful commit. Route/enabled changes refresh managed-root
 /// route staleness; a watchdog-only save updates the channel without stale.
+/// Holds the broker configuration mutation gate through write + live apply.
 pub async fn set_delegation_settings_core(
     conn: &DatabaseConnection,
     broker: &DelegationBroker,
     runtime: &DelegationRuntimeSettings,
     manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationSettings,
-) -> Result<DelegationSettings, AppCommandError> {
-    use sea_orm::TransactionTrait;
+) -> Result<DelegationMutation<DelegationSettings>, AppCommandError> {
+    let _gate = broker.configuration_mutation_guard().await;
     let before = runtime.snapshot();
     let clamped = desired.clamped();
     let txn = conn
         .begin()
         .await
-        .map_err(crate::db::error::DbError::from)
+        .map_err(DbError::from)
         .map_err(AppCommandError::from)?;
+    advance_catalog_revision_in_txn(&txn).await?;
     persist_settings_keys(&txn, &clamped).await?;
+    let catalog = load_delegation_profile_catalog_from(&txn).await?;
     txn.commit()
         .await
-        .map_err(crate::db::error::DbError::from)
+        .map_err(DbError::from)
         .map_err(AppCommandError::from)?;
-    // Commit succeeded — notify live consumers. Must not run on txn failure.
+    // Commit succeeded — notify live consumers while the gate is still held.
     let after = clamped.to_runtime_snapshot();
     runtime.set(after.clone());
     let profiles = broker.config_snapshot().await.profiles;
@@ -401,13 +543,17 @@ pub async fn set_delegation_settings_core(
             .refresh_delegation_route_staleness(after.route_policy, after.enabled)
             .await;
     }
-    Ok(clamped)
+    Ok(DelegationMutation {
+        value: clamped,
+        catalog,
+    })
 }
 
 /// Combined settings + profiles document saved in one DB transaction, then
 /// applied to the broker in a single `set_config` so concurrent delegations
 /// never observe "new settings + old profiles". Runtime watch is updated only
-/// after the transaction commits.
+/// after the transaction commits. Holds the broker configuration mutation gate
+/// through write + live apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationBundle {
     pub settings: DelegationSettings,
@@ -420,8 +566,8 @@ pub async fn set_delegation_bundle_core(
     runtime: &DelegationRuntimeSettings,
     manager: &crate::acp::manager::ConnectionManager,
     desired: DelegationBundle,
-) -> Result<DelegationBundle, AppCommandError> {
-    use sea_orm::TransactionTrait;
+) -> Result<DelegationMutation<DelegationBundle>, AppCommandError> {
+    let _gate = broker.configuration_mutation_guard().await;
     let before = runtime.snapshot();
     let clamped = desired.settings.clamped();
     let normalized = DelegationProfileDocument {
@@ -433,15 +579,17 @@ pub async fn set_delegation_bundle_core(
     let txn = conn
         .begin()
         .await
-        .map_err(crate::db::error::DbError::from)
+        .map_err(DbError::from)
         .map_err(AppCommandError::from)?;
+    advance_catalog_revision_in_txn(&txn).await?;
     persist_settings_keys(&txn, &clamped).await?;
     app_metadata_service::upsert_value(&txn, KEY_DELEGATION_PROFILES_V1, &profiles_json)
         .await
         .map_err(AppCommandError::from)?;
+    let catalog = load_delegation_profile_catalog_from(&txn).await?;
     txn.commit()
         .await
-        .map_err(crate::db::error::DbError::from)
+        .map_err(DbError::from)
         .map_err(AppCommandError::from)?;
 
     let after = clamped.to_runtime_snapshot();
@@ -459,9 +607,12 @@ pub async fn set_delegation_bundle_core(
             .refresh_delegation_route_staleness(after.route_policy, after.enabled)
             .await;
     }
-    Ok(DelegationBundle {
-        settings: clamped,
-        profiles: normalized,
+    Ok(DelegationMutation {
+        value: DelegationBundle {
+            settings: clamped,
+            profiles: normalized,
+        },
+        catalog,
     })
 }
 
@@ -502,10 +653,12 @@ fn normalize_profiles(
     Ok(normalized)
 }
 
-pub async fn load_delegation_profiles(
-    conn: &DatabaseConnection,
+/// Load + normalize the profiles document. Propagates operational DB errors;
+/// corrupt JSON still fails hard (not silently empty).
+pub async fn load_delegation_profiles_from<C: ConnectionTrait>(
+    conn: &C,
 ) -> Result<DelegationProfileDocument, AppCommandError> {
-    let Some(raw) = app_metadata_service::get_value(conn, KEY_DELEGATION_PROFILES_V1)
+    let Some(raw) = app_metadata_service::get_value_conn(conn, KEY_DELEGATION_PROFILES_V1)
         .await
         .map_err(AppCommandError::from)?
     else {
@@ -519,32 +672,43 @@ pub async fn load_delegation_profiles(
     })
 }
 
+pub async fn load_delegation_profiles(
+    conn: &DatabaseConnection,
+) -> Result<DelegationProfileDocument, AppCommandError> {
+    load_delegation_profiles_from(conn).await
+}
+
+/// Persist profiles + advance catalog revision, then apply to the live broker
+/// while holding the configuration mutation gate (no separate ungated apply).
 pub async fn set_delegation_profiles_core(
     conn: &DatabaseConnection,
+    broker: &DelegationBroker,
     desired: DelegationProfileDocument,
-) -> Result<DelegationProfileDocument, AppCommandError> {
+) -> Result<DelegationMutation<DelegationProfileDocument>, AppCommandError> {
+    let _gate = broker.configuration_mutation_guard().await;
     let normalized = DelegationProfileDocument {
         profiles: normalize_profiles(desired.profiles)?,
     };
     let json = serde_json::to_string(&normalized).map_err(|e| {
         AppCommandError::configuration_invalid(format!("serialize delegation profiles: {e}"))
     })?;
-    app_metadata_service::upsert_value(conn, KEY_DELEGATION_PROFILES_V1, &json)
+    let txn = conn
+        .begin()
+        .await
+        .map_err(DbError::from)
+        .map_err(AppCommandError::from)?;
+    advance_catalog_revision_in_txn(&txn).await?;
+    app_metadata_service::upsert_value(&txn, KEY_DELEGATION_PROFILES_V1, &json)
         .await
         .map_err(AppCommandError::from)?;
-    Ok(normalized)
-}
-
-/// Apply profiles to the broker after a successful profiles-only persist.
-/// Kept separate so the web/Tauri commands share the same sequence:
-/// DB write first, then live map (best-effort consistency on process death).
-pub async fn apply_profiles_to_broker(
-    broker: &DelegationBroker,
-    document: &DelegationProfileDocument,
-) {
+    let catalog = load_delegation_profile_catalog_from(&txn).await?;
+    txn.commit()
+        .await
+        .map_err(DbError::from)
+        .map_err(AppCommandError::from)?;
     broker
         .set_profiles(
-            document
+            normalized
                 .profiles
                 .iter()
                 .cloned()
@@ -552,6 +716,10 @@ pub async fn apply_profiles_to_broker(
                 .collect(),
         )
         .await;
+    Ok(DelegationMutation {
+        value: normalized,
+        catalog,
+    })
 }
 
 // -------- Tauri commands -----------------------------------------------------
@@ -573,6 +741,7 @@ pub async fn get_delegation_settings(
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn set_delegation_settings(
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
     #[cfg(feature = "tauri-runtime")] runtime: tauri::State<'_, DelegationRuntimeSettings>,
@@ -584,14 +753,20 @@ pub async fn set_delegation_settings(
 ) -> Result<DelegationSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        set_delegation_settings_core(
+        let mutation = set_delegation_settings_core(
             &db.conn,
             broker.inner(),
             runtime.inner(),
             manager.inner(),
             settings,
         )
-        .await
+        .await?;
+        emit_event(
+            &EventEmitter::Tauri(app),
+            DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+            mutation.catalog,
+        );
+        Ok(mutation.value)
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -615,16 +790,36 @@ pub async fn get_delegation_profiles(
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_delegation_profile_catalog(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+) -> Result<DelegationProfileCatalog, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        load_delegation_profile_catalog(&db.conn).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn set_delegation_profiles(
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
     document: DelegationProfileDocument,
 ) -> Result<DelegationProfileDocument, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let saved = set_delegation_profiles_core(&db.conn, document).await?;
-        apply_profiles_to_broker(broker.inner(), &saved).await;
-        Ok(saved)
+        let mutation =
+            set_delegation_profiles_core(&db.conn, broker.inner(), document).await?;
+        emit_event(
+            &EventEmitter::Tauri(app),
+            DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+            mutation.catalog,
+        );
+        Ok(mutation.value)
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -635,6 +830,7 @@ pub async fn set_delegation_profiles(
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn set_delegation_bundle(
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
     #[cfg(feature = "tauri-runtime")] broker: tauri::State<'_, Arc<DelegationBroker>>,
     #[cfg(feature = "tauri-runtime")] runtime: tauri::State<'_, DelegationRuntimeSettings>,
@@ -646,14 +842,20 @@ pub async fn set_delegation_bundle(
 ) -> Result<DelegationBundle, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        set_delegation_bundle_core(
+        let mutation = set_delegation_bundle_core(
             &db.conn,
             broker.inner(),
             runtime.inner(),
             manager.inner(),
             bundle,
         )
-        .await
+        .await?;
+        emit_event(
+            &EventEmitter::Tauri(app),
+            DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+            mutation.catalog,
+        );
+        Ok(mutation.value)
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -730,12 +932,14 @@ mod tests {
     #[tokio::test]
     async fn profiles_round_trip_and_corrupt_json_is_not_silently_empty() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
         let document = DelegationProfileDocument {
             profiles: vec![profile("11111111-1111-4111-8111-111111111111", " GLM5.2 ")],
         };
-        let saved = set_delegation_profiles_core(&db.conn, document)
+        let saved = set_delegation_profiles_core(&db.conn, &broker, document)
             .await
-            .unwrap();
+            .unwrap()
+            .value;
         assert_eq!(saved.profiles[0].name, "GLM5.2");
         assert_eq!(load_delegation_profiles(&db.conn).await.unwrap(), saved);
 
@@ -788,7 +992,8 @@ mod tests {
             bundle,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         assert!(saved.settings.enabled);
         assert_eq!(saved.settings.depth_limit, 3);
         assert_eq!(saved.profiles.profiles[0].name, "GLM5.2");
@@ -845,7 +1050,8 @@ mod tests {
             desired,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         assert!(!saved.enabled);
         assert_eq!(saved.depth_limit, 3);
 
@@ -889,7 +1095,8 @@ mod tests {
             desired,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         assert_eq!(saved.agent_defaults, agent_defaults);
 
         // Re-read from DB — the JSON blob should round-trip identically.
@@ -944,7 +1151,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         assert_eq!(saved.depth_limit, DEPTH_MAX);
     }
 
@@ -967,7 +1175,8 @@ mod tests {
             desired,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         assert_eq!(saved.completed_cache_max_mb, 8);
 
         // Persisted + reloaded identically.
@@ -1080,7 +1289,8 @@ mod tests {
             desired,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
         rx.changed().await.unwrap();
         assert_eq!(saved.route_policy, DelegationRoutePolicy::Native);
         assert_eq!(rx.borrow().stalled_after_seconds, 120);
@@ -1096,5 +1306,105 @@ mod tests {
         .unwrap();
         assert_eq!(settings.route_policy, DelegationRoutePolicy::Codeg);
         assert_eq!(settings.stalled_after_seconds, 300);
+    }
+
+    #[tokio::test]
+    async fn every_catalog_affecting_save_advances_revision_in_its_transaction() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let broker = make_broker();
+        let runtime = DelegationRuntimeSettings::default();
+        let manager = crate::acp::manager::ConnectionManager::new();
+        let settings = set_delegation_settings_core(
+            &db.conn,
+            &broker,
+            &runtime,
+            &manager,
+            DelegationSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("settings");
+        let profiles = set_delegation_profiles_core(
+            &db.conn,
+            &broker,
+            DelegationProfileDocument {
+                profiles: vec![profile(
+                    "11111111-1111-4111-8111-111111111111",
+                    "A",
+                )],
+            },
+        )
+        .await
+        .expect("profiles");
+        assert_eq!(settings.catalog.revision, 1);
+        assert_eq!(profiles.catalog.revision, 2);
+        assert!(profiles.catalog.delegation_enabled);
+        let live = broker.config_snapshot().await;
+        assert!(live.enabled);
+        assert_eq!(live.profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_settings_and_profile_saves_get_distinct_revisions() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db = crate::db::init_database(temp.path(), "profile-catalog-concurrency-test")
+            .await
+            .expect("open pooled WAL database");
+        let broker = make_broker();
+        let runtime = DelegationRuntimeSettings::default();
+        let manager = crate::acp::manager::ConnectionManager::new();
+
+        let (settings_result, profiles_result) = tokio::join!(
+            set_delegation_settings_core(
+                &db.conn,
+                &broker,
+                &runtime,
+                &manager,
+                DelegationSettings {
+                    enabled: true,
+                    depth_limit: 2,
+                    ..Default::default()
+                },
+            ),
+            set_delegation_profiles_core(
+                &db.conn,
+                &broker,
+                DelegationProfileDocument {
+                    profiles: vec![profile(
+                        "11111111-1111-4111-8111-111111111111",
+                        "A",
+                    )],
+                },
+            ),
+        );
+
+        let settings_mut = settings_result.expect("settings save");
+        let profiles_mut = profiles_result.expect("profiles save");
+        let mut revisions = [settings_mut.catalog.revision, profiles_mut.catalog.revision];
+        revisions.sort_unstable();
+        assert_eq!(revisions, [1, 2]);
+
+        let catalog = load_delegation_profile_catalog(&db.conn)
+            .await
+            .expect("catalog snapshot");
+        assert_eq!(catalog.revision, 2);
+        assert!(catalog.delegation_enabled);
+        assert_eq!(catalog.profiles.len(), 1);
+        assert_eq!(catalog.profiles[0].name, "A");
+
+        let live = broker.config_snapshot().await;
+        assert_eq!(live.enabled, catalog.delegation_enabled);
+        assert_eq!(live.profiles.len(), catalog.profiles.len());
+        assert_eq!(
+            live.profiles
+                .get("11111111-1111-4111-8111-111111111111")
+                .map(|p| p.name.as_str()),
+            Some("A")
+        );
+
+        // Keep TempDir alive through every assertion.
+        drop(temp);
     }
 }

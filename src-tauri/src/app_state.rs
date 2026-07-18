@@ -13,6 +13,7 @@ use crate::commands::conversation_experience::ConversationExperienceMutationGate
 use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
 use crate::pet_state_mapper::PetStateHandle;
+use crate::reference_search::ReferenceSearchRegistry;
 use crate::terminal::manager::TerminalManager;
 use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
 use crate::web::WebServerState;
@@ -37,6 +38,10 @@ pub struct AppState {
     pub auto_title_coordinator: Arc<AutoTitleCoordinator>,
     /// Process-local mutation gate for conversation-experience settings.
     pub conversation_experience_gate: Arc<ConversationExperienceMutationGate>,
+    /// Process-wide guarded pull-job registry for incremental reference search.
+    /// Desktop/server construct one factory+registry; embedded Axum clones the
+    /// same managed instance so both transports share limit epochs.
+    pub reference_search_registry: Arc<ReferenceSearchRegistry>,
     pub web_server_state: WebServerState,
     pub chat_channel_manager: ChatChannelManager,
     pub workspace_transfer: Arc<WorkspaceTransferManager>,
@@ -356,6 +361,15 @@ impl AppState {
         let auto_title_coordinator =
             AutoTitleCoordinator::new(title_db, runner, EventEmitter::Noop);
         let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
+        // Synchronous test constructor installs the production factory at the
+        // default limit. Async fixtures that need another value call
+        // `set_limit` before wrapping the state in Arc / sharing it.
+        let reference_search_registry = crate::reference_search::ReferenceSearchRegistry::new(
+            crate::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+            Arc::new(crate::reference_search::ProductionReferenceSourceFactory {
+                db: db.conn.clone(),
+            }),
+        );
 
         Self {
             db,
@@ -368,6 +382,7 @@ impl AppState {
             internal_sessions,
             auto_title_coordinator,
             conversation_experience_gate,
+            reference_search_registry,
             web_server_state: crate::web::WebServerState::new(),
             chat_channel_manager: default_chat_channel_manager(),
             workspace_transfer: Arc::new(

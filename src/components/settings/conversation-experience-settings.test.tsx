@@ -8,45 +8,37 @@ import {
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const h = vi.hoisted(() => ({
+const mocks = vi.hoisted(() => ({
   agents: [] as Array<{
     agent_type: string
     name: string
     enabled: boolean
     available: boolean
   }>,
+  getConversationExperienceSettings: vi.fn(),
   setAutoTitleAgent: vi.fn(),
-  bootstrap: vi.fn(),
-  settings: null as null | {
-    auto_title_agent: string | null
-    reference_search_limit: number
-    revision: number
-  },
-  loading: false,
+  setReferenceSearchLimit: vi.fn(),
+  subscribe: vi.fn(async () => () => {}),
+  onTransportReconnect: vi.fn(() => () => {}),
 }))
 
 vi.mock("@/hooks/use-acp-agents", () => ({
   useAcpAgents: () => ({
-    agents: h.agents,
+    agents: mocks.agents,
     fresh: true,
     refresh: vi.fn(),
   }),
 }))
 
-vi.mock("@/stores/conversation-experience-store", () => ({
-  useConversationExperienceBootstrap: h.bootstrap,
-  useConversationExperienceStore: (
-    selector: (s: {
-      settings: typeof h.settings
-      loading: boolean
-      setAutoTitleAgent: typeof h.setAutoTitleAgent
-    }) => unknown
-  ) =>
-    selector({
-      settings: h.settings,
-      loading: h.loading,
-      setAutoTitleAgent: h.setAutoTitleAgent,
-    }),
+vi.mock("@/lib/api", () => ({
+  getConversationExperienceSettings: mocks.getConversationExperienceSettings,
+  setAutoTitleAgent: mocks.setAutoTitleAgent,
+  setReferenceSearchLimit: mocks.setReferenceSearchLimit,
+}))
+
+vi.mock("@/lib/platform", () => ({
+  subscribe: mocks.subscribe,
+  onTransportReconnect: mocks.onTransportReconnect,
 }))
 
 vi.mock("sonner", () => ({
@@ -55,8 +47,12 @@ vi.mock("sonner", () => ({
 
 import { ConversationExperienceSettingsSection } from "./conversation-experience-settings"
 import enMessages from "@/i18n/messages/en.json"
+import {
+  resetConversationExperienceStore,
+  useConversationExperienceStore,
+} from "@/stores/conversation-experience-store"
 
-function renderWithIntl() {
+function renderSettings() {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <ConversationExperienceSettingsSection />
@@ -70,7 +66,8 @@ async function openListbox() {
 }
 
 beforeEach(() => {
-  h.agents = [
+  resetConversationExperienceStore()
+  mocks.agents = [
     {
       agent_type: "codex",
       name: "Codex",
@@ -90,20 +87,26 @@ beforeEach(() => {
       available: false,
     },
   ]
-  h.settings = {
+  mocks.getConversationExperienceSettings.mockReset()
+  mocks.getConversationExperienceSettings.mockResolvedValue({
     auto_title_agent: null,
     reference_search_limit: 50,
     revision: 1,
-  }
-  h.loading = false
-  h.setAutoTitleAgent.mockReset()
-  h.bootstrap.mockReset()
+  })
+  mocks.setAutoTitleAgent.mockReset()
+  mocks.setReferenceSearchLimit.mockReset()
+  mocks.subscribe.mockReset()
+  mocks.subscribe.mockResolvedValue(() => {})
+  mocks.onTransportReconnect.mockReset()
+  mocks.onTransportReconnect.mockReturnValue(() => {})
 })
 
 describe("ConversationExperienceSettingsSection", () => {
   it("lists Off plus enabled-and-available base agents only", async () => {
-    renderWithIntl()
-    expect(h.bootstrap).toHaveBeenCalled()
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
     const listbox = await openListbox()
     expect(within(listbox).getByText("Off")).toBeInTheDocument()
     expect(within(listbox).getByText("Codex")).toBeInTheDocument()
@@ -112,12 +115,17 @@ describe("ConversationExperienceSettingsSection", () => {
   })
 
   it("retains an unavailable saved agent as a disabled labeled row", async () => {
-    h.settings = {
+    mocks.getConversationExperienceSettings.mockResolvedValue({
       auto_title_agent: "gemini",
       reference_search_limit: 50,
       revision: 2,
-    }
-    renderWithIntl()
+    })
+    renderSettings()
+    await waitFor(() => {
+      expect(
+        useConversationExperienceStore.getState().settings?.auto_title_agent
+      ).toBe("gemini")
+    })
     const listbox = await openListbox()
     const row = within(listbox).getByText("Gemini (Unavailable)")
     expect(row).toBeInTheDocument()
@@ -126,16 +134,38 @@ describe("ConversationExperienceSettingsSection", () => {
   })
 
   it("saves the selected agent through the store", async () => {
-    h.setAutoTitleAgent.mockResolvedValue({
+    mocks.setAutoTitleAgent.mockResolvedValue({
       auto_title_agent: "codex",
       reference_search_limit: 50,
       revision: 3,
     })
-    renderWithIntl()
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
     const listbox = await openListbox()
     fireEvent.click(within(listbox).getByText("Codex"))
     await waitFor(() => {
-      expect(h.setAutoTitleAgent).toHaveBeenCalledWith("codex")
+      expect(mocks.setAutoTitleAgent).toHaveBeenCalledWith("codex")
     })
+  })
+
+  it("saves a clamped reference limit and adopts the returned revision", async () => {
+    mocks.setReferenceSearchLimit.mockResolvedValue({
+      auto_title_agent: "codex",
+      reference_search_limit: 500,
+      revision: 9,
+    })
+    renderSettings()
+    fireEvent.change(await screen.findByLabelText("Reference result limit"), {
+      target: { value: "999" },
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save reference limit" })
+    )
+    await waitFor(() =>
+      expect(mocks.setReferenceSearchLimit).toHaveBeenCalledWith(500)
+    )
+    expect(useConversationExperienceStore.getState().settings?.revision).toBe(9)
   })
 })

@@ -208,6 +208,11 @@ export function useAgentThinkingVisibility(
   )
 }
 
+/** Non-React selector: whether a successful agents reload has committed. */
+export function selectAcpAgentsFresh(): boolean {
+  return useAcpAgentsStore.getState().fresh
+}
+
 /** Test-only: reset the shared store + module race/refcount state to a clean
  *  slate (disposing any live subscription). */
 export function resetAcpAgentsStore(): void {

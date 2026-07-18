@@ -87,6 +87,15 @@ export interface CallOptions {
    * backend can return its own structured error.
    */
   timeoutMs?: number
+  /**
+   * Caller-owned abort signal. WebTransport maps pre-/mid-fetch aborts
+   * to a DOM `AbortError` (distinct from the internal timeout's
+   * `Error("Request timed out")`). Tauri and remote-desktop check
+   * `throwIfAborted()` before dispatch only — they cannot cancel an
+   * already-dispatched IPC command; callers must send guarded
+   * `cancel_reference_search` and reject late results by generation.
+   */
+  signal?: AbortSignal
 }
 
 export interface Transport {

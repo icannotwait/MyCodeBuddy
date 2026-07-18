@@ -24,6 +24,8 @@ interface ChatInputProps {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   defaultPath?: string
+  /** Authoritative folder scope for mention search (not the `0` command fallback). */
+  folderId?: number | null
   agentName?: string
   onFocus?: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
@@ -81,6 +83,7 @@ export const ChatInput = memo(function ChatInput({
   status,
   promptCapabilities,
   defaultPath,
+  folderId = null,
   agentName,
   onFocus,
   onSend,
@@ -147,6 +150,7 @@ export const ChatInput = memo(function ChatInput({
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
+        folderId={folderId}
         disabled={
           allowOfflineCompose
             ? false

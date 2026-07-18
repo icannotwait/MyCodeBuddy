@@ -1103,7 +1103,11 @@
     "autoTitleOff": "關閉",
     "autoTitleUnavailable": "{agent}（無法使用）",
     "autoTitleSaveFailed": "儲存自動標題智慧體失敗：{message}",
-    "autoTitleLoading": "正在載入自動標題設定..."
+    "autoTitleLoading": "正在載入自動標題設定...",
+    "referenceSearchLimit": "參照結果上限",
+    "referenceSearchLimitHint": "每個資源來源最多快取與搜尋的結果數（10-500）。",
+    "referenceSearchLimitSave": "儲存參照上限",
+    "referenceSearchLimitSaveFailed": "儲存參照結果上限失敗：{message}"
   },
   "LoginPage": {
     "documentTitle": "登入 - DrawCode",
@@ -2172,7 +2176,10 @@
         "mentionGroupAgent": "智能體",
         "mentionGroupSession": "工作階段",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionInvalidPattern": "規則運算式無效",
+        "mentionSourceError": "無法重新整理此來源",
+        "mentionProfileError": "無法載入委派設定檔"
       },
       "messageQueue": {
         "addToQueue": "加入佇列",

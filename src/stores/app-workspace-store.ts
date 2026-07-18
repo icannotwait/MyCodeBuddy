@@ -314,7 +314,10 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
         existing.is_repo !== head.is_repo ||
         existing.branch !== head.branch ||
         existing.detached !== head.detached ||
-        existing.short_sha !== head.short_sha
+        existing.short_sha !== head.short_sha ||
+        existing.canonical_repo !== head.canonical_repo ||
+        existing.head_sha !== head.head_sha ||
+        existing.reference_source_epoch !== head.reference_source_epoch
       ) {
         const next = new Map(gitHeads)
         next.set(folderId, head)

@@ -309,6 +309,28 @@ pub async fn set_auto_title_agent_core(
     Ok(saved)
 }
 
+/// Persist a new reference-search result limit, advance the registry limit
+/// epoch (cancelling old-epoch jobs), and broadcast the full settings
+/// snapshot. Holds the shared mutation gate through registry application and
+/// event emission so an older delayed write cannot restore an obsolete cap.
+pub async fn set_reference_search_limit_core(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+    registry: &crate::reference_search::ReferenceSearchRegistry,
+    mutation_gate: &ConversationExperienceMutationGate,
+    limit: u16,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let _mutation_guard = mutation_gate.lock().await;
+    let saved = set_reference_search_limit_persisted_core(conn, limit).await?;
+    registry.set_limit(saved.reference_search_limit).await;
+    emit_event(
+        emitter,
+        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        saved.clone(),
+    );
+    Ok(saved)
+}
+
 // -------- Tauri commands -----------------------------------------------------
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -343,6 +365,32 @@ pub async fn set_auto_title_agent(
     #[cfg(not(feature = "tauri-runtime"))]
     {
         let _ = agent;
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_reference_search_limit(
+    limit: u16,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")]
+    registry: tauri::State<
+        '_,
+        std::sync::Arc<crate::reference_search::ReferenceSearchRegistry>,
+    >,
+    #[cfg(feature = "tauri-runtime")]
+    mutation_gate: tauri::State<'_, std::sync::Arc<ConversationExperienceMutationGate>>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let emitter = EventEmitter::Tauri(app);
+        set_reference_search_limit_core(&db.conn, &emitter, &registry, &mutation_gate, limit)
+            .await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = limit;
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }
@@ -612,5 +660,267 @@ mod tests {
             .await
             .expect("load empty");
         assert_eq!(agent, None);
+    }
+
+    // ── Live registry fixtures (limit epoch + mutation gate) ────────────────
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use crate::reference_search::matcher::SearchPattern;
+    use crate::reference_search::sources::{
+        ReferenceSourceCursor, ReferenceSourceFactory, SourcePage,
+    };
+    use crate::reference_search::types::{
+        ReferenceDoneReason, ReferenceSearchPage, ReferenceSearchSource,
+        StartReferenceSearchRequest,
+    };
+    use crate::reference_search::ReferenceSearchRegistry;
+    use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+    struct BlockedFactory {
+        releases: Arc<tokio::sync::Mutex<Vec<oneshot::Sender<()>>>>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct BlockedCursor {
+        release_rx: Option<oneshot::Receiver<()>>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ReferenceSourceCursor for BlockedCursor {
+        async fn next_page(
+            &mut self,
+            _page_size: usize,
+            token: CancellationToken,
+        ) -> Result<SourcePage, crate::app_error::AppCommandError> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(rx) = self.release_rx.take() {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        return Err(crate::app_error::AppCommandError::new(
+                            AppErrorCode::Cancelled,
+                            "cancelled",
+                        ));
+                    }
+                    result = rx => {
+                        let _ = result;
+                    }
+                }
+            }
+            Ok(SourcePage {
+                items: Vec::new(),
+                source_epoch: None,
+                done: true,
+                done_reason: Some(ReferenceDoneReason::Exhausted),
+            })
+        }
+
+        async fn close(&mut self) {}
+    }
+
+    #[async_trait]
+    impl ReferenceSourceFactory for BlockedFactory {
+        async fn open(
+            &self,
+            _request: &StartReferenceSearchRequest,
+            _pattern: SearchPattern,
+            _limit: usize,
+        ) -> Result<Box<dyn ReferenceSourceCursor>, crate::app_error::AppCommandError> {
+            let (tx, rx) = oneshot::channel();
+            self.releases.lock().await.push(tx);
+            Ok(Box::new(BlockedCursor {
+                release_rx: Some(rx),
+                started: Arc::clone(&self.started),
+            }))
+        }
+    }
+
+    struct LiveRegistryFixture {
+        db: crate::db::AppDatabase,
+        emitter: EventEmitter,
+        registry: Arc<ReferenceSearchRegistry>,
+        mutation_gate: ConversationExperienceMutationGate,
+        broadcaster: Arc<WebEventBroadcaster>,
+        settings_rx: tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        releases: Arc<tokio::sync::Mutex<Vec<oneshot::Sender<()>>>>,
+        blocked_job: Option<JoinHandle<Result<ReferenceSearchPage, crate::app_error::AppCommandError>>>,
+        blocked_request: Option<StartReferenceSearchRequest>,
+    }
+
+    async fn live_registry_fixture(limit: u16) -> LiveRegistryFixture {
+        let db = fresh_in_memory_db().await;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let settings_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releases = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let factory = Arc::new(BlockedFactory {
+            releases: Arc::clone(&releases),
+            started: Arc::clone(&started),
+        });
+        let registry = ReferenceSearchRegistry::new(limit, factory);
+        LiveRegistryFixture {
+            db,
+            emitter,
+            registry,
+            mutation_gate: ConversationExperienceMutationGate::default(),
+            broadcaster,
+            settings_rx,
+            started,
+            releases,
+            blocked_job: None,
+            blocked_request: None,
+        }
+    }
+
+    impl LiveRegistryFixture {
+        async fn start_blocked_job(&mut self) {
+            let request = StartReferenceSearchRequest {
+                search_session_id: Uuid::new_v4().hyphenated().to_string(),
+                source_sequence: 1,
+                request_id: Uuid::new_v4().hyphenated().to_string(),
+                source: ReferenceSearchSource::File,
+                query: "blocked".into(),
+                workspace_path: Some("/tmp/live-registry".into()),
+            };
+            let registry = Arc::clone(&self.registry);
+            let start = request.clone();
+            let handle = tokio::spawn(async move { registry.start(start).await });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if self.started.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("blocked job never entered scan");
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            self.blocked_job = Some(handle);
+            self.blocked_request = Some(request);
+        }
+
+        async fn old_job_cancelled(&mut self) -> bool {
+            let Some(handle) = self.blocked_job.take() else {
+                return false;
+            };
+            match tokio::time::timeout(Duration::from_secs(2), handle).await {
+                Ok(Ok(Err(error))) => error.code == AppErrorCode::LimitEpochChanged,
+                other => {
+                    panic!("expected LimitEpochChanged on blocked job, got {other:?}");
+                }
+            }
+        }
+
+        fn last_settings_event(&mut self) -> ConversationExperienceSettings {
+            let mut last = None;
+            loop {
+                match self.settings_rx.try_recv() {
+                    Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                        last = Some(
+                            serde_json::from_value(evt.payload.as_ref().clone())
+                                .expect("settings payload"),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            last.expect("settings event")
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_limit_cancels_old_epoch_and_broadcasts_full_snapshot() {
+        let mut fixture = live_registry_fixture(50).await;
+        fixture.start_blocked_job().await;
+        let saved = set_reference_search_limit_core(
+            &fixture.db.conn,
+            &fixture.emitter,
+            &fixture.registry,
+            &fixture.mutation_gate,
+            25,
+        )
+        .await
+        .expect("limit");
+        assert_eq!(saved.reference_search_limit, 25);
+        assert!(fixture.old_job_cancelled().await);
+        assert_eq!(fixture.last_settings_event().revision, saved.revision);
+    }
+
+    #[tokio::test]
+    async fn concurrent_limit_saves_hold_the_gate_through_registry_application() {
+        let mut fixture = live_registry_fixture(50).await;
+        let (arrival, release) = fixture.registry.pause_next_limit_apply_before_effect().await;
+
+        let db = fixture.db.conn.clone();
+        let emitter = fixture.emitter.clone();
+        let registry = Arc::clone(&fixture.registry);
+        // Shared gate across concurrent wrappers (fixture gate stays put).
+        let gate = Arc::new(ConversationExperienceMutationGate::default());
+
+        let first = {
+            let db = db.clone();
+            let emitter = emitter.clone();
+            let registry = Arc::clone(&registry);
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                set_reference_search_limit_core(&db, &emitter, &registry, &gate, 20).await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), arrival)
+            .await
+            .expect("first set_limit arrival")
+            .expect("arrival oneshot");
+
+        let mut second = {
+            let db = db.clone();
+            let emitter = emitter.clone();
+            let registry = Arc::clone(&registry);
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                set_reference_search_limit_core(&db, &emitter, &registry, &gate, 30).await
+            })
+        };
+
+        let early = tokio::time::timeout(Duration::from_millis(50), &mut second).await;
+        assert!(
+            early.is_err(),
+            "second limit save must stay pending while first holds the gate through set_limit"
+        );
+
+        release.send(()).expect("release first set_limit");
+
+        let first_saved = first.await.expect("join first").expect("first ok");
+        let second_saved = second.await.expect("join second").expect("second ok");
+
+        assert_eq!(first_saved.reference_search_limit, 20);
+        assert_eq!(second_saved.reference_search_limit, 30);
+        assert!(second_saved.revision > first_saved.revision);
+
+        let loaded = get_conversation_experience_settings_core(&db)
+            .await
+            .expect("load");
+        assert_eq!(loaded.reference_search_limit, 30);
+        assert_eq!(loaded.revision, second_saved.revision);
+        assert_eq!(registry.current_limit().await, 30);
+        // Two set_limit calls → epoch advanced twice from 0.
+        assert_eq!(registry.current_limit_epoch().await, 2);
+
+        let last_event = fixture.last_settings_event();
+        assert_eq!(last_event.revision, second_saved.revision);
+        assert_eq!(last_event.reference_search_limit, 30);
     }
 }
