@@ -81,11 +81,15 @@ pub async fn delete_chat_channel_core(
     id: i32,
 ) -> Result<(), AppCommandError> {
     // Disconnect running backend before deleting from DB (prevents orphaned task)
-    let _ = manager.remove_channel(id).await;
+    if let Err(e) = manager.remove_channel(id).await {
+        tracing::warn!("[ChatChannel] failed to remove channel {id} before delete: {e}");
+    }
     chat_channel_service::delete(&db.conn, id)
         .await
         .map_err(AppCommandError::from)?;
-    let _ = crate::keyring_store::delete_channel_token(id);
+    if let Err(e) = crate::keyring_store::delete_channel_token(id) {
+        tracing::warn!("[ChatChannel] failed to delete keyring token for channel {id}: {e}");
+    }
     Ok(())
 }
 

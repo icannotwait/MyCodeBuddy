@@ -1559,6 +1559,36 @@ pub fn failed_to_add_folder_label(lang: Lang) -> &'static str {
     }
 }
 
+pub fn failed_to_select_folder_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "保存目录选择失败: ",
+        Lang::ZhTw => "儲存目錄選擇失敗: ",
+        Lang::Ja => "フォルダの選択の保存に失敗しました: ",
+        Lang::Ko => "폴더 선택 저장 실패: ",
+        Lang::Es => "Error al guardar la selección de carpeta: ",
+        Lang::De => "Ordnerauswahl konnte nicht gespeichert werden: ",
+        Lang::Fr => "Échec de l'enregistrement de la sélection du dossier : ",
+        Lang::Pt => "Falha ao salvar a seleção da pasta: ",
+        Lang::Ar => "فشل حفظ اختيار المجلد: ",
+        Lang::En => "Failed to save folder selection: ",
+    }
+}
+
+pub fn failed_to_select_agent_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "保存智能体选择失败: ",
+        Lang::ZhTw => "儲存智能體選擇失敗: ",
+        Lang::Ja => "エージェントの選択の保存に失敗しました: ",
+        Lang::Ko => "에이전트 선택 저장 실패: ",
+        Lang::Es => "Error al guardar la selección de agente: ",
+        Lang::De => "Agentenauswahl konnte nicht gespeichert werden: ",
+        Lang::Fr => "Échec de l'enregistrement de la sélection de l'agent : ",
+        Lang::Pt => "Falha ao salvar a seleção do agente: ",
+        Lang::Ar => "فشل حفظ اختيار الوكيل: ",
+        Lang::En => "Failed to save agent selection: ",
+    }
+}
+
 pub fn failed_to_load_context_label(lang: Lang) -> &'static str {
     match lang {
         Lang::ZhCn => "加载上下文失败: ",

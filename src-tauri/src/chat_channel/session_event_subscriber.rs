@@ -107,12 +107,18 @@ async fn handle_acp_envelope(
         AcpEvent::SessionStarted { session_id } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
-                let _ = conversation_service::update_external_id(
+                if let Err(e) = conversation_service::update_external_id(
                     db,
                     session.conversation_id,
                     session_id.clone(),
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "[SessionEventSub] failed to persist external_id for conversation {}: {e}",
+                        session.conversation_id
+                    );
+                }
 
                 if let Some(prompt_text) = session.pending_prompt.take() {
                     // Clone so the prompt can be RESTORED (not dropped) if a turn
@@ -469,12 +475,17 @@ async fn handle_acp_envelope(
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
                 if stop_reason == "end_turn" {
-                    let _ = conversation_service::update_status(
+                    if let Err(e) = conversation_service::update_status(
                         db,
                         conv_id,
                         crate::db::entities::conversation::ConversationStatus::Completed,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(
+                            "[SessionEventSub] failed to mark conversation {conv_id} completed: {e}"
+                        );
+                    }
                 }
 
                 // Retry the deferred kickoff now the turn that blocked it ended.
@@ -552,13 +563,21 @@ async fn handle_acp_envelope(
 
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
-                let _ = conversation_service::update_status(
+                if let Err(e) = conversation_service::update_status(
                     db,
                     conv_id,
                     crate::db::entities::conversation::ConversationStatus::Cancelled,
                 )
-                .await;
-                let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                .await
+                {
+                    tracing::warn!(
+                        "[SessionEventSub] failed to mark conversation {conv_id} cancelled: {e}"
+                    );
+                }
+                if let Err(e) = sender_context_service::clear_session(db, channel_id, &sender_id).await
+                {
+                    tracing::warn!("[SessionEventSub] failed to clear session after error: {e}");
+                }
             }
         }
 
@@ -573,7 +592,13 @@ async fn handle_acp_envelope(
                     let sender_id = session.sender_id.clone();
                     drop(guard);
 
-                    let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                    if let Err(e) =
+                        sender_context_service::clear_session(db, channel_id, &sender_id).await
+                    {
+                        tracing::warn!(
+                            "[SessionEventSub] failed to clear session on disconnect: {e}"
+                        );
+                    }
                 }
             }
         }

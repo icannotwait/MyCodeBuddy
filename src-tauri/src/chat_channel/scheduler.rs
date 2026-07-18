@@ -85,7 +85,7 @@ pub fn spawn_daily_report_scheduler(
                     Err(e) => ("failed", Some(e.to_string())),
                 };
 
-                let _ = chat_channel_message_log_service::create_log(
+                if let Err(e) = chat_channel_message_log_service::create_log(
                     &db_conn,
                     ch.id,
                     "outbound",
@@ -94,7 +94,13 @@ pub fn spawn_daily_report_scheduler(
                     status,
                     error_detail,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "[ChatChannel] failed to record daily_report log for channel {}: {e}",
+                        ch.id
+                    );
+                }
 
                 sent_today.insert(key);
             }

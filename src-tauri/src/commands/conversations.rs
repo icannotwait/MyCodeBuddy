@@ -670,7 +670,13 @@ pub async fn get_folder_conversation_core(
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
     if let Some(new_ext_id) = resolved_ext_id {
-        let _ = conversation_service::update_external_id(conn, conversation_id, new_ext_id).await;
+        if let Err(e) =
+            conversation_service::update_external_id(conn, conversation_id, new_ext_id).await
+        {
+            tracing::warn!(
+                "Failed to persist resolved external_id for conversation {conversation_id}: {e}"
+            );
+        }
     }
 
     let mut summary = summary;
