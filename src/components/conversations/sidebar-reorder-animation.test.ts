@@ -171,6 +171,36 @@ describe("detectSidebarActivityReorder", () => {
     const { before, after, activityId } = scenarioFixture(scenario)
     expect(detectSidebarActivityReorder(before, after, activityId)).toBeNull()
   })
+
+  it("rejects malformed snapshots whose root lists carry internal duplicates", () => {
+    // Builder invariant is one depth-0 entry per root. A broken multiset like
+    // [1,1,2] vs [1,2,2] must not pass sameNumberSet membership as equivalent.
+    const before: SidebarRootOrderSnapshot = {
+      structuralRowKeys: ["section-folders", "folder-10"],
+      rootsByBucket: new Map([["folder:10", [1, 1, 2]]]),
+      blockRowKeysByRoot: new Map([
+        [1, ["conv-claude_code-1"]],
+        [2, ["conv-claude_code-2"]],
+      ]),
+      bucketByRoot: new Map([
+        [1, "folder:10"],
+        [2, "folder:10"],
+      ]),
+    }
+    const after: SidebarRootOrderSnapshot = {
+      structuralRowKeys: ["section-folders", "folder-10"],
+      rootsByBucket: new Map([["folder:10", [2, 1, 2]]]),
+      blockRowKeysByRoot: new Map([
+        [1, ["conv-claude_code-1"]],
+        [2, ["conv-claude_code-2"]],
+      ]),
+      bucketByRoot: new Map([
+        [1, "folder:10"],
+        [2, "folder:10"],
+      ]),
+    }
+    expect(detectSidebarActivityReorder(before, after, 2)).toBeNull()
+  })
 })
 
 describe("selectSidebarAnchor", () => {

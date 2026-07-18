@@ -112,6 +112,10 @@ const virtuaCtl = vi.hoisted(() => ({
   scrollOffset: 0,
   onScroll: null as ((offset: number) => void) | null,
   scrollToIndex: vi.fn(),
+  lastProps: null as null | {
+    itemSize?: number
+    bufferSize?: number
+  },
 }))
 
 // Render EVERY row (data.map) rather than only a window, so the render-count
@@ -126,13 +130,18 @@ vi.mock("virtua", () => ({
     children,
     onScroll,
     ref,
+    itemSize,
+    bufferSize,
   }: {
     data: unknown[]
     children: (row: unknown, index: number) => ReactNode
     onScroll?: (offset: number) => void
     ref?: Ref<unknown>
+    itemSize?: number
+    bufferSize?: number
   }) => {
     virtuaCtl.onScroll = onScroll ?? null
+    virtuaCtl.lastProps = { itemSize, bufferSize }
     useImperativeHandle(ref, () => ({
       get scrollOffset() {
         return virtuaCtl.scrollOffset
@@ -961,6 +970,45 @@ describe("SidebarConversationList — Virtua animation integration", () => {
     expect(reorderAnimationCtl.lastOptions?.dragging).toBe(false)
   })
 
+  it("configures Virtualizer with itemSize 32 and bufferSize 400", () => {
+    render(tree())
+    expect(virtuaCtl.lastProps).toEqual({ itemSize: 32, bufferSize: 400 })
+  })
+
+  it("forwards dragging=true into the animation hook while a folder drag is active", () => {
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        top: 0,
+        bottom: 600,
+        left: 0,
+        right: 200,
+        width: 200,
+        height: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect)
+    try {
+      render(tree())
+      expect(reorderAnimationCtl.lastOptions?.dragging).toBe(false)
+
+      const grip = (
+        document.querySelector('[data-folder-id="1"]') as HTMLElement
+      ).parentElement as HTMLElement
+      act(() => firePointer(grip, "pointerdown", { clientY: 100 }))
+      act(() => firePointer(window, "pointermove", { clientY: 120 }))
+
+      // While dragging, Virtualizer unmounts but the hook still receives
+      // dragging=true so active waves cancel/rebase without animating.
+      expect(reorderAnimationCtl.lastOptions?.dragging).toBe(true)
+
+      act(() => firePointer(window, "pointercancel", { clientY: 120 }))
+    } finally {
+      rectSpy.mockRestore()
+    }
+  })
+
   it("puts stable ownership metadata on conversation Virtua child wrappers", () => {
     render(tree())
 
@@ -982,6 +1030,28 @@ describe("SidebarConversationList — Virtua animation integration", () => {
         conversationId: "12",
       }),
     })
+  })
+
+  it("marks non-owned structural wrappers with a key but no root/bucket/conversation ownership", () => {
+    render(tree())
+
+    const section = document.querySelector(
+      '[data-sidebar-row-key="section-folders"]'
+    ) as HTMLElement | null
+    expect(section).not.toBeNull()
+    expect(section?.dataset.sidebarRowKey).toBe("section-folders")
+    expect(section?.getAttribute("data-sidebar-root-id")).toBeNull()
+    expect(section?.getAttribute("data-sidebar-bucket-key")).toBeNull()
+    expect(section?.getAttribute("data-conversation-id")).toBeNull()
+
+    const folderRow = document.querySelector(
+      '[data-sidebar-row-key="folder-1"]'
+    ) as HTMLElement | null
+    expect(folderRow).not.toBeNull()
+    expect(folderRow?.dataset.sidebarRowKey).toBe("folder-1")
+    expect(folderRow?.getAttribute("data-sidebar-root-id")).toBeNull()
+    expect(folderRow?.getAttribute("data-sidebar-bucket-key")).toBeNull()
+    expect(folderRow?.getAttribute("data-conversation-id")).toBeNull()
   })
 
   it("marks subsession loading placeholders with the owning root metadata", async () => {

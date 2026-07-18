@@ -168,4 +168,28 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
     await waitFor(() => expect(h.setMode).toHaveBeenCalledWith("plan"))
     expect(h.sendPrompt).not.toHaveBeenCalled()
   })
+
+  it("invokes onTurnInProgress for TurnBusyError so callers can requeue", async () => {
+    const { TurnBusyError } = await import("@/lib/turn-busy")
+    h.sendPrompt.mockRejectedValueOnce(new TurnBusyError())
+    const onTurnInProgress = vi.fn()
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "tab-1",
+        agentType: "claude_code",
+        isActive: true,
+      })
+    )
+
+    act(() => {
+      result.current.handleSend(
+        { blocks: [{ type: "text", text: "wire" }], displayText: "wire" },
+        null,
+        { onTurnInProgress }
+      )
+    })
+
+    await waitFor(() => expect(onTurnInProgress).toHaveBeenCalledTimes(1))
+    expect(h.sendPrompt).toHaveBeenCalledTimes(1)
+  })
 })

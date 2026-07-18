@@ -398,12 +398,21 @@ beforeEach(() => {
     value: matchMediaMock,
   })
 
+  // Track id → callback so cancelAnimationFrame actually dequeues, matching
+  // browser semantics (cancelled frames must not run on flush).
+  const rafById = new Map<number, FrameRequestCallback>()
   vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+    const id = rafId++
+    rafById.set(id, cb)
     rafQueue.push(cb)
-    return rafId++
+    return id
   })
   vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
-    void id
+    const cb = rafById.get(id)
+    if (!cb) return
+    rafById.delete(id)
+    const index = rafQueue.indexOf(cb)
+    if (index >= 0) rafQueue.splice(index, 1)
   })
 })
 
@@ -824,6 +833,101 @@ describe("useSidebarReorderAnimation", () => {
     expect(animateMock.mock.calls.length).toBe(callsAfterWave)
   })
 
+  it("preserves an active wave when a later sequence has equivalent order (prompt-start ack)", async () => {
+    // Optimistic promotion (sequence N) places root 3 on top; the authoritative
+    // prompt-start ack advances to N+1 with the same order (root already top).
+    // That must not cancel the in-flight wave.
+    const { rerender, container } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    rerender(
+      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
+    )
+
+    const firstWave = animateMock.mock.results.map(
+      (result) => result.value as MockAnimation
+    )
+    expect(firstWave.length).toBeGreaterThan(0)
+    const callsAfterWave = animateMock.mock.calls.length
+
+    // Sequence N+1, identical order, activity root already at top.
+    const ackRows = rowsForFolder([root(3), root(1), root(2)])
+    rerender(
+      <Harness rows={ackRows} sequence={2} activityId={3} tops={afterTops} />
+    )
+
+    expect(firstWave.every((anim) => anim.cancel.mock.calls.length === 0)).toBe(
+      true
+    )
+    expect(animateMock.mock.calls.length).toBe(callsAfterWave)
+
+    // Wave still completes cleanly (owned styles cleared via finished).
+    await act(async () => {
+      for (const anim of firstWave) {
+        anim.resolveFinished()
+      }
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const viewport = container.querySelector(
+      '[data-testid="viewport"]'
+    ) as HTMLElement
+    for (const node of viewport.querySelectorAll<HTMLElement>(
+      "[data-sidebar-row-key]"
+    )) {
+      expect(node.style.transform).toBe("")
+      expect(node.style.opacity).toBe("")
+    }
+  })
+
+  it("reseeds after sequence regression so a later sequence 1 can animate again", () => {
+    const { rerender } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    // Consume a high sequence with an eligible promotion wave.
+    rerender(
+      <Harness rows={afterRows} sequence={5} activityId={3} tops={afterTops} />
+    )
+    const highWave = animateMock.mock.results.map(
+      (result) => result.value as MockAnimation
+    )
+    expect(highWave.length).toBeGreaterThan(0)
+
+    // Store reset: activitySequence regresses to 0. Must cancel and reseed.
+    rerender(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+    expect(highWave.every((anim) => anim.cancel.mock.calls.length >= 1)).toBe(
+      true
+    )
+
+    const callsAfterReset = animateMock.mock.calls.length
+
+    // Fresh sequence 1 after reset must be eligible again.
+    rerender(
+      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
+    )
+    expect(animateMock.mock.calls.length).toBeGreaterThan(callsAfterReset)
+  })
+
   it("cancels when dragging becomes true", () => {
     const { rerender } = render(
       <Harness
@@ -931,7 +1035,9 @@ describe("useSidebarReorderAnimation", () => {
     expect(animateMock.mock.calls.length).toBeGreaterThan(callsBefore)
   })
 
-  it("cancels and clears owned styles on unmount", () => {
+  it("cancels tracked animations and clears owned styles only on unmount disposal", () => {
+    // Unmount is an explicit disposal path. Same-sequence equivalent rerenders
+    // must not cancel; only this cleanup (and user scroll / drag / rebase) does.
     const { rerender, unmount, container } = render(
       <Harness
         rows={beforeRows}
@@ -1107,41 +1213,9 @@ describe("useSidebarReorderAnimation", () => {
     expect(seen[0]?.handleUserScroll).toBe(seen[1]?.handleUserScroll)
   })
 
-  it("clears owned styles when a move animation finishes via onfinish path helper", () => {
-    const { rerender, container } = render(
-      <Harness
-        rows={beforeRows}
-        sequence={0}
-        activityId={null}
-        tops={beforeTops}
-      />
-    )
-
-    rerender(
-      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
-    )
-
-    const animations = animateMock.mock.results.map(
-      (result) => result.value as MockAnimation
-    )
-    act(() => {
-      for (const anim of animations) {
-        finishAnimation(anim)
-      }
-    })
-
-    const viewport = container.querySelector(
-      '[data-testid="viewport"]'
-    ) as HTMLElement
-    for (const node of viewport.querySelectorAll<HTMLElement>(
-      "[data-sidebar-row-key]"
-    )) {
-      expect(node.style.transform).toBe("")
-      expect(node.style.opacity).toBe("")
-    }
-  })
-
-  it("clears owned styles when the finished promise resolves", async () => {
+  it("clears owned styles when a move animation finished promise resolves", async () => {
+    // Production tracks completion exclusively via Animation.finished (not
+    // onfinish). Resolving the promise must drop owned transform/opacity.
     const { rerender, container } = render(
       <Harness
         rows={beforeRows}
@@ -1160,11 +1234,9 @@ describe("useSidebarReorderAnimation", () => {
     )
     expect(animations.length).toBeGreaterThan(0)
 
-    // Resolve finished promises only — do not call onfinish. Production must
-    // clean up from the promise path.
     await act(async () => {
       for (const anim of animations) {
-        anim.resolveFinished()
+        finishAnimation(anim)
       }
       await Promise.resolve()
       await Promise.resolve()
@@ -1179,5 +1251,69 @@ describe("useSidebarReorderAnimation", () => {
       expect(node.style.transform).toBe("")
       expect(node.style.opacity).toBe("")
     }
+  })
+
+  it("clears a still-tracked entry when finished rejects from an external cancel", async () => {
+    // External cancel rejects `finished` without going through our cancel path.
+    // The catch must still clear styles, drop the entry, and stop the sampler
+    // when it was the last tracked handle.
+    const { rerender, container } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    rerender(
+      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
+    )
+
+    // Let the visual sampler schedule at least one frame.
+    act(() => {
+      flushAnimationFrame()
+    })
+    expect(rafQueue.length).toBeGreaterThan(0)
+
+    const animations = animateMock.mock.results.map(
+      (result) => result.value as MockAnimation
+    )
+    expect(animations.length).toBeGreaterThan(0)
+
+    // Leave transforms painted as if WAAPI was mid-flight, then reject finished
+    // without calling our cancel() (simulates browser/external abort).
+    for (const call of animateCalls) {
+      call.element.style.transform = "translateY(12px)"
+    }
+
+    await act(async () => {
+      for (const anim of animations) {
+        anim.rejectFinished(
+          new DOMException("externally cancelled", "AbortError")
+        )
+      }
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const viewport = container.querySelector(
+      '[data-testid="viewport"]'
+    ) as HTMLElement
+    for (const node of viewport.querySelectorAll<HTMLElement>(
+      "[data-sidebar-row-key]"
+    )) {
+      expect(node.style.transform).toBe("")
+      expect(node.style.opacity).toBe("")
+    }
+
+    // Sampler must stop: cancelled frames are removed from the rAF queue.
+    const pendingAfter = rafQueue.length
+    act(() => {
+      flushAnimationFrame()
+    })
+    // No new sampler ticks re-queued after last entry was cleared.
+    expect(rafQueue.length).toBe(0)
+    expect(pendingAfter).toBe(0)
   })
 })

@@ -36,11 +36,19 @@ function sameReadonlyStringArray(
   return true
 }
 
+/**
+ * Membership equality for root id lists. Rejects internal duplicates so a
+ * malformed snapshot (broken builder invariant) cannot pass as "same set"
+ * when multiset membership actually differs (e.g. [1,1,2] vs [1,2,2]).
+ */
 function sameNumberSet(a: readonly number[], b: readonly number[]): boolean {
   if (a.length !== b.length) return false
-  const set = new Set(a)
+  const setA = new Set(a)
+  if (setA.size !== a.length) return false
+  const setB = new Set(b)
+  if (setB.size !== b.length) return false
   for (const value of b) {
-    if (!set.has(value)) return false
+    if (!setA.has(value)) return false
   }
   return true
 }

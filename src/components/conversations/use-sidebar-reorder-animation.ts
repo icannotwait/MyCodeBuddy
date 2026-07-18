@@ -333,7 +333,17 @@ export function useSidebarReorderAnimation(
           }
         })
         .catch(() => {
-          // Cancelled animations reject `finished`; cancel paths clear styles.
+          // External cancel (or other rejection) may leave the entry tracked when
+          // our own cancelActiveAnimations path did not run. Clear ownership.
+          if (!activeAnimationsRef.current.includes(entry)) return
+          clearOwnedStyles(element)
+          activeAnimationsRef.current = activeAnimationsRef.current.filter(
+            (item) => item !== entry
+          )
+          if (activeAnimationsRef.current.length === 0) {
+            stopVisualSampler()
+            visualCacheRef.current = null
+          }
         })
     },
     [stopVisualSampler]
@@ -455,6 +465,18 @@ export function useSidebarReorderAnimation(
       return
     }
 
+    // Store reset (or any sequence regression below the last consumed value):
+    // cancel the wave, reseed geometry/snapshot, and adopt the lower sequence
+    // so subsequent 1+ activity events can animate again.
+    if (
+      consumedSequenceRef.current !== null &&
+      activitySequence < consumedSequenceRef.current
+    ) {
+      rebaseToCurrent(viewportEl, rows)
+      consumedSequenceRef.current = activitySequence
+      return
+    }
+
     const sequenceAdvanced =
       consumedSequenceRef.current !== null &&
       activitySequence > consumedSequenceRef.current
@@ -482,6 +504,18 @@ export function useSidebarReorderAnimation(
 
     // Always consume the advanced sequence, even when animation is skipped.
     consumedSequenceRef.current = activitySequence
+
+    // Advanced sequence with equivalent structure/order (e.g. prompt-start ack
+    // after optimistic promotion already placed the root on top): preserve the
+    // active wave exactly like the same-sequence equivalent path. Rebase only
+    // for actual structural/order change without an eligible reorder.
+    if (sidebarSnapshotsEquivalent(priorSnapshot, afterSnapshot)) {
+      priorSnapshotRef.current = afterSnapshot
+      if (activeAnimationsRef.current.length === 0) {
+        priorMeasuredRef.current = lastMeasured
+      }
+      return
+    }
 
     const activityId = activityConversationId
     const reorder =

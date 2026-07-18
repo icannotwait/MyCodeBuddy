@@ -2929,6 +2929,26 @@ describe("root_conversation_activity_at_acp_dispatch_boundaries", () => {
     )
   })
 
+  it("rolls back exact overlay and rethrows TurnBusyError for busy/TurnInProgress", async () => {
+    const { TurnBusyError } = await import("@/lib/turn-busy")
+    acpPromptMock.mockRejectedValueOnce(new TurnBusyError())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    // Activity begins immediately before the wire call; busy rejection must
+    // roll the exact overlay back and propagate the same TurnBusyError so the
+    // lifecycle/requeue path can catch it.
+    await expect(
+      h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }])
+    ).rejects.toBeInstanceOf(TurnBusyError)
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      false
+    )
+    expect(acpPromptMock).toHaveBeenCalledTimes(1)
+  })
+
   it("uses explicit opts.conversationId over the bound connection id", async () => {
     useAppWorkspaceStore
       .getState()

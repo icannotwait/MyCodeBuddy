@@ -23,10 +23,14 @@ vi.mock("@/lib/api", () => ({
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((r) => {
-    resolve = r
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
   })
-  return { promise, resolve }
+  // Swallow unhandled rejections from tests that reject after supersession.
+  void promise.catch(() => {})
+  return { promise, resolve, reject }
 }
 
 function makeSummary(
@@ -228,6 +232,20 @@ describe("optimistic conversation activity", () => {
     )
   })
 
+  it("does not advance conversationActivitySequence on rollback", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(makeSummary({ id: 1 }))
+    const token = store.beginConversationActivity(1)!
+    const sequence =
+      useAppWorkspaceStore.getState().conversationActivitySequence
+
+    store.rollbackConversationActivity(1, token)
+
+    const after = useAppWorkspaceStore.getState()
+    expect(after.optimisticActivityById.has(1)).toBe(false)
+    expect(after.conversationActivitySequence).toBe(sequence)
+  })
+
   it("ignores older state and acknowledges activity only past its baseline", () => {
     const store = useAppWorkspaceStore.getState()
     store.applyConversationUpsert(
@@ -331,8 +349,11 @@ describe("monotonic upsert and refresh reconciliation", () => {
     await refresh
 
     const rows = useAppWorkspaceStore.getState().conversations
+    // Full state tuple must survive the contended refresh merge, including
+    // awaiting_reply_token from the newer authoritative patch.
     expect(rows.find((row) => row.id === 1)).toMatchObject({
       status: "pending_review",
+      awaiting_reply_token: "g2",
       updated_at: "2026-07-18T03:00:00.000Z",
     })
     expect(rows.some((row) => row.id === 2)).toBe(true)
@@ -371,6 +392,47 @@ describe("monotonic upsert and refresh reconciliation", () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ id: 2, title: "From second" })
     expect(useAppWorkspaceStore.getState().conversationsLoading).toBe(false)
+  })
+
+  it("does not let a superseded refresh rejection overwrite newer success loading/error state", async () => {
+    const first = deferred<DbConversationSummary[]>()
+    const second = deferred<DbConversationSummary[]>()
+    api.listAllConversations
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+
+    const store = useAppWorkspaceStore.getState()
+    const refresh1 = store.refreshConversations()
+    const refresh2 = store.refreshConversations()
+
+    second.resolve([
+      makeSummary({
+        id: 2,
+        title: "From second",
+        updated_at: "2026-07-18T02:00:00.000Z",
+      }),
+    ])
+    await refresh2
+
+    const afterSuccess = useAppWorkspaceStore.getState()
+    expect(afterSuccess.conversationsLoading).toBe(false)
+    expect(afterSuccess.conversationsError).toBeNull()
+    expect(afterSuccess.conversations[0]).toMatchObject({
+      id: 2,
+      title: "From second",
+    })
+
+    // Older request fails after the newer one already committed success.
+    first.reject(new Error("stale network failure"))
+    await refresh1
+
+    const afterStaleReject = useAppWorkspaceStore.getState()
+    expect(afterStaleReject.conversationsLoading).toBe(false)
+    expect(afterStaleReject.conversationsError).toBeNull()
+    expect(afterStaleReject.conversations[0]).toMatchObject({
+      id: 2,
+      title: "From second",
+    })
   })
 
   it("removes rows omitted by a later uncontended refresh snapshot", async () => {
