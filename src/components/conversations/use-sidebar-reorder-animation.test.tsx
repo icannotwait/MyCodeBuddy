@@ -42,6 +42,8 @@ type MockAnimation = {
   finished: Promise<void>
   onfinish: ((this: Animation, ev: AnimationPlaybackEvent) => void) | null
   playState: string
+  resolveFinished: () => void
+  rejectFinished: (reason?: unknown) => void
 }
 
 const ROW_HEIGHT = 32
@@ -88,7 +90,10 @@ function rowsForFolder(roots: ConversationRow[]): SidebarRow[] {
 const beforeRows = rowsForFolder([root(1), root(2), root(3)])
 const afterRows = rowsForFolder([root(3), root(1), root(2)])
 
-/** Painted tops for a full three-root bucket (structural rows fixed). */
+/**
+ * Content-offset tops (relative to the scrollable content origin).
+ * Client top = viewportTop + contentTop - scrollTop + translateY.
+ */
 const beforeTops: Tops = {
   "section-folders": 0,
   "folder-10": 32,
@@ -106,26 +111,12 @@ const afterTops: Tops = {
 }
 
 /**
- * Anchor scenario: stable conversation at 152 → 184 while scrolled mid-list.
- * Structural rows sit above the viewport so they are not fully visible and
- * cannot steal the anchor (their tops do not move, so a stolen anchor yields
- * delta 0 and no correction).
+ * Anchor scenario uses the same content offsets. With viewportTop=100 and
+ * scrollTop=80, client tops are 120/152/184 so structural headers sit above
+ * the fully-visible band and cannot steal the anchor.
  */
-const anchorBeforeTops: Tops = {
-  "section-folders": 20,
-  "folder-10": 52,
-  "conv-claude_code-1": 120,
-  "conv-claude_code-2": 152,
-  "conv-claude_code-3": 184,
-}
-
-const anchorAfterTops: Tops = {
-  "section-folders": 20,
-  "folder-10": 52,
-  "conv-claude_code-3": 120,
-  "conv-claude_code-1": 152,
-  "conv-claude_code-2": 184,
-}
+const anchorBeforeTops = beforeTops
+const anchorAfterTops = afterTops
 
 /** Viewport band that excludes the structural headers above. */
 const ANCHOR_VIEWPORT_TOP = 100
@@ -150,13 +141,23 @@ function parseTranslateY(transform: string): number {
   return match ? Number(match[1]) : 0
 }
 
-function installNodeRect(el: HTMLElement): void {
+function findViewport(el: HTMLElement): HTMLElement | null {
+  return el.closest("[data-testid='viewport']") as HTMLElement | null
+}
+
+function installNodeRect(el: HTMLElement, viewportTop: number): void {
   Object.defineProperty(el, "getBoundingClientRect", {
     configurable: true,
     value: () => {
-      const baseTop = Number(el.dataset.top ?? "0")
+      const contentTop = Number(el.dataset.top ?? "0")
       const height = Number(el.dataset.height ?? String(ROW_HEIGHT))
-      const visualTop = baseTop + parseTranslateY(el.style.transform || "")
+      const viewport = findViewport(el)
+      const scrollTop = viewport?.scrollTop ?? 0
+      const visualTop =
+        viewportTop +
+        contentTop -
+        scrollTop +
+        parseTranslateY(el.style.transform || "")
       return {
         x: 0,
         y: visualTop,
@@ -195,23 +196,37 @@ function installViewportRect(el: HTMLElement, top = 0, bottom = 400): void {
 }
 
 function createMockAnimation(element: HTMLElement): MockAnimation {
+  let settled = false
   let resolveFinished!: () => void
-  const finished = new Promise<void>((resolve) => {
+  let rejectFinished!: (reason?: unknown) => void
+  const finished = new Promise<void>((resolve, reject) => {
     resolveFinished = resolve
+    rejectFinished = reject
   })
+  // Swallow rejection so cancel-driven Abort does not surface as unhandled.
+  void finished.catch(() => {})
+
   const animation: MockAnimation = {
     cancel: vi.fn(() => {
       element.style.transform = ""
       element.style.opacity = ""
+      animation.playState = "idle"
+      if (!settled) {
+        settled = true
+        rejectFinished(new DOMException("Animation cancelled", "AbortError"))
+      }
     }),
     commitStyles: vi.fn(() => {
-      // Freeze the opening keyframe as the current visual style so retarget
-      // measurements see the mid-flight position rather than layout top.
+      // Prefer the currently painted transform (mid-flight sample); otherwise
+      // freeze the opening keyframe so retarget can still read a visual top.
+      if (element.style.transform || element.style.opacity) {
+        return
+      }
       const lastCall = [...animateCalls]
         .reverse()
         .find((call) => call.element === element)
       const firstFrame = lastCall?.keyframes[0] as
-        | { transform?: string; opacity?: string }
+        | { transform?: string; opacity?: string | number }
         | undefined
       if (firstFrame?.transform) {
         element.style.transform = firstFrame.transform
@@ -223,30 +238,23 @@ function createMockAnimation(element: HTMLElement): MockAnimation {
     finished,
     onfinish: null,
     playState: "running",
+    resolveFinished: () => {
+      if (settled) return
+      settled = true
+      animation.playState = "finished"
+      resolveFinished()
+    },
+    rejectFinished: (reason?: unknown) => {
+      if (settled) return
+      settled = true
+      rejectFinished(reason)
+    },
   }
-  // Allow tests to complete the animation path.
-  void finished.then(() => {
-    if (typeof animation.onfinish === "function") {
-      animation.onfinish.call(
-        animation as unknown as Animation,
-        {} as AnimationPlaybackEvent
-      )
-    }
-    resolveFinished()
-  })
-  // Keep finished pending until finishAnimation / cancel.
-  void resolveFinished
   return animation
 }
 
 function finishAnimation(animation: MockAnimation): void {
-  animation.playState = "finished"
-  if (typeof animation.onfinish === "function") {
-    animation.onfinish.call(
-      animation as unknown as Animation,
-      {} as AnimationPlaybackEvent
-    )
-  }
+  animation.resolveFinished()
 }
 
 function flushAnimationFrame(): void {
@@ -255,6 +263,17 @@ function flushAnimationFrame(): void {
   for (const cb of queue) {
     cb(performance.now())
   }
+}
+
+function moveDeltaForKey(key: string): number | null {
+  const call = [...animateCalls].reverse().find((entry) => {
+    if (entry.element.dataset.sidebarRowKey !== key) return false
+    const frame = entry.keyframes[0] as { transform?: string }
+    return typeof frame.transform === "string"
+  })
+  if (!call) return null
+  const frame = call.keyframes[0] as { transform: string }
+  return parseTranslateY(frame.transform)
 }
 
 interface HarnessProps {
@@ -300,7 +319,7 @@ function Harness({
     for (const node of el.querySelectorAll<HTMLElement>(
       "[data-sidebar-row-key]"
     )) {
-      installNodeRect(node)
+      installNodeRect(node, viewportTop)
     }
   })
 
@@ -497,7 +516,7 @@ describe("useSidebarReorderAnimation", () => {
     expect(translateOnPromoted).toHaveLength(0)
   })
 
-  it("adds the anchor delta to scrollTop before creating move animations when scrolled", () => {
+  it("adds the anchor delta to scrollTop and uses corrected client coordinates", () => {
     let viewport: HTMLElement | null = null
     const scrollTopReads: number[] = []
 
@@ -544,10 +563,16 @@ describe("useSidebarReorderAnimation", () => {
       />
     )
 
-    // Anchor key conv-2: 152 → 184 ⇒ +32 applied before WAAPI.
+    // Anchor key conv-2: client 152 → 184 ⇒ +32 applied before WAAPI.
+    // After correction, content tops shift by -scrollTop so anchor FLIP is 0
+    // and the promoted row uses the corrected last client top (88, not 120).
     expect(viewport.scrollTop).toBe(112)
     expect(scrollTopReads.length).toBeGreaterThan(0)
     expect(scrollTopReads.every((value) => value === 112)).toBe(true)
+
+    expect(moveDeltaForKey(keyOf(2))).toBeNull()
+    // first client 184, last client after scroll 112: 100+100-112=88 → +96
+    expect(moveDeltaForKey(keyOf(3))).toBe(96)
   })
 
   it("does not correct scrollTop when already at the absolute top", () => {
@@ -623,18 +648,6 @@ describe("useSidebarReorderAnimation", () => {
     })
     expect(animateMock.mock.calls.length).toBe(callsAfterReorder)
 
-    // Active animations still present (not cancelled).
-    const animations = animateCalls.map((call) => {
-      // Recover mock animations via the last return of animateMock is hard;
-      // assert owned styles were not cleared by checking transforms are unset
-      // only after a real user scroll post-frame.
-      return call.element
-    })
-    // No cancel side-effect: commitStyles mock sets transform; without cancel
-    // mid-test we only assert handleUserScroll was a no-op for cancellation by
-    // ensuring a subsequent real user scroll (after raf) does cancel.
-    void animations
-
     act(() => {
       flushAnimationFrame()
     })
@@ -709,8 +722,8 @@ describe("useSidebarReorderAnimation", () => {
     }
   })
 
-  it("retargets a second eligible sequence via commitStyles without stacking", () => {
-    const { rerender } = render(
+  it("retargets a second eligible sequence from a sampled mid-flight visual top", () => {
+    const { rerender, container } = render(
       <Harness
         rows={beforeRows}
         sequence={0}
@@ -728,6 +741,20 @@ describe("useSidebarReorderAnimation", () => {
     )
     expect(firstWave.length).toBeGreaterThan(0)
     const firstWaveCount = animateMock.mock.calls.length
+
+    // Nontrivial mid-flight: layout last of root 3 is 100; opening keyframe was
+    // +64 (visual 164). Paint an intermediate translateY(40) → visual 140,
+    // which is neither the pre-reorder layout top (164) nor the post-commit
+    // second-sequence layout top (132).
+    const promoted = container.querySelector(
+      `[data-sidebar-row-key="${keyOf(3)}"]`
+    ) as HTMLElement
+    expect(promoted).toBeTruthy()
+    promoted.style.transform = "translateY(40px)"
+
+    act(() => {
+      flushAnimationFrame()
+    })
 
     // Second promotion: root 2 rises above 3 and 1.
     const secondAfterRows = rowsForFolder([root(2), root(3), root(1)])
@@ -755,6 +782,46 @@ describe("useSidebarReorderAnimation", () => {
 
     // New wave started; old handles were cancelled (no stack of dual actives).
     expect(animateMock.mock.calls.length).toBeGreaterThan(firstWaveCount)
+
+    // Sampled First visual top 140 → Last layout 132 ⇒ translateY(8px).
+    expect(moveDeltaForKey(keyOf(3))).toBe(8)
+  })
+
+  it("does not cancel an active wave on same-sequence equivalent rows rerender", () => {
+    const { rerender } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    rerender(
+      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
+    )
+
+    const firstWave = animateMock.mock.results.map(
+      (result) => result.value as MockAnimation
+    )
+    expect(firstWave.length).toBeGreaterThan(0)
+    const callsAfterWave = animateMock.mock.calls.length
+
+    // New array identity, same structure/order, same sequence.
+    const equivalentRows = rowsForFolder([root(3), root(1), root(2)])
+    rerender(
+      <Harness
+        rows={equivalentRows}
+        sequence={1}
+        activityId={3}
+        tops={afterTops}
+      />
+    )
+
+    expect(firstWave.every((anim) => anim.cancel.mock.calls.length === 0)).toBe(
+      true
+    )
+    expect(animateMock.mock.calls.length).toBe(callsAfterWave)
   })
 
   it("cancels when dragging becomes true", () => {
@@ -835,9 +902,6 @@ describe("useSidebarReorderAnimation", () => {
 
     // A later identical-looking eligible reorder with a new sequence must not
     // be blocked by a stale unconsumed signal — sequence 2 was consumed.
-    const thirdRows = rowsForFolder([root(1), root(3)])
-    // From [3,1] → [1,3] is downward for 1 and not upward for 3; use [1,3]→promote 3
-    // Start from [1,3] with sequence already 2 consumed, promote 3.
     const baseRows = rowsForFolder([root(1), root(3)])
     const baseTops: Tops = {
       "section-folders": 0,
@@ -865,7 +929,6 @@ describe("useSidebarReorderAnimation", () => {
       />
     )
     expect(animateMock.mock.calls.length).toBeGreaterThan(callsBefore)
-    void thirdRows
   })
 
   it("cancels and clears owned styles on unmount", () => {
@@ -969,6 +1032,50 @@ describe("useSidebarReorderAnimation", () => {
     expect(animateCalls).toHaveLength(0)
   })
 
+  it("degrades when element.animate throws without leaking styles or handles", () => {
+    animateMock.mockImplementation(function (this: HTMLElement) {
+      this.style.transform = "translateY(99px)"
+      this.style.opacity = "0.5"
+      throw new Error("WAAPI unavailable")
+    })
+
+    const { rerender, container } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    expect(() => {
+      rerender(
+        <Harness
+          rows={afterRows}
+          sequence={1}
+          activityId={3}
+          tops={afterTops}
+        />
+      )
+    }).not.toThrow()
+
+    const viewport = container.querySelector(
+      '[data-testid="viewport"]'
+    ) as HTMLElement
+    for (const node of viewport.querySelectorAll<HTMLElement>(
+      "[data-sidebar-row-key]"
+    )) {
+      expect(node.style.transform).toBe("")
+      expect(node.style.opacity).toBe("")
+    }
+    // No successfully tracked handles: mock never returned an Animation.
+    expect(
+      animateMock.mock.results.every(
+        (result) => result.type === "throw" || result.value == null
+      )
+    ).toBe(true)
+  })
+
   it("returns a stable handleUserScroll and controls object identity", () => {
     const seen: SidebarReorderAnimationControls[] = []
     const { rerender } = render(
@@ -1000,7 +1107,7 @@ describe("useSidebarReorderAnimation", () => {
     expect(seen[0]?.handleUserScroll).toBe(seen[1]?.handleUserScroll)
   })
 
-  it("clears owned styles when a move animation finishes", () => {
+  it("clears owned styles when a move animation finishes via onfinish path helper", () => {
     const { rerender, container } = render(
       <Harness
         rows={beforeRows}
@@ -1021,6 +1128,46 @@ describe("useSidebarReorderAnimation", () => {
       for (const anim of animations) {
         finishAnimation(anim)
       }
+    })
+
+    const viewport = container.querySelector(
+      '[data-testid="viewport"]'
+    ) as HTMLElement
+    for (const node of viewport.querySelectorAll<HTMLElement>(
+      "[data-sidebar-row-key]"
+    )) {
+      expect(node.style.transform).toBe("")
+      expect(node.style.opacity).toBe("")
+    }
+  })
+
+  it("clears owned styles when the finished promise resolves", async () => {
+    const { rerender, container } = render(
+      <Harness
+        rows={beforeRows}
+        sequence={0}
+        activityId={null}
+        tops={beforeTops}
+      />
+    )
+
+    rerender(
+      <Harness rows={afterRows} sequence={1} activityId={3} tops={afterTops} />
+    )
+
+    const animations = animateMock.mock.results.map(
+      (result) => result.value as MockAnimation
+    )
+    expect(animations.length).toBeGreaterThan(0)
+
+    // Resolve finished promises only — do not call onfinish. Production must
+    // clean up from the promise path.
+    await act(async () => {
+      for (const anim of animations) {
+        anim.resolveFinished()
+      }
+      await Promise.resolve()
+      await Promise.resolve()
     })
 
     const viewport = container.querySelector(

@@ -90,6 +90,64 @@ function captureViewportNodes(viewportEl: HTMLElement): CaptureResult {
   return { measured, elements }
 }
 
+function cloneMeasuredMap(
+  source: ReadonlyMap<string, SidebarMeasuredRow>
+): Map<string, SidebarMeasuredRow> {
+  return new Map(
+    [...source.entries()].map(([key, row]) => [
+      key,
+      {
+        key: row.key,
+        rootId: row.rootId,
+        top: row.top,
+        bottom: row.bottom,
+      },
+    ])
+  )
+}
+
+function sameStringOrder(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+function sameNumberOrder(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+/**
+ * True when two snapshots describe the same structural keys, root order, and
+ * per-root block membership — an "equivalent" same-sequence rows identity.
+ */
+function sidebarSnapshotsEquivalent(
+  a: SidebarRootOrderSnapshot,
+  b: SidebarRootOrderSnapshot
+): boolean {
+  if (!sameStringOrder(a.structuralRowKeys, b.structuralRowKeys)) return false
+  if (a.bucketByRoot.size !== b.bucketByRoot.size) return false
+  for (const [rootId, bucket] of a.bucketByRoot) {
+    if (b.bucketByRoot.get(rootId) !== bucket) return false
+  }
+  if (a.rootsByBucket.size !== b.rootsByBucket.size) return false
+  for (const [bucket, rootsA] of a.rootsByBucket) {
+    const rootsB = b.rootsByBucket.get(bucket)
+    if (!rootsB || !sameNumberOrder(rootsA, rootsB)) return false
+  }
+  if (a.blockRowKeysByRoot.size !== b.blockRowKeysByRoot.size) return false
+  for (const [rootId, keysA] of a.blockRowKeysByRoot) {
+    const keysB = b.blockRowKeysByRoot.get(rootId)
+    if (!keysB || !sameStringOrder(keysA, keysB)) return false
+  }
+  return true
+}
+
 function canAnimate(element: HTMLElement): boolean {
   return typeof element.animate === "function"
 }
@@ -116,25 +174,74 @@ function tryCommitStyles(animation: Animation): void {
  * Sidebar-local FLIP controller for painted same-bucket root reorders.
  * Owns only transform/opacity and Animation handles on stable descendants
  * marked `data-sidebar-row-key` inside the supplied viewport element.
+ *
+ * In-flight waves are preserved across equivalent same-sequence rerenders.
+ * Visual First for retarget comes from an active rAF sampler cache so the
+ * first frame of a new wave matches the last painted frame (no snap).
  */
 export function useSidebarReorderAnimation(
   options: UseSidebarReorderAnimationOptions
 ): SidebarReorderAnimationControls {
   const optionsRef = useRef(options)
+
   const priorSnapshotRef = useRef<SidebarRootOrderSnapshot | null>(null)
   const priorMeasuredRef = useRef<Map<string, SidebarMeasuredRow> | null>(null)
+  const visualCacheRef = useRef<Map<string, SidebarMeasuredRow> | null>(null)
   const activeAnimationsRef = useRef<ActiveAnimation[]>([])
   const consumedSequenceRef = useRef<number | null>(null)
   const suppressUserScrollRef = useRef(false)
   const suppressRafRef = useRef<number | null>(null)
+  const samplerRafRef = useRef<number | null>(null)
+  const viewportElRef = useRef<HTMLElement | null>(options.viewportEl)
 
+  // Keep latest options in a ref so scroll handlers / sampler ticks never close
+  // over a stale render without forcing effect cleanup on every identity change.
   useIsomorphicLayoutEffect(() => {
     optionsRef.current = options
   })
 
+  const stopVisualSampler = useCallback(() => {
+    if (samplerRafRef.current != null) {
+      cancelAnimationFrame(samplerRafRef.current)
+      samplerRafRef.current = null
+    }
+  }, [])
+
+  const sampleVisualCache = useCallback((viewport: HTMLElement) => {
+    const { measured } = captureViewportNodes(viewport)
+    visualCacheRef.current = measured
+    return measured
+  }, [])
+
+  const startVisualSampler = useCallback(
+    (viewport: HTMLElement) => {
+      stopVisualSampler()
+      sampleVisualCache(viewport)
+      if (typeof requestAnimationFrame !== "function") return
+
+      const tick = () => {
+        if (activeAnimationsRef.current.length === 0) {
+          samplerRafRef.current = null
+          return
+        }
+        const liveViewport = optionsRef.current.viewportEl
+        if (!liveViewport) {
+          samplerRafRef.current = null
+          return
+        }
+        sampleVisualCache(liveViewport)
+        samplerRafRef.current = requestAnimationFrame(tick)
+      }
+      samplerRafRef.current = requestAnimationFrame(tick)
+    },
+    [sampleVisualCache, stopVisualSampler]
+  )
+
   const cancelActiveAnimations = useCallback(() => {
     const active = activeAnimationsRef.current
     activeAnimationsRef.current = []
+    stopVisualSampler()
+    visualCacheRef.current = null
     for (const { element, animation } of active) {
       try {
         animation.cancel()
@@ -143,30 +250,36 @@ export function useSidebarReorderAnimation(
       }
       clearOwnedStyles(element)
     }
-  }, [])
+  }, [stopVisualSampler])
 
   /**
-   * Layout-effect cleanup path: freeze in-flight visual state, optionally
-   * capture those visual rectangles as the next First snapshot when animations
-   * were active, then cancel and clear controller-owned styles.
-   *
-   * When no animations are active, priorMeasuredRef already holds the previous
-   * layout Last (the correct First for the upcoming commit) and is left alone —
-   * remeasuring after React's DOM commit would incorrectly read the new layout.
+   * Freeze and tear down the current wave, preferring the rAF visual cache as
+   * the next First snapshot. Returns that First map (or null when idle).
    */
-  const captureFirstFromVisualState = useCallback(
-    (viewportEl: HTMLElement | null) => {
+  const retargetFreezeActiveWave = useCallback(
+    (viewport: HTMLElement): Map<string, SidebarMeasuredRow> | null => {
       const active = activeAnimationsRef.current
-      const hadActive = active.length > 0
+      if (active.length === 0 && visualCacheRef.current == null) {
+        return null
+      }
+
+      // Copy the last painted sample before commit/cancel mutates styles.
+      const cached =
+        visualCacheRef.current != null
+          ? cloneMeasuredMap(visualCacheRef.current)
+          : null
 
       for (const { animation } of active) {
         tryCommitStyles(animation)
       }
 
-      if (hadActive && viewportEl) {
-        const { measured } = captureViewportNodes(viewportEl)
-        priorMeasuredRef.current = measured
-      }
+      // Fallback: if the sampler never ran, measure after commitStyles while
+      // freezes still hold mid-flight transforms.
+      const first =
+        cached ??
+        (active.length > 0
+          ? cloneMeasuredMap(captureViewportNodes(viewport).measured)
+          : null)
 
       for (const { element, animation } of active) {
         try {
@@ -177,8 +290,11 @@ export function useSidebarReorderAnimation(
         clearOwnedStyles(element)
       }
       activeAnimationsRef.current = []
+      stopVisualSampler()
+      visualCacheRef.current = null
+      return first
     },
-    []
+    [stopVisualSampler]
   )
 
   const markProgrammaticScrollSuppression = useCallback(() => {
@@ -201,18 +317,26 @@ export function useSidebarReorderAnimation(
     (element: HTMLElement, animation: Animation) => {
       const entry: ActiveAnimation = { element, animation }
       activeAnimationsRef.current.push(entry)
-      const cleanup = () => {
-        clearOwnedStyles(element)
-        activeAnimationsRef.current = activeAnimationsRef.current.filter(
-          (item) => item !== entry
-        )
-      }
-      animation.onfinish = cleanup
-      void animation.finished.then(cleanup).catch(() => {
-        // Cancelled animations reject `finished`; styles are cleared on cancel.
-      })
+
+      // Single completion path: `finished` resolves on natural end and rejects
+      // on cancel. Clear styles/handles exactly once when still tracked.
+      void animation.finished
+        .then(() => {
+          if (!activeAnimationsRef.current.includes(entry)) return
+          clearOwnedStyles(element)
+          activeAnimationsRef.current = activeAnimationsRef.current.filter(
+            (item) => item !== entry
+          )
+          if (activeAnimationsRef.current.length === 0) {
+            stopVisualSampler()
+            visualCacheRef.current = null
+          }
+        })
+        .catch(() => {
+          // Cancelled animations reject `finished`; cancel paths clear styles.
+        })
     },
-    []
+    [stopVisualSampler]
   )
 
   const runMoveAnimation = useCallback(
@@ -255,18 +379,25 @@ export function useSidebarReorderAnimation(
     [trackAnimation]
   )
 
+  const rebaseToCurrent = useCallback(
+    (viewport: HTMLElement, rows: readonly SidebarRow[]) => {
+      cancelActiveAnimations()
+      const capture = captureViewportNodes(viewport)
+      priorMeasuredRef.current = capture.measured
+      priorSnapshotRef.current = buildSidebarRootOrderSnapshot(rows)
+    },
+    [cancelActiveAnimations]
+  )
+
   const handleUserScroll = useCallback(() => {
     if (suppressUserScrollRef.current) return
-    cancelActiveAnimations()
     const viewportEl = optionsRef.current.viewportEl
     if (viewportEl) {
-      const { measured } = captureViewportNodes(viewportEl)
-      priorMeasuredRef.current = measured
-      priorSnapshotRef.current = buildSidebarRootOrderSnapshot(
-        optionsRef.current.rows
-      )
+      rebaseToCurrent(viewportEl, optionsRef.current.rows)
+    } else {
+      cancelActiveAnimations()
     }
-  }, [cancelActiveAnimations])
+  }, [cancelActiveAnimations, rebaseToCurrent])
 
   useIsomorphicLayoutEffect(() => {
     const {
@@ -277,40 +408,43 @@ export function useSidebarReorderAnimation(
       dragging,
     } = options
 
-    // Local alias so scroll/DOM mutations are not attributed to hook args.
-    const viewport = viewportEl
-
-    if (!viewport) {
-      priorSnapshotRef.current = buildSidebarRootOrderSnapshot(rows)
-      return () => {
-        captureFirstFromVisualState(null)
+    // Viewport replacement: cancel any wave bound to the previous element.
+    if (viewportElRef.current !== viewportEl) {
+      if (viewportElRef.current != null && activeAnimationsRef.current.length) {
+        cancelActiveAnimations()
       }
+      stopVisualSampler()
+      visualCacheRef.current = null
+      priorMeasuredRef.current = null
+      priorSnapshotRef.current = null
+      viewportElRef.current = viewportEl
+    }
+
+    if (!viewportEl) {
+      priorSnapshotRef.current = buildSidebarRootOrderSnapshot(rows)
+      // Do not cancel via effect cleanup — unmount / explicit paths own that.
+      return
     }
 
     // Dragging: cancel/rebase and keep geometry current without animating.
     if (dragging) {
-      cancelActiveAnimations()
-      const capture = captureViewportNodes(viewport)
-      priorMeasuredRef.current = capture.measured
-      priorSnapshotRef.current = buildSidebarRootOrderSnapshot(rows)
+      rebaseToCurrent(viewportEl, rows)
       if (
         consumedSequenceRef.current === null ||
         activitySequence > consumedSequenceRef.current
       ) {
         consumedSequenceRef.current = activitySequence
       }
-      return () => {
-        captureFirstFromVisualState(viewport)
-      }
+      return
     }
 
     const afterSnapshot = buildSidebarRootOrderSnapshot(rows)
-    const lastCapture = captureViewportNodes(viewport)
+    let lastCapture = captureViewportNodes(viewportEl)
     let lastMeasured = lastCapture.measured
     const lastElements = new Map(lastCapture.elements)
 
     const priorSnapshot = priorSnapshotRef.current
-    const priorMeasured = priorMeasuredRef.current
+    let priorMeasured = priorMeasuredRef.current
 
     // First observation: seed caches and adopt the current sequence without
     // inventing motion for the initial paint.
@@ -318,9 +452,7 @@ export function useSidebarReorderAnimation(
       priorSnapshotRef.current = afterSnapshot
       priorMeasuredRef.current = lastMeasured
       consumedSequenceRef.current = activitySequence
-      return () => {
-        captureFirstFromVisualState(viewport)
-      }
+      return
     }
 
     const sequenceAdvanced =
@@ -328,12 +460,24 @@ export function useSidebarReorderAnimation(
       activitySequence > consumedSequenceRef.current
 
     if (!sequenceAdvanced) {
-      // No new activity: keep geometry cache aligned with the painted tree.
-      priorSnapshotRef.current = afterSnapshot
-      priorMeasuredRef.current = lastMeasured
-      return () => {
-        captureFirstFromVisualState(viewport)
+      // Equivalent structure/order: keep any active 230/120 ms wave running.
+      if (sidebarSnapshotsEquivalent(priorSnapshot, afterSnapshot)) {
+        priorSnapshotRef.current = afterSnapshot
+        if (activeAnimationsRef.current.length === 0) {
+          priorMeasuredRef.current = lastMeasured
+        }
+        return
       }
+
+      // Real non-activity structural or order change: cancel and rebase.
+      rebaseToCurrent(viewportEl, rows)
+      if (
+        consumedSequenceRef.current === null ||
+        activitySequence > consumedSequenceRef.current
+      ) {
+        consumedSequenceRef.current = activitySequence
+      }
+      return
     }
 
     // Always consume the advanced sequence, even when animation is skipped.
@@ -346,17 +490,27 @@ export function useSidebarReorderAnimation(
         : detectSidebarActivityReorder(priorSnapshot, afterSnapshot, activityId)
 
     if (!reorder) {
-      cancelActiveAnimations()
-      priorSnapshotRef.current = afterSnapshot
-      priorMeasuredRef.current = lastMeasured
-      return () => {
-        captureFirstFromVisualState(viewport)
+      rebaseToCurrent(viewportEl, rows)
+      return
+    }
+
+    // Retarget: use last painted visual cache as First, then clear the old wave.
+    const frozenFirst = retargetFreezeActiveWave(viewportEl)
+    if (frozenFirst) {
+      priorMeasured = frozenFirst
+      priorMeasuredRef.current = frozenFirst
+      // Remeasure pure layout Last after styles were cleared.
+      lastCapture = captureViewportNodes(viewportEl)
+      lastMeasured = lastCapture.measured
+      lastElements.clear()
+      for (const [key, element] of lastCapture.elements) {
+        lastElements.set(key, element)
       }
     }
 
     const reducedMotion = prefersReducedMotion()
-    const viewportRect = viewport.getBoundingClientRect()
-    const scrollTop = viewport.scrollTop
+    const viewportRect = viewportEl.getBoundingClientRect()
+    const scrollTop = viewportEl.scrollTop
 
     // Anchor correction before paint when scrolled away from the absolute top.
     if (scrollTop > 0) {
@@ -373,10 +527,10 @@ export function useSidebarReorderAnimation(
         if (afterAnchor) {
           const delta = sidebarAnchorScrollDelta(anchor.top, afterAnchor.top)
           if (delta !== 0) {
-            applyViewportScrollDelta(viewport, scrollTop, delta)
+            applyViewportScrollDelta(viewportEl, scrollTop, delta)
             markProgrammaticScrollSuppression()
-            // Remeasure Last after the scroll correction.
-            const remeasured = captureViewportNodes(viewport)
+            // Remeasure Last after the scroll correction (client tops shift).
+            const remeasured = captureViewportNodes(viewportEl)
             lastMeasured = remeasured.measured
             for (const [key, element] of remeasured.elements) {
               lastElements.set(key, element)
@@ -409,14 +563,17 @@ export function useSidebarReorderAnimation(
         if (!element) continue
         runFadeAnimation(element)
       }
+
+      if (activeAnimationsRef.current.length > 0) {
+        startVisualSampler(viewportEl)
+      }
     }
 
     priorSnapshotRef.current = afterSnapshot
     priorMeasuredRef.current = lastMeasured
 
-    return () => {
-      captureFirstFromVisualState(viewport)
-    }
+    // Intentionally no cleanup cancel: equivalent same-sequence rerenders must
+    // leave the active wave running. Cancel only via explicit paths.
   }, [
     options.rows,
     options.activitySequence,
@@ -424,13 +581,16 @@ export function useSidebarReorderAnimation(
     options.viewportEl,
     options.dragging,
     cancelActiveAnimations,
-    captureFirstFromVisualState,
     markProgrammaticScrollSuppression,
+    rebaseToCurrent,
+    retargetFreezeActiveWave,
     runMoveAnimation,
     runFadeAnimation,
+    startVisualSampler,
+    stopVisualSampler,
   ])
 
-  // Unmount disposal for rAF handles; animation cancel is also in effect cleanup.
+  // Unmount disposal only — empty deps so dependency churn cannot cancel.
   useIsomorphicLayoutEffect(() => {
     return () => {
       if (suppressRafRef.current != null) {
@@ -438,9 +598,20 @@ export function useSidebarReorderAnimation(
         suppressRafRef.current = null
       }
       suppressUserScrollRef.current = false
-      cancelActiveAnimations()
+      stopVisualSampler()
+      visualCacheRef.current = null
+      const active = activeAnimationsRef.current
+      activeAnimationsRef.current = []
+      for (const { element, animation } of active) {
+        try {
+          animation.cancel()
+        } catch {
+          // ignore
+        }
+        clearOwnedStyles(element)
+      }
     }
-  }, [cancelActiveAnimations])
+  }, [stopVisualSampler])
 
   const controls = useMemo(
     () => ({
