@@ -34,11 +34,14 @@ vi.mock("use-stick-to-bottom", () => ({
 
 import {
   InitialHistoryScrollController,
+  resyncScrollOffsetForVirtualizer,
   useInitialHistoryScrollEligibility,
 } from "./initial-history-scroll-controller"
 
 let nextFrameId = 1
 let frames = new Map<number, FrameRequestCallback>()
+let clientHeight = 400
+let scrollTop = 0
 
 function flushNextFrame(): void {
   const entry = frames.entries().next().value as
@@ -83,9 +86,22 @@ beforeEach(() => {
   stickRefs.contentRef.current = contentElement
   scrollHeight = 500
   contentHeight = 100
+  clientHeight = 400
+  scrollTop = 250
   Object.defineProperty(scrollElement, "scrollHeight", {
     configurable: true,
     get: () => scrollHeight,
+  })
+  Object.defineProperty(scrollElement, "clientHeight", {
+    configurable: true,
+    get: () => clientHeight,
+  })
+  Object.defineProperty(scrollElement, "scrollTop", {
+    configurable: true,
+    get: () => scrollTop,
+    set: (value: number) => {
+      scrollTop = value
+    },
   })
   vi.spyOn(contentElement, "getBoundingClientRect").mockImplementation(
     () =>
@@ -145,9 +161,51 @@ describe("useInitialHistoryScrollEligibility", () => {
   })
 })
 
+describe("resyncScrollOffsetForVirtualizer", () => {
+  it("nudges scrollTop so late-attached listeners observe the offset", () => {
+    const tops: number[] = []
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        tops.push(value)
+        scrollTop = value
+      },
+    })
+    scrollTop = 480
+
+    resyncScrollOffsetForVirtualizer(scrollElement)
+
+    expect(tops).toEqual([479, 480])
+    expect(scrollTop).toBe(480)
+  })
+
+  it("dispatches a scroll event when already at the top", () => {
+    scrollTop = 0
+    const onScroll = vi.fn()
+    scrollElement.addEventListener("scroll", onScroll)
+
+    resyncScrollOffsetForVirtualizer(scrollElement)
+
+    expect(onScroll).toHaveBeenCalledTimes(1)
+    expect(scrollTop).toBe(0)
+  })
+})
+
 describe("InitialHistoryScrollController", () => {
-  it("places instantly, waits for two stable frames, then corrects instantly", () => {
+  it("places instantly, waits for two stable frames, then corrects and resyncs", () => {
     const onFinish = vi.fn()
+    const tops: number[] = []
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        tops.push(value)
+        scrollTop = value
+      },
+    })
+    scrollTop = 480
+
     render(
       <InitialHistoryScrollController
         pending
@@ -170,10 +228,39 @@ describe("InitialHistoryScrollController", () => {
     expect(onFinish).not.toHaveBeenCalled()
     flushNextFrame()
 
-    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(2)
+    // initial place + post-stable correct + post-resync correct
+    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(3)
     expect(mocks.scrollToBottom).toHaveBeenLastCalledWith({
       animation: "instant",
     })
+    // virtua wake: scrollTop-1 then restore
+    expect(tops).toEqual([479, 480])
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    expect(frames.size).toBe(0)
+  })
+
+  it("does not finish while the viewport has zero client height", () => {
+    const onFinish = vi.fn()
+    clientHeight = 0
+
+    render(
+      <InitialHistoryScrollController
+        pending
+        historyReady
+        hasHistoryRows
+        onFinish={onFinish}
+      />
+    )
+
+    flushNextFrame()
+    flushNextFrame()
+    flushNextFrame()
+    flushNextFrame()
+    expect(onFinish).not.toHaveBeenCalled()
+    expect(frames.size).toBe(1)
+
+    clientHeight = 400
+    flushStableFinish()
     expect(onFinish).toHaveBeenCalledTimes(1)
     expect(frames.size).toBe(0)
   })
@@ -285,7 +372,7 @@ describe("InitialHistoryScrollController", () => {
     expect(frames.size).toBe(1)
 
     flushStableFinish()
-    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(2)
+    expect(mocks.scrollToBottom).toHaveBeenCalledTimes(3)
     expect(onFinish).toHaveBeenCalledTimes(1)
     expect(frames.size).toBe(0)
   })

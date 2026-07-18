@@ -11,6 +11,24 @@ export function useInitialHistoryScrollEligibility(
   return eligible
 }
 
+/**
+ * Wake late-attached scroll listeners (notably virtua) after a programmatic
+ * jump to the bottom. Setting `scrollTop` before virtua binds can leave its
+ * internal offset at 0 while the viewport is already at the end — empty range
+ * → blank transcript until the user scrolls.
+ *
+ * Protective only: restores the same offset; never changes the final position.
+ */
+export function resyncScrollOffsetForVirtualizer(el: HTMLElement): void {
+  const top = el.scrollTop
+  if (top > 0) {
+    el.scrollTop = top - 1
+    el.scrollTop = top
+    return
+  }
+  el.dispatchEvent(new Event("scroll"))
+}
+
 export interface InitialHistoryScrollControllerProps {
   pending: boolean
   historyReady: boolean
@@ -104,12 +122,30 @@ export function InitialHistoryScrollController({
       }
     }
 
+    /** Place → wake virtua → place again, then release the pending latch. */
+    const completeWithResync = (el: HTMLElement) => {
+      void scrollToBottomRef.current({ animation: "instant" })
+      resyncScrollOffsetForVirtualizer(el)
+      void scrollToBottomRef.current({ animation: "instant" })
+      finish(false)
+    }
+
     const measure = () => {
       frameId = null
       if (disposed) return
       const content = contentRef.current
       const currentViewport = scrollRef.current
       if (!content || !currentViewport) {
+        frameId = requestAnimationFrame(measure)
+        return
+      }
+
+      // Virtua's viewportSize is 0 until ResizeObserver fires; finishing then
+      // can leave an empty item range (blank transcript until user scroll).
+      if (currentViewport.clientHeight <= 0) {
+        stableFrames = 0
+        previousContentHeight = null
+        previousScrollHeight = null
         frameId = requestAnimationFrame(measure)
         return
       }
@@ -128,8 +164,7 @@ export function InitialHistoryScrollController({
       previousScrollHeight = currentScrollHeight
 
       if (stableFrames >= 2) {
-        void scrollToBottomRef.current({ animation: "instant" })
-        finish(false)
+        completeWithResync(currentViewport)
         return
       }
       frameId = requestAnimationFrame(measure)

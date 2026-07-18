@@ -879,8 +879,22 @@ export function MessageListView({
   // controller clears it. Later prop changes never re-arm this state.
   const [initialHistoryScrollPending, setInitialHistoryScrollPending] =
     useState(() => initialHistoryScrollEligible)
+  // Updated each render after threadItems is built; finish reads the latest.
+  const lastHistoryIndexRef = useRef(0)
+  // Declared early so the finish callback can close over it; VirtualizedMessageThread
+  // publishes into this after mount.
+  const scrollApiRef = useRef<MessageScrollContextValue | null>(null)
   const finishInitialHistoryScroll = useCallback(() => {
     setInitialHistoryScrollPending(false)
+    // Protective: virtua may still hold a stale offset after stick-to-bottom's
+    // programmatic jump. Align to the last history row without changing the
+    // intended "open at bottom" placement. Re-read the ref inside rAF so a
+    // publish that races finish still works.
+    const index = lastHistoryIndexRef.current
+    if (index < 0) return
+    requestAnimationFrame(() => {
+      scrollApiRef.current?.scrollToIndex(index, { align: "end" })
+    })
   }, [])
 
   // Compatibility `selectTimelineTurns` allocates a new outer array whenever a
@@ -1282,9 +1296,8 @@ export function MessageListView({
   const subAgentOverlayKey = `subagents-${conversationId}`
 
   // --- Message navigator panel ------------------------------------------------
-  // Lifted scroll handle so the panel (which lives in the overlay stack, outside
-  // the MessageScrollProvider subtree) can drive scrollToIndex.
-  const scrollApiRef = useRef<MessageScrollContextValue | null>(null)
+  // scrollApiRef is declared near initial-history finish (above) so that path
+  // can re-align virtua after open-history placement.
   // Collapse state is owned here (not in the panel) so the expensive per-file
   // `navEntries` is computed only while the panel is open.
   const [navExpanded, setNavExpanded] = useState(false)
@@ -1341,6 +1354,10 @@ export function MessageListView({
     }
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
+
+  // -1 when empty so finish does not call scrollToIndex on a vacant virtua.
+  lastHistoryIndexRef.current =
+    threadItems.length > 0 ? threadItems.length - 1 : -1
 
   const hasPersistedHistoryRows = threadItems.some(
     (item) => item.kind === "turn" && item.phase === "persisted"
