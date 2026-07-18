@@ -17,6 +17,8 @@ import {
   reuseSet,
   selectChatConversationsWithReuse,
   selectPinnedWithReuse,
+  sidebarRowKey,
+  type SidebarBucketKey,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 
@@ -47,6 +49,15 @@ function conv(
     pinned_at: null,
     ...overrides,
   }
+}
+
+function conversationRow(
+  conversation: DbConversationSummary,
+  depth: number,
+  rootId: number,
+  bucketKey: SidebarBucketKey
+): SidebarRow {
+  return { kind: "conversation", conversation, depth, rootId, bucketKey }
 }
 
 describe("formatRelative", () => {
@@ -91,32 +102,78 @@ describe("formatRelative", () => {
 })
 
 describe("groupByFolderWithReuse", () => {
-  it("groups by folder and sorts each bucket by created-at descending", () => {
-    const list = [conv(1, 10), conv(3, 10), conv(2, 20), conv(4, 10)]
-    const grouped = groupByFolderWithReuse(list, "created", new Map())
+  it("sorts every folder bucket by effective updated time", () => {
+    const createdNewer = conv(2, 10, {
+      created_at: "2026-07-18T03:00:00.000Z",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    const activeNewer = conv(1, 10, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+    const optimistic = new Map([
+      [
+        2,
+        {
+          token: "t2",
+          baselineUpdatedAt: createdNewer.updated_at,
+          effectiveAt: "2026-07-18T04:00:00.000Z",
+        },
+      ],
+    ])
 
-    expect([...grouped.keys()].sort()).toEqual([10, 20])
-    expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 1])
-    expect(grouped.get(20)!.map((c) => c.id)).toEqual([2])
+    const grouped = groupByFolderWithReuse(
+      [createdNewer, activeNewer],
+      new Map(),
+      undefined,
+      optimistic
+    )
+    expect(grouped.get(10)!.map((row) => row.id)).toEqual([2, 1])
   })
 
-  it("sorts by updated-at descending in updated mode", () => {
-    const a = conv(1, 10, { updated_at: new Date(1000).toISOString() })
-    const b = conv(2, 10, { updated_at: new Date(5000).toISOString() })
-    const grouped = groupByFolderWithReuse([a, b], "updated", new Map())
-    expect(grouped.get(10)!.map((c) => c.id)).toEqual([2, 1])
+  it("tie-breaks equal effective updated time by created_at then id", () => {
+    const sameUpdated = "2026-07-18T05:00:00.000Z"
+    // Higher created_at wins when updated_at ties.
+    const olderCreated = conv(1, 10, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    const newerCreated = conv(2, 10, {
+      created_at: "2026-07-18T02:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    expect(
+      groupByFolderWithReuse([olderCreated, newerCreated], new Map())
+        .get(10)!
+        .map((c) => c.id)
+    ).toEqual([2, 1])
+
+    // Same created_at + updated_at → higher id wins.
+    const lowId = conv(10, 20, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    const highId = conv(20, 20, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    expect(
+      groupByFolderWithReuse([lowId, highId], new Map())
+        .get(20)!
+        .map((c) => c.id)
+    ).toEqual([20, 10])
   })
 
   it("reuses the prior bucket array for folders whose membership is unchanged", () => {
     const a1 = conv(1, 10)
     const a2 = conv(2, 10)
     const b1 = conv(3, 20)
-    const first = groupByFolderWithReuse([a1, a2, b1], "created", new Map())
+    const first = groupByFolderWithReuse([a1, a2, b1], new Map())
 
     // Simulate a status event on folder 10: one summary is replaced by a new
     // object (slice + spread), every other summary keeps its identity.
-    const a2Patched = { ...a2, status: "completed" }
-    const second = groupByFolderWithReuse([a1, a2Patched, b1], "created", first)
+    const a2Patched = { ...a2, status: "completed" as const }
+    const second = groupByFolderWithReuse([a1, a2Patched, b1], first)
 
     // Folder 20 is untouched → same array reference (memo can bail out).
     expect(second.get(20)).toBe(first.get(20))
@@ -131,8 +188,8 @@ describe("groupByFolderWithReuse", () => {
 
   it("reuses every bucket when nothing changed at all", () => {
     const list = [conv(1, 10), conv(2, 20)]
-    const first = groupByFolderWithReuse(list, "created", new Map())
-    const second = groupByFolderWithReuse(list, "created", first)
+    const first = groupByFolderWithReuse(list, new Map())
+    const second = groupByFolderWithReuse(list, first)
     expect(second.get(10)).toBe(first.get(10))
     expect(second.get(20)).toBe(first.get(20))
   })
@@ -144,12 +201,7 @@ describe("groupByFolderWithReuse", () => {
       [12, 10],
     ])
     const list = [conv(1, 10), conv(2, 11), conv(3, 12), conv(4, 20)]
-    const grouped = groupByFolderWithReuse(
-      list,
-      "created",
-      new Map(),
-      childToParent
-    )
+    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
 
     // No child folder gets its own bucket; everything lands under the root (10).
     expect([...grouped.keys()].sort((a, b) => a - b)).toEqual([10, 20])
@@ -165,27 +217,23 @@ describe("groupByFolderWithReuse", () => {
     expect(merged.find((c) => c.id === 3)!.folder_id).toBe(12)
   })
 
-  it("sorts the merged parent+worktree bucket as one list", () => {
+  it("sorts the merged parent+worktree bucket by effective updated time", () => {
     const childToParent = new Map<number, number>([[11, 10]])
-    // ids encode created-at order (higher id = newer), interleaved across folders.
-    const list = [conv(1, 10), conv(4, 11), conv(2, 11), conv(3, 10)]
-    const grouped = groupByFolderWithReuse(
-      list,
-      "created",
-      new Map(),
-      childToParent
-    )
+    // Effective timestamps interleaved across root folder and worktree:
+    // id 4 (worktree) most recent, then 3 (root), 2 (worktree), 1 (root).
+    const list = [
+      conv(1, 10, { updated_at: "2026-07-18T01:00:00.000Z" }),
+      conv(4, 11, { updated_at: "2026-07-18T04:00:00.000Z" }),
+      conv(2, 11, { updated_at: "2026-07-18T02:00:00.000Z" }),
+      conv(3, 10, { updated_at: "2026-07-18T03:00:00.000Z" }),
+    ]
+    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 2, 1])
   })
 
   it("leaves grouping unchanged when childToParent is empty/omitted", () => {
     const list = [conv(1, 10), conv(2, 11)]
-    const withEmpty = groupByFolderWithReuse(
-      list,
-      "created",
-      new Map(),
-      new Map()
-    )
+    const withEmpty = groupByFolderWithReuse(list, new Map(), new Map())
     expect([...withEmpty.keys()].sort((a, b) => a - b)).toEqual([10, 11])
   })
 })
@@ -336,7 +384,7 @@ describe("buildRows", () => {
       foldersHeader(2),
       { kind: "folder", folderId: 20 },
       { kind: "folder", folderId: 10 },
-      { kind: "conversation", conversation: byFolder.get(10)![0], depth: 0 },
+      conversationRow(byFolder.get(10)![0], 0, 1, "folder:10"),
     ])
   })
 
@@ -378,11 +426,7 @@ describe("buildRows", () => {
       expanded: true,
       count: 1,
     })
-    expect(rows[1]).toEqual({
-      kind: "conversation",
-      conversation: p1,
-      depth: 0,
-    })
+    expect(rows[1]).toEqual(conversationRow(p1, 0, 1, "pinned"))
     expect(rows[2]).toEqual({
       kind: "section",
       section: "folders",
@@ -449,16 +493,8 @@ describe("buildRows", () => {
       expanded: true,
       count: 2,
     })
-    expect(rows[chatsIdx + 1]).toEqual({
-      kind: "conversation",
-      conversation: c1,
-      depth: 0,
-    })
-    expect(rows[chatsIdx + 2]).toEqual({
-      kind: "conversation",
-      conversation: c2,
-      depth: 0,
-    })
+    expect(rows[chatsIdx + 1]).toEqual(conversationRow(c1, 0, 1, "chat"))
+    expect(rows[chatsIdx + 2]).toEqual(conversationRow(c2, 0, 2, "chat"))
     // Flat — no folder headers inside the chat section.
     expect(rows.slice(chatsIdx + 1).some((r) => r.kind === "folder")).toBe(
       false
@@ -605,9 +641,9 @@ describe("buildRows", () => {
       childrenByParent: new Map([[1, [childA, childB]]]),
     })
     expect(rows.filter((r) => r.kind === "conversation")).toEqual([
-      { kind: "conversation", conversation: parent, depth: 0 },
-      { kind: "conversation", conversation: childA, depth: 1 },
-      { kind: "conversation", conversation: childB, depth: 1 },
+      conversationRow(parent, 0, 1, "folder:10"),
+      conversationRow(childA, 1, 1, "folder:10"),
+      conversationRow(childB, 1, 1, "folder:10"),
     ])
   })
 
@@ -628,7 +664,7 @@ describe("buildRows", () => {
       childrenByParent: new Map([[1, [childA]]]),
     })
     expect(rows.filter((r) => r.kind === "conversation")).toEqual([
-      { kind: "conversation", conversation: parent, depth: 0 },
+      conversationRow(parent, 0, 1, "folder:10"),
     ])
   })
 
@@ -651,6 +687,8 @@ describe("buildRows", () => {
       kind: "subsession-loading",
       parentId: 1,
       depth: 1,
+      rootId: 1,
+      bucketKey: "folder:10",
     })
   })
 
@@ -671,7 +709,7 @@ describe("buildRows", () => {
     })
     expect(rows.some((r) => r.kind === "subsession-loading")).toBe(false)
     expect(rows.filter((r) => r.kind === "conversation")).toEqual([
-      { kind: "conversation", conversation: parent, depth: 0 },
+      conversationRow(parent, 0, 1, "folder:10"),
     ])
   })
 
@@ -696,9 +734,9 @@ describe("buildRows", () => {
       ]),
     })
     expect(rows.filter((r) => r.kind === "conversation")).toEqual([
-      { kind: "conversation", conversation: parent, depth: 0 },
-      { kind: "conversation", conversation: child, depth: 1 },
-      { kind: "conversation", conversation: grandchild, depth: 2 },
+      conversationRow(parent, 0, 1, "folder:10"),
+      conversationRow(child, 1, 1, "folder:10"),
+      conversationRow(grandchild, 2, 1, "folder:10"),
     ])
   })
 
@@ -744,7 +782,190 @@ describe("buildRows", () => {
       kind: "subsession-loading",
       parentId: 1,
       depth: 1,
+      rootId: 1,
+      bucketKey: "folder:10",
     })
+  })
+
+  it("propagates rootId and bucketKey through folder root blocks", () => {
+    const parent = conv(1, 10, { child_count: 1 })
+    const child = conv(100, 10, {
+      kind: "delegate",
+      parent_id: 1,
+      child_count: 1,
+    })
+    const grandchild = conv(101, 10, { kind: "delegate", parent_id: 100 })
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([[10, [parent]]]),
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 1]]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      conversationExpanded: new Set([1, 100]),
+      childrenByParent: new Map([
+        [1, [child]],
+        [100, [grandchild]],
+      ]),
+    })
+    expect(
+      rows
+        .filter((row) => row.kind === "conversation")
+        .map((row) => ({
+          id: row.conversation.id,
+          rootId: row.rootId,
+          bucketKey: row.bucketKey,
+          key: sidebarRowKey(row),
+        }))
+    ).toEqual([
+      { id: 1, rootId: 1, bucketKey: "folder:10", key: "conv-claude_code-1" },
+      {
+        id: 100,
+        rootId: 1,
+        bucketKey: "folder:10",
+        key: "conv-claude_code-100",
+      },
+      {
+        id: 101,
+        rootId: 1,
+        bucketKey: "folder:10",
+        key: "conv-claude_code-101",
+      },
+    ])
+  })
+
+  it("propagates rootId and bucketKey for pinned root blocks", () => {
+    const parent = conv(1, 10, {
+      child_count: 1,
+      pinned_at: "2026-07-18T01:00:00.000Z",
+    })
+    const child = conv(100, 10, { kind: "delegate", parent_id: 1 })
+    const rows = buildRows({
+      pinned: [parent],
+      pinnedExpanded: true,
+      orderedFolderIds: [],
+      byFolder: new Map(),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      conversationExpanded: new Set([1]),
+      childrenByParent: new Map([[1, [child]]]),
+    })
+    expect(
+      rows
+        .filter((row) => row.kind === "conversation")
+        .map((row) => ({
+          id: row.conversation.id,
+          rootId: row.rootId,
+          bucketKey: row.bucketKey,
+          key: sidebarRowKey(row),
+        }))
+    ).toEqual([
+      { id: 1, rootId: 1, bucketKey: "pinned", key: "conv-claude_code-1" },
+      { id: 100, rootId: 1, bucketKey: "pinned", key: "conv-claude_code-100" },
+    ])
+  })
+
+  it("propagates rootId and bucketKey for chat root blocks", () => {
+    const parent = conv(1, 99, { kind: "chat", child_count: 1 })
+    const child = conv(100, 99, { kind: "delegate", parent_id: 1 })
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [],
+      byFolder: new Map(),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [parent],
+      chatsExpanded: true,
+      conversationExpanded: new Set([1]),
+      childrenByParent: new Map([[1, [child]]]),
+    })
+    expect(
+      rows
+        .filter((row) => row.kind === "conversation")
+        .map((row) => ({
+          id: row.conversation.id,
+          rootId: row.rootId,
+          bucketKey: row.bucketKey,
+          key: sidebarRowKey(row),
+        }))
+    ).toEqual([
+      { id: 1, rootId: 1, bucketKey: "chat", key: "conv-claude_code-1" },
+      { id: 100, rootId: 1, bucketKey: "chat", key: "conv-claude_code-100" },
+    ])
+  })
+
+  it("marks loading placeholders with the owning root's rootId and bucketKey", () => {
+    const parent = conv(1, 10, { child_count: 2 })
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([[10, [parent]]]),
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 1]]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      conversationExpanded: new Set([1]),
+      childrenByParent: new Map(),
+    })
+    const loading = rows.find((r) => r.kind === "subsession-loading")
+    expect(loading).toEqual({
+      kind: "subsession-loading",
+      parentId: 1,
+      depth: 1,
+      rootId: 1,
+      bucketKey: "folder:10",
+    })
+    expect(sidebarRowKey(loading!)).toBe("subloading-1")
+  })
+})
+
+describe("sidebarRowKey", () => {
+  it("preserves every existing key string form", () => {
+    const c = conv(1, 10)
+    expect(
+      sidebarRowKey({
+        kind: "section",
+        section: "pinned",
+        expanded: true,
+        count: 1,
+      })
+    ).toBe("section-pinned")
+    expect(sidebarRowKey({ kind: "folder", folderId: 10 })).toBe("folder-10")
+    expect(
+      sidebarRowKey({
+        kind: "empty",
+        folderId: 10,
+        totalConversationCount: 0,
+      })
+    ).toBe("empty-10")
+    expect(sidebarRowKey({ kind: "chats-empty" })).toBe("chats-empty")
+    expect(
+      sidebarRowKey({
+        kind: "subsession-loading",
+        parentId: 1,
+        depth: 1,
+        rootId: 1,
+        bucketKey: "folder:10",
+      })
+    ).toBe("subloading-1")
+    expect(
+      sidebarRowKey(
+        conversationRow(c, 0, 1, "folder:10") as Extract<
+          SidebarRow,
+          { kind: "conversation" }
+        >
+      )
+    ).toBe("conv-claude_code-1")
   })
 })
 
@@ -785,6 +1006,35 @@ describe("selectChatConversationsWithReuse", () => {
     expect(out.map((c) => c.id)).toEqual([2, 1])
   })
 
+  it("orders chat roots by optimistic effective updated time", () => {
+    const olderActive = conv(1, 99, {
+      kind: "chat",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+    const newerCreated = conv(2, 99, {
+      kind: "chat",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    const optimistic = new Map([
+      [
+        2,
+        {
+          token: "t2",
+          baselineUpdatedAt: newerCreated.updated_at,
+          effectiveAt: "2026-07-18T03:00:00.000Z",
+        },
+      ],
+    ])
+    expect(
+      selectChatConversationsWithReuse(
+        [olderActive, newerCreated],
+        true,
+        [],
+        optimistic
+      ).map((c) => c.id)
+    ).toEqual([2, 1])
+  })
+
   it("excludes completed conversations unless showCompleted", () => {
     const done = conv(1, 99, { kind: "chat", status: "completed" })
     const active = conv(2, 99, { kind: "chat" })
@@ -809,12 +1059,47 @@ describe("selectChatConversationsWithReuse", () => {
 })
 
 describe("selectPinnedWithReuse", () => {
-  it("selects only pinned conversations, most-recently-pinned first", () => {
-    const a = conv(1, 10, { pinned_at: new Date(1000).toISOString() })
-    const b = conv(2, 10, { pinned_at: new Date(3000).toISOString() })
-    const c = conv(3, 20) // not pinned
-    const pinned = selectPinnedWithReuse([a, b, c], [])
-    expect(pinned.map((p) => p.id)).toEqual([2, 1])
+  it("sorts pinned roots by activity before pinned_at", () => {
+    const olderPinButActive = conv(1, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T04:00:00.000Z",
+    })
+    const newerPin = conv(2, 10, {
+      pinned_at: "2026-07-18T03:00:00.000Z",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+    expect(
+      selectPinnedWithReuse([newerPin, olderPinButActive], [], new Map()).map(
+        (row) => row.id
+      )
+    ).toEqual([1, 2])
+  })
+
+  it("tie-breaks equal effective updated time by pinned_at then id", () => {
+    const sameUpdated = "2026-07-18T05:00:00.000Z"
+    const olderPin = conv(1, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    const newerPin = conv(2, 10, {
+      pinned_at: "2026-07-18T03:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    expect(
+      selectPinnedWithReuse([olderPin, newerPin], []).map((p) => p.id)
+    ).toEqual([2, 1])
+
+    const lowId = conv(10, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    const highId = conv(20, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: sameUpdated,
+    })
+    expect(selectPinnedWithReuse([lowId, highId], []).map((p) => p.id)).toEqual(
+      [20, 10]
+    )
   })
 
   it("reuses the previous array when pinned membership is unchanged", () => {
@@ -825,13 +1110,20 @@ describe("selectPinnedWithReuse", () => {
   })
 
   it("returns a fresh array when a conversation is pinned or unpinned", () => {
-    const a = conv(1, 10, { pinned_at: new Date(1000).toISOString() })
+    const a = conv(1, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
     const b = conv(2, 10) // unpinned
     const first = selectPinnedWithReuse([a, b], [])
-    const bPinned = { ...b, pinned_at: new Date(2000).toISOString() }
+    const bPinned = {
+      ...b,
+      pinned_at: "2026-07-18T02:00:00.000Z",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    }
     const second = selectPinnedWithReuse([a, bPinned], first)
     expect(second).not.toBe(first)
-    // newest pin (b @ 2000) first, then a (@ 1000)
+    // b more recently active → first, then a
     expect(second.map((p) => p.id)).toEqual([2, 1])
   })
 })
@@ -839,12 +1131,8 @@ describe("selectPinnedWithReuse", () => {
 describe("flatIndexOfConversation", () => {
   const rows: SidebarRow[] = [
     { kind: "folder", folderId: 10 },
-    { kind: "conversation", conversation: conv(1, 10), depth: 0 },
-    {
-      kind: "conversation",
-      conversation: conv(2, 10, { agent_type: "codex" }),
-      depth: 0,
-    },
+    conversationRow(conv(1, 10), 0, 1, "folder:10"),
+    conversationRow(conv(2, 10, { agent_type: "codex" }), 0, 2, "folder:10"),
     { kind: "folder", folderId: 20 },
     { kind: "empty", folderId: 20, totalConversationCount: 0 },
   ]
@@ -887,8 +1175,8 @@ describe("sticky overlay helpers", () => {
   // F10 expanded (2 convs), F20 collapsed, F30 expanded (empty hint).
   const rows: SidebarRow[] = [
     { kind: "folder", folderId: 10 }, // 0
-    { kind: "conversation", conversation: conv(1, 10), depth: 0 }, // 1
-    { kind: "conversation", conversation: conv(2, 10), depth: 0 }, // 2
+    conversationRow(conv(1, 10), 0, 1, "folder:10"), // 1
+    conversationRow(conv(2, 10), 0, 2, "folder:10"), // 2
     { kind: "folder", folderId: 20 }, // 3
     { kind: "folder", folderId: 30 }, // 4
     { kind: "empty", folderId: 30, totalConversationCount: 0 }, // 5
@@ -910,10 +1198,10 @@ describe("sticky overlay helpers", () => {
       // must never resolve a folder sticky overlay.
       const withSections: SidebarRow[] = [
         { kind: "section", section: "pinned", expanded: true, count: 1 }, // 0
-        { kind: "conversation", conversation: conv(5, 10), depth: 0 }, // 1 (pinned)
+        conversationRow(conv(5, 10), 0, 5, "pinned"), // 1 (pinned)
         { kind: "section", section: "folders", expanded: true, count: 1 }, // 2
         { kind: "folder", folderId: 10 }, // 3
-        { kind: "conversation", conversation: conv(1, 10), depth: 0 }, // 4
+        conversationRow(conv(1, 10), 0, 1, "folder:10"), // 4
       ]
       expect(Array.from(buildOwnerHeaderIndex(withSections))).toEqual([
         -1, -1, -1, 3, 3,
@@ -929,7 +1217,7 @@ describe("sticky overlay helpers", () => {
     it("ignores section headers, listing only folder header indices", () => {
       const withSections: SidebarRow[] = [
         { kind: "section", section: "pinned", expanded: true, count: 1 },
-        { kind: "conversation", conversation: conv(5, 10), depth: 0 },
+        conversationRow(conv(5, 10), 0, 5, "pinned"),
         { kind: "section", section: "folders", expanded: true, count: 2 },
         { kind: "folder", folderId: 10 },
         { kind: "folder", folderId: 20 },
