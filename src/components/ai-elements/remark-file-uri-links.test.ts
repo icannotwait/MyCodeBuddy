@@ -94,4 +94,23 @@ describe("remarkRewriteFileUriLinks", () => {
   it("leaves non-file URLs untouched", () => {
     expect(rewrite("https://example.com/x")).toBe("https://example.com/x")
   })
+
+  // Bare Windows drive hrefs (`D:/…`) are parsed as scheme `D:` by
+  // rehype-harden and rendered as "label [blocked]". Prefix a slash so they
+  // survive as root-relative local paths (same shape file:// rewrite emits).
+  it("prefixes a bare Windows drive href so harden does not block it", () => {
+    expect(
+      rewrite(
+        "D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037"
+      )
+    ).toBe("/D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037")
+  })
+
+  it("normalizes backslashes on bare Windows drive hrefs", () => {
+    expect(rewrite(String.raw`D:\repo\src\app.ts`)).toBe("/D:/repo/src/app.ts")
+  })
+
+  it("leaves already-safe /D:/ Windows hrefs unchanged", () => {
+    expect(rewrite("/D:/repo/src/app.ts:12")).toBe("/D:/repo/src/app.ts:12")
+  })
 })

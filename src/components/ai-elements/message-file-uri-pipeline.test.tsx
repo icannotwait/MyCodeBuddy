@@ -24,4 +24,26 @@ describe("MessageResponse Windows file URI pipeline", () => {
     })
     expect(container.textContent).not.toContain("[blocked]")
   })
+
+  // Codex / agents often cite sources as `[file](D:/abs/path:line)`. Without
+  // rewriting, rehype-harden treats `D:` as a blocked scheme.
+  it("renders a bare Windows drive markdown link as a file badge", async () => {
+    const { container } = render(
+      <MessageResponse>
+        {
+          "[companion.rs](D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037)"
+        }
+      </MessageResponse>
+    )
+
+    await waitFor(() => {
+      expect(
+        container.querySelector(
+          "button[data-resource-kind='file'][title='/D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037']"
+        )
+      ).not.toBeNull()
+    })
+    expect(container.textContent).not.toContain("[blocked]")
+    expect(container.textContent).toContain("companion.rs")
+  })
 })

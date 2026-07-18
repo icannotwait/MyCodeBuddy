@@ -4,6 +4,12 @@
 // the link clickable through the existing link-safety + open-file-dialog
 // flow. Image syntax is intentionally left untouched: harden's
 // "[Image blocked: …]" placeholder is more useful than a broken <img src>.
+//
+// Bare Windows drive destinations (`D:/…`, `C:\…`) hit the same wall: the
+// parser treats the drive letter as a URL scheme, harden blocks it, and the
+// transcript shows `label [blocked]`. Prefixing `/` yields the same
+// root-relative shape `file://` rewrite already emits (`/D:/…`), which harden
+// allows and `parseLocalFileTarget` understands.
 
 type MdastNodeLike = {
   type: string
@@ -11,6 +17,8 @@ type MdastNodeLike = {
   identifier?: unknown
   children?: unknown
 }
+
+const BARE_WINDOWS_DRIVE = /^[a-zA-Z]:[\\/]/
 
 function fileUriToLocalPath(uri: string): string | null {
   if (!/^file:\/\//i.test(uri)) return null
@@ -37,6 +45,16 @@ function fileUriToLocalPath(uri: string): string | null {
   // The URL parser already preserves encoded path characters in pathname.
   const path = parsed.pathname
   return `${path}${parsed.search}${parsed.hash}`
+}
+
+/** Prefix `/` on bare `D:/…` / `D:\…` so harden does not treat the drive as a scheme. */
+function windowsDriveHrefToHardenSafe(url: string): string | null {
+  if (!BARE_WINDOWS_DRIVE.test(url)) return null
+  return `/${url.replace(/\\/g, "/")}`
+}
+
+function rewriteLocalLinkUrl(url: string): string | null {
+  return fileUriToLocalPath(url) ?? windowsDriveHrefToHardenSafe(url)
 }
 
 function walk(node: MdastNodeLike, fn: (n: MdastNodeLike) => void): void {
@@ -67,7 +85,7 @@ export function remarkRewriteFileUriLinks() {
     walk(tree, (node) => {
       if (typeof node.url !== "string") return
       if (node.type === "link") {
-        const rewritten = fileUriToLocalPath(node.url)
+        const rewritten = rewriteLocalLinkUrl(node.url)
         if (rewritten != null) node.url = rewritten
         return
       }
@@ -77,7 +95,7 @@ export function remarkRewriteFileUriLinks() {
             ? node.identifier.toLowerCase()
             : ""
         if (imageRefIds.has(id)) return
-        const rewritten = fileUriToLocalPath(node.url)
+        const rewritten = rewriteLocalLinkUrl(node.url)
         if (rewritten != null) node.url = rewritten
       }
     })
