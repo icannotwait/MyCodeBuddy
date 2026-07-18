@@ -185,7 +185,11 @@ async fn select_folder_by_index(
         return RichMessage::info(i18n::folder_index_out_of_range(lang, prefix));
     };
 
-    let _ = sender_context_service::update_folder(db, channel_id, sender_id, Some(folder.id)).await;
+    if let Err(e) =
+        sender_context_service::update_folder(db, channel_id, sender_id, Some(folder.id)).await
+    {
+        return RichMessage::error(format!("{}{e}", i18n::failed_to_select_folder_label(lang)));
+    }
 
     RichMessage::info(format!("{} ({})", folder.name, folder.path))
         .with_title(i18n::folder_selected_title(lang))
@@ -205,7 +209,11 @@ async fn select_folder_by_path(
         }
     };
 
-    let _ = sender_context_service::update_folder(db, channel_id, sender_id, Some(entry.id)).await;
+    if let Err(e) =
+        sender_context_service::update_folder(db, channel_id, sender_id, Some(entry.id)).await
+    {
+        return RichMessage::error(format!("{}{e}", i18n::failed_to_select_folder_label(lang)));
+    }
 
     RichMessage::info(format!("{} ({})", entry.name, entry.path))
         .with_title(i18n::folder_selected_title(lang))
@@ -278,7 +286,11 @@ async fn select_agent_by_index(
 
     let at = agents[idx - 1];
     let at_str = agent_type_to_string(at);
-    let _ = sender_context_service::update_agent(db, channel_id, sender_id, Some(at_str)).await;
+    if let Err(e) =
+        sender_context_service::update_agent(db, channel_id, sender_id, Some(at_str)).await
+    {
+        return RichMessage::error(format!("{}{e}", i18n::failed_to_select_agent_label(lang)));
+    }
 
     RichMessage::info(at.to_string()).with_title(i18n::agent_selected_title(lang))
 }
@@ -298,7 +310,11 @@ async fn select_agent_by_name(
     };
 
     let at_str = agent_type_to_string(at);
-    let _ = sender_context_service::update_agent(db, channel_id, sender_id, Some(at_str)).await;
+    if let Err(e) =
+        sender_context_service::update_agent(db, channel_id, sender_id, Some(at_str)).await
+    {
+        return RichMessage::error(format!("{}{e}", i18n::failed_to_select_agent_label(lang)));
+    }
 
     RichMessage::info(at.to_string()).with_title(i18n::agent_selected_title(lang))
 }
@@ -411,14 +427,22 @@ pub async fn handle_task(
         Ok(id) => id,
         Err(e) => {
             // Clean up the conversation record and broadcast the exact patch.
-            if let Ok(patch) = conversation_service::update_status_with_patch(
+            match conversation_service::update_status_with_patch(
                 db,
                 conv.id,
                 conversation::ConversationStatus::Cancelled,
             )
             .await
             {
-                crate::commands::conversations::emit_conversation_state(emitter, patch);
+                Ok(patch) => {
+                    crate::commands::conversations::emit_conversation_state(emitter, patch);
+                }
+                Err(cleanup_err) => {
+                    tracing::warn!(
+                        "[ChatChannel] failed to mark conversation {} cancelled after spawn failure: {cleanup_err}",
+                        conv.id
+                    );
+                }
             }
             return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
         }
@@ -444,14 +468,17 @@ pub async fn handle_task(
     }
 
     // 7. Update sender context
-    let _ = sender_context_service::update_session(
+    if let Err(e) = sender_context_service::update_session(
         db,
         channel_id,
         sender_id,
         Some(conv.id),
         Some(connection_id),
     )
-    .await;
+    .await
+    {
+        tracing::warn!("[ChatChannel] failed to persist sender session after /task: {e}");
+    }
 
     RichMessage::info(format!("[{}] #{} @ {}", agent_type, conv.id, folder.name,))
         .with_title(i18n::task_started_title(lang))
@@ -640,16 +667,22 @@ pub async fn handle_resume(
     }
 
     // Update sender context
-    let _ = sender_context_service::update_session(
+    if let Err(e) = sender_context_service::update_session(
         db,
         channel_id,
         sender_id,
         Some(conv.id),
         Some(connection_id),
     )
-    .await;
-    let _ = sender_context_service::update_folder(db, channel_id, sender_id, Some(conv.folder_id))
-        .await;
+    .await
+    {
+        tracing::warn!("[ChatChannel] failed to persist sender session after /resume: {e}");
+    }
+    if let Err(e) =
+        sender_context_service::update_folder(db, channel_id, sender_id, Some(conv.folder_id)).await
+    {
+        tracing::warn!("[ChatChannel] failed to persist folder after /resume: {e}");
+    }
 
     let title = conv.title.as_deref().unwrap_or("(untitled)");
     RichMessage::info(format!(
@@ -687,13 +720,17 @@ pub async fn handle_cancel(
     // per-connection ConversationStatusChanged + global State patch when the
     // CAS wins). Do not write status again here — a second unconditional write
     // would emit a duplicate/out-of-order patch for the same user cancel.
-    let _ = conn_mgr.cancel(db, &connection_id).await;
+    if let Err(e) = conn_mgr.cancel(db, &connection_id).await {
+        tracing::warn!("[ChatChannel] failed to cancel connection {connection_id}: {e}");
+    }
 
     // Remove from bridge
     bridge.lock().await.remove(&connection_id);
 
     // Clear session from context
-    let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+    if let Err(e) = sender_context_service::clear_session(db, channel_id, sender_id).await {
+        tracing::warn!("[ChatChannel] failed to clear session after /cancel: {e}");
+    }
 
     RichMessage::info(i18n::task_cancelled_body(lang)).with_title(i18n::task_cancelled_title(lang))
 }
@@ -776,7 +813,11 @@ pub async fn handle_permission_response(
 
     // Update auto_approve if requested
     if always && approve {
-        let _ = sender_context_service::update_auto_approve(db, channel_id, sender_id, true).await;
+        if let Err(e) =
+            sender_context_service::update_auto_approve(db, channel_id, sender_id, true).await
+        {
+            tracing::warn!("[ChatChannel] failed to persist auto-approve setting: {e}");
+        }
     }
 
     let action = if approve {
@@ -822,9 +863,12 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
             None => {
                 // Connection lost, clear context
                 drop(bridge_guard);
-                let _ =
+                if let Err(e) =
                     sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
-                        .await;
+                        .await
+                {
+                    tracing::warn!("[ChatChannel] failed to clear lost session: {e}");
+                }
                 return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
             }
         }
@@ -848,7 +892,11 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         }
         // Otherwise the connection may have died — clean up.
         req.bridge.lock().await.remove(&connection_id);
-        let _ = sender_context_service::clear_session(req.db, req.channel_id, req.sender_id).await;
+        if let Err(clear_err) =
+            sender_context_service::clear_session(req.db, req.channel_id, req.sender_id).await
+        {
+            tracing::warn!("[ChatChannel] failed to clear dead session: {clear_err}");
+        }
         return RichMessage::error(format!(
             "{}{e}",
             i18n::failed_to_send_message_label(req.lang)

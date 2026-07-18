@@ -374,7 +374,7 @@ async fn process_envelope(
             Err(e) => ("failed", Some(e.to_string())),
         };
 
-        let _ = chat_channel_message_log_service::create_log(
+        if let Err(e) = chat_channel_message_log_service::create_log(
             db_conn,
             ch.id,
             "outbound",
@@ -383,7 +383,13 @@ async fn process_envelope(
             status,
             error_detail,
         )
-        .await;
+        .await
+        {
+            tracing::warn!(
+                "[ChatChannel] failed to record event_push log for channel {}: {e}",
+                ch.id
+            );
+        }
     }
 }
 

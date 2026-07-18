@@ -87,7 +87,7 @@ pub fn spawn_command_dispatcher(
             );
 
             // Log inbound command
-            let _ = chat_channel_message_log_service::create_log(
+            if let Err(e) = chat_channel_message_log_service::create_log(
                 &db_conn,
                 cmd.channel_id,
                 "inbound",
@@ -96,7 +96,13 @@ pub fn spawn_command_dispatcher(
                 "sent",
                 None,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    "[ChatChannel] failed to record inbound command log for channel {}: {e}",
+                    cmd.channel_id
+                );
+            }
 
             config.refresh_if_needed(&db_conn).await;
 
@@ -136,7 +142,7 @@ pub fn spawn_command_dispatcher(
                 }
             };
 
-            let _ = chat_channel_message_log_service::create_log(
+            if let Err(e) = chat_channel_message_log_service::create_log(
                 &db_conn,
                 cmd.channel_id,
                 "outbound",
@@ -145,7 +151,13 @@ pub fn spawn_command_dispatcher(
                 status,
                 error_detail,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    "[ChatChannel] failed to record command_response log for channel {}: {e}",
+                    cmd.channel_id
+                );
+            }
         }
     })
 }

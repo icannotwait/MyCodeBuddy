@@ -348,7 +348,7 @@ impl AutomationEngine {
         match self.launch(&auto, run.id).await {
             Ok(()) => Ok(run.id),
             Err(e) => {
-                let _ = automation_service::settle_run(
+                if let Err(settle_err) = automation_service::settle_run(
                     &self.db.conn,
                     run.id,
                     AutomationRunStatus::Failed,
@@ -356,7 +356,13 @@ impl AutomationEngine {
                     Some(e.clone()),
                     None,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "[automation] failed to settle run {} as failed: {settle_err}",
+                        run.id
+                    );
+                }
                 self.emit(AutomationChange::RunSettled {
                     automation_id,
                     run_id: run.id,
@@ -422,14 +428,19 @@ impl AutomationEngine {
             // cancelled run still links its worktree for tracking/cleanup rather
             // than orphaning it, then stop before spawning the agent.
             if cwd.worktree_folder_id.is_some() {
-                let _ = automation_service::attach_run_runtime(
+                if let Err(e) = automation_service::attach_run_runtime(
                     &self.db.conn,
                     run_id,
                     None,
                     None,
                     cwd.worktree_folder_id,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "[automation] failed to attach worktree to cancelled run {run_id}: {e}"
+                    );
+                }
             }
             return Ok(());
         }
@@ -485,14 +496,17 @@ impl AutomationEngine {
             .lock()
             .await
             .insert(conn_id.clone(), (run_id, auto.id));
-        let _ = automation_service::attach_run_runtime(
+        if let Err(e) = automation_service::attach_run_runtime(
             &self.db.conn,
             run_id,
             Some(conversation_id),
             Some(conn_id.clone()),
             cwd.worktree_folder_id,
         )
-        .await;
+        .await
+        {
+            tracing::warn!("[automation] failed to attach runtime to run {run_id}: {e}");
+        }
 
         // Re-emit now that the run carries its connection + conversation, so the
         // running row's "View conversation" link goes live during the run (the

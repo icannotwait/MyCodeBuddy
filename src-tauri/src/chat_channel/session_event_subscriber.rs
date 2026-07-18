@@ -125,12 +125,17 @@ async fn handle_acp_envelope(
             };
 
             if let Some((conversation_id, channel_id, pending_prompt)) = kickoff {
-                let _ = conversation_service::update_external_id(
+                if let Err(e) = conversation_service::update_external_id(
                     db,
                     conversation_id,
                     session_id.clone(),
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        "[SessionEventSub] failed to persist external_id for conversation {conversation_id}: {e}"
+                    );
+                }
 
                 if let Some(prompt_text) = pending_prompt {
                     if let Err(e) = super::session_commands::send_prompt_linked_for_chat(
@@ -500,17 +505,24 @@ async fn handle_acp_envelope(
                 let _ = manager.send_to_channel(channel_id, &msg).await;
 
                 if stop_reason == "end_turn" {
-                    if let Ok(patch) = conversation_service::update_status_with_patch(
+                    match conversation_service::update_status_with_patch(
                         db,
                         conv_id,
                         crate::db::entities::conversation::ConversationStatus::Completed,
                     )
                     .await
                     {
-                        // Emit via the durable app-level emitter so the global
-                        // state patch is not dropped when ConnectionManager
-                        // has already removed this connection.
-                        crate::commands::conversations::emit_conversation_state(emitter, patch);
+                        Ok(patch) => {
+                            // Emit via the durable app-level emitter so the global
+                            // state patch is not dropped when ConnectionManager
+                            // has already removed this connection.
+                            crate::commands::conversations::emit_conversation_state(emitter, patch);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[SessionEventSub] failed to mark conversation {conv_id} completed: {e}"
+                            );
+                        }
                     }
                 }
 
@@ -599,7 +611,7 @@ async fn handle_acp_envelope(
                 // CAS InProgress → Cancelled so a lifecycle terminal winner
                 // (or prior cancel) leaves chat as a no-op: no second
                 // updated_at bump and no duplicate state patch.
-                if let Ok(Some(patch)) = conversation_service::update_status_if_with_patch(
+                match conversation_service::update_status_if_with_patch(
                     db,
                     conv_id,
                     crate::db::entities::conversation::ConversationStatus::InProgress,
@@ -607,9 +619,21 @@ async fn handle_acp_envelope(
                 )
                 .await
                 {
-                    crate::commands::conversations::emit_conversation_state(emitter, patch);
+                    Ok(Some(patch)) => {
+                        crate::commands::conversations::emit_conversation_state(emitter, patch);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "[SessionEventSub] failed to mark conversation {conv_id} cancelled: {e}"
+                        );
+                    }
                 }
-                let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                if let Err(e) =
+                    sender_context_service::clear_session(db, channel_id, &sender_id).await
+                {
+                    tracing::warn!("[SessionEventSub] failed to clear session after error: {e}");
+                }
             }
         }
 
@@ -624,7 +648,13 @@ async fn handle_acp_envelope(
                     let sender_id = session.sender_id.clone();
                     drop(guard);
 
-                    let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                    if let Err(e) =
+                        sender_context_service::clear_session(db, channel_id, &sender_id).await
+                    {
+                        tracing::warn!(
+                            "[SessionEventSub] failed to clear session on disconnect: {e}"
+                        );
+                    }
                 }
             }
         }
