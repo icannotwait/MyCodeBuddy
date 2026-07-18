@@ -185,6 +185,22 @@ mod tests {
             .cas_fail_and_cancel_parent(
                 &record.continuation_id,
                 record.generation,
+                record.version + 1,
+                ContinuationState::Arming,
+                ContinuationFailureCode::ArmFailed,
+                Utc::now()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            memory.parent_status(1).await.as_deref(),
+            Some("in_progress")
+        );
+        assert!(memory
+            .cas_fail_and_cancel_parent(
+                &record.continuation_id,
+                record.generation,
                 record.version,
                 ContinuationState::Arming,
                 ContinuationFailureCode::ArmFailed,
@@ -200,6 +216,30 @@ mod tests {
             .insert_arming(new_continuation("sqlite", 1))
             .await
             .unwrap();
+        assert!(sqlite
+            .cas_fail_and_cancel_parent(
+                &record.continuation_id,
+                record.generation,
+                record.version + 1,
+                ContinuationState::Arming,
+                ContinuationFailureCode::ArmFailed,
+                Utc::now()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let stale_status: String = db
+            .conn
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT status FROM conversation WHERE id = 1".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "status")
+            .unwrap();
+        assert_eq!(stale_status, "in_progress");
         assert!(sqlite
             .cas_fail_and_cancel_parent(
                 &record.continuation_id,
@@ -224,6 +264,17 @@ mod tests {
             .try_get("", "status")
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn continuation_store_only_maps_active_parent_index_conflict_to_active_exists() {
+        let error = DbErr::Custom(
+            "UNIQUE constraint failed: delegation_continuations.parent_conversation_id, delegation_continuations.generation".to_string(),
+        );
+        assert!(matches!(
+            map_active_exists(error),
+            ContStoreError::Database(_)
+        ));
     }
 
     #[tokio::test]
@@ -788,8 +839,9 @@ impl ContinuationStore for DbContinuationStore {
 
 fn map_active_exists(err: DbErr) -> ContStoreError {
     let message = err.to_string().to_ascii_lowercase();
+    let unique_target = message.rsplit_once(':').map(|(_, target)| target.trim());
     if message.contains("idx_cont_one_active_per_parent")
-        || message.contains("delegation_continuations.parent_conversation_id")
+        || unique_target == Some("delegation_continuations.parent_conversation_id")
     {
         ContStoreError::ActiveExists
     } else {
