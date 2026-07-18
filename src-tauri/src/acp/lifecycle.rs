@@ -2092,21 +2092,22 @@ pub fn lifecycle_subscriber_task(
     }
     let metrics = Arc::clone(bus.metrics());
 
-    // Off-select serial worker for broker tool side-effects. Keeps register/
-    // project ordering without parking the lifecycle select loop.
-    let broker_tool_tx = broker.as_ref().map(|b| {
-        let (tx, mut tool_rx) =
-            mpsc::channel::<Arc<InternalEventEnvelope>>(BROKER_TOOL_QUEUE_CAPACITY);
-        let b = Arc::clone(b);
-        tokio::spawn(async move {
-            while let Some(env) = tool_rx.recv().await {
-                run_broker_tool_side_effects(b.as_ref(), env.as_ref()).await;
-            }
-        });
-        tx
-    });
-
     async move {
+        // Off-select serial worker for broker tool side-effects. Spawned
+        // inside the async body so we are on a Tokio runtime (this function
+        // is often constructed before `tauri::async_runtime::spawn`).
+        let broker_tool_tx = broker.as_ref().map(|b| {
+            let (tx, mut tool_rx) =
+                mpsc::channel::<Arc<InternalEventEnvelope>>(BROKER_TOOL_QUEUE_CAPACITY);
+            let b = Arc::clone(b);
+            tokio::spawn(async move {
+                while let Some(env) = tool_rx.recv().await {
+                    run_broker_tool_side_effects(b.as_ref(), env.as_ref()).await;
+                }
+            });
+            tx
+        });
+
         // connection_id → worker mailbox. Workers are spawned lazily on the
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).

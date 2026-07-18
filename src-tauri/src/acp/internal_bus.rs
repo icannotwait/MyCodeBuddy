@@ -187,25 +187,39 @@ impl InternalEventBus {
                     let tx = self.critical_tx.clone();
                     let conn = connection_id.clone();
                     let label = payload_label;
-                    tokio::spawn(async move {
-                        match tx.send(env).await {
-                            Ok(()) => {
-                                tracing::info!(
-                                    connection_id = %conn,
-                                    event = %label,
-                                    "[ACP][bus] critical lane overflow deliver succeeded"
-                                );
-                            }
-                            Err(_) => {
-                                tracing::error!(
-                                    connection_id = %conn,
-                                    event = %label,
-                                    "[ACP][bus][ERROR] critical lifecycle lane CLOSED \
-                                     during overflow deliver — status CAS will not run"
-                                );
-                            }
+                    // Must not panic if called outside a runtime (emit paths
+                    // are normally on Tokio; this is belt-and-suspenders).
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => {
+                            handle.spawn(async move {
+                                match tx.send(env).await {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            connection_id = %conn,
+                                            event = %label,
+                                            "[ACP][bus] critical lane overflow deliver succeeded"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::error!(
+                                            connection_id = %conn,
+                                            event = %label,
+                                            "[ACP][bus][ERROR] critical lifecycle lane CLOSED \
+                                             during overflow deliver — status CAS will not run"
+                                        );
+                                    }
+                                }
+                            });
                         }
-                    });
+                        Err(_) => {
+                            tracing::error!(
+                                connection_id = %connection_id,
+                                event = %payload_label,
+                                "[ACP][bus][ERROR] critical lane FULL and no Tokio runtime \
+                                 for overflow deliver — event may be lost"
+                            );
+                        }
+                    }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     tracing::error!(
