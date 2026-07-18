@@ -149,4 +149,23 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
       )
     })
   })
+
+  it("does not reach prompt dispatch when mode change fails", async () => {
+    h.setMode.mockRejectedValueOnce(new Error("mode failed"))
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "tab-1",
+        agentType: "claude_code",
+        isActive: true,
+      })
+    )
+    act(() => {
+      result.current.handleSend(
+        { blocks: [{ type: "text", text: "wire" }], displayText: "wire" },
+        "plan"
+      )
+    })
+    await waitFor(() => expect(h.setMode).toHaveBeenCalledWith("plan"))
+    expect(h.sendPrompt).not.toHaveBeenCalled()
+  })
 })

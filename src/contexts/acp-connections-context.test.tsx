@@ -12,9 +12,17 @@ import {
   __resetWritableConnectionsCloneCount,
   __getWritableConnectionsCloneCount,
 } from "@/contexts/acp-connections-context"
-import type { DesktopAcpEventBatch, DesktopDeliveryFailure } from "@/lib/types"
+import type {
+  DbConversationSummary,
+  DesktopAcpEventBatch,
+  DesktopDeliveryFailure,
+} from "@/lib/types"
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
+import {
+  resetAppWorkspaceStore,
+  useAppWorkspaceStore,
+} from "@/stores/app-workspace-store"
 import type { AttachHandlers } from "@/lib/transport/types"
 import type {
   EventEnvelope,
@@ -135,6 +143,7 @@ vi.mock("@/lib/snapshot-denormalize", () => ({
 }))
 
 const acpPromptMock = vi.hoisted(() => vi.fn())
+const acpAnswerQuestionMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
@@ -144,6 +153,7 @@ vi.mock("@/lib/api", () => ({
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
   acpGetDesktopDeliveryCapabilities: h.acpGetDesktopDeliveryCapabilities,
   acpPrompt: acpPromptMock,
+  acpAnswerQuestion: acpAnswerQuestionMock,
   acpSetMode: vi.fn(),
   acpSetConfigOption: vi.fn(),
   acpCancel: vi.fn(),
@@ -210,6 +220,32 @@ async function mountProvider() {
 
 const TAB = "conv-1-claude_code-42"
 
+function makeSummary(
+  overrides: Partial<DbConversationSummary> & { id: number }
+): DbConversationSummary {
+  return {
+    folder_id: 1,
+    title: null,
+    title_locked: false,
+    agent_type: "claude_code",
+    status: "in_progress",
+    awaiting_reply_token: null,
+    kind: "regular",
+    model: null,
+    git_branch: null,
+    external_id: null,
+    message_count: 0,
+    child_count: 0,
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z",
+    pinned_at: null,
+    parent_id: null,
+    parent_tool_use_id: null,
+    delegation_call_id: null,
+    ...overrides,
+  }
+}
+
 beforeEach(() => {
   h.attach.mockClear()
   h.store = null
@@ -225,6 +261,14 @@ beforeEach(() => {
   h.acpGetDesktopDeliveryCapabilities.mockReset()
   h.denormalizeSnapshot.mockReset()
   h.pushAlert.mockReset()
+  acpPromptMock.mockReset()
+  acpPromptMock.mockResolvedValue(undefined)
+  acpAnswerQuestionMock.mockReset()
+  acpAnswerQuestionMock.mockResolvedValue(undefined)
+  resetAppWorkspaceStore()
+  useAppWorkspaceStore
+    .getState()
+    .applyConversationUpsert(makeSummary({ id: 2 }))
   __resetStreamingConfigForProviderTests()
   __resetPublishedConnectionMapsCount()
   __resetWritableConnectionsCloneCount()
@@ -2791,11 +2835,6 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
 })
 
 describe("send_prompt_forwards_prompt_context_to_api", () => {
-  beforeEach(() => {
-    acpPromptMock.mockReset()
-    acpPromptMock.mockResolvedValue(undefined)
-  })
-
   it("forwards promptContext as the required sixth argument to acpPrompt", async () => {
     await mountProvider()
     await act(async () => {
@@ -2852,5 +2891,159 @@ describe("send_prompt_forwards_prompt_context_to_api", () => {
         locale: null,
       }
     )
+  })
+})
+
+describe("root_conversation_activity_at_acp_dispatch_boundaries", () => {
+  it("begins root activity immediately before acpPrompt and keeps it on success", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      false
+    )
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }])
+    })
+
+    expect(acpPromptMock).toHaveBeenCalledTimes(1)
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      true
+    )
+  })
+
+  it("rolls back the exact prompt token when acpPrompt rejects", async () => {
+    acpPromptMock.mockRejectedValueOnce(new Error("send failed"))
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    await expect(
+      h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }])
+    ).rejects.toThrow("send failed")
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      false
+    )
+  })
+
+  it("uses explicit opts.conversationId over the bound connection id", async () => {
+    useAppWorkspaceStore
+      .getState()
+      .applyConversationUpsert(makeSummary({ id: 3 }))
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "wire" }], {
+        conversationId: 3,
+      })
+    })
+
+    const optimistic = useAppWorkspaceStore.getState().optimisticActivityById
+    expect(optimistic.has(3)).toBe(true)
+    expect(optimistic.has(2)).toBe(false)
+  })
+
+  it("does not begin activity for an unknown connection context", async () => {
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.sendPrompt("missing-key", [
+        { type: "text", text: "wire" },
+      ])
+    })
+
+    expect(acpPromptMock).not.toHaveBeenCalled()
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.size).toBe(0)
+  })
+
+  it("begins viewer root activity through the connection-bound id", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValueOnce({
+      connection_id: "owner-conn",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "viewer send" }])
+    })
+
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      true
+    )
+  })
+
+  it("begins root activity immediately before acpAnswerQuestion and keeps it on success", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      false
+    )
+
+    await act(async () => {
+      await h.actions!.answerQuestion(TAB, "q-1", {
+        answers: [{ questionId: "choice", labels: ["A"] }],
+        declined: false,
+      })
+    })
+
+    expect(acpAnswerQuestionMock).toHaveBeenCalledTimes(1)
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      true
+    )
+  })
+
+  it("rolls back the exact answer-question token when acpAnswerQuestion rejects", async () => {
+    acpAnswerQuestionMock.mockRejectedValueOnce(new Error("answer failed"))
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    await expect(
+      h.actions!.answerQuestion(TAB, "q-1", {
+        answers: [{ questionId: "choice", labels: ["A"] }],
+        declined: false,
+      })
+    ).rejects.toThrow("answer failed")
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(2)).toBe(
+      false
+    )
+  })
+
+  it("does not begin root activity for delegation-child answerQuestion", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "child-1",
+        parentConnectionId: "spawned-conn",
+        parentToolUseId: "tool-1",
+        agentType: "codex",
+      })
+    })
+
+    await act(async () => {
+      await h.actions!.answerQuestion("child-1", "q-child", {
+        answers: [{ questionId: "choice", labels: ["A"] }],
+        declined: false,
+      })
+    })
+
+    expect(acpAnswerQuestionMock).toHaveBeenCalledTimes(1)
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.size).toBe(0)
   })
 })
