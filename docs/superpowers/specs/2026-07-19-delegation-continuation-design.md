@@ -2,7 +2,9 @@
 
 ## Status
 
-Approved in conversation on 2026-07-19.
+Approved in conversation on 2026-07-19. Reviewed against the current ACP
+connection and delegation lifecycle on 2026-07-19; the mandatory amendments in
+the next section are part of the approved design.
 
 This specification amends
 `docs/superpowers/specs/2026-07-17-event-driven-delegation-join-design.md`.
@@ -59,8 +61,9 @@ typical five-minute provider cache expires.
   sending it later.
 - Hide internal continuation prompts from the public transcript while still
   delivering them to the agent and retaining an auditable continuation record.
-- Recover waiting or wake-pending state after frontend reattachment, parent
-  connection recovery, or application restart.
+- Recover waiting state after frontend reattachment while the parent ACP
+  connection remains live, and fail closed when that connection or the Codeg
+  process is actually lost.
 - Make every wake, cancellation, and recovery path idempotent and race-safe.
 
 ## Non-Goals
@@ -70,6 +73,9 @@ typical five-minute provider cache expires.
 - Configuring Codex's default code-mode yield from Codeg.
 - Resuming the same canceled ACP request. A continuation always starts a new
   parent turn in the same agent session.
+- Transferring live children to a replacement ACP connection after the original
+  parent connection or Codeg process has exited. That needs a separately
+  designed cross-connection ownership handoff.
 - Queueing user prompts behind a continuation.
 - Locking navigation, other conversations, child inspection, or the entire app.
 - Applying continuation ownership to platform-native subagents not represented
@@ -135,6 +141,130 @@ Correctness cannot depend on prompt adherence.
 Rejected. It would fork an upstream execution runtime, complicate official npm
 updates, and solve only Codex while leaving other ACP agents with different
 turn-lifecycle behavior.
+
+## Review Amendments
+
+Two independent reviews converged on the same implementation risk, and the
+current code confirms it: the unsafe boundary is not Broker Join. It is the
+existing rule that every parent-turn end drains the complete live delegation
+tree. `src-tauri/src/acp/connection.rs:4761` maps `end_turn` to
+`JoinAbandoned` and all other terminal paths to a `ParentTurnEndReason`.
+The extension completion, stop-reason, prompt-response, and explicit Cancel
+branches then call `DelegationBroker::cancel_by_parent_turn`
+(`connection.rs:5194`, `5365`, `5447`, `5638`, and `5793`). That Broker method
+recursively drains descendants before asynchronously tearing their sessions
+down (`delegation/broker.rs:4695`).
+
+The following amendments remove that conflict without weakening explicit user
+Stop semantics.
+
+### Suspension is a third turn disposition, not a new cancel reason
+
+`SuspendForDelegation` must not be represented by a new
+`ParentTurnEndReason`. Every current value of that enum feeds the destructive
+parent-tree drain. Instead, the connection loop must use a private, exhaustive
+turn-finalization disposition such as:
+
+```text
+NaturalEnd(ParentTurnEndReason)
+UserCancelled
+DelegationSuspended(SuspensionLease)
+```
+
+`NaturalEnd` and `UserCancelled` retain the existing terminal behavior.
+`DelegationSuspended` is the only disposition that:
+
+- sends the ACP cancel notification for the current parent turn;
+- clears that turn's in-flight gate through an internal suspended-turn event;
+- abandons the pending `get_delegation_status` response; and
+- leaves Broker task ownership, attention, and the live child tree untouched.
+
+It must not emit the public `TurnComplete { stop_reason: "cancelled" }`, call
+`DelegationBroker::cancel_by_parent_turn`, invoke the manager's user-cancel
+conversation-status write, clear the continuation's task ownership, or resolve
+attention as `parent_canceled`.
+
+The existing `ConnectionCommand::Cancel` behavior remains reserved for a user
+Stop. It currently emits the public cancelled completion and cascades to the
+Broker (`connection.rs:5540` and `5745`); changing that path would regress the
+normal cancellation contract.
+
+### One fenced suspension path covers every terminal source
+
+Add `ConnectionCommand::SuspendForDelegation {
+continuation_id, parent_turn_generation, reply }`. A private
+`SuspensionLease` records the same identifiers plus the current connection and
+session. The connection loop accepts it only while that exact parent turn is
+in flight. It records the lease before sending the upstream cancel
+notification and acknowledges only after the loop has made the connection safe
+for another prompt.
+
+All current terminal producers must call one internal finalization helper:
+
+- extension `turn_completed` handling;
+- `SessionMessage::StopReason` handling;
+- `session/prompt` response completion; and
+- both active-turn and idle `ConnectionCommand::Cancel` branches.
+
+That helper consumes a matching `SuspensionLease` exactly once. A matching
+cancelled completion is classified as `DelegationSuspended`; a non-matching or
+late completion follows the existing natural/error/cancel rules. No new prompt
+may be admitted until the old turn's suspension acknowledgement has been
+persisted, so a delayed terminal event cannot be mistaken for the resumed
+turn. If a normal terminal event wins before the lease is committed, normal
+parent-tree cancellation wins and the continuation is failed rather than
+silently adopting ambiguous children.
+
+### V1 ownership transfer stops at a live parent connection
+
+The durable continuation transfers ownership across parent *turns*, not across
+an ACP connection or Codeg-process teardown. The current connection cleanup
+uses `cancel_by_parent(...ParentDisconnected)` and therefore cancels all live
+descendants (`delegation/broker.rs:4652`). V1 preserves that fail-closed
+behavior:
+
+- frontend reattachment may reconstruct a waiting projection while the backend
+  and parent connection are still alive;
+- an actual parent connection exit changes an active continuation to `Failed`
+  with `parent_connection_lost`, runs the existing parent-disconnected cascade,
+  and releases the prompt lock after durable cleanup; and
+- application restart follows the same policy instead of attempting an
+  unsupported session/child handoff.
+
+Automatic continuation on a replacement connection requires durable child
+control handles, session-resume guarantees for every ACP provider, and an
+atomic ownership handoff. It is intentionally deferred rather than implied by
+this design's persistence table.
+
+### Waiting is a distinct admission result, never a busy retry
+
+Add a stable `AcpError::ContinuationInProgress` with web error code
+`conversation_waiting_for_subagents` and HTTP 409 mapping. The common manager
+admission check must run before conversation creation, optimistic user-message
+projection, or prompt enqueue for every external producer.
+
+This error must not be translated to `TurnBusyError`. Today
+`src/lib/api.ts:208` converts `turn_in_progress` into `TurnBusyError`, and
+`src/hooks/use-connection-lifecycle.ts:433` re-queues that draft for automatic
+send. A continuation rejection instead leaves the editor's text only in its
+local draft and displays the waiting state; it is neither queued nor replayed
+when the lock ends.
+
+The frontend must receive a redacted continuation-lock projection and pass it
+to `ChatInput`/`MessageInput`. The present `ChatInput` disabled expression
+(`src/components/chat/chat-input.tsx:154`) considers only connection status and
+selector loading, so it is insufficient once `turn_in_flight` is deliberately
+false between turns. Stop, navigation, task cards, and editing remain enabled;
+only external prompt submission is locked.
+
+### Closing a status call remains non-destructive
+
+No Broker cancellation behavior is required merely because suspension closes
+the pending Join. `delegation/companion.rs:934` intentionally gives
+`get_delegation_status` no external handle, so an MCP cancellation suppresses
+only that response and does not cancel a task. Preserve this property with a
+regression test; it is what lets the coordinator, rather than the parent MCP
+call, own the live child set during the wait.
 
 ## Core Invariants
 
@@ -211,7 +341,8 @@ hides a public message.
 - Waits for the parent connection to become prompt-admissible.
 - Builds and submits the hidden continuation prompt.
 - Cancels watchers and prevents future wakes on explicit user Stop.
-- Recovers non-terminal rows at process startup.
+- Reconciles non-terminal rows to safe cleanup at process startup; V1 does not
+  resume them on a replacement connection.
 - Publishes runtime waiting state and low-cardinality metrics.
 
 The coordinator should live in shared backend state so desktop and server modes
@@ -232,6 +363,10 @@ use the same implementation.
 
 - Adds `ConnectionCommand::SuspendForDelegation` instead of reusing
   `ConnectionCommand::Cancel`.
+- Registers and consumes a one-shot `SuspensionLease` keyed by continuation id,
+  connection/session identity, and parent-turn generation.
+- Routes every terminal producer through one disposition classifier so a
+  matching suspension cannot fall through to `cancel_by_parent_turn`.
 - Sends the ACP cancel notification needed to stop the current parent turn.
 - Clears turn-scoped tool, permission, question, and terminal bookkeeping.
 - Emits an internal suspended-turn completion that clears `turn_in_flight`
@@ -244,6 +379,9 @@ use the same implementation.
 
 - Enforces the waiting lock in the backend's common prompt-admission boundary.
 - Covers Tauri, HTTP, chat-channel, automation, and any other external producer.
+- Returns `conversation_waiting_for_subagents`, rather than
+  `turn_in_progress`, so clients retain a local draft instead of auto-queuing
+  it for retry.
 - Accepts an internal continuation only through an in-process capability that
   public request types cannot construct.
 - Preserves ordinary `turn_in_flight` rejection while the continuation turn is
@@ -253,6 +391,8 @@ use the same implementation.
 
 - Projects a conversation-level `waiting_for_subagents` state.
 - Disables sending in the affected conversation while leaving editing enabled.
+- Applies that lock independently of `ConnectionStatus` and
+  `turn_in_flight`, which are intentionally clear between turns.
 - Keeps the draft local and unchanged across wait, wake, and cancellation.
 - Shows waiting state and the existing Delegation Cards, but no synthetic user
   bubble for the continuation prompt.
@@ -298,6 +438,7 @@ parent_conversation_id   INTEGER NOT NULL
 parent_session_id        TEXT NOT NULL
 parent_connection_id     TEXT NULL
 generation               INTEGER NOT NULL
+parent_turn_generation   INTEGER NOT NULL
 task_ids_json             TEXT NOT NULL
 state                     TEXT NOT NULL
 wake_reason               TEXT NULL
@@ -394,15 +535,18 @@ Arming uses this order:
 
 ```text
 1. authorize parent and task set
-2. evaluate the current Join predicate
-3. transactionally insert Arming with wake_at = now + 240 seconds; this insert
-   immediately activates the backend prompt gate
-4. arm the Broker notifier/watcher
-5. re-evaluate the predicate after arming
-6. send SuspendForDelegation with continuation id and parent turn generation
-7. await the connection-loop suspension acknowledgement
-8. transition Arming -> Waiting unless a wake already claimed WakePending
-9. publish the frontend waiting projection; backend enforcement is already live
+2. capture and validate the current parent-turn generation
+3. evaluate the current Join predicate
+4. transactionally insert Arming with that parent-turn generation and
+   wake_at = now + 240 seconds; this insert immediately activates the backend
+   prompt gate
+5. arm the Broker notifier/watcher
+6. re-evaluate the predicate after arming
+7. send SuspendForDelegation with continuation id and parent-turn generation
+8. await the connection-loop acknowledgement that its SuspensionLease was
+   consumed and the old turn can no longer reach generic finalization
+9. transition Arming -> Waiting unless a wake already claimed WakePending
+10. publish the frontend waiting projection; backend enforcement is already live
 ```
 
 The snapshot after notifier registration closes the event-before-registration
@@ -416,14 +560,16 @@ drops only the Join waiter and does not mutate task state.
 Suspension uses an acknowledgement channel. If the connection command cannot
 be delivered, Codeg conditionally fails the continuation and returns an error
 through the still-open Join. If the command was delivered but the agent is slow
-to acknowledge cancellation, Codeg's connection loop may publish the same
-immediate internal completion boundary used for UI recovery, then fence the old
-turn. It must not use the user-cancel side effects.
+to acknowledge cancellation, the connection loop may publish its immediate
+internal suspended-turn boundary, then drain the matching upstream terminal
+event under the lease. That boundary is not a public cancelled completion and
+must not use user-cancel side effects.
 
 ## Wake Algorithm
 
 Each non-terminal continuation has one in-memory task observer and one timer.
-They are recreated from the durable row after process restart.
+They are recreated only while the same backend process and parent connection
+remain live; process startup reconciles persisted rows to cleanup instead.
 
 ```text
 loop:
@@ -603,33 +749,21 @@ backend prompt queue.
 
 ### Parent connection interruption
 
-If the parent connection disappears while children are running, existing
-connection teardown may settle those children according to the established
-parent-disconnected policy. The coordinator re-reads durable reports and claims
-`unavailable` or `all_terminal` as appropriate.
-
-For a claimed wake with no live parent connection, the coordinator uses the
-existing conversation/session resume path. It retains `WakePending` while
-recovery is retryable. Prompt delivery is idempotent by `internal_prompt_id`.
-
-After a bounded recovery policy is exhausted, the continuation becomes
-`Failed`, any still-owned children are canceled with a stable continuation
-delivery failure code of `continuation_delivery_failed`, the lock is released,
-and Codeg surfaces a visible system error with Retry and Stop actions. It does
-not fabricate a user message.
+An actual parent connection exit is not an in-turn suspension. The coordinator
+atomically changes an active continuation to `Failed` with
+`parent_connection_lost`, disables its watcher/timer, and lets the existing
+`ParentDisconnected` parent-tree cascade settle live children. It then releases
+the prompt lock and surfaces a visible system error. It does not fabricate a
+user message or attempt a hidden prompt on another connection.
 
 ### Application restart
 
-Startup scans `Arming`, `Waiting`, `WakePending`, and `Resuming` rows before
-accepting external prompts for their conversations.
-
-- An expired `wake_at` is immediately eligible for `checkpoint`.
-- Existing terminal or attention state is immediately eligible for its normal
-  wake reason.
-- Existing host-restart task reconciliation may make the task set terminal or
-  unavailable; the coordinator reports that state instead of waiting forever.
-- `Resuming` without a confirmed prompt delivery is reconciled by
-  `internal_prompt_id` before retrying, preventing duplicate model turns.
+Process startup reconciles `Arming`, `Waiting`, `WakePending`, and `Resuming`
+rows as interrupted ownership, not as resumable work. It marks each row failed
+with `parent_connection_lost`, reconciles any durable child reports through the
+existing teardown policy, releases the lock, and preserves the audit record.
+The database remains authoritative for cleanup and observability, but V1 never
+starts a hidden continuation prompt after a process restart.
 
 ### Arming failure
 
@@ -663,7 +797,7 @@ Stop wins if it changes the active row before prompt admission. If the wake has
 already admitted a prompt, the normal active-turn Cancel path wins afterward.
 Neither order can submit two hidden prompts.
 
-### Two coordinator instances after recovery
+### Two coordinator instances after in-process reconciliation
 
 Every claim and prompt-admission transition is conditional on id, generation,
 state, and version. A losing instance stops when it observes the newer version.
@@ -675,9 +809,9 @@ unlock cannot accidentally replay the request.
 
 ### Hidden prompt accepted but acknowledgement lost
 
-Recovery correlates `internal_prompt_id` with the parent session/turn record.
-It marks the continuation completed when acceptance is already durable and
-does not resubmit the prompt.
+Before releasing the lock, the coordinator correlates `internal_prompt_id` with
+the parent session/turn record. It marks the continuation completed when
+acceptance is already durable and does not resubmit the prompt.
 
 ## Security and Isolation
 
@@ -704,7 +838,7 @@ continuation_wake_claimed{reason=all_terminal|attention_required|unavailable|che
 continuation_prompt_admitted
 continuation_cancelled{phase}
 continuation_failed{phase,code}
-continuation_recovered{state}
+continuation_reconciled{state}
 continuation_duplicate_claim_suppressed
 continuation_wait_duration_ms{reason}
 continuation_suspend_duration_ms
@@ -738,7 +872,7 @@ Rollout order:
 2. Add internal prompt origin, backend gate, snapshot state, and hidden
    transcript projection.
 3. Add `SuspendForDelegation` with turn fencing and no child cascade.
-4. Add Broker/coordinator integration and restart recovery.
+4. Add Broker/coordinator integration and startup cleanup reconciliation.
 5. Enable for official Codex ACP sessions and verify that repeated code-mode
    waits disappear.
 6. Enable per additional ACP agent only after cancel-and-resume conformance
@@ -750,7 +884,7 @@ V1 uses a named backend constant of `240_000` milliseconds. It is not exposed
 as a UI setting. A future configuration design may make it adjustable after
 provider behavior and operational data justify the added surface.
 
-Rollback disables new arming. Existing active rows must still be recovered,
+Rollback disables new arming. Existing active rows must still be reconciled,
 canceled, or completed by code that understands their schema; rollback must not
 strand a persisted lock or delete an active continuation blindly.
 
@@ -766,13 +900,18 @@ strand a persisted lock or delete an active continuation blindly.
 - Deadline/event and multiple-event races have one CAS winner.
 - A stale coordinator instance cannot wake a newer generation.
 - Prompt delivery is idempotent by `internal_prompt_id`.
-- Recovery handles every non-terminal state and an already-expired deadline.
+- Frontend reattachment restores an active lock without replaying a prompt.
+- Parent connection loss and process restart fail active ownership closed and
+  release the lock after the established descendant cleanup path.
 
 ### ACP lifecycle tests
 
 - `SuspendForDelegation` clears the parent turn without marking the conversation
   canceled.
 - Suspension never calls `cancel_by_parent_turn` and leaves children running.
+- Each of extension completion, stop-reason handling, prompt-response handling,
+  and the active-turn Cancel branch consumes a matching suspension lease instead
+  of falling through to the generic parent-end cascade.
 - Explicit user Cancel still cascades through all direct and nested children.
 - Late output and a late upstream TurnComplete from the suspended generation are
   fenced and deduplicated.
@@ -784,6 +923,8 @@ strand a persisted lock or delete an active continuation blindly.
 ### Prompt admission and transcript tests
 
 - Tauri, HTTP, chat-channel, and automation prompts are rejected while waiting.
+- The rejection has code `conversation_waiting_for_subagents` and is never
+  converted into `TurnBusyError` or an automatic queue entry.
 - A server-authored continuation prompt passes the same gate.
 - A client cannot forge the internal origin or hide its message with marker
   text.
@@ -817,11 +958,10 @@ Tests use paused/fake time; the suite must not sleep for four real minutes.
 
 ### Recovery and frontend tests
 
-- Restart reconstruction restores the conversation lock before external prompt
-  admission opens.
-- An expired continuation wakes immediately after recovery.
-- Permanent parent-session recovery failure cancels owned children, unlocks the
-  conversation, and surfaces a visible failure state.
+- Reattachment to a still-live backend restores the waiting lock before external
+  prompt admission opens.
+- Parent connection loss and process restart cancel or reconcile owned children,
+  unlock the conversation, and surface `parent_connection_lost`.
 - Waiting state remains scoped to one conversation across desktop and server
   clients.
 - Navigation, other conversations, child inspection, and Stop remain enabled.
@@ -843,11 +983,14 @@ Tests use paused/fake time; the suite must not sleep for four real minutes.
 - The continuation prompt is available to the model but absent from every
   user-visible live and cold transcript projection.
 - External prompts cannot enter the waiting conversation through any backend
-  path, and typed text is never queued or automatically submitted.
+  path, return `conversation_waiting_for_subagents`, and leave typed text
+  neither queued nor automatically submitted.
 - The user can navigate and inspect other work while waiting.
 - User Stop cancels the active continuation and the entire delegation tree.
-- Event, timer, cancellation, retry, and restart races cannot create duplicate
+- Event, timer, cancellation, and terminal-source races cannot create duplicate
   parent turns, orphan children, or a permanently stuck input lock.
+- Parent connection loss or process restart fails the continuation closed rather
+  than attempting an unsupported ownership transfer.
 - Disabling the capability restores the existing event-driven Join behavior for
   new waits without corrupting already-persisted continuations.
 
@@ -864,6 +1007,9 @@ The default-yield conclusion is based on official Codex source at commit
   10,000 milliseconds.
 - `codex-rs/features/src/feature_configs.rs` exposes no code-mode default-yield
   configuration.
+- The current public Codex configuration reference documents only
+  `features.code_mode.enabled`, `excluded_tool_namespaces`, and
+  `direct_only_tool_namespaces`; it exposes no default-yield setting.
 
 Relevant source links:
 
@@ -871,6 +1017,7 @@ Relevant source links:
 - <https://github.com/openai/codex/blob/b8b61bc692517adcd18622df260f2ddd80635122/codex-rs/code-mode/src/service.rs#L114-L120>
 - <https://github.com/openai/codex/blob/b8b61bc692517adcd18622df260f2ddd80635122/codex-rs/core/src/tools/code_mode/wait_spec.rs#L13-L16>
 - <https://github.com/openai/codex/blob/b8b61bc692517adcd18622df260f2ddd80635122/codex-rs/features/src/feature_configs.rs#L7-L20>
+- <https://learn.chatgpt.com/docs/config-file/config-reference#configtoml>
 
 These values explain why a Broker-side 240-second long poll alone cannot
 suppress Codex's outer model wakeups. They do not require Codeg to fork Codex;
