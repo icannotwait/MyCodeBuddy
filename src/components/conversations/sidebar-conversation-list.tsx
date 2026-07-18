@@ -105,6 +105,7 @@ import {
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 import { useSubsessionSync } from "@/hooks/use-subsession-sync"
+import { useSidebarReorderAnimation } from "./use-sidebar-reorder-animation"
 import { SidebarSectionHeader } from "./sidebar-section-header"
 import { ConversationManageDialog } from "./conversation-manage-dialog"
 import { CloneDialog } from "@/components/layout/clone-dialog"
@@ -577,6 +578,14 @@ export function SidebarConversationList({
   const optimisticActivityById = useAppWorkspaceStore(
     (state) => state.optimisticActivityById
   )
+  // Narrow activity signals for the reorder FLIP hook — sequence/id only so
+  // unrelated store churn does not resubscribe the animation path.
+  const conversationActivitySequence = useAppWorkspaceStore(
+    (state) => state.conversationActivitySequence
+  )
+  const lastConversationActivityId = useAppWorkspaceStore(
+    (state) => state.lastConversationActivityId
+  )
   const loading = useAppWorkspaceStore((s) => s.conversationsLoading)
   const error = useAppWorkspaceStore((s) => s.conversationsError)
   const refreshConversations = useAppWorkspaceStore(
@@ -1016,6 +1025,17 @@ export function SidebarConversationList({
   orderedFolderIdsRef.current = orderedFolderIds
   reorderingRef.current = reordering
 
+  // WAAPI FLIP on stable inner wrappers only. Consumes the store activity
+  // sequence/id, the live rows snapshot, the real OverlayScrollbars viewport,
+  // and folder-drag state. Does not own sticky/scrollToActive.
+  const { handleUserScroll } = useSidebarReorderAnimation({
+    rows,
+    activitySequence: conversationActivitySequence,
+    activityConversationId: lastConversationActivityId,
+    viewportEl,
+    dragging: dragging !== null,
+  })
+
   // Sticky-overlay lookup tables, rebuilt only when the flat rows change
   // (folder add/remove/expand, not status events). Consumed exclusively by the
   // imperative scroll handler via refs — never passed to a memoized child — so
@@ -1303,15 +1323,17 @@ export function SidebarConversationList({
     setStickyFolderId((prev) => (prev === nextFolderId ? prev : nextFolderId))
   }, [])
 
-  // virtua fires onScroll synchronously per scroll event; coalesce to one
-  // recompute per frame and keep the DOM write frame-aligned.
+  // virtua fires onScroll synchronously per scroll event. Cancel/rebase any
+  // in-flight reorder wave first, then coalesce sticky recompute to one frame
+  // so the DOM write stays frame-aligned.
   const handleVirtuaScroll = useCallback(() => {
+    handleUserScroll()
     if (stickyRafRef.current != null) return
     stickyRafRef.current = requestAnimationFrame(() => {
       stickyRafRef.current = null
       recomputeSticky()
     })
-  }, [recomputeSticky])
+  }, [handleUserScroll, recomputeSticky])
 
   // Collapse from the overlay, then bring the now-collapsed header to the top so
   // the eye lands on the folder just folded (the in-list toggle leaves you mid
@@ -1961,35 +1983,33 @@ export function SidebarConversationList({
     // Worktree child folders render under their parent group, so theme the row
     // by the display group (parent) for a unified look.
     const groupId = childToParent.get(conv.folder_id) ?? conv.folder_id
+    // data-conversation-id lives on the stable Virtua child wrapper (below),
+    // which still contains the card label for optimistic-time tests.
     return themeWrap(
       groupId,
-      // data-conversation-id on this wrapper (not only the card button) so tests
-      // and mobile close-on-select can read the full row, including the time label.
-      <div data-conversation-id={conv.id}>
-        <SidebarConversationCard
-          conversation={conv}
-          isSelected={
-            selectedConversation?.agentType === conv.agent_type &&
-            selectedConversation?.id === conv.id
-          }
-          isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
-          timeLabel={formatRelative(
-            getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
-            now
-          )}
-          onSelect={handleSelect}
-          onDoubleClick={handleDoubleClick}
-          onRename={handleRename}
-          onDelete={handleDelete}
-          onStatusChange={handleStatusChange}
-          onNewConversation={handleNewConversationForFolder}
-          onTogglePin={handleTogglePin}
-          depth={row.depth}
-          hasChildren={conv.child_count > 0}
-          expanded={conversationExpanded.has(conv.id)}
-          onToggleExpand={toggleConversation}
-        />
-      </div>
+      <SidebarConversationCard
+        conversation={conv}
+        isSelected={
+          selectedConversation?.agentType === conv.agent_type &&
+          selectedConversation?.id === conv.id
+        }
+        isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
+        timeLabel={formatRelative(
+          getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
+          now
+        )}
+        onSelect={handleSelect}
+        onDoubleClick={handleDoubleClick}
+        onRename={handleRename}
+        onDelete={handleDelete}
+        onStatusChange={handleStatusChange}
+        onNewConversation={handleNewConversationForFolder}
+        onTogglePin={handleTogglePin}
+        depth={row.depth}
+        hasChildren={conv.child_count > 0}
+        expanded={conversationExpanded.has(conv.id)}
+        onToggleExpand={toggleConversation}
+      />
     )
   }
 
@@ -2084,9 +2104,31 @@ export function SidebarConversationList({
                     bufferSize={400}
                     onScroll={handleVirtuaScroll}
                   >
-                    {(row: SidebarRow) => (
-                      <div key={sidebarRowKey(row)}>{renderRow(row)}</div>
-                    )}
+                    {(row: SidebarRow) => {
+                      // Metadata and keys live ONLY on this stable inner child.
+                      // Never style/pass ownership attrs to virtua's outer item
+                      // (no custom item/shift/transform/transition props).
+                      const ownedRow =
+                        row.kind === "conversation" ||
+                        row.kind === "subsession-loading"
+                          ? row
+                          : null
+                      return (
+                        <div
+                          key={sidebarRowKey(row)}
+                          data-sidebar-row-key={sidebarRowKey(row)}
+                          data-sidebar-root-id={ownedRow?.rootId}
+                          data-sidebar-bucket-key={ownedRow?.bucketKey}
+                          data-conversation-id={
+                            row.kind === "conversation"
+                              ? row.conversation.id
+                              : undefined
+                          }
+                        >
+                          {renderRow(row)}
+                        </div>
+                      )
+                    }}
                   </Virtualizer>
                 ) : (
                   <div className="flex flex-col gap-1.5 pt-1">

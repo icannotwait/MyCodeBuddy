@@ -4,9 +4,10 @@ import {
   type Ref,
   useEffect,
   useImperativeHandle,
+  useRef,
   useState,
 } from "react"
-import { act, fireEvent, render } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -75,6 +76,27 @@ const stableTask = vi.hoisted(() => ({
 }))
 const stableTerminal = vi.hoisted(() => ({
   createTerminalInDirectory: () => {},
+}))
+
+// Task 8: capture the animation-hook wiring without running WAAPI. The spy is
+// the contract the Virtua onScroll path must call before sticky coalescing.
+const reorderAnimationCtl = vi.hoisted(() => ({
+  handleUserScroll: vi.fn(),
+  lastOptions: null as null | {
+    rows: unknown
+    activitySequence: number
+    activityConversationId: number | null
+    viewportEl: HTMLElement | null
+    dragging: boolean
+  },
+}))
+
+// Hangable children fetch so an expanded root can keep its loading placeholder
+// long enough for ownership metadata assertions.
+const apiMocks = vi.hoisted(() => ({
+  listChildConversations: vi.fn(
+    async (): Promise<DbConversationSummary[]> => []
+  ),
 }))
 
 vi.mock("@/components/agent-icon", () => ({
@@ -153,7 +175,8 @@ vi.mock("lucide-react", async (importOriginal) => {
 })
 
 // The list mounts the Virtualizer only once OverlayScrollbars surfaces its
-// viewport; the mock fires that bridge synchronously after mount.
+// viewport; the mock forwards a real mounted element (not a detached node) so
+// the animation hook receives a queryable container for [data-sidebar-row-key].
 vi.mock("@/components/ui/scroll-area", () => ({
   ScrollArea: ({
     children,
@@ -162,12 +185,41 @@ vi.mock("@/components/ui/scroll-area", () => ({
     children?: ReactNode
     onViewportRef?: (el: HTMLElement | null) => void
   }) => {
+    const viewportLocalRef = useRef<HTMLDivElement | null>(null)
     useEffect(() => {
-      onViewportRef?.(document.createElement("div"))
+      onViewportRef?.(viewportLocalRef.current)
+      return () => onViewportRef?.(null)
     }, [onViewportRef])
-    return <>{children}</>
+    return (
+      <div ref={viewportLocalRef} data-testid="sidebar-scroll-viewport">
+        {children}
+      </div>
+    )
   },
 }))
+
+vi.mock("./use-sidebar-reorder-animation", () => ({
+  useSidebarReorderAnimation: (options: {
+    rows: unknown
+    activitySequence: number
+    activityConversationId: number | null
+    viewportEl: HTMLElement | null
+    dragging: boolean
+  }) => {
+    reorderAnimationCtl.lastOptions = options
+    return { handleUserScroll: reorderAnimationCtl.handleUserScroll }
+  },
+}))
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    listChildConversations: (
+      ...args: Parameters<typeof actual.listChildConversations>
+    ) => apiMocks.listChildConversations(...args),
+  }
+})
 
 vi.mock("next-themes", () => ({
   useTheme: () => ({ resolvedTheme: "light" }),
@@ -323,6 +375,10 @@ beforeEach(() => {
   virtuaCtl.scrollOffset = 0
   virtuaCtl.onScroll = null
   virtuaCtl.scrollToIndex.mockClear()
+  reorderAnimationCtl.handleUserScroll.mockClear()
+  reorderAnimationCtl.lastOptions = null
+  apiMocks.listChildConversations.mockReset()
+  apiMocks.listChildConversations.mockResolvedValue([])
 })
 
 describe("SidebarConversationList — single status event re-render scope", () => {
@@ -869,5 +925,132 @@ describe("SidebarConversationList — activity order and optimistic labels", () 
     expect(after.indexOf("conv-12")).toBeLessThan(after.indexOf("conv-11"))
     const row = document.querySelector('[data-conversation-id="12"]')
     expect(row?.textContent).toContain("now")
+  })
+})
+
+describe("SidebarConversationList — Virtua animation integration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+    probes.card = 0
+    probes.folder = 0
+    const folders = [folder(1, "Folder 1")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [conv(11, 1), conv(12, 1)],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it("passes a real mounted OverlayScrollbars viewport into the animation hook", () => {
+    render(tree())
+
+    const viewport = screen.getByTestId("sidebar-scroll-viewport")
+    expect(viewport).toBeInstanceOf(HTMLElement)
+    // Rows must live under the mounted viewport (not a detached createElement).
+    expect(
+      viewport.querySelector('[data-sidebar-row-key="conv-claude_code-11"]')
+    ).not.toBeNull()
+    expect(reorderAnimationCtl.lastOptions?.viewportEl).toBe(viewport)
+    expect(reorderAnimationCtl.lastOptions?.dragging).toBe(false)
+  })
+
+  it("puts stable ownership metadata on conversation Virtua child wrappers", () => {
+    render(tree())
+
+    expect(
+      document.querySelector('[data-sidebar-row-key="conv-claude_code-11"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "11",
+        sidebarBucketKey: "folder:1",
+        conversationId: "11",
+      }),
+    })
+    expect(
+      document.querySelector('[data-sidebar-row-key="conv-claude_code-12"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "12",
+        sidebarBucketKey: "folder:1",
+        conversationId: "12",
+      }),
+    })
+  })
+
+  it("marks subsession loading placeholders with the owning root metadata", async () => {
+    // Never resolves → loading placeholder stays mounted under the expanded root.
+    apiMocks.listChildConversations.mockImplementation(
+      () => new Promise(() => {})
+    )
+    useAppWorkspaceStore.setState({
+      conversations: [conv(11, 1, { child_count: 1 })],
+    })
+
+    render(tree())
+
+    const expand = screen.getByRole("button", {
+      name: "Expand sub-conversations",
+    })
+    await act(async () => {
+      fireEvent.click(expand)
+    })
+
+    expect(
+      document.querySelector('[data-sidebar-row-key="subloading-11"]')
+    ).toMatchObject({
+      dataset: expect.objectContaining({
+        sidebarRootId: "11",
+        sidebarBucketKey: "folder:1",
+      }),
+    })
+  })
+
+  it("calls handleUserScroll at the start of Virtua onScroll before sticky rAF", () => {
+    const order: string[] = []
+    reorderAnimationCtl.handleUserScroll.mockImplementation(() => {
+      order.push("handleUserScroll")
+    })
+    vi.stubGlobal("requestAnimationFrame", (() => {
+      order.push("stickyRaf")
+      return 1
+    }) as typeof requestAnimationFrame)
+
+    render(tree())
+    expect(virtuaCtl.onScroll).toEqual(expect.any(Function))
+
+    order.length = 0
+    act(() => {
+      virtuaCtl.onScroll?.(40)
+    })
+
+    expect(order[0]).toBe("handleUserScroll")
+    expect(order).toContain("stickyRaf")
+    expect(reorderAnimationCtl.handleUserScroll).toHaveBeenCalledTimes(1)
+  })
+
+  it("forwards activity sequence/id and live rows into the animation hook", () => {
+    render(tree())
+
+    act(() => {
+      useAppWorkspaceStore.getState().beginConversationActivity(12)
+    })
+    act(() => harness.rerender())
+
+    const state = useAppWorkspaceStore.getState()
+    expect(reorderAnimationCtl.lastOptions?.activitySequence).toBe(
+      state.conversationActivitySequence
+    )
+    expect(reorderAnimationCtl.lastOptions?.activityConversationId).toBe(12)
+    expect(Array.isArray(reorderAnimationCtl.lastOptions?.rows)).toBe(true)
+    expect(
+      (reorderAnimationCtl.lastOptions?.rows as unknown[]).length
+    ).toBeGreaterThan(0)
   })
 })
