@@ -90,6 +90,14 @@ pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-ag
 /// `coordination_v1` is off (also strips `return_when` from the schema).
 pub const LEGACY_STATUS_DESCRIPTION: &str = "Get status or results for one or more task_ids from delegate_to_agent. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.";
 
+/// Pre-coordination `wait_ms` parameter description restored when
+/// `coordination_v1` is off so legacy tools/list does not advertise rejection.
+pub const LEGACY_WAIT_MS_DESCRIPTION: &str = "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout.";
+
+pub const COORDINATION_POSITIVE_WAIT_ERROR: &str =
+    "positive wait_ms is unavailable with coordination_v1; retry with \
+     return_when=\"all_terminal_or_attention\" and wait_ms=0";
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -425,6 +433,18 @@ pub async fn dispatch_line(
                                             .and_then(Value::as_object_mut)
                                         {
                                             props.remove("return_when");
+                                            if let Some(wait_ms) = props
+                                                .get_mut("wait_ms")
+                                                .and_then(Value::as_object_mut)
+                                            {
+                                                wait_ms.remove("maximum");
+                                                wait_ms.insert(
+                                                    "description".into(),
+                                                    Value::String(
+                                                        LEGACY_WAIT_MS_DESCRIPTION.into(),
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -519,11 +539,11 @@ async fn build_tools_call_spawn(
                 }
                 Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
             };
-            let wait_ms = arguments.get("wait_ms").and_then(|v| v.as_u64());
-            let return_when = match parse_return_when(&arguments, ctx.features.coordination_v1) {
-                Ok(v) => v,
-                Err(msg) => return LineAction::Respond(err(id, -32602, msg)),
-            };
+            let (wait_ms, return_when) =
+                match parse_status_wait_arguments(&arguments, ctx.features.coordination_v1) {
+                    Ok(values) => values,
+                    Err(message) => return LineAction::Respond(err(id, -32602, message)),
+                };
             let req = BrokerStatusRequest {
                 token: ctx.token.clone(),
                 task_ids,
@@ -1053,6 +1073,18 @@ pub fn parse_return_when(
         return Err("return_when=all_terminal_or_attention requires explicit wait_ms=0".into());
     }
     Ok(Some(DelegationReturnWhen::AllTerminalOrAttention))
+}
+
+fn parse_status_wait_arguments(
+    arguments: &Value,
+    coordination_v1: bool,
+) -> Result<(Option<u64>, Option<DelegationReturnWhen>), String> {
+    let wait_ms = arguments.get("wait_ms").and_then(Value::as_u64);
+    let return_when = parse_return_when(arguments, coordination_v1)?;
+    if coordination_v1 && return_when.is_none() && wait_ms.is_some_and(|ms| ms > 0) {
+        return Err(COORDINATION_POSITIVE_WAIT_ERROR.into());
+    }
+    Ok((wait_ms, return_when))
 }
 
 struct ParentDecisionArgs {
@@ -1910,6 +1942,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn coordination_rejects_positive_legacy_status_wait_without_spawning() {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_status",
+                "arguments": { "task_ids": ["task-a"], "wait_ms": 60_000 }
+            }
+        })
+        .to_string();
+
+        let response = unwrap_respond(dispatch_with_features(COORDINATION, &line).await);
+        let error = response.error.expect("positive coordination wait must fail");
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.message,
+            "positive wait_ms is unavailable with coordination_v1; retry with \
+             return_when=\"all_terminal_or_attention\" and wait_ms=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_keeps_supported_status_wait_forms() {
+        for arguments in [
+            json!({ "task_ids": ["task-a"] }),
+            json!({ "task_ids": ["task-a"], "wait_ms": 0 }),
+            json!({
+                "task_ids": ["task-a"],
+                "wait_ms": 0,
+                "return_when": "all_terminal_or_attention"
+            }),
+        ] {
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "tools/call",
+                "params": { "name": "get_delegation_status", "arguments": arguments }
+            })
+            .to_string();
+            assert!(matches!(
+                dispatch_with_features(COORDINATION, &line).await,
+                LineAction::Spawn(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_connection_keeps_positive_status_wait() {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 26,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_status",
+                "arguments": { "task_ids": ["task-a"], "wait_ms": 60_000 }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_for_test(&line).await,
+            LineAction::Spawn(_)
+        ));
+    }
+
     #[test]
     fn normalize_status_task_ids_dedups_preserves_order() {
         // Trim each entry, drop "", collapse the duplicate "a", keep first-seen
@@ -2098,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_tools_list_hides_return_when_without_coordination() {
+    async fn coordination_and_legacy_tools_list_project_wait_contract() {
         let legacy = unwrap_respond(
             dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
@@ -2111,6 +2209,12 @@ mod tests {
             .get("return_when")
             .is_none());
         assert!(!tool_guidance(status).contains("all_terminal_or_attention"));
+        let legacy_wait = &status["inputSchema"]["properties"]["wait_ms"];
+        assert_eq!(legacy_wait["minimum"], 0);
+        assert!(legacy_wait.get("maximum").is_none());
+        let legacy_guidance = tool_guidance(status);
+        assert!(legacy_guidance.contains("positive wait (max 60000 ms)"));
+        assert!(!legacy_guidance.contains("positive wait_ms is rejected"));
         let delegate = tools
             .iter()
             .find(|t| t["name"] == "delegate_to_agent")
@@ -2133,6 +2237,22 @@ mod tests {
             .get("return_when")
             .is_some());
         assert!(tool_guidance(status).contains("all_terminal_or_attention"));
+        let coordination_wait = &status["inputSchema"]["properties"]["wait_ms"];
+        assert_eq!(coordination_wait["minimum"], 0);
+        assert_eq!(coordination_wait["maximum"], 0);
+        let coordination_guidance = tool_guidance(status);
+        for required in [
+            "omit wait_ms for an immediate snapshot",
+            "return_when=all_terminal_or_attention",
+            "positive wait_ms is rejected",
+            "re-join only still-running required",
+        ] {
+            assert!(
+                coordination_guidance.contains(required),
+                "coordination guidance missing {required:?}"
+            );
+        }
+        assert!(!coordination_guidance.contains("positive wait (max 60000 ms)"));
         let delegate = tools
             .iter()
             .find(|t| t["name"] == "delegate_to_agent")
@@ -2324,18 +2444,16 @@ mod tests {
                     "wait_ms",
                     "return_when",
                     "all_terminal_or_attention",
-                    "immediate snapshot",
-                    "positive wait (max 60000 ms)",
-                    "terminal, stalled, waiting_input, or its deadline",
-                    "wait_ms=0 waits only for a terminal result without a timeout",
-                    "running result at a bounded deadline is not a failure",
-                    "after stalled/waiting_input",
-                    "call again for unfinished tasks",
-                    "input order with each task_id",
-                    "running, completed, failed, canceled, or unknown",
-                    "final text when available",
-                    "blocking waits",
-                    "call again silently",
+                    "omit wait_ms for an immediate snapshot",
+                    "return_when=all_terminal_or_attention",
+                    "positive wait_ms is rejected",
+                    "re-join only still-running required",
+                    "all requested tasks are terminal",
+                    "attention",
+                    "unavailable",
+                    "input order",
+                    "wake_reason",
+                    "attention_requests",
                 ],
             ),
             (
