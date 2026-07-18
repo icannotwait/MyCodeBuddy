@@ -101,18 +101,27 @@ mod tests {
         ] {
             assert_eq!(value.as_str(), expected);
             assert_eq!(ContinuationState::from_str(expected), Ok(value));
-            assert_eq!(serde_json::to_string(&value).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{expected}\"")
+            );
         }
 
         for (value, expected) in [
             (ContinuationWakeReason::AllTerminal, "all_terminal"),
-            (ContinuationWakeReason::AttentionRequired, "attention_required"),
+            (
+                ContinuationWakeReason::AttentionRequired,
+                "attention_required",
+            ),
             (ContinuationWakeReason::Unavailable, "unavailable"),
             (ContinuationWakeReason::Checkpoint, "checkpoint"),
         ] {
             assert_eq!(value.as_str(), expected);
             assert_eq!(ContinuationWakeReason::from_str(expected), Ok(value));
-            assert_eq!(serde_json::to_string(&value).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{expected}\"")
+            );
         }
 
         for (value, expected) in [
@@ -137,7 +146,10 @@ mod tests {
         ] {
             assert_eq!(value.as_str(), expected);
             assert_eq!(ContinuationFailureCode::from_str(expected), Ok(value));
-            assert_eq!(serde_json::to_string(&value).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{expected}\"")
+            );
         }
 
         assert!(ContinuationState::from_str("unknown").is_err());
