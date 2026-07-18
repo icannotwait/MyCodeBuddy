@@ -1,4 +1,5 @@
 import { fireEvent, render } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -121,5 +122,17 @@ describe("Sidebar — fixed New chat / Search region", () => {
     fireEvent.click(btn)
     expect(spies.openChatModeTab).toHaveBeenCalled()
     expect(spies.openNewConversationTab).not.toHaveBeenCalled()
+  })
+
+  it("does not expose a created-time sort mode", async () => {
+    const user = userEvent.setup()
+    const { getByLabelText, queryByText, getByText, findByText } =
+      renderSidebar()
+    await user.click(getByLabelText("View options"))
+    // Other view controls remain once the funnel menu is open.
+    expect(await findByText("Show completed conversations")).toBeTruthy()
+    expect(getByText("Section order")).toBeTruthy()
+    expect(queryByText("Sort by")).toBeNull()
+    expect(queryByText("Created time")).toBeNull()
   })
 })

@@ -12,6 +12,13 @@ import {
   reorderFolders as apiReorderFolders,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
+import {
+  EMPTY_OPTIMISTIC_ACTIVITY_BY_ID,
+  nextOptimisticActivityTimestamp,
+  parseActivityTimestamp,
+  type OptimisticActivityById,
+  type OptimisticConversationActivity,
+} from "@/lib/conversation-activity"
 import type {
   AgentStats,
   AgentType,
@@ -20,6 +27,7 @@ import type {
   FolderDetail,
   GitHeadInfo,
 } from "@/lib/types"
+import { randomUUID } from "@/lib/utils"
 
 /**
  * Workspace-level shared state (folders, conversations, branches) as a Zustand
@@ -60,6 +68,24 @@ export interface AppWorkspaceStoreState {
   stats: AgentStats | null
 
   /**
+   * Optimistic presentation overlay for sidebar time-sort. Does not mutate
+   * authoritative `DbConversationSummary.updated_at` rows.
+   */
+  optimisticActivityById: OptimisticActivityById
+
+  /**
+   * Monotonic counter bumped when optimistic activity starts or when an
+   * authoritative backend `updated_at` advances. Sidebar sort consumers use
+   * this (with `lastConversationActivityId`) as a cheap invalidation signal.
+   */
+  conversationActivitySequence: number
+
+  /**
+   * Conversation id that last advanced activity (optimistic or authoritative).
+   */
+  lastConversationActivityId: number | null
+
+  /**
    * Currently-active folder id as driven by the active tab.
    * TabProvider sets this; `useActiveFolder` / other consumers read it.
    */
@@ -83,8 +109,20 @@ export interface AppWorkspaceStoreState {
    * Apply an authoritative backend state patch (`status`, `awaiting_reply_token`,
    * `updated_at`). Does NOT invent client `updated_at` — use this for
    * `conversation://changed` kind `"state"`, never `updateConversationLocal`.
+   * Ignores strictly older `updated_at` and clears optimistic overlay only once
+   * the backend advances past the optimistic baseline.
    */
   applyConversationStatePatch: (patch: ConversationStatePatch) => void
+  /**
+   * Start an optimistic activity bump for a known root conversation. Returns
+   * a rollback token, or null when the id is unknown / not a root.
+   */
+  beginConversationActivity: (id: number) => string | null
+  /**
+   * Clear optimistic activity only when `token` matches the current overlay
+   * entry. Does not advance the activity sequence.
+   */
+  rollbackConversationActivity: (id: number, token: string) => void
   applyConversationUpsert: (summary: DbConversationSummary) => void
   applyConversationRemove: (id: number) => void
   getBranch: (folderId: number) => string | null | undefined
@@ -149,6 +187,72 @@ const DELETED_TOMBSTONE_CAP = 512
 // reused, so the tombstone is permanent; the set is FIFO-bounded.
 const deletedIds = new Set<number>()
 
+// Module-local clock for strictly monotonic optimistic effective timestamps
+// across same-millisecond dispatches. Reset with the store so tests/backend
+// switches never inherit a prior session clock.
+let lastOptimisticActivityMs = 0
+
+// Monotonic conversation-array revision: advanced whenever an event or local
+// patch mutates `conversations`. In-flight refreshes compare this against the
+// revision captured at request start to decide snapshot-replace vs merge.
+let conversationRevision = 0
+// Only the latest refresh request may commit conversations, errors, or
+// `conversationsLoading=false`. Earlier responses that resolve late are ignored.
+let latestConversationRefreshRequest = 0
+
+function advanceConversationRevision() {
+  conversationRevision += 1
+}
+
+/**
+ * Merge an incoming summary into the current row. Newer/equal activity
+ * timestamps take the full incoming row; older timestamps still apply
+ * metadata but preserve the newer state tuple (`status`,
+ * `awaiting_reply_token`, `updated_at`).
+ */
+function mergeConversationSummary(
+  current: DbConversationSummary,
+  incoming: DbConversationSummary
+): DbConversationSummary {
+  if (
+    parseActivityTimestamp(incoming.updated_at) >=
+    parseActivityTimestamp(current.updated_at)
+  ) {
+    return incoming
+  }
+  return {
+    ...incoming,
+    status: current.status,
+    awaiting_reply_token: current.awaiting_reply_token,
+    updated_at: current.updated_at,
+  }
+}
+
+/**
+ * Drop optimistic overlays whose conversation is gone, tombstoned, or whose
+ * authoritative `updated_at` has advanced past the optimistic baseline.
+ * Returns the existing map reference when nothing changes.
+ */
+function reconcileOptimisticActivity(
+  rows: readonly DbConversationSummary[],
+  current: OptimisticActivityById
+): OptimisticActivityById {
+  const rowsById = new Map(rows.map((row) => [row.id, row]))
+  let next: Map<number, OptimisticConversationActivity> | null = null
+  for (const [id, activity] of current) {
+    const row = rowsById.get(id)
+    const acknowledged =
+      row !== undefined &&
+      parseActivityTimestamp(row.updated_at) >
+        parseActivityTimestamp(activity.baselineUpdatedAt)
+    if (!row || acknowledged || deletedIds.has(id)) {
+      next ??= new Map(current)
+      next.delete(id)
+    }
+  }
+  return next ?? current
+}
+
 export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
   (set, get) => ({
     folders: [],
@@ -163,6 +267,9 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     branches: new Map(),
     gitHeads: new Map(),
     stats: null,
+    optimisticActivityById: EMPTY_OPTIMISTIC_ACTIVITY_BY_ID,
+    conversationActivitySequence: 0,
+    lastConversationActivityId: null,
     activeFolderId: null,
 
     fetchFolders: async () => {
@@ -187,14 +294,59 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     },
 
     refreshConversations: async () => {
+      const requestId = ++latestConversationRefreshRequest
+      const revisionAtStart = conversationRevision
       set({ conversationsLoading: true })
       try {
         const list = await listAllConversations()
-        set({ ...withConversations(list), conversationsError: null })
+        // Only the latest request may commit. Late responses from superseded
+        // refreshes must not clobber newer state or flip loading off early.
+        if (requestId !== latestConversationRefreshRequest) return
+
+        const snapshot = list.filter((row) => !deletedIds.has(row.id))
+        let nextRows: DbConversationSummary[]
+        if (revisionAtStart === conversationRevision) {
+          // No concurrent mutations while the fetch was in flight: replace
+          // with the non-tombstoned snapshot (rows omitted by the server go away).
+          nextRows = snapshot
+        } else {
+          // Concurrent state/upsert/remove/local patches advanced the revision:
+          // merge snapshot rows against current authority and keep current-only
+          // non-tombstoned rows that the snapshot has not yet observed.
+          const current = get().conversations
+          const currentById = new Map(current.map((row) => [row.id, row]))
+          const snapshotIds = new Set<number>()
+          nextRows = []
+          for (const incoming of snapshot) {
+            snapshotIds.add(incoming.id)
+            const existing = currentById.get(incoming.id)
+            nextRows.push(
+              existing ? mergeConversationSummary(existing, incoming) : incoming
+            )
+          }
+          for (const row of current) {
+            if (!snapshotIds.has(row.id) && !deletedIds.has(row.id)) {
+              nextRows.push(row)
+            }
+          }
+        }
+
+        const nextOptimistic = reconcileOptimisticActivity(
+          nextRows,
+          get().optimisticActivityById
+        )
+        set({
+          ...withConversations(nextRows),
+          conversationsError: null,
+          optimisticActivityById: nextOptimistic,
+          conversationsLoading: false,
+        })
       } catch (err) {
-        set({ conversationsError: toErrorMessage(err) })
-      } finally {
-        set({ conversationsLoading: false })
+        if (requestId !== latestConversationRefreshRequest) return
+        set({
+          conversationsError: toErrorMessage(err),
+          conversationsLoading: false,
+        })
       }
     },
 
@@ -208,14 +360,12 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       // don't re-render on a logical no-op.
       if (idx < 0) return
       const next = prev.slice()
-      // A pin toggle is a view preference, not activity — mirror the backend
-      // (`update_pin`) and leave `updated_at` untouched so an updated-sorted
-      // folder doesn't briefly float the row. Status/title patches still bump.
-      const bumpUpdatedAt = !("pinned_at" in patch)
+      // Local title/status/pin patches never invent `updated_at`. Authoritative
+      // activity time stays on the backend; presentation bumps use the
+      // optimistic overlay (`beginConversationActivity`) instead.
       next[idx] = {
         ...next[idx],
         ...patch,
-        ...(bumpUpdatedAt ? { updated_at: new Date().toISOString() } : {}),
       }
       // `stats` (computeStats) depends ONLY on the conversation count and each
       // row's agent_type/message_count. This path replaces a row IN PLACE (count
@@ -229,6 +379,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       // ever widened to include a stat input (it recomputes then); today it is
       // always false, i.e. always reuse.
       const statsAffecting = "message_count" in patch || "agent_type" in patch
+      advanceConversationRevision()
       set(
         statsAffecting
           ? withConversations(next)
@@ -239,42 +390,124 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     // Authoritative backend state for status / awaiting_reply_token / updated_at.
     // Never invents client timestamps — those would race the backend clock and
     // break relative-time display. Stats are identity-stable: state patches
-    // cannot change count, agent type, or message count.
+    // cannot change count, agent type, or message count. Strictly older patches
+    // are ignored; optimistic overlay clears only past its baseline.
     applyConversationStatePatch: (patch) => {
       const prev = get().conversations
       const index = prev.findIndex(
         (conversation) => conversation.id === patch.id
       )
       if (index < 0) return
+      const current = prev[index]
+      const currentMs = parseActivityTimestamp(current.updated_at)
+      const patchMs = parseActivityTimestamp(patch.updated_at)
+      if (patchMs < currentMs) return
+
+      const optimistic = get().optimisticActivityById.get(patch.id)
+      const clearsOptimistic =
+        optimistic !== undefined &&
+        patchMs > parseActivityTimestamp(optimistic.baselineUpdatedAt)
+      const currentOptimistic = get().optimisticActivityById
+      let nextOptimistic = currentOptimistic
+      if (clearsOptimistic) {
+        const mutable = new Map(currentOptimistic)
+        mutable.delete(patch.id)
+        nextOptimistic = mutable
+      }
+
+      const authoritativeAdvanced = patchMs > currentMs
       const next = prev.slice()
       next[index] = {
-        ...next[index],
+        ...current,
         status: patch.status,
         awaiting_reply_token: patch.awaiting_reply_token,
         updated_at: patch.updated_at,
       }
-      set({ conversations: next, stats: get().stats })
+
+      advanceConversationRevision()
+      set({
+        conversations: next,
+        stats: get().stats,
+        optimisticActivityById: nextOptimistic,
+        ...(authoritativeAdvanced
+          ? {
+              conversationActivitySequence:
+                get().conversationActivitySequence + 1,
+              lastConversationActivityId: patch.id,
+            }
+          : {}),
+      })
+    },
+
+    beginConversationActivity: (id) => {
+      const conversation = get().conversations.find((c) => c.id === id)
+      // Only known root conversations participate in sidebar activity sort.
+      if (!conversation || conversation.parent_id != null) return null
+
+      const token = randomUUID()
+      const baselineUpdatedAt = conversation.updated_at
+      const { effectiveAt, effectiveMs } = nextOptimisticActivityTimestamp(
+        baselineUpdatedAt,
+        lastOptimisticActivityMs
+      )
+      lastOptimisticActivityMs = effectiveMs
+
+      const nextOptimistic = new Map(get().optimisticActivityById)
+      nextOptimistic.set(id, {
+        token,
+        baselineUpdatedAt,
+        effectiveAt,
+      })
+
+      set({
+        optimisticActivityById: nextOptimistic,
+        conversationActivitySequence: get().conversationActivitySequence + 1,
+        lastConversationActivityId: id,
+      })
+      return token
+    },
+
+    rollbackConversationActivity: (id, token) => {
+      const current = get().optimisticActivityById.get(id)
+      if (!current || current.token !== token) return
+      const nextOptimistic = new Map(get().optimisticActivityById)
+      nextOptimistic.delete(id)
+      set({ optimisticActivityById: nextOptimistic })
     },
 
     // Insert-or-replace a conversation by id (create + field updates). Root-only:
     // delegation children (parent_id set) are not sidebar rows. New rows prepend
-    // (most-recent-first); existing rows replace in place to keep their position.
+    // (most-recent-first); existing rows merge in place to keep their position
+    // and preserve a newer state tuple against stale metadata upserts.
     applyConversationUpsert: (summary) => {
       if (summary.parent_id != null) return
       if (deletedIds.has(summary.id)) return
       const prev = get().conversations
       const idx = prev.findIndex((c) => c.id === summary.id)
+      let next: DbConversationSummary[]
       if (idx < 0) {
-        set(withConversations([summary, ...prev]))
-        return
+        next = [summary, ...prev]
+      } else {
+        next = prev.slice()
+        next[idx] = mergeConversationSummary(prev[idx], summary)
       }
-      const next = prev.slice()
-      next[idx] = summary
-      set(withConversations(next))
+      advanceConversationRevision()
+      // Merge first so a stale-timestamp upsert cannot falsely acknowledge the
+      // optimistic overlay with an older authoritative `updated_at`.
+      const nextOptimistic = reconcileOptimisticActivity(
+        next,
+        get().optimisticActivityById
+      )
+      set({
+        ...withConversations(next),
+        optimisticActivityById: nextOptimistic,
+      })
     },
 
-    // Remove a conversation by id. Idempotent: an unknown id leaves state
-    // untouched (no re-render; keeps `stats` stable).
+    // Remove a conversation by id. Idempotent for the conversation array: an
+    // unknown id leaves `conversations`/`stats` untouched. Always tombstones
+    // the id and reconciles optimistic overlay (cleanup only — never advances
+    // `conversationActivitySequence`).
     applyConversationRemove: (id) => {
       deletedIds.add(id)
       if (deletedIds.size > DELETED_TOMBSTONE_CAP) {
@@ -284,10 +517,27 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
       }
       const prev = get().conversations
       const idx = prev.findIndex((c) => c.id === id)
-      if (idx < 0) return
+      if (idx < 0) {
+        const nextOptimistic = reconcileOptimisticActivity(
+          prev,
+          get().optimisticActivityById
+        )
+        if (nextOptimistic !== get().optimisticActivityById) {
+          set({ optimisticActivityById: nextOptimistic })
+        }
+        return
+      }
       const next = prev.slice()
       next.splice(idx, 1)
-      set(withConversations(next))
+      advanceConversationRevision()
+      const nextOptimistic = reconcileOptimisticActivity(
+        next,
+        get().optimisticActivityById
+      )
+      set({
+        ...withConversations(next),
+        optimisticActivityById: nextOptimistic,
+      })
     },
 
     getBranch: (folderId) => get().branches.get(folderId),
@@ -466,6 +716,9 @@ export function resetAppWorkspaceStore() {
   // today (the backend-identity guard never fires); a real in-place backend switch
   // would need per-store fetch epochs. See `RemoteConnectionGate`.
   deletedIds.clear()
+  lastOptimisticActivityMs = 0
+  conversationRevision = 0
+  latestConversationRefreshRequest = 0
   useAppWorkspaceStore.setState(useAppWorkspaceStore.getInitialState(), true)
 }
 

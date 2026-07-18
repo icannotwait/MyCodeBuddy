@@ -66,6 +66,7 @@ import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import type {
   AgentType,
   AcpAgentStatus,
@@ -3030,6 +3031,28 @@ const LEGACY_DISABLED_CAPABILITIES: DesktopDeliveryCapabilities = {
 /** sessionStorage key — survives Provider remount / soft WebView reload. */
 const DESKTOP_DELIVERY_FAILED_STORAGE_KEY = "codeg.desktopAcpDeliveryFailed"
 
+/** Begin optimistic root activity for real ACP dispatches (prompt / root
+ *  structured question). Excludes delegation children and unknown ids. */
+function beginRootConversationActivity(
+  connection: ConnectionState,
+  explicitConversationId?: number | null
+): { id: number; token: string } | null {
+  if (connection.isDelegationChild) return null
+  const id = explicitConversationId ?? connection.conversationId ?? null
+  if (id == null) return null
+  const token = useAppWorkspaceStore.getState().beginConversationActivity(id)
+  return token ? { id, token } : null
+}
+
+function rollbackRootConversationActivity(
+  activity: { id: number; token: string } | null
+) {
+  if (!activity) return
+  useAppWorkspaceStore
+    .getState()
+    .rollbackConversationActivity(activity.id, activity.token)
+}
+
 function readDesktopDeliveryFailed(): boolean {
   if (typeof sessionStorage === "undefined") return false
   try {
@@ -4552,7 +4575,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       contextKey: string,
       connectionId: string,
       agentType: AgentType,
-      workingDir: string | null
+      workingDir: string | null,
+      conversationId: number | null
     ) => {
       dispatch({
         type: "CONNECTION_CREATED",
@@ -4561,6 +4585,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         agentType,
         workingDir,
         isViewer: true,
+        conversationId,
       })
       lastActivityRef.current.set(contextKey, Date.now())
 
@@ -4825,7 +4850,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               contextKey,
               discovered.connection_id,
               agentType,
-              nextWorkingDir
+              nextWorkingDir,
+              conversationId ?? null
             )
             return
           }
@@ -4875,7 +4901,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               contextKey,
               appErr.detail,
               agentType,
-              nextWorkingDir
+              nextWorkingDir,
+              conversationId ?? null
             )
             return
           }
@@ -5182,14 +5209,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         visibleText: null,
         locale: null,
       }
-      await acpPrompt(
-        conn.connectionId,
-        blocks,
-        opts?.folderId ?? null,
-        opts?.conversationId ?? null,
-        opts?.clientMessageId ?? null,
-        promptContext
-      )
+      // Begin optimistic sidebar activity only once a real connection exists
+      // and immediately before the ACP wire call. Explicit prompt conversationId
+      // wins over the connection-bound id; rollback the exact token on reject.
+      const activity = beginRootConversationActivity(conn, opts?.conversationId)
+      try {
+        await acpPrompt(
+          conn.connectionId,
+          blocks,
+          opts?.folderId ?? null,
+          opts?.conversationId ?? null,
+          opts?.clientMessageId ?? null,
+          promptContext
+        )
+      } catch (e) {
+        rollbackRootConversationActivity(activity)
+        throw e
+      }
     },
     []
   )
@@ -5269,6 +5305,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           `[AcpConnections] answerQuestion: no connection for ${contextKey}`
         )
       }
+      // Root structured answers promote sidebar activity; delegation children
+      // stay excluded (no conversation id / isDelegationChild guard).
+      const activity = beginRootConversationActivity(conn)
       try {
         lastActivityRef.current.set(contextKey, Date.now())
         await acpAnswerQuestion(conn.connectionId, questionId, answer)
@@ -5276,6 +5315,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // (idempotent on the matched id).
         dispatch({ type: "CLEAR_ASK_QUESTION", contextKey, questionId })
       } catch (e) {
+        rollbackRootConversationActivity(activity)
         console.error("[AcpConnections] answerQuestion failed:", e)
         throw e
       }

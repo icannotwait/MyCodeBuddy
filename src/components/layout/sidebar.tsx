@@ -39,12 +39,9 @@ import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { formatShortcutLabel } from "@/lib/keyboard-shortcuts"
 import {
   loadShowCompleted,
-  loadSortMode,
   loadSectionOrder,
   saveShowCompleted,
-  saveSortMode,
   saveSectionOrder,
-  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
 import { cn } from "@/lib/utils"
@@ -119,7 +116,6 @@ export function Sidebar() {
   const listRef = useRef<SidebarConversationListHandle>(null)
 
   const [showCompleted, setShowCompleted] = useState(false)
-  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
   const [allExpanded, setAllExpanded] = useState(true)
@@ -131,9 +127,9 @@ export function Sidebar() {
     shortcuts.new_conversation,
     isMac
   )
-  // General umbrella name for the funnel menu (show-completed + sort + section
-  // order). Kept generic so the accessible name / tooltip stays accurate as the
-  // menu gains options.
+  // General umbrella name for the funnel menu (show-completed + section order).
+  // Kept generic so the accessible name / tooltip stays accurate as the menu
+  // gains options.
   const viewOptionsLabel = t("viewOptions")
   const toggleExpandLabel = allExpanded
     ? t("collapseAllGroups")
@@ -143,19 +139,12 @@ export function Sidebar() {
     // Hydrate from localStorage after mount to keep SSR/CSR markup consistent.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowCompleted(loadShowCompleted())
-    setSortMode(loadSortMode())
     setSectionOrder(loadSectionOrder())
   }, [])
 
   const handleSetShowCompleted = useCallback((value: boolean) => {
     setShowCompleted(value)
     saveShowCompleted(value)
-  }, [])
-
-  const handleSetSortMode = useCallback((value: string) => {
-    const mode: SidebarSortMode = value === "updated" ? "updated" : "created"
-    setSortMode(mode)
-    saveSortMode(mode)
   }, [])
 
   const handleSetSectionOrder = useCallback((value: string) => {
@@ -244,19 +233,6 @@ export function Sidebar() {
                 {t("showCompleted")}
               </DropdownMenuCheckboxItem>
               <DropdownMenuSeparator />
-              <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
-              <DropdownMenuRadioGroup
-                value={sortMode}
-                onValueChange={handleSetSortMode}
-              >
-                <DropdownMenuRadioItem value="created">
-                  {t("sortByCreatedAt")}
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="updated">
-                  {t("sortByUpdatedAt")}
-                </DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-              <DropdownMenuSeparator />
               <DropdownMenuLabel>{t("sectionOrder")}</DropdownMenuLabel>
               <DropdownMenuRadioGroup
                 value={sectionOrder}
@@ -337,7 +313,6 @@ export function Sidebar() {
         <SidebarConversationList
           ref={listRef}
           showCompleted={showCompleted}
-          sortMode={sortMode}
           sectionOrder={sectionOrder}
         />
       </div>
