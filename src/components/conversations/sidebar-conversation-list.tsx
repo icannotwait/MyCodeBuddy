@@ -101,6 +101,7 @@ import {
   reuseSet,
   selectChatConversationsWithReuse,
   selectPinnedWithReuse,
+  sidebarRowKey,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 import { useSubsessionSync } from "@/hooks/use-subsession-sync"
@@ -559,7 +560,8 @@ export interface SidebarConversationListProps {
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
+  // sortMode is kept on the public props type so Task-4-owned parents still
+  // typecheck, but ordering is now activity-only in the grouping selectors.
   sectionOrder = "folders-first",
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>
@@ -898,13 +900,12 @@ export function SidebarConversationList({
   const byFolder = useMemo(() => {
     const grouped = groupByFolderWithReuse(
       folderConversations,
-      sortMode,
       byFolderRef.current,
       childToParent
     )
     byFolderRef.current = grouped
     return grouped
-  }, [folderConversations, sortMode, childToParent])
+  }, [folderConversations, childToParent])
 
   // Counts the unfiltered-but-non-pinned conversations per display group, so the
   // empty-hint renderer distinguishes a truly empty folder from one whose rows
@@ -1978,15 +1979,6 @@ export function SidebarConversationList({
     )
   }
 
-  const rowKey = (row: SidebarRow): string => {
-    if (row.kind === "section") return `section-${row.section}`
-    if (row.kind === "folder") return `folder-${row.folderId}`
-    if (row.kind === "empty") return `empty-${row.folderId}`
-    if (row.kind === "chats-empty") return "chats-empty"
-    if (row.kind === "subsession-loading") return `subloading-${row.parentId}`
-    return `conv-${row.conversation.agent_type}-${row.conversation.id}`
-  }
-
   return (
     <div className="relative flex flex-col flex-1 min-h-0">
       {(loading || refreshing) && (
@@ -2079,7 +2071,7 @@ export function SidebarConversationList({
                     onScroll={handleVirtuaScroll}
                   >
                     {(row: SidebarRow) => (
-                      <div key={rowKey(row)}>{renderRow(row)}</div>
+                      <div key={sidebarRowKey(row)}>{renderRow(row)}</div>
                     )}
                   </Virtualizer>
                 ) : (

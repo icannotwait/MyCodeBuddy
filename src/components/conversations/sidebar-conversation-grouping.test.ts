@@ -103,6 +103,8 @@ describe("formatRelative", () => {
 
 describe("groupByFolderWithReuse", () => {
   it("sorts every folder bucket by effective updated time", () => {
+    // created_at order is opposite of updated_at so a created-first
+    // regression cannot accidentally pass the non-optimistic assertion.
     const createdNewer = conv(2, 10, {
       created_at: "2026-07-18T03:00:00.000Z",
       updated_at: "2026-07-18T01:00:00.000Z",
@@ -111,6 +113,16 @@ describe("groupByFolderWithReuse", () => {
       created_at: "2026-07-18T01:00:00.000Z",
       updated_at: "2026-07-18T02:00:00.000Z",
     })
+
+    // Non-optimistic: updated_at wins → activeNewer first (created order
+    // would put createdNewer first).
+    expect(
+      groupByFolderWithReuse([createdNewer, activeNewer], new Map())
+        .get(10)!
+        .map((row) => row.id)
+    ).toEqual([1, 2])
+
+    // Optimistic overlay then reverses the pair.
     const optimistic = new Map([
       [
         2,
@@ -121,14 +133,16 @@ describe("groupByFolderWithReuse", () => {
         },
       ],
     ])
-
-    const grouped = groupByFolderWithReuse(
-      [createdNewer, activeNewer],
-      new Map(),
-      undefined,
-      optimistic
-    )
-    expect(grouped.get(10)!.map((row) => row.id)).toEqual([2, 1])
+    expect(
+      groupByFolderWithReuse(
+        [createdNewer, activeNewer],
+        new Map(),
+        undefined,
+        optimistic
+      )
+        .get(10)!
+        .map((row) => row.id)
+    ).toEqual([2, 1])
   })
 
   it("tie-breaks equal effective updated time by created_at then id", () => {
@@ -219,13 +233,27 @@ describe("groupByFolderWithReuse", () => {
 
   it("sorts the merged parent+worktree bucket by effective updated time", () => {
     const childToParent = new Map<number, number>([[11, 10]])
-    // Effective timestamps interleaved across root folder and worktree:
-    // id 4 (worktree) most recent, then 3 (root), 2 (worktree), 1 (root).
+    // Effective timestamps interleaved across root folder and worktree.
+    // created_at is deliberately the reverse of updated_at so a created-first
+    // comparator cannot pass: created order would be [1,2,3,4]; updated is
+    // [4,3,2,1] (id 4 worktree newest-updated, then 3 root, 2 worktree, 1 root).
     const list = [
-      conv(1, 10, { updated_at: "2026-07-18T01:00:00.000Z" }),
-      conv(4, 11, { updated_at: "2026-07-18T04:00:00.000Z" }),
-      conv(2, 11, { updated_at: "2026-07-18T02:00:00.000Z" }),
-      conv(3, 10, { updated_at: "2026-07-18T03:00:00.000Z" }),
+      conv(1, 10, {
+        created_at: "2026-07-18T04:00:00.000Z",
+        updated_at: "2026-07-18T01:00:00.000Z",
+      }),
+      conv(4, 11, {
+        created_at: "2026-07-18T01:00:00.000Z",
+        updated_at: "2026-07-18T04:00:00.000Z",
+      }),
+      conv(2, 11, {
+        created_at: "2026-07-18T03:00:00.000Z",
+        updated_at: "2026-07-18T02:00:00.000Z",
+      }),
+      conv(3, 10, {
+        created_at: "2026-07-18T02:00:00.000Z",
+        updated_at: "2026-07-18T03:00:00.000Z",
+      }),
     ]
     const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 2, 1])
@@ -927,6 +955,65 @@ describe("buildRows", () => {
     })
     expect(sidebarRowKey(loading!)).toBe("subloading-1")
   })
+
+  it("assigns the parent display bucketKey to conversations from a raw worktree folder", () => {
+    // Worktree folder 11 merges into parent display bucket 10; the summary
+    // keeps folder_id=11 but the flattened row's bucketKey must be folder:10.
+    const rootConv = conv(1, 10, {
+      created_at: "2026-07-18T02:00:00.000Z",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    const worktreeConv = conv(2, 11, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+    const childToParent = new Map<number, number>([[11, 10]])
+    const byFolder = groupByFolderWithReuse(
+      [rootConv, worktreeConv],
+      new Map(),
+      childToParent
+    )
+    expect(byFolder.get(10)!.map((c) => c.id)).toEqual([2, 1])
+    expect(worktreeConv.folder_id).toBe(11)
+
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder,
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 2]]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+    })
+    expect(
+      rows
+        .filter((row) => row.kind === "conversation")
+        .map((row) => ({
+          id: row.conversation.id,
+          folder_id: row.conversation.folder_id,
+          rootId: row.rootId,
+          bucketKey: row.bucketKey,
+          key: sidebarRowKey(row),
+        }))
+    ).toEqual([
+      {
+        id: 2,
+        folder_id: 11,
+        rootId: 2,
+        bucketKey: "folder:10",
+        key: "conv-claude_code-2",
+      },
+      {
+        id: 1,
+        folder_id: 10,
+        rootId: 1,
+        bucketKey: "folder:10",
+        key: "conv-claude_code-1",
+      },
+    ])
+  })
 })
 
 describe("sidebarRowKey", () => {
@@ -1006,28 +1093,42 @@ describe("selectChatConversationsWithReuse", () => {
     expect(out.map((c) => c.id)).toEqual([2, 1])
   })
 
-  it("orders chat roots by optimistic effective updated time", () => {
-    const olderActive = conv(1, 99, {
+  it("orders chat roots by effective updated time", () => {
+    // created_at opposite of updated_at so a created-first regression fails.
+    const createdNewer = conv(2, 99, {
       kind: "chat",
-      updated_at: "2026-07-18T02:00:00.000Z",
-    })
-    const newerCreated = conv(2, 99, {
-      kind: "chat",
+      created_at: "2026-07-18T03:00:00.000Z",
       updated_at: "2026-07-18T01:00:00.000Z",
     })
+    const activeNewer = conv(1, 99, {
+      kind: "chat",
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+
+    // Non-optimistic: updated_at wins → activeNewer first.
+    expect(
+      selectChatConversationsWithReuse(
+        [createdNewer, activeNewer],
+        true,
+        []
+      ).map((c) => c.id)
+    ).toEqual([1, 2])
+
+    // Optimistic overlay then reverses the pair.
     const optimistic = new Map([
       [
         2,
         {
           token: "t2",
-          baselineUpdatedAt: newerCreated.updated_at,
+          baselineUpdatedAt: createdNewer.updated_at,
           effectiveAt: "2026-07-18T03:00:00.000Z",
         },
       ],
     ])
     expect(
       selectChatConversationsWithReuse(
-        [olderActive, newerCreated],
+        [createdNewer, activeNewer],
         true,
         [],
         optimistic
@@ -1059,6 +1160,31 @@ describe("selectChatConversationsWithReuse", () => {
 })
 
 describe("selectPinnedWithReuse", () => {
+  it("omits unpinned conversations from pinned membership", () => {
+    const pinnedOnly = conv(1, 10, {
+      pinned_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    const unpinned = conv(2, 10, {
+      updated_at: "2026-07-18T05:00:00.000Z",
+    })
+    const pinnedChat = conv(3, 99, {
+      kind: "chat",
+      pinned_at: "2026-07-18T02:00:00.000Z",
+      updated_at: "2026-07-18T02:00:00.000Z",
+    })
+    expect(
+      selectPinnedWithReuse([unpinned, pinnedOnly, pinnedChat], []).map(
+        (row) => row.id
+      )
+    ).toEqual([3, 1])
+    expect(
+      selectPinnedWithReuse([unpinned, pinnedOnly, pinnedChat], []).every(
+        (row) => row.pinned_at != null
+      )
+    ).toBe(true)
+  })
+
   it("sorts pinned roots by activity before pinned_at", () => {
     const olderPinButActive = conv(1, 10, {
       pinned_at: "2026-07-18T01:00:00.000Z",
