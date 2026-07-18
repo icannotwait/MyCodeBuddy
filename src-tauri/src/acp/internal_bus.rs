@@ -160,10 +160,7 @@ impl InternalEventBus {
                     self.metrics
                         .critical_lane_emit_count
                         .fetch_add(1, Ordering::Relaxed);
-                    if matches!(
-                        internal.payload,
-                        AcpEvent::TurnComplete { .. }
-                    ) {
+                    if matches!(internal.payload, AcpEvent::TurnComplete { .. }) {
                         tracing::info!(
                             connection_id = %connection_id,
                             event = %payload_label,
@@ -173,7 +170,10 @@ impl InternalEventBus {
                         );
                     }
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(env)) => {
+                    // Never drop lifecycle-critical envelopes on Full. A
+                    // blocked lifecycle consumer must not lose TurnComplete —
+                    // spawn a deliverer that waits (no timeout) for capacity.
                     self.metrics
                         .critical_lane_full_count
                         .fetch_add(1, Ordering::Relaxed);
@@ -181,9 +181,31 @@ impl InternalEventBus {
                         connection_id = %connection_id,
                         event = %payload_label,
                         "[ACP][bus][ERROR] critical lifecycle lane FULL — \
-                         TurnComplete/SessionStarted may be delayed or lost \
-                         if broadcast also lags"
+                         spawning unbounded overflow deliverer (will not drop \
+                         TurnComplete/SessionStarted)"
                     );
+                    let tx = self.critical_tx.clone();
+                    let conn = connection_id.clone();
+                    let label = payload_label;
+                    tokio::spawn(async move {
+                        match tx.send(env).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    connection_id = %conn,
+                                    event = %label,
+                                    "[ACP][bus] critical lane overflow deliver succeeded"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    connection_id = %conn,
+                                    event = %label,
+                                    "[ACP][bus][ERROR] critical lifecycle lane CLOSED \
+                                     during overflow deliver — status CAS will not run"
+                                );
+                            }
+                        }
+                    });
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     tracing::error!(

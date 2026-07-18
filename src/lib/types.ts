@@ -1563,6 +1563,8 @@ export interface EventBusMetricsSnapshot {
   snapshot_cold_count: number
   forwarder_lagged_count: number
   worker_queue_full_count: number
+  critical_lane_emit_count: number
+  critical_lane_full_count: number
   desktop_raw_envelope_count: number
   desktop_raw_bytes: number
   desktop_emit_attempt_count: number

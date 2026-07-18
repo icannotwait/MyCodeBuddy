@@ -865,6 +865,8 @@ export class StreamingPerfRecorder {
       snapshot_cold_count: 0,
       forwarder_lagged_count: 0,
       worker_queue_full_count: 0,
+      critical_lane_emit_count: 0,
+      critical_lane_full_count: 0,
       desktop_raw_envelope_count: 0,
       desktop_raw_bytes: 0,
       desktop_emit_attempt_count: 0,
