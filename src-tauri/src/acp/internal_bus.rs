@@ -23,18 +23,25 @@
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
-use crate::acp::types::EventEnvelope;
+use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::auto_title::TurnCompletionSnapshot;
 
 /// Capacity of the broadcast channel. Sized to the same headroom as
 /// `WebEventBroadcaster` (4096) — they observe the same emit rate so the
 /// burst tolerance is identical.
 const BUS_CAPACITY: usize = 4096;
+
+/// Dedicated lane for lifecycle-critical events (`TurnComplete`,
+/// `SessionStarted`, …). Bounded but large: these fire a handful of times
+/// per turn, never at ContentDelta rate. When the lifecycle consumer is
+/// briefly busy, the lane absorbs the burst without blocking emitters and
+/// without competing with the broadcast buffer that ContentDelta floods.
+const CRITICAL_LANE_CAPACITY: usize = 1024;
 
 /// Internal-only wrapper around the public event envelope. May carry an
 /// immutable turn-completion sidecar for lifecycle title work. Public
@@ -53,22 +60,53 @@ impl Deref for InternalEventEnvelope {
     }
 }
 
+/// Whether this payload must reach the lifecycle worker for correctness
+/// (status CAS, external_id bind, terminal teardown). Mirrored by
+/// `lifecycle::is_lifecycle_relevant` — keep both in sync.
+pub fn is_lifecycle_critical(payload: &AcpEvent) -> bool {
+    matches!(
+        payload,
+        AcpEvent::SessionStarted { .. }
+            | AcpEvent::TurnComplete { .. }
+            | AcpEvent::ConversationLinked { .. }
+            | AcpEvent::StatusChanged {
+                status: ConnectionStatus::Disconnected
+            }
+            | AcpEvent::Error { terminal: true, .. }
+    )
+}
+
 /// Process-wide bus delivering ACP envelopes to in-process consumers.
 ///
 /// Subscribers (lifecycle / pet / chat-channel) call `subscribe()` once at
 /// startup and hold the receiver for the lifetime of the process.
 /// `emit_with_state` calls `send_with_completion()` after the per-connection
 /// stream so the envelope arrives in lockstep with the WS attach delivery.
+///
+/// Lifecycle-critical events are **also** pushed onto a dedicated mpsc lane
+/// (`take_critical_rx`) so a broadcast `Lagged` (ContentDelta flood while the
+/// dispatcher was briefly busy) cannot silently drop `TurnComplete` and leave
+/// conversation rows stuck at `in_progress`.
 #[derive(Debug)]
 pub struct InternalEventBus {
     sender: broadcast::Sender<Arc<InternalEventEnvelope>>,
+    critical_tx: mpsc::Sender<Arc<InternalEventEnvelope>>,
+    /// Taken once by the lifecycle subscriber. `Mutex` so `new` stays sync
+    /// and only one consumer can own the receiver.
+    critical_rx: Mutex<Option<mpsc::Receiver<Arc<InternalEventEnvelope>>>>,
     metrics: Arc<EventBusMetrics>,
 }
 
 impl InternalEventBus {
     pub fn new(metrics: Arc<EventBusMetrics>) -> Self {
         let (sender, _) = broadcast::channel(BUS_CAPACITY);
-        Self { sender, metrics }
+        let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_LANE_CAPACITY);
+        Self {
+            sender,
+            critical_tx,
+            critical_rx: Mutex::new(Some(critical_rx)),
+            metrics,
+        }
     }
 
     /// Broadcast a sidecar-free internal event. Used by direct producers and
@@ -79,23 +117,84 @@ impl InternalEventBus {
 
     /// Broadcast a public envelope with an optional completion sidecar.
     /// Used only by the shared event-bridge emit core.
+    ///
+    /// Lifecycle-critical payloads are always mirrored onto the critical
+    /// lane (even when there are currently zero broadcast subscribers) so
+    /// status CAS cannot depend solely on the lag-prone broadcast path.
     pub fn send_with_completion(
         &self,
         event: Arc<EventEnvelope>,
         completion: Option<Arc<TurnCompletionSnapshot>>,
     ) {
-        if self.sender.receiver_count() == 0 {
-            return;
+        let critical = is_lifecycle_critical(&event.payload);
+        let connection_id = event.connection_id.clone();
+        let payload_label = if critical {
+            critical_payload_label(&event.payload)
+        } else {
+            ""
+        };
+
+        let internal = Arc::new(InternalEventEnvelope { event, completion });
+
+        let receivers = self.sender.receiver_count();
+        if receivers > 0 {
+            // SendError can only fire when receiver_count() == 0, which we just
+            // checked under the same lock-free atomic. The race window is narrow
+            // (a subscriber dropping between the check and the send) and a
+            // dropped envelope in that exact window is benign — there's no one
+            // to deliver to anyway.
+            let _ = self.sender.send(Arc::clone(&internal));
+            self.metrics.emitted_count.fetch_add(1, Ordering::Relaxed);
+        } else if critical {
+            tracing::warn!(
+                connection_id = %connection_id,
+                event = %payload_label,
+                "[ACP][bus] broadcast has 0 subscribers for critical event; \
+                 relying on critical lifecycle lane only"
+            );
         }
-        // SendError can only fire when receiver_count() == 0, which we just
-        // checked under the same lock-free atomic. The race window is narrow
-        // (a subscriber dropping between the check and the send) and a
-        // dropped envelope in that exact window is benign — there's no one
-        // to deliver to anyway.
-        let _ = self
-            .sender
-            .send(Arc::new(InternalEventEnvelope { event, completion }));
-        self.metrics.emitted_count.fetch_add(1, Ordering::Relaxed);
+
+        if critical {
+            match self.critical_tx.try_send(Arc::clone(&internal)) {
+                Ok(()) => {
+                    self.metrics
+                        .critical_lane_emit_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    if matches!(
+                        internal.payload,
+                        AcpEvent::TurnComplete { .. }
+                    ) {
+                        tracing::info!(
+                            connection_id = %connection_id,
+                            event = %payload_label,
+                            broadcast_receivers = receivers,
+                            has_completion_sidecar = internal.completion.is_some(),
+                            "[ACP][bus] TurnComplete on critical lifecycle lane"
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics
+                        .critical_lane_full_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        event = %payload_label,
+                        "[ACP][bus][ERROR] critical lifecycle lane FULL — \
+                         TurnComplete/SessionStarted may be delayed or lost \
+                         if broadcast also lags"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        event = %payload_label,
+                        "[ACP][bus][ERROR] critical lifecycle lane CLOSED — \
+                         no lifecycle consumer; status CAS will not run"
+                    );
+                }
+            }
+        }
     }
 
     /// Subscribe to the bus. The returned receiver buffers up to
@@ -106,8 +205,30 @@ impl InternalEventBus {
         self.sender.subscribe()
     }
 
+    /// Take the once-only critical-lane receiver. Lifecycle must call this
+    /// at subscriber start; subsequent calls return `None`.
+    pub fn take_critical_rx(&self) -> Option<mpsc::Receiver<Arc<InternalEventEnvelope>>> {
+        self.critical_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     pub fn metrics(&self) -> &Arc<EventBusMetrics> {
         &self.metrics
+    }
+}
+
+fn critical_payload_label(payload: &AcpEvent) -> &'static str {
+    match payload {
+        AcpEvent::TurnComplete { .. } => "TurnComplete",
+        AcpEvent::SessionStarted { .. } => "SessionStarted",
+        AcpEvent::ConversationLinked { .. } => "ConversationLinked",
+        AcpEvent::StatusChanged {
+            status: ConnectionStatus::Disconnected,
+        } => "StatusChanged(Disconnected)",
+        AcpEvent::Error { terminal: true, .. } => "Error(terminal)",
+        _ => "critical",
     }
 }
 
@@ -146,12 +267,14 @@ pub struct EventBusMetrics {
     /// triggers a client re-attach (and therefore a snapshot or replay).
     pub forwarder_lagged_count: AtomicU64,
     /// Lifecycle dispatcher observed a per-connection worker mailbox at
-    /// capacity and had to block on `send().await` to enqueue. **No event
-    /// is dropped** — the dispatcher waits for the worker to drain. Counts
-    /// each occurrence so operators can spot connections that chronically
-    /// stall their worker (typically a SQLite contention pattern). Distinct
-    /// from `lagged_count` (bus-level event loss).
+    /// capacity. The dispatcher no longer blocks — it spawns an overflow
+    /// deliverer — but the counter still marks chronic worker stalls
+    /// (typically SQLite contention). Distinct from `lagged_count`.
     pub worker_queue_full_count: AtomicU64,
+    /// Critical lifecycle-lane emits (`TurnComplete` / `SessionStarted` / …).
+    pub critical_lane_emit_count: AtomicU64,
+    /// Critical lane `try_send` found the buffer full.
+    pub critical_lane_full_count: AtomicU64,
 
     // --- Desktop ACP delivery observability (Tauri webview leg only) ---
     /// Envelopes offered to the desktop delivery path (legacy emit or batcher).
@@ -226,6 +349,8 @@ impl EventBusMetrics {
             snapshot_cold_count: self.snapshot_cold_count.load(Ordering::Relaxed),
             forwarder_lagged_count: self.forwarder_lagged_count.load(Ordering::Relaxed),
             worker_queue_full_count: self.worker_queue_full_count.load(Ordering::Relaxed),
+            critical_lane_emit_count: self.critical_lane_emit_count.load(Ordering::Relaxed),
+            critical_lane_full_count: self.critical_lane_full_count.load(Ordering::Relaxed),
             desktop_raw_envelope_count: self.desktop_raw_envelope_count.load(Ordering::Relaxed),
             desktop_raw_bytes: self.desktop_raw_bytes.load(Ordering::Relaxed),
             desktop_emit_attempt_count: self.desktop_emit_attempt_count.load(Ordering::Relaxed),
@@ -268,6 +393,8 @@ pub struct EventBusMetricsSnapshot {
     pub snapshot_cold_count: u64,
     pub forwarder_lagged_count: u64,
     pub worker_queue_full_count: u64,
+    pub critical_lane_emit_count: u64,
+    pub critical_lane_full_count: u64,
     pub desktop_raw_envelope_count: u64,
     pub desktop_raw_bytes: u64,
     pub desktop_emit_attempt_count: u64,
@@ -325,6 +452,53 @@ mod tests {
         // Same Arc — broadcast clones the handle, not the payload.
         assert!(Arc::ptr_eq(&e1, &e2));
         assert_eq!(metrics.emitted_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn turn_complete_hits_critical_lane_even_without_broadcast_subscribers() {
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = InternalEventBus::new(metrics.clone());
+        let mut critical = bus.take_critical_rx().expect("critical rx");
+        assert!(bus.take_critical_rx().is_none(), "critical rx is once-only");
+
+        let env = Arc::new(EventEnvelope {
+            seq: 9,
+            connection_id: "c-crit".into(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "s".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "codex".into(),
+                mark_awaiting_reply: true,
+            },
+        });
+        // No broadcast subscriber — previous code would no-op entirely.
+        bus.send_with_completion(env, None);
+
+        let got = tokio::time::timeout(Duration::from_secs(1), critical.recv())
+            .await
+            .expect("critical recv timed out")
+            .expect("critical closed");
+        assert_eq!(got.connection_id, "c-crit");
+        assert!(matches!(got.payload, AcpEvent::TurnComplete { .. }));
+        assert_eq!(metrics.critical_lane_emit_count.load(Ordering::Relaxed), 1);
+        // Broadcast had no receivers — emitted_count stays 0.
+        assert_eq!(metrics.emitted_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn content_delta_does_not_use_critical_lane() {
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = InternalEventBus::new(metrics.clone());
+        let mut critical = bus.take_critical_rx().expect("critical rx");
+        let _broadcast = bus.subscribe();
+        bus.send(fake_envelope(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), critical.recv())
+                .await
+                .is_err(),
+            "ContentDelta must not enter the critical lane"
+        );
+        assert_eq!(metrics.critical_lane_emit_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

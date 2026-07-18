@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
-use crate::acp::internal_bus::{InternalEventBus, InternalEventEnvelope};
+use crate::acp::internal_bus::{EventBusMetrics, InternalEventBus, InternalEventEnvelope};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
@@ -60,16 +60,13 @@ const WORKER_QUEUE_CAPACITY: usize = 64;
 /// `register_delegation_tool_call_from_event`, so these high-frequency events
 /// never need to reach a worker.
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
-    matches!(
-        event,
-        AcpEvent::SessionStarted { .. }
-            | AcpEvent::TurnComplete { .. }
-            | AcpEvent::ConversationLinked { .. }
-            | AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected
-            }
-            | AcpEvent::Error { .. }
-    )
+    // Keep in sync with `internal_bus::is_lifecycle_critical` (critical lane).
+    // Non-terminal `Error` is also worker-relevant for logging paths that still
+    // forward it, but the critical lane only carries `terminal: true` Errors
+    // (see `is_lifecycle_critical`). Worker still accepts any Error via the
+    // broader match used historically for terminal-or-not branching.
+    crate::acp::internal_bus::is_lifecycle_critical(event)
+        || matches!(event, AcpEvent::Error { terminal: false, .. })
 }
 
 /// Whether the dispatcher should tear down (drop the sender for) the per-
@@ -1665,31 +1662,249 @@ async fn connection_worker_loop(
                 terminal_dispatched = true;
             }
             _ => {
-                handle_internal_event_with_retry(&db, &manager, internal, broker.as_ref()).await;
+                // Bound worker time so a stuck DB/broker call cannot freeze
+                // the per-connection mailbox forever (which used to back-pressure
+                // the dispatcher into broadcast Lagged and drop later TurnCompletes).
+                const WORKER_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
+                match tokio::time::timeout(
+                    WORKER_HANDLE_TIMEOUT,
+                    handle_internal_event_with_retry(&db, &manager, internal, broker.as_ref()),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        tracing::error!(
+                            connection_id = %connection_id,
+                            event = %lifecycle_payload_kind(&internal.payload),
+                            timeout_secs = 45,
+                            "[lifecycle][ERROR] worker handle_event timed out — \
+                             moving on so later TurnComplete can still CAS \
+                             (row may need reconnect if this was the CAS itself)"
+                        );
+                    }
+                }
             }
         }
     }
 }
 
-/// Subscribe to the in-process bus synchronously and return the dispatcher
-/// loop future. Filters out events the lifecycle worker doesn't care about
+/// Label for logs (stable, short).
+fn lifecycle_payload_kind(payload: &AcpEvent) -> String {
+    match payload {
+        AcpEvent::TurnComplete { stop_reason, .. } => {
+            format!("TurnComplete({stop_reason})")
+        }
+        AcpEvent::SessionStarted { .. } => "SessionStarted".into(),
+        AcpEvent::ConversationLinked { .. } => "ConversationLinked".into(),
+        AcpEvent::StatusChanged { status, .. } => {
+            format!("StatusChanged({status:?})")
+        }
+        AcpEvent::Error { terminal, .. } => format!("Error(terminal={terminal})"),
+        other => format!("{other:?}")
+            .split_whitespace()
+            .next()
+            .unwrap_or("Other")
+            .to_string(),
+    }
+}
+
+/// Spawn a per-connection lifecycle worker and return its mailbox sender.
+fn spawn_lifecycle_worker(
+    conn_id: &str,
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    broker: &Option<Arc<DelegationBroker>>,
+) -> mpsc::Sender<Arc<InternalEventEnvelope>> {
+    let (tx, worker_rx) =
+        mpsc::channel::<Arc<InternalEventEnvelope>>(WORKER_QUEUE_CAPACITY);
+    let db_clone = db_conn.clone();
+    let mgr_clone = manager.clone_ref();
+    let broker_clone = broker.clone();
+    let id_clone = conn_id.to_string();
+    tokio::spawn(connection_worker_loop(
+        id_clone,
+        db_clone,
+        mgr_clone,
+        broker_clone,
+        worker_rx,
+    ));
+    tx
+}
+
+/// Enqueue a lifecycle-relevant envelope onto the per-connection worker.
+///
+/// **Never awaits** a full mailbox. Blocking the dispatcher here was the
+/// production failure mode behind stuck `in_progress` rows: one stalled
+/// worker filled its queue, `send().await` froze the bus consumer, the
+/// broadcast lagged, and a later `TurnComplete` was dropped before enqueue
+/// (Codex #385: 19 emits, 18 CAS — last turn had `TurnComplete emitted` but
+/// no `enqueue`).
+///
+/// Full mailbox → spawn an overflow deliverer with a timeout. Closed →
+/// respawn worker and retry (or overflow).
+fn enqueue_lifecycle_envelope(
+    workers: &mut HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>>,
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    broker: &Option<Arc<DelegationBroker>>,
+    metrics: &EventBusMetrics,
+    envelope_arc: Arc<InternalEventEnvelope>,
+    source: &'static str,
+) {
+    let conn_id = envelope_arc.connection_id.clone();
+    let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
+    let payload_kind = lifecycle_payload_kind(&envelope_arc.payload);
+
+    if workers.get(&conn_id).is_some_and(|tx| tx.is_closed()) {
+        tracing::warn!(
+            connection_id = %conn_id,
+            event = %payload_kind,
+            source,
+            "[lifecycle][WARN] worker channel closed; respawning before enqueue \
+             (prior worker likely panicked)"
+        );
+        workers.remove(&conn_id);
+    }
+
+    let tx = workers
+        .entry(conn_id.clone())
+        .or_insert_with(|| spawn_lifecycle_worker(&conn_id, db_conn, manager, broker));
+
+    if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+        tracing::info!(
+            connection_id = %conn_id,
+            event = %payload_kind,
+            source,
+            has_completion_sidecar = envelope_arc.completion.is_some(),
+            "[lifecycle] enqueue TurnComplete to worker"
+        );
+    }
+
+    const OVERFLOW_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let overflow = |tx: mpsc::Sender<Arc<InternalEventEnvelope>>,
+                    env: Arc<InternalEventEnvelope>,
+                    conn_id: String,
+                    payload_kind: String,
+                    source: &'static str,
+                    why: &'static str| {
+        tokio::spawn(async move {
+            tracing::warn!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                why,
+                timeout_secs = 60,
+                "[lifecycle][WARN] overflow deliver waiting for worker mailbox"
+            );
+            match tokio::time::timeout(OVERFLOW_SEND_TIMEOUT, tx.send(env)).await {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle] overflow deliver succeeded"
+                    );
+                }
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle][ERROR] DROPPED lifecycle event — worker \
+                         channel closed during overflow deliver"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        connection_id = %conn_id,
+                        event = %payload_kind,
+                        source,
+                        "[lifecycle][ERROR] DROPPED lifecycle event — worker \
+                         stuck >60s (mailbox never drained); conversation may \
+                         stay in_progress"
+                    );
+                }
+            }
+        });
+    };
+
+    match tx.try_send(envelope_arc) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(env)) => {
+            metrics
+                .worker_queue_full_count
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                "[lifecycle][WARN] worker queue full — spawning overflow \
+                 deliverer (dispatcher stays unblocked)"
+            );
+            overflow(
+                tx.clone(),
+                env,
+                conn_id.clone(),
+                payload_kind.clone(),
+                source,
+                "queue_full",
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(env)) => {
+            tracing::error!(
+                connection_id = %conn_id,
+                event = %payload_kind,
+                source,
+                "[lifecycle][ERROR] worker channel closed mid-send; respawning \
+                 and re-enqueueing"
+            );
+            workers.remove(&conn_id);
+            let tx2 = workers
+                .entry(conn_id.clone())
+                .or_insert_with(|| spawn_lifecycle_worker(&conn_id, db_conn, manager, broker));
+            match tx2.try_send(env) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(env2))
+                | Err(mpsc::error::TrySendError::Closed(env2)) => {
+                    overflow(
+                        tx2.clone(),
+                        env2,
+                        conn_id.clone(),
+                        payload_kind.clone(),
+                        source,
+                        "respawn_retry",
+                    );
+                }
+            }
+        }
+    }
+
+    if is_terminal {
+        // Drop the sender; worker drains the queue then exits. Overflow
+        // tasks hold their own Sender clone so they can still complete.
+        workers.remove(&conn_id);
+    }
+}
+
+/// Subscribe to the in-process bus (and the critical lifecycle lane)
+/// synchronously and return the dispatcher loop future.
+///
+/// Filters out events the lifecycle worker doesn't care about
 /// (high-frequency ContentDelta / ToolCall / PermissionRequest etc.) and
 /// fans the rest out to per-connection worker tasks. Within a single
 /// connection, ordering is preserved by the per-worker mpsc; across
 /// connections, workers run independently so a slow SQLite write on one
 /// connection doesn't backpressure the others.
 ///
-/// All forwarded events (the 5 types in `is_lifecycle_relevant`) use
-/// blocking `send().await` to guarantee delivery even when the worker
-/// mailbox is full — `SessionStarted` (writes external_id) and
-/// `TurnComplete` (writes terminal status) are correctness-critical and
-/// silently dropping either leaves the conversation row in a permanently
-/// wrong state. Filtering keeps the queue from filling on noise traffic
-/// so the blocking path is rarely exercised.
+/// The dispatcher **never blocks** on a full worker mailbox. Critical events
+/// also arrive on a dedicated mpsc lane that bypasses broadcast lag, so a
+/// ContentDelta flood cannot drop `TurnComplete`.
 ///
-/// The `subscribe()` call happens here, before the future is returned, so any
-/// events emitted between this call and the first poll are buffered by the
-/// broadcast channel rather than dropped.
+/// The `subscribe()` / `take_critical_rx()` calls happen here, before the
+/// future is returned, so any events emitted between this call and the first
+/// poll are buffered rather than dropped.
 pub fn lifecycle_subscriber_task(
     db_conn: DatabaseConnection,
     manager: ConnectionManager,
@@ -1697,6 +1912,15 @@ pub fn lifecycle_subscriber_task(
     broker: Option<Arc<DelegationBroker>>,
 ) -> impl Future<Output = ()> + Send + 'static {
     let mut rx = bus.subscribe();
+    let mut critical_rx = bus.take_critical_rx();
+    if critical_rx.is_none() {
+        tracing::error!(
+            "[lifecycle][ERROR] critical lifecycle lane already taken or missing — \
+             TurnComplete relies on broadcast only (lag-prone)"
+        );
+    } else {
+        tracing::info!("[lifecycle] critical lane attached (TurnComplete bypasses broadcast lag)");
+    }
     let metrics = Arc::clone(bus.metrics());
     async move {
         // connection_id → worker mailbox. Workers are spawned lazily on the
@@ -1704,178 +1928,123 @@ pub fn lifecycle_subscriber_task(
         // event by dropping the sender (worker drains its queue and exits).
         let mut workers: HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>> = HashMap::new();
         loop {
-            match rx.recv().await {
-                Ok(envelope_arc) => {
-                    // Off-worker delegation correlation. Register parent-side
-                    // `delegate_to_agent` tool_call_ids the instant they come
-                    // off the bus — before the `is_lifecycle_relevant` filter
-                    // and before any worker `send().await` that could block and
-                    // back-pressure the bus into dropping a later event. This is
-                    // why `ToolCall`/`ToolCallUpdate` no longer need to reach a
-                    // worker at all. See `register_delegation_tool_call_from_event`.
-                    if let Some(b) = broker.as_ref() {
-                        register_delegation_tool_call_from_event(
-                            b.as_ref(),
-                            envelope_arc.event.as_ref(),
-                        )
-                        .await;
-                        // Child runtime projection beside ToolCall correlation —
-                        // independent of the DB-coupled worker mailbox so
-                        // ToolCall/ToolCallUpdate never need the worker path.
-                        b.project_child_tool_event(
-                            &envelope_arc.connection_id,
-                            &envelope_arc.payload,
-                        )
-                        .await;
+            tokio::select! {
+                // Prefer critical lane so status CAS is not starved by a
+                // ContentDelta flood on the broadcast receiver.
+                biased;
+
+                crit = async {
+                    match critical_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
-
-                    // Fast-path filter: skip events the worker would no-op.
-                    // Avoids spawning a worker for connections that only emit
-                    // high-frequency noise and avoids crowding existing
-                    // workers' mailboxes.
-                    if !is_lifecycle_relevant(&envelope_arc.payload) {
-                        continue;
-                    }
-
-                    let conn_id = envelope_arc.connection_id.clone();
-                    let is_terminal = is_dispatcher_terminal(&envelope_arc.payload);
-                    let payload_kind = match &envelope_arc.payload {
-                        AcpEvent::TurnComplete { stop_reason, .. } => {
-                            format!("TurnComplete({stop_reason})")
-                        }
-                        AcpEvent::SessionStarted { .. } => "SessionStarted".into(),
-                        AcpEvent::ConversationLinked { .. } => "ConversationLinked".into(),
-                        AcpEvent::StatusChanged { status, .. } => {
-                            format!("StatusChanged({status:?})")
-                        }
-                        AcpEvent::Error { terminal, .. } => {
-                            format!("Error(terminal={terminal})")
-                        }
-                        other => format!("{other:?}")
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("Other")
-                            .to_string(),
-                    };
-
-                    // Drop closed senders so `or_insert_with` can respawn.
-                    if workers
-                        .get(&conn_id)
-                        .is_some_and(|tx| tx.is_closed())
-                    {
-                        tracing::warn!(
-                            connection_id = %conn_id,
-                            event = %payload_kind,
-                            "[lifecycle][WARN] worker channel closed; respawning \
-                             before enqueue (prior worker likely panicked)"
-                        );
-                        workers.remove(&conn_id);
-                    }
-
-                    let spawn_worker = |conn_id: &str| {
-                        let (tx, worker_rx) =
-                            mpsc::channel::<Arc<InternalEventEnvelope>>(WORKER_QUEUE_CAPACITY);
-                        let db_clone = db_conn.clone();
-                        let mgr_clone = manager.clone_ref();
-                        let broker_clone = broker.clone();
-                        let id_clone = conn_id.to_string();
-                        tokio::spawn(connection_worker_loop(
-                            id_clone,
-                            db_clone,
-                            mgr_clone,
-                            broker_clone,
-                            worker_rx,
-                        ));
-                        tx
-                    };
-
-                    let tx = workers
-                        .entry(conn_id.clone())
-                        .or_insert_with(|| spawn_worker(&conn_id));
-
-                    if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
-                        tracing::info!(
-                            connection_id = %conn_id,
-                            event = %payload_kind,
-                            "[lifecycle] enqueue TurnComplete to worker"
-                        );
-                    }
-
-                    // Two-phase send: try non-blocking first (the common
-                    // case), only `await` when the mailbox is actually full.
-                    // Counts queue-full as back-pressure observation rather
-                    // than a drop event — nothing is dropped, the dispatcher
-                    // just waits for the worker to make room.
-                    //
-                    // On Closed: prior code removed the worker and `continue`d
-                    // without re-enqueue — silently dropping TurnComplete and
-                    // leaving the conversation row stuck at `in_progress`.
-                    // Always respawn + re-send correctness-critical events.
-                    let send_result = match tx.try_send(envelope_arc) {
-                        Ok(()) => Ok(()),
-                        Err(mpsc::error::TrySendError::Full(env)) => {
-                            metrics
-                                .worker_queue_full_count
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                connection_id = %conn_id,
-                                event = %payload_kind,
-                                "[lifecycle][WARN] worker queue full, \
-                                 awaiting drain (back-pressure)"
+                } => {
+                    match crit {
+                        Some(envelope_arc) => {
+                            let kind = lifecycle_payload_kind(&envelope_arc.payload);
+                            if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+                                tracing::info!(
+                                    connection_id = %envelope_arc.connection_id,
+                                    event = %kind,
+                                    has_completion_sidecar = envelope_arc.completion.is_some(),
+                                    "[lifecycle] critical lane received TurnComplete"
+                                );
+                            }
+                            // Critical lane only carries lifecycle-critical
+                            // payloads — no broker tool-correlation needed here.
+                            enqueue_lifecycle_envelope(
+                                &mut workers,
+                                &db_conn,
+                                &manager,
+                                &broker,
+                                metrics.as_ref(),
+                                envelope_arc,
+                                "critical_lane",
                             );
-                            tx.send(env).await.map_err(|_| ())
                         }
-                        Err(mpsc::error::TrySendError::Closed(env)) => {
+                        None => {
                             tracing::error!(
-                                connection_id = %conn_id,
-                                event = %payload_kind,
-                                "[lifecycle][ERROR] worker channel closed mid-send; \
-                                 respawning and re-enqueueing (must not drop \
-                                 TurnComplete / SessionStarted)"
+                                "[lifecycle][ERROR] critical lifecycle lane closed"
                             );
-                            workers.remove(&conn_id);
-                            let tx2 = workers
-                                .entry(conn_id.clone())
-                                .or_insert_with(|| spawn_worker(&conn_id));
-                            tx2.send(env).await.map_err(|_| ())
+                            critical_rx = None;
                         }
-                    };
-
-                    if send_result.is_err() {
-                        tracing::error!(
-                            connection_id = %conn_id,
-                            event = %payload_kind,
-                            "[lifecycle][ERROR] DROPPED lifecycle event after \
-                             worker respawn failed — conversation status may \
-                             stay wrong until reconnect"
-                        );
-                        workers.remove(&conn_id);
-                        continue;
-                    }
-
-                    if is_terminal {
-                        // Drop the sender; worker drains the queue then
-                        // exits. Releases the per-connection `CachedConn`
-                        // (state Arc + emitter) the worker was holding.
-                        workers.remove(&conn_id);
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Lagged at the bus level. Now that the dispatcher
-                    // filters and only blocks on the rare relevant events,
-                    // this should only fire under genuine emit-rate spikes
-                    // exceeding the 4096 broadcast capacity.
-                    tracing::warn!(
-                        "[lifecycle][WARN] internal bus lagged, dropped {skipped} events \
-                         (emit rate exceeded broadcast capacity)"
-                    );
-                    metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    tracing::info!("[lifecycle] internal bus closed; dispatcher exiting");
-                    // Drop all worker senders; workers drain & exit on their own.
-                    drop(workers);
-                    break;
+
+                bus_msg = rx.recv() => {
+                    match bus_msg {
+                        Ok(envelope_arc) => {
+                            if matches!(envelope_arc.payload, AcpEvent::TurnComplete { .. }) {
+                                tracing::info!(
+                                    connection_id = %envelope_arc.connection_id,
+                                    event = %lifecycle_payload_kind(&envelope_arc.payload),
+                                    has_completion_sidecar = envelope_arc.completion.is_some(),
+                                    "[lifecycle] broadcast received TurnComplete"
+                                );
+                            }
+
+                            // Off-worker delegation correlation — only tool
+                            // events need it; skip the await path for the rest
+                            // so ContentDelta cannot stall behind a broker lock.
+                            if let Some(b) = broker.as_ref() {
+                                let needs_broker = matches!(
+                                    envelope_arc.payload,
+                                    AcpEvent::ToolCall { .. }
+                                        | AcpEvent::ToolCallUpdate { .. }
+                                );
+                                if needs_broker {
+                                    register_delegation_tool_call_from_event(
+                                        b.as_ref(),
+                                        envelope_arc.event.as_ref(),
+                                    )
+                                    .await;
+                                    b.project_child_tool_event(
+                                        &envelope_arc.connection_id,
+                                        &envelope_arc.payload,
+                                    )
+                                    .await;
+                                }
+                            }
+
+                            if !is_lifecycle_relevant(&envelope_arc.payload) {
+                                continue;
+                            }
+
+                            // When the critical lane is live, critical payloads
+                            // are already enqueued from that path. Still fan
+                            // out from broadcast for redundancy (CAS is
+                            // idempotent). Duplicate TurnComplete → second CAS
+                            // is a logged no-op.
+                            enqueue_lifecycle_envelope(
+                                &mut workers,
+                                &db_conn,
+                                &manager,
+                                &broker,
+                                metrics.as_ref(),
+                                envelope_arc,
+                                "broadcast",
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Critical lane should still deliver TurnComplete.
+                            // Log at ERROR so operators notice residual risk
+                            // (SessionStarted on broadcast-only consumers, etc.).
+                            tracing::error!(
+                                skipped,
+                                "[lifecycle][ERROR] internal bus lagged, dropped {skipped} \
+                                 broadcast events (critical lane should still carry \
+                                 TurnComplete/SessionStarted)"
+                            );
+                            metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "[lifecycle] internal bus closed; dispatcher exiting"
+                            );
+                            drop(workers);
+                            break;
+                        }
+                    }
                 }
             }
         }
