@@ -43,7 +43,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Get status or results for one or more task_ids from delegate_to_agent. Canonical Join: pass return_when=all_terminal_or_attention with explicit wait_ms=0 to wait until all requested tasks are terminal, a requested child needs a parent decision (attention_requests), or the Broker cannot continue waiting safely (wake_reason=unavailable). Answer every returned attention request, then re-Join only still-running required task ids. Omitting return_when retains legacy snapshot / supervised / any-terminal behavior. Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. A running result at a bounded deadline is not a failure. After stalled/waiting_input, surface or handle the condition, or use terminal wait when the result remains required. A wait returns when ANY requested task meets the mode condition, so call again for unfinished tasks. Returns {\"tasks\":[...]} in input order with each task_id, status (running, completed, failed, canceled, or unknown), observation fields while running when available, and final text when available; Join responses also include wake_reason and attention_requests. Prefer blocking waits to repeated polls. While only waiting, call again silently; message the user only for a terminal result or needed input.",
+    "description": "Get status or results for task_ids. Omit wait_ms for an immediate snapshot. To block, Join with return_when=all_terminal_or_attention and explicit wait_ms=0; positive wait_ms is rejected on coordination_v1. Join returns when all requested tasks are terminal, requested-child attention is required, or the Broker is unavailable. Answer every attention request, then re-Join only still-running required task ids. Returns {\"tasks\":[...]} in input order; Join responses also include wake_reason and attention_requests.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -57,12 +57,13 @@
         "wait_ms": {
           "type": "integer",
           "minimum": 0,
-          "description": "Omit wait_ms for an immediate snapshot. A positive wait (max 60000 ms) returns on terminal, stalled, waiting_input, or its deadline. wait_ms=0 waits only for a terminal result without a timeout. Join mode requires explicit wait_ms=0 with return_when."
+          "maximum": 0,
+          "description": "Omit wait_ms for an immediate snapshot. Use 0 with return_when=all_terminal_or_attention for canonical Join. Positive wait_ms is rejected on coordination_v1."
         },
         "return_when": {
           "type": "string",
           "enum": ["all_terminal_or_attention"],
-          "description": "Join mode. Requires explicit wait_ms=0 and returns only when all requested tasks are terminal, a requested child needs a parent decision, or the Broker cannot continue waiting safely."
+          "description": "Canonical Join condition. Requires explicit wait_ms=0; returns for all terminal, attention required, or unavailable."
         }
       }
     }
