@@ -280,19 +280,30 @@ export function DelegationSettingsSection() {
               )}
             </div>
             <ButtonGroup aria-label={t("routePolicy")} className="shrink-0">
-              {(["codeg", "native"] as const).map((policy) => (
-                <Button
-                  key={policy}
-                  type="button"
-                  variant={routePolicy === policy ? "secondary" : "outline"}
-                  aria-pressed={routePolicy === policy}
-                  disabled={loading || !enabled}
-                  onClick={() => setRoutePolicy(policy)}
-                  size="sm"
-                >
-                  {t(`route.${policy}`)}
-                </Button>
-              ))}
+              {(["codeg", "native"] as const).map((policy) => {
+                const selected = routePolicy === policy
+                return (
+                  <Button
+                    key={policy}
+                    type="button"
+                    // `default` (primary fill) vs `outline` — same pattern as
+                    // other segmented toggles. `secondary` was nearly
+                    // indistinguishable from `outline` in this theme.
+                    variant={selected ? "default" : "outline"}
+                    aria-pressed={selected}
+                    disabled={loading || !enabled}
+                    onClick={() => setRoutePolicy(policy)}
+                    size="sm"
+                    className={
+                      selected
+                        ? "relative z-10 shadow-sm ring-1 ring-primary/40"
+                        : undefined
+                    }
+                  >
+                    {t(`route.${policy}`)}
+                  </Button>
+                )
+              })}
             </ButtonGroup>
           </div>
 

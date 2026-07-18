@@ -197,6 +197,27 @@ describe("DelegationSettingsSection", () => {
     })
   })
 
+  it("highlights the active default route (aria-pressed) and toggles on click", async () => {
+    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: true }))
+
+    renderWithIntl()
+
+    const codeg = await screen.findByRole("button", { name: "Codeg" })
+    const native = screen.getByRole("button", { name: "Native" })
+
+    expect(codeg).toHaveAttribute("aria-pressed", "true")
+    expect(codeg).toHaveAttribute("data-variant", "default")
+    expect(native).toHaveAttribute("aria-pressed", "false")
+    expect(native).toHaveAttribute("data-variant", "outline")
+
+    fireEvent.click(native)
+
+    expect(native).toHaveAttribute("aria-pressed", "true")
+    expect(native).toHaveAttribute("data-variant", "default")
+    expect(codeg).toHaveAttribute("aria-pressed", "false")
+    expect(codeg).toHaveAttribute("data-variant", "outline")
+  })
+
   it("reflects backend default (disabled): switch off, depth input disabled", async () => {
     // Regression for the "default off" UX guarantee: when persistence has
     // never been written, the backend returns `enabled: false` and the
