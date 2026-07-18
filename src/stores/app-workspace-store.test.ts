@@ -170,3 +170,84 @@ describe("applyGitHead", () => {
     expect(useAppWorkspaceStore.getState().gitHeads.get(1)).toEqual(second)
   })
 })
+
+describe("optimistic conversation activity", () => {
+  it("does not invent updated_at for local title or status patches", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(makeSummary({ id: 1 }))
+    // Re-read after upsert: Zustand snapshots do not refresh row arrays.
+    const baseline = useAppWorkspaceStore.getState().conversations[0].updated_at
+
+    store.updateConversationLocal(1, { title: "Renamed" })
+    store.updateConversationLocal(1, { status: "pending_review" })
+
+    expect(useAppWorkspaceStore.getState().conversations[0].updated_at).toBe(
+      baseline
+    )
+  })
+
+  it("rolls back only the matching optimistic token", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(makeSummary({ id: 1 }))
+    const first = store.beginConversationActivity(1)!
+    const second = store.beginConversationActivity(1)!
+
+    store.rollbackConversationActivity(1, first)
+    expect(
+      useAppWorkspaceStore.getState().optimisticActivityById.get(1)?.token
+    ).toBe(second)
+
+    store.rollbackConversationActivity(1, second)
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(1)).toBe(
+      false
+    )
+  })
+
+  it("ignores older state and acknowledges activity only past its baseline", () => {
+    const store = useAppWorkspaceStore.getState()
+    store.applyConversationUpsert(
+      makeSummary({ id: 1, updated_at: "2026-07-18T02:00:00.000Z" })
+    )
+    const token = store.beginConversationActivity(1)
+    expect(token).not.toBeNull()
+    const sequence =
+      useAppWorkspaceStore.getState().conversationActivitySequence
+
+    store.applyConversationStatePatch({
+      id: 1,
+      status: "cancelled",
+      awaiting_reply_token: null,
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    expect(useAppWorkspaceStore.getState().conversations[0].status).toBe(
+      "in_progress"
+    )
+    expect(useAppWorkspaceStore.getState().optimisticActivityById.has(1)).toBe(
+      true
+    )
+
+    store.applyConversationStatePatch({
+      id: 1,
+      status: "pending_review",
+      awaiting_reply_token: "generation-1",
+      updated_at: "2026-07-18T03:00:00.000Z",
+    })
+    const after = useAppWorkspaceStore.getState()
+    expect(after.optimisticActivityById.has(1)).toBe(false)
+    expect(after.conversationActivitySequence).toBe(sequence + 1)
+    expect(after.lastConversationActivityId).toBe(1)
+  })
+
+  it("returns null for unknown or non-root conversations", () => {
+    const store = useAppWorkspaceStore.getState()
+    expect(store.beginConversationActivity(999)).toBeNull()
+
+    // Bypass root-only upsert so a child row can exist in state.
+    useAppWorkspaceStore.setState({
+      conversations: [makeSummary({ id: 2, parent_id: 1 })],
+    })
+    expect(
+      useAppWorkspaceStore.getState().beginConversationActivity(2)
+    ).toBeNull()
+  })
+})
