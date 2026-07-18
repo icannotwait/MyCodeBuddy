@@ -269,7 +269,13 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
         <StatusBadge status={status} errorCode={errorCode} />
       </div>
       {task && (
-        <div className="break-words text-[11px] text-muted-foreground">
+        // Single-line ellipsis (not break-words): long / multi-line tasks
+        // (e.g. wire shell context mixed into the prompt text) must not inflate
+        // the compact overlay card. Full text stays available via `title`.
+        <div
+          className="min-w-0 truncate text-[11px] text-muted-foreground"
+          title={task}
+        >
           {task}
         </div>
       )}

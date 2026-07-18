@@ -115,6 +115,30 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByText("Write the fix")).toBeInTheDocument()
   })
 
+  it("keeps long multi-line task text to a single truncated line", () => {
+    // Multi-line tasks (and any long shell-context noise) must stay one line
+    // with ellipsis — not expand the overlay card via break-words.
+    const longTask =
+      "Line one of a very long delegated task description.\n" +
+      "Line two keeps going with more context that used to wrap.\n" +
+      "Line three would inflate the overlay without truncate."
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[source("pt-1", { agent_type: "codex", task: longTask })]}
+        overlayKey="k-truncate"
+      />
+    )
+    const row = screen.getByTestId("sub-agent-row")
+    const taskEl = Array.from(row.querySelectorAll("div")).find((el) =>
+      el.classList.contains("truncate")
+    )
+    expect(taskEl).toBeDefined()
+    expect(taskEl).toHaveClass("truncate")
+    expect(taskEl).not.toHaveClass("break-words")
+    expect(taskEl).toHaveAttribute("title", longTask)
+    expect(taskEl?.textContent).toContain("Line one of a very long")
+  })
+
   it("collapses to a pill summarizing the count when defaultExpanded is false", () => {
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
