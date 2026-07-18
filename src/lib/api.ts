@@ -10,6 +10,10 @@ import { getCodegToken } from "./transport/web-auth"
 import { notifyWebUnauthorized } from "./transport/web-connection-store"
 import { getCurrentEffectiveAppLocale } from "./i18n"
 import { TurnBusyError, isTurnInProgressRejection } from "./turn-busy"
+import {
+  continuationWaitingError,
+  isContinuationWaitingRejection,
+} from "./continuation-waiting"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
@@ -205,6 +209,7 @@ export async function acpPrompt(
       locale: context.locale,
     })
   } catch (e) {
+    if (isContinuationWaitingRejection(e)) throw continuationWaitingError(e)
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
     throw e
   }

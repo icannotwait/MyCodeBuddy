@@ -17,6 +17,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress
+        | AppErrorCode::ConversationWaitingForSubagents
         | AppErrorCode::SessionRouteConflict
         | AppErrorCode::Cancelled
         | AppErrorCode::StaleStart
@@ -70,6 +71,14 @@ mod tests {
         assert_eq!(
             status_for_app_error_code(AppErrorCode::TerminalShellUnsupported),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn continuation_gate_waiting_error_maps_to_http_409() {
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::ConversationWaitingForSubagents),
+            StatusCode::CONFLICT
         );
     }
 }

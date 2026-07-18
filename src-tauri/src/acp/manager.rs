@@ -17,6 +17,7 @@ use crate::acp::connection::{
     SpawnHandshake,
 };
 use crate::acp::delegation::continuation::store::ContinuationStore;
+use crate::acp::delegation::metrics::PromptAdmissionSource;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
 #[cfg(test)]
@@ -1378,15 +1379,57 @@ impl ConnectionManager {
         None
     }
 
+    /// Reject an external prompt if a durable continuation owns its conversation.
+    /// Called while the connection's `prompt_lock` is held, before prompt side
+    /// effects. Store failures remain protocol failures so admission never fails
+    /// open when the continuation state is unavailable.
+    async fn admit_external_prompt(
+        &self,
+        state_arc: &Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        caller_conversation_id: Option<i32>,
+        source: PromptAdmissionSource,
+    ) -> Result<(), AcpError> {
+        let conversation_id = state_arc
+            .read()
+            .await
+            .conversation_id
+            .or(caller_conversation_id);
+        if let (Some(conversation_id), Some(store)) = (conversation_id, self.continuation_store()) {
+            let active = store
+                .load_active_for_conversation(conversation_id)
+                .await
+                .map_err(|error| {
+                    AcpError::protocol(format!(
+                        "failed to load active continuation for conversation {conversation_id}: {error}"
+                    ))
+                })?;
+            if let Some(active) = active {
+                if let Some(injection) = self.delegation_snapshot() {
+                    injection.metrics.record_prompt_rejected_waiting(source);
+                }
+                return Err(AcpError::ContinuationInProgress {
+                    conversation_id,
+                    state: active.state,
+                });
+            }
+        }
+
+        if state_arc.read().await.turn_in_flight {
+            return Err(AcpError::TurnInProgress);
+        }
+        Ok(())
+    }
+
     /// Forwards a prompt to the connection's command channel without
     /// touching `prompt_lock`. Internal helper — both `send_prompt` and
     /// `send_prompt_linked` acquire the lock externally and then call
     /// this. Re-entering through `send_prompt` from `send_prompt_linked`
     /// while holding the lock would deadlock, hence the split.
     ///
-    /// Admission order (under the caller's per-connection prompt lock):
+    /// Its public caller has already completed external continuation admission
+    /// under the same prompt lock. Local enqueue order is:
     /// 1. `reserve()` — only cancellable/blocking point before capture
-    /// 2. state write guard; reject in-flight turn
+    /// 2. state write guard; defensive re-check for an in-flight turn
     /// 3. linked + non-internal: `capture_prompt_context` while holding the
     ///    write guard (serializes write-once first text)
     /// 4. set `active_turn` / `effective_locale` / `turn_in_flight`
@@ -1540,6 +1583,12 @@ impl ConnectionManager {
         }
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
+        let state_arc = self
+            .get_state(conn_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Foreground)
+            .await?;
         // Non-linked UI sends: register mandatory routes + mark attention.
         // Capture runs only when the connection is already linked (and not
         // internal); unlinked paths bypass capture by design.
@@ -1557,6 +1606,12 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
+        let state_arc = self
+            .get_state(conn_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Background)
+            .await?;
         self.send_prompt_inner(None, conn_id, blocks, None, true, false, None)
             .await
     }
@@ -1674,6 +1729,7 @@ impl ConnectionManager {
             client_message_id,
             mark_awaiting_reply,
             capture,
+            PromptAdmissionSource::LinkedForeground,
         )
         .await
     }
@@ -1699,6 +1755,7 @@ impl ConnectionManager {
             None,
             false,
             capture,
+            PromptAdmissionSource::LinkedBackground,
         )
         .await
     }
@@ -1719,6 +1776,7 @@ impl ConnectionManager {
         client_message_id: Option<String>,
         mark_awaiting_reply: bool,
         capture: Option<PromptCaptureContext>,
+        admission_source: PromptAdmissionSource,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1761,35 +1819,25 @@ impl ConnectionManager {
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
         // any racing send sees a consistent post-link state.
-        let (state_arc, emitter, agent_type, already_linked, turn_in_flight) = {
+        let (state_arc, emitter, agent_type, already_linked) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            let (already, in_flight) = {
+            let already = {
                 let s = conn.state.read().await;
-                (s.conversation_id.is_some(), s.turn_in_flight)
+                s.conversation_id.is_some()
             };
             (
                 conn.state.clone(),
                 conn.emitter.clone(),
                 conn.agent_type,
                 already,
-                in_flight,
             )
         };
 
-        // Reject a concurrent prompt while a turn is already in flight, BEFORE
-        // any side effects (row creation, InProgress emit, user-message
-        // broadcast). `send_prompt_inner` re-checks and sets the flag
-        // authoritatively below; doing it here too — while still holding
-        // `prompt_lock`, so the value can't change underneath us (the loop only
-        // ever clears it) — keeps a rejected prompt from flipping the row to
-        // InProgress or broadcasting a phantom user message. The frontend turns
-        // this rejection into a queued message above the input box.
-        if turn_in_flight {
-            return Err(AcpError::TurnInProgress);
-        }
+        self.admit_external_prompt(&state_arc, conversation_id, admission_source)
+            .await?;
 
         if !already_linked {
             match (conversation_id, folder_id) {
@@ -5371,6 +5419,181 @@ mod tests {
         assert!(
             matches!(res, Err(AcpError::TurnInProgress)),
             "send_prompt must return TurnInProgress when a turn is in flight, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_gate_linked_rejects_arming_before_turn_in_flight_without_side_effects() {
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, InMemoryContinuationStore, NewContinuation,
+        };
+        use chrono::{Duration, Utc};
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/continuation-gate").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("seed conversation");
+        let manager = ConnectionManager::new();
+        let conn_id = "continuation-gate-linked";
+        let mut command_receiver =
+            insert_live_connection(&manager, conn_id, AgentType::ClaudeCode, None).await;
+        let mut events = subscribe_conn_stream(&manager, conn_id).await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let armed_at = Utc::now();
+        store
+            .insert_arming(NewContinuation {
+                continuation_id: "continuation-gate".into(),
+                parent_conversation_id: conversation.id,
+                parent_session_id: "session".into(),
+                parent_connection_id: conn_id.into(),
+                parent_turn_generation: 1,
+                task_ids: crate::acp::delegation::continuation::types::ContinuationTaskIds(vec![
+                    "task".into(),
+                ]),
+                armed_at,
+                wake_at: armed_at + Duration::minutes(4),
+                internal_prompt_id: "internal-prompt".into(),
+                internal_prompt_marker: "marker".into(),
+            })
+            .await
+            .expect("arm continuation");
+        manager.install_continuation_store(store);
+        manager
+            .get_state(conn_id)
+            .await
+            .expect("state")
+            .write()
+            .await
+            .turn_in_flight = true;
+
+        let rows_before = count_conversation_rows(&db).await;
+        let result = manager
+            .send_prompt_linked(
+                &db,
+                conn_id,
+                one_text_block(),
+                Some(folder_id),
+                Some(conversation.id),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AcpError::ContinuationInProgress {
+                    conversation_id,
+                    state: crate::acp::delegation::continuation::types::ContinuationState::Arming,
+                }) if conversation_id == conversation.id
+            ),
+            "active continuation must win over turn_in_flight, got {result:?}"
+        );
+        assert_eq!(count_conversation_rows(&db).await, rows_before);
+        use crate::db::entities::conversation;
+        use sea_orm::EntityTrait;
+        let row = conversation::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .expect("read conversation")
+            .expect("conversation exists");
+        assert_eq!(
+            row.status,
+            ConversationStatus::InProgress,
+            "rejected prompt must not write a conversation status"
+        );
+        assert!(
+            command_receiver.try_recv().is_err(),
+            "rejected prompt must not enqueue ConnectionCommand::Prompt"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "rejected prompt must not emit ConversationLinked, status, or UserMessage events"
+        );
+        let state = manager.get_state(conn_id).await.expect("state");
+        assert_eq!(
+            state.read().await.conversation_id,
+            None,
+            "rejected prompt must not link the conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_gate_nonlinked_public_paths_reject_arming_before_turn_in_flight() {
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, InMemoryContinuationStore, NewContinuation,
+        };
+        use chrono::{Duration, Utc};
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, "/tmp/continuation-gate-direct").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("seed conversation");
+        let manager = ConnectionManager::new();
+        let conn_id = "continuation-gate-direct";
+        let mut command_receiver =
+            insert_live_connection(&manager, conn_id, AgentType::ClaudeCode, None).await;
+        manager
+            .get_state(conn_id)
+            .await
+            .expect("state")
+            .write()
+            .await
+            .conversation_id = Some(conversation.id);
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let armed_at = Utc::now();
+        store
+            .insert_arming(NewContinuation {
+                continuation_id: "continuation-gate-direct".into(),
+                parent_conversation_id: conversation.id,
+                parent_session_id: "session".into(),
+                parent_connection_id: conn_id.into(),
+                parent_turn_generation: 1,
+                task_ids: crate::acp::delegation::continuation::types::ContinuationTaskIds(vec![
+                    "task".into(),
+                ]),
+                armed_at,
+                wake_at: armed_at + Duration::minutes(4),
+                internal_prompt_id: "internal-prompt".into(),
+                internal_prompt_marker: "marker".into(),
+            })
+            .await
+            .expect("arm continuation");
+        manager.install_continuation_store(store);
+        manager
+            .get_state(conn_id)
+            .await
+            .expect("state")
+            .write()
+            .await
+            .turn_in_flight = true;
+
+        let foreground = manager
+            .send_prompt(&db, conn_id, one_text_block(), None)
+            .await;
+        let background = manager
+            .send_prompt_background(conn_id, one_text_block())
+            .await;
+        for result in [foreground, background] {
+            assert!(
+                matches!(
+                    result,
+                    Err(AcpError::ContinuationInProgress {
+                        conversation_id,
+                        state: crate::acp::delegation::continuation::types::ContinuationState::Arming,
+                    }) if conversation_id == conversation.id
+                ),
+                "active continuation must win over turn_in_flight, got {result:?}"
+            );
+        }
+        assert!(
+            command_receiver.try_recv().is_err(),
+            "rejected public prompt paths must not enqueue ConnectionCommand::Prompt"
         );
     }
 

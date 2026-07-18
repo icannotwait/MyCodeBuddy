@@ -80,7 +80,7 @@ pub async fn acp_connect(
     )
     .await
     .map_err(|e| {
-        e.shell_command_error()
+        e.app_command_error()
             .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
     })?;
 
@@ -108,7 +108,7 @@ pub async fn acp_connect(
         .await
         .map_err(|error| {
             error
-                .shell_command_error()
+                .app_command_error()
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
 
@@ -184,17 +184,10 @@ pub async fn acp_prompt(
             capture,
         )
         .await
-        .map_err(|e| {
-            let message = e.to_string();
-            // A concurrent send while a turn is in flight is an expected,
-            // recoverable condition (409), not a server fault (500). The
-            // frontend re-queues the draft. Other errors stay 500.
-            match e {
-                AcpError::TurnInProgress => {
-                    AppCommandError::new(AppErrorCode::TurnInProgress, message)
-                }
-                _ => AppCommandError::task_execution_failed(message),
-            }
+        .map_err(|error| {
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
     Ok(Json(()))
 }

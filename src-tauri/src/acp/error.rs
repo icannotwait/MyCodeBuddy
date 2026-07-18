@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::acp::delegation::continuation::types::ContinuationState;
 use crate::acp::delegation::route::RouteDegradedReason;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::terminal::shell::ShellResolveError;
@@ -41,6 +42,11 @@ pub enum AcpError {
     /// message queue above the input box instead of surfacing an error.
     #[error("turn already in progress for this connection")]
     TurnInProgress,
+    #[error("conversation {conversation_id} is waiting for subagents ({})", state.as_str())]
+    ContinuationInProgress {
+        conversation_id: i32,
+        state: ContinuationState,
+    },
     /// Live feedback was submitted while no turn was in flight. Feedback only
     /// makes sense while the agent is working (it is pulled mid-turn via the
     /// `check_user_feedback` MCP tool); with no active turn there is nothing to
@@ -99,6 +105,7 @@ impl AcpError {
             Self::ProbeTimedOut => Some("probe_timed_out"),
             Self::ProcessExited => Some("process_exited"),
             Self::TurnInProgress => Some("turn_in_progress"),
+            Self::ContinuationInProgress { .. } => Some("conversation_waiting_for_subagents"),
             Self::NoActiveTurn => Some("no_active_turn"),
             Self::FeedbackDisabled => Some("feedback_disabled"),
             Self::InvalidFeedback(_) => Some("invalid_feedback"),
@@ -113,12 +120,16 @@ impl AcpError {
         }
     }
 
-    /// Structured wire payload for shell preflight and route boundary failures.
+    /// Structured wire payload for command boundary failures.
     ///
     /// Other variants return `None` so Tauri serialization stays a bare
     /// legacy string (preserving SdkNotInstalled substring matching, etc.).
-    pub(crate) fn shell_command_error(&self) -> Option<AppCommandError> {
+    pub(crate) fn app_command_error(&self) -> Option<AppCommandError> {
         match self {
+            AcpError::TurnInProgress => Some(AppCommandError::new(
+                AppErrorCode::TurnInProgress,
+                "turn already in progress for this connection",
+            )),
             AcpError::TerminalShellUnavailable {
                 display_name,
                 executable,
@@ -163,6 +174,22 @@ impl AcpError {
                 )
                 .with_detail(existing_connection_id.clone()),
             ),
+            AcpError::ContinuationInProgress {
+                conversation_id,
+                state,
+            } => Some(
+                AppCommandError::new(
+                    AppErrorCode::ConversationWaitingForSubagents,
+                    "Conversation is waiting for subagents",
+                )
+                .with_i18n(
+                    "backendErrors.conversationWaitingForSubagents",
+                    BTreeMap::from([
+                        ("conversationId".into(), conversation_id.to_string()),
+                        ("state".into(), state.as_str().to_string()),
+                    ]),
+                ),
+            ),
             _ => None,
         }
     }
@@ -194,7 +221,7 @@ impl Serialize for AcpError {
     where
         S: serde::Serializer,
     {
-        if let Some(error) = self.shell_command_error() {
+        if let Some(error) = self.app_command_error() {
             return error.serialize(serializer);
         }
         serializer.serialize_str(&self.to_string())
@@ -267,5 +294,35 @@ mod tests {
         let err = AcpError::SdkNotInstalled("agent is not installed".into());
         let value = serde_json::to_value(&err).expect("serialize");
         assert_eq!(value, json!("agent is not installed"));
+    }
+
+    #[test]
+    fn continuation_gate_error_serializes_stable_waiting_fields() {
+        let err = AcpError::ContinuationInProgress {
+            conversation_id: 42,
+            state: crate::acp::delegation::continuation::types::ContinuationState::Arming,
+        };
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(
+            value,
+            json!({
+                "code": "conversation_waiting_for_subagents",
+                "message": "Conversation is waiting for subagents",
+                "i18n_key": "backendErrors.conversationWaitingForSubagents",
+                "i18n_params": { "conversationId": "42", "state": "arming" },
+            })
+        );
+    }
+
+    #[test]
+    fn acp_error_serialization_preserves_turn_in_progress_http_contract() {
+        let value = serde_json::to_value(&AcpError::TurnInProgress).expect("serialize");
+        assert_eq!(
+            value,
+            json!({
+                "code": "turn_in_progress",
+                "message": "turn already in progress for this connection",
+            })
+        );
     }
 }

@@ -311,7 +311,7 @@ pub async fn set_draft_delegation_route_preference(
         )
         .await
         .map_err(|e| {
-            e.shell_command_error()
+            e.app_command_error()
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
         })?;
     Ok(Json(()))

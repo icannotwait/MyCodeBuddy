@@ -6,6 +6,7 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
+import { ContinuationWaitingError } from "@/lib/continuation-waiting"
 import { getCurrentEffectiveAppLocale } from "@/lib/i18n"
 import {
   AGENT_LABELS,
@@ -54,6 +55,8 @@ export interface UseConnectionLifecycleReturn {
        * draft instead of treating it as an error.
        */
       onTurnInProgress?: () => void
+      /** Called when subagent continuation owns admission for this conversation. */
+      onContinuationWaiting?: () => void
     }
   ) => void
   handleSetConfigOption: (configId: string, valueId: string) => void
@@ -408,10 +411,12 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
+        onContinuationWaiting?: () => void
       }
     ) => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onContinuationWaiting = opts?.onContinuationWaiting
       void (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -430,6 +435,10 @@ export function useConnectionLifecycle({
           },
         })
       })().catch((e: unknown) => {
+        if (e instanceof ContinuationWaitingError) {
+          onContinuationWaiting?.()
+          return
+        }
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
           // co-controlling client, or a "prompting" status this client hadn't

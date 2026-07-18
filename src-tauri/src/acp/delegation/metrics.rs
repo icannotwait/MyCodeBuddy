@@ -65,6 +65,26 @@ pub enum WaitReturnReason {
     PeerClosed,
 }
 
+/// Bounded source label for public external prompt admission paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAdmissionSource {
+    Foreground,
+    Background,
+    LinkedForeground,
+    LinkedBackground,
+}
+
+impl PromptAdmissionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+            Self::LinkedForeground => "linked_foreground",
+            Self::LinkedBackground => "linked_background",
+        }
+    }
+}
+
 /// Result of applying a native-suppression plan at process launch (no secrets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +121,7 @@ pub struct DelegationMetricsSnapshot {
     pub explicit_other_cancel_count: u64,
     pub mcp_request_cancel_count: u64,
     pub mixed_route_invariant_violations: u64,
+    pub prompt_rejected: BTreeMap<String, u64>,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -128,6 +149,7 @@ pub struct DelegationMetrics {
     explicit_other_cancel_count: AtomicU64,
     mcp_request_cancel_count: AtomicU64,
     mixed_route_invariant_violations: AtomicU64,
+    prompt_rejected: Mutex<BTreeMap<String, u64>>,
 }
 
 impl DelegationMetrics {
@@ -299,6 +321,15 @@ impl DelegationMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an external prompt rejected by the continuation admission gate.
+    /// Both labels are fixed enum values, never caller-controlled content.
+    pub fn record_prompt_rejected_waiting(&self, source: PromptAdmissionSource) {
+        Self::inc_labeled(
+            &self.prompt_rejected,
+            format!("waiting_for_subagents:{}", source.as_str()),
+        );
+    }
+
     /// Deterministic, serializable snapshot of all counters.
     pub fn snapshot(&self) -> DelegationMetricsSnapshot {
         let route_selections = self
@@ -318,6 +349,11 @@ impl DelegationMetrics {
             .clone();
         let wait_return_reasons = self
             .wait_return_reasons
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let prompt_rejected = self
+            .prompt_rejected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -346,6 +382,7 @@ impl DelegationMetrics {
             mixed_route_invariant_violations: self
                 .mixed_route_invariant_violations
                 .load(Ordering::Relaxed),
+            prompt_rejected,
         }
     }
 }
@@ -1053,6 +1090,8 @@ mod tests {
         metrics.record_explicit_cancel(CancelDelegationReason::TaskFail);
         metrics.record_explicit_cancel(CancelDelegationReason::Others);
         metrics.record_explicit_cancel(CancelDelegationReason::Timeout);
+        metrics.record_prompt_rejected_waiting(PromptAdmissionSource::Foreground);
+        metrics.record_prompt_rejected_waiting(PromptAdmissionSource::LinkedBackground);
         let snap = metrics.snapshot();
         assert_eq!(snap.snapshot_wait_count, 1);
         assert_eq!(snap.terminal_wait_count, 1);
@@ -1060,6 +1099,18 @@ mod tests {
         assert_eq!(snap.explicit_taskfail_cancel_count, 1);
         assert_eq!(snap.explicit_other_cancel_count, 1);
         assert_eq!(snap.explicit_user_cancel_count, 0);
+        assert_eq!(
+            snap.prompt_rejected
+                .get("waiting_for_subagents:foreground")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            snap.prompt_rejected
+                .get("waiting_for_subagents:linked_background")
+                .copied(),
+            Some(1)
+        );
     }
 
     #[test]

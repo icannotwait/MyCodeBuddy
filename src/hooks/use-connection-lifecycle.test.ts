@@ -192,4 +192,32 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
     await waitFor(() => expect(onTurnInProgress).toHaveBeenCalledTimes(1))
     expect(h.sendPrompt).toHaveBeenCalledTimes(1)
   })
+
+  it("invokes only onContinuationWaiting for a continuation waiting rejection", async () => {
+    const { ContinuationWaitingError } =
+      await import("@/lib/continuation-waiting")
+    h.sendPrompt.mockRejectedValueOnce(
+      new ContinuationWaitingError(42, "arming")
+    )
+    const onTurnInProgress = vi.fn()
+    const onContinuationWaiting = vi.fn()
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "tab-1",
+        agentType: "claude_code",
+        isActive: true,
+      })
+    )
+
+    act(() => {
+      result.current.handleSend(
+        { blocks: [{ type: "text", text: "wire" }], displayText: "wire" },
+        null,
+        { onTurnInProgress, onContinuationWaiting }
+      )
+    })
+
+    await waitFor(() => expect(onContinuationWaiting).toHaveBeenCalledTimes(1))
+    expect(onTurnInProgress).not.toHaveBeenCalled()
+  })
 })

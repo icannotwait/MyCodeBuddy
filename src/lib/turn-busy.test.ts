@@ -42,6 +42,12 @@ describe("isTurnInProgressRejection", () => {
     expect(isTurnInProgressRejection(undefined)).toBe(false)
     expect(isTurnInProgressRejection(42)).toBe(false)
     expect(isTurnInProgressRejection({})).toBe(false)
+    expect(
+      isTurnInProgressRejection({
+        code: "conversation_waiting_for_subagents",
+        message: "Conversation is waiting for subagents",
+      })
+    ).toBe(false)
   })
 })
 
