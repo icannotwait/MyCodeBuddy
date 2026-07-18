@@ -141,8 +141,20 @@ describe("findAbsoluteLocalPathRanges", () => {
     String.raw`"D:\My \"Quoted\" Project\app.ts"`,
     String.raw`"D:\My 'Nested' Project\app.ts"`,
     String.raw`"D:\unterminated path\app.ts`,
+    // CJK category labels with slashes (not filesystem paths). The leading
+    // CJK character is not a START_BLOCKER, so `/…/…` would otherwise match.
+    "进度/耗时/工具统计",
+    "进度/耗时/工具统计走 Delegation Card 事件",
+    "/耗时/工具统计",
+    "/进度/耗时/工具",
   ])("rejects unsupported or ambiguous candidate %s", (text) => {
     expect(findAbsoluteLocalPathRanges(text)).toEqual([])
+  })
+
+  it("still accepts POSIX paths that contain ASCII after CJK prose", () => {
+    expect(
+      links("进度走 /Users/me/app.ts 与 /tmp/目录/a.ts").map((item) => item.label)
+    ).toEqual(["/Users/me/app.ts", "/tmp/目录/a.ts"])
   })
 
   it("handles many matches without a timing-sensitive assertion", () => {

@@ -12,6 +12,11 @@ export interface LocalPathMatch {
 const WINDOWS_ABSOLUTE = /^[a-zA-Z]:[\\/]/
 const LOCATION_SUFFIX = /(#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)$/i
 const ROOT_FILE_WITH_EXTENSION = /^\.[^./\\]+$|^[^./\\]+\.[^./\\]+$/
+// POSIX paths in chat almost always carry at least one ASCII letter or digit
+// (e.g. /Users, /tmp, file.ts). Pure CJK multi-segment strings such as
+// "进度/耗时/工具统计" are category labels, not filesystem paths — reject them
+// so the leading CJK boundary does not turn the rest into a file badge.
+const HAS_ASCII_ALNUM = /[a-zA-Z0-9]/
 const START_BLOCKER = /[a-zA-Z0-9_./\\:@~%+#?&=$-]/
 const UNQUOTED_TERMINATOR = /[\s`"'<>*|,;!，。；：！？、]/
 const SIMPLE_TRAILING = new Set([
@@ -70,6 +75,7 @@ function classifyPath(path: string): LocalPathKind | null {
   if (!path.startsWith("/") || path.startsWith("//")) return null
   const body = path.slice(1)
   if (!body) return null
+  if (!HAS_ASCII_ALNUM.test(body)) return null
   if (body.includes("/")) return "posix"
   return ROOT_FILE_WITH_EXTENSION.test(body) ? "posix" : null
 }
