@@ -470,101 +470,15 @@ mod tauri_app {
                     });
                 }
 
-                // Start chat channel background tasks
-                {
-                    let ccm = app.state::<ChatChannelManager>();
-                    let broadcaster =
-                        app.state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>();
-                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
-                    let ccm_ref = ccm.clone_ref();
-                    let br = broadcaster.inner().clone();
-                    let bus = app
-                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
-                        .inner()
-                        .clone();
-                    let cm = app.state::<ConnectionManager>().clone_ref();
-                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
-                    let runtime = app
-                        .state::<crate::commands::delegation::DelegationRuntimeSettings>()
-                        .inner()
-                        .clone();
-                    let runtime_ctx = crate::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
-                        runtime,
-                        data_dir: effective_data_dir.clone(),
-                    };
-                    tauri::async_runtime::spawn(async move {
-                        ccm_ref
-                            .start_background(br, bus, db_conn, cm, emitter, runtime_ctx)
-                            .await;
-                    });
-                }
-
-                // Spawn the desktop pet state mapper: subscribes to ACP events
-                // (typed envelopes via the in-process bus) AND folder/app
-                // side-channel notifications (JSON via the broadcaster), and
-                // emits `pet://state` whenever the aggregated pet state
-                // changes. The renderer in the floating pet window listens
-                // for these events to drive its sprite animation row.
-                {
-                    let bus = app
-                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
-                        .inner()
-                        .clone();
-                    let broadcaster = app
-                        .state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>()
-                        .inner()
-                        .clone();
-                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
-                    let pet_state_handle = app
-                        .state::<crate::pet_state_mapper::PetStateHandle>()
-                        .inner()
-                        .clone();
-                    tauri::async_runtime::spawn(
-                        crate::pet_state_mapper::pet_state_subscriber_task(
-                            bus,
-                            broadcaster,
-                            emitter,
-                            pet_state_handle,
-                        ),
-                    );
-                }
-
-                // Spawn the pet panel active-session aggregator: rebuilds the
-                // `PetSessionsPayload` (running/waiting/error counts + per-
-                // session rows with titles and pending permissions) on ACP
-                // lifecycle events and emits `pet://sessions` for the sprite
-                // badge + panel window. Shares the same buses as the ambient
-                // mapper but is kept separate so the DB-free ambient task stays
-                // simple; desktop-only (server mode has no pet window).
-                {
-                    let bus = app
-                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
-                        .inner()
-                        .clone();
-                    let broadcaster = app
-                        .state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>()
-                        .inner()
-                        .clone();
-                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
-                    let manager = app.state::<ConnectionManager>().inner().clone_ref();
-                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
-                    tauri::async_runtime::spawn(
-                        crate::pet_sessions::pet_sessions_subscriber_task(
-                            bus,
-                            broadcaster,
-                            emitter,
-                            manager,
-                            db_conn,
-                        ),
-                    );
-                }
-
                 // Delegation broker + UDS listener. Built from the managed
                 // ConnectionManager + DB so spawn / depth-lookup work against
                 // live state. Managed alongside the existing per-resource
                 // states so commands (Tauri + web) can resolve them by type.
-                // MUST run before the LifecycleSubscriber spawn below so the
-                // broker handle is available to it.
+                //
+                // MUST run before:
+                //   * chat-channel / automation startup paths that
+                //     `state::<DelegationRuntimeSettings>()`
+                //   * LifecycleSubscriber spawn so the broker handle is available
                 let broker_for_lifecycle = {
                     let cm_state = app.state::<ConnectionManager>();
                     let db_conn = app.state::<db::AppDatabase>().conn.clone();
@@ -677,6 +591,96 @@ mod tauri_app {
                     });
                     stack.broker
                 };
+
+                // Start chat channel background tasks (needs
+                // DelegationRuntimeSettings managed above).
+                {
+                    let ccm = app.state::<ChatChannelManager>();
+                    let broadcaster =
+                        app.state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>();
+                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let ccm_ref = ccm.clone_ref();
+                    let br = broadcaster.inner().clone();
+                    let bus = app
+                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .inner()
+                        .clone();
+                    let cm = app.state::<ConnectionManager>().clone_ref();
+                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let runtime = app
+                        .state::<crate::commands::delegation::DelegationRuntimeSettings>()
+                        .inner()
+                        .clone();
+                    let runtime_ctx = crate::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
+                        runtime,
+                        data_dir: effective_data_dir.clone(),
+                    };
+                    tauri::async_runtime::spawn(async move {
+                        ccm_ref
+                            .start_background(br, bus, db_conn, cm, emitter, runtime_ctx)
+                            .await;
+                    });
+                }
+
+                // Spawn the desktop pet state mapper: subscribes to ACP events
+                // (typed envelopes via the in-process bus) AND folder/app
+                // side-channel notifications (JSON via the broadcaster), and
+                // emits `pet://state` whenever the aggregated pet state
+                // changes. The renderer in the floating pet window listens
+                // for these events to drive its sprite animation row.
+                {
+                    let bus = app
+                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .inner()
+                        .clone();
+                    let broadcaster = app
+                        .state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>()
+                        .inner()
+                        .clone();
+                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let pet_state_handle = app
+                        .state::<crate::pet_state_mapper::PetStateHandle>()
+                        .inner()
+                        .clone();
+                    tauri::async_runtime::spawn(
+                        crate::pet_state_mapper::pet_state_subscriber_task(
+                            bus,
+                            broadcaster,
+                            emitter,
+                            pet_state_handle,
+                        ),
+                    );
+                }
+
+                // Spawn the pet panel active-session aggregator: rebuilds the
+                // `PetSessionsPayload` (running/waiting/error counts + per-
+                // session rows with titles and pending permissions) on ACP
+                // lifecycle events and emits `pet://sessions` for the sprite
+                // badge + panel window. Shares the same buses as the ambient
+                // mapper but is kept separate so the DB-free ambient task stays
+                // simple; desktop-only (server mode has no pet window).
+                {
+                    let bus = app
+                        .state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .inner()
+                        .clone();
+                    let broadcaster = app
+                        .state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>()
+                        .inner()
+                        .clone();
+                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let manager = app.state::<ConnectionManager>().inner().clone_ref();
+                    let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    tauri::async_runtime::spawn(
+                        crate::pet_sessions::pet_sessions_subscriber_task(
+                            bus,
+                            broadcaster,
+                            emitter,
+                            manager,
+                            db_conn,
+                        ),
+                    );
+                }
 
                 // Spawn the LifecycleSubscriber: persists cross-connection DB state
                 // (currently `external_id` on conversation rows when SessionStarted fires)
