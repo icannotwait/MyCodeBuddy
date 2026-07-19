@@ -36,7 +36,7 @@
 Add this test beside the existing coalesced runtime tests:
 
 ```rust
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn coalesced_runtime_flush_releases_pending_lock_before_meta_refresh() {
     let (broker, spawner, store, _attention) = coordination_broker().await;
     let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
@@ -45,19 +45,15 @@ async fn coalesced_runtime_flush_releases_pending_lock_before_meta_refresh() {
         .await
         .expect("coordination identity")
         .runtime;
+
+    broker
+        .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
+        .await;
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     runtime
         .install_publication_gate(entered_tx, release_rx)
         .await;
-
-    broker
-        .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
-        .await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(RUNTIME_STATS_FLUSH_INTERVAL).await;
     entered_rx
         .await
         .expect("coalesced flush should reach runtime publication");
@@ -87,7 +83,7 @@ Run from `src-tauri`:
 cargo test --features test-utils coalesced_runtime_flush_releases_pending_lock_before_meta_refresh -- --nocapture
 ```
 
-Expected: FAIL after the `within` one-second timeout with `operation should finish within one second`, proving the successful flush retained `pending.inner`.
+Expected: FAIL after the real-time `within` one-second timeout with `operation should finish within one second`, proving the successful flush retained `pending.inner`. This test intentionally does not pause Tokio time because a permanently blocked background flush prevents paused time from auto-advancing.
 
 - [ ] **Step 3: Implement the minimal guard-lifetime fix**
 
