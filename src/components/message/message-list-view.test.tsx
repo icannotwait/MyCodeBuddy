@@ -461,6 +461,7 @@ function seedHistory(
               agent_type: "codex",
               title: "t",
               title_locked: false,
+              auto_title_finalized: false,
               status: "in_progress",
               awaiting_reply_token: null,
               kind: "regular",

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
-import type { ActiveDelegationState } from "@/lib/types"
+import { emptyRuntimeStats, type ActiveDelegationState } from "@/lib/types"
 
 function dele(
   overrides: Partial<ActiveDelegationState> & { parent_tool_use_id: string }
@@ -10,6 +10,9 @@ function dele(
     child_connection_id: "c1",
     child_conversation_id: 99,
     agent_type: "codex",
+    task_id: "task-1",
+    started_at: "2026-07-19T00:00:00.000Z",
+    runtime_stats: emptyRuntimeStats(),
     ...overrides,
   }
 }

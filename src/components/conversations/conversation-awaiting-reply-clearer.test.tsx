@@ -37,6 +37,7 @@ function makeSummary(
     folder_id: 1,
     title: null,
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "claude_code",
     status: "pending_review",
     awaiting_reply_token: null,

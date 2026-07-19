@@ -20,6 +20,7 @@ function summary(
     folder_id: 1,
     title: "t",
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "claude_code",
     status: "in_progress",
     awaiting_reply_token: null,

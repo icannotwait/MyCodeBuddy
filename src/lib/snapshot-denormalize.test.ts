@@ -38,6 +38,16 @@ describe("denormalizeSnapshot — active_delegations", () => {
             child_connection_id: "c1",
             child_conversation_id: 9,
             agent_type: "codex",
+            task_id: "task-1",
+            started_at: "2026-07-19T00:00:00.000Z",
+            runtime_stats: {
+              started_at: "2026-07-19T00:00:00.000Z",
+              tool_call_count: 0,
+              edit_tool_call_count: 0,
+              touched_files: [],
+              touched_files_truncated: false,
+              line_counts_complete: false,
+            },
           },
         ],
       })
