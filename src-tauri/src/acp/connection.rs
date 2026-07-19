@@ -2323,6 +2323,19 @@ fn companion_features_arg(
     Some(features.join(","))
 }
 
+fn continuation_enabled_for_launch(
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    agent_type: AgentType,
+    env_value: Option<&std::ffi::OsStr>,
+) -> bool {
+    plan.expose_codeg_delegation
+        && agent_type == AgentType::Codex
+        && env_value.is_some_and(|value| {
+            let value = value.to_string_lossy();
+            value.as_ref() == "1" || value.eq_ignore_ascii_case("true")
+        })
+}
+
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
 /// stash for revocation, whether feedback was exposed, and an optional ready
 /// lease waiter (required only when the plan exposes Codeg delegation).
@@ -2339,6 +2352,7 @@ async fn inject_codeg_mcp(
     injection: &DelegationInjection,
     parent_connection_id: &str,
     working_dir: &Path,
+    agent_type: AgentType,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
 ) -> Option<CompanionInjection> {
     // Feature list follows the immutable launch plan for Codeg delegation —
@@ -2347,6 +2361,11 @@ async fn inject_codeg_mcp(
     let delegation_enabled = plan.expose_codeg_delegation;
     // Join capability is connection-bound and follows Codeg delegation exposure.
     let coordination_v1 = plan.expose_codeg_delegation;
+    let delegation_continuation_v1 = continuation_enabled_for_launch(
+        plan,
+        agent_type,
+        std::env::var_os("CODEG_DELEGATION_CONTINUATION_V1").as_deref(),
+    );
     let role = if plan.source == crate::acp::delegation::route::DelegationRouteSource::ForcedChild {
         crate::acp::delegation::transport::CompanionRole::DelegationChild
     } else {
@@ -2381,6 +2400,7 @@ async fn inject_codeg_mcp(
                 parent_connection_id: parent_connection_id.to_string(),
                 working_dir: working_dir.to_path_buf(),
                 coordination_v1,
+                delegation_continuation_v1,
                 role,
             },
         )
@@ -3026,8 +3046,15 @@ async fn run_connection(
             let mut delegate_injection =
                 if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
                     if let Some(inj) = delegation_injection.as_ref() {
-                        inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd, &route_plan)
-                            .await
+                        inject_codeg_mcp(
+                            &mut mcp_servers,
+                            inj,
+                            &conn_id,
+                            &cwd,
+                            agent_type,
+                            &route_plan,
+                        )
+                        .await
                     } else {
                         None
                     }
@@ -9588,6 +9615,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuation_capability_defaults_off() {
+        assert!(!continuation_enabled_for_launch(
+            &codeg_plan(AgentType::Codex),
+            AgentType::Codex,
+            None,
+        ));
+    }
+
+    #[test]
+    fn continuation_capability_enables_only_opted_in_codex_codeg_launch() {
+        use std::ffi::OsStr;
+
+        let codex_codeg = codeg_plan(AgentType::Codex);
+        for enabled in [OsStr::new("1"), OsStr::new("true"), OsStr::new("TRUE")] {
+            assert!(continuation_enabled_for_launch(
+                &codex_codeg,
+                AgentType::Codex,
+                Some(enabled),
+            ));
+        }
+        for disabled in [OsStr::new("0"), OsStr::new("false"), OsStr::new("yes")] {
+            assert!(!continuation_enabled_for_launch(
+                &codex_codeg,
+                AgentType::Codex,
+                Some(disabled),
+            ));
+        }
+        assert!(!continuation_enabled_for_launch(
+            &native_plan(AgentType::Codex),
+            AgentType::Codex,
+            Some(OsStr::new("1")),
+        ));
+        assert!(!continuation_enabled_for_launch(
+            &codeg_plan(AgentType::ClaudeCode),
+            AgentType::ClaudeCode,
+            Some(OsStr::new("1")),
+        ));
+    }
+
     /// Build base Npx argv then apply the immutable route plan once — mirrors
     /// production `build_agent` for Npx agents.
     fn apply_base_npx_then_route(
@@ -12656,6 +12723,7 @@ mod tests {
             &injection,
             "parent-conn",
             std::path::Path::new("/tmp"),
+            AgentType::Codex,
             &plan,
         )
         .await;

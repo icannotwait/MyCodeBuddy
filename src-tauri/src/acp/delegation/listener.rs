@@ -9,13 +9,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::continuation::coordinator::{
+    ContinuationError, DelegationContinuationCoordinator, JoinArmOutcome, JoinArmRequest,
+};
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
@@ -58,6 +63,8 @@ pub struct TokenEntry {
     pub working_dir: PathBuf,
     /// Whether this launch advertised `coordination_v1` (Join semantics).
     pub coordination_v1: bool,
+    /// Whether this immutable launch opted into durable Join continuation.
+    pub delegation_continuation_v1: bool,
     /// Immutable companion role for this launch.
     pub role: CompanionRole,
 }
@@ -69,6 +76,7 @@ impl TokenEntry {
             parent_connection_id: parent_connection_id.to_string(),
             working_dir,
             coordination_v1: false,
+            delegation_continuation_v1: false,
             role: CompanionRole::Root,
         }
     }
@@ -77,9 +85,23 @@ impl TokenEntry {
 #[derive(Default)]
 pub struct TokenRegistry {
     inner: RwLock<HashMap<String, TokenEntry>>,
+    continuation_coordinator: OnceLock<Arc<DelegationContinuationCoordinator>>,
 }
 
 impl TokenRegistry {
+    pub fn with_continuation_coordinator(
+        coordinator: Arc<DelegationContinuationCoordinator>,
+    ) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            continuation_coordinator: OnceLock::from(coordinator),
+        }
+    }
+
+    fn continuation_coordinator(&self) -> Option<Arc<DelegationContinuationCoordinator>> {
+        self.continuation_coordinator.get().cloned()
+    }
+
     pub async fn register(&self, token: String, entry: TokenEntry) {
         self.inner.write().await.insert(token, entry);
     }
@@ -107,6 +129,41 @@ impl TokenRegistry {
             }
         });
         revoked
+    }
+}
+
+enum ArmStatus {
+    Immediate(DelegationStatusBatch),
+    Suspended,
+}
+
+#[derive(Serialize)]
+struct StatusErrorBody {
+    code: &'static str,
+    message: &'static str,
+}
+
+#[derive(Serialize)]
+struct StatusErrorEnvelope {
+    error: StatusErrorBody,
+}
+
+impl StatusErrorEnvelope {
+    fn continuation_arm_failed() -> Self {
+        Self {
+            error: StatusErrorBody {
+                code: "continuation_arm_failed",
+                message: "Delegation continuation could not be armed",
+            },
+        }
+    }
+}
+
+struct CancelWaiterOnDrop(CancellationToken);
+
+impl Drop for CancelWaiterOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -279,7 +336,10 @@ impl DelegationListener {
                         return Ok(());
                     },
                 };
-                status_response(reports)?
+                match reports {
+                    Ok(batch) => status_response(batch)?,
+                    Err(_) => value_response(&StatusErrorEnvelope::continuation_arm_failed())?,
+                }
             }
             BrokerMessage::CancelTask(req) => report_response(self.process_cancel_task(req).await)?,
             BrokerMessage::Feedback(req) => {
@@ -497,34 +557,37 @@ impl DelegationListener {
     /// `wait_ms=0` and a token that advertised `coordination_v1`. Invalid-token
     /// or capability-denied Join still returns Join-shaped additive fields
     /// without revealing ownership and without parking.
-    async fn process_status(&self, req: BrokerStatusRequest) -> DelegationStatusBatch {
+    async fn process_status(
+        &self,
+        req: BrokerStatusRequest,
+    ) -> Result<DelegationStatusBatch, ContinuationError> {
         let Some(entry) = self.tokens.lookup(&req.token).await else {
             let unknown_reports: Vec<_> =
                 req.task_ids.iter().map(|id| unknown_report(id)).collect();
-            return match req.return_when {
+            return Ok(match req.return_when {
                 None => DelegationStatusBatch::legacy(unknown_reports),
                 Some(_) => DelegationStatusBatch::joined(
                     unknown_reports,
                     DelegationWakeReason::Unavailable,
                     Vec::new(),
                 ),
-            };
+            });
         };
         // Connection-bound capability: a legacy token must not enter Join or
         // consult Broker ownership even if raw socket JSON sends return_when.
         if req.return_when.is_some() && !entry.coordination_v1 {
-            return DelegationStatusBatch::joined(
+            return Ok(DelegationStatusBatch::joined(
                 req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                 DelegationWakeReason::Unavailable,
                 Vec::new(),
-            );
+            ));
         }
         let parent_conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
             .await;
         match req.return_when {
-            None => DelegationStatusBatch::legacy(
+            None => Ok(DelegationStatusBatch::legacy(
                 self.broker
                     .get_tasks_status(
                         &entry.parent_connection_id,
@@ -533,21 +596,78 @@ impl DelegationListener {
                         legacy_wait_from(req.wait_ms),
                     )
                     .await,
-            ),
+            )),
             Some(DelegationReturnWhen::AllTerminalOrAttention) if req.wait_ms == Some(0) => {
-                self.broker
-                    .join_tasks_status(
+                if !entry.delegation_continuation_v1 {
+                    return Ok(self
+                        .broker
+                        .join_tasks_status(
+                            &entry.parent_connection_id,
+                            parent_conversation_id,
+                            &req.task_ids,
+                        )
+                        .await);
+                }
+                let Some(parent_conversation_id) = parent_conversation_id else {
+                    return Ok(DelegationStatusBatch::joined(
+                        req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    ));
+                };
+                if let crate::acp::delegation::broker::JoinEvaluation::Ready(batch) = self
+                    .broker
+                    .evaluate_join_snapshot(
                         &entry.parent_connection_id,
                         parent_conversation_id,
                         &req.task_ids,
                     )
                     .await
+                {
+                    return Ok(batch);
+                }
+                let coordinator = self
+                    .tokens
+                    .continuation_coordinator()
+                    .ok_or(ContinuationError::ArmWorkerDropped)?;
+                let waiter_closed = CancellationToken::new();
+                let _cancel_waiter_on_drop = CancelWaiterOnDrop(waiter_closed.clone());
+                let request = JoinArmRequest {
+                    parent_connection_id: entry.parent_connection_id,
+                    parent_conversation_id,
+                    task_ids: req.task_ids,
+                    waiter_closed,
+                };
+                let arm_task = tokio::spawn(async move {
+                    match coordinator.begin_arm_from_join(request).await? {
+                        JoinArmOutcome::Immediate(batch) => {
+                            Ok::<ArmStatus, ContinuationError>(ArmStatus::Immediate(batch))
+                        }
+                        JoinArmOutcome::Arming { completion, .. } => {
+                            completion
+                                .await
+                                .map_err(|_| ContinuationError::ArmWorkerDropped)??;
+                            Ok::<ArmStatus, ContinuationError>(ArmStatus::Suspended)
+                        }
+                    }
+                });
+                let status = arm_task
+                    .await
+                    .map_err(|_| ContinuationError::ArmWorkerDropped)??;
+                match status {
+                    ArmStatus::Immediate(batch) => Ok(batch),
+                    ArmStatus::Suspended => {
+                        std::future::pending::<()>().await;
+                        drop(_cancel_waiter_on_drop);
+                        unreachable!("the suspended canonical Join never returns")
+                    }
+                }
             }
-            Some(_) => DelegationStatusBatch::joined(
+            Some(_) => Ok(DelegationStatusBatch::joined(
                 req.task_ids.iter().map(|id| unknown_report(id)).collect(),
                 DelegationWakeReason::Unavailable,
                 Vec::new(),
-            ),
+            )),
         }
     }
 
@@ -1001,13 +1121,26 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::connection::SuspensionAck;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
+    use crate::acp::delegation::continuation::coordinator::{
+        ContinuationError, ContinuationPromptRequest, DelegationContinuationCoordinator,
+        ParentContinuationPort, ParentTurnSnapshot, PromptAdmissionResult, SuspendRequest,
+        SystemContinuationClock,
+    };
+    use crate::acp::delegation::continuation::store::{
+        ContinuationStore, InMemoryContinuationStore,
+    };
+    use crate::acp::delegation::continuation::types::{
+        ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
+    };
     use crate::acp::delegation::spawner::{
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
     };
     use chrono::Utc;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::duplex;
 
@@ -1143,6 +1276,187 @@ mod tests {
             })
             .await;
         broker
+    }
+
+    struct ContinuationTestPort {
+        snapshot_calls: AtomicUsize,
+        snapshot_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        snapshot_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        suspend_entered: std::sync::Mutex<Option<oneshot::Sender<SuspendRequest>>>,
+        suspend_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        fail_snapshot: bool,
+    }
+
+    impl ContinuationTestPort {
+        fn ready() -> Arc<Self> {
+            Arc::new(Self {
+                snapshot_calls: AtomicUsize::new(0),
+                snapshot_entered: std::sync::Mutex::new(None),
+                snapshot_release: tokio::sync::Mutex::new(None),
+                suspend_entered: std::sync::Mutex::new(None),
+                suspend_release: tokio::sync::Mutex::new(None),
+                fail_snapshot: false,
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                fail_snapshot: true,
+                ..Self::ready_value()
+            })
+        }
+
+        fn snapshot_gated() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    snapshot_entered: std::sync::Mutex::new(Some(entered_tx)),
+                    snapshot_release: tokio::sync::Mutex::new(Some(release_rx)),
+                    ..Self::ready_value()
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+
+        fn suspend_gated() -> (
+            Arc<Self>,
+            oneshot::Receiver<SuspendRequest>,
+            oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    suspend_entered: std::sync::Mutex::new(Some(entered_tx)),
+                    suspend_release: tokio::sync::Mutex::new(Some(release_rx)),
+                    ..Self::ready_value()
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+
+        fn ready_value() -> Self {
+            Self {
+                snapshot_calls: AtomicUsize::new(0),
+                snapshot_entered: std::sync::Mutex::new(None),
+                snapshot_release: tokio::sync::Mutex::new(None),
+                suspend_entered: std::sync::Mutex::new(None),
+                suspend_release: tokio::sync::Mutex::new(None),
+                fail_snapshot: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for ContinuationTestPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(entered) = self
+                .snapshot_entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.snapshot_release.lock().await.take() {
+                let _ = release.await;
+            }
+            if self.fail_snapshot {
+                return Err(ContinuationError::ParentUnavailable);
+            }
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.to_string(),
+                conversation_id: 1,
+                session_id: "session-1".into(),
+                turn_generation: 1,
+                turn_in_flight: true,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            if let Some(entered) = self
+                .suspend_entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = entered.send(SuspendRequest {
+                    continuation_id: request.continuation_id.clone(),
+                    parent_connection_id: request.parent_connection_id.clone(),
+                    parent_conversation_id: request.parent_conversation_id,
+                    parent_session_id: request.parent_session_id.clone(),
+                    parent_turn_generation: request.parent_turn_generation,
+                });
+            }
+            if let Some(release) = self.suspend_release.lock().await.take() {
+                let _ = release.await;
+            }
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    fn continuation_registry(
+        broker: Arc<DelegationBroker>,
+        store: Arc<InMemoryContinuationStore>,
+        port: Arc<ContinuationTestPort>,
+    ) -> (Arc<TokenRegistry>, Arc<DelegationContinuationCoordinator>) {
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store as Arc<dyn ContinuationStore>,
+            broker,
+            Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            port,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let tokens = Arc::new(TokenRegistry::with_continuation_coordinator(
+            coordinator.clone(),
+        ));
+        (tokens, coordinator)
+    }
+
+    fn continuation_token_entry(enabled: bool) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: "parent-conn".into(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: true,
+            delegation_continuation_v1: enabled,
+            role: CompanionRole::Root,
+        }
     }
 
     fn make_listener(
@@ -1419,6 +1733,286 @@ mod tests {
         (broker, tokens, task_id)
     }
 
+    async fn complete_running_task(broker: &DelegationBroker, task_id: &str) {
+        broker
+            .complete_call(
+                task_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 7,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn continuation_capability_off_keeps_existing_parked_join() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "continuation-off-running")
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("tok".into(), continuation_token_entry(false))
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+
+        let join = tokio::spawn(async move {
+            listener
+                .process_status(BrokerStatusRequest {
+                    token: "tok".into(),
+                    task_ids: vec![task_id],
+                    wait_ms: Some(0),
+                    return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !join.is_finished(),
+            "capability-off Join must retain the existing parked listener behavior"
+        );
+
+        complete_running_task(&broker, "continuation-off-running").await;
+        let batch = join.await.unwrap().unwrap();
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
+        assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn continuation_capability_unbound_parent_returns_unavailable_without_row() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        broker
+            .seed_live_task_for_test("parent-conn", "unbound-running")
+            .await;
+        broker
+            .seed_live_task_for_test("other-parent", "foreign-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = ContinuationTestPort::ready();
+        let (tokens, _coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port.clone());
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker.clone(), tokens.clone(), None);
+
+        let batch = listener
+            .process_status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["unbound-running".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+        assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
+
+        let bound_listener = make_listener(broker, tokens, Some(1));
+        let invalid_batch = bound_listener
+            .process_status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["missing".into(), "foreign-running".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_batch.wake_reason,
+            Some(DelegationWakeReason::Unavailable)
+        );
+        assert!(
+            invalid_batch
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Unknown)
+        );
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+        assert_eq!(
+            port.snapshot_calls.load(Ordering::SeqCst),
+            0,
+            "an unbound parent must not construct or dispatch a JoinArmRequest"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_peer_close_before_insert_creates_no_row() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        broker
+            .seed_live_task_for_test("parent-conn", "pre-insert-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, snapshot_entered, snapshot_release) = ContinuationTestPort::snapshot_gated();
+        let (tokens, coordinator) = continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let baseline_coordinator_owners = Arc::strong_count(&coordinator);
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["pre-insert-running".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        snapshot_entered
+            .await
+            .expect("snapshot gate establishes the pre-insert boundary");
+        assert!(Arc::strong_count(&coordinator) > baseline_coordinator_owners);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("peer EOF must drop the status waiter")
+            .unwrap()
+            .unwrap();
+        snapshot_release.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&coordinator) != baseline_coordinator_owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached pre-insert arm task must observe waiter cancellation and exit");
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_peer_close_during_suspend_does_not_abort_arm_worker() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        broker
+            .seed_live_task_for_test("parent-conn", "post-insert-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, _coordinator) = continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["post-insert-running".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        let suspend = suspend_entered
+            .await
+            .expect("suspend entry proves the row and worker own the arm");
+        assert_eq!(suspend.parent_connection_id, "parent-conn");
+        assert_eq!(store.list_non_terminal().await.unwrap().len(), 1);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("peer EOF must release serve_one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.list_non_terminal().await.unwrap().len(), 1);
+
+        suspend_release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows
+                    .first()
+                    .is_some_and(|row| row.state == ContinuationState::Waiting)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached arm task must allow the owned worker to publish Waiting");
+
+        complete_running_task(&broker, "post-insert-running").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !store.list_non_terminal().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned worker must finish after the child becomes terminal");
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_arm_failure_returns_explicit_tool_error() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        broker
+            .seed_live_task_for_test("parent-conn", "arm-failure-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (tokens, _coordinator) = continuation_registry(
+            broker.clone(),
+            store.clone(),
+            ContinuationTestPort::failing(),
+        );
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["arm-failure-running".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        let response: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            response.outcome,
+            json!({
+                "error": {
+                    "code": "continuation_arm_failed",
+                    "message": "Delegation continuation could not be armed"
+                }
+            })
+        );
+        let rendered = crate::acp::delegation::companion::render_status_result(&response.outcome);
+        assert_eq!(rendered["isError"], true);
+        assert_eq!(
+            rendered["content"][0]["text"],
+            "Delegation continuation could not be armed"
+        );
+        assert_eq!(rendered["structuredContent"], response.outcome);
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+    }
+
     /// A legacy token (`coordination_v1=false`) must not enter Join or reveal
     /// whether a requested running task exists, even if raw socket JSON sends
     /// `return_when=all_terminal_or_attention`.
@@ -1436,7 +2030,8 @@ mod tests {
             }),
         )
         .await
-        .expect("legacy-token Join rejection must not park");
+        .expect("legacy-token Join rejection must not park")
+        .unwrap();
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
         assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
         assert!(batch.attention_requests.unwrap().is_empty());
@@ -1522,8 +2117,7 @@ mod tests {
     /// terminal. The peer-close race abandons the wait while leaving the task
     /// itself untouched — there's no broker-side side effect from a status
     /// query.
-    #[tokio::test]
-    async fn infinite_status_wait_abandoned_when_peer_closes() {
+    async fn assert_status_peer_close_leaves_children_running() {
         let (broker, tokens, task_id) = running_task_fixture().await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
         let (mut client, mut server) = duplex(8 * 1024);
@@ -1536,14 +2130,6 @@ mod tests {
             return_when: None,
         });
         write_frame(&mut client, &status).await.unwrap();
-
-        // Let the server park inside the unbounded wait.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(
-            !server_task.is_finished(),
-            "server must be parked on the unbounded wait"
-        );
-
         // Companion cancels: drop the request socket without completing the task.
         drop(client);
 
@@ -1556,6 +2142,25 @@ mod tests {
 
         // The task itself was not touched by the abandoned status query.
         assert_eq!(broker.pending_count().await, 1);
+        assert_eq!(
+            broker
+                .metrics()
+                .snapshot()
+                .wait_return_reasons
+                .get("peer_closed"),
+            Some(&1),
+            "metrics prove serve_one observed peer EOF while the status wait was active"
+        );
+    }
+
+    #[tokio::test]
+    async fn infinite_status_wait_abandoned_when_peer_closes() {
+        assert_status_peer_close_leaves_children_running().await;
+    }
+
+    #[tokio::test]
+    async fn continuation_status_peer_close_leaves_children_running() {
+        assert_status_peer_close_leaves_children_running().await;
     }
 
     /// Batch status over the listener: two tasks, one completed and one still
@@ -2830,6 +3435,7 @@ mod tests {
             parent_connection_id: conn.to_string(),
             working_dir: PathBuf::from("/tmp"),
             coordination_v1: true,
+            delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
         }
     }
@@ -2839,6 +3445,7 @@ mod tests {
             parent_connection_id: conn.to_string(),
             working_dir: PathBuf::from("/tmp"),
             coordination_v1: true,
+            delegation_continuation_v1: false,
             role: CompanionRole::Root,
         }
     }

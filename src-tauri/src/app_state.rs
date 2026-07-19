@@ -223,7 +223,9 @@ pub fn build_delegation_stack(
             crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new(),
         ),
     ));
-    let tokens = Arc::new(TokenRegistry::default());
+    let tokens = Arc::new(TokenRegistry::with_continuation_coordinator(
+        continuation_coordinator.clone(),
+    ));
     let leases = Arc::new(CompanionLeaseRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());
     let feedback = crate::acp::feedback::FeedbackRuntimeConfig::new();

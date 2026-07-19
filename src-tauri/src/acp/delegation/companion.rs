@@ -1026,6 +1026,17 @@ fn timeout_cancel_guidance_report(task_id: &str) -> Value {
 /// `attention_requests`) in both text content and `structuredContent`. Legacy
 /// outcomes without those keys stay a tasks-only envelope.
 pub fn render_status_result(outcome: &Value) -> Value {
+    if let Some(error) = outcome.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Delegation continuation could not be armed");
+        return json!({
+            "content": [{"type": "text", "text": message}],
+            "isError": true,
+            "structuredContent": outcome,
+        });
+    }
     let tasks = outcome
         .get("tasks")
         .and_then(Value::as_array)
@@ -2082,6 +2093,26 @@ mod tests {
         assert_eq!(tasks[0]["task_id"], "t1");
         assert_eq!(tasks[0]["status"], "failed");
         assert_eq!(rendered["isError"], true);
+    }
+
+    #[test]
+    fn continuation_arm_failure_returns_explicit_tool_error() {
+        let outcome = json!({
+            "error": {
+                "code": "continuation_arm_failed",
+                "message": "Delegation continuation could not be armed"
+            }
+        });
+
+        let rendered = render_status_result(&outcome);
+
+        assert_eq!(rendered["isError"], true);
+        assert_eq!(
+            rendered["content"][0]["text"],
+            "Delegation continuation could not be armed"
+        );
+        assert_eq!(rendered["structuredContent"], outcome);
+        assert!(rendered["structuredContent"].get("tasks").is_none());
     }
 
     #[test]
