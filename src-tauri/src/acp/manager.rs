@@ -10723,9 +10723,10 @@ mod tests {
         assert!(still.prompt_admitted_at.is_some());
 
         admit_release_tx.send(()).unwrap();
-        completed_rx
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx)
             .await
-            .expect("worker must finish Completed after post-admission Stop");
+            .expect("worker must finish Completed after post-admission Stop within bound")
+            .expect("Completed CAS notification channel closed unexpectedly");
         let done = inner.load(&continuation_id).await.unwrap().unwrap();
         assert_eq!(done.state, ContinuationState::Completed);
         assert!(done.prompt_admitted_at.is_some());

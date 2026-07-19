@@ -2149,6 +2149,9 @@ mod cleanup_tests {
         wake_pending: Mutex<Option<oneshot::Sender<()>>>,
         completed: Mutex<Option<oneshot::Sender<()>>>,
         cancelled: Mutex<Option<oneshot::Sender<()>>>,
+        /// Gates insert so a join can become Ready before the worker evaluates
+        /// its post-insert snapshot (forces claimed suspend path).
+        insert_gate: tokio::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
         /// Gates the first Arming CAS that sets `suspend_requested_at` so cancel
         /// can race before the first suspension dispatch.
         suspend_request_gate:
@@ -2162,6 +2165,7 @@ mod cleanup_tests {
                 wake_pending: Mutex::new(None),
                 completed: Mutex::new(None),
                 cancelled: Mutex::new(None),
+                insert_gate: tokio::sync::Mutex::new(None),
                 suspend_request_gate: tokio::sync::Mutex::new(None),
             })
         }
@@ -2193,6 +2197,14 @@ mod cleanup_tests {
             rx
         }
 
+        async fn install_insert_gate(
+            &self,
+            entered: oneshot::Sender<()>,
+            release: oneshot::Receiver<()>,
+        ) {
+            *self.insert_gate.lock().await = Some((entered, release));
+        }
+
         async fn install_suspend_request_gate(
             &self,
             entered: oneshot::Sender<()>,
@@ -2208,6 +2220,10 @@ mod cleanup_tests {
             &self,
             new: NewContinuation,
         ) -> Result<ContinuationRecord, ContStoreError> {
+            if let Some((entered, release)) = self.insert_gate.lock().await.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             self.inner.insert_arming(new).await
         }
 
@@ -2712,9 +2728,10 @@ mod cleanup_tests {
             .is_empty());
 
         release_tx.send(()).unwrap();
-        completed_rx
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx)
             .await
-            .expect("worker must CAS Completed after admission release");
+            .expect("worker must CAS Completed after admission release within bound")
+            .expect("Completed CAS notification channel closed unexpectedly");
         let done = store.load(&continuation_id).await.unwrap().unwrap();
         assert_eq!(done.state, ContinuationState::Completed);
         assert!(done.prompt_admitted_at.is_some());
@@ -2933,10 +2950,15 @@ mod cleanup_tests {
     async fn continuation_cleanup_cancel_fences_before_first_suspension_dispatch() {
         let inner = Arc::new(InMemoryContinuationStore::default());
         let store = TransitionNotifyStore::new(inner);
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
+        let (insert_entered_tx, insert_entered_rx) = oneshot::channel();
+        let (insert_release_tx, insert_release_rx) = oneshot::channel();
         store
-            .install_suspend_request_gate(entered_tx, release_rx)
+            .install_insert_gate(insert_entered_tx, insert_release_rx)
+            .await;
+        let (cas_entered_tx, cas_entered_rx) = oneshot::channel();
+        let (cas_release_tx, cas_release_rx) = oneshot::channel();
+        store
+            .install_suspend_request_gate(cas_entered_tx, cas_release_rx)
             .await;
         let (port, mut suspend_entered_rx, _suspend_release) = SuspendGatePort::new();
         let broker = Arc::new(DelegationBroker::new(
@@ -2946,20 +2968,34 @@ mod cleanup_tests {
         broker.seed_live_task_for_test("parent", "task-1").await;
         let coordinator = Arc::new(DelegationContinuationCoordinator::new(
             store.clone() as Arc<dyn ContinuationStore>,
-            broker,
+            broker.clone(),
             Arc::new(DelegationMetrics::default()),
             port.clone() as Arc<dyn ParentContinuationPort>,
             Arc::new(SystemContinuationClock::new()),
         ));
-        let outcome = coordinator
-            .begin_arm_from_join(JoinArmRequest {
-                parent_connection_id: "parent".into(),
-                parent_conversation_id: 1,
-                task_ids: vec!["task-1".into()],
-                waiter_closed: CancellationToken::new(),
-            })
+        // Hold insert so the join can become Ready before the worker's post-insert
+        // evaluation. That forces the claimed suspend path: unfixed production
+        // uses bare suspend.await (no cancel arm) and hangs on the unreleased
+        // SuspendGatePort, while the post-CAS cancel fence returns immediately.
+        let arm = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .begin_arm_from_join(JoinArmRequest {
+                        parent_connection_id: "parent".into(),
+                        parent_conversation_id: 1,
+                        task_ids: vec!["task-1".into()],
+                        waiter_closed: CancellationToken::new(),
+                    })
+                    .await
+            }
+        });
+        insert_entered_rx
             .await
-            .unwrap();
+            .expect("arm must enter insert_arming gate");
+        complete_cleanup_task(&broker, "task-1").await;
+        insert_release_tx.send(()).unwrap();
+        let outcome = arm.await.unwrap().unwrap();
         let JoinArmOutcome::Arming {
             continuation_id,
             completion,
@@ -2967,7 +3003,7 @@ mod cleanup_tests {
         else {
             panic!("expected arming worker");
         };
-        entered_rx
+        cas_entered_rx
             .await
             .expect("worker must reach pre-suspension suspend_requested CAS gate");
         assert_eq!(
@@ -2981,8 +3017,17 @@ mod cleanup_tests {
             "gate holds the suspend_requested CAS before it commits"
         );
         assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
-        release_tx.send(()).unwrap();
-        let arm_result = completion.await.unwrap();
+        // Release only the pre-suspension store gate. Leave SuspendGatePort's
+        // release intentionally unsent so a regression that dispatches
+        // suspend_parent on the claimed path hangs until this timeout fires.
+        cas_release_tx.send(()).unwrap();
+        let arm_result = tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+            .await
+            .expect(
+                "cancel before first suspension dispatch must drop the arm worker without \
+                 entering an unreleased claimed suspend_parent gate",
+            )
+            .unwrap();
         assert!(
             matches!(arm_result, Err(ContinuationError::ArmWorkerDropped)),
             "cancel before first suspension dispatch must drop the arm worker: {arm_result:?}"
