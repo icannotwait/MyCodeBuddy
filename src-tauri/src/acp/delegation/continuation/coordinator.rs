@@ -2057,6 +2057,9 @@ mod cleanup_tests {
         entered: Mutex<Option<oneshot::Sender<()>>>,
         release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
         admit_calls: AtomicUsize,
+        /// Set only after the gated release completes, proving the admit future
+        /// was not dropped by a cancellation-first select.
+        admit_future_completed: AtomicUsize,
     }
 
     impl AdmitGatePort {
@@ -2068,6 +2071,7 @@ mod cleanup_tests {
                     entered: Mutex::new(Some(entered_tx)),
                     release: tokio::sync::Mutex::new(Some(release_rx)),
                     admit_calls: AtomicUsize::new(0),
+                    admit_future_completed: AtomicUsize::new(0),
                 }),
                 entered_rx,
                 release_tx,
@@ -2116,7 +2120,495 @@ mod cleanup_tests {
             if let Some(release) = self.release.lock().await.take() {
                 let _ = release.await;
             }
+            // Reached only when the admit future was not cancelled mid-await.
+            self.admit_future_completed.fetch_add(1, Ordering::SeqCst);
             Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    /// Observes CAS targets so race tests can wait for explicit state changes
+    /// without yield-polling.
+    struct TransitionNotifyStore {
+        inner: Arc<InMemoryContinuationStore>,
+        wake_pending: Mutex<Option<oneshot::Sender<()>>>,
+        completed: Mutex<Option<oneshot::Sender<()>>>,
+        cancelled: Mutex<Option<oneshot::Sender<()>>>,
+        /// Gates the first Arming CAS that sets `suspend_requested_at` so cancel
+        /// can race before the first suspension dispatch.
+        suspend_request_gate:
+            tokio::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    }
+
+    impl TransitionNotifyStore {
+        fn new(inner: Arc<InMemoryContinuationStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                wake_pending: Mutex::new(None),
+                completed: Mutex::new(None),
+                cancelled: Mutex::new(None),
+                suspend_request_gate: tokio::sync::Mutex::new(None),
+            })
+        }
+
+        fn watch_wake_pending(&self) -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            *self
+                .wake_pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+            rx
+        }
+
+        fn watch_completed(&self) -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            *self
+                .completed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+            rx
+        }
+
+        fn watch_cancelled(&self) -> oneshot::Receiver<()> {
+            let (tx, rx) = oneshot::channel();
+            *self
+                .cancelled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+            rx
+        }
+
+        async fn install_suspend_request_gate(
+            &self,
+            entered: oneshot::Sender<()>,
+            release: oneshot::Receiver<()>,
+        ) {
+            *self.suspend_request_gate.lock().await = Some((entered, release));
+        }
+    }
+
+    #[async_trait]
+    impl ContinuationStore for TransitionNotifyStore {
+        async fn insert_arming(
+            &self,
+            new: NewContinuation,
+        ) -> Result<ContinuationRecord, ContStoreError> {
+            self.inner.insert_arming(new).await
+        }
+
+        async fn load(
+            &self,
+            continuation_id: &str,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner.load(continuation_id).await
+        }
+
+        async fn load_active_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .load_active_for_conversation(conversation_id)
+                .await
+        }
+
+        async fn list_non_terminal(&self) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+            self.inner.list_non_terminal().await
+        }
+
+        async fn cas_transition(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+            patch: ContinuationPatch,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            if expected_state == ContinuationState::Arming
+                && patch.state == ContinuationState::Arming
+                && matches!(patch.suspend_requested_at, FieldPatch::Set(_))
+            {
+                if let Some((entered, release)) = self.suspend_request_gate.lock().await.take() {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
+            let result = self
+                .inner
+                .cas_transition(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    patch.clone(),
+                )
+                .await?;
+            if result.is_some() {
+                match patch.state {
+                    ContinuationState::WakePending => {
+                        if let Some(tx) = self
+                            .wake_pending
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    }
+                    ContinuationState::Completed => {
+                        if let Some(tx) = self
+                            .completed
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    }
+                    ContinuationState::Cancelled => {
+                        if let Some(tx) = self
+                            .cancelled
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(result)
+        }
+
+        async fn cas_claim_cleanup(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .cas_claim_cleanup(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                )
+                .await
+        }
+
+        async fn cas_fail_and_cancel_parent(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: ContinuationState,
+            failure_code: ContinuationFailureCode,
+            finished_at: DateTime<Utc>,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .cas_fail_and_cancel_parent(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    failure_code,
+                    finished_at,
+                )
+                .await
+        }
+
+        async fn matches_admitted_marker(
+            &self,
+            conversation_id: i32,
+            marker: &str,
+        ) -> Result<bool, ContStoreError> {
+            self.inner
+                .matches_admitted_marker(conversation_id, marker)
+                .await
+        }
+
+        async fn load_latest_failure_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+            self.inner
+                .load_latest_failure_for_conversation(conversation_id)
+                .await
+        }
+    }
+
+    /// Clock that never fires far-future checkpoint sleeps and completes short
+    /// retry/backoff sleeps immediately so cancel can race the retry admit path
+    /// without wall-clock waits.
+    struct InstantRetryClock {
+        base: SystemContinuationClock,
+        short_sleeps: AtomicUsize,
+    }
+
+    impl InstantRetryClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                base: SystemContinuationClock::new(),
+                short_sleeps: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ContinuationClock for InstantRetryClock {
+        fn now_utc(&self) -> DateTime<Utc> {
+            self.base.now_utc()
+        }
+
+        fn sleep_until(
+            &self,
+            deadline: DateTime<Utc>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            let delay = deadline
+                .signed_duration_since(self.now_utc())
+                .to_std()
+                .unwrap_or_default();
+            // Retry delays are 100/500/2000ms; checkpoint sleeps are minutes.
+            if delay <= std::time::Duration::from_secs(3) {
+                self.short_sleeps.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            } else {
+                // Never fire the far-future checkpoint arm; join notify drives wake.
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    /// Gates resume-path `snapshot_parent` after the arm-time snapshot so cancel
+    /// can race WakePending → Resuming.
+    struct ResumeSnapshotGatePort {
+        snapshots: AtomicUsize,
+        resume_entered: Mutex<Option<oneshot::Sender<()>>>,
+        resume_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        admit_calls: AtomicUsize,
+        suspend_calls: AtomicUsize,
+    }
+
+    impl ResumeSnapshotGatePort {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    snapshots: AtomicUsize::new(0),
+                    resume_entered: Mutex::new(Some(entered_tx)),
+                    resume_release: tokio::sync::Mutex::new(Some(release_rx)),
+                    admit_calls: AtomicUsize::new(0),
+                    suspend_calls: AtomicUsize::new(0),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for ResumeSnapshotGatePort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            let n = self.snapshots.fetch_add(1, Ordering::SeqCst) + 1;
+            // Snapshot #1 is begin_arm_from_join; later calls are resume_and_finish.
+            if n >= 2 {
+                if let Some(tx) = self
+                    .resume_entered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                if let Some(release) = self.resume_release.lock().await.take() {
+                    let _ = release.await;
+                }
+            }
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: n == 1,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            self.suspend_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    /// Fails attempt-zero admission, then gates attempt-one so cancel can race
+    /// the retry/backoff path.
+    struct RetryAdmitGatePort {
+        attempts: AtomicUsize,
+        retry_entered: Mutex<Option<oneshot::Sender<()>>>,
+        retry_release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        retry_future_completed: AtomicUsize,
+    }
+
+    impl RetryAdmitGatePort {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    attempts: AtomicUsize::new(0),
+                    retry_entered: Mutex::new(Some(entered_tx)),
+                    retry_release: tokio::sync::Mutex::new(Some(release_rx)),
+                    retry_future_completed: AtomicUsize::new(0),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for RetryAdmitGatePort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: true,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                return Err(ContinuationError::PromptDelivery(AcpError::ProcessExited));
+            }
+            if let Some(tx) = self
+                .retry_entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            if let Some(release) = self.retry_release.lock().await.take() {
+                let _ = release.await;
+            }
+            self.retry_future_completed.fetch_add(1, Ordering::SeqCst);
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    /// Immediate suspend for arm, then admit via RetryAdmitGatePort.
+    struct CompositeRetryPort {
+        admit: Arc<RetryAdmitGatePort>,
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for CompositeRetryPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            self.admit.snapshot_parent(connection_id).await
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit.admit_continuation(request).await
         }
 
         async fn publish_waiting(
@@ -2156,8 +2648,10 @@ mod cleanup_tests {
 
     #[tokio::test]
     async fn continuation_cleanup_stop_after_admission_before_completed_preserves_completed() {
-        let store = Arc::new(InMemoryContinuationStore::default());
-        let (port, admitted_rx, release_tx) = PostAdmissionGatePort::new(store.clone());
+        let inner = Arc::new(InMemoryContinuationStore::default());
+        let store = TransitionNotifyStore::new(inner.clone());
+        let completed_rx = store.watch_completed();
+        let (port, admitted_rx, release_tx) = PostAdmissionGatePort::new(inner.clone());
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
             Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
@@ -2218,14 +2712,9 @@ mod cleanup_tests {
             .is_empty());
 
         release_tx.send(()).unwrap();
-        for _ in 0..50 {
-            if store.load(&continuation_id).await.unwrap().unwrap().state
-                == ContinuationState::Completed
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        completed_rx
+            .await
+            .expect("worker must CAS Completed after admission release");
         let done = store.load(&continuation_id).await.unwrap().unwrap();
         assert_eq!(done.state, ContinuationState::Completed);
         assert!(done.prompt_admitted_at.is_some());
@@ -2282,7 +2771,9 @@ mod cleanup_tests {
 
     #[tokio::test]
     async fn continuation_cleanup_cancel_fences_direct_claimed_suspension_await() {
-        let store = Arc::new(InMemoryContinuationStore::default());
+        let inner = Arc::new(InMemoryContinuationStore::default());
+        let store = TransitionNotifyStore::new(inner);
+        let wake_pending_rx = store.watch_wake_pending();
         let (port, entered_rx, release_tx) = SuspendGatePort::new();
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
@@ -2316,29 +2807,24 @@ mod cleanup_tests {
         // Complete the join while suspension is still gated so the worker claims
         // wake and re-enters the cancel-vs-suspend select with claimed=Some.
         complete_cleanup_task(&broker, "task-1").await;
-        for _ in 0..50 {
-            if store.load(&continuation_id).await.unwrap().unwrap().state
-                == ContinuationState::WakePending
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wake_pending_rx
+            .await
+            .expect("worker must claim wake before cancel races the claimed suspend await");
         assert_eq!(
             store.load(&continuation_id).await.unwrap().unwrap().state,
             ContinuationState::WakePending,
             "worker must claim wake before cancel races the claimed suspend await"
         );
         assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
-        let arm_result = completion.await.unwrap();
+        let arm_result = tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+            .await
+            .expect("cancel must interrupt claimed suspend await without release")
+            .unwrap();
         assert!(matches!(
             arm_result,
             Err(ContinuationError::ArmWorkerDropped)
         ));
         let _ = release_tx.send(());
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
         assert_eq!(port.admit_calls.load(Ordering::SeqCst), 0);
         let row = store.load(&continuation_id).await.unwrap().unwrap();
         assert!(
@@ -2353,7 +2839,9 @@ mod cleanup_tests {
 
     #[tokio::test]
     async fn continuation_cleanup_cancel_fences_attempt_zero_admission_wait() {
-        let store = Arc::new(InMemoryContinuationStore::default());
+        let inner = Arc::new(InMemoryContinuationStore::default());
+        let store = TransitionNotifyStore::new(inner);
+        let cancelled_rx = store.watch_cancelled();
         let (port, entered_rx, release_tx) = AdmitGatePort::new();
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
@@ -2398,21 +2886,275 @@ mod cleanup_tests {
             coordinator.handle_parent_stop("parent", 1).await.unwrap(),
             1
         );
-        let _ = release_tx.send(());
-        for _ in 0..20 {
-            if coordinator.worker_count() == 0 {
-                break;
+        cancelled_rx
+            .await
+            .expect("Stop must CAS Cancelled before admission can complete");
+        // Keep the admit gate held. Cancellation-first select must drop the admit
+        // future and exit the worker without ever returning Admitted.
+        let worker_gone = async {
+            loop {
+                if coordinator.worker_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker_gone)
+            .await
+            .expect("cancelled attempt-zero worker must exit while admit is still gated");
+        assert_eq!(
+            port.admit_future_completed.load(Ordering::SeqCst),
+            0,
+            "admit future must be cancelled before it can return Admitted"
+        );
+        // Receiver should already be dropped with the cancelled admit future.
+        let _ = release_tx.send(());
         let row = store.load(&continuation_id).await.unwrap().unwrap();
         assert_eq!(row.state, ContinuationState::Cancelled);
-        assert!(row.prompt_admitted_at.is_none());
+        assert!(
+            row.prompt_admitted_at.is_none(),
+            "durable admission must never complete once Stop owns cleanup"
+        );
+        assert_ne!(row.state, ContinuationState::Completed);
         assert_eq!(
             port.admit_calls.load(Ordering::SeqCst),
             1,
-            "admission may enter the port but must not complete after cancel"
+            "admission may enter the port while Stop races it"
         );
+        assert_eq!(
+            port.admit_future_completed.load(Ordering::SeqCst),
+            0,
+            "post-release must not revive a cancelled admit future"
+        );
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cancel_fences_before_first_suspension_dispatch() {
+        let inner = Arc::new(InMemoryContinuationStore::default());
+        let store = TransitionNotifyStore::new(inner);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        store
+            .install_suspend_request_gate(entered_tx, release_rx)
+            .await;
+        let (port, mut suspend_entered_rx, _suspend_release) = SuspendGatePort::new();
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker,
+            Arc::new(DelegationMetrics::default()),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        entered_rx
+            .await
+            .expect("worker must reach pre-suspension suspend_requested CAS gate");
+        assert_eq!(
+            store
+                .load(&continuation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .suspend_requested_at,
+            None,
+            "gate holds the suspend_requested CAS before it commits"
+        );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+        release_tx.send(()).unwrap();
+        let arm_result = completion.await.unwrap();
+        assert!(
+            matches!(arm_result, Err(ContinuationError::ArmWorkerDropped)),
+            "cancel before first suspension dispatch must drop the arm worker: {arm_result:?}"
+        );
+        assert!(
+            matches!(
+                suspend_entered_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "suspend_parent must never be dispatched after pre-suspension cancel"
+        );
+        assert_eq!(port.admit_calls.load(Ordering::SeqCst), 0);
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert!(
+            row.suspended_at.is_none(),
+            "first suspension must never complete after pre-dispatch cancel: {row:?}"
+        );
+        assert!(
+            !matches!(
+                row.state,
+                ContinuationState::Completed | ContinuationState::Failed
+            ),
+            "pre-suspension cancel must not invent terminal failure/completion: {row:?}"
+        );
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cancel_fences_wake_pending_to_resuming() {
+        let inner = Arc::new(InMemoryContinuationStore::default());
+        let store = TransitionNotifyStore::new(inner);
+        let wake_pending_rx = store.watch_wake_pending();
+        let (port, resume_entered_rx, resume_release_tx) = ResumeSnapshotGatePort::new();
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(DelegationMetrics::default()),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        completion.await.unwrap().unwrap();
+        complete_cleanup_task(&broker, "task-1").await;
+        wake_pending_rx
+            .await
+            .expect("worker must reach WakePending before resume snapshot gate");
+        resume_entered_rx
+            .await
+            .expect("resume snapshot must gate WakePending→Resuming");
+        assert_eq!(
+            store.load(&continuation_id).await.unwrap().unwrap().state,
+            ContinuationState::WakePending
+        );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+        resume_release_tx.send(()).unwrap();
+        // Wait for the worker registry drop via a short join on worker_count by
+        // observing the cancel-path exit: no Resuming and no admit.
+        let worker_gone = async {
+            loop {
+                if coordinator.worker_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker_gone)
+            .await
+            .expect("cancelled resume worker must exit");
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            ContinuationState::WakePending,
+            "cancel during WakePending→Resuming must not win Resuming CAS: {row:?}"
+        );
+        assert_eq!(port.admit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cancel_fences_retry_backoff_admission() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (admit_port, retry_entered_rx, retry_release_tx) = RetryAdmitGatePort::new();
+        let clock = InstantRetryClock::new();
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(DelegationMetrics::default()),
+            Arc::new(CompositeRetryPort {
+                admit: admit_port.clone(),
+            }) as Arc<dyn ParentContinuationPort>,
+            clock.clone() as Arc<dyn ContinuationClock>,
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        completion.await.unwrap().unwrap();
+        complete_cleanup_task(&broker, "task-1").await;
+
+        // Attempt zero fails PromptDelivery; InstantRetryClock completes the
+        // backoff sleep immediately; attempt one enters the retry admit gate.
+        retry_entered_rx
+            .await
+            .expect("worker must reach retry admission after backoff");
+        assert_eq!(admit_port.attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            clock.short_sleeps.load(Ordering::SeqCst) >= 1,
+            "retry path must observe at least one backoff sleep"
+        );
+
+        // Cancel during the post-backoff retry admission await.
+        assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+        let _ = retry_release_tx.send(());
+        let worker_gone = async {
+            loop {
+                if coordinator.worker_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker_gone)
+            .await
+            .expect("cancelled retry worker must exit");
+        assert_eq!(
+            admit_port.retry_future_completed.load(Ordering::SeqCst),
+            0,
+            "cancel during retry admit must drop the future before Admitted returns"
+        );
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert!(
+            row.prompt_admitted_at.is_none(),
+            "retry/backoff cancel must not durable-admit"
+        );
+        assert_ne!(row.state, ContinuationState::Completed);
         assert_eq!(coordinator.worker_count(), 0);
     }
 
