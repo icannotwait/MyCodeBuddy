@@ -250,9 +250,18 @@ pub async fn apply_usable_completion(
 /// txn). `attempt_turn_seq` is set from the row's current `usable_turn_seq` in
 /// the same UPDATE so a concurrent usable-turn advance cannot pair a stale
 /// attempt with a newer sequence.
+///
+/// Transient SQLite contention (busy / locked / snapshot) on the claim CAS is
+/// retried with a bound; permanent write failures propagate as `Err` so the
+/// coordinator drain can back off instead of hanging forever.
 pub async fn claim_next_ready(
     conn: &DatabaseConnection,
 ) -> Result<Option<AutoTitleClaim>, DbError> {
+    /// Initial try + retries for snapshot/busy on the ready→running upgrade.
+    const CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS: u32 = 8;
+
+    let mut transient_cas_failures: u32 = 0;
+
     loop {
         let txn = conn.begin().await?;
 
@@ -284,6 +293,8 @@ pub async fn claim_next_ready(
                 .exec(&txn)
                 .await?;
             txn.commit().await?;
+            // Progress made; transient CAS budget applies only to consecutive failures.
+            transient_cas_failures = 0;
             continue;
         }
 
@@ -293,6 +304,7 @@ pub async fn claim_next_ready(
                 .exec(&txn)
                 .await?;
             txn.commit().await?;
+            transient_cas_failures = 0;
             continue;
         };
 
@@ -311,6 +323,7 @@ pub async fn claim_next_ready(
         };
 
         // Test-only gate between select and CAS (usable_turn_seq race barrier).
+        // Scoped via task-local so parallel tests cannot steal the hook.
         #[cfg(test)]
         claim_test_hooks::run_pre_cas_hook().await;
 
@@ -335,16 +348,38 @@ pub async fn claim_next_ready(
             .exec(&txn)
             .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                transient_cas_failures = 0;
+                result
+            }
             Err(error) => {
+                let _ = txn.rollback().await;
+                if !is_transient_claim_cas_error(&error) {
+                    tracing::warn!(
+                        conversation_id = job.conversation_id,
+                        %error,
+                        "auto-title claim CAS failed with non-retryable error"
+                    );
+                    return Err(DbError::Database(error));
+                }
+                transient_cas_failures = transient_cas_failures.saturating_add(1);
+                if transient_cas_failures >= CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        conversation_id = job.conversation_id,
+                        attempts = transient_cas_failures,
+                        %error,
+                        "auto-title claim CAS exhausted transient retries"
+                    );
+                    return Err(DbError::Database(error));
+                }
                 // Concurrent writer may force SQLite snapshot/busy failure on
-                // the upgrade to write. Rollback and retry with a fresh begin.
+                // the upgrade to write. Retry with a fresh begin.
                 tracing::debug!(
                     conversation_id = job.conversation_id,
+                    attempt = transient_cas_failures,
                     %error,
-                    "auto-title claim CAS failed; retrying with fresh transaction"
+                    "auto-title claim CAS transient failure; retrying with fresh transaction"
                 );
-                let _ = txn.rollback().await;
                 continue;
             }
         };
@@ -377,28 +412,52 @@ pub async fn claim_next_ready(
     }
 }
 
+/// True for SQLite contention / snapshot errors that may clear on a fresh txn.
+fn is_transient_claim_cas_error(error: &sea_orm::DbErr) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("database is locked")
+        || lower.contains("database is busy")
+        || lower.contains("sqlite_busy")
+        || lower.contains("sqlite_locked")
+        || lower.contains("busy_snapshot")
+        || lower.contains("code: 5")
+        || lower.contains("code: 6")
+        || lower.contains("code: 517")
+        // SQLite "cannot commit transaction - SQL statements in progress" style
+        // snapshot races sometimes surface with "snapshot" wording only.
+        || lower.contains("snapshot")
+}
+
 /// Test-only hooks for deterministic claim races (select → CAS barrier).
+///
+/// Hook state is **task-local** (not process-global), so a parallel test's
+/// `claim_next_ready` cannot steal another test's barrier. Install via
+/// [`claim_test_hooks::scope`] on the same task that runs the claim.
 #[cfg(test)]
 mod claim_test_hooks {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
 
-    use tokio::sync::Mutex;
-
     type Hook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-    static PRE_CAS: Mutex<Option<Hook>> = Mutex::const_new(None);
+    tokio::task_local! {
+        static PRE_CAS: Hook;
+    }
 
-    pub async fn set_pre_cas_hook(hook: Option<Hook>) {
-        *PRE_CAS.lock().await = hook;
+    /// Run `fut` with `hook` installed for this task only.
+    pub async fn scope<F, T>(hook: Hook, fut: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        PRE_CAS.scope(hook, fut).await
     }
 
     pub async fn run_pre_cas_hook() {
-        let hook = PRE_CAS.lock().await.clone();
-        if let Some(hook) = hook {
-            hook().await;
-        }
+        let Ok(hook) = PRE_CAS.try_with(Clone::clone) else {
+            return;
+        };
+        hook().await;
     }
 }
 
@@ -1367,6 +1426,11 @@ mod tests {
 
         use crate::db::test_helpers::fresh_disk_db;
 
+        /// Bound for the whole select→advance→CAS handshake so a stuck barrier
+        /// cannot hang the suite indefinitely.
+        const BARRIER_SEQ_TIMEOUT: Duration = Duration::from_secs(5);
+        const GATE_STEP_TIMEOUT: Duration = Duration::from_secs(2);
+
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
         enable_auto_title(&migrate.conn, AgentType::Codex).await;
@@ -1418,30 +1482,42 @@ mod tests {
         // writer can advance usable_turn_seq. Retries after lost/snapshot CAS
         // must not re-block on the same notifies.
         let gate_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        {
+
+        let claim_conn = claim_db.clone();
+        // Task-local hook: only this claim task sees the barrier (parallel tests
+        // cannot steal a process-global slot).
+        let claim_handle = tokio::spawn({
             let after_read = after_read.clone();
             let allow_cas = allow_cas.clone();
             let gate_armed = gate_armed.clone();
-            claim_test_hooks::set_pre_cas_hook(Some(Arc::new(move || {
-                let after_read = after_read.clone();
-                let allow_cas = allow_cas.clone();
-                let gate_armed = gate_armed.clone();
-                Box::pin(async move {
-                    if !gate_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    after_read.notify_one();
-                    allow_cas.notified().await;
-                })
-            })))
-            .await;
-        }
-
-        let claim_conn = claim_db.clone();
-        let claim_handle = tokio::spawn(async move { claim_next_ready(&claim_conn.conn).await });
+            async move {
+                claim_test_hooks::scope(
+                    Arc::new(move || {
+                        let after_read = after_read.clone();
+                        let allow_cas = allow_cas.clone();
+                        let gate_armed = gate_armed.clone();
+                        Box::pin(async move {
+                            if !gate_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
+                            after_read.notify_one();
+                            // Bound the wait for the test to release CAS so a
+                            // dropped harness cannot leave claim parked forever.
+                            tokio::time::timeout(GATE_STEP_TIMEOUT, allow_cas.notified())
+                                .await
+                                .expect("pre-CAS gate must be released before timeout");
+                        })
+                    }),
+                    claim_next_ready(&claim_conn.conn),
+                )
+                .await
+            }
+        });
 
         // Wait until claim has selected the Ready candidate (seq=1).
-        after_read.notified().await;
+        tokio::time::timeout(GATE_STEP_TIMEOUT, after_read.notified())
+            .await
+            .expect("claim must reach pre-CAS gate before barrier timeout");
 
         // Concurrent usable-turn progress while still Ready.
         auto_title_job::Entity::update_many()
@@ -1459,10 +1535,9 @@ mod tests {
 
         allow_cas.notify_one();
 
-        let claim_result = tokio::time::timeout(Duration::from_secs(5), claim_handle).await;
-        claim_test_hooks::set_pre_cas_hook(None).await;
+        let claim_result = tokio::time::timeout(BARRIER_SEQ_TIMEOUT, claim_handle).await;
         let claim = claim_result
-            .expect("claim must not hang")
+            .expect("claim must not hang past barrier sequence timeout")
             .expect("join claim task")
             .expect("claim result")
             .expect("must claim Ready job after seq race");
