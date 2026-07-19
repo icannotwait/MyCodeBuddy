@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1143,19 +1143,7 @@ pub async fn spawn_agent_connection(
         // still-pending delegations AND questions owned by this parent.
         // All are best-effort: a missing token entry is a no-op.
         if let Some(inj) = delegation_for_cleanup {
-            let token = {
-                let snap = state_clone.read().await;
-                snap.delegation_token.clone()
-            };
-            if let Some(tok) = token {
-                inj.leases.revoke(&tok).await;
-                inj.tokens.revoke(&tok).await;
-            }
-            inj.broker.cancel_by_parent(&conn_id).await;
-            // Reclaim a parked `ask_user_question` instead of waiting for the
-            // companion's ask socket to close (which a reparented/hard-killed
-            // agent may never do); the dropped sender declines the tool cleanly.
-            inj.questions.cancel_questions_by_parent(&conn_id).await;
+            cleanup_delegation_parent(&inj, &conn_id, &state_clone).await;
         }
 
         if let Err(e) = result {
@@ -4808,6 +4796,25 @@ fn parent_turn_end_reason(stop_reason: &str) -> crate::acp::delegation::types::P
     }
 }
 
+async fn cleanup_delegation_parent(
+    injection: &DelegationInjection,
+    connection_id: &str,
+    state: &Arc<RwLock<SessionState>>,
+) {
+    let token = state.read().await.delegation_token.clone();
+    if let Some(token) = token {
+        injection.leases.revoke(&token).await;
+        injection.tokens.revoke(&token).await;
+    }
+    injection.broker.cancel_by_parent(connection_id).await;
+    // Reclaim a parked `ask_user_question` instead of waiting for the
+    // companion's ask socket to close; dropping the sender declines it cleanly.
+    injection
+        .questions
+        .cancel_questions_by_parent(connection_id)
+        .await;
+}
+
 fn reject_suspension_lease(lease: &mut SuspensionLease, code: &'static str) {
     if let Some(reply) = lease.reply.take() {
         let _ = reply.send(Err(AcpError::protocol(code)));
@@ -4851,13 +4858,6 @@ fn record_suspension_terminal_diagnostic(
     }
     *diagnostic = Some(reason.to_string());
     true
-}
-
-#[cfg(test)]
-fn suspension_drain_deadline() -> tokio::time::Sleep {
-    tokio::time::sleep(std::time::Duration::from_millis(
-        SUSPENSION_DRAIN_TIMEOUT_MS,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5037,8 +5037,29 @@ async fn finalize_turn_terminal(
 
 enum ActiveCommandControl {
     Continue,
+    SuspensionInstalled,
     UserCancel,
     Disconnect,
+}
+
+enum ActiveCommandOutcome {
+    Control(ActiveCommandControl),
+    SuspensionDrainTimeout,
+}
+
+fn drain_ready_active_control(
+    cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
+    deferred_commands: &mut VecDeque<ConnectionCommand>,
+) -> Option<ActiveCommandControl> {
+    let ready_commands = cmd_rx.len();
+    for _ in 0..ready_commands {
+        match cmd_rx.try_recv() {
+            Ok(ConnectionCommand::Cancel) => return Some(ActiveCommandControl::UserCancel),
+            Ok(command) => deferred_commands.push_back(command),
+            Err(_) => break,
+        }
+    }
+    (cmd_rx.is_closed() && cmd_rx.is_empty()).then_some(ActiveCommandControl::Disconnect)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5054,7 +5075,6 @@ async fn handle_active_turn_command(
     conn_id: &str,
     turn_generation: u64,
     suspension: &mut Option<SuspensionLease>,
-    suspension_deadline: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
 ) -> ActiveCommandControl {
     match command {
         Some(ConnectionCommand::RespondPermission {
@@ -5152,19 +5172,105 @@ async fn handle_active_turn_command(
                 },
             );
             if was_empty && suspension.is_some() {
-                suspension_deadline.as_mut().reset(
-                    tokio::time::Instant::now()
-                        + std::time::Duration::from_millis(SUSPENSION_DRAIN_TIMEOUT_MS),
-                );
-                let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+                ActiveCommandControl::SuspensionInstalled
+            } else {
+                ActiveCommandControl::Continue
             }
-            ActiveCommandControl::Continue
         }
         Some(ConnectionCommand::Cancel) => ActiveCommandControl::UserCancel,
         Some(ConnectionCommand::Disconnect) | None => ActiveCommandControl::Disconnect,
         Some(ConnectionCommand::Prompt { .. }) | Some(ConnectionCommand::Fork { .. }) => {
             ActiveCommandControl::Continue
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_active_command_with_deadline(
+    command: Option<ConnectionCommand>,
+    cx: &ConnectionTo<Agent>,
+    sid: &SessionId,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    perms: &PendingPermissions,
+    file_system_runtime: &FileSystemRuntime,
+    agent_type: AgentType,
+    conn_id: &str,
+    turn_generation: u64,
+    suspension: &mut Option<SuspensionLease>,
+    suspension_deadline: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
+    deferred_commands: &mut VecDeque<ConnectionCommand>,
+) -> ActiveCommandOutcome {
+    let is_user_cancel = matches!(&command, Some(ConnectionCommand::Cancel));
+    let lease_installed = suspension.is_some();
+    let command_future = handle_active_turn_command(
+        command,
+        cx,
+        sid,
+        state,
+        emitter,
+        perms,
+        file_system_runtime,
+        agent_type,
+        conn_id,
+        turn_generation,
+        suspension,
+    );
+
+    let control = if lease_installed && !is_user_cancel {
+        tokio::pin!(command_future);
+        loop {
+            tokio::select! {
+                biased;
+                queued = cmd_rx.recv(), if deferred_commands.len() < cmd_rx.max_capacity() => {
+                    match queued {
+                        Some(ConnectionCommand::Cancel) => {
+                            return ActiveCommandOutcome::Control(
+                                ActiveCommandControl::UserCancel,
+                            );
+                        }
+                        Some(command) => deferred_commands.push_back(command),
+                        None => {
+                            return ActiveCommandOutcome::Control(
+                                ActiveCommandControl::Disconnect,
+                            );
+                        }
+                    }
+                }
+                _ = suspension_deadline.as_mut() => {
+                    if let Some(control) =
+                        drain_ready_active_control(cmd_rx, deferred_commands)
+                    {
+                        return ActiveCommandOutcome::Control(control);
+                    }
+                    return ActiveCommandOutcome::SuspensionDrainTimeout;
+                }
+                control = command_future.as_mut() => break control,
+            }
+
+            if tokio::time::Instant::now() >= suspension_deadline.deadline() {
+                if let Some(control) =
+                    drain_ready_active_control(cmd_rx, deferred_commands)
+                {
+                    return ActiveCommandOutcome::Control(control);
+                }
+                return ActiveCommandOutcome::SuspensionDrainTimeout;
+            }
+        }
+    } else {
+        command_future.await
+    };
+
+    if matches!(control, ActiveCommandControl::SuspensionInstalled) {
+        suspension_deadline.as_mut().reset(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_millis(SUSPENSION_DRAIN_TIMEOUT_MS),
+        );
+        let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+        ActiveCommandOutcome::Control(ActiveCommandControl::Continue)
+    } else {
+        ActiveCommandOutcome::Control(control)
     }
 }
 
@@ -5515,11 +5621,17 @@ async fn run_conversation_loop<'a>(
                 // Read updates until turn completes.
                 // We must also listen for commands (e.g. RespondPermission)
                 // to avoid deadlocking when the agent awaits a permission response.
+                let mut deferred_commands = VecDeque::new();
                 loop {
                     tokio::select! {
                         biased;
-                        command = cmd_rx.recv() => {
-                            match handle_active_turn_command(
+                        command = async {
+                            match deferred_commands.pop_front() {
+                                Some(command) => Some(command),
+                                None => cmd_rx.recv().await,
+                            }
+                        } => {
+                            match run_active_command_with_deadline(
                                 command,
                                 &cx,
                                 &sid,
@@ -5532,11 +5644,16 @@ async fn run_conversation_loop<'a>(
                                 turn_generation,
                                 &mut suspension,
                                 &mut suspension_deadline,
+                                cmd_rx,
+                                &mut deferred_commands,
                             )
                             .await
                             {
-                                ActiveCommandControl::Continue => {}
-                                ActiveCommandControl::UserCancel => {
+                                ActiveCommandOutcome::Control(ActiveCommandControl::Continue) => {}
+                                ActiveCommandOutcome::Control(ActiveCommandControl::SuspensionInstalled) => {
+                                    unreachable!("suspension installation is normalized by command runner")
+                                }
+                                ActiveCommandOutcome::Control(ActiveCommandControl::UserCancel) => {
                                     let _ = cx.send_notification_to(
                                         Agent,
                                         CancelNotification::new(sid.clone()),
@@ -5563,7 +5680,7 @@ async fn run_conversation_loop<'a>(
                                     });
                                     break;
                                 }
-                                ActiveCommandControl::Disconnect => {
+                                ActiveCommandOutcome::Control(ActiveCommandControl::Disconnect) => {
                                     tracing::info!(
                                         "[ACP] disconnect requested during prompting; connection_id={conn_id}"
                                     );
@@ -5582,6 +5699,22 @@ async fn run_conversation_loop<'a>(
                                     terminal_runtime
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
+                                    disconnect_requested = true;
+                                    break;
+                                }
+                                ActiveCommandOutcome::SuspensionDrainTimeout => {
+                                    let _ = finalize_turn_terminal(
+                                        TurnTerminalSource::SuspensionDrainTimeout,
+                                        &mut suspension,
+                                        state,
+                                        emitter,
+                                        conn_id,
+                                        sid.0.as_ref(),
+                                        agent_type,
+                                        mark_awaiting_reply,
+                                        delegation_injection.map(|injection| injection.broker.as_ref()),
+                                    )
+                                    .await;
                                     disconnect_requested = true;
                                     break;
                                 }
@@ -7438,6 +7571,173 @@ mod tests {
     use sacp::schema::Diff;
     use std::sync::Arc;
 
+    struct SuspensionLoopMockAgent {
+        prompts: Arc<std::sync::Mutex<Vec<sacp::Responder<sacp::schema::PromptResponse>>>>,
+        modes: Arc<std::sync::Mutex<Vec<sacp::Responder<sacp::schema::SetSessionModeResponse>>>>,
+        agent_connection: Arc<std::sync::Mutex<Option<ConnectionTo<Client>>>>,
+        cancel_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl sacp::ConnectTo<Client> for SuspensionLoopMockAgent {
+        async fn connect_to(
+            self,
+            client: impl sacp::ConnectTo<Agent>,
+        ) -> Result<(), sacp::Error> {
+            use std::sync::atomic::Ordering;
+
+            let prompt_responders = self.prompts;
+            let prompt_connection = self.agent_connection.clone();
+            let mode_responders = self.modes;
+            let cancel_count = self.cancel_count;
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |_request: PromptRequest,
+                                responder: sacp::Responder<sacp::schema::PromptResponse>,
+                                connection: ConnectionTo<Client>| {
+                        *prompt_connection.lock().unwrap() = Some(connection);
+                        prompt_responders.lock().unwrap().push(responder);
+                        Ok(())
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: SetSessionModeRequest,
+                                responder: sacp::Responder<
+                        sacp::schema::SetSessionModeResponse,
+                    >,
+                                _connection: ConnectionTo<Client>| {
+                        mode_responders.lock().unwrap().push(responder);
+                        Ok(())
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |_notification: CancelNotification,
+                                _connection: ConnectionTo<Client>| {
+                        cancel_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    sacp::on_receive_notification!(),
+                )
+                .connect_to(client)
+                .await
+        }
+    }
+
+    struct SuspensionNoQuestions;
+
+    #[async_trait::async_trait]
+    impl crate::acp::question::SessionQuestionAccess for SuspensionNoQuestions {
+        async fn register_question(
+            &self,
+            _parent_connection_id: &str,
+            _questions: Vec<crate::acp::question::QuestionSpec>,
+        ) -> Option<crate::acp::question::RegisteredQuestion> {
+            None
+        }
+
+        async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+
+        async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+    }
+
+    fn delegation_suspend_injection(
+        broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+    ) -> DelegationInjection {
+        DelegationInjection {
+            broker,
+            tokens: Arc::new(crate::acp::delegation::listener::TokenRegistry::default()),
+            leases: Arc::new(
+                crate::acp::delegation::lease::CompanionLeaseRegistry::default(),
+            ),
+            socket_path: PathBuf::from("/tmp/codeg-suspension-test.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(SuspensionNoQuestions),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        }
+    }
+
+    async fn wait_for_suspension_loop_condition(
+        description: &str,
+        mut condition: impl FnMut() -> bool,
+    ) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for {description}");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_suspension_test_loop(
+        mock_agent: SuspensionLoopMockAgent,
+        state: Arc<RwLock<SessionState>>,
+        mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
+        injection: DelegationInjection,
+        seed_aux_stop_reason: bool,
+    ) -> Result<(), sacp::Error> {
+        Client
+            .builder()
+            .connect_with(mock_agent, async move |cx| {
+                let session_id = SessionId::new("session-1".to_string());
+                let mut session = cx.attach_session(
+                    NewSessionResponse::new(session_id),
+                    Default::default(),
+                )?;
+                if seed_aux_stop_reason {
+                    session.send_prompt("auxiliary terminal producer")?;
+                }
+                let shell = test_placeholder_terminal_shell();
+                let terminal_runtime = Arc::new(TerminalRuntime::new(
+                    BTreeMap::new(),
+                    shell.spec.clone(),
+                    adapter_for(AgentType::Codex),
+                ));
+                let terminal_assoc = Arc::new(std::sync::Mutex::new(
+                    TerminalAssocFallback::new(false),
+                ));
+                let file_system_runtime = Arc::new(FileSystemRuntime::new(PathBuf::from(".")));
+                let prompt_ledger = background_watch::PromptLedger::shared();
+                let terminal_prompt_context = TerminalPromptContext::new(shell.spec.clone());
+                let pending_perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let route_plan = native_plan(AgentType::Codex);
+
+                let loop_result = run_conversation_loop(
+                    &mut session,
+                    "parent-conn",
+                    &EventEmitter::Noop,
+                    &state,
+                    AgentType::Codex,
+                    &pending_perms,
+                    &mut cmd_rx,
+                    terminal_runtime,
+                    terminal_assoc,
+                    file_system_runtime,
+                    ".",
+                    false,
+                    &shell.spec,
+                    &route_plan,
+                    prompt_ledger.as_ref(),
+                    &terminal_prompt_context,
+                    Some(&injection),
+                )
+                .await;
+
+                if matches!(loop_result, Ok(None)) {
+                    cleanup_delegation_parent(&injection, "parent-conn", &state).await;
+                }
+                loop_result.map(|_| ())
+            })
+            .await
+    }
+
     fn delegation_suspend_state(generation: u64) -> Arc<RwLock<SessionState>> {
         let mut state = SessionState::new(
             "parent-conn".into(),
@@ -7552,19 +7852,107 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_suspend_waits_for_bound_prompt_response() {
-        let (lease, mut receiver) = delegation_suspend_lease(1);
-        let mut diagnostic = None;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        assert!(record_suspension_terminal_diagnostic(
-            Some(&lease),
-            &mut diagnostic,
-            "end_turn",
+        let state = delegation_suspend_state(1);
+        let (broker, spawner, task_id) = delegation_suspend_broker_with_running_child().await;
+        let injection = delegation_suspend_injection(broker.clone());
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_connection = Arc::new(std::sync::Mutex::new(None));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: prompts.clone(),
+            modes,
+            agent_connection: agent_connection.clone(),
+            cancel_count: cancel_count.clone(),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        cmd_tx
+            .send(ConnectionCommand::Prompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "bound parent prompt".into(),
+                }],
+                user_message: None,
+                mark_awaiting_reply: false,
+                turn_generation: 1,
+            })
+            .await
+            .unwrap();
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state,
+            cmd_rx,
+            injection,
+            true,
         ));
-        assert_eq!(diagnostic.as_deref(), Some("end_turn"));
+
+        wait_for_suspension_loop_condition("auxiliary and bound prompt requests", || {
+            prompts.lock().unwrap().len() == 2
+        })
+        .await;
+        let (reply, mut receiver) = oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::SuspendForDelegation {
+                continuation_id: "continuation-1".into(),
+                parent_turn_generation: 1,
+                reply,
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("suspension CancelNotification", || {
+            cancel_count.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let extension = UntypedMessage::new(
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "stopReason": "end_turn"
+                }
+            }),
+        )
+        .unwrap();
+        agent_connection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("mock agent connection")
+            .send_notification(extension)
+            .unwrap();
+        let auxiliary = prompts.lock().unwrap().remove(0);
+        auxiliary
+            .respond(sacp::schema::PromptResponse::new(StopReason::EndTurn))
+            .unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         assert!(matches!(
             receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+
+        let bound = prompts.lock().unwrap().remove(0);
+        bound
+            .respond(sacp::schema::PromptResponse::new(StopReason::Cancelled))
+            .unwrap();
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("bound prompt suspension ack timeout")
+            .expect("bound prompt suspension reply")
+            .expect("bound prompt suspension success");
+        assert_eq!(ack.parent_turn_generation, 1);
+        assert_eq!(
+            delegation_suspend_task_status(&broker, &task_id).await,
+            crate::acp::delegation::types::TaskStatus::Running
+        );
+        assert!(spawner.cancels.lock().await.is_empty());
+
+        cmd_tx.send(ConnectionCommand::Disconnect).await.unwrap();
+        loop_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -7617,44 +8005,106 @@ mod tests {
         assert!(spawner.cancels.lock().await.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn delegation_suspend_user_cancel_wins_installed_lease() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let state = delegation_suspend_state(1);
         let (broker, spawner, task_id) = delegation_suspend_broker_with_running_child().await;
-        let (lease, receiver) = delegation_suspend_lease(1);
-        let mut slot = Some(lease);
-
-        let disposition = finalize_turn_terminal(
-            TurnTerminalSource::UserCancel,
-            &mut slot,
-            &state,
-            &EventEmitter::Noop,
-            "parent-conn",
-            "session-1",
-            AgentType::Codex,
+        let injection = delegation_suspend_injection(broker.clone());
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: prompts.clone(),
+            modes: modes.clone(),
+            agent_connection: Arc::new(std::sync::Mutex::new(None)),
+            cancel_count: cancel_count.clone(),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        cmd_tx
+            .send(ConnectionCommand::Prompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "bound cancel prompt".into(),
+                }],
+                user_message: None,
+                mark_awaiting_reply: false,
+                turn_generation: 1,
+            })
+            .await
+            .unwrap();
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state,
+            cmd_rx,
+            injection,
             false,
-            Some(broker.as_ref()),
-        )
-        .await;
-
-        assert!(matches!(
-            disposition,
-            TurnFinalizationDisposition::UserCancelled
         ));
-        assert!(receiver.await.expect("reply").is_err());
-        for _ in 0..100 {
-            if delegation_suspend_task_status(&broker, &task_id).await
-                == crate::acp::delegation::types::TaskStatus::Canceled
-            {
-                break;
-            }
+
+        wait_for_suspension_loop_condition("bound prompt request", || {
+            prompts.lock().unwrap().len() == 1
+        })
+        .await;
+        let (reply, mut receiver) = oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::SuspendForDelegation {
+                continuation_id: "continuation-1".into(),
+                parent_turn_generation: 1,
+                reply,
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("suspension CancelNotification", || {
+            cancel_count.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        cmd_tx
+            .send(ConnectionCommand::SetMode {
+                mode_id: "hung-mode".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("hung session/set_mode request", || {
+            modes.lock().unwrap().len() == 1
+        })
+        .await;
+        for index in 0..8 {
+            cmd_tx
+                .send(ConnectionCommand::SetMode {
+                    mode_id: format!("queued-mode-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+        cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(
+            SUSPENSION_DRAIN_TIMEOUT_MS,
+        ))
+        .await;
+        for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+
+        let error = receiver
+            .try_recv()
+            .expect("queued user cancel must resolve the installed lease")
+            .unwrap_err();
+        assert!(error.to_string().contains("suspend_cancelled_by_user"));
+        wait_for_suspension_loop_condition("ParentCanceled child cancel", || {
+            spawner
+                .cancels
+                .try_lock()
+                .map(|cancels| cancels.as_slice() == ["child-conn"])
+                .unwrap_or(false)
+        })
+        .await;
         assert_eq!(
             delegation_suspend_task_status(&broker, &task_id).await,
             crate::acp::delegation::types::TaskStatus::Canceled
         );
-        assert_eq!(spawner.cancels.lock().await.as_slice(), ["child-conn"]);
+
+        cmd_tx.send(ConnectionCommand::Disconnect).await.unwrap();
+        loop_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -7698,39 +8148,96 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delegation_suspend_timeout_disconnects_and_never_acks_reuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let state = delegation_suspend_state(1);
-        let (lease, receiver) = delegation_suspend_lease(1);
-        let mut slot = Some(lease);
-        let deadline = suspension_drain_deadline();
-        tokio::pin!(deadline);
+        let (broker, spawner, _task_id) = delegation_suspend_broker_with_running_child().await;
+        let injection = delegation_suspend_injection(broker);
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_connection = Arc::new(std::sync::Mutex::new(None));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: prompts.clone(),
+            modes: modes.clone(),
+            agent_connection,
+            cancel_count: cancel_count.clone(),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        cmd_tx
+            .send(ConnectionCommand::Prompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "bound timeout prompt".into(),
+                }],
+                user_message: None,
+                mark_awaiting_reply: false,
+                turn_generation: 1,
+            })
+            .await
+            .unwrap();
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state.clone(),
+            cmd_rx,
+            injection,
+            false,
+        ));
+
+        wait_for_suspension_loop_condition("bound prompt request", || {
+            prompts.lock().unwrap().len() == 1
+        })
+        .await;
+        let (reply, mut receiver) = oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::SuspendForDelegation {
+                continuation_id: "continuation-1".into(),
+                parent_turn_generation: 1,
+                reply,
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("suspension CancelNotification", || {
+            cancel_count.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        cmd_tx
+            .send(ConnectionCommand::SetMode {
+                mode_id: "hung-mode".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("hung session/set_mode request", || {
+            modes.lock().unwrap().len() == 1
+        })
+        .await;
 
         tokio::time::advance(std::time::Duration::from_millis(
             SUSPENSION_DRAIN_TIMEOUT_MS,
         ))
         .await;
-        deadline.await;
-        let disposition = finalize_turn_terminal(
-            TurnTerminalSource::SuspensionDrainTimeout,
-            &mut slot,
-            &state,
-            &EventEmitter::Noop,
-            "parent-conn",
-            "session-1",
-            AgentType::Codex,
-            false,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            disposition,
-            TurnFinalizationDisposition::SuspensionFailed
-        ));
-        let error = receiver.await.expect("timeout reply").unwrap_err();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let error = receiver
+            .try_recv()
+            .expect("production loop must reject at the absolute drain deadline")
+            .unwrap_err();
         assert!(error.to_string().contains("suspend_drain_timeout"));
+        wait_for_suspension_loop_condition("connection loop exit", || loop_task.is_finished())
+            .await;
+        loop_task.await.unwrap().unwrap();
         let state = state.read().await;
         assert_eq!(state.active_turn_generation, Some(1));
         assert_eq!(state.last_suspended_turn_generation, None);
+        drop(state);
+        wait_for_suspension_loop_condition("ParentDisconnected child cancel", || {
+            spawner
+                .cancels
+                .try_lock()
+                .map(|cancels| cancels.as_slice() == ["child-conn"])
+                .unwrap_or(false)
+        })
+        .await;
     }
 
     #[tokio::test]
