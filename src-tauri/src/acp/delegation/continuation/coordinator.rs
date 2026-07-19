@@ -216,7 +216,6 @@ impl ParentContinuationPort for ManagerContinuationPort {
                 request.parent_turn_generation,
             )
             .await
-            .map_err(ContinuationError::SuspendDispatch)
     }
 
     async fn admit_continuation(
@@ -238,11 +237,13 @@ impl ParentContinuationPort for ManagerContinuationPort {
             .ok_or(ContinuationError::ParentUnavailable)?;
         let conversation_id = {
             let mut live = state.write().await;
-            let conversation_id = waiting
-                .as_ref()
-                .map(|projection| projection.conversation_id)
-                .or(live.conversation_id)
-                .ok_or(ContinuationError::ParentIdentityChanged)?;
+            let conversation_id = match waiting.as_ref() {
+                Some(projection) => projection.conversation_id,
+                None => match live.waiting_for_subagents.as_ref() {
+                    Some(projection) => projection.conversation_id,
+                    None => return Ok(()),
+                },
+            };
             if live.conversation_id != Some(conversation_id) {
                 return Err(ContinuationError::ParentIdentityChanged);
             }
@@ -630,6 +631,88 @@ async fn fail_before_suspension(
     }
 }
 
+#[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
+async fn retain_until_cancelled(context: &WorkerContext) {
+    context.cancel.cancelled().await;
+}
+
+fn is_terminal_state(state: ContinuationState) -> bool {
+    matches!(
+        state,
+        ContinuationState::Completed | ContinuationState::Cancelled | ContinuationState::Failed
+    )
+}
+
+async fn retain_if_active(context: &WorkerContext, continuation_id: &str) {
+    let terminal = context
+        .store
+        .load(continuation_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|record| is_terminal_state(record.state));
+    if !terminal {
+        retain_until_cancelled(context).await;
+    }
+}
+
+#[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
+async fn fail_after_suspension(
+    context: &WorkerContext,
+    owned: &ContinuationRecord,
+    code: ContinuationFailureCode,
+) {
+    let exact_row_is_terminal = context
+        .store
+        .load(&owned.continuation_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            record.generation == owned.generation && is_terminal_state(record.state)
+        });
+    if exact_row_is_terminal {
+        return;
+    }
+    let connection_id = owned.parent_connection_id.clone().unwrap_or_default();
+    context
+        .broker
+        .cancel_by_parent_turn_inline(&connection_id, ParentTurnEndReason::ParentTurnFailed)
+        .await;
+    match context
+        .store
+        .cas_fail_and_cancel_parent(
+            &owned.continuation_id,
+            owned.generation,
+            owned.version,
+            owned.state,
+            code,
+            context.clock.now_utc(),
+        )
+        .await
+    {
+        Ok(Some(_)) => {
+            context
+                .metrics
+                .record_continuation_failed(owned.state, code);
+            let _ = context.port.publish_waiting(&connection_id, None).await;
+            let _ = context.port.publish_failure(&connection_id, code).await;
+        }
+        Ok(None) | Err(_) => {
+            let terminal = context
+                .store
+                .load(&owned.continuation_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|record| is_terminal_state(record.state));
+            if !terminal {
+                retain_until_cancelled(context).await;
+            }
+        }
+    }
+}
+
 #[allow(dead_code, reason = "Task 7 activates coordinator workers")]
 async fn run_worker(
     context: WorkerContext,
@@ -703,6 +786,7 @@ async fn run_worker_owned(
                 Ok(claimed) => Some(claimed),
                 Err(error) => {
                     let _ = completion.send(Err(error));
+                    retain_if_active(context, &record.continuation_id).await;
                     return;
                 }
             },
@@ -734,6 +818,7 @@ async fn run_worker_owned(
                                 }
                                 Err(error) => {
                                     let _ = completion.send(Err(error));
+                                    retain_if_active(context, &record.continuation_id).await;
                                     return;
                                 }
                             }
@@ -752,6 +837,7 @@ async fn run_worker_owned(
                         }
                         Err(error) => {
                             let _ = completion.send(Err(error));
+                            retain_if_active(context, &record.continuation_id).await;
                             return;
                         }
                     }
@@ -767,13 +853,21 @@ async fn run_worker_owned(
     let ack = match ack {
         Ok(ack) => ack,
         Err(error) => {
+            if matches!(
+                &error,
+                ContinuationError::SuspendDrainTimeout | ContinuationError::ParentConnectionLost
+            ) {
+                let _ = completion.send(Err(error));
+                retain_until_cancelled(context).await;
+                return;
+            }
             let failed_record = claimed.as_ref().unwrap_or(&record);
-            fail_before_suspension(
-                context,
-                failed_record,
-                ContinuationFailureCode::SuspendDispatchFailed,
-            )
-            .await;
+            let failure_code = if matches!(&error, ContinuationError::SuspendDispatch(_)) {
+                ContinuationFailureCode::SuspendDispatchFailed
+            } else {
+                ContinuationFailureCode::ArmFailed
+            };
+            fail_before_suspension(context, failed_record, failure_code).await;
             let _ = completion.send(Err(error));
             return;
         }
@@ -782,8 +876,13 @@ async fn run_worker_owned(
         || ack.parent_turn_generation != record.parent_turn_generation
     {
         let failed_record = claimed.as_ref().unwrap_or(&record);
-        fail_before_suspension(context, failed_record, ContinuationFailureCode::ArmFailed).await;
         let _ = completion.send(Err(ContinuationError::ParentIdentityChanged));
+        fail_after_suspension(
+            context,
+            failed_record,
+            ContinuationFailureCode::StateConflict,
+        )
+        .await;
         return;
     }
 
@@ -805,6 +904,8 @@ async fn run_worker_owned(
             Ok(Some(record)) => record,
             _ => {
                 let _ = completion.send(Err(ContinuationError::StateConflict));
+                fail_after_suspension(context, &claimed, ContinuationFailureCode::StateConflict)
+                    .await;
                 return;
             }
         }
@@ -825,6 +926,8 @@ async fn run_worker_owned(
             Ok(Some(record)) => record,
             _ => {
                 let _ = completion.send(Err(ContinuationError::StateConflict));
+                fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict)
+                    .await;
                 return;
             }
         }
@@ -850,6 +953,7 @@ async fn run_worker_owned(
         .is_err()
     {
         let _ = completion.send(Err(ContinuationError::StateConflict));
+        fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict).await;
         return;
     }
     let _ = completion.send(Ok(ack));
@@ -870,14 +974,28 @@ async fn run_worker_owned(
             {
                 JoinEvaluation::Ready(batch) => {
                     let Some(reason) = wake_reason(&batch) else {
+                        fail_after_suspension(
+                            context,
+                            &record,
+                            ContinuationFailureCode::StateConflict,
+                        )
+                        .await;
                         return;
                     };
-                    match claim_wake(context, record, reason).await {
+                    match claim_wake(context, record.clone(), reason).await {
                         Ok(claimed) => {
                             record = claimed;
                             break;
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            fail_after_suspension(
+                                context,
+                                &record,
+                                ContinuationFailureCode::StateConflict,
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
                 JoinEvaluation::Waiting(_) => {}
@@ -885,12 +1003,24 @@ async fn run_worker_owned(
             tokio::select! {
                 _ = &mut notified => {}
                 _ = context.clock.sleep_until(record.wake_at) => {
-                    match claim_wake(context, record, ContinuationWakeReason::Checkpoint).await {
+                    match claim_wake(
+                        context,
+                        record.clone(),
+                        ContinuationWakeReason::Checkpoint,
+                    ).await {
                         Ok(claimed) => {
                             record = claimed;
                             break;
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            fail_after_suspension(
+                                context,
+                                &record,
+                                ContinuationFailureCode::StateConflict,
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
                 _ = context.cancel.cancelled() => return,
@@ -909,7 +1039,10 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             if snapshot.connection_id == connection_id
                 && snapshot.conversation_id == record.parent_conversation_id
                 && snapshot.session_id == record.parent_session_id => {}
-        _ => return,
+        _ => {
+            fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict).await;
+            return;
+        }
     }
     let patch = keep_patch(ContinuationState::Resuming);
     record = match context
@@ -924,7 +1057,10 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
         .await
     {
         Ok(Some(record)) => record,
-        _ => return,
+        _ => {
+            fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict).await;
+            return;
+        }
     };
 
     let reason = record
@@ -951,14 +1087,21 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             {
                 current
             }
-            _ => return,
+            _ => {
+                retain_until_cancelled(context).await;
+                return;
+            }
         };
         match context.port.snapshot_parent(&connection_id).await {
             Ok(snapshot)
                 if snapshot.connection_id == connection_id
                     && snapshot.conversation_id == current.parent_conversation_id
                     && snapshot.session_id == current.parent_session_id => {}
-            _ => return,
+            _ => {
+                fail_after_suspension(context, &current, ContinuationFailureCode::StateConflict)
+                    .await;
+                return;
+            }
         }
         let snapshot = match context
             .broker
@@ -1004,11 +1147,14 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
                     {
                         admitted
                     }
-                    _ => return,
+                    _ => {
+                        retain_until_cancelled(context).await;
+                        return;
+                    }
                 };
                 let mut completed = keep_patch(ContinuationState::Completed);
                 completed.finished_at = FieldPatch::Set(context.clock.now_utc());
-                if context
+                match context
                     .store
                     .cas_transition(
                         &admitted.continuation_id,
@@ -1018,60 +1164,44 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
                         completed,
                     )
                     .await
-                    .ok()
-                    .flatten()
-                    .is_some()
                 {
-                    let _ = context.port.publish_waiting(&connection_id, None).await;
+                    Ok(Some(_)) => {
+                        let _ = context.port.publish_waiting(&connection_id, None).await;
+                    }
+                    Ok(None) | Err(_) => {
+                        fail_after_suspension(
+                            context,
+                            &admitted,
+                            ContinuationFailureCode::StateConflict,
+                        )
+                        .await;
+                    }
                 }
                 return;
             }
             Err(ContinuationError::PromptDelivery(_)) if attempt < retry_delays_ms.len() => {}
             Err(ContinuationError::PromptDelivery(_)) => {
-                terminal_failure = Some(ContinuationFailureCode::PromptDeliveryFailed);
+                terminal_failure = Some((ContinuationFailureCode::PromptDeliveryFailed, current));
                 break;
             }
             Err(ContinuationError::StateConflict) => {
-                terminal_failure = Some(ContinuationFailureCode::StateConflict);
+                terminal_failure = Some((ContinuationFailureCode::StateConflict, current));
                 break;
             }
-            Err(_) => return,
+            Err(ContinuationError::ParentUnavailable)
+            | Err(ContinuationError::ParentConnectionLost) => {
+                retain_until_cancelled(context).await;
+                return;
+            }
+            Err(_) => {
+                fail_after_suspension(context, &current, ContinuationFailureCode::StateConflict)
+                    .await;
+                return;
+            }
         }
     }
-    let Some(failure_code) = terminal_failure else {
+    let Some((failure_code, failed_record)) = terminal_failure else {
         return;
     };
-
-    context
-        .broker
-        .cancel_by_parent_turn_inline(&connection_id, ParentTurnEndReason::ParentTurnFailed)
-        .await;
-    let current = match context.store.load(&record.continuation_id).await {
-        Ok(Some(current)) => current,
-        _ => return,
-    };
-    if context
-        .store
-        .cas_fail_and_cancel_parent(
-            &current.continuation_id,
-            current.generation,
-            current.version,
-            current.state,
-            failure_code,
-            context.clock.now_utc(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        context
-            .metrics
-            .record_continuation_failed(current.state, failure_code);
-        let _ = context.port.publish_waiting(&connection_id, None).await;
-        let _ = context
-            .port
-            .publish_failure(&connection_id, failure_code)
-            .await;
-    }
+    fail_after_suspension(context, &failed_record, failure_code).await;
 }

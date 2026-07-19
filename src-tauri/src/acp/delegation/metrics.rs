@@ -1307,11 +1307,78 @@ mod tests {
         }
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.continuation_wake_claimed.len(), 4);
-        assert_eq!(snapshot.continuation_cancelled.len(), 4);
-        assert_eq!(snapshot.continuation_failed.len(), 24);
-        assert_eq!(snapshot.continuation_reconciled.len(), 4);
-        assert_eq!(snapshot.continuation_wait_duration_ms_count.len(), 4);
+        let wake_keys = [
+            "all_terminal",
+            "attention_required",
+            "checkpoint",
+            "unavailable",
+        ];
+        let phase_keys = ["arming", "resuming", "waiting", "wake_pending"];
+        let failure_codes = [
+            "arm_failed",
+            "parent_connection_lost",
+            "prompt_delivery_failed",
+            "state_conflict",
+            "suspend_dispatch_failed",
+            "suspend_drain_timeout",
+        ];
+        let mut failure_keys = phase_keys
+            .iter()
+            .flat_map(|phase| {
+                failure_codes
+                    .iter()
+                    .map(move |code| format!("{phase}:{code}"))
+            })
+            .collect::<Vec<_>>();
+        failure_keys.sort();
+        assert_eq!(
+            snapshot
+                .continuation_wake_claimed
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            wake_keys
+        );
+        assert_eq!(
+            snapshot
+                .continuation_cancelled
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            phase_keys
+        );
+        assert_eq!(
+            snapshot
+                .continuation_failed
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            failure_keys
+        );
+        assert_eq!(
+            snapshot
+                .continuation_reconciled
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            phase_keys
+        );
+        assert_eq!(
+            snapshot
+                .continuation_wait_duration_ms_count
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            wake_keys
+        );
+        assert_eq!(
+            snapshot
+                .continuation_wait_duration_ms_total
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            wake_keys
+        );
         let json = serde_json::to_string(&snapshot).unwrap();
         for forbidden in [
             "550e8400-e29b-41d4-a716-446655440000",

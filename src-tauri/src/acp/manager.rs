@@ -11,9 +11,9 @@ use sea_orm::{
 };
 
 #[cfg(any(test, feature = "test-utils"))]
-use crate::acp::connection::{connection_channel, matching_config_pair, LaneSender};
+use crate::acp::connection::{connection_channel, matching_config_pair};
 use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
+    spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl, LaneSender,
     RouteBootstrapOutcome, SpawnHandshake, SuspensionAck,
 };
 use crate::acp::delegation::continuation::build_continuation_prompt_text;
@@ -54,6 +54,34 @@ use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
+
+pub(crate) async fn dispatch_suspension_control(
+    control_tx: LaneSender<ConnectionControl>,
+    continuation_id: impl Into<String>,
+    parent_turn_generation: u64,
+) -> Result<SuspensionAck, ContinuationError> {
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(ConnectionControl::SuspendForDelegation {
+            continuation_id: continuation_id.into(),
+            parent_turn_generation,
+            reply,
+        })
+        .await
+        .map_err(|_| ContinuationError::SuspendDispatch(AcpError::ProcessExited))?;
+    match receiver.await {
+        Err(_) => Err(ContinuationError::ParentConnectionLost),
+        Ok(Ok(ack)) => Ok(ack),
+        Ok(Err(AcpError::ProcessExited)) => Err(ContinuationError::ParentConnectionLost),
+        Ok(Err(AcpError::Protocol(code))) if code == "suspend_drain_timeout" => {
+            Err(ContinuationError::SuspendDrainTimeout)
+        }
+        Ok(Err(AcpError::Protocol(code))) if code == "suspend_parent_disconnected" => {
+            Err(ContinuationError::ParentConnectionLost)
+        }
+        Ok(Err(error)) => Err(ContinuationError::SuspendDispatch(error)),
+    }
+}
 
 #[cfg(any(test, feature = "test-utils"))]
 fn test_control_sender() -> LaneSender<ConnectionControl> {
@@ -1588,25 +1616,18 @@ impl ConnectionManager {
         conn_id: &str,
         continuation_id: String,
         parent_turn_generation: u64,
-    ) -> Result<SuspensionAck, AcpError> {
+    ) -> Result<SuspensionAck, ContinuationError> {
         let control_tx = {
             let connections = self.connections.lock().await;
             connections
                 .get(conn_id)
-                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
+                .ok_or_else(|| {
+                    ContinuationError::SuspendDispatch(AcpError::ConnectionNotFound(conn_id.into()))
+                })?
                 .control_tx
                 .clone()
         };
-        let (reply, receiver) = tokio::sync::oneshot::channel();
-        control_tx
-            .send(ConnectionControl::SuspendForDelegation {
-                continuation_id,
-                parent_turn_generation,
-                reply,
-            })
-            .await
-            .map_err(|_| AcpError::ProcessExited)?;
-        receiver.await.map_err(|_| AcpError::ProcessExited)?
+        dispatch_suspension_control(control_tx, continuation_id, parent_turn_generation).await
     }
 
     #[allow(

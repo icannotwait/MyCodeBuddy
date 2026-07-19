@@ -19,7 +19,7 @@ use super::types::{
     ContinuationWakeReason, CONTINUATION_CHECKPOINT_MS,
 };
 use super::{filter_internal_continuation_turns, internal_prompt_marker};
-use crate::acp::connection::SuspensionAck;
+use crate::acp::connection::{ConnectionControl, SuspensionAck};
 use crate::acp::delegation::attention::{
     mock::MemoryDelegationAttentionStore, DelegationAttentionStore, NewAttentionRequest,
 };
@@ -30,6 +30,7 @@ use crate::acp::delegation::types::{
     DelegationError, DelegationOutcome, DelegationSuccess, DelegationWakeReason, TaskStatus,
 };
 use crate::acp::error::AcpError;
+use crate::acp::manager::dispatch_suspension_control;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::AcpEvent;
 use crate::models::{AgentType, ContentBlock, MessageTurn, TurnRole};
@@ -70,22 +71,113 @@ async fn complete_seeded_task(broker: &DelegationBroker, task_id: &str) {
 
 #[tokio::test]
 async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
-    let broker = test_broker();
+    let broker = Arc::new(test_broker());
     complete_seeded_task(&broker, "task-terminal").await;
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
 
-    let evaluation = broker
-        .evaluate_join_snapshot("parent", 7, &["task-terminal".into()])
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-terminal".into()],
+            waiter_closed: CancellationToken::new(),
+        })
         .await;
-
-    let JoinEvaluation::Ready(batch) = evaluation else {
+    let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
         panic!("all-terminal Join must be immediately ready")
     };
     assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
     assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+    assert!(store.list_non_terminal().await.unwrap().is_empty());
+    assert_eq!(coordinator.worker_count(), 0);
 }
 
 #[tokio::test]
 async fn continuation_broker_immediate_attention_snapshot_is_ready() {
+    let attention = Arc::new(MemoryDelegationAttentionStore::new());
+    let broker = Arc::new(
+        test_broker().with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+    );
+    broker
+        .seed_live_task_for_test("parent", "task-attention")
+        .await;
+    attention
+        .open_or_recover(NewAttentionRequest {
+            task_id: "task-attention".into(),
+            parent_conversation_id: 7,
+            child_conversation_id: 99,
+            child_tool_call_id: "child-tool".into(),
+            message: "Need a decision".into(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-attention".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await;
+    let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
+        panic!("open attention must make Join immediately ready")
+    };
+    assert_eq!(
+        batch.wake_reason,
+        Some(DelegationWakeReason::AttentionRequired)
+    );
+    assert_eq!(batch.attention_requests.unwrap().len(), 1);
+    assert!(store.list_non_terminal().await.unwrap().is_empty());
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
+    let broker = Arc::new(test_broker());
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["missing-task".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await;
+    let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
+        panic!("unknown task must fail open as unavailable")
+    };
+    assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
+    assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
+    assert!(store.list_non_terminal().await.unwrap().is_empty());
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_broker_attention_has_priority_over_unavailable() {
     let attention = Arc::new(MemoryDelegationAttentionStore::new());
     let broker =
         test_broker().with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>);
@@ -105,32 +197,20 @@ async fn continuation_broker_immediate_attention_snapshot_is_ready() {
         .unwrap();
 
     let evaluation = broker
-        .evaluate_join_snapshot("parent", 7, &["task-attention".into()])
+        .evaluate_join_snapshot(
+            "parent",
+            7,
+            &["task-attention".into(), "missing-task".into()],
+        )
         .await;
-
     let JoinEvaluation::Ready(batch) = evaluation else {
-        panic!("open attention must make Join immediately ready")
+        panic!("attention must be immediately ready")
     };
     assert_eq!(
         batch.wake_reason,
         Some(DelegationWakeReason::AttentionRequired)
     );
     assert_eq!(batch.attention_requests.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
-    let broker = test_broker();
-
-    let evaluation = broker
-        .evaluate_join_snapshot("parent", 7, &["missing-task".into()])
-        .await;
-
-    let JoinEvaluation::Ready(batch) = evaluation else {
-        panic!("unknown task must fail open as unavailable")
-    };
-    assert_eq!(batch.wake_reason, Some(DelegationWakeReason::Unavailable));
-    assert_eq!(batch.tasks[0].status, TaskStatus::Unknown);
 }
 
 struct ReadyPort;
@@ -269,6 +349,11 @@ struct ObservedStore {
     drain_check_broker: Mutex<Option<Arc<DelegationBroker>>>,
     drain_check_task: Mutex<Option<(Arc<MockTaskStore>, String)>>,
     drain_verified: std::sync::atomic::AtomicBool,
+    fail_transition_to: Mutex<Option<ContinuationState>>,
+    failure_attempted: tokio::sync::Notify,
+    failure_fence: Mutex<Option<(u64, u64, ContinuationState)>>,
+    fail_next_load: AtomicUsize,
+    load_failure_observed: tokio::sync::Notify,
 }
 
 impl ObservedStore {
@@ -288,6 +373,11 @@ impl ObservedStore {
                 drain_check_broker: Mutex::new(None),
                 drain_check_task: Mutex::new(None),
                 drain_verified: std::sync::atomic::AtomicBool::new(false),
+                fail_transition_to: Mutex::new(None),
+                failure_attempted: tokio::sync::Notify::new(),
+                failure_fence: Mutex::new(None),
+                fail_next_load: AtomicUsize::new(0),
+                load_failure_observed: tokio::sync::Notify::new(),
             }),
             rx,
         )
@@ -303,6 +393,17 @@ impl ObservedStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(entered);
         *self.insert_release.lock().await = Some(release);
+    }
+
+    fn fail_next_transition_to(&self, state: ContinuationState) {
+        *self
+            .fail_transition_to
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(state);
+    }
+
+    fn fail_next_load(&self) {
+        self.fail_next_load.store(1, Ordering::Release);
     }
 }
 
@@ -330,6 +431,10 @@ impl ContinuationStore for ObservedStore {
         &self,
         continuation_id: &str,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        if self.fail_next_load.swap(0, Ordering::AcqRel) == 1 {
+            self.load_failure_observed.notify_waiters();
+            return Ok(None);
+        }
         self.inner.load(continuation_id).await
     }
 
@@ -354,6 +459,21 @@ impl ContinuationStore for ObservedStore {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        let should_fail = {
+            let mut target = self
+                .fail_transition_to
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if target.as_ref() == Some(&patch.state) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Ok(None);
+        }
         let result = self
             .inner
             .cas_transition(
@@ -400,6 +520,12 @@ impl ContinuationStore for ObservedStore {
         failure_code: ContinuationFailureCode,
         finished_at: chrono::DateTime<Utc>,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        *self
+            .failure_fence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some((generation, expected_version, expected_state));
+        self.failure_attempted.notify_waiters();
         let broker = self
             .drain_check_broker
             .lock()
@@ -512,6 +638,7 @@ impl ParentContinuationPort for GatedPort {
         &self,
         request: SuspendRequest,
     ) -> Result<SuspensionAck, ContinuationError> {
+        let release = self.suspend_release.lock().await.take();
         if let Some(tx) = self
             .suspend_started
             .lock()
@@ -520,7 +647,7 @@ impl ParentContinuationPort for GatedPort {
         {
             let _ = tx.send(request.clone());
         }
-        if let Some(release) = self.suspend_release.lock().await.take() {
+        if let Some(release) = release {
             let _ = release.await;
         }
         Ok(SuspensionAck {
@@ -677,6 +804,196 @@ impl ParentContinuationPort for ConflictAdmissionPort {
         _request: ContinuationPromptRequest,
     ) -> Result<PromptAdmissionResult, ContinuationError> {
         Err(ContinuationError::StateConflict)
+    }
+
+    async fn publish_waiting(
+        &self,
+        connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_waiting(connection_id, waiting).await
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
+struct WaitingPublishFailurePort;
+
+#[async_trait]
+impl ParentContinuationPort for WaitingPublishFailurePort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        ReadyPort.snapshot_parent(connection_id).await
+    }
+
+    async fn suspend_parent(
+        &self,
+        request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        ReadyPort.suspend_parent(request).await
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        ReadyPort.admit_continuation(request).await
+    }
+
+    async fn publish_waiting(
+        &self,
+        _connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        if waiting.is_some() {
+            Err(ContinuationError::ParentIdentityChanged)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
+struct ParentIdentityDriftPort {
+    snapshots: AtomicUsize,
+}
+
+#[async_trait]
+impl ParentContinuationPort for ParentIdentityDriftPort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        let mut snapshot = ReadyPort.snapshot_parent(connection_id).await?;
+        if self.snapshots.fetch_add(1, Ordering::Relaxed) > 0 {
+            snapshot.conversation_id += 1;
+        }
+        Ok(snapshot)
+    }
+
+    async fn suspend_parent(
+        &self,
+        request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        ReadyPort.suspend_parent(request).await
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        ReadyPort.admit_continuation(request).await
+    }
+
+    async fn publish_waiting(
+        &self,
+        connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_waiting(connection_id, waiting).await
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SuspensionFailureCause {
+    DrainTimeout,
+    ParentConnectionLost,
+}
+
+struct SuspensionFailurePort(SuspensionFailureCause);
+
+#[async_trait]
+impl ParentContinuationPort for SuspensionFailurePort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        ReadyPort.snapshot_parent(connection_id).await
+    }
+
+    async fn suspend_parent(
+        &self,
+        _request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        Err(match self.0 {
+            SuspensionFailureCause::DrainTimeout => ContinuationError::SuspendDrainTimeout,
+            SuspensionFailureCause::ParentConnectionLost => ContinuationError::ParentConnectionLost,
+        })
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        ReadyPort.admit_continuation(request).await
+    }
+
+    async fn publish_waiting(
+        &self,
+        connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_waiting(connection_id, waiting).await
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
+struct PostAdmissionReloadFailurePort {
+    store: Arc<ObservedStore>,
+}
+
+#[async_trait]
+impl ParentContinuationPort for PostAdmissionReloadFailurePort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        ReadyPort.snapshot_parent(connection_id).await
+    }
+
+    async fn suspend_parent(
+        &self,
+        request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        ReadyPort.suspend_parent(request).await
+    }
+
+    async fn admit_continuation(
+        &self,
+        _request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        self.store.fail_next_load();
+        Ok(PromptAdmissionResult::Admitted)
     }
 
     async fn publish_waiting(
@@ -971,90 +1288,441 @@ async fn continuation_coordinator_event_deadline_race_claims_once_and_clears_reg
     assert_eq!(coordinator.worker_count(), 0);
 }
 
-#[tokio::test]
-async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer_row() {
-    let store = InMemoryContinuationStore::default();
-    let now = Utc::now();
-    let first = store
-        .insert_arming(NewContinuation {
-            continuation_id: "first".into(),
-            parent_conversation_id: 7,
-            parent_session_id: "session-7".into(),
+async fn assert_post_ack_transition_failure_is_terminalized(target: ContinuationState) {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    store.fail_next_transition_to(target);
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
             parent_connection_id: "parent".into(),
-            parent_turn_generation: 3,
-            task_ids: super::types::ContinuationTaskIds(vec!["task".into()]),
-            armed_at: now,
-            wake_at: now + ChronoDuration::seconds(240),
-            internal_prompt_id: "prompt-first".into(),
-            internal_prompt_marker: "marker-first".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
         })
         .await
         .unwrap();
-    let mut cancel = ContinuationPatch {
-        state: ContinuationState::Cancelled,
-        wake_reason: super::store::FieldPatch::Keep,
-        suspend_requested_at: super::store::FieldPatch::Keep,
-        suspended_at: super::store::FieldPatch::Keep,
-        wake_claimed_at: super::store::FieldPatch::Keep,
-        prompt_admitted_at: super::store::FieldPatch::Keep,
-        finished_at: super::store::FieldPatch::Keep,
-        failure_code: super::store::FieldPatch::Keep,
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
     };
-    cancel.finished_at = super::store::FieldPatch::Set(now);
-    store
+
+    if target == ContinuationState::Waiting {
+        assert!(matches!(
+            completion.await.unwrap(),
+            Err(ContinuationError::StateConflict)
+        ));
+    } else {
+        completion.await.unwrap().unwrap();
+        complete_seeded_task(&broker, "task-running").await;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_millis(250), &mut terminal)
+        .await
+        .expect("post-ack transition failure must reach a terminal row");
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Failed);
+    assert_eq!(
+        row.failure_code,
+        Some(ContinuationFailureCode::StateConflict)
+    );
+    assert_eq!(broker.pending_count().await, 0);
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_post_ack_suspended_cas_failure_is_not_ownerless() {
+    assert_post_ack_transition_failure_is_terminalized(ContinuationState::Waiting).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_post_ack_resuming_cas_failure_is_not_ownerless() {
+    assert_post_ack_transition_failure_is_terminalized(ContinuationState::Resuming).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_post_admission_completion_cas_failure_is_not_ownerless() {
+    assert_post_ack_transition_failure_is_terminalized(ContinuationState::Completed).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_post_admission_reload_failure_retains_owner_until_cleanup() {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let load_failure = store.load_failure_observed.notified();
+    tokio::pin!(load_failure);
+    load_failure.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(PostAdmissionReloadFailurePort {
+            store: store.clone(),
+        }),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    completion.await.unwrap().unwrap();
+    complete_seeded_task(&broker, "task-running").await;
+    load_failure.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Resuming);
+    assert_eq!(coordinator.worker_count(), 1);
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless() {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(WaitingPublishFailurePort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::StateConflict)
+    ));
+    tokio::time::timeout(std::time::Duration::from_millis(250), &mut terminal)
+        .await
+        .expect("waiting publication failure must reach a terminal row");
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Failed);
+    assert_eq!(
+        row.failure_code,
+        Some(ContinuationFailureCode::StateConflict)
+    );
+    assert_eq!(broker.pending_count().await, 0);
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_post_ack_parent_identity_drift_is_not_ownerless() {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ParentIdentityDriftPort {
+            snapshots: AtomicUsize::new(0),
+        }),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    completion.await.unwrap().unwrap();
+    complete_seeded_task(&broker, "task-running").await;
+    tokio::time::timeout(std::time::Duration::from_millis(250), &mut terminal)
+        .await
+        .expect("parent identity drift must reach a terminal row");
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Failed);
+    assert_eq!(
+        row.failure_code,
+        Some(ContinuationFailureCode::StateConflict)
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCause) {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(SuspensionFailurePort(cause)),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    let error = completion.await.unwrap().unwrap_err();
+    match cause {
+        SuspensionFailureCause::DrainTimeout => {
+            assert!(matches!(error, ContinuationError::SuspendDrainTimeout));
+        }
+        SuspensionFailureCause::ParentConnectionLost => {
+            assert!(matches!(error, ContinuationError::ParentConnectionLost));
+        }
+    }
+    tokio::task::yield_now().await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Arming);
+    assert_eq!(row.failure_code, None);
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_suspend_drain_timeout_stays_owned_for_task8_cleanup() {
+    assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::DrainTimeout).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_parent_connection_loss_stays_owned_for_task8_cleanup() {
+    assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::ParentConnectionLost).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer_row() {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let (port, suspend_started, _suspend_release, _admission_started) = GatedPort::new();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    suspend_started.await.expect("suspension dispatched");
+    let owned = store.load(&continuation_id).await.unwrap().unwrap();
+    let newer = store
         .cas_transition(
-            &first.continuation_id,
-            first.generation,
-            first.version,
+            &owned.continuation_id,
+            owned.generation,
+            owned.version,
             ContinuationState::Arming,
-            cancel,
+            ContinuationPatch {
+                state: ContinuationState::Arming,
+                wake_reason: super::store::FieldPatch::Keep,
+                suspend_requested_at: super::store::FieldPatch::Set(Utc::now()),
+                suspended_at: super::store::FieldPatch::Keep,
+                wake_claimed_at: super::store::FieldPatch::Keep,
+                prompt_admitted_at: super::store::FieldPatch::Keep,
+                finished_at: super::store::FieldPatch::Keep,
+                failure_code: super::store::FieldPatch::Keep,
+            },
         )
         .await
         .unwrap()
         .unwrap();
-    let newer = store
-        .insert_arming(NewContinuation {
-            continuation_id: "newer".into(),
-            parent_conversation_id: 7,
-            parent_session_id: "session-7".into(),
+    complete_seeded_task(&broker, "task-running").await;
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::StateConflict)
+    ));
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.version, newer.version);
+    assert_eq!(row.state, ContinuationState::Arming);
+    assert_eq!(coordinator.worker_count(), 1);
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row() {
+    let broker = Arc::new(test_broker());
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let (port, suspend_started, suspend_release, _admission_started) = GatedPort::new();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let first = coordinator
+        .begin_arm_from_join(JoinArmRequest {
             parent_connection_id: "parent".into(),
-            parent_turn_generation: 4,
-            task_ids: super::types::ContinuationTaskIds(vec!["task".into()]),
-            armed_at: now,
-            wake_at: now + ChronoDuration::seconds(240),
-            internal_prompt_id: "prompt-newer".into(),
-            internal_prompt_marker: "marker-newer".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
         })
         .await
         .unwrap();
-    let mut wake = ContinuationPatch {
-        state: ContinuationState::WakePending,
-        wake_reason: super::store::FieldPatch::Set(ContinuationWakeReason::AllTerminal),
-        suspend_requested_at: super::store::FieldPatch::Keep,
-        suspended_at: super::store::FieldPatch::Keep,
-        wake_claimed_at: super::store::FieldPatch::Set(now),
-        prompt_admitted_at: super::store::FieldPatch::Keep,
-        finished_at: super::store::FieldPatch::Keep,
-        failure_code: super::store::FieldPatch::Keep,
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id: first_id,
+        completion: first_completion,
+    } = first
+    else {
+        panic!("must arm first generation")
     };
-    wake.suspend_requested_at = super::store::FieldPatch::Keep;
-
-    let stale = store
+    suspend_started.await.expect("first suspension dispatched");
+    tokio::task::yield_now().await;
+    let first_row = store.load(&first_id).await.unwrap().unwrap();
+    let cancelled = store
         .cas_transition(
-            &newer.continuation_id,
-            first.generation,
-            newer.version + 1,
+            &first_row.continuation_id,
+            first_row.generation,
+            first_row.version,
             ContinuationState::Arming,
-            wake,
+            ContinuationPatch {
+                state: ContinuationState::Cancelled,
+                wake_reason: super::store::FieldPatch::Keep,
+                suspend_requested_at: super::store::FieldPatch::Keep,
+                suspended_at: super::store::FieldPatch::Keep,
+                wake_claimed_at: super::store::FieldPatch::Keep,
+                prompt_admitted_at: super::store::FieldPatch::Keep,
+                finished_at: super::store::FieldPatch::Set(Utc::now()),
+                failure_code: super::store::FieldPatch::Keep,
+            },
         )
         .await
+        .unwrap()
         .unwrap();
 
-    assert!(stale.is_none());
-    assert_eq!(
-        store.load("newer").await.unwrap().unwrap().state,
-        ContinuationState::Arming
-    );
+    let second = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id: second_id,
+        completion: second_completion,
+    } = second
+    else {
+        panic!("must arm second generation")
+    };
+    second_completion.await.unwrap().unwrap();
+    let second_waiting = store.load(&second_id).await.unwrap().unwrap();
+    assert!(second_waiting.generation > cancelled.generation);
+    assert_eq!(second_waiting.state, ContinuationState::Waiting);
+
+    suspend_release.send(()).unwrap();
+    assert!(matches!(
+        first_completion.await.unwrap(),
+        Err(ContinuationError::StateConflict)
+    ));
+    tokio::task::yield_now().await;
+    let second_after_stale_exit = store.load(&second_id).await.unwrap().unwrap();
+    assert_eq!(second_after_stale_exit.state, ContinuationState::Waiting);
+    assert_eq!(second_after_stale_exit.version, second_waiting.version);
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1226,41 +1894,31 @@ async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_c
     }
     let record = seed_resuming_continuation(&store).await;
     let marker = record.internal_prompt_marker.clone();
-    let (dequeued_tx, dequeued_rx) = tokio::sync::oneshot::channel();
-    let store_at_dequeue = store.clone();
-    let dequeue = tokio::spawn(async move {
-        let command = command_rx.recv().await.expect("continuation command");
-        let durable = store_at_dequeue
-            .matches_admitted_marker(7, &marker)
-            .await
-            .unwrap();
-        let text = match command {
-            crate::acp::connection::ConnectionCommand::Prompt {
-                blocks,
-                user_message,
-                mark_awaiting_reply,
-                ..
-            } => {
-                assert!(user_message.is_none());
-                assert!(mark_awaiting_reply);
-                match blocks.into_iter().next().unwrap() {
-                    crate::acp::types::PromptInputBlock::Text { text } => text,
-                    _ => panic!("continuation prompt must be text"),
-                }
-            }
-            _ => panic!("expected continuation prompt"),
-        };
-        dequeued_tx.send((durable, text)).unwrap();
-    });
 
     let first = manager
         .admit_delegation_continuation(admission_request(&record))
         .await
         .unwrap();
     assert_eq!(first, PromptAdmissionResult::Admitted);
-    let (durable_at_dequeue, prompt_text) = dequeued_rx.await.unwrap();
+    let command = command_rx.recv().await.expect("continuation command");
+    let durable_at_dequeue = store.matches_admitted_marker(7, &marker).await.unwrap();
+    let prompt_text = match command {
+        crate::acp::connection::ConnectionCommand::Prompt {
+            blocks,
+            user_message,
+            mark_awaiting_reply,
+            ..
+        } => {
+            assert!(user_message.is_none());
+            assert!(mark_awaiting_reply);
+            match blocks.into_iter().next().unwrap() {
+                crate::acp::types::PromptInputBlock::Text { text } => text,
+                _ => panic!("continuation prompt must be text"),
+            }
+        }
+        _ => panic!("expected continuation prompt"),
+    };
     assert!(durable_at_dequeue);
-    dequeue.await.unwrap();
 
     let admitted = store.load(&record.continuation_id).await.unwrap().unwrap();
     let replay = manager
@@ -1268,6 +1926,10 @@ async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_c
         .await
         .unwrap();
     assert_eq!(replay, PromptAdmissionResult::AlreadyAdmitted);
+    assert!(matches!(
+        command_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 
     let mut turns = vec![MessageTurn {
         id: "internal".into(),
@@ -1547,6 +2209,99 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
 }
 
 #[tokio::test(start_paused = true)]
+async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fence() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let (settle_entered_tx, settle_entered_rx) = tokio::sync::oneshot::channel();
+    let (settle_release_tx, settle_release_rx) = tokio::sync::oneshot::channel();
+    task_store
+        .install_settle_gate(settle_entered_tx, settle_release_rx)
+        .await;
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake) = ObservedStore::new();
+    let (port, _attempts) = RetryPort::always_fail();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker,
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    completion.await.unwrap().unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(
+        CONTINUATION_CHECKPOINT_MS + 2_600,
+    ))
+    .await;
+    settle_entered_rx.await.expect("failure drain entered");
+
+    let owned = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(owned.state, ContinuationState::Resuming);
+    let newer = store
+        .cas_transition(
+            &owned.continuation_id,
+            owned.generation,
+            owned.version,
+            ContinuationState::Resuming,
+            ContinuationPatch {
+                state: ContinuationState::Resuming,
+                wake_reason: super::store::FieldPatch::Keep,
+                suspend_requested_at: super::store::FieldPatch::Keep,
+                suspended_at: super::store::FieldPatch::Keep,
+                wake_claimed_at: super::store::FieldPatch::Keep,
+                prompt_admitted_at: super::store::FieldPatch::Set(Utc::now()),
+                finished_at: super::store::FieldPatch::Keep,
+                failure_code: super::store::FieldPatch::Keep,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(newer.version > owned.version);
+
+    let failure_attempted = store.failure_attempted.notified();
+    tokio::pin!(failure_attempted);
+    failure_attempted.as_mut().enable();
+    settle_release_tx.send(()).unwrap();
+    failure_attempted.await;
+
+    assert_eq!(
+        *store
+            .failure_fence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        Some((owned.generation, owned.version, ContinuationState::Resuming)),
+        "the stale worker must use the exact Resuming attempt verified before drain"
+    );
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Resuming);
+    assert_eq!(row.version, newer.version);
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn continuation_coordinator_state_conflict_drains_children_with_distinct_failure_code() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
     let broker =
@@ -1657,11 +2412,30 @@ async fn continuation_waiting_manager_port_updates_matching_session_and_rejects_
         mismatch,
         Err(ContinuationError::ParentIdentityChanged)
     ));
-    assert_eq!(state.read().await.waiting_for_subagents, Some(waiting));
+    assert_eq!(
+        state.read().await.waiting_for_subagents,
+        Some(waiting.clone())
+    );
     assert!(matches!(
         events.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+
+    state.write().await.conversation_id = Some(8);
+    assert!(matches!(
+        port.publish_waiting("parent", None).await,
+        Err(ContinuationError::ParentIdentityChanged)
+    ));
+    assert_eq!(
+        state.read().await.waiting_for_subagents,
+        Some(waiting.clone()),
+        "a connection rebound to another conversation cannot clear the stored projection"
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    state.write().await.conversation_id = Some(7);
 
     let state_write = state.write().await;
     let clear = port.publish_waiting("parent", None);
@@ -1684,6 +2458,13 @@ async fn continuation_waiting_manager_port_updates_matching_session_and_rejects_
         }
     ));
     assert_eq!(state.read().await.waiting_for_subagents, None);
+
+    state.write().await.conversation_id = Some(8);
+    port.publish_waiting("parent", None).await.unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -1778,6 +2559,55 @@ async fn continuation_coordinator_manager_port_suspend_rechecks_parent_identity(
             port.suspend_parent(request).await,
             Err(ContinuationError::ParentIdentityChanged)
         ));
+    }
+}
+
+#[tokio::test]
+async fn continuation_coordinator_suspension_dispatch_preserves_installation_stage_causes() {
+    let (closed_tx, closed_rx, _closed_liveness) = crate::acp::connection::connection_channel(1);
+    drop(closed_rx);
+    assert!(matches!(
+        dispatch_suspension_control(closed_tx, "continuation", 3).await,
+        Err(ContinuationError::SuspendDispatch(AcpError::ProcessExited))
+    ));
+
+    for (reply_error, expected_code) in [
+        (
+            Some(AcpError::protocol("suspend_drain_timeout")),
+            "suspend_drain_timeout",
+        ),
+        (
+            Some(AcpError::protocol("suspend_parent_disconnected")),
+            "parent_connection_lost",
+        ),
+        (Some(AcpError::ProcessExited), "parent_connection_lost"),
+        (None, "parent_connection_lost"),
+    ] {
+        let (control_tx, mut control_rx, _control_liveness) =
+            crate::acp::connection::connection_channel(1);
+        let dispatch = dispatch_suspension_control(control_tx, "continuation", 3);
+        tokio::pin!(dispatch);
+        let control = tokio::select! {
+            control = control_rx.recv() => control.expect("suspension control dispatched"),
+            result = &mut dispatch => panic!("dispatch ended before control receipt: {result:?}"),
+        };
+        let ConnectionControl::SuspendForDelegation { reply, .. } = control else {
+            panic!("expected suspension control")
+        };
+        if let Some(error) = reply_error {
+            reply.send(Err(error)).unwrap();
+        } else {
+            drop(reply);
+        }
+        let error = dispatch.await.unwrap_err();
+        assert_eq!(
+            match error {
+                ContinuationError::SuspendDrainTimeout => "suspend_drain_timeout",
+                ContinuationError::ParentConnectionLost => "parent_connection_lost",
+                other => panic!("unexpected mapped suspension error: {other:?}"),
+            },
+            expected_code
+        );
     }
 }
 

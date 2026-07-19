@@ -5185,13 +5185,6 @@ impl DelegationBroker {
             || class_views.iter().zip(&tasks).any(|(class, task)| {
                 matches!(class, StatusClass::NotInMemory) && task.status == TaskStatus::Running
             });
-        if unavailable {
-            return JoinEvaluation::Ready(DelegationStatusBatch::joined(
-                tasks,
-                DelegationWakeReason::Unavailable,
-                attention_requests,
-            ));
-        }
         if !attention_requests.is_empty() {
             return JoinEvaluation::Ready(DelegationStatusBatch::joined(
                 tasks,
@@ -5199,10 +5192,22 @@ impl DelegationBroker {
                 attention_requests,
             ));
         }
-        if tasks.iter().all(|task| task.status != TaskStatus::Running) {
+        if tasks.iter().all(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled
+            )
+        }) {
             return JoinEvaluation::Ready(DelegationStatusBatch::joined(
                 tasks,
                 DelegationWakeReason::AllTerminal,
+                Vec::new(),
+            ));
+        }
+        if unavailable {
+            return JoinEvaluation::Ready(DelegationStatusBatch::joined(
+                tasks,
+                DelegationWakeReason::Unavailable,
                 Vec::new(),
             ));
         }
