@@ -116,8 +116,9 @@ pub async fn finalize_generated_title(
 /// - `Some(visible_text)` (including empty) is authoritative and never falls
 ///   back to wire blocks; `None`/absent uses the privacy-safe projection.
 /// - Locale prefers an explicit capture locale, else `fallback_locale`.
-/// - When a job row still exists, updates locale on every call and writes
-///   `first_user_text` only while it is still null (any surviving job state).
+/// - When a job row still exists, writes `first_user_text` + `first_prompt_at`
+///   once via a CAS update (both columns still NULL). Concurrent losers and
+///   later captures only refresh locale (any surviving job state).
 pub async fn capture_prompt_context<C: ConnectionTrait>(
     conn: &C,
     conversation_id: i32,
@@ -132,16 +133,38 @@ pub async fn capture_prompt_context<C: ConnectionTrait>(
     let visible_text = bound_context(&raw_visible);
     let locale = capture.and_then(|c| c.locale).unwrap_or(fallback_locale);
 
-    if let Some(job) = auto_title_job::Entity::find_by_id(conversation_id)
-        .one(conn)
-        .await?
-    {
-        let mut active: auto_title_job::ActiveModel = job.clone().into();
-        if job.first_user_text.is_none() {
-            active.first_user_text = Set(Some(visible_text.clone()));
-        }
-        active.locale = Set(Some(app_locale_to_wire(locale).to_string()));
-        active.update(conn).await?;
+    // Conditional first-fields write: only when both are still NULL.
+    let now = Utc::now();
+    let locale_wire = app_locale_to_wire(locale).to_string();
+    let first_write = auto_title_job::Entity::update_many()
+        .col_expr(
+            auto_title_job::Column::FirstUserText,
+            Expr::value(visible_text.clone()),
+        )
+        .col_expr(auto_title_job::Column::FirstPromptAt, Expr::value(now))
+        .col_expr(
+            auto_title_job::Column::Locale,
+            Expr::value(locale_wire.clone()),
+        )
+        .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+        .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
+        .filter(auto_title_job::Column::FirstUserText.is_null())
+        .filter(auto_title_job::Column::FirstPromptAt.is_null())
+        .exec(conn)
+        .await?;
+
+    if first_write.rows_affected == 0 {
+        // Job may exist with first fields set (or be absent): refresh locale only.
+        // When no job row exists both updates affect 0 rows — fine.
+        auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::Locale,
+                Expr::value(locale_wire),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
+            .exec(conn)
+            .await?;
     }
 
     Ok(CapturedPrompt {
@@ -755,11 +778,190 @@ mod tests {
             .unwrap()
             .expect("job");
         assert_eq!(job.first_user_text.as_deref(), Some("first task"));
+        assert!(
+            job.first_prompt_at.is_some(),
+            "first capture must stamp first_prompt_at"
+        );
         assert_eq!(
             job.locale.as_deref(),
             Some("ja"),
             "locale still refreshes while first text stays"
         );
+    }
+
+    #[tokio::test]
+    async fn capture_sets_first_user_and_first_prompt_at_once() {
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-first-prompt-at-once").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+
+        let first = PromptCaptureContext::new(Some("task A".into()), Some(AppLocale::En));
+        capture_prompt_context(&db.conn, conversation.id, &[], Some(&first), AppLocale::En)
+            .await
+            .expect("first capture");
+
+        let after_first = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(after_first.first_user_text.as_deref(), Some("task A"));
+        let stamped = after_first
+            .first_prompt_at
+            .expect("first_prompt_at must be set on first capture");
+
+        let second = PromptCaptureContext::new(Some("task B".into()), Some(AppLocale::ZhCn));
+        capture_prompt_context(
+            &db.conn,
+            conversation.id,
+            &[],
+            Some(&second),
+            AppLocale::En,
+        )
+        .await
+        .expect("second capture");
+
+        let after_second = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(after_second.first_user_text.as_deref(), Some("task A"));
+        assert_eq!(
+            after_second.first_prompt_at,
+            Some(stamped),
+            "first_prompt_at is write-once across subsequent captures"
+        );
+        assert_eq!(
+            after_second.locale.as_deref(),
+            Some("zh_cn"),
+            "locale may still refresh when first fields are already set"
+        );
+    }
+
+    /// Two independent SQLite connections on one WAL file race the first-fields
+    /// CAS. Exactly one writer stamps `first_user_text` + `first_prompt_at`.
+    #[tokio::test]
+    async fn concurrent_captures_only_one_writes_first_fields() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+        use tokio::sync::Barrier;
+
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+        use crate::db::test_helpers::fresh_disk_db;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Migrate once; reopen as two separate pools on the same WAL file.
+        let migrate = fresh_disk_db(dir.path()).await;
+        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        let folder = seed_folder(&migrate, "/tmp/title-concurrent-capture").await;
+        let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let conversation_id = conversation.id;
+        // Release the migrator pool so WAL writers are just the two racers.
+        migrate.conn.close().await.expect("close migrate pool");
+
+        let path = dir.path().join("source.db");
+        async fn open_wal_pool(path: &std::path::Path) -> crate::db::AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal pool");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            crate::db::AppDatabase { conn }
+        }
+
+        let pool_a = Arc::new(open_wal_pool(&path).await);
+        let pool_b = Arc::new(open_wal_pool(&path).await);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+        let db_a = pool_a.clone();
+        let db_b = pool_b.clone();
+
+        let (res_a, res_b) = tokio::join!(
+            async move {
+                // Barrier immediately before first-fields UPDATE (via capture).
+                barrier_a.wait().await;
+                let capture =
+                    PromptCaptureContext::new(Some("task A".into()), Some(AppLocale::En));
+                capture_prompt_context(
+                    &db_a.conn,
+                    conversation_id,
+                    &[],
+                    Some(&capture),
+                    AppLocale::En,
+                )
+                .await
+            },
+            async move {
+                barrier_b.wait().await;
+                let capture =
+                    PromptCaptureContext::new(Some("task B".into()), Some(AppLocale::Ja));
+                capture_prompt_context(
+                    &db_b.conn,
+                    conversation_id,
+                    &[],
+                    Some(&capture),
+                    AppLocale::En,
+                )
+                .await
+            },
+        );
+        res_a.expect("capture A");
+        res_b.expect("capture B");
+
+        let check = open_wal_pool(&path).await;
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&check.conn)
+            .await
+            .unwrap()
+            .expect("job");
+
+        let first = job
+            .first_user_text
+            .as_deref()
+            .expect("exactly one writer must set first_user_text");
+        assert!(
+            first == "task A" || first == "task B",
+            "first_user_text must equal a winner visible text, got {first:?}"
+        );
+        assert!(
+            job.first_prompt_at.is_some(),
+            "first_prompt_at must be set exactly once by the winning writer"
+        );
+        // Loser always refreshes locale after losing the first-fields CAS, so
+        // the durable locale is the non-winner's wire value.
+        let expected_locale = if first == "task A" { "ja" } else { "en" };
+        assert_eq!(
+            job.locale.as_deref(),
+            Some(expected_locale),
+            "losing concurrent capture may only refresh locale"
+        );
+
+        drop(dir);
     }
 
     #[tokio::test]
