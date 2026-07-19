@@ -2027,6 +2027,7 @@
       "confirmCloseOtherDirtyTabs": "Fechar outras abas com alterações não salvas?",
       "confirmCloseAllDirtyTabs": "Fechar todas as abas com alterações não salvas?",
       "unableLoadContent": "Não foi possível carregar o conteúdo.\n\n{message}",
+      "unableOpenFile": "Não foi possível abrir {name}",
       "previewRequestTimedOut": "A solicitação de preview expirou",
       "diffRequestTimedOut": "A solicitação de Diff expirou",
       "branchCompareRequestTimedOut": "A solicitação de comparação de branch expirou",

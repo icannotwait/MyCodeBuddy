@@ -2027,6 +2027,7 @@
       "confirmCloseOtherDirtyTabs": "إغلاق التبويبات الأخرى التي تحتوي تغييرات غير محفوظة؟",
       "confirmCloseAllDirtyTabs": "إغلاق جميع التبويبات التي تحتوي تغييرات غير محفوظة؟",
       "unableLoadContent": "تعذر تحميل المحتوى.\n\n{message}",
+      "unableOpenFile": "تعذر فتح {name}",
       "previewRequestTimedOut": "انتهت مهلة طلب المعاينة",
       "diffRequestTimedOut": "انتهت مهلة طلب Diff",
       "branchCompareRequestTimedOut": "انتهت مهلة طلب مقارنة الفروع",

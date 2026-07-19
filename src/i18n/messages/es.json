@@ -2027,6 +2027,7 @@
       "confirmCloseOtherDirtyTabs": "¿Cerrar otras pestañas con cambios sin guardar?",
       "confirmCloseAllDirtyTabs": "¿Cerrar todas las pestañas con cambios sin guardar?",
       "unableLoadContent": "No se puede cargar el contenido.\n\n{message}",
+      "unableOpenFile": "No se pudo abrir {name}",
       "previewRequestTimedOut": "La solicitud de vista previa agotó el tiempo",
       "diffRequestTimedOut": "La solicitud de Diff agotó el tiempo",
       "branchCompareRequestTimedOut": "La solicitud de comparación de ramas agotó el tiempo",

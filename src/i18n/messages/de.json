@@ -2027,6 +2027,7 @@
       "confirmCloseOtherDirtyTabs": "Andere Tabs mit ungespeicherten Änderungen schließen?",
       "confirmCloseAllDirtyTabs": "Alle Tabs mit ungespeicherten Änderungen schließen?",
       "unableLoadContent": "Inhalt konnte nicht geladen werden.\n\n{message}",
+      "unableOpenFile": "{name} konnte nicht geöffnet werden",
       "previewRequestTimedOut": "Vorschauanfrage hat das Zeitlimit überschritten",
       "diffRequestTimedOut": "Diff-Anfrage hat das Zeitlimit überschritten",
       "branchCompareRequestTimedOut": "Branch-Vergleichsanfrage hat das Zeitlimit überschritten",

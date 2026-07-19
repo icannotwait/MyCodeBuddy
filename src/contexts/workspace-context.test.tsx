@@ -25,6 +25,16 @@ vi.mock("next-intl", () => {
   return { useTranslations: () => t }
 })
 
+const toastMock = vi.hoisted(() => ({
+  error: vi.fn(),
+}))
+
+vi.mock("sonner", () => ({
+  toast: {
+    error: toastMock.error,
+  },
+}))
+
 // Active-folder store backing the active-folder mock below. Tests switch the
 // active folder inside act() and consumers re-render via
 // useSyncExternalStore. Workspace folder lists (allFolders / foldersHydrated)
@@ -649,7 +659,7 @@ describe("openFilePreview cache semantics", () => {
     })
   })
 
-  it("retries after an error and clears the error state", async () => {
+  it("retries after a cold open failure by creating a fresh tab", async () => {
     mockedApi.readFileForEdit
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce({
@@ -671,7 +681,8 @@ describe("openFilePreview cache semantics", () => {
     await act(async () => {
       screen.getByText("open").click()
     })
-    expect(captured?.saveState).toBe("error")
+    // Cold fail removes the tab — no sticky error body / saveState error.
+    expect(captured).toBeNull()
 
     await act(async () => {
       screen.getByText("open").click()
@@ -3103,5 +3114,475 @@ describe("unified absolute-path file tabs (outside-workspace opens)", () => {
     expect(mockedApi.readFileForEdit.mock.calls.length).toBe(
       readsAfterFreshness
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 1: cold/warm open failure matrix + maximize-on-success settle
+// ---------------------------------------------------------------------------
+
+describe("openFilePreview failure matrix and maximize-on-success", () => {
+  beforeEach(() => {
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.gitIsTracked.mockReset()
+    mockedApi.gitShowFile.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+    toastMock.error.mockReset()
+  })
+
+  function editPayload(
+    path: string,
+    content: string,
+    etag = "e1"
+  ): {
+    path: string
+    content: string
+    etag: string
+    mtime_ms: number
+    readonly: boolean
+    line_ending: "lf"
+  } {
+    return {
+      path,
+      content,
+      etag,
+      mtime_ms: 1,
+      readonly: false,
+      line_ending: "lf",
+    }
+  }
+
+  it("cold open failure removes the tab and does not leave saveState error", async () => {
+    mockedApi.readFileForEdit.mockRejectedValueOnce(new Error("ENOENT"))
+
+    let settle: unknown
+    function Probe() {
+      const { openFilePreview, fileTabs, activeFileTab } = useWorkspaceContext()
+      return (
+        <div>
+          <output data-testid="tab-count">{fileTabs.length}</output>
+          <output data-testid="save-state">
+            {activeFileTab?.saveState ?? "none"}
+          </output>
+          <button
+            onClick={() => {
+              void openFilePreview("missing.ts").then((r) => {
+                settle = r
+              })
+            }}
+          >
+            open-missing
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-missing").click()
+    })
+
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("save-state")).toHaveTextContent("none")
+    expect(toastMock.error).toHaveBeenCalled()
+    expect(String(toastMock.error.mock.calls[0]?.[0])).toContain(
+      "unableOpenFile"
+    )
+    expect(settle).toEqual({ ok: false, reason: "load" })
+  })
+
+  it("warm reload failure keeps prior content", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(editPayload("a.ts", "kept"))
+      .mockRejectedValueOnce(new Error("locked"))
+
+    let snap: {
+      content: string
+      loading: boolean
+      saveState?: string
+      tabCount: number
+    } = { content: "", loading: false, tabCount: 0 }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openFilePreview, fileTabs, activeFileTab } = useWorkspaceContext()
+      onCapture({
+        content: activeFileTab?.content ?? "",
+        loading: activeFileTab?.loading ?? false,
+        saveState: activeFileTab?.saveState,
+        tabCount: fileTabs.length,
+      })
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("a.ts")}>open</button>
+          <button
+            onClick={() => void openFilePreview("a.ts", { reload: true })}
+          >
+            reload
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.content).toBe("kept")
+
+    await act(async () => {
+      screen.getByText("reload").click()
+    })
+
+    expect(snap.tabCount).toBe(1)
+    expect(snap.content).toBe("kept")
+    expect(snap.loading).toBe(false)
+    expect(snap.saveState).not.toBe("error")
+    expect(toastMock.error).toHaveBeenCalled()
+  })
+
+  it("pre-seed resolve failure toasts without creating a tab", async () => {
+    foldersMock.setActiveFolderId(null)
+
+    let settle: unknown
+    function Probe() {
+      const { openFilePreview, fileTabs } = useWorkspaceContext()
+      return (
+        <div>
+          <output data-testid="tab-count">{fileTabs.length}</output>
+          <button
+            onClick={() => {
+              void openFilePreview("relative-only.ts").then((r) => {
+                settle = r
+              })
+            }}
+          >
+            open-unresolvable
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-unresolvable").click()
+    })
+
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("0")
+    expect(mockedApi.readFileForEdit).not.toHaveBeenCalled()
+    expect(toastMock.error).toHaveBeenCalled()
+    expect(settle).toEqual({ ok: false, reason: "resolve" })
+  })
+
+  it("maximize true only after successful settle of new tab", async () => {
+    let resolveRead: ((v: ReturnType<typeof editPayload>) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((res) => (resolveRead = res))
+    )
+
+    let maximizedDuringLoad: boolean | null = null
+    function Probe({
+      onCapture,
+    }: {
+      onCapture: (s: {
+        filesMaximized: boolean
+        loading: boolean
+        content: string
+      }) => void
+    }) {
+      const { openFilePreview, filesMaximized, activeFileTab } =
+        useWorkspaceContext()
+      onCapture({
+        filesMaximized,
+        loading: activeFileTab?.loading ?? false,
+        content: activeFileTab?.content ?? "",
+      })
+      return (
+        <div>
+          <output data-testid="files-maximized">
+            {String(filesMaximized)}
+          </output>
+          <output data-testid="content">{activeFileTab?.content ?? ""}</output>
+          <button onClick={() => void openFilePreview("a.ts")}>open</button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe
+          onCapture={(s) => {
+            if (s.loading && maximizedDuringLoad === null) {
+              maximizedDuringLoad = s.filesMaximized
+            }
+          }}
+        />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    // Mid-load: tab exists but content not settled — must not maximize yet.
+    expect(maximizedDuringLoad).toBe(false)
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("false")
+
+    await act(async () => {
+      resolveRead!(editPayload("a.ts", "hello"))
+    })
+
+    expect(screen.getByTestId("content")).toHaveTextContent("hello")
+    // Only after successful settle.
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("true")
+  })
+
+  it("failed cold open with pre-existing other tab does not steal maximize incorrectly", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(editPayload("a.ts", "a-content"))
+      .mockRejectedValueOnce(new Error("ENOENT"))
+
+    function Probe() {
+      const {
+        openFilePreview,
+        filesMaximized,
+        fileTabs,
+        toggleFilesMaximized,
+      } = useWorkspaceContext()
+      return (
+        <div>
+          <output data-testid="files-maximized">
+            {String(filesMaximized)}
+          </output>
+          <output data-testid="tab-count">{fileTabs.length}</output>
+          <button onClick={() => void openFilePreview("a.ts")}>open-a</button>
+          <button onClick={() => void openFilePreview("b.ts")}>open-b</button>
+          <button onClick={toggleFilesMaximized}>toggle-max</button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-a").click()
+    })
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("true")
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("1")
+
+    // User restored split; cold-fail of another file must not re-maximize.
+    await act(async () => {
+      screen.getByText("toggle-max").click()
+    })
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("false")
+
+    await act(async () => {
+      screen.getByText("open-b").click()
+    })
+
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("1")
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("false")
+    expect(toastMock.error).toHaveBeenCalled()
+  })
+
+  it("auto office open path does not maximize when maximizeOnSuccess is false", async () => {
+    function Probe() {
+      const { openFilePreview, filesMaximized, fileTabs, activeFileTab } =
+        useWorkspaceContext()
+      return (
+        <div>
+          <output data-testid="files-maximized">
+            {String(filesMaximized)}
+          </output>
+          <output data-testid="tab-count">{fileTabs.length}</output>
+          <output data-testid="language">
+            {activeFileTab?.language ?? "none"}
+          </output>
+          <button
+            onClick={() =>
+              void openFilePreview("report.docx", { maximizeOnSuccess: false })
+            }
+          >
+            open-office
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-office").click()
+    })
+
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("1")
+    expect(screen.getByTestId("language")).toHaveTextContent("office")
+    expect(screen.getByTestId("files-maximized")).toHaveTextContent("false")
+    expect(mockedApi.readFileForEdit).not.toHaveBeenCalled()
+  })
+
+  it("rejectFileTab still writes error body", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      editPayload("a.ts", "fresh")
+    )
+
+    let snap: {
+      content: string
+      saveState?: string
+      saveError: string | null
+    } = { content: "", saveError: null }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openFilePreview, activeFileTab, rejectFileTab } =
+        useWorkspaceContext()
+      onCapture(
+        activeFileTab
+          ? {
+              content: activeFileTab.content,
+              saveState: activeFileTab.saveState,
+              saveError: activeFileTab.saveError ?? null,
+            }
+          : { content: "", saveError: null }
+      )
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("a.ts")}>open</button>
+          <button
+            onClick={() => rejectFileTab("/repo/a.ts", "ENOENT: file removed")}
+          >
+            reject
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.content).toBe("fresh")
+
+    await act(async () => {
+      screen.getByText("reject").click()
+    })
+
+    expect(snap.saveState).toBe("error")
+    expect(snap.saveError).toBe("ENOENT: file removed")
+    expect(snap.content).not.toBe("fresh")
+    expect(snap.content.length).toBeGreaterThan(0)
+  })
+
+  it("openFilePreview returns ok true after settle", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      editPayload("a.ts", "settled")
+    )
+
+    let settle: unknown
+    function Probe() {
+      const { openFilePreview } = useWorkspaceContext()
+      return (
+        <button
+          onClick={() => {
+            void openFilePreview("a.ts").then((r) => {
+              settle = r
+            })
+          }}
+        >
+          open
+        </button>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+
+    expect(settle).toEqual({
+      ok: true,
+      tabId: fileTabId("/repo/a.ts"),
+    })
+  })
+
+  it("reloadOpenFileBackground warm fail keeps content and toasts", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(editPayload("a.ts", "bg-kept"))
+      .mockRejectedValueOnce(new Error("io fail"))
+
+    let snap: {
+      content: string
+      loading: boolean
+      tabCount: number
+    } = { content: "", loading: false, tabCount: 0 }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openFilePreview, reloadOpenFileBackground, fileTabs } =
+        useWorkspaceContext()
+      const tab = fileTabs[0]
+      onCapture({
+        content: tab?.content ?? "",
+        loading: tab?.loading ?? false,
+        tabCount: fileTabs.length,
+      })
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("a.ts")}>open</button>
+          <button onClick={() => void reloadOpenFileBackground("/repo/a.ts")}>
+            bg-reload
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.content).toBe("bg-kept")
+
+    await act(async () => {
+      screen.getByText("bg-reload").click()
+    })
+
+    expect(snap.tabCount).toBe(1)
+    expect(snap.content).toBe("bg-kept")
+    expect(snap.loading).toBe(false)
+    expect(toastMock.error).toHaveBeenCalled()
   })
 })

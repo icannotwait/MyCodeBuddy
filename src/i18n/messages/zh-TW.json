@@ -2027,6 +2027,7 @@
       "confirmCloseOtherDirtyTabs": "其他分頁有未儲存變更，確定關閉嗎？",
       "confirmCloseAllDirtyTabs": "存在未儲存變更，確定關閉全部分頁嗎？",
       "unableLoadContent": "無法載入內容。\n\n{message}",
+      "unableOpenFile": "無法打開 {name}",
       "previewRequestTimedOut": "預覽請求逾時",
       "diffRequestTimedOut": "Diff 請求逾時",
       "branchCompareRequestTimedOut": "分支比較請求逾時",
