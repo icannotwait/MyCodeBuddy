@@ -662,8 +662,8 @@ impl ConnectionManager {
         // safe-native fallback only for typed RouteSpecific bootstrap failures.
         // Child and Fatal never retry.
         let mut attempt_plan = route_plan;
-        // Internal title runs never carry Codeg MCP / delegation injection.
-        let skip_delegation_injection = launch_context.purpose == ConnectionPurpose::InternalTitle;
+        // Hidden generation (title/translate) never carries Codeg MCP / delegation injection.
+        let skip_delegation_injection = launch_context.purpose.is_hidden_generation();
         // Authoritative route record after exclusivity validation (Task 13).
         if !skip_delegation_injection {
             if let Some(inj) = self.delegation_snapshot() {
@@ -1448,10 +1448,8 @@ impl ConnectionManager {
             return Err(AcpError::TurnInProgress);
         }
 
-        let is_internal = matches!(
-            state.purpose,
-            ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
-        );
+        let is_internal = matches!(state.purpose, ConnectionPurpose::InternalProbe)
+            || state.purpose.is_hidden_generation();
         // Unlinked and internal-purpose sends bypass capture entirely.
         if let (Some(db), Some(conversation_id)) = (db, state.conversation_id) {
             if !is_internal {
@@ -1509,16 +1507,16 @@ impl ConnectionManager {
         blocks: Vec<PromptInputBlock>,
         capture: Option<PromptCaptureContext>,
     ) -> Result<(), AcpError> {
-        // Ordinary DB-aware UI path never drives InternalTitle connections.
+        // Ordinary DB-aware UI path never drives hidden generation connections.
         {
             let state_arc = self
                 .get_state(conn_id)
                 .await
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             let purpose = state_arc.read().await.purpose;
-            if purpose == ConnectionPurpose::InternalTitle {
+            if purpose.is_hidden_generation() {
                 return Err(AcpError::protocol(
-                    "send_prompt rejects InternalTitle purpose; use send_prompt_unlinked_internal",
+                    "send_prompt rejects hidden generation purpose; use send_prompt_unlinked_internal",
                 ));
             }
         }
@@ -1545,10 +1543,10 @@ impl ConnectionManager {
             .await
     }
 
-    /// Unlinked internal enqueue for probe/title workers. Rejects every purpose
-    /// except `InternalProbe` and `InternalTitle`, remains unlinked, and
-    /// bypasses title capture. Crate-visible for Task 7's runner outside
-    /// `acp::manager`.
+    /// Unlinked internal enqueue for probe/title/translate workers. Rejects
+    /// every purpose except `InternalProbe` and hidden generation
+    /// (`InternalTitle` / `InternalTranslate`), remains unlinked, and bypasses
+    /// title capture. Crate-visible for Task 7's runner outside `acp::manager`.
     // No production Task 4B caller yet — Task 7 owns the first real consumer.
     // Keep crate-visible without inventing a fake call solely to silence lint.
     #[allow(dead_code)]
@@ -1563,12 +1561,11 @@ impl ConnectionManager {
                 .await
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             let purpose = state_arc.read().await.purpose;
-            if !matches!(
-                purpose,
-                ConnectionPurpose::InternalProbe | ConnectionPurpose::InternalTitle
-            ) {
+            let admitted = matches!(purpose, ConnectionPurpose::InternalProbe)
+                || purpose.is_hidden_generation();
+            if !admitted {
                 return Err(AcpError::protocol(format!(
-                    "send_prompt_unlinked_internal requires InternalProbe or InternalTitle purpose, got {purpose:?}"
+                    "send_prompt_unlinked_internal requires InternalProbe or hidden generation purpose, got {purpose:?}"
                 )));
             }
         }
@@ -1915,8 +1912,15 @@ impl ConnectionManager {
         // respect to the same status value, so re-writing `InProgress` is a
         // benign no-op on the row (touches `updated_at` only) and returns the
         // patch for the global state broadcast.
+        // Logged inside `update_status_with_patch` (prev→new); tag here so
+        // post-CAS → InProgress races are attributable to a real prompt send.
         let conversation_id_for_status = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id_for_status {
+            tracing::info!(
+                connection_id = %conn_id,
+                conversation_id = cid,
+                "[manager] send_prompt_linked → InProgress (pre-send status write)"
+            );
             let patch = conversation_service::update_status_with_patch(
                 &db.conn,
                 cid,
@@ -4870,7 +4874,35 @@ mod tests {
             .await
             .expect_err("ordinary send must reject InternalTitle");
         assert!(
-            err.to_string().contains("InternalTitle")
+            err.to_string().contains("hidden generation")
+                || err.to_string().contains("InternalTitle")
+                || err.to_string().contains("send_prompt_unlinked_internal"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_send_prompt_rejects_internal_translate_purpose() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = mgr
+            .insert_test_connection_live(
+                "reject-internal-translate",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = mgr.get_state("reject-internal-translate").await.unwrap();
+            state.write().await.purpose = ConnectionPurpose::InternalTranslate;
+        }
+        let err = mgr
+            .send_prompt(&db, "reject-internal-translate", one_text_block(), None)
+            .await
+            .expect_err("ordinary send must reject InternalTranslate");
+        assert!(
+            err.to_string().contains("hidden generation")
                 || err.to_string().contains("send_prompt_unlinked_internal"),
             "unexpected error: {err:?}"
         );
@@ -5005,6 +5037,19 @@ mod tests {
             .expect("InternalTitle accepted");
         assert!(matches!(
             rx.try_recv().expect("title enqueued"),
+            ConnectionCommand::Prompt { .. }
+        ));
+        {
+            let state = mgr.get_state("internal-helper-conn").await.unwrap();
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.purpose = crate::auto_title::ConnectionPurpose::InternalTranslate;
+        }
+        mgr.send_prompt_unlinked_internal("internal-helper-conn", one_text_block())
+            .await
+            .expect("InternalTranslate accepted");
+        assert!(matches!(
+            rx.try_recv().expect("translate enqueued"),
             ConnectionCommand::Prompt { .. }
         ));
         // Internal path never stages title capture context.

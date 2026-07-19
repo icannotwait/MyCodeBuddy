@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub enum InternalAgentSessionPurpose {
     #[sea_orm(string_value = "title")]
     Title,
+    #[sea_orm(string_value = "translate")]
+    Translate,
 }
 
 /// Registry of external agent sessions spawned for internal purposes (e.g.

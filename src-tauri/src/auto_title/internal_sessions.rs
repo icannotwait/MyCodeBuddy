@@ -21,12 +21,15 @@ use crate::parsers::normalize_path_for_matching;
 pub enum InternalSessionPurpose {
     /// Automatic conversation-title generation.
     Title,
+    /// On-demand document translation (hidden generation).
+    Translate,
 }
 
 impl InternalSessionPurpose {
     fn as_entity(self) -> InternalAgentSessionPurpose {
         match self {
             InternalSessionPurpose::Title => InternalAgentSessionPurpose::Title,
+            InternalSessionPurpose::Translate => InternalAgentSessionPurpose::Translate,
         }
     }
 }
@@ -177,7 +180,7 @@ impl InternalAgentSessionRegistry {
             .await?;
 
         if let Some(row) = existing {
-            // Same title purpose is idempotent; never create a second row.
+            // Same purpose is idempotent; never create a second row.
             if row.purpose == purpose.as_entity() {
                 return Ok(());
             }
@@ -356,6 +359,54 @@ mod tests {
         assert_eq!(rows.len(), 1, "duplicate must not create another row");
         assert_eq!(rows[0].agent_type, "claude_code");
         assert_eq!(rows[0].purpose, InternalAgentSessionPurpose::Title);
+    }
+
+    #[tokio::test]
+    async fn register_translate_purpose_persists_and_hides_from_discovery() {
+        let fixture = registry_fixture().await;
+        fixture
+            .registry
+            .register(
+                AgentType::Codex,
+                "translate-id",
+                InternalSessionPurpose::Translate,
+            )
+            .await
+            .expect("register translate");
+        let row = internal_agent_session::Entity::find()
+            .filter(internal_agent_session::Column::ExternalId.eq("translate-id"))
+            .one(&fixture.db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.purpose, InternalAgentSessionPurpose::Translate);
+        let (_, filter) = fixture.registry.shared_filter().await.expect("filter");
+        assert!(filter.contains(AgentType::Codex, Some("translate-id"), None));
+
+        // Same translate purpose is idempotent.
+        fixture
+            .registry
+            .register(
+                AgentType::Codex,
+                "translate-id",
+                InternalSessionPurpose::Translate,
+            )
+            .await
+            .expect("idempotent translate");
+
+        // Cross-purpose conflict still fails.
+        let conflict = fixture
+            .registry
+            .register(
+                AgentType::Codex,
+                "translate-id",
+                InternalSessionPurpose::Title,
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "title must not overwrite translate purpose"
+        );
     }
 
     #[tokio::test]
