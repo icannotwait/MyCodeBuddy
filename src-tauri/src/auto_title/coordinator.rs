@@ -131,12 +131,18 @@ pub struct AutoTitleCoordinator {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
-    /// Count of deadline sweep pass attempts (including injected failures).
+    /// Count of finished deadline sweep passes (Ok or Err; end-of-pass).
     #[cfg(any(test, feature = "test-utils"))]
     sweep_pass_count: AtomicU64,
     /// First next sweep pass returns an error without promoting (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     sweep_fail_once: AtomicBool,
+    /// How many times the injected sweep fail path ran (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    sweep_fail_observed: AtomicU64,
+    /// How many times `drain_ready` exited on empty queue (`Ok(None)`).
+    #[cfg(any(test, feature = "test-utils"))]
+    drain_idle_count: AtomicU64,
     /// How many times `notification_loop` entered (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     notification_loop_starts: AtomicU64,
@@ -237,6 +243,10 @@ impl AutoTitleCoordinator {
             sweep_pass_count: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             sweep_fail_once: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            sweep_fail_observed: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            drain_idle_count: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             notification_loop_starts: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -402,19 +412,20 @@ impl AutoTitleCoordinator {
             if let Err(error) = self.run_deadline_sweep_once().await {
                 tracing::warn!(%error, "auto-title deadline sweep failed");
             }
+            // End-of-pass: count only after the body returns (Ok or Err).
+            #[cfg(any(test, feature = "test-utils"))]
+            self.sweep_pass_count.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.sweep_interval).await;
         }
     }
 
     async fn run_deadline_sweep_once(&self) -> Result<(), DbError> {
         #[cfg(any(test, feature = "test-utils"))]
-        {
-            self.sweep_pass_count.fetch_add(1, Ordering::SeqCst);
-            if self.sweep_fail_once.swap(false, Ordering::SeqCst) {
-                return Err(DbError::Validation(
-                    "injected deadline sweep failure".into(),
-                ));
-            }
+        if self.sweep_fail_once.swap(false, Ordering::SeqCst) {
+            self.sweep_fail_observed.fetch_add(1, Ordering::SeqCst);
+            return Err(DbError::Validation(
+                "injected deadline sweep failure".into(),
+            ));
         }
 
         let params = DeadlinePromoteParams {
@@ -497,6 +508,8 @@ impl AutoTitleCoordinator {
                 Ok(None) => {
                     claim_error_backoff.reset();
                     drop(permit);
+                    #[cfg(any(test, feature = "test-utils"))]
+                    self.drain_idle_count.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
                 Err(error) => {
@@ -764,6 +777,16 @@ impl AutoTitleCoordinator {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn arm_sweep_fail_once(&self) {
         self.sweep_fail_once.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn sweep_fail_observed(&self) -> u64 {
+        self.sweep_fail_observed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn drain_idle_count(&self) -> u64 {
+        self.drain_idle_count.load(Ordering::SeqCst)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1732,6 +1755,42 @@ mod tests {
         });
     }
 
+    async fn wait_for_sweep_fail_observed(coordinator: &AutoTitleCoordinator, min: u64) {
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if coordinator.sweep_fail_observed() >= min {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "sweep fail observed timeout: got {} want >= {min}",
+                coordinator.sweep_fail_observed()
+            )
+        });
+    }
+
+    async fn wait_for_drain_idle(coordinator: &AutoTitleCoordinator, min: u64) {
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if coordinator.drain_idle_count() >= min {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "drain idle timeout: got {} want >= {min}",
+                coordinator.drain_idle_count()
+            )
+        });
+    }
+
     /// Immediate first pass: long interval so a quick observation cannot be the
     /// post-sleep second tick. Uses real time (sqlx + start_paused conflict).
     #[tokio::test]
@@ -1750,6 +1809,7 @@ mod tests {
             .recover_and_start()
             .await
             .expect("start");
+        // End-of-pass counter: first body finished without waiting for interval.
         wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
         assert!(
             fixture.coordinator.sweep_pass_count() >= 1,
@@ -1758,12 +1818,14 @@ mod tests {
         assert_eq!(fixture.coordinator.sweep_loop_starts(), 1);
     }
 
-    /// Short real interval + wall sleep (paused time breaks in-memory SQLite
-    /// pool acquire on this runtime).
+    /// Fail-observed hook gates the first pass; next end-of-pass proves the
+    /// loop continues (no fixed wall-clock window after fail).
     #[tokio::test]
     async fn sweep_continues_after_transient_failure() {
         let runner = FakeRunner::succeed_once("unused");
-        let sweep_interval = Duration::from_millis(50);
+        // Longer interval than the old 50ms flaky window; wait is still driven
+        // by fail-observed + end-of-pass counters, not a short fixed sleep.
+        let sweep_interval = Duration::from_millis(200);
         let fixture = coordinator_with_sweep(
             runner,
             Arc::new(EmptyPartialSource),
@@ -1779,22 +1841,32 @@ mod tests {
             .await
             .expect("start");
 
+        wait_for_sweep_fail_observed(fixture.coordinator.as_ref(), 1).await;
         wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
         let after_fail = fixture.coordinator.sweep_pass_count();
         assert_eq!(after_fail, 1, "first pass counts even when injected fail");
+        assert_eq!(
+            fixture.coordinator.sweep_fail_observed(),
+            1,
+            "injected fail must be observed exactly once"
+        );
 
-        tokio::time::sleep(sweep_interval + Duration::from_millis(50)).await;
         wait_for_sweep_passes(fixture.coordinator.as_ref(), after_fail + 1).await;
         assert!(
             fixture.coordinator.sweep_pass_count() > after_fail,
             "loop continues after transient failure"
+        );
+        assert_eq!(
+            fixture.coordinator.sweep_fail_observed(),
+            1,
+            "fail-once must not re-arm"
         );
     }
 
     #[tokio::test]
     async fn lost_wake_ready_row_is_renotified_and_claimed() {
         let runner = FakeRunner::succeed_once("Lost Wake Title");
-        let sweep_interval = Duration::from_millis(50);
+        let sweep_interval = Duration::from_millis(100);
         let fixture = coordinator_with_sweep(
             runner,
             Arc::new(EmptyPartialSource),
@@ -1808,9 +1880,18 @@ mod tests {
             .recover_and_start()
             .await
             .expect("start");
-        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
 
-        // Insert Ready after startup notify/drain without an explicit wake.
+        // Synchronize past startup: first sweep fully finished AND the
+        // recover notify_ready empty drain completed. Inserting Ready before
+        // either can spuriously pass via the startup wake / first pass.
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+        wait_for_drain_idle(fixture.coordinator.as_ref(), 1).await;
+
+        let passes_before_insert = fixture.coordinator.sweep_pass_count();
+        let claims_before = fixture.coordinator.claim_call_count();
+        let drain_idle_before = fixture.coordinator.drain_idle_count();
+
+        // Insert Ready only after end-of-pass + drain idle; no explicit wake.
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
         seed_job(
             &fixture.db,
@@ -1822,10 +1903,9 @@ mod tests {
         )
         .await;
 
-        let claims_before = fixture.coordinator.claim_call_count();
-        // Next sweep pass must re-notify; wait past one interval.
-        tokio::time::sleep(sweep_interval + Duration::from_millis(50)).await;
-        wait_for_sweep_passes(fixture.coordinator.as_ref(), 2).await;
+        // Next completed sweep pass must re-notify (lost-wake heal).
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), passes_before_insert + 1)
+            .await;
 
         timeout(TokioDuration::from_secs(2), async {
             loop {
@@ -1838,8 +1918,15 @@ mod tests {
         .await
         .expect("lost-wake re-notify should drive claim");
 
+        // Drain that claimed the Ready row should have gone idle after spawn.
+        wait_for_drain_idle(fixture.coordinator.as_ref(), drain_idle_before + 1).await;
+
         fixture.wait_for_job_deleted(cid).await;
         assert!(fixture.runner.call_count() >= 1);
+        assert!(
+            fixture.coordinator.sweep_pass_count() > passes_before_insert,
+            "claim must follow a post-insert sweep pass, not startup wake"
+        );
     }
 
     #[tokio::test]
