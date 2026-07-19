@@ -1,11 +1,15 @@
 //! Enrollment, job cancellation, generated-title finalization, prompt capture,
 //! and durable usable-completion transitions.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, Order, QueryFilter, QueryOrder, Set, TransactionTrait,
+    DatabaseTransaction, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 
 use crate::acp::types::PromptInputBlock;
@@ -294,6 +298,103 @@ pub async fn apply_usable_completion(
         usable_turn_seq: job.usable_turn_seq,
         became_ready,
     })
+}
+
+/// Parameters for listing and CAS-promoting deadline-elapsed `awaiting_turn` jobs.
+#[derive(Debug, Clone, Copy)]
+pub struct DeadlinePromoteParams {
+    pub now: DateTime<Utc>,
+    pub deadline: Duration,
+    pub batch_limit: usize,
+}
+
+fn deadline_cutoff(params: &DeadlinePromoteParams) -> DateTime<Utc> {
+    params.now
+        - chrono::Duration::from_std(params.deadline).unwrap_or_else(|_| chrono::Duration::zero())
+}
+
+/// List conversation ids eligible for deadline promotion, oldest first.
+///
+/// Candidates must be `awaiting_turn` with a captured user prompt, a non-null
+/// `first_prompt_at` at or before `now - deadline`, and no first assistant yet.
+pub async fn list_deadline_candidates(
+    conn: &DatabaseConnection,
+    params: &DeadlinePromoteParams,
+) -> Result<Vec<i32>, DbError> {
+    let cutoff = deadline_cutoff(params);
+    let rows = auto_title_job::Entity::find()
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::AwaitingTurn))
+        .filter(auto_title_job::Column::FirstUserText.is_not_null())
+        .filter(auto_title_job::Column::FirstPromptAt.is_not_null())
+        .filter(auto_title_job::Column::FirstPromptAt.lte(cutoff))
+        .filter(auto_title_job::Column::FirstAssistantText.is_null())
+        .order_by_asc(auto_title_job::Column::FirstPromptAt)
+        .order_by_asc(auto_title_job::Column::ConversationId)
+        .limit(params.batch_limit as u64)
+        .all(conn)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.conversation_id).collect())
+}
+
+/// Re-list deadline candidates and promote each with CAS (missing partial ⇒ `""`).
+///
+/// Prefer [`list_deadline_candidates`] + [`promote_deadline_jobs_by_ids`] when the
+/// coordinator already has partials for a known id batch (avoids a second select).
+pub async fn promote_deadline_elapsed_jobs(
+    conn: &DatabaseConnection,
+    params: &DeadlinePromoteParams,
+    partials: &HashMap<i32, String>,
+) -> Result<usize, DbError> {
+    let ids = list_deadline_candidates(conn, params).await?;
+    promote_deadline_jobs_by_ids(conn, params, &ids, partials).await
+}
+
+/// Promote pre-listed jobs that still satisfy deadline CAS predicates.
+///
+/// For each id: bound the partial (missing key ⇒ empty string), then
+/// `awaiting_turn` + `first_assistant_text IS NULL` + aged `first_prompt_at`
+/// UPDATE to `ready` with write-once first assistant. Concurrent end-turn or
+/// job deletion yields `rows_affected == 0` (no error).
+pub async fn promote_deadline_jobs_by_ids(
+    conn: &DatabaseConnection,
+    params: &DeadlinePromoteParams,
+    ids: &[i32],
+    partials: &HashMap<i32, String>,
+) -> Result<usize, DbError> {
+    let cutoff = deadline_cutoff(params);
+    let mut promoted = 0usize;
+
+    for &id in ids {
+        // Test-only gate immediately before promote CAS (deadline vs end-turn
+        // barrier races). No-op outside first_ready_race_hooks::scope_promote.
+        #[cfg(test)]
+        first_ready_race_hooks::run_promote_pre_cas_hook().await;
+
+        let partial = partials.get(&id).cloned().unwrap_or_default();
+        let bounded = bound_context(&partial);
+        let res = auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(AutoTitleJobState::Ready),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstAssistantText,
+                Expr::value(bounded),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(params.now))
+            .filter(auto_title_job::Column::ConversationId.eq(id))
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::AwaitingTurn))
+            .filter(auto_title_job::Column::FirstAssistantText.is_null())
+            .filter(auto_title_job::Column::FirstPromptAt.is_not_null())
+            .filter(auto_title_job::Column::FirstPromptAt.lte(cutoff))
+            .exec(conn)
+            .await?;
+        if res.rows_affected == 1 {
+            promoted += 1;
+        }
+    }
+
+    Ok(promoted)
 }
 
 /// Claim the oldest ready job: `ready → running`, increment attempts, snapshot
@@ -654,7 +755,9 @@ pub async fn recover_interrupted_jobs(conn: &DatabaseConnection) -> Result<(), D
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 
@@ -1391,34 +1494,424 @@ mod tests {
         assert!(job.last_usable_turn_token.is_none());
     }
 
-    /// Deadline promote CAS used by completion races (Task 6 owns the real
-    /// sweep; tests mirror the required write-once predicates).
-    async fn simulate_deadline_promote<C: ConnectionTrait>(
-        conn: &C,
+    /// Race-test helper: ensure deadline eligibility, then promote via the real
+    /// CAS path (includes `first_ready_race_hooks` pre-CAS gate).
+    async fn simulate_deadline_promote(
+        conn: &DatabaseConnection,
         conversation_id: i32,
         partial: &str,
     ) -> u64 {
-        // Test-only gate immediately before promote CAS (deadline vs end-turn
-        // barrier races). No-op outside first_ready_race_hooks::scope_promote.
-        first_ready_race_hooks::run_promote_pre_cas_hook().await;
-
-        let result = auto_title_job::Entity::update_many()
+        let now = Utc::now();
+        let aged = now - chrono::Duration::seconds(400);
+        // Make the job deadline-eligible without touching first_assistant when
+        // already set (second simulate / post-end-turn calls stay no-ops).
+        auto_title_job::Entity::update_many()
             .col_expr(
-                auto_title_job::Column::State,
-                Expr::value(AutoTitleJobState::Ready),
+                auto_title_job::Column::FirstUserText,
+                Expr::value("task".to_string()),
             )
-            .col_expr(
-                auto_title_job::Column::FirstAssistantText,
-                Expr::value(partial.to_string()),
-            )
-            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .col_expr(auto_title_job::Column::FirstPromptAt, Expr::value(aged))
             .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
-            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::AwaitingTurn))
             .filter(auto_title_job::Column::FirstAssistantText.is_null())
             .exec(conn)
             .await
-            .expect("simulate deadline promote");
-        result.rows_affected
+            .expect("seed deadline eligibility for simulate promote");
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 32,
+        };
+        let mut partials = HashMap::new();
+        partials.insert(conversation_id, partial.to_string());
+        promote_deadline_jobs_by_ids(conn, &params, &[conversation_id], &partials)
+            .await
+            .expect("simulate deadline promote") as u64
+    }
+
+    async fn seed_deadline_fields(
+        conn: &DatabaseConnection,
+        conversation_id: i32,
+        first_user_text: Option<&str>,
+        first_prompt_at: Option<DateTime<Utc>>,
+        state: AutoTitleJobState,
+        first_assistant_text: Option<&str>,
+    ) {
+        let now = Utc::now();
+        auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(state),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstUserText,
+                Expr::value(first_user_text.map(|s| s.to_string())),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstPromptAt,
+                Expr::value(first_prompt_at),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstAssistantText,
+                Expr::value(first_assistant_text.map(|s| s.to_string())),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
+            .exec(conn)
+            .await
+            .expect("seed deadline fields");
+    }
+
+    #[tokio::test]
+    async fn promote_deadline_ready_with_partial_and_empty() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-deadline-promote-ready").await;
+        let now = Utc::now();
+        let aged = now - chrono::Duration::seconds(301);
+
+        let with_partial = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create partial job");
+        let missing_partial = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create empty-partial job");
+
+        seed_deadline_fields(
+            &db.conn,
+            with_partial.id,
+            Some("user task A"),
+            Some(aged),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            missing_partial.id,
+            Some("user task B"),
+            Some(aged - chrono::Duration::seconds(1)),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 10,
+        };
+        let mut partials = HashMap::new();
+        partials.insert(with_partial.id, "  partial answer  ".to_string());
+        // missing_partial intentionally omitted → ""
+
+        let ids = list_deadline_candidates(&db.conn, &params)
+            .await
+            .expect("list");
+        assert_eq!(
+            ids,
+            vec![missing_partial.id, with_partial.id],
+            "oldest first_prompt_at first, then conversation_id"
+        );
+
+        let promoted = promote_deadline_jobs_by_ids(&db.conn, &params, &ids, &partials)
+            .await
+            .expect("promote");
+        assert_eq!(promoted, 2);
+
+        let job_partial = auto_title_job::Entity::find_by_id(with_partial.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job partial");
+        assert_eq!(job_partial.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            job_partial.first_assistant_text.as_deref(),
+            Some("  partial answer  "),
+            "bound_context keeps short text; promote stores bounded partial"
+        );
+        assert_eq!(job_partial.updated_at, now);
+
+        let job_empty = auto_title_job::Entity::find_by_id(missing_partial.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job empty");
+        assert_eq!(job_empty.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            job_empty.first_assistant_text.as_deref(),
+            Some(""),
+            "missing partial key promotes with Some(\"\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_skips_young_and_retry_wait_and_null_prompt_at() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-deadline-promote-skip").await;
+        let now = Utc::now();
+        let aged = now - chrono::Duration::seconds(400);
+        let young = now - chrono::Duration::seconds(10);
+
+        async fn enroll(db: &crate::db::AppDatabase, folder: i32) -> i32 {
+            create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create")
+                .id
+        }
+
+        let young_id = enroll(&db, folder).await;
+        let retry_id = enroll(&db, folder).await;
+        let null_prompt_id = enroll(&db, folder).await;
+        let ready_id = enroll(&db, folder).await;
+        let running_id = enroll(&db, folder).await;
+        let eligible_id = enroll(&db, folder).await;
+
+        seed_deadline_fields(
+            &db.conn,
+            young_id,
+            Some("young"),
+            Some(young),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            retry_id,
+            Some("retry"),
+            Some(aged),
+            AutoTitleJobState::RetryWait,
+            Some("snap"),
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            null_prompt_id,
+            Some("legacy"),
+            None,
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            ready_id,
+            Some("ready"),
+            Some(aged),
+            AutoTitleJobState::Ready,
+            Some("already"),
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            running_id,
+            Some("running"),
+            Some(aged),
+            AutoTitleJobState::Running,
+            Some("running-snap"),
+        )
+        .await;
+        seed_deadline_fields(
+            &db.conn,
+            eligible_id,
+            Some("eligible"),
+            Some(aged),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 50,
+        };
+        let candidates = list_deadline_candidates(&db.conn, &params)
+            .await
+            .expect("list");
+        assert_eq!(
+            candidates,
+            vec![eligible_id],
+            "only aged awaiting_turn with non-null first_prompt_at"
+        );
+
+        let mut partials = HashMap::new();
+        for id in [
+            young_id,
+            retry_id,
+            null_prompt_id,
+            ready_id,
+            running_id,
+            eligible_id,
+        ] {
+            partials.insert(id, format!("partial-{id}"));
+        }
+
+        // Force-promote every id; only eligible should succeed.
+        let all_ids = [
+            young_id,
+            retry_id,
+            null_prompt_id,
+            ready_id,
+            running_id,
+            eligible_id,
+        ];
+        let promoted =
+            promote_deadline_jobs_by_ids(&db.conn, &params, &all_ids, &partials)
+                .await
+                .expect("promote");
+        assert_eq!(promoted, 1);
+
+        let young_job = auto_title_job::Entity::find_by_id(young_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(young_job.state, AutoTitleJobState::AwaitingTurn);
+        assert!(young_job.first_assistant_text.is_none());
+
+        let retry_job = auto_title_job::Entity::find_by_id(retry_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_job.state, AutoTitleJobState::RetryWait);
+        assert_eq!(retry_job.first_assistant_text.as_deref(), Some("snap"));
+
+        let null_job = auto_title_job::Entity::find_by_id(null_prompt_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(null_job.state, AutoTitleJobState::AwaitingTurn);
+        assert!(null_job.first_assistant_text.is_none());
+        assert!(null_job.first_prompt_at.is_none());
+
+        let ready_job = auto_title_job::Entity::find_by_id(ready_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready_job.state, AutoTitleJobState::Ready);
+        assert_eq!(ready_job.first_assistant_text.as_deref(), Some("already"));
+
+        let running_job = auto_title_job::Entity::find_by_id(running_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running_job.state, AutoTitleJobState::Running);
+        assert_eq!(
+            running_job.first_assistant_text.as_deref(),
+            Some("running-snap")
+        );
+
+        let eligible_job = auto_title_job::Entity::find_by_id(eligible_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(eligible_job.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            eligible_job.first_assistant_text.as_deref(),
+            Some(format!("partial-{eligible_id}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_cas_loses_to_end_turn() {
+        let fixture = awaiting_job_fixture().await;
+        let now = Utc::now();
+        let aged = now - chrono::Duration::seconds(301);
+        seed_deadline_fields(
+            &fixture.db.conn,
+            fixture.conversation_id,
+            Some("task"),
+            Some(aged),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+
+        let snapshot = fixture.snapshot("tok-wins", "full final wins first");
+        let transition = fixture.apply_completion(&snapshot).await;
+        assert!(transition.became_ready);
+        assert_eq!(transition.usable_turn_seq, 1);
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 10,
+        };
+        let mut partials = HashMap::new();
+        partials.insert(
+            fixture.conversation_id,
+            "deadline partial must lose".to_string(),
+        );
+
+        let promoted = promote_deadline_elapsed_jobs(&fixture.db.conn, &params, &partials)
+            .await
+            .expect("promote after end-turn");
+        assert_eq!(promoted, 0, "end-turn already owns first-assistant");
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            job.first_assistant_text.as_deref(),
+            Some("full final wins first"),
+            "promote must not overwrite end-turn assistant"
+        );
+        assert_eq!(job.usable_turn_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn promote_select_then_delete_before_cas_is_noop() {
+        let fixture = awaiting_job_fixture().await;
+        let now = Utc::now();
+        let aged = now - chrono::Duration::seconds(301);
+        seed_deadline_fields(
+            &fixture.db.conn,
+            fixture.conversation_id,
+            Some("task"),
+            Some(aged),
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 10,
+        };
+        let ids = list_deadline_candidates(&fixture.db.conn, &params)
+            .await
+            .expect("list candidates");
+        assert_eq!(ids, vec![fixture.conversation_id]);
+
+        let deleted = cancel_job(&fixture.db.conn, fixture.conversation_id)
+            .await
+            .expect("cancel/delete job after select");
+        assert!(deleted);
+
+        let mut partials = HashMap::new();
+        partials.insert(fixture.conversation_id, "stale partial".to_string());
+        let promoted =
+            promote_deadline_jobs_by_ids(&fixture.db.conn, &params, &ids, &partials)
+                .await
+                .expect("promote after delete must not panic");
+        assert_eq!(promoted, 0);
+
+        assert!(
+            auto_title_job::Entity::find_by_id(fixture.conversation_id)
+                .one(&fixture.db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "job remains deleted"
+        );
     }
 
     #[tokio::test]

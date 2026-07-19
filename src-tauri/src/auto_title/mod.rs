@@ -23,8 +23,9 @@ pub use runner::{
 };
 pub use service::{
     apply_usable_completion, cancel_job, capture_prompt_context, claim_is_still_running,
-    claim_next_ready, enroll_new_conversation, finalize_generated_title, record_attempt_failure,
-    recover_interrupted_jobs,
+    claim_next_ready, enroll_new_conversation, finalize_generated_title,
+    list_deadline_candidates, promote_deadline_elapsed_jobs, promote_deadline_jobs_by_ids,
+    record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
 pub use types::{
     app_locale_to_wire, parse_supported_app_locale, prompt_capture_from_wire,
