@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::acp::delegation::broker::DelegationBroker;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
+use crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator;
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
@@ -55,6 +56,7 @@ pub struct AppState {
     /// requests here. v1 uses the default `DelegationConfig`; settings UI
     /// hot-swaps via `delegation_broker.set_config`.
     pub delegation_broker: Arc<DelegationBroker>,
+    pub continuation_coordinator: Arc<DelegationContinuationCoordinator>,
     /// Process-local delegation reliability metrics (route/accepted/terminal/
     /// wait/cancel). Shared with broker, supervisor, listener, and route launch.
     pub delegation_metrics: Arc<DelegationMetrics>,
@@ -133,6 +135,7 @@ pub struct DelegationStack {
     pub runtime_settings: DelegationRuntimeSettings,
     pub metrics: Arc<DelegationMetrics>,
     pub continuation_store: Arc<dyn ContinuationStore>,
+    pub continuation_coordinator: Arc<DelegationContinuationCoordinator>,
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -193,7 +196,9 @@ pub fn build_delegation_stack(
     let live_reply_lookup = Arc::new(ConnectionManagerLiveReplyLookup {
         manager: cm_arc.clone(),
     }) as Arc<dyn ChildLiveReplyLookup>;
-    let event_emitter = Arc::new(ConnectionManagerEventEmitter { manager: cm_arc })
+    let event_emitter = Arc::new(ConnectionManagerEventEmitter {
+        manager: cm_arc.clone(),
+    })
         as Arc<dyn DelegationEventEmitter>;
     let delegation_metrics = Arc::new(DelegationMetrics::default());
     let broker = Arc::new(
@@ -204,6 +209,20 @@ pub fn build_delegation_stack(
             .with_live_reply_lookup(live_reply_lookup)
             .with_metrics(delegation_metrics.clone()),
     );
+    let continuation_port = Arc::new(
+        crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(
+            cm_arc,
+        ),
+    );
+    let continuation_coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        continuation_store.clone(),
+        broker.clone(),
+        delegation_metrics.clone(),
+        continuation_port,
+        Arc::new(
+            crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new(),
+        ),
+    ));
     let tokens = Arc::new(TokenRegistry::default());
     let leases = Arc::new(CompanionLeaseRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());
@@ -251,6 +270,7 @@ pub fn build_delegation_stack(
         runtime_settings,
         metrics: delegation_metrics,
         continuation_store,
+        continuation_coordinator,
     }
 }
 
@@ -398,6 +418,7 @@ impl AppState {
             ),
             pet_state: crate::pet_state_mapper::new_pet_state_handle(),
             delegation_broker: stack.broker,
+            continuation_coordinator: stack.continuation_coordinator,
             delegation_metrics: stack.metrics,
             delegation_runtime_settings: stack.runtime_settings,
             delegation_tokens: stack.tokens,

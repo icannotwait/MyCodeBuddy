@@ -328,6 +328,7 @@ async fn async_main() -> ExitCode {
         ),
         pet_state: pet_state_handle.clone(),
         delegation_broker: stack.broker.clone(),
+        continuation_coordinator: stack.continuation_coordinator.clone(),
         delegation_metrics: stack.metrics.clone(),
         delegation_runtime_settings: stack.runtime_settings.clone(),
         delegation_tokens: stack.tokens.clone(),

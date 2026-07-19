@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::acp::delegation::continuation::types::ContinuationWaitingProjection;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
@@ -159,6 +161,10 @@ pub enum AcpEvent {
     ConversationStatusChanged {
         conversation_id: i32,
         status: crate::db::entities::conversation::ConversationStatus,
+    },
+    ContinuationWaitingChanged {
+        conversation_id: i32,
+        waiting: Option<ContinuationWaitingProjection>,
     },
     /// Session modes are available for this connection
     SessionModes { modes: SessionModeStateInfo },

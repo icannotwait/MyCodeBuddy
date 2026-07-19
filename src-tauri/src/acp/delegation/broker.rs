@@ -1144,6 +1144,11 @@ pub enum StatusWait {
     Terminal,
 }
 
+pub(crate) enum JoinEvaluation {
+    Ready(DelegationStatusBatch),
+    Waiting(DelegationStatusBatch),
+}
+
 /// Supervised wait exits when any report is non-Running or has an actionable
 /// observation (`Stalled` / `WaitingInput`). `Active` or pre-publish `None`
 /// alone continues parking (until a requested observation transition).
@@ -4715,6 +4720,23 @@ impl DelegationBroker {
         });
     }
 
+    #[allow(
+        dead_code,
+        reason = "Task 7 reaches this through the coordinator worker"
+    )]
+    pub(crate) async fn cancel_by_parent_turn_inline(
+        &self,
+        parent_connection_id: &str,
+        reason: ParentTurnEndReason,
+    ) {
+        debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
+        self.clear_mandatory_profile_routes(parent_connection_id);
+        let drained = self
+            .drain_parent_tree(parent_connection_id, reason, true)
+            .await;
+        self.settle_drained_for_parent_end(drained, reason).await;
+    }
+
     /// Fast, lock-guarded part of a parent end: BFS the full descendant tree
     /// under `parent_connection_id`, mark in-flight setups, and migrate every
     /// live running task into `settling` under one `pending.inner` lock so
@@ -5093,66 +5115,12 @@ impl DelegationBroker {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let classes = {
-                let inner = self.pending.inner.lock().await;
-                task_ids
-                    .iter()
-                    .map(|id| classify_locked(&inner, parent_connection_id, id))
-                    .collect::<Vec<_>>()
-            };
-            let class_views = classes.clone();
-            let tasks = self
-                .assemble_reports(Some(parent_conversation_id), task_ids, classes)
-                .await;
-            let mut attention_requests = match self
-                .attention_store
-                .list_open_for_tasks(parent_conversation_id, task_ids)
+            match self
+                .evaluate_join_snapshot(parent_connection_id, parent_conversation_id, task_ids)
                 .await
             {
-                Ok(requests) => requests,
-                Err(_error) => {
-                    tracing::error!("[delegation] Join attention snapshot failed");
-                    return DelegationStatusBatch::joined(
-                        tasks,
-                        DelegationWakeReason::Unavailable,
-                        Vec::new(),
-                    );
-                }
-            };
-            // A terminal transition and its attention closure are separate
-            // conditional writes. Exclude a stale open row unless this same
-            // snapshot still reports that task as Running.
-            attention_requests.retain(|request| {
-                tasks.iter().any(|task| {
-                    task.task_id.as_deref() == Some(request.task_id.as_str())
-                        && task.status == TaskStatus::Running
-                })
-            });
-
-            let unavailable = tasks.iter().any(|task| task.status == TaskStatus::Unknown)
-                || class_views.iter().zip(&tasks).any(|(class, task)| {
-                    matches!(class, StatusClass::NotInMemory) && task.status == TaskStatus::Running
-                });
-            if unavailable {
-                return DelegationStatusBatch::joined(
-                    tasks,
-                    DelegationWakeReason::Unavailable,
-                    attention_requests,
-                );
-            }
-            if !attention_requests.is_empty() {
-                return DelegationStatusBatch::joined(
-                    tasks,
-                    DelegationWakeReason::AttentionRequired,
-                    attention_requests,
-                );
-            }
-            if tasks.iter().all(|task| task.status != TaskStatus::Running) {
-                return DelegationStatusBatch::joined(
-                    tasks,
-                    DelegationWakeReason::AllTerminal,
-                    Vec::new(),
-                );
+                JoinEvaluation::Ready(batch) => return batch,
+                JoinEvaluation::Waiting(batch) => drop(batch),
             }
 
             if woke_from_hint {
@@ -5164,6 +5132,81 @@ impl DelegationBroker {
             notified.await;
             woke_from_hint = true;
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Task 7 reaches this through the coordinator worker"
+    )]
+    pub(crate) fn join_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.result_notify)
+    }
+
+    pub(crate) async fn evaluate_join_snapshot(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+        task_ids: &[String],
+    ) -> JoinEvaluation {
+        let classes = {
+            let inner = self.pending.inner.lock().await;
+            task_ids
+                .iter()
+                .map(|id| classify_locked(&inner, parent_connection_id, id))
+                .collect::<Vec<_>>()
+        };
+        let class_views = classes.clone();
+        let tasks = self
+            .assemble_reports(Some(parent_conversation_id), task_ids, classes)
+            .await;
+        let mut attention_requests = match self
+            .attention_store
+            .list_open_for_tasks(parent_conversation_id, task_ids)
+            .await
+        {
+            Ok(requests) => requests,
+            Err(_error) => {
+                tracing::error!("[delegation] Join attention snapshot failed");
+                return JoinEvaluation::Ready(DelegationStatusBatch::joined(
+                    tasks,
+                    DelegationWakeReason::Unavailable,
+                    Vec::new(),
+                ));
+            }
+        };
+        attention_requests.retain(|request| {
+            tasks.iter().any(|task| {
+                task.task_id.as_deref() == Some(request.task_id.as_str())
+                    && task.status == TaskStatus::Running
+            })
+        });
+
+        let unavailable = tasks.iter().any(|task| task.status == TaskStatus::Unknown)
+            || class_views.iter().zip(&tasks).any(|(class, task)| {
+                matches!(class, StatusClass::NotInMemory) && task.status == TaskStatus::Running
+            });
+        if unavailable {
+            return JoinEvaluation::Ready(DelegationStatusBatch::joined(
+                tasks,
+                DelegationWakeReason::Unavailable,
+                attention_requests,
+            ));
+        }
+        if !attention_requests.is_empty() {
+            return JoinEvaluation::Ready(DelegationStatusBatch::joined(
+                tasks,
+                DelegationWakeReason::AttentionRequired,
+                attention_requests,
+            ));
+        }
+        if tasks.iter().all(|task| task.status != TaskStatus::Running) {
+            return JoinEvaluation::Ready(DelegationStatusBatch::joined(
+                tasks,
+                DelegationWakeReason::AllTerminal,
+                Vec::new(),
+            ));
+        }
+        JoinEvaluation::Waiting(DelegationStatusBatch::legacy(tasks))
     }
 
     /// Finish a batch status pass: resolve each [`StatusClass`] into a final

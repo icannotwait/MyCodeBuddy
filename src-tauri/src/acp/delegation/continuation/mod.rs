@@ -1,6 +1,10 @@
 mod prompt;
+pub mod coordinator;
 pub mod store;
 pub mod types;
+
+#[cfg(test)]
+mod tests;
 
 #[allow(unused_imports)]
 pub(crate) use prompt::{

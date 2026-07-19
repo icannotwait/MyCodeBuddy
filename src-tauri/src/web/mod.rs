@@ -825,6 +825,10 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::acp::delegation::broker::DelegationBroker>>()
             .inner()
             .clone(),
+        continuation_coordinator: app
+            .state::<Arc<crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator>>()
+            .inner()
+            .clone(),
         delegation_metrics: app
             .state::<Arc<crate::acp::delegation::metrics::DelegationMetrics>>()
             .inner()

@@ -47,6 +47,14 @@ impl DelegationContinuationOrigin {
     pub(crate) fn internal_prompt_id(&self) -> &str {
         &self.internal_prompt_id
     }
+
+    pub(crate) fn internal_prompt_marker(&self) -> &str {
+        &self.internal_prompt_marker
+    }
+
+    pub(crate) fn wake_reason(&self) -> ContinuationWakeReason {
+        self.wake_reason
+    }
 }
 
 #[allow(dead_code)]

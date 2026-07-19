@@ -16,7 +16,14 @@ use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
     RouteBootstrapOutcome, SpawnHandshake, SuspensionAck,
 };
-use crate::acp::delegation::continuation::store::ContinuationStore;
+use crate::acp::delegation::continuation::build_continuation_prompt_text;
+use crate::acp::delegation::continuation::coordinator::{
+    ContinuationError, ContinuationPromptRequest, PromptAdmissionResult,
+};
+use crate::acp::delegation::continuation::store::{
+    ContinuationPatch, ContinuationStore, FieldPatch,
+};
+use crate::acp::delegation::continuation::types::ContinuationState;
 use crate::acp::delegation::metrics::PromptAdmissionSource;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::route::DelegationRoutePlan;
@@ -32,7 +39,7 @@ use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
-use crate::acp::session_state::ActiveTurnContext;
+use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission};
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
@@ -1600,6 +1607,143 @@ impl ConnectionManager {
             .await
             .map_err(|_| AcpError::ProcessExited)?;
         receiver.await.map_err(|_| AcpError::ProcessExited)?
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Task 7 reaches this sealed coordinator admission path"
+    )]
+    pub(crate) async fn admit_delegation_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        let (prompt_lock, cmd_tx, state_arc) = {
+            let connections = self.connections.lock().await;
+            let connection = connections
+                .get(&request.parent_connection_id)
+                .ok_or(ContinuationError::ParentUnavailable)?;
+            (
+                connection.prompt_lock.clone(),
+                connection.cmd_tx.clone(),
+                connection.state.clone(),
+            )
+        };
+        let _prompt_guard = prompt_lock.lock().await;
+        let store = self
+            .continuation_store()
+            .ok_or(ContinuationError::StateConflict)?;
+        let row = store
+            .load(request.origin.continuation_id())
+            .await?
+            .ok_or(ContinuationError::StateConflict)?;
+        if row.generation != request.continuation_generation
+            || row.state != ContinuationState::Resuming
+            || row.parent_connection_id.as_deref() != Some(request.parent_connection_id.as_str())
+            || row.parent_conversation_id != request.parent_conversation_id
+            || row.parent_session_id != request.parent_session_id
+            || row.parent_turn_generation != request.suspended_turn_generation
+            || request.origin.generation() != request.continuation_generation
+            || row.internal_prompt_id != request.origin.internal_prompt_id()
+            || row.internal_prompt_marker != request.origin.internal_prompt_marker()
+            || row.wake_reason != Some(request.origin.wake_reason())
+        {
+            return Err(ContinuationError::StateConflict);
+        }
+
+        {
+            let state = state_arc.read().await;
+            let identity_matches = state.connection_id == request.parent_connection_id
+                && state.conversation_id == Some(request.parent_conversation_id)
+                && state.external_id.as_deref() == Some(request.parent_session_id.as_str())
+                && state.last_suspended_turn_generation == Some(request.suspended_turn_generation);
+            if !identity_matches {
+                return Err(ContinuationError::ParentIdentityChanged);
+            }
+            if row.prompt_admitted_at.is_some() {
+                let same_admission =
+                    state
+                        .last_internal_prompt_admission
+                        .as_ref()
+                        .is_some_and(|admission| {
+                            admission.continuation_id == request.origin.continuation_id()
+                                && admission.continuation_generation
+                                    == request.continuation_generation
+                                && admission.internal_prompt_id
+                                    == request.origin.internal_prompt_id()
+                        });
+                return if same_admission {
+                    Ok(PromptAdmissionResult::AlreadyAdmitted)
+                } else {
+                    Err(ContinuationError::StateConflict)
+                };
+            }
+            if state.parent_turn_generation != request.suspended_turn_generation
+                || state.turn_in_flight
+            {
+                return Err(ContinuationError::StateConflict);
+            }
+        }
+
+        let prompt_text = build_continuation_prompt_text(&request.origin, &request.snapshot)
+            .map_err(|_| {
+                ContinuationError::PromptDelivery(AcpError::protocol(
+                    "continuation prompt serialization failed",
+                ))
+            })?;
+        let permit = cmd_tx
+            .reserve()
+            .await
+            .map_err(|_| ContinuationError::PromptDelivery(AcpError::ProcessExited))?;
+
+        let mut state = state_arc.write().await;
+        if state.connection_id != request.parent_connection_id
+            || state.conversation_id != Some(request.parent_conversation_id)
+            || state.external_id.as_deref() != Some(request.parent_session_id.as_str())
+            || state.last_suspended_turn_generation != Some(request.suspended_turn_generation)
+            || state.parent_turn_generation != request.suspended_turn_generation
+            || state.turn_in_flight
+        {
+            return Err(ContinuationError::StateConflict);
+        }
+        let turn_generation = state
+            .parent_turn_generation
+            .checked_add(1)
+            .ok_or(ContinuationError::StateConflict)?;
+        let admitted = store
+            .cas_transition(
+                request.origin.continuation_id(),
+                request.continuation_generation,
+                request.expected_version,
+                ContinuationState::Resuming,
+                ContinuationPatch {
+                    state: ContinuationState::Resuming,
+                    wake_reason: FieldPatch::Keep,
+                    suspend_requested_at: FieldPatch::Keep,
+                    suspended_at: FieldPatch::Keep,
+                    wake_claimed_at: FieldPatch::Keep,
+                    prompt_admitted_at: FieldPatch::Set(request.admitted_at),
+                    finished_at: FieldPatch::Keep,
+                    failure_code: FieldPatch::Keep,
+                },
+            )
+            .await?
+            .ok_or(ContinuationError::StateConflict)?;
+        state.last_internal_prompt_admission = Some(InternalPromptAdmission {
+            continuation_id: admitted.continuation_id,
+            continuation_generation: admitted.generation,
+            internal_prompt_id: request.origin.internal_prompt_id().to_string(),
+            admitted_turn_generation: turn_generation,
+        });
+        state.parent_turn_generation = turn_generation;
+        state.active_turn_generation = Some(turn_generation);
+        state.turn_in_flight = true;
+        permit.send(ConnectionCommand::Prompt {
+            blocks: vec![PromptInputBlock::Text { text: prompt_text }],
+            user_message: None,
+            mark_awaiting_reply: true,
+            turn_generation,
+        });
+        Ok(PromptAdmissionResult::Admitted)
     }
 
     /// Clone the connection's `prompt_lock` under a short connections-map lock.

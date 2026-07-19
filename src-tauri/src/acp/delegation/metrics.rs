@@ -16,6 +16,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::continuation::types::{
+    ContinuationFailureCode, ContinuationState, ContinuationWakeReason,
+};
 use crate::acp::delegation::route::{
     DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, NativeSuppressionPlan,
     RouteDegradedReason, RouteResolutionError,
@@ -122,6 +125,19 @@ pub struct DelegationMetricsSnapshot {
     pub mcp_request_cancel_count: u64,
     pub mixed_route_invariant_violations: u64,
     pub prompt_rejected: BTreeMap<String, u64>,
+    pub continuation_armed: u64,
+    pub continuation_suspended: u64,
+    pub continuation_wake_claimed: BTreeMap<String, u64>,
+    pub continuation_prompt_admitted: u64,
+    pub continuation_cancelled: BTreeMap<String, u64>,
+    pub continuation_failed: BTreeMap<String, u64>,
+    pub continuation_reconciled: BTreeMap<String, u64>,
+    pub continuation_duplicate_claim_suppressed: u64,
+    pub continuation_wait_duration_ms_count: BTreeMap<String, u64>,
+    pub continuation_wait_duration_ms_total: BTreeMap<String, u64>,
+    pub continuation_suspend_duration_ms_count: u64,
+    pub continuation_suspend_duration_ms_total: u64,
+    pub continuation_prompt_delivery_retry: u64,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -150,6 +166,19 @@ pub struct DelegationMetrics {
     mcp_request_cancel_count: AtomicU64,
     mixed_route_invariant_violations: AtomicU64,
     prompt_rejected: Mutex<BTreeMap<String, u64>>,
+    continuation_armed: AtomicU64,
+    continuation_suspended: AtomicU64,
+    continuation_wake_claimed: Mutex<BTreeMap<String, u64>>,
+    continuation_prompt_admitted: AtomicU64,
+    continuation_cancelled: Mutex<BTreeMap<String, u64>>,
+    continuation_failed: Mutex<BTreeMap<String, u64>>,
+    continuation_reconciled: Mutex<BTreeMap<String, u64>>,
+    continuation_duplicate_claim_suppressed: AtomicU64,
+    continuation_wait_duration_ms_count: Mutex<BTreeMap<String, u64>>,
+    continuation_wait_duration_ms_total: Mutex<BTreeMap<String, u64>>,
+    continuation_suspend_duration_ms_count: AtomicU64,
+    continuation_suspend_duration_ms_total: AtomicU64,
+    continuation_prompt_delivery_retry: AtomicU64,
 }
 
 impl DelegationMetrics {
@@ -330,6 +359,82 @@ impl DelegationMetrics {
         );
     }
 
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_armed(&self) {
+        self.continuation_armed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_suspended(&self, duration: Duration) {
+        self.continuation_suspended.fetch_add(1, Ordering::Relaxed);
+        self.continuation_suspend_duration_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+        let ms = Self::duration_ms_saturating(duration);
+        let _ = self.continuation_suspend_duration_ms_total.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(ms)),
+        );
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_wake_claimed(
+        &self,
+        reason: ContinuationWakeReason,
+        duration: Duration,
+    ) {
+        let label = reason.as_str().to_string();
+        Self::inc_labeled(&self.continuation_wake_claimed, label.clone());
+        Self::inc_labeled(&self.continuation_wait_duration_ms_count, label.clone());
+        let ms = Self::duration_ms_saturating(duration);
+        let mut totals = self
+            .continuation_wait_duration_ms_total
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let total = totals.entry(label).or_insert(0);
+        *total = total.saturating_add(ms);
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_prompt_admitted(&self) {
+        self.continuation_prompt_admitted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code, reason = "Task 8 records ordered cancellation winners")]
+    pub(crate) fn record_continuation_cancelled(&self, phase: ContinuationState) {
+        Self::inc_labeled(&self.continuation_cancelled, phase.as_str().to_string());
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_failed(
+        &self,
+        phase: ContinuationState,
+        code: ContinuationFailureCode,
+    ) {
+        Self::inc_labeled(
+            &self.continuation_failed,
+            format!("{}:{}", phase.as_str(), code.as_str()),
+        );
+    }
+
+    #[allow(dead_code, reason = "Task 8 records reconciliation winners")]
+    pub(crate) fn record_continuation_reconciled(&self, state: ContinuationState) {
+        Self::inc_labeled(&self.continuation_reconciled, state.as_str().to_string());
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_duplicate_claim_suppressed(&self) {
+        self.continuation_duplicate_claim_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code, reason = "Task 7 activates coordinator metrics")]
+    pub(crate) fn record_continuation_prompt_delivery_retry(&self) {
+        self.continuation_prompt_delivery_retry
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Deterministic, serializable snapshot of all counters.
     pub fn snapshot(&self) -> DelegationMetricsSnapshot {
         let route_selections = self
@@ -354,6 +459,36 @@ impl DelegationMetrics {
             .clone();
         let prompt_rejected = self
             .prompt_rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_wake_claimed = self
+            .continuation_wake_claimed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_cancelled = self
+            .continuation_cancelled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_failed = self
+            .continuation_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_reconciled = self
+            .continuation_reconciled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_wait_duration_ms_count = self
+            .continuation_wait_duration_ms_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let continuation_wait_duration_ms_total = self
+            .continuation_wait_duration_ms_total
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -383,6 +518,27 @@ impl DelegationMetrics {
                 .mixed_route_invariant_violations
                 .load(Ordering::Relaxed),
             prompt_rejected,
+            continuation_armed: self.continuation_armed.load(Ordering::Relaxed),
+            continuation_suspended: self.continuation_suspended.load(Ordering::Relaxed),
+            continuation_wake_claimed,
+            continuation_prompt_admitted: self.continuation_prompt_admitted.load(Ordering::Relaxed),
+            continuation_cancelled,
+            continuation_failed,
+            continuation_reconciled,
+            continuation_duplicate_claim_suppressed: self
+                .continuation_duplicate_claim_suppressed
+                .load(Ordering::Relaxed),
+            continuation_wait_duration_ms_count,
+            continuation_wait_duration_ms_total,
+            continuation_suspend_duration_ms_count: self
+                .continuation_suspend_duration_ms_count
+                .load(Ordering::Relaxed),
+            continuation_suspend_duration_ms_total: self
+                .continuation_suspend_duration_ms_total
+                .load(Ordering::Relaxed),
+            continuation_prompt_delivery_retry: self
+                .continuation_prompt_delivery_retry
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -1111,6 +1267,61 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn continuation_coordinator_metrics_labels_are_fixed_and_bounded() {
+        let metrics = DelegationMetrics::default();
+        metrics.record_continuation_armed();
+        metrics.record_continuation_suspended(Duration::from_millis(7));
+        metrics.record_continuation_prompt_admitted();
+        metrics.record_continuation_duplicate_claim_suppressed();
+        metrics.record_continuation_prompt_delivery_retry();
+        for reason in [
+            ContinuationWakeReason::AllTerminal,
+            ContinuationWakeReason::AttentionRequired,
+            ContinuationWakeReason::Unavailable,
+            ContinuationWakeReason::Checkpoint,
+        ] {
+            metrics.record_continuation_wake_claimed(reason, Duration::from_millis(11));
+        }
+        let phases = [
+            ContinuationState::Arming,
+            ContinuationState::Waiting,
+            ContinuationState::WakePending,
+            ContinuationState::Resuming,
+        ];
+        for phase in phases {
+            metrics.record_continuation_cancelled(phase);
+            metrics.record_continuation_reconciled(phase);
+            for code in [
+                ContinuationFailureCode::ArmFailed,
+                ContinuationFailureCode::SuspendDispatchFailed,
+                ContinuationFailureCode::SuspendDrainTimeout,
+                ContinuationFailureCode::ParentConnectionLost,
+                ContinuationFailureCode::PromptDeliveryFailed,
+                ContinuationFailureCode::StateConflict,
+            ] {
+                metrics.record_continuation_failed(phase, code);
+            }
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.continuation_wake_claimed.len(), 4);
+        assert_eq!(snapshot.continuation_cancelled.len(), 4);
+        assert_eq!(snapshot.continuation_failed.len(), 24);
+        assert_eq!(snapshot.continuation_reconciled.len(), 4);
+        assert_eq!(snapshot.continuation_wait_duration_ms_count.len(), 4);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        for forbidden in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "connection-123",
+            "session-123",
+            "task-123",
+            "prompt-123",
+        ] {
+            assert!(!json.contains(forbidden));
+        }
     }
 
     #[test]

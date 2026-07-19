@@ -525,6 +525,7 @@ mod tauri_app {
                     app.manage(stack.sessions.clone());
                     app.manage(stack.runtime_settings.clone());
                     app.manage(stack.metrics.clone());
+                    app.manage(stack.continuation_coordinator.clone());
                     app.manage(crate::commands::delegation::DelegationSocketPath(
                         stack.socket_path.clone(),
                     ));

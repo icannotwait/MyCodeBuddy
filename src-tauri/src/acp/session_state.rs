@@ -8,6 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::delegation::continuation::types::ContinuationWaitingProjection;
 use crate::acp::delegation::route::{
     DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
 };
@@ -318,6 +319,9 @@ pub struct SessionState {
     /// the backend's `pending_questions` registry keys the answer one-shot.
     pub pending_question: Option<PendingQuestionState>,
 
+    /// Durable suspension projection for a parent waiting on delegated work.
+    pub waiting_for_subagents: Option<ContinuationWaitingProjection>,
+
     /// In-flight (running) sub-agent delegations keyed by `parent_tool_use_id`.
     /// `DelegationStarted` inserts; `DelegationCompleted` removes. UNLIKE
     /// `active_tool_calls`, NOT cleared on `TurnComplete` (an async delegation
@@ -537,6 +541,7 @@ impl SessionState {
             active_tool_calls: BTreeMap::new(),
             pending_permission: None,
             pending_question: None,
+            waiting_for_subagents: None,
             active_delegations: BTreeMap::new(),
             feedback: Vec::new(),
             background_outstanding: 0,
@@ -993,6 +998,14 @@ impl SessionState {
                 // `LiveSessionSnapshot`. Listed explicitly (rather than swept
                 // up by the catchall) so the no-op is intentional and grep-able.
             }
+            AcpEvent::ContinuationWaitingChanged {
+                conversation_id,
+                waiting,
+            } => {
+                if self.conversation_id == Some(*conversation_id) {
+                    self.waiting_for_subagents = waiting.clone();
+                }
+            }
             AcpEvent::SelectorsReady => {
                 // Latches once. Snapshot exposes this so a fresh frontend (e.g.
                 // after browser refresh) can tell the initial handshake is
@@ -1438,6 +1451,7 @@ impl SessionState {
             active_tool_calls: self.active_tool_calls.values().cloned().collect(),
             pending_permission: self.pending_permission.clone(),
             pending_question: self.pending_question.clone(),
+            waiting_for_subagents: self.waiting_for_subagents.clone(),
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             feedback: self.feedback.clone(),
@@ -1493,6 +1507,8 @@ pub struct LiveSessionSnapshot {
     /// the wire so every snapshot stays byte-identical with the pre-feature shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_subagents: Option<ContinuationWaitingProjection>,
     /// The in-flight user prompt for the current turn (see
     /// `SessionState.pending_user_message`). `#[serde(default)]` so older
     /// payloads still deserialize; `skip_serializing_if` so the no-pending case
