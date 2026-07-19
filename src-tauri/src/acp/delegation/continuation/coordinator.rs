@@ -131,6 +131,12 @@ pub(crate) enum PromptAdmissionResult {
     AlreadyAdmitted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentConnectionExitCause {
+    Disconnected,
+    SuspensionDrainTimeout,
+}
+
 #[async_trait]
 #[allow(dead_code, reason = "Task 7 activates the coordinator parent port")]
 pub(crate) trait ParentContinuationPort: Send + Sync {
@@ -428,6 +434,204 @@ impl DelegationContinuationCoordinator {
             }
         }
         cancelled
+    }
+
+    pub(crate) async fn handle_parent_stop(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+    ) -> Result<usize, ContinuationError> {
+        self.cancel_workers_for_parent(parent_connection_id);
+        let active = match self
+            .store
+            .load_active_for_conversation(parent_conversation_id)
+            .await
+        {
+            Ok(active) => active,
+            Err(error) => {
+                self.broker
+                    .cancel_by_parent_turn(
+                        parent_connection_id,
+                        ParentTurnEndReason::ParentCanceled,
+                    )
+                    .await;
+                return Err(error.into());
+            }
+        };
+        if !active.as_ref().is_some_and(|record| {
+            record.parent_connection_id.as_deref() == Some(parent_connection_id)
+        }) {
+            return Ok(0);
+        }
+
+        self.broker
+            .cancel_by_parent_turn(parent_connection_id, ParentTurnEndReason::ParentCanceled)
+            .await;
+        let Some(current) = self
+            .store
+            .load_active_for_conversation(parent_conversation_id)
+            .await?
+        else {
+            return Ok(0);
+        };
+        if current.parent_connection_id.as_deref() != Some(parent_connection_id) {
+            return Ok(0);
+        }
+        let mut cancelled = keep_patch(ContinuationState::Cancelled);
+        cancelled.finished_at = FieldPatch::Set(self.clock.now_utc());
+        let Some(winner) = self
+            .store
+            .cas_transition(
+                &current.continuation_id,
+                current.generation,
+                current.version,
+                current.state,
+                cancelled,
+            )
+            .await?
+        else {
+            return Ok(0);
+        };
+        self.metrics.record_continuation_cancelled(current.state);
+        if let Err(error) = self.port.publish_waiting(parent_connection_id, None).await {
+            tracing::warn!(
+                parent_connection_id,
+                continuation_id = %winner.continuation_id,
+                "failed to clear continuation waiting projection after user stop: {error}"
+            );
+        }
+        Ok(1)
+    }
+
+    pub(crate) async fn handle_parent_connection_exit(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        cause: ParentConnectionExitCause,
+    ) {
+        self.cancel_workers_for_parent(parent_connection_id);
+        let had_matching_active = match parent_conversation_id {
+            Some(conversation_id) => match self
+                .store
+                .load_active_for_conversation(conversation_id)
+                .await
+            {
+                Ok(Some(record)) => {
+                    record.parent_connection_id.as_deref() == Some(parent_connection_id)
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        parent_connection_id,
+                        conversation_id,
+                        "failed to load continuation during parent connection cleanup: {error}"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+
+        self.broker.cancel_by_parent(parent_connection_id).await;
+        if !had_matching_active {
+            return;
+        }
+        let Some(conversation_id) = parent_conversation_id else {
+            return;
+        };
+        let current = match self
+            .store
+            .load_active_for_conversation(conversation_id)
+            .await
+        {
+            Ok(Some(record))
+                if record.parent_connection_id.as_deref() == Some(parent_connection_id) =>
+            {
+                record
+            }
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(
+                    parent_connection_id,
+                    conversation_id,
+                    "failed to reload continuation after parent disconnect drain: {error}"
+                );
+                return;
+            }
+        };
+        let failure_code = match cause {
+            ParentConnectionExitCause::Disconnected => {
+                ContinuationFailureCode::ParentConnectionLost
+            }
+            ParentConnectionExitCause::SuspensionDrainTimeout => {
+                ContinuationFailureCode::SuspendDrainTimeout
+            }
+        };
+        match self
+            .store
+            .cas_fail_and_cancel_parent(
+                &current.continuation_id,
+                current.generation,
+                current.version,
+                current.state,
+                failure_code,
+                self.clock.now_utc(),
+            )
+            .await
+        {
+            Ok(Some(_)) => {
+                self.metrics
+                    .record_continuation_failed(current.state, failure_code);
+                if let Err(error) = self.port.publish_waiting(parent_connection_id, None).await {
+                    tracing::warn!(
+                        parent_connection_id,
+                        conversation_id,
+                        "failed to clear continuation waiting projection after disconnect: {error}"
+                    );
+                }
+                if let Err(error) = self
+                    .port
+                    .publish_failure(parent_connection_id, failure_code)
+                    .await
+                {
+                    tracing::warn!(
+                        parent_connection_id,
+                        conversation_id,
+                        code = failure_code.as_str(),
+                        "failed to publish continuation disconnect failure: {error}"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                parent_connection_id,
+                conversation_id,
+                "failed to persist continuation disconnect failure: {error}"
+            ),
+        }
+    }
+
+    pub async fn reconcile_on_startup(&self) -> Result<usize, ContStoreError> {
+        let rows = self
+            .store
+            .fail_non_terminal_on_startup(self.clock.now_utc())
+            .await?;
+        for row in &rows {
+            self.metrics.record_continuation_reconciled(row.state);
+            let connection_id = row.parent_connection_id.as_deref().unwrap_or_default();
+            let code = row
+                .failure_code
+                .unwrap_or(ContinuationFailureCode::ParentConnectionLost);
+            if let Err(error) = self.port.publish_failure(connection_id, code).await {
+                tracing::warn!(
+                    parent_connection_id = connection_id,
+                    conversation_id = row.parent_conversation_id,
+                    code = code.as_str(),
+                    "failed to publish startup continuation failure: {error}"
+                );
+            }
+        }
+        Ok(rows.len())
     }
 
     #[allow(dead_code, reason = "Task 7 invokes the Join coordinator entry")]
@@ -1226,4 +1430,317 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
         return;
     };
     fail_after_suspension(context, &failed_record, failure_code).await;
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::acp::delegation::broker::ConversationDepthLookup;
+    use crate::acp::delegation::continuation::store::InMemoryContinuationStore;
+    use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+    use crate::acp::delegation::types::DelegationError;
+
+    #[derive(Default)]
+    struct RecordingPort {
+        failures: tokio::sync::Mutex<Vec<(String, ContinuationFailureCode)>>,
+        waiting_clears: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for RecordingPort {
+        async fn snapshot_parent(
+            &self,
+            _connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Err(ContinuationError::ParentUnavailable)
+        }
+
+        async fn suspend_parent(
+            &self,
+            _request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Err(ContinuationError::ParentUnavailable)
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            Err(ContinuationError::ParentUnavailable)
+        }
+
+        async fn publish_waiting(
+            &self,
+            connection_id: &str,
+            waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            assert!(waiting.is_none());
+            self.waiting_clears
+                .lock()
+                .await
+                .push(connection_id.to_string());
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            connection_id: &str,
+            code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            self.failures
+                .lock()
+                .await
+                .push((connection_id.to_string(), code));
+            Ok(())
+        }
+    }
+
+    struct EmptyDepth;
+
+    #[async_trait]
+    impl ConversationDepthLookup for EmptyDepth {
+        async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+            Ok(None)
+        }
+    }
+
+    fn cleanup_coordinator(
+        store: Arc<dyn ContinuationStore>,
+        port: Arc<RecordingPort>,
+    ) -> DelegationContinuationCoordinator {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        DelegationContinuationCoordinator::new(
+            store,
+            broker,
+            Arc::new(DelegationMetrics::default()),
+            port,
+            Arc::new(SystemContinuationClock::new()),
+        )
+    }
+
+    fn cleanup_new(id: &str, connection_id: &str, conversation_id: i32) -> NewContinuation {
+        let now = Utc::now();
+        NewContinuation {
+            continuation_id: id.to_string(),
+            parent_conversation_id: conversation_id,
+            parent_session_id: "parent-session".to_string(),
+            parent_connection_id: connection_id.to_string(),
+            parent_turn_generation: 1,
+            task_ids: ContinuationTaskIds(vec!["task-1".to_string()]),
+            armed_at: now,
+            wake_at: now,
+            internal_prompt_id: format!("prompt-{id}"),
+            internal_prompt_marker: format!("marker-{id}"),
+        }
+    }
+
+    fn cleanup_patch(state: ContinuationState) -> ContinuationPatch {
+        ContinuationPatch {
+            state,
+            wake_reason: FieldPatch::Keep,
+            suspend_requested_at: FieldPatch::Keep,
+            suspended_at: FieldPatch::Keep,
+            wake_claimed_at: FieldPatch::Keep,
+            prompt_admitted_at: FieldPatch::Keep,
+            finished_at: FieldPatch::Keep,
+            failure_code: FieldPatch::Keep,
+        }
+    }
+
+    async fn advance_to(
+        store: &InMemoryContinuationStore,
+        mut record: ContinuationRecord,
+        target: ContinuationState,
+    ) -> ContinuationRecord {
+        for state in [
+            ContinuationState::Waiting,
+            ContinuationState::WakePending,
+            ContinuationState::Resuming,
+            ContinuationState::Completed,
+        ] {
+            if record.state == target {
+                break;
+            }
+            record = store
+                .cas_transition(
+                    &record.continuation_id,
+                    record.generation,
+                    record.version,
+                    record.state,
+                    cleanup_patch(state),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        record
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_stop_cancels_each_active_phase_and_registered_worker() {
+        for (index, phase) in [
+            ContinuationState::Arming,
+            ContinuationState::Waiting,
+            ContinuationState::WakePending,
+            ContinuationState::Resuming,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store = Arc::new(InMemoryContinuationStore::default());
+            let record = store
+                .insert_arming(cleanup_new(&format!("stop-{index}"), "parent", 1))
+                .await
+                .unwrap();
+            let record = advance_to(&store, record, phase).await;
+            let port = Arc::new(RecordingPort::default());
+            let coordinator = cleanup_coordinator(store.clone(), port);
+            let worker_cancel = CancellationToken::new();
+            coordinator.workers.lock().unwrap().insert(
+                (record.continuation_id.clone(), record.generation),
+                WorkerRegistration {
+                    instance_id: Uuid::new_v4(),
+                    parent_connection_id: "parent".to_string(),
+                    cancel: worker_cancel.clone(),
+                },
+            );
+
+            assert_eq!(
+                coordinator.handle_parent_stop("parent", 1).await.unwrap(),
+                1
+            );
+            assert!(worker_cancel.is_cancelled());
+            assert_eq!(
+                store
+                    .load(&record.continuation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ContinuationState::Cancelled
+            );
+            assert_eq!(
+                coordinator
+                    .metrics
+                    .snapshot()
+                    .continuation_cancelled
+                    .get(phase.as_str()),
+                Some(&1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_stop_skips_completed_prompt_admission() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let record = store
+            .insert_arming(cleanup_new("completed", "parent", 1))
+            .await
+            .unwrap();
+        let completed = advance_to(&store, record, ContinuationState::Completed).await;
+        let coordinator = cleanup_coordinator(store.clone(), Arc::new(RecordingPort::default()));
+
+        assert_eq!(
+            coordinator.handle_parent_stop("parent", 1).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .load(&completed.continuation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ContinuationState::Completed
+        );
+        assert!(coordinator
+            .metrics
+            .snapshot()
+            .continuation_cancelled
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_connection_exit_fences_parent_and_maps_typed_cause() {
+        for (index, cause, expected) in [
+            (
+                0,
+                ParentConnectionExitCause::Disconnected,
+                ContinuationFailureCode::ParentConnectionLost,
+            ),
+            (
+                1,
+                ParentConnectionExitCause::SuspensionDrainTimeout,
+                ContinuationFailureCode::SuspendDrainTimeout,
+            ),
+        ] {
+            let store = Arc::new(InMemoryContinuationStore::default());
+            let record = store
+                .insert_arming(cleanup_new(&format!("exit-{index}"), "parent", 1))
+                .await
+                .unwrap();
+            let port = Arc::new(RecordingPort::default());
+            let coordinator = cleanup_coordinator(store.clone(), port.clone());
+
+            coordinator
+                .handle_parent_connection_exit("parent", Some(1), cause)
+                .await;
+
+            let failed = store.load(&record.continuation_id).await.unwrap().unwrap();
+            assert_eq!(failed.state, ContinuationState::Failed);
+            assert_eq!(failed.failure_code, Some(expected));
+            assert_eq!(
+                port.failures.lock().await.as_slice(),
+                &[("parent".to_string(), expected)]
+            );
+            assert_eq!(port.waiting_clears.lock().await.as_slice(), &["parent"]);
+        }
+
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let record = store
+            .insert_arming(cleanup_new("mismatch", "other-parent", 1))
+            .await
+            .unwrap();
+        let coordinator = cleanup_coordinator(store.clone(), Arc::new(RecordingPort::default()));
+        coordinator
+            .handle_parent_connection_exit(
+                "parent",
+                Some(1),
+                ParentConnectionExitCause::Disconnected,
+            )
+            .await;
+        assert_eq!(
+            store
+                .load(&record.continuation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ContinuationState::Arming
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_publishes_winners_once() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        store
+            .insert_arming(cleanup_new("startup", "parent", 1))
+            .await
+            .unwrap();
+        let port = Arc::new(RecordingPort::default());
+        let coordinator = cleanup_coordinator(store, port.clone());
+
+        assert_eq!(coordinator.reconcile_on_startup().await.unwrap(), 1);
+        assert_eq!(coordinator.reconcile_on_startup().await.unwrap(), 0);
+        assert_eq!(
+            port.failures.lock().await.as_slice(),
+            &[(
+                "parent".to_string(),
+                ContinuationFailureCode::ParentConnectionLost
+            )]
+        );
+    }
 }

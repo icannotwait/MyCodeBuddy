@@ -534,6 +534,7 @@ mod tauri_app {
                     // + feedback + question + session-info config before listener
                     // accept.
                     let broker_for_init = stack.broker.clone();
+                    let coordinator_for_init = stack.continuation_coordinator.clone();
                     let runtime_for_init = stack.runtime_settings.clone();
                     let db_for_init = db_conn.clone();
                     let feedback_for_init = stack.feedback.clone();
@@ -562,11 +563,24 @@ mod tauri_app {
                         )
                         .await;
                         // After migrations + settings, before the listener accepts:
-                        // fail only orphaned running delegate rows as host_restarted.
-                        // Fail-closed: do not start the listener on reconcile error.
+                        // reconcile Broker children first, then continuation parents.
+                        // Fail-closed: do not start the listener on either error.
                         crate::acp::delegation::broker::DelegationBroker::require_reconcile_ok(
                             broker_for_init.reconcile_running_on_startup().await,
-                        )
+                        )?;
+                        let reconciled = coordinator_for_init
+                            .reconcile_on_startup()
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "delegation startup blocked: continuation reconciliation failed: {error}"
+                                )
+                            })?;
+                        tracing::info!(
+                            reconciled,
+                            "[delegation] continuation startup reconciliation complete"
+                        );
+                        Ok::<(), String>(())
                     });
                     if let Err(e) = reconcile_result {
                         tracing::error!("[delegation] {e}");

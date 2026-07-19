@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::AgentType;
 use super::message::{MessageTurn, TurnUsage};
+use crate::acp::delegation::continuation::types::ContinuationFailureCode;
 use crate::acp::delegation::route::DelegationRoutePolicy;
 use crate::db::entities::conversation::{ConversationKind, DelegationTaskStatus};
 
@@ -144,6 +145,14 @@ pub struct DbConversationDetail {
     /// mid-stream, which would otherwise double-render against the live reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_flight_user_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_failure: Option<ContinuationFailureProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationFailureProjection {
+    pub code: ContinuationFailureCode,
+    pub finished_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

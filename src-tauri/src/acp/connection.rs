@@ -2150,6 +2150,10 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
 #[derive(Clone)]
 pub struct DelegationInjection {
     pub broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+    pub continuation_coordinator: std::sync::Weak<
+        crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator,
+    >,
+    pub(crate) parent_connection_exit_causes: Arc<ParentConnectionExitCauses>,
     pub tokens: Arc<crate::acp::delegation::listener::TokenRegistry>,
     /// Authenticated ready-lease registry. Lease waiters are registered at
     /// MCP injection when the immutable plan exposes Codeg delegation.
@@ -2182,6 +2186,36 @@ pub struct DelegationInjection {
     pub supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake,
     /// Process-local reliability metrics (route validation at launch).
     pub metrics: std::sync::Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+}
+
+#[derive(Default)]
+pub(crate) struct ParentConnectionExitCauses {
+    suspension_drain_timeouts: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl ParentConnectionExitCauses {
+    fn record_suspension_drain_timeout(&self, connection_id: &str) {
+        self.suspension_drain_timeouts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(connection_id.to_string());
+    }
+
+    fn take(
+        &self,
+        connection_id: &str,
+    ) -> crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause {
+        if self
+            .suspension_drain_timeouts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(connection_id)
+        {
+            crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause::SuspensionDrainTimeout
+        } else {
+            crate::acp::delegation::continuation::coordinator::ParentConnectionExitCause::Disconnected
+        }
+    }
 }
 
 /// Typed bootstrap outcome from the connection task to the manager.
@@ -4956,12 +4990,22 @@ async fn cleanup_delegation_parent(
     connection_id: &str,
     state: &Arc<RwLock<SessionState>>,
 ) {
-    let token = state.read().await.delegation_token.clone();
+    let (token, conversation_id) = {
+        let state = state.read().await;
+        (state.delegation_token.clone(), state.conversation_id)
+    };
     if let Some(token) = token {
         injection.leases.revoke(&token).await;
         injection.tokens.revoke(&token).await;
     }
-    injection.broker.cancel_by_parent(connection_id).await;
+    let cause = injection.parent_connection_exit_causes.take(connection_id);
+    if let Some(coordinator) = injection.continuation_coordinator.upgrade() {
+        coordinator
+            .handle_parent_connection_exit(connection_id, conversation_id, cause)
+            .await;
+    } else {
+        injection.broker.cancel_by_parent(connection_id).await;
+    }
     // Reclaim a parked `ask_user_question` instead of waiting for the
     // companion's ask socket to close; dropping the sender declines it cleanly.
     injection
@@ -6133,6 +6177,11 @@ async fn run_conversation_loop<'a>(
                                 }
                                 disconnect_requested = true;
                                 break;
+                            }
+                            if let Some(injection) = delegation_injection {
+                                injection
+                                    .parent_connection_exit_causes
+                                    .record_suspension_drain_timeout(conn_id);
                             }
                             let _ = finalize_turn_terminal(
                                 TurnTerminalSource::SuspensionDrainTimeout,
@@ -8105,6 +8154,8 @@ mod tests {
     ) -> DelegationInjection {
         DelegationInjection {
             broker,
+            continuation_coordinator: std::sync::Weak::new(),
+            parent_connection_exit_causes: Arc::new(ParentConnectionExitCauses::default()),
             tokens: Arc::new(crate::acp::delegation::listener::TokenRegistry::default()),
             leases: Arc::new(
                 crate::acp::delegation::lease::CompanionLeaseRegistry::default(),
@@ -8368,6 +8419,61 @@ mod tests {
             .get_task_status("parent-conn", Some(1), task_id, StatusWait::Snapshot)
             .await
             .status
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_connection_teardown_projects_recorded_timeout_cause() {
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, InMemoryContinuationStore, NewContinuation,
+        };
+        use crate::acp::delegation::continuation::types::{
+            ContinuationFailureCode, ContinuationState, ContinuationTaskIds,
+        };
+
+        let (broker, _spawner, _task_id) = delegation_suspend_broker_with_running_child().await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let now = chrono::Utc::now();
+        let row = store
+            .insert_arming(NewContinuation {
+                continuation_id: "connection-exit".to_string(),
+                parent_conversation_id: 1,
+                parent_session_id: "parent-session".to_string(),
+                parent_connection_id: "parent-conn".to_string(),
+                parent_turn_generation: 1,
+                task_ids: ContinuationTaskIds(vec!["task-1".to_string()]),
+                armed_at: now,
+                wake_at: now,
+                internal_prompt_id: "prompt-1".to_string(),
+                internal_prompt_marker: "marker-1".to_string(),
+            })
+            .await
+            .unwrap();
+        let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
+        let coordinator = Arc::new(
+            crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator::new(
+                store.clone(),
+                broker.clone(),
+                Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+                Arc::new(crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(manager)),
+                Arc::new(crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new()),
+            ),
+        );
+        let mut injection = delegation_suspend_injection(broker);
+        injection.continuation_coordinator = Arc::downgrade(&coordinator);
+        injection
+            .parent_connection_exit_causes
+            .record_suspension_drain_timeout("parent-conn");
+        let state = delegation_suspend_state(1);
+        state.write().await.conversation_id = Some(1);
+
+        cleanup_delegation_parent(&injection, "parent-conn", &state).await;
+
+        let failed = store.load(&row.continuation_id).await.unwrap().unwrap();
+        assert_eq!(failed.state, ContinuationState::Failed);
+        assert_eq!(
+            failed.failure_code,
+            Some(ContinuationFailureCode::SuspendDrainTimeout)
+        );
     }
 
     #[test]
@@ -12703,6 +12809,8 @@ mod tests {
         }
         let injection = DelegationInjection {
             broker,
+            continuation_coordinator: std::sync::Weak::new(),
+            parent_connection_exit_causes: Arc::new(ParentConnectionExitCauses::default()),
             tokens: Arc::new(TokenRegistry::default()),
             leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: std::path::PathBuf::from("/tmp/codeg-mcp.sock"),

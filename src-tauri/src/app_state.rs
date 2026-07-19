@@ -243,6 +243,10 @@ pub fn build_delegation_stack(
     // without an extra parameter at every call site.
     connection_manager.install_delegation(DelegationInjection {
         broker: broker.clone(),
+        continuation_coordinator: Arc::downgrade(&continuation_coordinator),
+        parent_connection_exit_causes: Arc::new(
+            crate::acp::connection::ParentConnectionExitCauses::default(),
+        ),
         tokens: tokens.clone(),
         leases: leases.clone(),
         socket_path: socket_path.clone(),

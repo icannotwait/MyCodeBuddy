@@ -38,6 +38,217 @@ mod tests {
         (DbContinuationStore::new(db.conn.clone()), db)
     }
 
+    async fn sqlite_parent_status(db: &crate::db::AppDatabase, conversation_id: i32) -> String {
+        db.conn
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT status FROM conversation WHERE id = ?",
+                [conversation_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "status")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_fails_row_and_parent_atomically_with_store_parity() {
+        let finished_at = Utc::now();
+        let memory = InMemoryContinuationStore::default();
+        memory.seed_parent_status(1, "in_progress").await;
+        memory
+            .insert_arming(new_continuation("memory-startup", 1))
+            .await
+            .unwrap();
+
+        let memory_winners = memory
+            .fail_non_terminal_on_startup(finished_at)
+            .await
+            .unwrap();
+        assert_eq!(memory_winners.len(), 1);
+        assert_eq!(memory_winners[0].state, ContinuationState::Failed);
+        assert_eq!(
+            memory_winners[0].failure_code,
+            Some(ContinuationFailureCode::ParentConnectionLost)
+        );
+        assert_eq!(memory_winners[0].finished_at, Some(finished_at));
+        assert_eq!(memory.parent_status(1).await.as_deref(), Some("cancelled"));
+        assert!(memory
+            .fail_non_terminal_on_startup(finished_at + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let (sqlite, db) = sqlite_store().await;
+        sqlite
+            .insert_arming(new_continuation("sqlite-startup", 1))
+            .await
+            .unwrap();
+        let sqlite_winners = sqlite
+            .fail_non_terminal_on_startup(finished_at)
+            .await
+            .unwrap();
+        assert_eq!(sqlite_winners.len(), 1);
+        assert_eq!(sqlite_winners[0].state, ContinuationState::Failed);
+        assert_eq!(
+            sqlite_winners[0].failure_code,
+            Some(ContinuationFailureCode::ParentConnectionLost)
+        );
+        assert_eq!(sqlite_winners[0].finished_at, Some(finished_at));
+        assert_eq!(sqlite_parent_status(&db, 1).await, "cancelled");
+        assert!(sqlite
+            .fail_non_terminal_on_startup(finished_at + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_cas_loser_reports_no_winner_with_store_parity() {
+        let finished_at = Utc::now();
+        let memory = Arc::new(InMemoryContinuationStore::default());
+        memory.seed_parent_status(1, "in_progress").await;
+        memory
+            .insert_arming(new_continuation("memory-startup-race", 1))
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            memory.fail_non_terminal_on_startup(finished_at),
+            memory.fail_non_terminal_on_startup(finished_at)
+        );
+        assert_eq!(first.unwrap().len() + second.unwrap().len(), 1);
+        assert_eq!(memory.parent_status(1).await.as_deref(), Some("cancelled"));
+
+        let (sqlite, db) = sqlite_store().await;
+        let sqlite = Arc::new(sqlite);
+        sqlite
+            .insert_arming(new_continuation("sqlite-startup-race", 1))
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            sqlite.fail_non_terminal_on_startup(finished_at),
+            sqlite.fail_non_terminal_on_startup(finished_at)
+        );
+        assert_eq!(first.unwrap().len() + second.unwrap().len(), 1);
+        assert_eq!(sqlite_parent_status(&db, 1).await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_parent_write_error_rolls_back_row() {
+        let (sqlite, db) = sqlite_store().await;
+        let record = sqlite
+            .insert_arming(new_continuation("sqlite-startup-rollback", 1))
+            .await
+            .unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE TRIGGER fail_startup_parent_update BEFORE UPDATE OF status ON conversation BEGIN SELECT RAISE(ABORT, 'parent update failed'); END".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(sqlite
+            .fail_non_terminal_on_startup(Utc::now())
+            .await
+            .is_err());
+        let unchanged = sqlite.load(&record.continuation_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.state, ContinuationState::Arming);
+        assert_eq!(unchanged.version, record.version);
+        assert_eq!(sqlite_parent_status(&db, 1).await, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_in_memory_error_rolls_back_row_and_parent() {
+        let memory = InMemoryContinuationStore::default();
+        memory.seed_parent_status(1, "in_progress").await;
+        let record = memory
+            .insert_arming(new_continuation("memory-startup-rollback", 1))
+            .await
+            .unwrap();
+        memory.fail_next_startup_before_commit().await;
+
+        assert!(memory
+            .fail_non_terminal_on_startup(Utc::now())
+            .await
+            .is_err());
+        let unchanged = memory.load(&record.continuation_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.state, ContinuationState::Arming);
+        assert_eq!(unchanged.version, record.version);
+        assert_eq!(
+            memory.parent_status(1).await.as_deref(),
+            Some("in_progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_latest_failure_requires_newest_failed_and_cancelled_parent() {
+        let finished_at = Utc::now();
+        let memory = InMemoryContinuationStore::default();
+        memory.seed_parent_status(1, "in_progress").await;
+        memory
+            .insert_arming(new_continuation("memory-failed", 1))
+            .await
+            .unwrap();
+        memory
+            .fail_non_terminal_on_startup(finished_at)
+            .await
+            .unwrap();
+        assert!(memory
+            .load_latest_failure_for_conversation(1)
+            .await
+            .unwrap()
+            .is_some());
+        let newer = memory
+            .insert_arming(new_continuation("memory-newer", 1))
+            .await
+            .unwrap();
+        memory
+            .cas_transition(
+                &newer.continuation_id,
+                newer.generation,
+                newer.version,
+                newer.state,
+                transition(ContinuationState::Cancelled),
+            )
+            .await
+            .unwrap();
+        assert!(memory
+            .load_latest_failure_for_conversation(1)
+            .await
+            .unwrap()
+            .is_none());
+
+        let (sqlite, db) = sqlite_store().await;
+        sqlite
+            .insert_arming(new_continuation("sqlite-failed", 1))
+            .await
+            .unwrap();
+        sqlite
+            .fail_non_terminal_on_startup(finished_at)
+            .await
+            .unwrap();
+        assert!(sqlite
+            .load_latest_failure_for_conversation(1)
+            .await
+            .unwrap()
+            .is_some());
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE conversation SET status = 'in_progress' WHERE id = ?",
+                [1.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(sqlite
+            .load_latest_failure_for_conversation(1)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn continuation_store_rejects_second_active_parent() {
         let memory = InMemoryContinuationStore::default();
@@ -707,6 +918,14 @@ pub trait ContinuationStore: Send + Sync {
         conversation_id: i32,
     ) -> Result<Option<ContinuationRecord>, ContStoreError>;
     async fn list_non_terminal(&self) -> Result<Vec<ContinuationRecord>, ContStoreError>;
+    async fn fail_non_terminal_on_startup(
+        &self,
+        _finished_at: DateTime<Utc>,
+    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+        Err(ContStoreError::InvalidRecord(
+            "startup reconciliation is not implemented by this continuation store".to_string(),
+        ))
+    }
     async fn cas_transition(
         &self,
         continuation_id: &str,
@@ -861,6 +1080,53 @@ impl ContinuationStore for DbContinuationStore {
         rows.iter().map(record_from_row).collect()
     }
 
+    async fn fail_non_terminal_on_startup(
+        &self,
+        finished_at: DateTime<Utc>,
+    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+        let txn = self.db.begin().await?;
+        let candidates = txn
+            .query_all(Self::statement(
+                "SELECT * FROM delegation_continuations WHERE state IN ('arming','waiting','wake_pending','resuming') ORDER BY parent_conversation_id, generation",
+                vec![],
+            ))
+            .await?;
+        let candidates: Vec<_> = candidates
+            .iter()
+            .map(record_from_row)
+            .collect::<Result<_, _>>()?;
+        let mut winners = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let row = txn
+                .query_one(Self::statement(
+                    CAS_FAIL_SQL,
+                    vec![
+                        candidate.continuation_id.clone().into(),
+                        to_i64(candidate.generation, "generation")?.into(),
+                        to_i64(candidate.version, "version")?.into(),
+                        candidate.state.as_str().into(),
+                        ContinuationFailureCode::ParentConnectionLost
+                            .as_str()
+                            .into(),
+                        finished_at.into(),
+                        finished_at.into(),
+                    ],
+                ))
+                .await?;
+            let Some(record) = row.map(|row| record_from_row(&row)).transpose()? else {
+                continue;
+            };
+            txn.execute(Self::statement(
+                "UPDATE conversation SET status = 'cancelled' WHERE id = ? AND status = 'in_progress'",
+                vec![record.parent_conversation_id.into()],
+            ))
+            .await?;
+            winners.push(record);
+        }
+        txn.commit().await?;
+        Ok(winners)
+    }
+
     async fn cas_transition(
         &self,
         continuation_id: &str,
@@ -973,7 +1239,13 @@ impl ContinuationStore for DbContinuationStore {
         &self,
         conversation_id: i32,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
-        load_one(&self.db, "SELECT * FROM delegation_continuations WHERE parent_conversation_id = ? AND state = 'failed' ORDER BY generation DESC LIMIT 1", vec![conversation_id.into()]).await
+        let latest = load_one(
+            &self.db,
+            "SELECT dc.* FROM delegation_continuations dc JOIN conversation c ON c.id = dc.parent_conversation_id WHERE dc.parent_conversation_id = ? AND c.status = 'cancelled' ORDER BY dc.generation DESC LIMIT 1",
+            vec![conversation_id.into()],
+        )
+        .await?;
+        Ok(latest.filter(|record| record.state == ContinuationState::Failed))
     }
 }
 
@@ -1221,10 +1493,11 @@ pub struct InMemoryContinuationStore {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct InMemoryState {
     records: std::collections::HashMap<String, ContinuationRecord>,
     parent_statuses: std::collections::HashMap<i32, String>,
+    fail_next_startup_before_commit: bool,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1246,6 +1519,11 @@ impl InMemoryContinuationStore {
             .parent_statuses
             .get(&conversation_id)
             .cloned()
+    }
+
+    #[cfg(test)]
+    async fn fail_next_startup_before_commit(&self) {
+        self.inner.lock().await.fail_next_startup_before_commit = true;
     }
 }
 
@@ -1342,6 +1620,53 @@ impl ContinuationStore for InMemoryContinuationStore {
             .collect();
         records.sort_by_key(|record| (record.parent_conversation_id, record.generation));
         Ok(records)
+    }
+
+    async fn fail_non_terminal_on_startup(
+        &self,
+        finished_at: DateTime<Utc>,
+    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+        let mut inner = self.inner.lock().await;
+        let fail_before_commit = std::mem::take(&mut inner.fail_next_startup_before_commit);
+        let mut transaction = inner.clone();
+        let mut keys: Vec<_> = transaction
+            .records
+            .iter()
+            .filter(|(_, record)| is_active(record.state))
+            .map(|(id, record)| (id.clone(), record.parent_conversation_id, record.generation))
+            .collect();
+        keys.sort_by_key(|(_, conversation_id, generation)| (*conversation_id, *generation));
+        let mut winners = Vec::with_capacity(keys.len());
+        for (continuation_id, conversation_id, _) in keys {
+            let Some(record) = transaction.records.get_mut(&continuation_id) else {
+                continue;
+            };
+            if !is_active(record.state) {
+                continue;
+            }
+            record.state = ContinuationState::Failed;
+            record.failure_code = Some(ContinuationFailureCode::ParentConnectionLost);
+            record.finished_at = Some(finished_at);
+            record.version += 1;
+            record.updated_at = finished_at;
+            winners.push(record.clone());
+            if transaction
+                .parent_statuses
+                .get(&conversation_id)
+                .is_some_and(|status| status == "in_progress")
+            {
+                transaction
+                    .parent_statuses
+                    .insert(conversation_id, "cancelled".to_string());
+            }
+        }
+        if fail_before_commit {
+            return Err(ContStoreError::InvalidRecord(
+                "injected in-memory startup transaction failure".to_string(),
+            ));
+        }
+        *inner = transaction;
+        Ok(winners)
     }
 
     async fn cas_transition(
@@ -1452,17 +1777,20 @@ impl ContinuationStore for InMemoryContinuationStore {
         &self,
         conversation_id: i32,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
-        Ok(self
-            .inner
-            .lock()
-            .await
+        let inner = self.inner.lock().await;
+        if !inner
+            .parent_statuses
+            .get(&conversation_id)
+            .is_some_and(|status| status == "cancelled")
+        {
+            return Ok(None);
+        }
+        Ok(inner
             .records
             .values()
-            .filter(|record| {
-                record.parent_conversation_id == conversation_id
-                    && record.state == ContinuationState::Failed
-            })
+            .filter(|record| record.parent_conversation_id == conversation_id)
             .max_by_key(|record| record.generation)
+            .filter(|record| record.state == ContinuationState::Failed)
             .cloned())
     }
 }

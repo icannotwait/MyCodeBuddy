@@ -2388,21 +2388,35 @@ impl ConnectionManager {
     }
 
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
-        let (control_tx, state_arc, emitter) = {
+        let (prompt_lock, control_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             (
+                conn.prompt_lock.clone(),
                 conn.control_tx.clone(),
                 conn.state.clone(),
                 conn.emitter.clone(),
             )
         };
-        control_tx
+        let _prompt_guard = prompt_lock.lock_owned().await;
+        let conversation_id = state_arc.read().await.conversation_id;
+        let cleanup_error = match (
+            conversation_id,
+            self.delegation_snapshot()
+                .and_then(|injection| injection.continuation_coordinator.upgrade()),
+        ) {
+            (Some(conversation_id), Some(coordinator)) => coordinator
+                .handle_parent_stop(conn_id, conversation_id)
+                .await
+                .err(),
+            _ => None,
+        };
+        let cancel_result = control_tx
             .send(ConnectionControl::Cancel)
             .await
-            .map_err(|_| AcpError::ProcessExited)?;
+            .map_err(|_| AcpError::ProcessExited);
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
@@ -2411,7 +2425,6 @@ impl ConnectionManager {
         // — without this write the row would strand on `InProgress`.
         // CAS-guarded so we don't overwrite a `PendingReview`/`Completed`
         // status if the turn happened to end just before the user clicked.
-        let conversation_id = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id {
             match conversation_service::update_status_if_with_patch(
                 db,
@@ -2443,6 +2456,12 @@ impl ConnectionManager {
             }
         }
 
+        cancel_result?;
+        if let Some(error) = cleanup_error {
+            return Err(AcpError::protocol(format!(
+                "continuation stop persistence failed: {error}"
+            )));
+        }
         Ok(())
     }
 
@@ -9278,6 +9297,10 @@ mod tests {
         ));
         mgr.install_delegation(crate::acp::connection::DelegationInjection {
             broker,
+            continuation_coordinator: std::sync::Weak::new(),
+            parent_connection_exit_causes: Arc::new(
+                crate::acp::connection::ParentConnectionExitCauses::default(),
+            ),
             tokens: Arc::clone(&tokens),
             leases: Arc::clone(&leases),
             socket_path: PathBuf::from("/tmp/codeg-test.sock"),
@@ -9467,6 +9490,10 @@ mod tests {
         ));
         mgr.install_delegation(crate::acp::connection::DelegationInjection {
             broker,
+            continuation_coordinator: std::sync::Weak::new(),
+            parent_connection_exit_causes: Arc::new(
+                crate::acp::connection::ParentConnectionExitCauses::default(),
+            ),
             tokens: Arc::clone(&tokens),
             leases: Arc::clone(&leases),
             socket_path: PathBuf::from("/tmp/codeg-test.sock"),
@@ -9648,6 +9675,364 @@ mod tests {
         assert_eq!(
             plans[1].source,
             crate::acp::delegation::route::DelegationRouteSource::SafeFallback
+        );
+    }
+
+    struct CleanupGateStore {
+        inner: Arc<crate::acp::delegation::continuation::store::InMemoryContinuationStore>,
+        gate: tokio::sync::Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        fail_active_load: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::acp::delegation::continuation::store::ContinuationStore for CleanupGateStore {
+        async fn insert_arming(
+            &self,
+            new: crate::acp::delegation::continuation::store::NewContinuation,
+        ) -> Result<
+            crate::acp::delegation::continuation::store::ContinuationRecord,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner.insert_arming(new).await
+        }
+
+        async fn load(
+            &self,
+            continuation_id: &str,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner.load(continuation_id).await
+        }
+
+        async fn load_active_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            if let Some((entered, release)) = self.gate.lock().await.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            if self.fail_active_load {
+                return Err(
+                    crate::acp::delegation::continuation::store::ContStoreError::InvalidRecord(
+                        "injected stop read failure".to_string(),
+                    ),
+                );
+            }
+            self.inner
+                .load_active_for_conversation(conversation_id)
+                .await
+        }
+
+        async fn list_non_terminal(
+            &self,
+        ) -> Result<
+            Vec<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner.list_non_terminal().await
+        }
+
+        async fn cas_transition(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: crate::acp::delegation::continuation::types::ContinuationState,
+            patch: crate::acp::delegation::continuation::store::ContinuationPatch,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner
+                .cas_transition(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    patch,
+                )
+                .await
+        }
+
+        async fn cas_claim_cleanup(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: crate::acp::delegation::continuation::types::ContinuationState,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner
+                .cas_claim_cleanup(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                )
+                .await
+        }
+
+        async fn cas_fail_and_cancel_parent(
+            &self,
+            continuation_id: &str,
+            generation: u64,
+            expected_version: u64,
+            expected_state: crate::acp::delegation::continuation::types::ContinuationState,
+            failure_code: crate::acp::delegation::continuation::types::ContinuationFailureCode,
+            finished_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner
+                .cas_fail_and_cancel_parent(
+                    continuation_id,
+                    generation,
+                    expected_version,
+                    expected_state,
+                    failure_code,
+                    finished_at,
+                )
+                .await
+        }
+
+        async fn matches_admitted_marker(
+            &self,
+            conversation_id: i32,
+            marker: &str,
+        ) -> Result<bool, crate::acp::delegation::continuation::store::ContStoreError> {
+            self.inner
+                .matches_admitted_marker(conversation_id, marker)
+                .await
+        }
+
+        async fn load_latest_failure_for_conversation(
+            &self,
+            conversation_id: i32,
+        ) -> Result<
+            Option<crate::acp::delegation::continuation::store::ContinuationRecord>,
+            crate::acp::delegation::continuation::store::ContStoreError,
+        > {
+            self.inner
+                .load_latest_failure_for_conversation(conversation_id)
+                .await
+        }
+    }
+
+    struct CleanupEmptyDepth;
+
+    #[async_trait::async_trait]
+    impl crate::acp::delegation::broker::ConversationDepthLookup for CleanupEmptyDepth {
+        async fn parent_of(
+            &self,
+            _id: i32,
+        ) -> Result<Option<i32>, crate::acp::delegation::types::DelegationError> {
+            Ok(None)
+        }
+    }
+
+    fn cleanup_new_continuation(
+        id: &str,
+    ) -> crate::acp::delegation::continuation::store::NewContinuation {
+        let now = chrono::Utc::now();
+        crate::acp::delegation::continuation::store::NewContinuation {
+            continuation_id: id.to_string(),
+            parent_conversation_id: 1,
+            parent_session_id: "session".to_string(),
+            parent_connection_id: "cleanup-parent".to_string(),
+            parent_turn_generation: 1,
+            task_ids: crate::acp::delegation::continuation::types::ContinuationTaskIds(vec![
+                "task-1".to_string(),
+            ]),
+            armed_at: now,
+            wake_at: now,
+            internal_prompt_id: format!("prompt-{id}"),
+            internal_prompt_marker: format!("marker-{id}"),
+        }
+    }
+
+    async fn install_cleanup_connection(
+        manager: &Arc<ConnectionManager>,
+        store: Arc<dyn crate::acp::delegation::continuation::store::ContinuationStore>,
+    ) -> (
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionControl>,
+        Arc<crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator>,
+    ) {
+        let (cmd_tx, cmd_rx, _) = connection_channel(4);
+        let (control_tx, control_rx, _) = connection_channel(4);
+        let mut connection = fake_connection("cleanup-parent", Some(1));
+        connection.cmd_tx = cmd_tx;
+        connection.control_tx = control_tx;
+        manager
+            .connections
+            .lock()
+            .await
+            .insert("cleanup-parent".to_string(), connection);
+        manager.install_continuation_store(store.clone());
+
+        let broker = Arc::new(crate::acp::delegation::broker::DelegationBroker::new(
+            Arc::new(crate::acp::delegation::spawner::mock::MockSpawner::default())
+                as Arc<dyn crate::acp::delegation::spawner::ConnectionSpawner>,
+            Arc::new(CleanupEmptyDepth)
+                as Arc<dyn crate::acp::delegation::broker::ConversationDepthLookup>,
+        ));
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let coordinator = Arc::new(
+            crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator::new(
+                store,
+                broker.clone(),
+                metrics.clone(),
+                Arc::new(crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(manager.clone())),
+                Arc::new(crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new()),
+            ),
+        );
+        let tokens = Arc::new(
+            crate::acp::delegation::listener::TokenRegistry::with_continuation_coordinator(
+                coordinator.clone(),
+            ),
+        );
+        manager.install_delegation(crate::acp::connection::DelegationInjection {
+            broker,
+            tokens,
+            leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
+            socket_path: std::path::PathBuf::from("cleanup.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(ConnectionManagerQuestionLookup {
+                manager: manager.clone(),
+            }),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics,
+            continuation_coordinator: Arc::downgrade(&coordinator),
+            parent_connection_exit_causes: Arc::new(
+                crate::acp::connection::ParentConnectionExitCauses::default(),
+            ),
+        });
+        (cmd_rx, control_rx, coordinator)
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_stop_holds_prompt_lock_until_durable_cleanup_finishes() {
+        use crate::acp::delegation::continuation::store::ContinuationStore;
+
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "C:/cleanup-stop").await;
+        crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let inner = Arc::new(
+            crate::acp::delegation::continuation::store::InMemoryContinuationStore::default(),
+        );
+        inner
+            .insert_arming(cleanup_new_continuation("gated"))
+            .await
+            .unwrap();
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let store = Arc::new(CleanupGateStore {
+            inner: inner.clone(),
+            gate: tokio::sync::Mutex::new(Some((entered_tx, release_rx))),
+            fail_active_load: false,
+        });
+        let manager = Arc::new(ConnectionManager::new());
+        let (mut cmd_rx, mut control_rx, _coordinator) =
+            install_cleanup_connection(&manager, store).await;
+        let stop_db = db.conn.clone();
+        let stop_manager = manager.clone();
+        let mut stop =
+            tokio::spawn(async move { stop_manager.cancel(&stop_db, "cleanup-parent").await });
+        tokio::select! {
+            entered = &mut entered_rx => entered.expect("stop entered continuation cleanup"),
+            result = &mut stop => panic!("stop completed before durable cleanup: {result:?}"),
+        }
+
+        let prompt_db = Arc::new(crate::db::AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let prompt_manager = manager.clone();
+        let prompt = tokio::spawn(async move {
+            prompt_manager
+                .send_prompt(
+                    &prompt_db,
+                    "cleanup-parent",
+                    vec![PromptInputBlock::Text {
+                        text: "racing prompt".to_string(),
+                    }],
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !prompt.is_finished(),
+            "external prompt passed prompt_lock early"
+        );
+
+        release_tx.send(()).unwrap();
+        stop.await.unwrap().unwrap();
+        prompt.await.unwrap().unwrap();
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ConnectionControl::Cancel)
+        ));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ConnectionCommand::Prompt { .. })
+        ));
+        assert_eq!(
+            inner.load("gated").await.unwrap().unwrap().state,
+            crate::acp::delegation::continuation::types::ContinuationState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_stop_store_failure_still_dispatches_cancel_and_leaves_gate() {
+        use crate::acp::delegation::continuation::store::ContinuationStore;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "C:/cleanup-failure").await;
+        crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let inner = Arc::new(
+            crate::acp::delegation::continuation::store::InMemoryContinuationStore::default(),
+        );
+        inner
+            .insert_arming(cleanup_new_continuation("unresolved"))
+            .await
+            .unwrap();
+        let store = Arc::new(CleanupGateStore {
+            inner: inner.clone(),
+            gate: tokio::sync::Mutex::new(None),
+            fail_active_load: true,
+        });
+        let manager = Arc::new(ConnectionManager::new());
+        let (_cmd_rx, mut control_rx, _coordinator) =
+            install_cleanup_connection(&manager, store).await;
+
+        let error = manager
+            .cancel(&db.conn, "cleanup-parent")
+            .await
+            .expect_err("persistence error must be surfaced after explicit Cancel");
+        assert!(error.to_string().contains("injected stop read failure"));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ConnectionControl::Cancel)
+        ));
+        assert_eq!(
+            inner.load("unresolved").await.unwrap().unwrap().state,
+            crate::acp::delegation::continuation::types::ContinuationState::Arming
         );
     }
 

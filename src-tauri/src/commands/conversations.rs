@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::acp::delegation::continuation::filter_internal_continuation_turns;
-use crate::acp::delegation::continuation::store::DbContinuationStore;
+use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::app_error::AppCommandError;
 use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::db::entities::conversation;
@@ -9,6 +9,7 @@ use crate::db::entities::folder::FolderKind;
 use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
+use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
@@ -890,6 +891,19 @@ pub async fn get_folder_conversation_core(
             AppCommandError::database_error("Failed to filter internal continuation prompts")
                 .with_detail(error.to_string())
         })?;
+    let continuation_failure = continuation_store
+        .load_latest_failure_for_conversation(conversation_id)
+        .await
+        .map_err(|error| {
+            AppCommandError::database_error("Failed to load continuation failure")
+                .with_detail(error.to_string())
+        })?
+        .and_then(|record| {
+            Some(ContinuationFailureProjection {
+                code: record.failure_code?,
+                finished_at: record.finished_at?,
+            })
+        });
 
     let mut summary = summary;
     summary.message_count = turns.len() as u32;
@@ -912,6 +926,7 @@ pub async fn get_folder_conversation_core(
             session_stats,
             transcript_watermark,
             in_flight_user_turn_id: None,
+            continuation_failure,
         },
         parsed_title,
     ))
@@ -4325,6 +4340,84 @@ mod tests {
             Some(token.as_str()),
             "DB token must survive get_folder_conversation_core"
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cold_failure_projection_is_redacted_and_status_scoped() {
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, DbContinuationStore, NewContinuation,
+        };
+        use crate::acp::delegation::continuation::types::{
+            ContinuationFailureCode, ContinuationTaskIds,
+        };
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-continuation-failure").await;
+        let id = create_conversation_core(&db.conn, folder_id, AgentType::Codex, None, None)
+            .await
+            .expect("create");
+        let store = DbContinuationStore::new(db.conn.clone());
+        let finished_at = chrono::Utc::now();
+        store
+            .insert_arming(NewContinuation {
+                continuation_id: "secret-continuation-id".to_string(),
+                parent_conversation_id: id,
+                parent_session_id: "secret-parent-session".to_string(),
+                parent_connection_id: "secret-parent-connection".to_string(),
+                parent_turn_generation: 1,
+                task_ids: ContinuationTaskIds(vec!["secret-task-id".to_string()]),
+                armed_at: finished_at,
+                wake_at: finished_at,
+                internal_prompt_id: "secret-prompt-id".to_string(),
+                internal_prompt_marker: "secret-marker".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .fail_non_terminal_on_startup(finished_at)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+
+        let (detail, _) = get_folder_conversation_core(&db.conn, registry.as_ref(), id)
+            .await
+            .expect("get failure projection");
+        let projection = detail
+            .continuation_failure
+            .as_ref()
+            .expect("cancelled parent exposes latest failed continuation");
+        assert_eq!(
+            projection.code,
+            ContinuationFailureCode::ParentConnectionLost
+        );
+        assert_eq!(projection.finished_at, finished_at);
+        let json = serde_json::to_value(&detail).unwrap();
+        let projected = json["continuation_failure"].as_object().unwrap();
+        assert_eq!(projected.len(), 2);
+        let serialized = serde_json::to_string(&json).unwrap();
+        for secret in [
+            "secret-continuation-id",
+            "secret-parent-session",
+            "secret-parent-connection",
+            "secret-task-id",
+            "secret-prompt-id",
+            "secret-marker",
+        ] {
+            assert!(!serialized.contains(secret), "projection leaked {secret}");
+        }
+
+        update_conversation_status_core(&db.conn, id, "in_progress".to_string())
+            .await
+            .unwrap();
+        let (detail, _) = get_folder_conversation_core(&db.conn, registry.as_ref(), id)
+            .await
+            .expect("get after new prompt status");
+        assert!(detail.continuation_failure.is_none());
     }
 
     #[tokio::test]
