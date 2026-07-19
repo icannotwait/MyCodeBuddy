@@ -323,6 +323,10 @@ pub(crate) enum ContinuationError {
     SuspendDrainTimeout,
     #[error("parent connection was lost")]
     ParentConnectionLost,
+    #[error("parent stop cleanup owns suspension rejection")]
+    ParentStopRequested,
+    #[error("parent suspension was rejected before continuation ownership: {0}")]
+    SuspendRejected(String),
     #[error("continuation prompt delivery failed: {0}")]
     PromptDelivery(#[source] AcpError),
     #[error("continuation state changed before this operation committed")]
@@ -597,7 +601,7 @@ async fn fail_before_suspension(
     let mut patch = keep_patch(ContinuationState::Failed);
     patch.failure_code = FieldPatch::Set(code);
     patch.finished_at = FieldPatch::Set(context.clock.now_utc());
-    if context
+    match context
         .store
         .cas_transition(
             &record.continuation_id,
@@ -607,27 +611,28 @@ async fn fail_before_suspension(
             patch,
         )
         .await
-        .ok()
-        .flatten()
-        .is_some()
     {
-        context
-            .metrics
-            .record_continuation_failed(record.state, code);
-        let _ = context
-            .port
-            .publish_waiting(
-                &record.parent_connection_id.clone().unwrap_or_default(),
-                None,
-            )
-            .await;
-        let _ = context
-            .port
-            .publish_failure(
-                &record.parent_connection_id.clone().unwrap_or_default(),
-                code,
-            )
-            .await;
+        Ok(Some(_)) => {
+            context
+                .metrics
+                .record_continuation_failed(record.state, code);
+            let _ = context
+                .port
+                .publish_waiting(
+                    &record.parent_connection_id.clone().unwrap_or_default(),
+                    None,
+                )
+                .await;
+            let _ = context
+                .port
+                .publish_failure(
+                    &record.parent_connection_id.clone().unwrap_or_default(),
+                    code,
+                )
+                .await;
+        }
+        Ok(None) => retain_unless_exact_terminal(context, record).await,
+        Err(_) => retain_until_cancelled(context).await,
     }
 }
 
@@ -656,13 +661,8 @@ async fn retain_if_active(context: &WorkerContext, continuation_id: &str) {
     }
 }
 
-#[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
-async fn fail_after_suspension(
-    context: &WorkerContext,
-    owned: &ContinuationRecord,
-    code: ContinuationFailureCode,
-) {
-    let exact_row_is_terminal = context
+async fn retain_unless_exact_terminal(context: &WorkerContext, owned: &ContinuationRecord) {
+    let exact_terminal = context
         .store
         .load(&owned.continuation_id)
         .await
@@ -671,9 +671,37 @@ async fn fail_after_suspension(
         .is_some_and(|record| {
             record.generation == owned.generation && is_terminal_state(record.state)
         });
-    if exact_row_is_terminal {
-        return;
+    if !exact_terminal {
+        retain_until_cancelled(context).await;
     }
+}
+
+#[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
+async fn fail_after_suspension(
+    context: &WorkerContext,
+    owned: &ContinuationRecord,
+    code: ContinuationFailureCode,
+) {
+    let claimed = match context
+        .store
+        .cas_claim_cleanup(
+            &owned.continuation_id,
+            owned.generation,
+            owned.version,
+            owned.state,
+        )
+        .await
+    {
+        Ok(Some(claimed)) => claimed,
+        Ok(None) => {
+            retain_unless_exact_terminal(context, owned).await;
+            return;
+        }
+        Err(_) => {
+            retain_until_cancelled(context).await;
+            return;
+        }
+    };
     let connection_id = owned.parent_connection_id.clone().unwrap_or_default();
     context
         .broker
@@ -682,10 +710,10 @@ async fn fail_after_suspension(
     match context
         .store
         .cas_fail_and_cancel_parent(
-            &owned.continuation_id,
-            owned.generation,
-            owned.version,
-            owned.state,
+            &claimed.continuation_id,
+            claimed.generation,
+            claimed.version,
+            claimed.state,
             code,
             context.clock.now_utc(),
         )
@@ -694,21 +722,12 @@ async fn fail_after_suspension(
         Ok(Some(_)) => {
             context
                 .metrics
-                .record_continuation_failed(owned.state, code);
+                .record_continuation_failed(claimed.state, code);
             let _ = context.port.publish_waiting(&connection_id, None).await;
             let _ = context.port.publish_failure(&connection_id, code).await;
         }
         Ok(None) | Err(_) => {
-            let terminal = context
-                .store
-                .load(&owned.continuation_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|record| is_terminal_state(record.state));
-            if !terminal {
-                retain_until_cancelled(context).await;
-            }
+            retain_unless_exact_terminal(context, &claimed).await;
         }
     }
 }
@@ -761,11 +780,12 @@ async fn run_worker_owned(
         Ok(Some(record)) => record,
         Ok(None) => {
             let _ = completion.send(Err(ContinuationError::StateConflict));
+            retain_unless_exact_terminal(context, &record).await;
             return;
         }
         Err(_) => {
-            fail_before_suspension(context, &record, ContinuationFailureCode::ArmFailed).await;
             let _ = completion.send(Err(ContinuationError::StateConflict));
+            fail_before_suspension(context, &record, ContinuationFailureCode::ArmFailed).await;
             return;
         }
     };
@@ -855,7 +875,9 @@ async fn run_worker_owned(
         Err(error) => {
             if matches!(
                 &error,
-                ContinuationError::SuspendDrainTimeout | ContinuationError::ParentConnectionLost
+                ContinuationError::SuspendDrainTimeout
+                    | ContinuationError::ParentConnectionLost
+                    | ContinuationError::ParentStopRequested
             ) {
                 let _ = completion.send(Err(error));
                 retain_until_cancelled(context).await;
@@ -867,8 +889,8 @@ async fn run_worker_owned(
             } else {
                 ContinuationFailureCode::ArmFailed
             };
-            fail_before_suspension(context, failed_record, failure_code).await;
             let _ = completion.send(Err(error));
+            fail_before_suspension(context, failed_record, failure_code).await;
             return;
         }
     };

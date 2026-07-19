@@ -350,8 +350,11 @@ struct ObservedStore {
     drain_check_task: Mutex<Option<(Arc<MockTaskStore>, String)>>,
     drain_verified: std::sync::atomic::AtomicBool,
     fail_transition_to: Mutex<Option<ContinuationState>>,
+    error_transition_to: Mutex<Option<ContinuationState>>,
     failure_attempted: tokio::sync::Notify,
     failure_fence: Mutex<Option<(u64, u64, ContinuationState)>>,
+    cleanup_claim_attempted: tokio::sync::Notify,
+    cleanup_claim_fence: Mutex<Option<(u64, u64, ContinuationState)>>,
     fail_next_load: AtomicUsize,
     load_failure_observed: tokio::sync::Notify,
 }
@@ -374,8 +377,11 @@ impl ObservedStore {
                 drain_check_task: Mutex::new(None),
                 drain_verified: std::sync::atomic::AtomicBool::new(false),
                 fail_transition_to: Mutex::new(None),
+                error_transition_to: Mutex::new(None),
                 failure_attempted: tokio::sync::Notify::new(),
                 failure_fence: Mutex::new(None),
+                cleanup_claim_attempted: tokio::sync::Notify::new(),
+                cleanup_claim_fence: Mutex::new(None),
                 fail_next_load: AtomicUsize::new(0),
                 load_failure_observed: tokio::sync::Notify::new(),
             }),
@@ -398,6 +404,13 @@ impl ObservedStore {
     fn fail_next_transition_to(&self, state: ContinuationState) {
         *self
             .fail_transition_to
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(state);
+    }
+
+    fn error_next_transition_to(&self, state: ContinuationState) {
+        *self
+            .error_transition_to
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(state);
     }
@@ -459,6 +472,23 @@ impl ContinuationStore for ObservedStore {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        let should_error = {
+            let mut target = self
+                .error_transition_to
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if target.as_ref() == Some(&patch.state) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if should_error {
+            return Err(ContStoreError::InvalidRecord(
+                "injected transition error".into(),
+            ));
+        }
         let should_fail = {
             let mut target = self
                 .fail_transition_to
@@ -568,6 +598,31 @@ impl ContinuationStore for ObservedStore {
             self.terminal.notify_waiters();
         }
         Ok(result)
+    }
+
+    async fn cas_claim_cleanup(
+        &self,
+        continuation_id: &str,
+        generation: u64,
+        expected_version: u64,
+        expected_state: ContinuationState,
+    ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        *self
+            .cleanup_claim_fence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some((generation, expected_version, expected_state));
+        let result = self
+            .inner
+            .cas_claim_cleanup(
+                continuation_id,
+                generation,
+                expected_version,
+                expected_state,
+            )
+            .await;
+        self.cleanup_claim_attempted.notify_waiters();
+        result
     }
 
     async fn matches_admitted_marker(
@@ -781,6 +836,129 @@ impl ParentContinuationPort for RetryPort {
     }
 }
 
+struct FinalFailureGatePort {
+    attempts: AtomicUsize,
+    final_entered: Mutex<Option<tokio::sync::oneshot::Sender<ContinuationPromptRequest>>>,
+    final_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl FinalFailureGatePort {
+    fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<ContinuationPromptRequest>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                attempts: AtomicUsize::new(0),
+                final_entered: Mutex::new(Some(entered_tx)),
+                final_release: tokio::sync::Mutex::new(Some(release_rx)),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait]
+impl ParentContinuationPort for FinalFailureGatePort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        ReadyPort.snapshot_parent(connection_id).await
+    }
+
+    async fn suspend_parent(
+        &self,
+        request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        ReadyPort.suspend_parent(request).await
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempt == 4 {
+            let release = self.final_release.lock().await.take();
+            if let Some(entered) = self
+                .final_entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = entered.send(request);
+            }
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        Err(ContinuationError::PromptDelivery(AcpError::ProcessExited))
+    }
+
+    async fn publish_waiting(
+        &self,
+        connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_waiting(connection_id, waiting).await
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
+struct PreSuspendDispatchFailurePort;
+
+#[async_trait]
+impl ParentContinuationPort for PreSuspendDispatchFailurePort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        ReadyPort.snapshot_parent(connection_id).await
+    }
+
+    async fn suspend_parent(
+        &self,
+        _request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        Err(ContinuationError::SuspendDispatch(AcpError::ProcessExited))
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        ReadyPort.admit_continuation(request).await
+    }
+
+    async fn publish_waiting(
+        &self,
+        connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_waiting(connection_id, waiting).await
+    }
+
+    async fn publish_failure(
+        &self,
+        connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        ReadyPort.publish_failure(connection_id, code).await
+    }
+}
+
 struct ConflictAdmissionPort;
 
 #[async_trait]
@@ -921,6 +1099,7 @@ impl ParentContinuationPort for ParentIdentityDriftPort {
 enum SuspensionFailureCause {
     DrainTimeout,
     ParentConnectionLost,
+    ParentStopRequested,
 }
 
 struct SuspensionFailurePort(SuspensionFailureCause);
@@ -941,6 +1120,7 @@ impl ParentContinuationPort for SuspensionFailurePort {
         Err(match self.0 {
             SuspensionFailureCause::DrainTimeout => ContinuationError::SuspendDrainTimeout,
             SuspensionFailureCause::ParentConnectionLost => ContinuationError::ParentConnectionLost,
+            SuspensionFailureCause::ParentStopRequested => ContinuationError::ParentStopRequested,
         })
     }
 
@@ -1543,6 +1723,9 @@ async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCau
         SuspensionFailureCause::ParentConnectionLost => {
             assert!(matches!(error, ContinuationError::ParentConnectionLost));
         }
+        SuspensionFailureCause::ParentStopRequested => {
+            assert!(matches!(error, ContinuationError::ParentStopRequested));
+        }
     }
     tokio::task::yield_now().await;
 
@@ -1564,6 +1747,173 @@ async fn continuation_coordinator_suspend_drain_timeout_stays_owned_for_task8_cl
 #[tokio::test]
 async fn continuation_coordinator_parent_connection_loss_stays_owned_for_task8_cleanup() {
     assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::ParentConnectionLost).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_parent_stop_rejection_stays_owned_for_task8_cleanup() {
+    assert_suspension_cleanup_cause_stays_owned(SuspensionFailureCause::ParentStopRequested).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_owner() {
+    struct LocalRejectionPort;
+
+    #[async_trait]
+    impl ParentContinuationPort for LocalRejectionPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            ReadyPort.snapshot_parent(connection_id).await
+        }
+
+        async fn suspend_parent(
+            &self,
+            _request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Err(ContinuationError::SuspendRejected(
+                "suspend_turn_generation_mismatch".into(),
+            ))
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            ReadyPort.admit_continuation(request).await
+        }
+
+        async fn publish_waiting(
+            &self,
+            connection_id: &str,
+            waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            ReadyPort.publish_waiting(connection_id, waiting).await
+        }
+
+        async fn publish_failure(
+            &self,
+            connection_id: &str,
+            code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            ReadyPort.publish_failure(connection_id, code).await
+        }
+    }
+
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(LocalRejectionPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::SuspendRejected(_))
+    ));
+    terminal.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Failed);
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bool) {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    if store_error {
+        store.error_next_transition_to(ContinuationState::Failed);
+    } else {
+        store.fail_next_transition_to(ContinuationState::Failed);
+    }
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(PreSuspendDispatchFailurePort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::SuspendDispatch(AcpError::ProcessExited))
+    ));
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Arming);
+    assert_eq!(row.failure_code, None);
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_coordinator_pre_suspension_active_cas_loser_retains_owner() {
+    assert_pre_suspension_failure_persistence_retains_owner(false).await;
+}
+
+#[tokio::test]
+async fn continuation_coordinator_pre_suspension_store_error_retains_owner() {
+    assert_pre_suspension_failure_persistence_retains_owner(true).await;
 }
 
 #[tokio::test]
@@ -1877,8 +2227,8 @@ fn admission_request(record: &ContinuationRecord) -> ContinuationPromptRequest {
 }
 
 #[tokio::test]
-async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_crash_safe() {
-    let manager = crate::acp::manager::ConnectionManager::new();
+async fn continuation_coordinator_manager_ack_loss_marker_is_crash_safe() {
+    let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
     let store = Arc::new(InMemoryContinuationStore::default());
     manager.install_continuation_store(store.clone() as Arc<dyn ContinuationStore>);
     let mut command_rx = manager
@@ -1895,12 +2245,22 @@ async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_c
     let record = seed_resuming_continuation(&store).await;
     let marker = record.internal_prompt_marker.clone();
 
-    let first = manager
-        .admit_delegation_continuation(admission_request(&record))
-        .await
-        .unwrap();
-    assert_eq!(first, PromptAdmissionResult::Admitted);
+    let (caller_release, caller_hold) = tokio::sync::oneshot::channel::<()>();
+    let caller = tokio::spawn({
+        let manager = manager.clone();
+        let request = admission_request(&record);
+        async move {
+            let admission = manager.admit_delegation_continuation(request).await;
+            drop(manager);
+            let _ = caller_hold.await;
+            admission
+        }
+    });
     let command = command_rx.recv().await.expect("continuation command");
+    assert!(
+        !caller.is_finished(),
+        "the admission caller must remain abortable after enqueue"
+    );
     let durable_at_dequeue = store.matches_admitted_marker(7, &marker).await.unwrap();
     let prompt_text = match command {
         crate::acp::connection::ConnectionCommand::Prompt {
@@ -1920,17 +2280,15 @@ async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_c
     };
     assert!(durable_at_dequeue);
 
-    let admitted = store.load(&record.continuation_id).await.unwrap().unwrap();
-    let replay = manager
-        .admit_delegation_continuation(admission_request(&admitted))
-        .await
-        .unwrap();
-    assert_eq!(replay, PromptAdmissionResult::AlreadyAdmitted);
-    assert!(matches!(
-        command_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    caller.abort();
+    drop(caller);
+    drop(caller_release);
+    drop(state);
+    drop(command_rx);
+    drop(manager);
 
+    let cold_row = store.load(&record.continuation_id).await.unwrap().unwrap();
+    assert!(cold_row.prompt_admitted_at.is_some());
     let mut turns = vec![MessageTurn {
         id: "internal".into(),
         role: TurnRole::User,
@@ -1945,6 +2303,42 @@ async fn continuation_coordinator_manager_ack_loss_is_idempotent_and_marker_is_c
         .await
         .unwrap();
     assert!(turns.is_empty());
+}
+
+#[tokio::test]
+async fn continuation_coordinator_manager_admission_replay_is_idempotent() {
+    let manager = crate::acp::manager::ConnectionManager::new();
+    let store = Arc::new(InMemoryContinuationStore::default());
+    manager.install_continuation_store(store.clone() as Arc<dyn ContinuationStore>);
+    let mut command_rx = manager
+        .insert_test_connection_live("parent", AgentType::ClaudeCode, None, EventEmitter::Noop)
+        .await;
+    let state = manager.get_state("parent").await.unwrap();
+    {
+        let mut state = state.write().await;
+        state.conversation_id = Some(7);
+        state.external_id = Some("session-7".into());
+        state.parent_turn_generation = 3;
+        state.last_suspended_turn_generation = Some(3);
+    }
+    let record = seed_resuming_continuation(&store).await;
+
+    let first = manager
+        .admit_delegation_continuation(admission_request(&record))
+        .await
+        .unwrap();
+    assert_eq!(first, PromptAdmissionResult::Admitted);
+    let _ = command_rx.recv().await.expect("continuation command");
+    let admitted = store.load(&record.continuation_id).await.unwrap().unwrap();
+    let replay = manager
+        .admit_delegation_continuation(admission_request(&admitted))
+        .await
+        .unwrap();
+    assert_eq!(replay, PromptAdmissionResult::AlreadyAdmitted);
+    assert!(matches!(
+        command_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -2211,21 +2605,16 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
 #[tokio::test(start_paused = true)]
 async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fence() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
-    let (settle_entered_tx, settle_entered_rx) = tokio::sync::oneshot::channel();
-    let (settle_release_tx, settle_release_rx) = tokio::sync::oneshot::channel();
-    task_store
-        .install_settle_gate(settle_entered_tx, settle_release_rx)
-        .await;
     let broker =
-        Arc::new(test_broker().with_task_store(task_store as Arc<dyn DelegationTaskStore>));
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
     broker
         .seed_live_task_for_test("parent", "task-running")
         .await;
     let (store, _wake) = ObservedStore::new();
-    let (port, _attempts) = RetryPort::always_fail();
+    let (port, final_attempt, final_release) = FinalFailureGatePort::new();
     let coordinator = DelegationContinuationCoordinator::new(
         store.clone() as Arc<dyn ContinuationStore>,
-        broker,
+        broker.clone(),
         Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
         port,
         Arc::new(SystemContinuationClock::new()),
@@ -2251,10 +2640,13 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
         CONTINUATION_CHECKPOINT_MS + 2_600,
     ))
     .await;
-    settle_entered_rx.await.expect("failure drain entered");
+    let request = final_attempt
+        .await
+        .expect("final admission attempt entered");
 
     let owned = store.load(&continuation_id).await.unwrap().unwrap();
     assert_eq!(owned.state, ContinuationState::Resuming);
+    assert_eq!(request.expected_version, owned.version);
     let newer = store
         .cas_transition(
             &owned.continuation_id,
@@ -2277,19 +2669,32 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
         .unwrap();
     assert!(newer.version > owned.version);
 
+    let cleanup_claim_attempted = store.cleanup_claim_attempted.notified();
+    tokio::pin!(cleanup_claim_attempted);
+    cleanup_claim_attempted.as_mut().enable();
     let failure_attempted = store.failure_attempted.notified();
     tokio::pin!(failure_attempted);
     failure_attempted.as_mut().enable();
-    settle_release_tx.send(()).unwrap();
-    failure_attempted.await;
+    final_release.send(()).unwrap();
+    tokio::select! {
+        _ = &mut cleanup_claim_attempted => {}
+        _ = &mut failure_attempted => {
+            panic!("stale worker drained children before acquiring an exact cleanup claim")
+        }
+    }
 
     assert_eq!(
         *store
-            .failure_fence
+            .cleanup_claim_fence
             .lock()
             .unwrap_or_else(|error| error.into_inner()),
         Some((owned.generation, owned.version, ContinuationState::Resuming)),
-        "the stale worker must use the exact Resuming attempt verified before drain"
+        "the stale worker must claim the exact Resuming attempt verified before drain"
+    );
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
     );
     let row = store.load(&continuation_id).await.unwrap().unwrap();
     assert_eq!(row.state, ContinuationState::Resuming);
@@ -2573,11 +2978,43 @@ async fn continuation_coordinator_suspension_dispatch_preserves_installation_sta
 
     for (reply_error, expected_code) in [
         (
+            Some(AcpError::protocol("suspend_no_active_turn")),
+            "pre_suspension_rejected",
+        ),
+        (
+            Some(AcpError::protocol("suspend_turn_generation_mismatch")),
+            "pre_suspension_rejected",
+        ),
+        (
+            Some(AcpError::protocol("suspend_already_pending")),
+            "pre_suspension_rejected",
+        ),
+        (
+            Some(AcpError::protocol("suspend_session_fence_mismatch")),
+            "pre_suspension_rejected",
+        ),
+        (
+            Some(AcpError::protocol("suspend_turn_ended_before_cancel")),
+            "pre_suspension_rejected",
+        ),
+        (
             Some(AcpError::protocol("suspend_drain_timeout")),
             "suspend_drain_timeout",
         ),
         (
             Some(AcpError::protocol("suspend_parent_disconnected")),
+            "parent_connection_lost",
+        ),
+        (
+            Some(AcpError::protocol("suspend_prompt_response_failed")),
+            "parent_connection_lost",
+        ),
+        (
+            Some(AcpError::protocol("suspend_cancelled_by_user")),
+            "parent_stop_requested",
+        ),
+        (
+            Some(AcpError::protocol("future_unknown_suspension_rejection")),
             "parent_connection_lost",
         ),
         (Some(AcpError::ProcessExited), "parent_connection_lost"),
@@ -2604,6 +3041,8 @@ async fn continuation_coordinator_suspension_dispatch_preserves_installation_sta
             match error {
                 ContinuationError::SuspendDrainTimeout => "suspend_drain_timeout",
                 ContinuationError::ParentConnectionLost => "parent_connection_lost",
+                ContinuationError::ParentStopRequested => "parent_stop_requested",
+                ContinuationError::SuspendRejected(_) => "pre_suspension_rejected",
                 other => panic!("unexpected mapped suspension error: {other:?}"),
             },
             expected_code

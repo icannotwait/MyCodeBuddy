@@ -73,12 +73,19 @@ pub(crate) async fn dispatch_suspension_control(
         Err(_) => Err(ContinuationError::ParentConnectionLost),
         Ok(Ok(ack)) => Ok(ack),
         Ok(Err(AcpError::ProcessExited)) => Err(ContinuationError::ParentConnectionLost),
-        Ok(Err(AcpError::Protocol(code))) if code == "suspend_drain_timeout" => {
-            Err(ContinuationError::SuspendDrainTimeout)
-        }
-        Ok(Err(AcpError::Protocol(code))) if code == "suspend_parent_disconnected" => {
-            Err(ContinuationError::ParentConnectionLost)
-        }
+        Ok(Err(AcpError::Protocol(code))) => match code.as_str() {
+            "suspend_no_active_turn"
+            | "suspend_turn_generation_mismatch"
+            | "suspend_already_pending"
+            | "suspend_session_fence_mismatch"
+            | "suspend_turn_ended_before_cancel" => Err(ContinuationError::SuspendRejected(code)),
+            "suspend_drain_timeout" => Err(ContinuationError::SuspendDrainTimeout),
+            "suspend_parent_disconnected" | "suspend_prompt_response_failed" => {
+                Err(ContinuationError::ParentConnectionLost)
+            }
+            "suspend_cancelled_by_user" => Err(ContinuationError::ParentStopRequested),
+            _ => Err(ContinuationError::ParentConnectionLost),
+        },
         Ok(Err(error)) => Err(ContinuationError::SuspendDispatch(error)),
     }
 }

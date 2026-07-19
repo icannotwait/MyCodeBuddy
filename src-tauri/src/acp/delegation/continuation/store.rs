@@ -266,6 +266,110 @@ mod tests {
         assert_eq!(status, "cancelled");
     }
 
+    #[tokio::test]
+    async fn continuation_store_cleanup_claim_is_exact_and_versioned() {
+        let (sqlite, db) = sqlite_store().await;
+        for store in [
+            Arc::new(InMemoryContinuationStore::default()) as Arc<dyn ContinuationStore>,
+            Arc::new(sqlite) as Arc<dyn ContinuationStore>,
+        ] {
+            let record = store
+                .insert_arming(new_continuation("cleanup-claim", 1))
+                .await
+                .unwrap();
+            let claimed = store
+                .cas_claim_cleanup(
+                    &record.continuation_id,
+                    record.generation,
+                    record.version,
+                    ContinuationState::Arming,
+                )
+                .await
+                .unwrap()
+                .expect("exact active cleanup claim wins");
+            assert_eq!(claimed.state, ContinuationState::Arming);
+            assert_eq!(claimed.version, record.version + 1);
+
+            for (generation, version, state) in [
+                (
+                    claimed.generation,
+                    record.version,
+                    ContinuationState::Arming,
+                ),
+                (
+                    claimed.generation + 1,
+                    claimed.version,
+                    ContinuationState::Arming,
+                ),
+                (
+                    claimed.generation,
+                    claimed.version,
+                    ContinuationState::Waiting,
+                ),
+            ] {
+                assert!(store
+                    .cas_claim_cleanup(&claimed.continuation_id, generation, version, state,)
+                    .await
+                    .unwrap()
+                    .is_none());
+                let unchanged = store.load(&claimed.continuation_id).await.unwrap().unwrap();
+                assert_eq!(unchanged.generation, claimed.generation);
+                assert_eq!(unchanged.version, claimed.version);
+                assert_eq!(unchanged.state, claimed.state);
+            }
+
+            let cancelled = store
+                .cas_transition(
+                    &claimed.continuation_id,
+                    claimed.generation,
+                    claimed.version,
+                    ContinuationState::Arming,
+                    transition(ContinuationState::Cancelled),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .cas_claim_cleanup(
+                    &cancelled.continuation_id,
+                    cancelled.generation,
+                    cancelled.version,
+                    ContinuationState::Arming,
+                )
+                .await
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                store
+                    .cas_claim_cleanup(
+                        &cancelled.continuation_id,
+                        cancelled.generation,
+                        cancelled.version,
+                        ContinuationState::Cancelled,
+                    )
+                    .await,
+                Err(ContStoreError::InvalidRecord(_))
+            ));
+            for (generation, version) in [
+                (u64::MAX, cancelled.version),
+                (cancelled.generation, u64::MAX),
+            ] {
+                assert!(matches!(
+                    store
+                        .cas_claim_cleanup(
+                            &cancelled.continuation_id,
+                            generation,
+                            version,
+                            ContinuationState::Arming,
+                        )
+                        .await,
+                    Err(ContStoreError::InvalidRecord(_))
+                ));
+            }
+        }
+        drop(db);
+    }
+
     #[test]
     fn continuation_store_only_maps_active_parent_index_conflict_to_active_exists() {
         let error = DbErr::Custom(
@@ -611,6 +715,13 @@ pub trait ContinuationStore: Send + Sync {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError>;
+    async fn cas_claim_cleanup(
+        &self,
+        continuation_id: &str,
+        generation: u64,
+        expected_version: u64,
+        expected_state: ContinuationState,
+    ) -> Result<Option<ContinuationRecord>, ContStoreError>;
     async fn cas_fail_and_cancel_parent(
         &self,
         continuation_id: &str,
@@ -678,6 +789,11 @@ prompt_admitted_at = CASE ?14 WHEN 1 THEN ?15 WHEN 2 THEN NULL ELSE prompt_admit
 finished_at = CASE ?16 WHEN 1 THEN ?17 WHEN 2 THEN NULL ELSE finished_at END, \
 failure_code = CASE ?18 WHEN 1 THEN ?19 WHEN 2 THEN NULL ELSE failure_code END, \
 version = version + 1, updated_at = ?20 \
+WHERE continuation_id = ?1 AND generation = ?2 AND version = ?3 AND state = ?4 \
+RETURNING *";
+
+const CAS_CLAIM_CLEANUP_SQL: &str = "UPDATE delegation_continuations SET \
+version = version + 1, updated_at = ?5 \
 WHERE continuation_id = ?1 AND generation = ?2 AND version = ?3 AND state = ?4 \
 RETURNING *";
 
@@ -767,6 +883,30 @@ impl ContinuationStore for DbContinuationStore {
                     &patch,
                     now,
                 )?,
+            ))
+            .await?;
+        row.map(|row| record_from_row(&row)).transpose()
+    }
+
+    async fn cas_claim_cleanup(
+        &self,
+        continuation_id: &str,
+        generation: u64,
+        expected_version: u64,
+        expected_state: ContinuationState,
+    ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        validate_cleanup_claim(expected_state)?;
+        let row = self
+            .db
+            .query_one(Self::statement(
+                CAS_CLAIM_CLEANUP_SQL,
+                vec![
+                    continuation_id.into(),
+                    to_i64(generation, "generation")?.into(),
+                    to_i64(expected_version, "version")?.into(),
+                    expected_state.as_str().into(),
+                    Utc::now().into(),
+                ],
             ))
             .await?;
         row.map(|row| record_from_row(&row)).transpose()
@@ -1063,6 +1203,17 @@ fn validate_transition(
     }
 }
 
+fn validate_cleanup_claim(state: ContinuationState) -> Result<(), ContStoreError> {
+    if is_active(state) {
+        Ok(())
+    } else {
+        Err(ContStoreError::InvalidRecord(format!(
+            "cannot claim terminal continuation state {} for cleanup",
+            state.as_str()
+        )))
+    }
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Default)]
 pub struct InMemoryContinuationStore {
@@ -1213,6 +1364,31 @@ impl ContinuationStore for InMemoryContinuationStore {
             return Ok(None);
         }
         apply_patch(record, patch);
+        Ok(Some(record.clone()))
+    }
+
+    async fn cas_claim_cleanup(
+        &self,
+        continuation_id: &str,
+        generation: u64,
+        expected_version: u64,
+        expected_state: ContinuationState,
+    ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        validate_cleanup_claim(expected_state)?;
+        to_i64(generation, "generation")?;
+        to_i64(expected_version, "version")?;
+        let mut inner = self.inner.lock().await;
+        let Some(record) = inner.records.get_mut(continuation_id) else {
+            return Ok(None);
+        };
+        if record.generation != generation
+            || record.version != expected_version
+            || record.state != expected_state
+        {
+            return Ok(None);
+        }
+        record.version += 1;
+        record.updated_at = Utc::now();
         Ok(Some(record.clone()))
     }
 
