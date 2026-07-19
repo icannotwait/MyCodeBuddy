@@ -366,6 +366,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_while_first_still_cleaning_spawn_timeout() {
+        // Contract: service capacity stays occupied for the full `run()`
+        // lifetime. On spawn-timeout the runner awaits JoinHandle settle +
+        // disconnect/rmdir before returning Timeout — so a second translate
+        // must see Busy while that cleanup hold is active.
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        let agent = ControllableAgent::new(Err(DocumentTranslateError::Timeout));
+        agent.enable_block();
+        let svc = DocumentTranslationService::new(
+            Arc::clone(&db),
+            agent.clone() as Arc<dyn DocumentTranslateAgent>,
+        );
+
+        let svc1 = Arc::clone(&svc);
+        let first = tokio::spawn(async move {
+            svc1.translate(params("first document", "plainText")).await
+        });
+
+        wait_until_holding(&agent).await;
+        assert_eq!(agent.holding.load(Ordering::SeqCst), 1);
+
+        let err = svc
+            .translate(params("second", "plainText"))
+            .await
+            .expect_err("busy during spawn-timeout cleanup");
+        assert_eq!(err, DocumentTranslateError::Busy);
+
+        agent.release();
+        let first_result = first.await.expect("join");
+        assert!(
+            matches!(first_result, Err(DocumentTranslateError::Timeout)),
+            "first returns Timeout only after cleanup hold ends: {first_result:?}"
+        );
+
+        // Permit free after cleanup: a non-blocking run must admit.
+        agent.block.store(0, Ordering::SeqCst);
+        *agent.response.lock().unwrap() = Ok("after-cleanup".into());
+        let ok = svc
+            .translate(params("third", "plainText"))
+            .await
+            .expect("capacity free after spawn cleanup");
+        assert_eq!(ok.translated_content, "after-cleanup");
+    }
+
+    #[tokio::test]
     async fn plaintext_happy_path_calls_runner() {
         let db = db_with_agent(Some(AgentType::Codex)).await;
         let agent = ControllableAgent::new(Ok("translated".into()));

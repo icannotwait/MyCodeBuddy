@@ -228,8 +228,9 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
         let mut lease = Some(guard);
 
         // Spawn on a JoinHandle so a deadline hit mid-spawn still observes any
-        // conn_id that was created and disconnects it (no orphan). Title-runner
-        // style: once we hold conn_id, every exit path disconnects exactly once.
+        // conn_id that was created and disconnects it (no orphan). On timeout the
+        // helper awaits the handle + disconnect/rmdir before returning Timeout so
+        // the service capacity permit covers orphan cleanup.
         let conn_id = match spawn_internal_with_deadline(
             Arc::clone(&self.driver),
             agent,
@@ -243,9 +244,8 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
         {
             Ok(id) => id,
             Err(e) => {
-                // Timeout detaches cleanup that disconnects (if a conn_id was
-                // created) and rmdirs after spawn settles — do not rmdir here.
-                // Hard spawn errors never exposed a conn_id; rmdir immediately.
+                // Spawn-timeout path already cleaned (await handle + disconnect
+                // + rmdir). Hard spawn errors never exposed a conn_id; rmdir now.
                 if !matches!(e, DocumentTranslateError::Timeout) {
                     let _ = best_effort_remove_dir(&run_dir);
                 }
@@ -278,8 +278,10 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
 ///
 /// `timeout_at` on the spawn future alone would drop it mid-flight and lose
 /// any conn_id production `spawn_agent` already inserted. Instead we join a
-/// detached task: on deadline we detach a cleanup that still awaits the spawn
-/// result and disconnects if a connection was created.
+/// task: on deadline we **await** the spawn handle (it may still return a
+/// conn_id after a partial insert), then disconnect + rmdir **before**
+/// returning [`DocumentTranslateError::Timeout`]. That keeps the service
+/// capacity permit held for the full orphan-cleanup window.
 async fn spawn_internal_with_deadline(
     driver: Arc<dyn DocumentConnectionDriver>,
     agent: AgentType,
@@ -313,26 +315,24 @@ async fn spawn_internal_with_deadline(
             }
         }
         _ = tokio::time::sleep_until(overall_deadline) => {
-            drop(lease.take());
-            // Detach cleanup: if spawn still returns a conn_id, disconnect it.
-            let cleanup_driver = Arc::clone(&driver);
-            let cleanup_dir = run_dir;
-            tokio::spawn(async move {
-                match spawn_handle.await {
-                    Ok(Ok(conn_id)) => {
-                        cleanup_after_run(
-                            cleanup_driver.as_ref(),
-                            &conn_id,
-                            &cleanup_dir,
-                            None,
-                        )
-                        .await;
-                    }
-                    _ => {
-                        let _ = best_effort_remove_dir(&cleanup_dir);
-                    }
+            // Do not return Timeout until spawn settles and cleanup finishes.
+            // Capacity (service permit) is tied to `run()` returning.
+            let cleanup_lease = lease.take();
+            match spawn_handle.await {
+                Ok(Ok(conn_id)) => {
+                    cleanup_after_run(
+                        driver.as_ref(),
+                        &conn_id,
+                        &run_dir,
+                        cleanup_lease,
+                    )
+                    .await;
                 }
-            });
+                _ => {
+                    drop(cleanup_lease);
+                    let _ = best_effort_remove_dir(&run_dir);
+                }
+            }
             Err(DocumentTranslateError::Timeout)
         }
     }
@@ -913,8 +913,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_timeout_after_partial_insert_still_disconnects() {
         // Models production: connection map entry exists before spawn returns.
-        // Deadline fires while spawn is blocked after insert → runner returns
-        // Timeout and detached cleanup must still disconnect the partial conn.
+        // Deadline fires while spawn is blocked after insert → runner must
+        // await spawn settle + disconnect/rmdir *before* returning Timeout so
+        // the service capacity permit covers orphan cleanup.
         let (runner, agent, _dir, _registry) = fixture().await;
         agent
             .block_spawn_after_insert
@@ -955,37 +956,36 @@ mod tests {
         // Fire overall deadline while spawn is still blocked after insert.
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
 
-        let result = timeout(Duration::from_secs(2), handle)
+        // Critical: do not return Timeout while spawn handle is still unsettled.
+        assert!(
+            !handle.is_finished(),
+            "run must not return Timeout until spawn cleanup finishes"
+        );
+        assert_eq!(
+            agent_watch.disconnect_count.load(Ordering::SeqCst),
+            0,
+            "disconnect only after spawn settles"
+        );
+
+        // Resume wall clock and release spawn so inline cleanup can disconnect.
+        tokio::time::resume();
+        agent_watch.spawn_gate.release();
+
+        let result = timeout(Duration::from_secs(5), handle)
             .await
-            .expect("runner must settle after deadline advance")
+            .expect("runner must settle after spawn release")
             .expect("join");
         assert!(
             matches!(result, Err(DocumentTranslateError::Timeout)),
             "expected Timeout, got {result:?}"
         );
-
-        // Resume wall clock and release spawn so detached cleanup can disconnect.
-        tokio::time::resume();
-        agent_watch.spawn_gate.release();
-
-        let cleanup_start = std::time::Instant::now();
-        while cleanup_start.elapsed() < Duration::from_secs(5) {
-            if agent_watch.disconnect_count.load(Ordering::SeqCst) > 0
-                && agent_watch
-                    .manager
-                    .get_state(&agent_watch.conn_id)
-                    .await
-                    .is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert!(
             agent_watch.disconnect_count.load(Ordering::SeqCst) >= 1,
-            "spawn timeout must disconnect partial connection"
+            "spawn timeout must disconnect partial connection before returning"
         );
         assert!(
             agent_watch
