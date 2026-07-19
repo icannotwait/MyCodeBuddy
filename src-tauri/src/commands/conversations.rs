@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::acp::delegation::continuation::filter_internal_continuation_turns;
+use crate::acp::delegation::continuation::store::DbContinuationStore;
 use crate::app_error::AppCommandError;
 use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::db::entities::conversation;
@@ -880,6 +882,14 @@ pub async fn get_folder_conversation_core(
     if let Some(new_ext_id) = resolved_ext_id {
         let _ = conversation_service::update_external_id(conn, conversation_id, new_ext_id).await;
     }
+
+    let continuation_store = DbContinuationStore::new(conn.clone());
+    filter_internal_continuation_turns(&continuation_store, conversation_id, &mut turns)
+        .await
+        .map_err(|error| {
+            AppCommandError::database_error("Failed to filter internal continuation prompts")
+                .with_detail(error.to_string())
+        })?;
 
     let mut summary = summary;
     summary.message_count = turns.len() as u32;
