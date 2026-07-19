@@ -239,21 +239,32 @@ pub async fn apply_usable_completion(
 /// Claim the oldest ready job: `ready → running`, increment attempts, snapshot
 /// the configured agent. When the setting is Off, delete all ready orphans and
 /// return `None` so the worker does not spin.
+///
+/// Claim rules for Ready rows:
+/// - empty / missing `first_user_text` → delete and continue
+/// - `first_assistant_text == Some("")` (or any `Some`) → claimable
+/// - `first_assistant_text == None` → invalid Ready; delete and continue
+///
+/// Each attempt begins a fresh transaction for select + CAS. A lost claim CAS
+/// always `rollback`s and loops (never reuses a dirty snapshot under one open
+/// txn). `attempt_turn_seq` is set from the row's current `usable_turn_seq` in
+/// the same UPDATE so a concurrent usable-turn advance cannot pair a stale
+/// attempt with a newer sequence.
 pub async fn claim_next_ready(
     conn: &DatabaseConnection,
 ) -> Result<Option<AutoTitleClaim>, DbError> {
-    let txn = conn.begin().await?;
-
-    let Some(agent) = load_auto_title_agent_from(&txn).await? else {
-        auto_title_job::Entity::delete_many()
-            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
-            .exec(&txn)
-            .await?;
-        txn.commit().await?;
-        return Ok(None);
-    };
-
     loop {
+        let txn = conn.begin().await?;
+
+        let Some(agent) = load_auto_title_agent_from(&txn).await? else {
+            auto_title_job::Entity::delete_many()
+                .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+                .exec(&txn)
+                .await?;
+            txn.commit().await?;
+            return Ok(None);
+        };
+
         let candidate = auto_title_job::Entity::find()
             .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
             .order_by(auto_title_job::Column::UpdatedAt, Order::Asc)
@@ -267,14 +278,23 @@ pub async fn claim_next_ready(
         };
 
         let first_user = job.first_user_text.clone().unwrap_or_default();
-        let first_assistant = job.first_assistant_text.clone().unwrap_or_default();
-        if first_user.trim().is_empty() || first_assistant.trim().is_empty() {
-            // Unusable ready row — drop it and continue.
+        if first_user.trim().is_empty() {
+            // Empty / missing user — unusable Ready row.
             auto_title_job::Entity::delete_by_id(job.conversation_id)
                 .exec(&txn)
                 .await?;
+            txn.commit().await?;
             continue;
         }
+
+        // Do not use unwrap_or_default(): None is invalid on Ready; Some("") is claimable.
+        let Some(first_assistant) = job.first_assistant_text.clone() else {
+            auto_title_job::Entity::delete_by_id(job.conversation_id)
+                .exec(&txn)
+                .await?;
+            txn.commit().await?;
+            continue;
+        };
 
         let locale = match parse_supported_app_locale(job.locale.as_deref()) {
             Some(locale) => locale,
@@ -290,39 +310,95 @@ pub async fn claim_next_ready(
             }
         };
 
-        let new_attempts = job.attempts + 1;
-        let attempt_turn_seq = job.usable_turn_seq;
-        let updated = auto_title_job::Entity::update_many()
+        // Test-only gate between select and CAS (usable_turn_seq race barrier).
+        #[cfg(test)]
+        claim_test_hooks::run_pre_cas_hook().await;
+
+        // Atomic claim: attempt_turn_seq := usable_turn_seq on the same row
+        // version being transitioned to running (no stale observed-seq write).
+        let updated = match auto_title_job::Entity::update_many()
             .col_expr(
                 auto_title_job::Column::State,
                 Expr::value(AutoTitleJobState::Running),
             )
-            .col_expr(auto_title_job::Column::Attempts, Expr::value(new_attempts))
+            .col_expr(
+                auto_title_job::Column::Attempts,
+                Expr::col(auto_title_job::Column::Attempts).add(1).into(),
+            )
             .col_expr(
                 auto_title_job::Column::AttemptTurnSeq,
-                Expr::value(attempt_turn_seq),
+                Expr::col(auto_title_job::Column::UsableTurnSeq).into(),
             )
             .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
             .filter(auto_title_job::Column::ConversationId.eq(job.conversation_id))
             .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
             .exec(&txn)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // Concurrent writer may force SQLite snapshot/busy failure on
+                // the upgrade to write. Rollback and retry with a fresh begin.
+                tracing::debug!(
+                    conversation_id = job.conversation_id,
+                    %error,
+                    "auto-title claim CAS failed; retrying with fresh transaction"
+                );
+                let _ = txn.rollback().await;
+                continue;
+            }
+        };
 
         if updated.rows_affected != 1 {
-            // Lost the race — try the next candidate under the same permit.
+            // Lost the race (another claimer won) — fresh txn, re-select.
+            txn.rollback().await?;
             continue;
         }
 
+        let claimed = auto_title_job::Entity::find_by_id(job.conversation_id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                DbError::Validation(
+                    "auto-title claim disappeared after successful ready→running CAS".into(),
+                )
+            })?;
+
         txn.commit().await?;
         return Ok(Some(AutoTitleClaim {
-            conversation_id: job.conversation_id,
-            attempt: new_attempts,
+            conversation_id: claimed.conversation_id,
+            attempt: claimed.attempts,
             agent,
             first_user_text: first_user,
             first_assistant_text: first_assistant,
             locale,
-            attempt_turn_seq,
+            attempt_turn_seq: claimed.attempt_turn_seq,
         }));
+    }
+}
+
+/// Test-only hooks for deterministic claim races (select → CAS barrier).
+#[cfg(test)]
+mod claim_test_hooks {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use tokio::sync::Mutex;
+
+    type Hook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+    static PRE_CAS: Mutex<Option<Hook>> = Mutex::const_new(None);
+
+    pub async fn set_pre_cas_hook(hook: Option<Hook>) {
+        *PRE_CAS.lock().await = hook;
+    }
+
+    pub async fn run_pre_cas_hook() {
+        let hook = PRE_CAS.lock().await.clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
     }
 }
 
@@ -1146,5 +1222,272 @@ mod tests {
         assert_eq!(job.usable_turn_seq, 0);
         assert!(job.first_assistant_text.is_none());
         assert!(job.last_usable_turn_token.is_none());
+    }
+
+    async fn seed_ready_claim_job(
+        conn: &DatabaseConnection,
+        conversation_id: i32,
+        first_user_text: Option<&str>,
+        first_assistant_text: Option<&str>,
+        usable_turn_seq: i32,
+    ) {
+        let now = Utc::now();
+        auto_title_job::ActiveModel {
+            conversation_id: Set(conversation_id),
+            state: Set(AutoTitleJobState::Ready),
+            attempts: Set(0),
+            first_user_text: Set(first_user_text.map(|s| s.to_string())),
+            first_assistant_text: Set(first_assistant_text.map(|s| s.to_string())),
+            first_prompt_at: Set(None),
+            locale: Set(Some("en".into())),
+            usable_turn_seq: Set(usable_turn_seq),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(Some(format!("tok-{usable_turn_seq}"))),
+            updated_at: Set(now),
+        }
+        .insert(conn)
+        .await
+        .expect("seed ready claim job");
+    }
+
+    #[tokio::test]
+    async fn claim_accepts_empty_assistant_some_empty_string() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-empty-assistant").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        // create() may enroll awaiting_turn; replace with precise Ready row.
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user task"),
+            Some(""),
+            1,
+        )
+        .await;
+
+        let claim = claim_next_ready(&db.conn)
+            .await
+            .expect("claim")
+            .expect("Ready + Some(\"\") must be claimable");
+
+        assert_eq!(claim.conversation_id, conversation.id);
+        assert_eq!(claim.first_user_text, "user task");
+        assert_eq!(claim.first_assistant_text, "");
+        assert_eq!(claim.attempt, 1);
+        assert_eq!(claim.attempt_turn_seq, 1);
+        assert_eq!(claim.agent, AgentType::Codex);
+
+        let job = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("running job");
+        assert_eq!(job.state, AutoTitleJobState::Running);
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.attempt_turn_seq, 1);
+        assert_eq!(job.first_assistant_text.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn claim_deletes_ready_with_none_assistant() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-none-assistant").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(&db.conn, conversation.id, Some("user task"), None, 1).await;
+
+        let claim = claim_next_ready(&db.conn).await.expect("claim");
+        assert!(
+            claim.is_none(),
+            "Ready + None assistant must not produce a claim"
+        );
+        assert!(
+            auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "invalid Ready row with None assistant must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_still_deletes_empty_user() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-empty-user").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("   "),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        let claim = claim_next_ready(&db.conn).await.expect("claim");
+        assert!(claim.is_none(), "empty trimmed user must not claim");
+        assert!(
+            auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "empty-user Ready row must be deleted"
+        );
+    }
+
+    /// REQUIRED barrier: claim reads Ready with seq=1; a concurrent connection
+    /// advances `usable_turn_seq` to 2 before CAS; the claim must not hang and
+    /// must return `attempt_turn_seq` matching the row actually claimed.
+    #[tokio::test]
+    async fn claim_retries_after_usable_turn_seq_changes_between_read_and_cas() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+        use tokio::sync::Notify;
+
+        use crate::db::test_helpers::fresh_disk_db;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migrate = fresh_disk_db(dir.path()).await;
+        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        let folder = seed_folder(&migrate, "/tmp/title-claim-seq-race").await;
+        let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let conversation_id = conversation.id;
+        let _ = auto_title_job::Entity::delete_by_id(conversation_id)
+            .exec(&migrate.conn)
+            .await;
+        seed_ready_claim_job(
+            &migrate.conn,
+            conversation_id,
+            Some("user task"),
+            Some("assistant reply"),
+            1,
+        )
+        .await;
+        migrate.conn.close().await.expect("close migrate pool");
+
+        let path = dir.path().join("source.db");
+        async fn open_wal_pool(path: &std::path::Path) -> crate::db::AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal pool");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            crate::db::AppDatabase { conn }
+        }
+
+        let claim_db = Arc::new(open_wal_pool(&path).await);
+        let advance_db = open_wal_pool(&path).await;
+
+        let after_read = Arc::new(Notify::new());
+        let allow_cas = Arc::new(Notify::new());
+        // One-shot gate: only the first select→CAS path is paused so a concurrent
+        // writer can advance usable_turn_seq. Retries after lost/snapshot CAS
+        // must not re-block on the same notifies.
+        let gate_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let after_read = after_read.clone();
+            let allow_cas = allow_cas.clone();
+            let gate_armed = gate_armed.clone();
+            claim_test_hooks::set_pre_cas_hook(Some(Arc::new(move || {
+                let after_read = after_read.clone();
+                let allow_cas = allow_cas.clone();
+                let gate_armed = gate_armed.clone();
+                Box::pin(async move {
+                    if !gate_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    after_read.notify_one();
+                    allow_cas.notified().await;
+                })
+            })))
+            .await;
+        }
+
+        let claim_conn = claim_db.clone();
+        let claim_handle = tokio::spawn(async move { claim_next_ready(&claim_conn.conn).await });
+
+        // Wait until claim has selected the Ready candidate (seq=1).
+        after_read.notified().await;
+
+        // Concurrent usable-turn progress while still Ready.
+        auto_title_job::Entity::update_many()
+            .col_expr(auto_title_job::Column::UsableTurnSeq, Expr::value(2))
+            .col_expr(
+                auto_title_job::Column::LastUsableTurnToken,
+                Expr::value("tok-2"),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .exec(&advance_db.conn)
+            .await
+            .expect("advance usable_turn_seq");
+
+        allow_cas.notify_one();
+
+        let claim_result = tokio::time::timeout(Duration::from_secs(5), claim_handle).await;
+        claim_test_hooks::set_pre_cas_hook(None).await;
+        let claim = claim_result
+            .expect("claim must not hang")
+            .expect("join claim task")
+            .expect("claim result")
+            .expect("must claim Ready job after seq race");
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&advance_db.conn)
+            .await
+            .unwrap()
+            .expect("claimed job");
+
+        assert_eq!(job.state, AutoTitleJobState::Running);
+        assert_eq!(job.usable_turn_seq, 2);
+        assert_eq!(
+            claim.attempt_turn_seq, job.attempt_turn_seq,
+            "claim snapshot must match durable attempt_turn_seq"
+        );
+        assert_eq!(
+            claim.attempt_turn_seq, job.usable_turn_seq,
+            "attempt_turn_seq must track usable_turn_seq at CAS, not the stale read"
+        );
+        assert_eq!(claim.attempt_turn_seq, 2);
+        assert_eq!(claim.attempt, job.attempts);
+        assert_eq!(claim.conversation_id, conversation_id);
+        assert_eq!(claim.first_assistant_text, "assistant reply");
+
+        drop(dir);
     }
 }
