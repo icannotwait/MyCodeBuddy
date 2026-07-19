@@ -1461,7 +1461,19 @@
       "preview": "Vista previa",
       "editSource": "Editar fuente",
       "maximize": "Maximizar",
-      "restore": "Restaurar"
+      "restore": "Restaurar",
+      "translateToCurrentLanguage": "Traducir",
+      "translating": "Traduciendo…",
+      "translateAgentNotConfigured": "Configure un agente de título automático en la experiencia de conversación para traducir documentos.",
+      "translateAgentUnavailable": "El agente de traducción no está disponible.",
+      "translateContentEmpty": "No hay nada que traducir.",
+      "translateContentTooLarge": "El documento es demasiado grande para traducir (máx. {limit} caracteres).",
+      "translateUnsupportedFormat": "Este tipo de archivo no se puede traducir.",
+      "translateBusy": "Ya hay una traducción en curso.",
+      "translateTimeout": "La traducción agotó el tiempo de espera.",
+      "translateFailed": "La traducción falló.",
+      "translatePlaceholderIntegrityFailed": "La traducción falló: no se pudieron conservar los bloques de código de forma segura.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "Renombrar",

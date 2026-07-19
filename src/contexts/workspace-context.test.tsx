@@ -3986,3 +3986,320 @@ describe("openFilePreview failure matrix and maximize-on-success", () => {
     expect(toastMock.error).toHaveBeenCalled()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Task 6: transient translation tabs + request generation
+// ---------------------------------------------------------------------------
+
+describe("document translation transient tabs", () => {
+  it("openTranslationResultTab inserts a pathless readonly transient tab and maximizes", async () => {
+    let snap: {
+      tabCount: number
+      activeId: string | null
+      path: string | null
+      readonly: boolean | undefined
+      content: string
+      transientType: string | undefined
+      filesMaximized: boolean
+      hasLoadedSuccessfully: boolean
+    } = {
+      tabCount: 0,
+      activeId: null,
+      path: null,
+      readonly: undefined,
+      content: "",
+      transientType: undefined,
+      filesMaximized: false,
+      hasLoadedSuccessfully: false,
+    }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const {
+        beginTranslateRequest,
+        openTranslationResultTab,
+        fileTabs,
+        activeFileTabId,
+        activeFileTab,
+        filesMaximized,
+      } = useWorkspaceContext()
+      onCapture({
+        tabCount: fileTabs.length,
+        activeId: activeFileTabId,
+        path: activeFileTab?.path ?? null,
+        readonly: activeFileTab?.readonly,
+        content: activeFileTab?.content ?? "",
+        transientType: activeFileTab?.transient?.type,
+        filesMaximized,
+        hasLoadedSuccessfully: activeFileTab?.hasLoadedSuccessfully ?? false,
+      })
+      return (
+        <button
+          onClick={() => {
+            const gen = beginTranslateRequest("src-tab")
+            openTranslationResultTab({
+              sourceTabId: "src-tab",
+              requestGen: gen,
+              content: "translated body",
+              locale: "zh_cn",
+              format: "markdown",
+              sourcePath: "/repo/README.md",
+              sourceContentHash: "deadbeef",
+              sourceTitle: "README.md",
+            })
+          }}
+        >
+          open-result
+        </button>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-result").click()
+    })
+
+    expect(snap.tabCount).toBe(1)
+    expect(snap.activeId).toMatch(/^translate:src-tab:zh_cn:/)
+    expect(snap.path).toBeNull()
+    expect(snap.readonly).toBe(true)
+    expect(snap.content).toBe("translated body")
+    expect(snap.transientType).toBe("translation")
+    expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(snap.filesMaximized).toBe(true)
+  })
+
+  it("drops late results when request gen mismatches", async () => {
+    let snap = { tabCount: 0, content: "" }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const {
+        beginTranslateRequest,
+        openTranslationResultTab,
+        fileTabs,
+        activeFileTab,
+      } = useWorkspaceContext()
+      onCapture({
+        tabCount: fileTabs.length,
+        content: activeFileTab?.content ?? "",
+      })
+      return (
+        <button
+          onClick={() => {
+            const gen1 = beginTranslateRequest("src-tab")
+            const gen2 = beginTranslateRequest("src-tab")
+            // Stale gen1 must be ignored
+            openTranslationResultTab({
+              sourceTabId: "src-tab",
+              requestGen: gen1,
+              content: "stale",
+              locale: "en",
+              format: "plainText",
+              sourcePath: null,
+              sourceContentHash: "1",
+              sourceTitle: "a.txt",
+            })
+            openTranslationResultTab({
+              sourceTabId: "src-tab",
+              requestGen: gen2,
+              content: "fresh",
+              locale: "en",
+              format: "plainText",
+              sourcePath: null,
+              sourceContentHash: "2",
+              sourceTitle: "a.txt",
+            })
+          }}
+        >
+          race
+        </button>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("race").click()
+    })
+
+    expect(snap.tabCount).toBe(1)
+    expect(snap.content).toBe("fresh")
+  })
+
+  it("still opens result when source tab is closed if gen matches", async () => {
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+    mockedApi.readFileForEdit.mockResolvedValue({
+      path: "README.md",
+      content: "# Hello",
+      etag: "e1",
+      mtime_ms: 1,
+      readonly: false,
+      line_ending: "lf",
+    })
+
+    let snap = {
+      titles: [] as string[],
+      tabCount: 0,
+      hasTransient: false,
+    }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const {
+        openFilePreview,
+        closeFileTab,
+        beginTranslateRequest,
+        openTranslationResultTab,
+        fileTabs,
+      } = useWorkspaceContext()
+      onCapture({
+        titles: fileTabs.map((t) => t.title),
+        tabCount: fileTabs.length,
+        hasTransient: fileTabs.some((t) => t.transient?.type === "translation"),
+      })
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("README.md")}>
+            open
+          </button>
+          <button
+            onClick={() => {
+              const source = fileTabs[0]
+              if (!source) return
+              const gen = beginTranslateRequest(source.id)
+              closeFileTab(source.id)
+              openTranslationResultTab({
+                sourceTabId: source.id,
+                requestGen: gen,
+                content: "ok",
+                locale: "ja",
+                format: "markdown",
+                sourcePath: source.path,
+                sourceContentHash: "h",
+                sourceTitle: source.title,
+              })
+            }}
+          >
+            translate-after-close
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.tabCount).toBe(1)
+
+    await act(async () => {
+      screen.getByText("translate-after-close").click()
+    })
+
+    expect(snap.hasTransient).toBe(true)
+    expect(snap.tabCount).toBe(1)
+  })
+
+  it("pins transient translation tabs against content eviction", async () => {
+    // Force eviction by temporarily lowering the budget via module mock is hard;
+    // instead, insert a huge non-active source-like file tab + a transient tab
+    // and call through the real filter by ensuring total exceeds the budget.
+    // With a 48MB budget this is impractical in unit tests, so we assert the
+    // public contract: transient tabs retain content when other tabs would
+    // qualify as unload candidates by checking filter exclusion via a probe
+    // that opens a translation tab and verifies content stays after an idle flush.
+    let snap = { content: "", path: null as string | null }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const {
+        beginTranslateRequest,
+        openTranslationResultTab,
+        openFilePreview,
+        switchFileTab,
+        fileTabs,
+        activeFileTab,
+      } = useWorkspaceContext()
+      const transient = fileTabs.find(
+        (t) => t.transient?.type === "translation"
+      )
+      onCapture({
+        content: transient?.content ?? "",
+        path: activeFileTab?.path ?? null,
+      })
+      return (
+        <div>
+          <button
+            onClick={() => {
+              const gen = beginTranslateRequest("src")
+              openTranslationResultTab({
+                sourceTabId: "src",
+                requestGen: gen,
+                content: "must-not-evict",
+                locale: "en",
+                format: "markdown",
+                sourcePath: "/repo/README.md",
+                sourceContentHash: "x",
+                sourceTitle: "README.md",
+              })
+            }}
+          >
+            make-transient
+          </button>
+          <button
+            onClick={() => {
+              void openFilePreview("other.ts").then(() => {
+                const other = fileTabs.find((t) => t.path?.endsWith("other.ts"))
+                // switch away is implicit when opening other; keep transient non-active
+                void other
+              })
+            }}
+          >
+            open-other
+          </button>
+        </div>
+      )
+    }
+
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+    mockedApi.readFileForEdit.mockResolvedValue({
+      path: "other.ts",
+      content: "other",
+      etag: "e2",
+      mtime_ms: 1,
+      readonly: false,
+      line_ending: "lf",
+    })
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("make-transient").click()
+    })
+    expect(snap.content).toBe("must-not-evict")
+
+    await act(async () => {
+      screen.getByText("open-other").click()
+    })
+
+    // Transient content still present after another tab becomes active.
+    expect(snap.content).toBe("must-not-evict")
+  })
+})

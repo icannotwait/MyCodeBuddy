@@ -1461,7 +1461,19 @@
       "preview": "Aperçu",
       "editSource": "Modifier la source",
       "maximize": "Agrandir",
-      "restore": "Restaurer"
+      "restore": "Restaurer",
+      "translateToCurrentLanguage": "Traduire",
+      "translating": "Traduction…",
+      "translateAgentNotConfigured": "Configurez un agent de titre automatique dans les paramètres d’expérience de conversation pour traduire des documents.",
+      "translateAgentUnavailable": "L’agent de traduction n’est pas disponible.",
+      "translateContentEmpty": "Rien à traduire.",
+      "translateContentTooLarge": "Le document est trop volumineux pour être traduit (max. {limit} caractères).",
+      "translateUnsupportedFormat": "Ce type de fichier ne peut pas être traduit.",
+      "translateBusy": "Une traduction est déjà en cours.",
+      "translateTimeout": "La traduction a expiré.",
+      "translateFailed": "Échec de la traduction.",
+      "translatePlaceholderIntegrityFailed": "Échec de la traduction : les blocs de code n’ont pas pu être conservés en toute sécurité.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "Renommer",

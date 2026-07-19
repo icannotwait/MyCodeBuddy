@@ -1461,7 +1461,19 @@
       "preview": "Preview",
       "editSource": "Edit Source",
       "maximize": "Maximize",
-      "restore": "Restore"
+      "restore": "Restore",
+      "translateToCurrentLanguage": "Translate",
+      "translating": "Translating…",
+      "translateAgentNotConfigured": "Configure an automatic title agent in Conversation experience settings to translate documents.",
+      "translateAgentUnavailable": "The translation agent is not available.",
+      "translateContentEmpty": "Nothing to translate.",
+      "translateContentTooLarge": "Document is too large to translate (max {limit} characters).",
+      "translateUnsupportedFormat": "This file type cannot be translated.",
+      "translateBusy": "A translation is already in progress.",
+      "translateTimeout": "Translation timed out.",
+      "translateFailed": "Translation failed.",
+      "translatePlaceholderIntegrityFailed": "Translation failed: code blocks could not be preserved safely.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "Rename",

@@ -1461,7 +1461,19 @@
       "preview": "Vorschau",
       "editSource": "Quelle bearbeiten",
       "maximize": "Maximieren",
-      "restore": "Wiederherstellen"
+      "restore": "Wiederherstellen",
+      "translateToCurrentLanguage": "Übersetzen",
+      "translating": "Wird übersetzt…",
+      "translateAgentNotConfigured": "Konfigurieren Sie in den Gesprächserlebnis-Einstellungen einen Agenten für automatische Titel, um Dokumente zu übersetzen.",
+      "translateAgentUnavailable": "Der Übersetzungsagent ist nicht verfügbar.",
+      "translateContentEmpty": "Nichts zu übersetzen.",
+      "translateContentTooLarge": "Dokument ist zu groß zum Übersetzen (max. {limit} Zeichen).",
+      "translateUnsupportedFormat": "Dieser Dateityp kann nicht übersetzt werden.",
+      "translateBusy": "Eine Übersetzung läuft bereits.",
+      "translateTimeout": "Zeitüberschreitung bei der Übersetzung.",
+      "translateFailed": "Übersetzung fehlgeschlagen.",
+      "translatePlaceholderIntegrityFailed": "Übersetzung fehlgeschlagen: Codeblöcke konnten nicht sicher erhalten werden.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "Umbenennen",

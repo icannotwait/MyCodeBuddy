@@ -8,11 +8,14 @@ import {
   ExternalLink,
   FileText,
   GitCompare,
+  Languages,
+  Loader2,
   Maximize2,
   Minimize2,
   X,
 } from "lucide-react"
-import { useTranslations } from "next-intl"
+import { useLocale, useTranslations } from "next-intl"
+import { toast } from "sonner"
 import { openPath } from "@/lib/platform"
 import { isHtmlPreviewable } from "@/lib/language-detect"
 import {
@@ -34,6 +37,19 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
+import { translateDocument } from "@/lib/api"
+import {
+  formatFromTranslatablePath,
+  hashDocumentContent,
+  intlLocaleToWire,
+  isTranslationEligible,
+} from "@/lib/document-translate"
+import {
+  extractAppCommandError,
+  toLocalizedErrorMessage,
+  type AppErrorTranslator,
+} from "@/lib/app-error"
+import { useConversationExperienceStore } from "@/stores/conversation-experience-store"
 
 /** Escape close gate for files chrome (export for unit tests). */
 export function shouldHandleFilesEscape(
@@ -75,6 +91,8 @@ export function shouldHandleFilesEscape(
 
 export function FileWorkspaceTabBar() {
   const t = useTranslations("Folder.fileWorkspace")
+  const tRoot = useTranslations()
+  const intlLocale = useLocale()
   const { mode, activePane, filesMaximized } = useWorkspaceView()
   const { fileTabs, activeFileTabId, previewFileTabIds } =
     useWorkspaceFileTabs()
@@ -86,7 +104,12 @@ export function FileWorkspaceTabBar() {
     reorderFileTabs,
     toggleFileTabPreview,
     toggleFilesMaximized,
+    beginTranslateRequest,
+    openTranslationResultTab,
   } = useWorkspaceActions()
+  const autoTitleAgent = useConversationExperienceStore(
+    (s) => s.settings?.auto_title_agent ?? null
+  )
   const { shortcuts } = useShortcutSettings()
   const scrollRef = useRef<HTMLDivElement>(null)
   const isCoarsePointer = useIsCoarsePointer()
@@ -95,6 +118,9 @@ export function FileWorkspaceTabBar() {
   const [touchSortingTabId, setTouchSortingTabId] = useState<string | null>(
     null
   )
+  // In-flight translate guard (button busy + double-click).
+  const [translateBusy, setTranslateBusy] = useState(false)
+  const translateBusyRef = useRef(false)
 
   const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
     if (e.deltaY !== 0 && scrollRef.current) {
@@ -184,6 +210,65 @@ export function FileWorkspaceTabBar() {
     canPreview && activeFileTabId
       ? previewFileTabIds.has(activeFileTabId)
       : false
+  const canTranslate = activeTab != null && isTranslationEligible(activeTab)
+
+  const handleTranslate = useCallback(async () => {
+    if (!activeTab || !isTranslationEligible(activeTab)) return
+    // Double-click / re-entry guard before any async work.
+    if (translateBusyRef.current) return
+    if (!autoTitleAgent) {
+      toast.error(t("translateAgentNotConfigured"))
+      return
+    }
+
+    // Snapshot at click — later editor edits must not change the payload.
+    const snapshotContent = activeTab.content
+    const snapshotPath = activeTab.path
+    const snapshotTitle = activeTab.title
+    const snapshotId = activeTab.id
+    const requestGen = beginTranslateRequest(snapshotId)
+    const locale = intlLocaleToWire(intlLocale)
+    const format = formatFromTranslatablePath(snapshotPath ?? snapshotTitle)
+    const sourceContentHash = hashDocumentContent(snapshotContent)
+
+    translateBusyRef.current = true
+    setTranslateBusy(true)
+    try {
+      const result = await translateDocument({
+        content: snapshotContent,
+        format,
+        locale,
+        displayName: snapshotTitle,
+      })
+      openTranslationResultTab({
+        sourceTabId: snapshotId,
+        requestGen,
+        content: result.translatedContent,
+        locale: result.locale,
+        format: result.format,
+        sourcePath: snapshotPath,
+        sourceContentHash,
+        sourceTitle: snapshotTitle,
+      })
+    } catch (error) {
+      const appError = extractAppCommandError(error)
+      const message = appError?.i18n_key
+        ? toLocalizedErrorMessage(error, tRoot as unknown as AppErrorTranslator)
+        : t("translateFailed")
+      toast.error(message)
+    } finally {
+      translateBusyRef.current = false
+      setTranslateBusy(false)
+    }
+  }, [
+    activeTab,
+    autoTitleAgent,
+    beginTranslateRequest,
+    intlLocale,
+    openTranslationResultTab,
+    t,
+    tRoot,
+  ])
 
   if (fileTabs.length === 0) {
     return (
@@ -269,6 +354,33 @@ export function FileWorkspaceTabBar() {
           title={t("preview")}
         >
           <ExternalLink className="h-4 w-4" />
+        </button>
+      )}
+      {canTranslate && (
+        <button
+          type="button"
+          onClick={() => {
+            void handleTranslate()
+          }}
+          disabled={translateBusy}
+          className={cn(
+            "shrink-0 flex items-center justify-center w-10 border-b border-border hover:bg-primary/8 transition-colors",
+            "disabled:opacity-50 disabled:pointer-events-none"
+          )}
+          aria-label={
+            translateBusy ? t("translating") : t("translateToCurrentLanguage")
+          }
+          title={
+            translateBusy ? t("translating") : t("translateToCurrentLanguage")
+          }
+          aria-busy={translateBusy}
+          data-testid="translate-document"
+        >
+          {translateBusy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Languages className="h-4 w-4" />
+          )}
         </button>
       )}
       {!isMobile && mode === "fusion" && (

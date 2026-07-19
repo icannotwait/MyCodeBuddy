@@ -1,4 +1,4 @@
-import { act, cleanup, render } from "@testing-library/react"
+import { act, cleanup, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { FileWorkspaceTab } from "@/contexts/workspace-context"
 import { DEFAULT_SHORTCUTS } from "@/lib/keyboard-shortcuts"
@@ -10,6 +10,8 @@ const closeOtherFileTabs = vi.fn()
 const reorderFileTabs = vi.fn()
 const toggleFileTabPreview = vi.fn()
 const toggleFilesMaximized = vi.fn()
+const beginTranslateRequest = vi.fn(() => 1)
+const openTranslationResultTab = vi.fn(() => "translate:file-1:zh_cn:1")
 
 const viewState = {
   mode: "fusion" as string,
@@ -23,12 +25,50 @@ const tabsState = {
   previewFileTabIds: new Set<string>(),
 }
 
+const experienceState = vi.hoisted(() => ({
+  autoTitleAgent: "codex" as string | null,
+}))
+
+const translateDocument = vi.hoisted(() =>
+  vi.fn(async () => ({
+    translatedContent: "你好",
+    locale: "zh_cn",
+    format: "markdown" as const,
+  }))
+)
+
+const toastMock = vi.hoisted(() => ({
+  error: vi.fn(),
+}))
+
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
+  useLocale: () => "zh-CN",
+}))
+
+vi.mock("sonner", () => ({
+  toast: {
+    error: toastMock.error,
+  },
 }))
 
 vi.mock("@/lib/platform", () => ({
   openPath: vi.fn(),
+}))
+
+vi.mock("@/lib/api", () => ({
+  translateDocument: (...args: unknown[]) => translateDocument(...args),
+}))
+
+vi.mock("@/stores/conversation-experience-store", () => ({
+  useConversationExperienceStore: (
+    selector: (s: {
+      settings: { auto_title_agent: string | null } | null
+    }) => unknown
+  ) =>
+    selector({
+      settings: { auto_title_agent: experienceState.autoTitleAgent },
+    }),
 }))
 
 vi.mock("@/hooks/use-is-coarse-pointer", () => ({
@@ -65,6 +105,8 @@ vi.mock("@/contexts/workspace-context", () => ({
     reorderFileTabs,
     toggleFileTabPreview,
     toggleFilesMaximized,
+    beginTranslateRequest,
+    openTranslationResultTab,
   }),
 }))
 
@@ -322,5 +364,135 @@ describe("FileWorkspaceTabBar Escape", () => {
     pressEscape()
     expect(closeFileTab).toHaveBeenCalledTimes(1)
     expect(closeFileTab).toHaveBeenCalledWith("file-dirty")
+  })
+})
+
+describe("FileWorkspaceTabBar Translate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    beginTranslateRequest.mockReturnValue(1)
+    openTranslationResultTab.mockReturnValue("translate:file-1:zh_cn:1")
+    translateDocument.mockReset()
+    translateDocument.mockResolvedValue({
+      translatedContent: "你好",
+      locale: "zh_cn",
+      format: "markdown",
+    })
+    experienceState.autoTitleAgent = "codex"
+    viewState.mode = "fusion"
+    viewState.activePane = "files"
+    viewState.filesMaximized = false
+    tabsState.fileTabs = [
+      makeFileTab({
+        id: "file-1",
+        title: "readme.md",
+        path: "/proj/readme.md",
+        language: "markdown",
+        content: "# Hello world",
+      }),
+    ]
+    tabsState.activeFileTabId = "file-1"
+    tabsState.previewFileTabIds = new Set()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("shows Translate for eligible markdown tabs", () => {
+    render(<FileWorkspaceTabBar />)
+    expect(screen.getByTestId("translate-document")).toBeTruthy()
+  })
+
+  it("hides Translate for non-eligible tabs", () => {
+    tabsState.fileTabs = [
+      makeFileTab({
+        id: "file-ts",
+        title: "a.ts",
+        path: "/proj/a.ts",
+        language: "typescript",
+        content: "const x = 1",
+      }),
+    ]
+    tabsState.activeFileTabId = "file-ts"
+    render(<FileWorkspaceTabBar />)
+    expect(screen.queryByTestId("translate-document")).toBeNull()
+  })
+
+  it("toasts agent-not-configured without calling the API", async () => {
+    experienceState.autoTitleAgent = null
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("translate-document").click()
+    })
+    expect(toastMock.error).toHaveBeenCalledWith("translateAgentNotConfigured")
+    expect(translateDocument).not.toHaveBeenCalled()
+    expect(beginTranslateRequest).not.toHaveBeenCalled()
+  })
+
+  it("snapshots content at click so later edits do not change the payload", async () => {
+    const tab = tabsState.fileTabs[0]
+    render(<FileWorkspaceTabBar />)
+
+    await act(async () => {
+      screen.getByTestId("translate-document").click()
+      // Mutate the tab after click, as if the user typed while in-flight.
+      tab.content = "# EDITED after click"
+    })
+
+    expect(translateDocument).toHaveBeenCalledTimes(1)
+    expect(translateDocument.mock.calls[0]?.[0]).toMatchObject({
+      content: "# Hello world",
+      format: "markdown",
+      locale: "zh_cn",
+      displayName: "readme.md",
+    })
+    expect(beginTranslateRequest).toHaveBeenCalledWith("file-1")
+    expect(openTranslationResultTab).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceTabId: "file-1",
+        requestGen: 1,
+        content: "你好",
+        locale: "zh_cn",
+        format: "markdown",
+        sourcePath: "/proj/readme.md",
+        sourceTitle: "readme.md",
+      })
+    )
+  })
+
+  it("disables the button while busy and ignores a second click", async () => {
+    let resolveTranslate!: (value: {
+      translatedContent: string
+      locale: string
+      format: "markdown"
+    }) => void
+    translateDocument.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveTranslate = resolve
+        })
+    )
+
+    render(<FileWorkspaceTabBar />)
+    const button = screen.getByTestId("translate-document")
+
+    await act(async () => {
+      button.click()
+    })
+    expect(button).toHaveProperty("disabled", true)
+
+    await act(async () => {
+      button.click()
+    })
+    expect(translateDocument).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveTranslate({
+        translatedContent: "done",
+        locale: "zh_cn",
+        format: "markdown",
+      })
+    })
   })
 })

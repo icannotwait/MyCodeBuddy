@@ -1461,7 +1461,19 @@
       "preview": "معاينة",
       "editSource": "تحرير المصدر",
       "maximize": "تكبير",
-      "restore": "استعادة"
+      "restore": "استعادة",
+      "translateToCurrentLanguage": "ترجمة",
+      "translating": "جارٍ الترجمة…",
+      "translateAgentNotConfigured": "قم بتهيئة وكيل العنوان التلقائي في إعدادات تجربة المحادثة لترجمة المستندات.",
+      "translateAgentUnavailable": "وكيل الترجمة غير متاح.",
+      "translateContentEmpty": "لا يوجد محتوى للترجمة.",
+      "translateContentTooLarge": "المستند كبير جدًا للترجمة (الحد الأقصى {limit} حرفًا).",
+      "translateUnsupportedFormat": "لا يمكن ترجمة هذا النوع من الملفات.",
+      "translateBusy": "هناك ترجمة قيد التنفيذ بالفعل.",
+      "translateTimeout": "انتهت مهلة الترجمة.",
+      "translateFailed": "فشلت الترجمة.",
+      "translatePlaceholderIntegrityFailed": "فشلت الترجمة: تعذر الحفاظ على كتل التعليمات البرمجية بأمان.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "إعادة تسمية",

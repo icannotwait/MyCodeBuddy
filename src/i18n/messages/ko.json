@@ -1461,7 +1461,19 @@
       "preview": "미리보기",
       "editSource": "소스 편집",
       "maximize": "최대화",
-      "restore": "복원"
+      "restore": "복원",
+      "translateToCurrentLanguage": "번역",
+      "translating": "번역 중…",
+      "translateAgentNotConfigured": "문서를 번역하려면 대화 경험 설정에서 자동 제목 에이전트를 구성하세요.",
+      "translateAgentUnavailable": "번역 에이전트를 사용할 수 없습니다.",
+      "translateContentEmpty": "번역할 내용이 없습니다.",
+      "translateContentTooLarge": "문서가 너무 커서 번역할 수 없습니다(최대 {limit}자).",
+      "translateUnsupportedFormat": "이 파일 형식은 번역할 수 없습니다.",
+      "translateBusy": "이미 번역이 진행 중입니다.",
+      "translateTimeout": "번역 시간이 초과되었습니다.",
+      "translateFailed": "번역에 실패했습니다.",
+      "translatePlaceholderIntegrityFailed": "번역 실패: 코드 블록을 안전하게 보존할 수 없습니다.",
+      "translationTabTitle": "{name} ({locale})"
     },
     "terminal": {
       "rename": "이름 변경",

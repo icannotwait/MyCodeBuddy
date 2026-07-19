@@ -1461,7 +1461,19 @@
       "preview": "预览",
       "editSource": "编辑源码",
       "maximize": "最大化",
-      "restore": "还原"
+      "restore": "还原",
+      "translateToCurrentLanguage": "翻译",
+      "translating": "正在翻译…",
+      "translateAgentNotConfigured": "请在「对话体验」设置中配置自动标题代理后再翻译文档。",
+      "translateAgentUnavailable": "翻译代理不可用。",
+      "translateContentEmpty": "没有可翻译的内容。",
+      "translateContentTooLarge": "文档过大，无法翻译（最多 {limit} 个字符）。",
+      "translateUnsupportedFormat": "此文件类型无法翻译。",
+      "translateBusy": "已有翻译正在进行。",
+      "translateTimeout": "翻译超时。",
+      "translateFailed": "翻译失败。",
+      "translatePlaceholderIntegrityFailed": "翻译失败：无法安全保留代码块。",
+      "translationTabTitle": "{name}（{locale}）"
     },
     "terminal": {
       "rename": "重命名",

@@ -1461,7 +1461,19 @@
       "preview": "預覽",
       "editSource": "編輯原始碼",
       "maximize": "最大化",
-      "restore": "還原"
+      "restore": "還原",
+      "translateToCurrentLanguage": "翻譯",
+      "translating": "正在翻譯…",
+      "translateAgentNotConfigured": "請在「對話體驗」設定中配置自動標題代理後再翻譯文件。",
+      "translateAgentUnavailable": "翻譯代理不可用。",
+      "translateContentEmpty": "沒有可翻譯的內容。",
+      "translateContentTooLarge": "文件過大，無法翻譯（最多 {limit} 個字元）。",
+      "translateUnsupportedFormat": "此檔案類型無法翻譯。",
+      "translateBusy": "已有翻譯正在進行。",
+      "translateTimeout": "翻譯逾時。",
+      "translateFailed": "翻譯失敗。",
+      "translatePlaceholderIntegrityFailed": "翻譯失敗：無法安全保留程式碼區塊。",
+      "translationTabTitle": "{name}（{locale}）"
     },
     "terminal": {
       "rename": "重新命名",

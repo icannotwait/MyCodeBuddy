@@ -1461,7 +1461,19 @@
       "preview": "プレビュー",
       "editSource": "ソースを編集",
       "maximize": "最大化",
-      "restore": "元に戻す"
+      "restore": "元に戻す",
+      "translateToCurrentLanguage": "翻訳",
+      "translating": "翻訳中…",
+      "translateAgentNotConfigured": "ドキュメントを翻訳するには、会話体験設定で自動タイトルエージェントを設定してください。",
+      "translateAgentUnavailable": "翻訳エージェントを利用できません。",
+      "translateContentEmpty": "翻訳する内容がありません。",
+      "translateContentTooLarge": "ドキュメントが大きすぎて翻訳できません（上限 {limit} 文字）。",
+      "translateUnsupportedFormat": "このファイル形式は翻訳できません。",
+      "translateBusy": "別の翻訳が進行中です。",
+      "translateTimeout": "翻訳がタイムアウトしました。",
+      "translateFailed": "翻訳に失敗しました。",
+      "translatePlaceholderIntegrityFailed": "翻訳に失敗しました：コードブロックを安全に保持できませんでした。",
+      "translationTabTitle": "{name}（{locale}）"
     },
     "terminal": {
       "rename": "名前を変更",

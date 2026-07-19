@@ -45,6 +45,12 @@ import {
 } from "@/lib/language-detect"
 import { toErrorMessage } from "@/lib/app-error"
 import {
+  buildSuggestedTranslationName,
+  buildTranslationTabId,
+  type DocumentTranslateFormat,
+  type TranslationTransientMeta,
+} from "@/lib/document-translate"
+import {
   HIDDEN_TAB_CONTENT_BUDGET_CHARS,
   selectTabsToUnload,
 } from "@/lib/file-tab-memory"
@@ -57,6 +63,7 @@ import { useOfficeAutoPreview } from "@/lib/office-preview-prefs"
 
 export type WorkspaceMode = "conversation" | "fusion"
 export type WorkspacePane = "conversation" | "files"
+export type { TranslationTransientMeta, DocumentTranslateFormat }
 
 type FileWorkspaceTabKind = "file" | "diff" | "rich-diff"
 type FileSaveState = "idle" | "saving" | "error"
@@ -96,6 +103,11 @@ export interface FileWorkspaceTab {
   // True after at least one successful content settle for this tab. Cold
   // open failures (never true) remove the tab; warm failures keep content.
   hasLoadedSuccessfully: boolean
+  /**
+   * Pathless in-memory result tabs (document translation). Not disk-watched;
+   * pinned against content eviction until the user closes the tab.
+   */
+  transient?: TranslationTransientMeta
 }
 
 export type OpenFileOptions = {
@@ -193,6 +205,27 @@ interface WorkspaceActionsValue {
   reloadActiveFile: () => Promise<void>
   toggleFileTabPreview: (tabId: string) => void
   toggleFilesMaximized: () => void
+  /**
+   * Bump the per-source translate request generation and return the new gen.
+   * Call at click time (with the content snapshot) before the async API.
+   */
+  beginTranslateRequest: (sourceTabId: string) => number
+  /**
+   * Insert a transient readonly translation result tab when `requestGen`
+   * still matches the latest gen for `sourceTabId`. Returns the new tab id,
+   * or null when the result is stale (newer request, or provider unmounted).
+   * Closing the source tab does not cancel an in-flight result.
+   */
+  openTranslationResultTab: (input: {
+    sourceTabId: string
+    requestGen: number
+    content: string
+    locale: string
+    format: DocumentTranslateFormat
+    sourcePath: string | null
+    sourceContentHash: string
+    sourceTitle: string
+  }) => string | null
 }
 
 interface WorkspaceViewValue {
@@ -374,6 +407,7 @@ interface WorkspaceProviderProps {
 
 export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const t = useTranslations("Folder.workspaceContext")
+  const tFiles = useTranslations("Folder.fileWorkspace")
   const { activeFolder } = useActiveFolder()
   // Reactive: `useOpenFileTabsWatch` re-derives its per-root FS subscriptions
   // when the registered-folder set changes. Low-frequency (open/close folder).
@@ -445,6 +479,18 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // Most-recently-active tab ids, most recent first. Drives the memory
   // guardrail's least-recently-active eviction order.
   const tabRecencyRef = useRef<string[]>([])
+  // Per source-tab request generation for document translation. Late API
+  // results whose gen no longer matches are dropped (no result tab).
+  const translateRequestGenRef = useRef(new Map<string, number>())
+  // Drop late translation results after provider unmount.
+  const providerAliveRef = useRef(true)
+
+  useEffect(() => {
+    providerAliveRef.current = true
+    return () => {
+      providerAliveRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     fileTabsRef.current = fileTabs
@@ -2537,8 +2583,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // budget, drop the least-recently-active buffers (content + git base;
   // metadata/etag survive) and flag them stale — activation refetches
   // through the existing stale machinery. Dirty/loading/saving tabs are
-  // never touched. Converges in one pass: unloaded tabs hold no content,
-  // so they stop being candidates.
+  // never touched. Transient translation tabs are pathless (no disk
+  // refetch) and must keep their content until the user closes them.
+  // Converges in one pass: unloaded tabs hold no content, so they stop
+  // being candidates.
   useEffect(() => {
     const candidates = fileTabs
       .filter(
@@ -2548,7 +2596,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           !tab.isDirty &&
           !tab.loading &&
           tab.saveState !== "saving" &&
-          tab.content.length > 0
+          tab.content.length > 0 &&
+          tab.transient?.type !== "translation"
       )
       .map((tab) => ({
         id: tab.id,
@@ -2641,6 +2690,105 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     })
   }, [])
 
+  const beginTranslateRequest = useCallback((sourceTabId: string) => {
+    const next = (translateRequestGenRef.current.get(sourceTabId) ?? 0) + 1
+    translateRequestGenRef.current.set(sourceTabId, next)
+    return next
+  }, [])
+
+  const openTranslationResultTab = useCallback(
+    (input: {
+      sourceTabId: string
+      requestGen: number
+      content: string
+      locale: string
+      format: DocumentTranslateFormat
+      sourcePath: string | null
+      sourceContentHash: string
+      sourceTitle: string
+    }): string | null => {
+      if (!providerAliveRef.current) return null
+      const current = translateRequestGenRef.current.get(input.sourceTabId)
+      if (current !== input.requestGen) return null
+
+      const sourceName =
+        input.sourceTitle ||
+        (input.sourcePath
+          ? input.sourcePath.replace(/\\/g, "/").split("/").pop() || "document"
+          : "document")
+      const suggestedName = buildSuggestedTranslationName(
+        sourceName,
+        input.locale
+      )
+      const tabId = buildTranslationTabId(
+        input.sourceTabId,
+        input.locale,
+        input.requestGen
+      )
+      const language = input.format === "plainText" ? "plaintext" : "markdown"
+      const title = tFiles("translationTabTitle", {
+        name: sourceName,
+        locale: input.locale,
+      })
+
+      const transient: TranslationTransientMeta = {
+        type: "translation",
+        sourceTabId: input.sourceTabId,
+        sourcePath: input.sourcePath,
+        sourceContentHash: input.sourceContentHash,
+        locale: input.locale,
+        format: input.format,
+        suggestedName,
+      }
+
+      const tab: FileWorkspaceTab = {
+        id: tabId,
+        kind: "file",
+        folderId: null,
+        title,
+        description: suggestedName,
+        path: null,
+        language,
+        content: input.content,
+        loading: false,
+        savedContent: input.content,
+        isDirty: false,
+        etag: null,
+        mtimeMs: null,
+        readonly: true,
+        lineEnding: "lf",
+        saveState: "idle",
+        saveError: null,
+        hasLoadedSuccessfully: true,
+        transient,
+      }
+
+      // Replace existing same-id tab (re-run with same gen is rare) or append.
+      setFileTabs((prev) => {
+        const idx = prev.findIndex((t) => t.id === tabId)
+        const next =
+          idx >= 0 ? prev.map((t, i) => (i === idx ? tab : t)) : [...prev, tab]
+        fileTabsRef.current = next
+        return next
+      })
+      setActiveFileTabId(tabId)
+      activeFileTabIdRef.current = tabId
+      activateFilePane()
+      // User-initiated translate success → maximize (same policy as open).
+      setFilesMaximized(true)
+      if (language === "markdown") {
+        setPreviewFileTabIds((prev) => {
+          if (prev.has(tabId)) return prev
+          const next = new Set(prev)
+          next.add(tabId)
+          return next
+        })
+      }
+      return tabId
+    },
+    [activateFilePane, tFiles]
+  )
+
   // Stable for the provider's lifetime: every callback reads mutable state
   // through refs or functional updaters, never through render-scoped
   // closures, so this memo's inputs only change if a callback identity
@@ -2671,6 +2819,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       reloadActiveFile,
       toggleFileTabPreview,
       toggleFilesMaximized,
+      beginTranslateRequest,
+      openTranslationResultTab,
     }),
     [
       setActivePane,
@@ -2697,6 +2847,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       reloadActiveFile,
       toggleFileTabPreview,
       toggleFilesMaximized,
+      beginTranslateRequest,
+      openTranslationResultTab,
     ]
   )
 
