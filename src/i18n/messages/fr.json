@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} ne peut pas basculer vers ce modèle dans une conversation existante. Démarrez une nouvelle session pour l'utiliser.",
           "turnFailedEmpty": "{agent} a terminé le tour sans produire de réponse. Vérifiez la configuration de l'agent.",
           "terminalShellUnavailable": "{shell} n'est pas disponible. Choisissez un shell disponible dans les paramètres généraux.",
-          "terminalShellUnsupported": "{shell} n'est pas pris en charge pour l'exécution du terminal ACP. Choisissez un shell pris en charge dans les paramètres généraux."
+          "terminalShellUnsupported": "{shell} n'est pas pris en charge pour l'exécution du terminal ACP. Choisissez un shell pris en charge dans les paramètres généraux.",
+          "conversationWaitingForSubagents": "Cette conversation attend les sous-agents.",
+          "parentConnectionLost": "L'attente de délégation s'est terminée car la connexion de l'agent a été perdue.",
+          "suspendDrainTimeout": "L'attente de délégation s'est terminée car le tour de l'agent ne s'est pas arrêté à temps.",
+          "continuationFailed": "L'attente de délégation s'est terminée car l'agent n'a pas pu être repris."
         },
         "unableReadAgentConfig": "Impossible de lire la configuration de l'agent : {message}",
         "connectFailedTitle": "Échec de la connexion de {agent}",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "Connexion...",
         "agentResponding": "{agent} répond...",
-        "sendMessage": "Envoyer un message..."
+        "sendMessage": "Envoyer un message...",
+        "waitingForSubagents": "En attente des sous-agents...",
+        "waitingForSubagentsHint": "Vous pouvez continuer à modifier pendant que cette conversation attend."
       },
       "messageInput": {
         "askAnything": "Posez n'importe quelle question...",

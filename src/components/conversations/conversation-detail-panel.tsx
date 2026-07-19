@@ -67,6 +67,7 @@ import {
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
+import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import {
   completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
@@ -118,6 +119,7 @@ import {
   ExportTooLongError,
   type ExportLabels,
 } from "@/lib/export-conversation"
+import type { PromptDraftRestore } from "@/components/chat/message-input"
 import { resolveActiveSessionDetails } from "./active-session-details"
 import { SessionDetailsDialog } from "./session-details-dialog"
 
@@ -296,6 +298,13 @@ const ConversationTabView = memo(function ConversationTabView({
   const [agentConnectError, setAgentConnectError] = useState<string | null>(
     null
   )
+  // Direct-send rejection restore: MessageInput applies strictly newer revisions.
+  const [promptDraftRestore, setPromptDraftRestore] =
+    useState<PromptDraftRestore | null>(null)
+  const promptDraftRestoreRevisionRef = useRef(0)
+  // Cold continuation_failure toast: dedupe by (code, finished_at) per mount.
+  const lastContinuationFailureKeyRef = useRef<string | null>(null)
+  const tAcpConnections = useTranslations("Folder.chat.acpConnections")
   const [hasSentMessage, setHasSentMessage] = useState(false)
   const [quickActionInject, setQuickActionInject] =
     useState<ComposerInjectContent | null>(null)
@@ -426,6 +435,18 @@ const ConversationTabView = memo(function ConversationTabView({
     error: detailError,
     acpLoadError,
   } = useConversationDetail(effectiveConversationId)
+
+  // Cold detail: surface a redacted continuation failure exactly once per
+  // (code, finished_at) identity while this panel is mounted. Uses the same
+  // i18n mapping as live ACP error events so copy cannot drift.
+  useEffect(() => {
+    const failure = detail?.continuation_failure
+    if (!failure) return
+    const identity = `${failure.code}|${failure.finished_at}`
+    if (lastContinuationFailureKeyRef.current === identity) return
+    lastContinuationFailureKeyRef.current = identity
+    toast.error(tAcpConnections(continuationFailureI18nKey(failure.code)))
+  }, [detail?.continuation_failure, tAcpConnections])
 
   // Subscribe to only the fields this panel actually reads from its runtime
   // session — NOT the whole session object. The live-message sink rewrites the
@@ -659,8 +680,16 @@ const ConversationTabView = memo(function ConversationTabView({
   // which blocks re-entry until that send settles (the turn completes, or it
   // bounces and rolls back to idle to retry the next item). A bounce backoff
   // rate-limits retries against a still-busy backend.
+  const waitingForSubagentsRef = useRef(conn.waitingForSubagents)
+  useEffect(() => {
+    waitingForSubagentsRef.current = conn.waitingForSubagents
+  }, [conn.waitingForSubagents])
+
   useEffect(() => {
     if (connStatus !== "connected") return
+    // Do not dequeue / auto-flush while a durable continuation owns this
+    // conversation — waiting is independent of status/turn_in_flight.
+    if (conn.waitingForSubagents) return
     // Don't flush onto a connection whose cwd doesn't match the tab's intended
     // working dir. This matters for a just-bound chat conversation: bind switches
     // the tab's workingDir from the draft's previous folder to the scratch dir,
@@ -680,6 +709,8 @@ const ConversationTabView = memo(function ConversationTabView({
     const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
     const timer = setTimeout(() => {
       if (connStatusRef.current !== "connected") return
+      // Re-check waiting inside the timer: Connected-before-waiting-event race.
+      if (waitingForSubagentsRef.current) return
       const next = autoSendQueueRef.current()
       if (next) {
         // Mark this as the queue auto-flush: it sends the dequeued head now and,
@@ -694,6 +725,7 @@ const ConversationTabView = memo(function ConversationTabView({
     msgQueue.length,
     conn.connectedWorkingDir,
     workingDirForConnection,
+    conn.waitingForSubagents,
   ])
 
   // Mirror the connection's liveMessage into the runtime session OUTSIDE React,
@@ -857,6 +889,9 @@ const ConversationTabView = memo(function ConversationTabView({
       // read a stale "connected" for the old cwd, and an inline send then would
       // deliver to the wrong workspace. Same predicate the flush effect uses.
       if (!connectionReady) return
+      // Advisory UI lock can race the backend gate — still refuse optimistic
+      // mutation when the current snapshot already says waiting.
+      if (conn.waitingForSubagents) return
 
       const fromQueueFlush = opts?.fromQueueFlush ?? false
       // Preserve FIFO: a direct send issued while the queue is non-empty joins
@@ -915,6 +950,24 @@ const ConversationTabView = memo(function ConversationTabView({
         }
       }
 
+      // Continuation waiting rejection: restore runtime to idle, drop the
+      // optimistic turn. Direct composer send → PromptDraftRestore (never
+      // queue). Queue-flush rejection → requeue the same head (never overwrite
+      // the editor). fromQueueFlush remains visible to this closure.
+      const onContinuationWaiting = () => {
+        removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        setSyncState(effectiveConversationId, "idle")
+        if (fromQueueFlush) {
+          mqRequeueFront(draft, selectedModeIdArg ?? null)
+        } else {
+          promptDraftRestoreRevisionRef.current += 1
+          setPromptDraftRestore({
+            revision: promptDraftRestoreRevisionRef.current,
+            draft,
+          })
+        }
+      }
+
       // Pin the tab if it was a temporary preview (single-click opened)
       if (ownTab && !ownTab.isPinned) {
         pinTab(tabId)
@@ -933,6 +986,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // turn by exact id (and never suppresses a different sender's prompt).
           clientMessageId: optimisticTurn.id,
           onTurnInProgress,
+          onContinuationWaiting,
         })
         return
       }
@@ -1038,6 +1092,7 @@ const ConversationTabView = memo(function ConversationTabView({
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
+            onContinuationWaiting,
           })
         } catch (e) {
           console.error("[ConversationTabView] create conversation:", e)
@@ -1077,6 +1132,7 @@ const ConversationTabView = memo(function ConversationTabView({
       bindConversationTab,
       canAutoConnect,
       connectionReady,
+      conn.waitingForSubagents,
       effectiveConversationId,
       folderId,
       hasPersistedConversation,
@@ -1495,10 +1551,13 @@ const ConversationTabView = memo(function ConversationTabView({
         connStatus === "connected" &&
         hasPersistedConversation &&
         conn.supportsFork &&
+        !conn.waitingForSubagents &&
         !forkSendBlockedByQueue(msgQueue.length)
           ? handleForkSend
           : undefined
       }
+      waitingForSubagents={conn.waitingForSubagents}
+      draftRestore={promptDraftRestore}
     >
       {isWelcomeMode ? (
         <div className="relative isolate flex h-full min-h-0 flex-col overflow-x-hidden overflow-y-auto">
@@ -1551,6 +1610,8 @@ const ConversationTabView = memo(function ConversationTabView({
               onFocus={handleFocus}
               onSend={handleSend}
               onCancel={handleCancel}
+              waitingForSubagents={conn.waitingForSubagents}
+              draftRestore={promptDraftRestore}
               modes={connectionModes}
               configOptions={connectionConfigOptions}
               modeLoading={modeLoading}

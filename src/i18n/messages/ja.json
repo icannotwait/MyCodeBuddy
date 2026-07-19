@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} は既存の会話ではこのモデルに切り替えられません。新しいセッションを開始して使用してください。",
           "turnFailedEmpty": "{agent} は応答を生成せずにターンを終了しました。エージェントの設定を確認してください。",
           "terminalShellUnavailable": "{shell} は利用できません。一般設定で利用可能なシェルを選択してください。",
-          "terminalShellUnsupported": "ACP ターミナル実行では {shell} はサポートされていません。一般設定でサポート対象のシェルを選択してください。"
+          "terminalShellUnsupported": "ACP ターミナル実行では {shell} はサポートされていません。一般設定でサポート対象のシェルを選択してください。",
+          "conversationWaitingForSubagents": "この会話はサブエージェントの完了を待機しています。",
+          "parentConnectionLost": "エージェント接続が失われたため、委任の待機が終了しました。",
+          "suspendDrainTimeout": "エージェントのターンが時間内に停止しなかったため、委任の待機が終了しました。",
+          "continuationFailed": "エージェントを再開できなかったため、委任の待機が終了しました。"
         },
         "unableReadAgentConfig": "エージェント設定を読み取れません: {message}",
         "connectFailedTitle": "{agent} の接続に失敗しました",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "接続中...",
         "agentResponding": "{agent} が応答中...",
-        "sendMessage": "メッセージを送信..."
+        "sendMessage": "メッセージを送信...",
+        "waitingForSubagents": "サブエージェントを待機中...",
+        "waitingForSubagentsHint": "この会話の待機中も編集を続けられます。"
       },
       "messageInput": {
         "askAnything": "何でも質問してください...",

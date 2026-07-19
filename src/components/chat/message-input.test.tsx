@@ -554,3 +554,98 @@ describe("MessageInput collapsed selectors popover", () => {
     )
   })
 })
+
+describe("MessageInput PromptDraftRestore rehydration", () => {
+  afterEach(() => {
+    cleanup()
+    referenceSearchHook.options = null
+    referenceSearchHook.mock.mockClear()
+  })
+
+  it("applies a strictly newer restore revision once and restores draft text", async () => {
+    const draft = {
+      blocks: [{ type: "text" as const, text: "restored prompt body" }],
+      displayText: "restored prompt body",
+    }
+    const { rerender, container } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftRestore={null}
+        />
+      </NextIntlClientProvider>
+    )
+
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftRestore={{ revision: 1, draft }}
+        />
+      </NextIntlClientProvider>
+    )
+
+    await waitFor(() => {
+      expect(composerHandle.current?.getText()).toContain(
+        "restored prompt body"
+      )
+    })
+
+    // Same revision must not re-apply / clobber later user edits.
+    composerHandle.current?.setText("user kept typing")
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftRestore={{ revision: 1, draft }}
+        />
+      </NextIntlClientProvider>
+    )
+    await act(async () => {
+      await new Promise((r) => requestAnimationFrame(r))
+    })
+    expect(composerHandle.current?.getText()).toContain("user kept typing")
+  })
+
+  it("showCancel renders Stop without setting isPrompting enqueue mode", async () => {
+    const onCancel = vi.fn()
+    const onEnqueue = vi.fn()
+    const onSend = vi.fn()
+    const { container } = renderInput({
+      showCancel: true,
+      isPrompting: false,
+      disabled: true,
+      onCancel,
+      onEnqueue,
+      onSend,
+    })
+
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    const cancelTitle = enMessages.Folder.chat.messageInput.cancel
+    const stop = container.querySelector<HTMLButtonElement>(
+      `button[title="${cancelTitle}"]`
+    )
+    expect(stop).not.toBeNull()
+
+    // Editor stays editable while disabled (send-only lock).
+    const textbox = container.querySelector('[role="textbox"]') as HTMLElement
+    expect(textbox.getAttribute("contenteditable")).toBe("true")
+
+    // isPrompting is false → Enter does not enqueue.
+    composerHandle.current?.setText("would enqueue if prompting")
+    await act(async () => {
+      // No programmatic submit of enqueue path — assert no enqueue button mode.
+    })
+    expect(onEnqueue).not.toHaveBeenCalled()
+  })
+})

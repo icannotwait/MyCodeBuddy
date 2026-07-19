@@ -3,6 +3,7 @@ import type {
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  ContinuationWaitingProjection,
   DelegationRouteSnapshot,
   LiveContentBlock as WireLiveContentBlock,
   LiveMessage as WireLiveMessage,
@@ -78,6 +79,11 @@ export interface SnapshotPatch {
    * omitted the field (older payloads). Never derived from live settings.
    */
   delegationRoute: DelegationRouteSnapshot | null
+  /**
+   * Waiting projection for durable delegation continuation. Independent of
+   * connection status / turn_in_flight. `null` when not waiting or omitted.
+   */
+  waitingForSubagents: ContinuationWaitingProjection | null
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -132,6 +138,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     eventSeq: wire.event_seq,
     activeDelegations: wire.active_delegations ?? [],
     delegationRoute: wire.delegation_route ?? null,
+    waitingForSubagents: wire.waiting_for_subagents ?? null,
   }
 }
 

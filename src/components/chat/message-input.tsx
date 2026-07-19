@@ -144,6 +144,7 @@ import { OFFICE_ACTIONS, type OfficeAction } from "@/lib/office-actions"
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  saveMessageInputDraft,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
 import {
@@ -195,6 +196,12 @@ export interface ComposerInjectContent {
   skill?: { id: string; label: string }
 }
 
+/** Direct-send rejection restore: apply each strictly newer revision once. */
+export interface PromptDraftRestore {
+  revision: number
+  draft: PromptDraft
+}
+
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   placeholder?: string
@@ -210,7 +217,14 @@ interface MessageInputProps {
   onFocus?: () => void
   className?: string
   isPrompting?: boolean
+  /**
+   * Show the Stop button (wired to `onCancel`). Independent of `isPrompting` so
+   * waiting-for-subagents can expose Stop without switching into enqueue mode.
+   */
+  showCancel?: boolean
   onCancel?: () => void
+  /** Strictly newer revisions rehydrate the editor after a rejected direct send. */
+  draftRestore?: PromptDraftRestore | null
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
   modeLoading?: boolean
@@ -498,7 +512,9 @@ export function MessageInput({
   onFocus,
   className,
   isPrompting = false,
+  showCancel = false,
   onCancel,
+  draftRestore = null,
   modes,
   configOptions,
   modeLoading = false,
@@ -620,6 +636,8 @@ export function MessageInput({
   // doesn't clobber the user's in-progress changes — keyed on id, not display
   // text (two attachment-only items share the text "Attached 1 attachment").
   const prevEditingItemIdRef = useRef<string | null>(null)
+  // Last applied PromptDraftRestore revision — only strictly newer values rehydrate.
+  const lastRestoreRevisionRef = useRef(0)
   const dragActiveRef = useRef(false)
   // Bridge so the early `onChange` handler can call the editor-driven slash
   // detection that is defined further down (after the slash state).
@@ -880,6 +898,36 @@ export function MessageInput({
     editingDraftBlocks,
     hydrateFromBlocks,
   ])
+
+  // Direct-send rejection restore: apply each strictly newer revision once,
+  // reusing the same block hydration path as queue-edit restore, and persist
+  // the restored draft so a refresh still recovers it. Never queues.
+  useEffect(() => {
+    if (!draftRestore || !composerReady) return
+    if (draftRestore.revision <= lastRestoreRevisionRef.current) return
+    lastRestoreRevisionRef.current = draftRestore.revision
+    const { draft } = draftRestore
+    const raf = requestAnimationFrame(() => {
+      const handle = editorRef.current
+      if (!handle) return
+      const editor = handle.getEditor()
+      if (draft.blocks.length > 0 && editor) {
+        hydrateFromBlocks(editor, draft.blocks)
+      } else {
+        handle.setText(draft.displayText)
+      }
+      setComposerEmpty(editor ? isComposerEmpty(editor) : !draft.displayText)
+      if (effectiveDraftStorageKey) {
+        // Persist text fallback so the draft survives a remount.
+        saveMessageInputDraft(effectiveDraftStorageKey, draft.displayText)
+        const doc = editor?.getJSON()
+        if (doc) {
+          saveMessageInputDraftV2(effectiveDraftStorageKey, doc)
+        }
+      }
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [draftRestore, composerReady, hydrateFromBlocks, effectiveDraftStorageKey])
 
   useEffect(() => {
     if (!injectContent || !composerReady) return
@@ -2806,8 +2854,22 @@ export function MessageInput({
     t,
   ])
 
+  const stopButton =
+    showCancel && onCancel ? (
+      <Button
+        onClick={onCancel}
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        title={t("cancel")}
+      >
+        <Square className="size-4" />
+      </Button>
+    ) : null
+
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
+      {stopButton}
       <Button
         onClick={onCancelQueueEdit}
         variant="ghost"
@@ -2827,16 +2889,8 @@ export function MessageInput({
         <Check className="size-4" />
       </Button>
     </div>
-  ) : isPrompting && onCancel ? (
-    <Button
-      onClick={onCancel}
-      variant="destructive"
-      size="icon"
-      className="h-8 w-8"
-      title={t("cancel")}
-    >
-      <Square className="size-4" />
-    </Button>
+  ) : stopButton ? (
+    stopButton
   ) : onForkSend ? (
     <div className="flex items-center">
       <Button

@@ -245,6 +245,82 @@ describe("ConversationDetailPanel send-path hardening", () => {
   })
 })
 
+describe("ConversationDetailPanel continuation waiting / draft-safe wiring", () => {
+  it("guards queue flush both before scheduling and inside the timer callback", () => {
+    // Pre-schedule guard + dependency.
+    expect(source).toMatch(/if \(conn\.waitingForSubagents\) return/)
+    expect(source).toContain("conn.waitingForSubagents")
+    // Timer callback must re-check (Connected-before-waiting race).
+    const flushStart = source.indexOf(
+      "Flush queued messages whenever the agent is idle"
+    )
+    const flushEnd = source.indexOf(
+      "Mirror the connection's liveMessage into the runtime session",
+      flushStart
+    )
+    expect(flushStart).toBeGreaterThan(-1)
+    expect(flushEnd).toBeGreaterThan(flushStart)
+    const flushBlock = source.slice(flushStart, flushEnd)
+    expect(flushBlock).toMatch(/waitingForSubagents/)
+    expect(flushBlock).toContain("setTimeout")
+    // Dependency array includes waiting projection.
+    expect(flushBlock).toMatch(/conn\.waitingForSubagents/)
+  })
+
+  it("handleSend returns early when snapshot already says waiting", () => {
+    const sendStart = source.indexOf("const handleSend = useCallback(")
+    const sendEnd = source.indexOf(
+      "// Sync handleSend ref for auto-send effect",
+      sendStart
+    )
+    expect(sendStart).toBeGreaterThan(-1)
+    const sendBlock = source.slice(sendStart, sendEnd)
+    // Guard before optimistic mutation.
+    const waitingGuard = sendBlock.indexOf("waitingForSubagents")
+    const optimistic = sendBlock.indexOf("buildOptimisticUserTurnFromDraft")
+    expect(waitingGuard).toBeGreaterThan(-1)
+    expect(optimistic).toBeGreaterThan(waitingGuard)
+  })
+
+  it("pins direct-restore vs queue-head-requeue on continuation waiting rejection", () => {
+    expect(source).toContain("onContinuationWaiting")
+    const start = source.indexOf("onContinuationWaiting")
+    const block = source.slice(start, start + 1200)
+    // Direct path restores PromptDraft; queue-flush requeues front.
+    expect(block).toContain("fromQueueFlush")
+    expect(block).toContain("mqRequeueFront")
+    expect(block).toMatch(
+      /PromptDraftRestore|draftRestore|setDraftRestore|setPromptDraftRestore/
+    )
+    // Direct restore must not enqueue.
+    expect(block).not.toMatch(/onContinuationWaiting[\s\S]{0,400}mqEnqueue\(/)
+  })
+
+  it("cold continuation_failure effect keys dedup by code and finished_at", () => {
+    expect(source).toContain("continuation_failure")
+    expect(source).toContain("continuationFailureI18nKey")
+    // Identity is (code, finished_at) — both must appear in the dedup key.
+    expect(source).toMatch(
+      /continuation_failure[\s\S]{0,800}(code|finished_at)[\s\S]{0,200}(finished_at|code)/
+    )
+    // Uses localized mapping, not raw failure text.
+    expect(source).toMatch(
+      /toast\.error\([\s\S]{0,120}continuationFailureI18nKey|tAcp\(|t\(/
+    )
+  })
+
+  it("threads waitingForSubagents through ConversationShell and welcome ChatInput", () => {
+    expect(conversationShellSource).toContain("waitingForSubagents")
+    expect(chatInputSource).toContain("waitingForSubagents")
+    expect(chatInputSource).toContain("showCancel")
+    expect(messageInputSource).toContain("showCancel")
+    expect(messageInputSource).toContain("draftRestore")
+    expect(messageInputSource).toContain("PromptDraftRestore")
+    // Welcome + shell both receive waiting.
+    expect(source).toMatch(/waitingForSubagents=\{/)
+  })
+})
+
 describe("ConversationTabView initial history eligibility", () => {
   it("captures persisted eligibility at mount and passes successful load state", () => {
     expect(source).toMatch(

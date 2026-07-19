@@ -27,6 +27,10 @@ import type {
 import { randomUUID } from "@/lib/utils"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
 import {
+  continuationFailureI18nKey,
+  isContinuationFailureCode,
+} from "@/lib/continuation-waiting"
+import {
   acpConnect,
   acpGetAgentStatus,
   acpPrompt,
@@ -345,6 +349,14 @@ export interface ConnectionState {
    * for older fixtures.
    */
   delegationRouteOverride?: DelegationRoutePolicy | null
+  /**
+   * Durable continuation waiting projection for this connection's conversation.
+   * Independent of `status` and turn_in_flight. `null` when not waiting.
+   * Optional on older fixtures; production constructors always set it.
+   */
+  waitingForSubagents?:
+    | import("@/lib/types").ContinuationWaitingProjection
+    | null
 }
 
 type ConnectRequest = {
@@ -387,6 +399,11 @@ type Action =
       type: "DELEGATION_ROUTE_AVAILABILITY"
       contextKey: string
       available: boolean
+    }
+  | {
+      type: "CONTINUATION_WAITING_CHANGED"
+      contextKey: string
+      waiting: import("@/lib/types").ContinuationWaitingProjection | null
     }
   | {
       type: "HYDRATE_FROM_SNAPSHOT"
@@ -1287,6 +1304,7 @@ function reduceSingleAction(
         delegationRoute: null,
         conversationId: action.conversationId ?? null,
         delegationRouteOverride: action.delegationRouteOverride ?? null,
+        waitingForSubagents: null,
       })
       return next
     }
@@ -1347,6 +1365,7 @@ function reduceSingleAction(
         delegationRoute: null,
         conversationId: null,
         delegationRouteOverride: null,
+        waitingForSubagents: null,
       })
       return next
     }
@@ -1454,7 +1473,37 @@ function reduceSingleAction(
         backgroundOutstanding: action.patch.backgroundOutstanding,
         // Authoritative route snapshot — never derived from live settings.
         delegationRoute: action.patch.delegationRoute,
+        // Waiting projection is independent of status / turn_in_flight.
+        waitingForSubagents: action.patch.waitingForSubagents,
         lastAppliedSeq: action.patch.eventSeq,
+      })
+      return next
+    }
+
+    case "CONTINUATION_WAITING_CHANGED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (conn.waitingForSubagents === action.waiting) return state
+      // Structural equality: avoid re-render when projection is identical.
+      if (
+        conn.waitingForSubagents &&
+        action.waiting &&
+        conn.waitingForSubagents.conversation_id ===
+          action.waiting.conversation_id &&
+        conn.waitingForSubagents.state === action.waiting.state &&
+        conn.waitingForSubagents.generation === action.waiting.generation &&
+        conn.waitingForSubagents.armed_at === action.waiting.armed_at &&
+        conn.waitingForSubagents.wake_at === action.waiting.wake_at
+      ) {
+        return state
+      }
+      if (conn.waitingForSubagents == null && action.waiting == null) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        waitingForSubagents: action.waiting,
       })
       return next
     }
@@ -2649,6 +2698,13 @@ function prepareMappedEnvelope(
         available: e.available,
       })
       break
+    case "continuation_waiting_changed":
+      actions.push({
+        type: "CONTINUATION_WAITING_CHANGED",
+        contextKey,
+        waiting: e.waiting,
+      })
+      break
     case "selectors_ready": {
       actions.push({ type: "SELECTORS_READY", contextKey })
       const agentType = snapshot.agentType
@@ -2738,6 +2794,11 @@ function prepareMappedEnvelope(
       const agentLabel =
         AGENT_LABELS[snapshot.agentType] || (e.agent_type as string)
       const localizedMessage = (() => {
+        // Shared mapping with cold detail projection — keep in sync via
+        // continuationFailureI18nKey so live events cannot drift.
+        if (isContinuationFailureCode(e.code)) {
+          return env.t(continuationFailureI18nKey(e.code))
+        }
         switch (e.code) {
           case "initialize_timeout":
             return env.t("backendErrors.initializeTimeout", {
@@ -2925,7 +2986,8 @@ function onlyCursorChanged(
     before.isDelegationChild === after.isDelegationChild &&
     before.delegationRoute === after.delegationRoute &&
     before.conversationId === after.conversationId &&
-    before.delegationRouteOverride === after.delegationRouteOverride
+    before.delegationRouteOverride === after.delegationRouteOverride &&
+    before.waitingForSubagents === after.waitingForSubagents
   )
 }
 

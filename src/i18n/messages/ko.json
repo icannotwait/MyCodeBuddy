@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent}은(는) 기존 대화에서는 해당 모델로 전환할 수 없습니다. 새 세션을 시작하여 사용하세요.",
           "turnFailedEmpty": "{agent}이(가) 어떤 응답도 생성하지 않고 턴을 종료했습니다. 에이전트 구성을 확인하세요.",
           "terminalShellUnavailable": "{shell}을(를) 사용할 수 없습니다. 일반 설정에서 사용 가능한 셸을 선택하세요.",
-          "terminalShellUnsupported": "ACP 터미널 실행에서 {shell}은(는) 지원되지 않습니다. 일반 설정에서 지원되는 셸을 선택하세요."
+          "terminalShellUnsupported": "ACP 터미널 실행에서 {shell}은(는) 지원되지 않습니다. 일반 설정에서 지원되는 셸을 선택하세요.",
+          "conversationWaitingForSubagents": "이 대화는 서브 에이전트를 기다리고 있습니다.",
+          "parentConnectionLost": "에이전트 연결이 끊어져 위임 대기가 종료되었습니다.",
+          "suspendDrainTimeout": "에이전트 턴이 제때 중지되지 않아 위임 대기가 종료되었습니다.",
+          "continuationFailed": "에이전트를 재개할 수 없어 위임 대기가 종료되었습니다."
         },
         "unableReadAgentConfig": "에이전트 구성을 읽을 수 없습니다: {message}",
         "connectFailedTitle": "{agent} 연결 실패",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "연결 중...",
         "agentResponding": "{agent} 응답 중...",
-        "sendMessage": "메시지 보내기..."
+        "sendMessage": "메시지 보내기...",
+        "waitingForSubagents": "서브 에이전트 대기 중...",
+        "waitingForSubagentsHint": "이 대화가 대기하는 동안에도 계속 편집할 수 있습니다."
       },
       "messageInput": {
         "askAnything": "무엇이든 물어보세요...",

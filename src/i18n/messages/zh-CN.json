@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} 无法在已有对话中切换到该模型，请新建会话以使用它。",
           "turnFailedEmpty": "{agent} 本轮没有产生任何回复就结束了，请检查代理配置。",
           "terminalShellUnavailable": "{shell} 不可用。请在“常规”设置中选择可用的 Shell。",
-          "terminalShellUnsupported": "ACP 终端执行不支持 {shell}。请在“常规”设置中选择受支持的 Shell。"
+          "terminalShellUnsupported": "ACP 终端执行不支持 {shell}。请在“常规”设置中选择受支持的 Shell。",
+          "conversationWaitingForSubagents": "此会话正在等待子智能体。",
+          "parentConnectionLost": "委派等待已结束，因为智能体连接已断开。",
+          "suspendDrainTimeout": "委派等待已结束，因为智能体回合未能及时停止。",
+          "continuationFailed": "委派等待已结束，因为无法恢复智能体。"
         },
         "unableReadAgentConfig": "无法读取 Agent 配置：{message}",
         "connectFailedTitle": "{agent} 连接失败",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "连接中...",
         "agentResponding": "{agent} 正在响应...",
-        "sendMessage": "发送消息..."
+        "sendMessage": "发送消息...",
+        "waitingForSubagents": "正在等待子智能体...",
+        "waitingForSubagentsHint": "会话等待期间仍可继续编辑。"
       },
       "messageInput": {
         "askAnything": "请开始输入...",

@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} can't switch to that model in an existing conversation. Start a new session to use it.",
           "turnFailedEmpty": "{agent} ended the turn without producing any response. Please check the agent's configuration.",
           "terminalShellUnavailable": "{shell} is unavailable. Choose an available shell in General settings.",
-          "terminalShellUnsupported": "{shell} is not supported for ACP terminal execution. Choose a supported shell in General settings."
+          "terminalShellUnsupported": "{shell} is not supported for ACP terminal execution. Choose a supported shell in General settings.",
+          "conversationWaitingForSubagents": "This conversation is waiting for subagents.",
+          "parentConnectionLost": "The delegation wait ended because the agent connection was lost.",
+          "suspendDrainTimeout": "The delegation wait ended because the agent turn did not stop in time.",
+          "continuationFailed": "The delegation wait ended because it could not resume the agent."
         },
         "unableReadAgentConfig": "Unable to read Agent config: {message}",
         "connectFailedTitle": "{agent} connection failed",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "Connecting...",
         "agentResponding": "{agent} is responding...",
-        "sendMessage": "Send a message..."
+        "sendMessage": "Send a message...",
+        "waitingForSubagents": "Waiting for subagents...",
+        "waitingForSubagentsHint": "You can keep editing while this conversation waits."
       },
       "messageInput": {
         "askAnything": "Ask anything...",

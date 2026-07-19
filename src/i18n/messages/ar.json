@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "لا يمكن لـ {agent} التبديل إلى هذا النموذج في محادثة قائمة. ابدأ جلسة جديدة لاستخدامه.",
           "turnFailedEmpty": "أنهى {agent} الجولة دون إنتاج أي رد. يرجى التحقق من إعدادات الوكيل.",
           "terminalShellUnavailable": "الصدفة {shell} غير متاحة. اختر صدفة متاحة في الإعدادات العامة.",
-          "terminalShellUnsupported": "الصدفة {shell} غير مدعومة لتنفيذ أوامر طرفية ACP. اختر صدفة مدعومة في الإعدادات العامة."
+          "terminalShellUnsupported": "الصدفة {shell} غير مدعومة لتنفيذ أوامر طرفية ACP. اختر صدفة مدعومة في الإعدادات العامة.",
+          "conversationWaitingForSubagents": "هذه المحادثة في انتظار الوكلاء الفرعيين.",
+          "parentConnectionLost": "انتهى انتظار التفويض لأن اتصال الوكيل فُقد.",
+          "suspendDrainTimeout": "انتهى انتظار التفويض لأن دور الوكيل لم يتوقف في الوقت المحدد.",
+          "continuationFailed": "انتهى انتظار التفويض لأنه تعذّر استئناف الوكيل."
         },
         "unableReadAgentConfig": "تعذر قراءة إعدادات الوكيل: {message}",
         "connectFailedTitle": "فشل اتصال {agent}",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "جارٍ الاتصال...",
         "agentResponding": "{agent} يرد...",
-        "sendMessage": "أرسل رسالة..."
+        "sendMessage": "أرسل رسالة...",
+        "waitingForSubagents": "بانتظار الوكلاء الفرعيين...",
+        "waitingForSubagentsHint": "يمكنك متابعة التحرير بينما تنتظر هذه المحادثة."
       },
       "messageInput": {
         "askAnything": "اسأل أي شيء...",

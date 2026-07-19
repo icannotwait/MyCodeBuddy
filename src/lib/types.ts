@@ -485,6 +485,45 @@ export interface DbConversationDetail {
    * mid-stream, which would otherwise double-render against the live reply.
    */
   in_flight_user_turn_id?: string | null
+  /**
+   * Redacted projection of the latest terminal continuation failure for this
+   * conversation (cold detail load). Absent when none has finished.
+   */
+  continuation_failure?: ContinuationFailureProjection | null
+}
+
+/** Mirrors Rust `ContinuationState` (delegation continuation FSM). */
+export type ContinuationState =
+  | "arming"
+  | "waiting"
+  | "wake_pending"
+  | "resuming"
+  | "completed"
+  | "cancelled"
+  | "failed"
+
+/** Mirrors Rust `ContinuationFailureCode`. */
+export type ContinuationFailureCode =
+  | "arm_failed"
+  | "suspend_dispatch_failed"
+  | "suspend_drain_timeout"
+  | "parent_connection_lost"
+  | "prompt_delivery_failed"
+  | "state_conflict"
+
+/** Live/snapshot waiting projection for a parent conversation. */
+export interface ContinuationWaitingProjection {
+  conversation_id: number
+  state: ContinuationState
+  generation: number
+  armed_at: string
+  wake_at: string
+}
+
+/** Redacted terminal failure projection (detail + live error family). */
+export interface ContinuationFailureProjection {
+  code: ContinuationFailureCode
+  finished_at: string
 }
 
 export type ConversationStatus =
@@ -1431,6 +1470,16 @@ export type AcpEvent =
       stale: boolean
       kind: ConfigStaleKind
     }
+  /**
+   * Durable continuation waiting projection changed for this connection's
+   * conversation. `waiting: null` clears the lock (terminal or unlocked).
+   * Independent of connection `status` / turn_in_flight.
+   */
+  | {
+      type: "continuation_waiting_changed"
+      conversation_id: number
+      waiting: ContinuationWaitingProjection | null
+    }
 
 /** Which settings surface drifted (mirror of Rust `ConfigStaleKind`), used to
  *  word the "restart to apply" banner. */
@@ -1836,6 +1885,12 @@ export interface LiveSessionSnapshot {
    * older payloads — denormalized to `null`, never derived from live settings.
    */
   delegation_route?: DelegationRouteSnapshot
+  /**
+   * Authoritative waiting projection while a durable continuation owns this
+   * conversation. Absent / null when not waiting. Independent of `status` and
+   * turn_in_flight.
+   */
+  waiting_for_subagents?: ContinuationWaitingProjection | null
   event_seq: number
 }
 

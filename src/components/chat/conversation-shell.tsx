@@ -3,6 +3,7 @@ import { useTranslations } from "next-intl"
 import type {
   AgentType,
   ConnectionStatus,
+  ContinuationWaitingProjection,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   PromptDraft,
@@ -20,6 +21,7 @@ import type {
 import type { QueuedMessage } from "@/hooks/use-message-queue"
 import { Loader2 } from "lucide-react"
 import { ChatInput } from "@/components/chat/chat-input"
+import type { PromptDraftRestore } from "@/components/chat/message-input"
 import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { QuestionDialog } from "@/components/chat/question-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
@@ -85,6 +87,10 @@ interface ConversationShellProps {
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
+  /** Durable continuation waiting projection for this conversation. */
+  waitingForSubagents?: ContinuationWaitingProjection | null
+  /** Restore a rejected direct-send draft into the composer. */
+  draftRestore?: PromptDraftRestore | null
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
@@ -141,6 +147,8 @@ export function ConversationShell({
   onSaveQueueEdit,
   onCancelQueueEdit,
   onForkSend,
+  waitingForSubagents = null,
+  draftRestore = null,
   topBanner,
   routeNotice,
 }: ConversationShellProps) {
@@ -242,6 +250,8 @@ export function ConversationShell({
               onFocus={onFocus}
               onSend={onSend}
               onCancel={onCancel}
+              waitingForSubagents={waitingForSubagents}
+              draftRestore={draftRestore}
               modes={modes}
               configOptions={configOptions}
               modeLoading={modeLoading}
