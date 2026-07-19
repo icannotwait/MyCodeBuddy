@@ -15,6 +15,7 @@ import {
   matchReferenceRegex,
   nextReferenceSearchPage,
   startReferenceSearch,
+  translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
 
@@ -45,6 +46,32 @@ describe("acpPrompt transport payload", () => {
       visibleText: "README.md task",
       locale: "zh_cn",
     })
+  })
+})
+
+describe("translateDocument transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({
+      translatedContent: "你好",
+      locale: "zh_cn",
+      format: "markdown",
+    })
+  })
+
+  it("passes timeoutMs 195000 for document translation", async () => {
+    const params = {
+      content: "# Hello",
+      format: "markdown" as const,
+      locale: "zh_cn",
+      displayName: "README.md",
+    }
+    await translateDocument(params)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "translate_document",
+      params,
+      { timeoutMs: 195_000 }
+    )
   })
 })
 

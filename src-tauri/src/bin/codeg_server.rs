@@ -284,6 +284,17 @@ async fn async_main() -> ExitCode {
         tracing::error!("[SERVER] auto-title recovery failed: {e}");
         return ExitCode::FAILURE;
     }
+    let document_translation = {
+        let translate_db = Arc::new(codeg_lib::db::AppDatabase {
+            conn: db.conn.clone(),
+        });
+        codeg_lib::document_translate::build_production_document_translation_service(
+            translate_db,
+            connection_manager.clone_ref(),
+            Arc::clone(&internal_sessions),
+            data_dir.clone(),
+        )
+    };
     let conversation_experience_gate = Arc::new(
         codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
     );
@@ -319,6 +330,7 @@ async fn async_main() -> ExitCode {
         data_dir,
         internal_sessions: internal_sessions.clone(),
         auto_title_coordinator: auto_title_coordinator.clone(),
+        document_translation,
         conversation_experience_gate,
         reference_search_registry,
         web_server_state: WebServerState::new(),

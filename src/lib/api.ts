@@ -3415,6 +3415,36 @@ export async function setReferenceSearchLimit(
   return getTransport().call("set_reference_search_limit", { limit })
 }
 
+// ─── Document translation ───────────────────────────────────────────────────
+// Backend deadline is 120s; FE uses 195s so Web/remote proxies leave room for
+// transport overhead. Tauri invoke has no client timeout of its own.
+
+export type DocumentTranslateFormat = "markdown" | "plainText"
+
+export interface TranslateDocumentParams {
+  content: string
+  format: DocumentTranslateFormat
+  locale?: string
+  displayName?: string
+}
+
+export interface TranslateDocumentResult {
+  translatedContent: string
+  locale: string
+  format: DocumentTranslateFormat
+}
+
+export async function translateDocument(params: {
+  content: string
+  format: DocumentTranslateFormat
+  locale?: string
+  displayName?: string
+}): Promise<TranslateDocumentResult> {
+  return getTransport().call("translate_document", params, {
+    timeoutMs: 195_000,
+  })
+}
+
 // ─── Incremental reference search ───────────────────────────────────────────
 // Flat protocol payloads (no nested `request`). Start/page use 35s so the
 // backend's 30s page deadline remains authoritative.

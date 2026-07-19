@@ -7,6 +7,7 @@ pub mod conversation_experience;
 pub mod conversations;
 pub mod delegation;
 pub mod delegation_metrics;
+pub mod document_translate;
 mod error;
 pub mod event_metrics;
 pub mod experts;

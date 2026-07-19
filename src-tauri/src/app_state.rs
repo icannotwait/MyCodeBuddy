@@ -8,6 +8,7 @@ use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
 use crate::auto_title::{AutoTitleCoordinator, InternalAgentSessionRegistry};
+use crate::document_translate::DocumentTranslationService;
 use crate::chat_channel::manager::ChatChannelManager;
 use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::commands::delegation::DelegationRuntimeSettings;
@@ -36,6 +37,9 @@ pub struct AppState {
     pub internal_sessions: Arc<InternalAgentSessionRegistry>,
     /// Durable automatic-title worker. Shared by lifecycle, Tauri commands, and Axum.
     pub auto_title_coordinator: Arc<AutoTitleCoordinator>,
+    /// Process-wide on-demand document translation (capacity 1). Shared by
+    /// Tauri commands and Axum so both transports share the same admission.
+    pub document_translation: Arc<DocumentTranslationService>,
     /// Process-local mutation gate for conversation-experience settings.
     pub conversation_experience_gate: Arc<ConversationExperienceMutationGate>,
     /// Process-wide guarded pull-job registry for incremental reference search.
@@ -360,6 +364,12 @@ impl AppState {
         // Never start the production notification worker from test constructors.
         let auto_title_coordinator =
             AutoTitleCoordinator::new(title_db, runner, EventEmitter::Noop);
+        let document_translation = {
+            let translate_db = Arc::new(crate::db::AppDatabase {
+                conn: db.conn.clone(),
+            });
+            crate::document_translate::DocumentTranslationService::new_inert(translate_db)
+        };
         let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
         // Synchronous test constructor installs the production factory at the
         // default limit. Async fixtures that need another value call
@@ -381,6 +391,7 @@ impl AppState {
             data_dir,
             internal_sessions,
             auto_title_coordinator,
+            document_translation,
             conversation_experience_gate,
             reference_search_registry,
             web_server_state: crate::web::WebServerState::new(),
