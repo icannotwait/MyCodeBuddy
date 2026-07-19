@@ -203,6 +203,12 @@ pub async fn apply_usable_completion(
     let locale_wire = app_locale_to_wire(snapshot.locale).to_string();
     let bounded = bound_context(snapshot.final_text.trim());
 
+    // Test-only gate before any usable-completion write so a concurrent deadline
+    // promote can commit first (SQLite blocks promote if this txn already wrote).
+    // Task-local: parallel tests cannot steal the barrier.
+    #[cfg(test)]
+    first_ready_race_hooks::run_completion_pre_write_hook().await;
+
     // 1) Atomic progress (token idempotent) — any live job state.
     let progress = auto_title_job::Entity::update_many()
         .col_expr(
@@ -509,6 +515,54 @@ mod claim_test_hooks {
 
     pub async fn run_pre_cas_hook() {
         let Ok(hook) = PRE_CAS.try_with(Clone::clone) else {
+            return;
+        };
+        hook().await;
+    }
+}
+
+/// Test-only hooks for deterministic deadline-promote vs usable-completion races.
+///
+/// Both hooks are **task-local** so parallel tests cannot steal barriers.
+/// - Completion hook runs **before any write** in `apply_usable_completion` so a
+///   concurrent promote is not blocked by an open write transaction.
+/// - Promote hook runs immediately before the promote CAS UPDATE.
+#[cfg(test)]
+mod first_ready_race_hooks {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    type Hook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+    tokio::task_local! {
+        static COMPLETION_PRE_WRITE: Hook;
+        static PROMOTE_PRE_CAS: Hook;
+    }
+
+    pub async fn scope_completion<F, T>(hook: Hook, fut: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        COMPLETION_PRE_WRITE.scope(hook, fut).await
+    }
+
+    pub async fn scope_promote<F, T>(hook: Hook, fut: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        PROMOTE_PRE_CAS.scope(hook, fut).await
+    }
+
+    pub async fn run_completion_pre_write_hook() {
+        let Ok(hook) = COMPLETION_PRE_WRITE.try_with(Clone::clone) else {
+            return;
+        };
+        hook().await;
+    }
+
+    pub async fn run_promote_pre_cas_hook() {
+        let Ok(hook) = PROMOTE_PRE_CAS.try_with(Clone::clone) else {
             return;
         };
         hook().await;
@@ -1344,6 +1398,10 @@ mod tests {
         conversation_id: i32,
         partial: &str,
     ) -> u64 {
+        // Test-only gate immediately before promote CAS (deadline vs end-turn
+        // barrier races). No-op outside first_ready_race_hooks::scope_promote.
+        first_ready_race_hooks::run_promote_pre_cas_hook().await;
+
         let result = auto_title_job::Entity::update_many()
             .col_expr(
                 auto_title_job::Column::State,
@@ -1621,19 +1679,25 @@ mod tests {
         drop(dir);
     }
 
-    /// REQUIRED WAL: deadline promote vs end-turn in BOTH orders — exactly one
-    /// first-assistant snapshot; job ends Ready without double first-ready
-    /// corruption.
+    /// REQUIRED WAL + barriers: deadline promote vs end-turn in BOTH orders.
+    ///
+    /// Sequential pre-seed is not enough — each order parks one side at a
+    /// task-local pre-write / pre-CAS gate (claim-style) so the other commits
+    /// first-assistant, then releases. Exactly one first-assistant snapshot;
+    /// job ends Ready without panic or double first-ready corruption.
     #[tokio::test]
     async fn concurrent_end_turn_and_deadline_both_orders_wal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
 
         use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+        use tokio::sync::Notify;
 
         use crate::db::test_helpers::fresh_disk_db;
 
-        const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
+        const BARRIER_SEQ_TIMEOUT: Duration = Duration::from_secs(5);
+        const GATE_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
@@ -1660,7 +1724,7 @@ mod tests {
             crate::db::AppDatabase { conn }
         }
 
-        // Seed two independent conversations so both orderings share one DB file.
+        // Two conversations: one per barrier order (shared WAL file).
         let mut conversation_ids = Vec::new();
         for _ in 0..2 {
             let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
@@ -1681,26 +1745,75 @@ mod tests {
         let pool_end = Arc::new(open_wal_pool(&path).await);
         let pool_deadline = Arc::new(open_wal_pool(&path).await);
 
-        // Order A: deadline promote commits, then usable completion.
+        // ------------------------------------------------------------------
+        // Order A: completion parks pre-write; promote commits first-assistant;
+        // then completion CAS loses write-once and only advances seq.
+        // ------------------------------------------------------------------
         {
             let cid = conversation_ids[0];
+            let after_completion_at_gate = Arc::new(Notify::new());
+            let allow_completion = Arc::new(Notify::new());
+            let gate_armed = Arc::new(AtomicBool::new(true));
+
+            let end_pool = pool_end.clone();
+            let after_gate = after_completion_at_gate.clone();
+            let allow = allow_completion.clone();
+            let armed = gate_armed.clone();
+            let end_handle = tokio::spawn(async move {
+                first_ready_race_hooks::scope_completion(
+                    Arc::new(move || {
+                        let after_gate = after_gate.clone();
+                        let allow = allow.clone();
+                        let armed = armed.clone();
+                        Box::pin(async move {
+                            if !armed.swap(false, Ordering::SeqCst) {
+                                return;
+                            }
+                            after_gate.notify_one();
+                            tokio::time::timeout(GATE_STEP_TIMEOUT, allow.notified())
+                                .await
+                                .expect("completion pre-write gate must be released");
+                        })
+                    }),
+                    async move {
+                        let snap = TurnCompletionSnapshot {
+                            conversation_id: cid,
+                            turn_token: "tok-order-a".into(),
+                            locale: AppLocale::En,
+                            final_text: Arc::from("full-a must not win"),
+                        };
+                        let txn = end_pool.conn.begin().await.expect("begin order a");
+                        let result = apply_usable_completion(&txn, &snap, "end_turn")
+                            .await
+                            .expect("apply order a");
+                        txn.commit().await.expect("commit order a");
+                        result
+                    },
+                )
+                .await
+            });
+
+            // Completion reached pre-write gate (no open write txn yet).
+            tokio::time::timeout(GATE_STEP_TIMEOUT, after_completion_at_gate.notified())
+                .await
+                .expect("completion must reach pre-write gate before barrier timeout");
+
+            // Promote commits first-assistant while completion is parked.
             let promoted =
                 simulate_deadline_promote(&pool_deadline.conn, cid, "partial-a").await;
-            assert_eq!(promoted, 1);
+            assert_eq!(promoted, 1, "deadline promote must win first-ready in order A");
 
-            let snap = TurnCompletionSnapshot {
-                conversation_id: cid,
-                turn_token: "tok-order-a".into(),
-                locale: AppLocale::En,
-                final_text: Arc::from("full-a must not win"),
-            };
-            let txn = pool_end.conn.begin().await.expect("begin order a");
-            let transition = apply_usable_completion(&txn, &snap, "end_turn")
+            allow_completion.notify_one();
+
+            let transition = tokio::time::timeout(BARRIER_SEQ_TIMEOUT, end_handle)
                 .await
-                .expect("apply order a");
-            txn.commit().await.expect("commit order a");
+                .expect("order A completion must not hang past barrier sequence")
+                .expect("join order A completion");
             assert_eq!(transition.usable_turn_seq, 1);
-            assert!(!transition.became_ready);
+            assert!(
+                !transition.became_ready,
+                "end-turn must not re-win first-ready after promote"
+            );
 
             let job = auto_title_job::Entity::find_by_id(cid)
                 .one(&pool_end.conn)
@@ -1708,13 +1821,62 @@ mod tests {
                 .unwrap()
                 .expect("job order a");
             assert_eq!(job.state, AutoTitleJobState::Ready);
-            assert_eq!(job.first_assistant_text.as_deref(), Some("partial-a"));
+            assert_eq!(
+                job.first_assistant_text.as_deref(),
+                Some("partial-a"),
+                "promote first-assistant must win order A"
+            );
             assert_eq!(job.usable_turn_seq, 1);
         }
 
-        // Order B: usable completion commits, then deadline promote no-ops.
+        // ------------------------------------------------------------------
+        // Order B: promote parks pre-CAS; completion commits first-assistant;
+        // then promote CAS no-ops (rows=0).
+        // ------------------------------------------------------------------
         {
             let cid = conversation_ids[1];
+            let after_promote_at_gate = Arc::new(Notify::new());
+            let allow_promote = Arc::new(Notify::new());
+            let gate_armed = Arc::new(AtomicBool::new(true));
+
+            let deadline_pool = pool_deadline.clone();
+            let after_gate = after_promote_at_gate.clone();
+            let allow = allow_promote.clone();
+            let armed = gate_armed.clone();
+            let promote_handle = tokio::spawn(async move {
+                first_ready_race_hooks::scope_promote(
+                    Arc::new(move || {
+                        let after_gate = after_gate.clone();
+                        let allow = allow.clone();
+                        let armed = armed.clone();
+                        Box::pin(async move {
+                            if !armed.swap(false, Ordering::SeqCst) {
+                                return;
+                            }
+                            after_gate.notify_one();
+                            tokio::time::timeout(GATE_STEP_TIMEOUT, allow.notified())
+                                .await
+                                .expect("promote pre-CAS gate must be released");
+                        })
+                    }),
+                    async move {
+                        simulate_deadline_promote(
+                            &deadline_pool.conn,
+                            cid,
+                            "partial-b-must-lose",
+                        )
+                        .await
+                    },
+                )
+                .await
+            });
+
+            // Promote reached pre-CAS gate (no promote write yet).
+            tokio::time::timeout(GATE_STEP_TIMEOUT, after_promote_at_gate.notified())
+                .await
+                .expect("promote must reach pre-CAS gate before barrier timeout");
+
+            // Completion commits first-assistant while promote is parked.
             let snap = TurnCompletionSnapshot {
                 conversation_id: cid,
                 turn_token: "tok-order-b".into(),
@@ -1729,9 +1891,16 @@ mod tests {
             assert!(transition.became_ready);
             assert_eq!(transition.usable_turn_seq, 1);
 
-            let promoted =
-                simulate_deadline_promote(&pool_deadline.conn, cid, "partial-b-must-lose").await;
-            assert_eq!(promoted, 0, "deadline must lose after end-turn first-ready");
+            allow_promote.notify_one();
+
+            let promoted = tokio::time::timeout(BARRIER_SEQ_TIMEOUT, promote_handle)
+                .await
+                .expect("order B promote must not hang past barrier sequence")
+                .expect("join order B promote");
+            assert_eq!(
+                promoted, 0,
+                "deadline must lose after end-turn first-ready in order B"
+            );
 
             let job = auto_title_job::Entity::find_by_id(cid)
                 .one(&pool_deadline.conn)
@@ -1741,80 +1910,10 @@ mod tests {
             assert_eq!(job.state, AutoTitleJobState::Ready);
             assert_eq!(
                 job.first_assistant_text.as_deref(),
-                Some("full-b wins first")
+                Some("full-b wins first"),
+                "completion first-assistant must win order B"
             );
             assert_eq!(job.usable_turn_seq, 1);
-        }
-
-        // Concurrent race on a third conversation: both writers fire together.
-        {
-            let conversation = {
-                // Re-open migrate connection via a third pool to create another job.
-                let seed = open_wal_pool(&path).await;
-                enable_auto_title(&seed.conn, AgentType::Codex).await;
-                let conversation =
-                    create(&seed.conn, folder, AgentType::ClaudeCode, None, None)
-                        .await
-                        .expect("create concurrent");
-                conversation.id
-            };
-            let cid = conversation;
-
-            let end_pool = pool_end.clone();
-            let deadline_pool = pool_deadline.clone();
-            let end_handle = tokio::spawn(async move {
-                let snap = TurnCompletionSnapshot {
-                    conversation_id: cid,
-                    turn_token: "tok-race".into(),
-                    locale: AppLocale::En,
-                    final_text: Arc::from("race-full"),
-                };
-                let txn = end_pool.conn.begin().await.expect("begin race end");
-                let result = apply_usable_completion(&txn, &snap, "end_turn")
-                    .await
-                    .expect("apply race");
-                txn.commit().await.expect("commit race end");
-                result
-            });
-            let deadline_handle = tokio::spawn(async move {
-                simulate_deadline_promote(&deadline_pool.conn, cid, "race-partial").await
-            });
-
-            let (end_res, deadline_res) = tokio::time::timeout(
-                ORDER_TIMEOUT,
-                async { tokio::join!(end_handle, deadline_handle) },
-            )
-            .await
-            .expect("deadline vs end-turn race must not hang");
-            let transition = end_res.expect("join end");
-            let promoted = deadline_res.expect("join deadline");
-
-            let job = auto_title_job::Entity::find_by_id(cid)
-                .one(&pool_end.conn)
-                .await
-                .unwrap()
-                .expect("job race");
-            assert_eq!(job.state, AutoTitleJobState::Ready);
-            assert_eq!(transition.usable_turn_seq, 1);
-            assert_eq!(job.usable_turn_seq, 1);
-            let assistant = job
-                .first_assistant_text
-                .as_deref()
-                .expect("exactly one first-assistant snapshot");
-            assert!(
-                assistant == "race-full" || assistant == "race-partial",
-                "unexpected assistant snapshot {assistant:?}"
-            );
-            // Exactly one first-ready writer wins: either promote rows=1 and
-            // end-turn does not re-write assistant, or end-turn became_ready
-            // and promote rows=0. Never both writing distinct snapshots.
-            if assistant == "race-full" {
-                assert_eq!(promoted, 0);
-                assert!(transition.became_ready);
-            } else {
-                assert_eq!(promoted, 1);
-                assert!(!transition.became_ready);
-            }
         }
 
         drop(dir);
