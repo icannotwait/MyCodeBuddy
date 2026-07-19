@@ -2,7 +2,27 @@
 
 Date: 2026-07-20
 
-Status: Design written; awaiting user review before implementation plan
+Status: Design revised after Codex review (NEEDS_REWORK → fixes applied);
+awaiting implementation plan
+
+## Revision note (Codex review)
+
+Addressed Critical and Important findings from Codex CLI review of the first
+draft. Major corrections:
+
+- Maximize only on **successful settle** of a creating generation (not at seed).
+- Cold/warm failure matrix per call site; Office runtime errors excluded.
+- Translation uses reserved cwd + centralized hidden-generation policy (not
+  workspace cwd); parallel runner, not title-trait branches.
+- SQLite purpose migration for `translate`; registry retention/rate limits.
+- Fail-closed placeholder integrity; no fuzzy restore; no result tab on mismatch.
+- `format: Markdown | PlainText`; **drop `.mdx` from v1**.
+- Dedicated `save_translation_as` with workspace isolation and exclusive create.
+- Transport `timeoutMs` ≥ backend deadline + cleanup; conservative size cap.
+- Typed `AppErrorCode` / i18n keys; no client-disconnect cancel in v1.
+- Transient translation tab model; request generation; click-time snapshot.
+- Escape precedence; dirty-tab confirm; post-save exclusive path rules.
+- Provider disclosure; complete i18n; locale wire conversion.
 
 ## Summary
 
@@ -10,562 +30,512 @@ This change improves the file workspace open/close experience and adds an
 on-demand document translation action that reuses the configured automatic-title
 agent (`auto_title_agent`).
 
-1. **Open UX**: clicking a file that cannot be loaded must not leave an error
-   tab (“error window”). Show a toast only. Successfully opening a **new** file
-   tab defaults the files pane to maximized. `Escape` closes the active file
-   tab.
-2. **Document translation**: for Markdown / plain-text documents, a toolbar
-   action translates content into the current application interface language via
-   the same global title agent, opens a **read-only preview tab**, and offers
-   **Save as…**. Code blocks and proper/technical English terms must not be
-   translated away.
+1. **Open UX**: cold open failures toast and remove the tab (no sticky error
+   body). After a **successful first settle** of a newly created file tab,
+   maximize the files pane. `Escape` closes the active file tab (with dirty
+   confirm and overlay precedence).
+2. **Document translation**: for Markdown / plain text only, a toolbar action
+   translates a **click-time content snapshot** into the current UI language
+   via a hidden one-shot agent run (same agent setting as auto-title), opens a
+   **transient read-only tab**, and offers **Save as…** through a dedicated
+   write API. Fenced/inline code is structurally protected (fail-closed).
+   Technical English preservation is **best-effort via prompt**, not a hard
+   guarantee.
 
-Both desktop (Tauri) and server (Axum) transports expose the same behavior.
+Desktop and server transports share the same commands/handlers.
 
 ## Goals
 
-- On cold-load failure of a newly opened file tab: toast + remove the tab; never
-  surface the current `unableLoadContent` error body as a sticky error window.
-- On first successful seed of a **new** file tab: set `filesMaximized = true`.
+- Cold-load failure of a newly opened **file** tab: toast + remove tab; never
+  leave `unableLoadContent` as a sticky error window for that path.
+- Maximize files pane only after the **first successful settle** of a creating
+  generation, while that tab is still active.
 - Re-activating an already-open tab does **not** force maximize.
-- `Escape` closes the current file tab when the files workspace is interactive
-  (fusion + files pane active, or files maximized). Dialogs, composers, and
-  other focus traps that already consume Escape keep precedence.
-- Toolbar “Translate to current language” for Markdown / plain-text file tabs
-  only, using `auto_title_agent` and the current UI locale.
-- If the title agent is unset or unavailable: toast that points the user to
-  conversation-experience settings; do not start a runner.
-- Translation result lands in a new read-only tab; optional Save as… writes a
-  new path without overwriting the source.
-- Preserve fenced/inline code and proper English terminology (APIs, brands,
-  identifiers, paths, commands).
+- `Escape` closes the current file tab in files context, after overlay/dialog
+  precedence and using existing dirty confirmation.
+- Translate toolbar for `.md` / `.markdown` / `.txt` only; uses
+  `auto_title_agent` + current UI locale.
+- Agent unset/unavailable: toast; no runner spawn.
+- Result: transient readonly tab + Save as… (exclusive create, never overwrite
+  source or existing files in v1).
+- Hard guarantee: protected code placeholders restore 1:1 or fail with no tab.
+- Soft quality: prompt asks to keep proper/technical English terms.
 
 ## Non-goals
 
-- Auto-translating on every file open.
-- Translating source code, images, Office binaries, or HTML preview shells as a
-  first-class path (HTML may be text-openable but is out of the translate
-  button whitelist unless listed below).
-- Changing the automatic conversation title job coordinator, job table, or
-  title-finalized persistence model.
-- Side-by-side original/translation split view.
-- Offline / non-agent machine translation.
-- Per-project translation-agent overrides.
-- Streaming partial translation into the editor (one-shot result is enough).
-- Replacing native OS “open with” for unsupported binaries beyond toast messaging.
+- Auto-translate on open; chunked multi-call translation in v1.
+- MDX, HTML, source code, images, Office as translate targets.
+- Changing auto-title job coordinator / `auto_title_jobs` / finalized flags.
+- Side-by-side split view; streaming translation UI.
+- User cancel mid-run or client-disconnect cancel in v1 (runner always cleans up).
+- Per-project translation agent; glossary UI.
+- Claiming “hidden from Codeg” means deleted from the agent CLI or private from
+  the model provider.
 
 ## Confirmed Product Decisions
 
 | Area | Decision |
 | --- | --- |
-| Unopenable file | Any cold-load failure → toast only, no error tab retained |
-| Expand default | New file tab → `filesMaximized = true` |
-| Existing tab click | Activate only; do not force maximize |
-| Escape | Close current file tab (empty workspace → conversation mode) |
-| Translate entry | Toolbar button after open |
-| Translate types | Markdown / plain text only (`.md`, `.mdx`, `.markdown`, `.txt`) |
-| Translate agent | Global `auto_title_agent` (same setting as auto titles) |
-| Agent off / missing | Toast → configure in settings |
-| Translate output | Read-only new tab + Save as… |
-| Code / terms | Do not translate code blocks; keep proper/technical English |
-| Open architecture | Seed loading tab first; on cold failure close + toast (Approach 1) |
-
-## Current Behavior (baseline)
-
-### Open path
-
-`openFilePreview` in `workspace-context.tsx`:
-
-1. Resolves absolute path, builds a seed tab, runs `decideLoad`.
-2. Cold open calls `seedLoadingTab` → tab appears, files pane activates, mode
-   becomes `fusion`.
-3. Fetch succeeds → content settled on the tab.
-4. Fetch fails → `rejectTab` writes `unableLoadContent` into tab content and
-   `saveState: "error"`. The tab remains open (the “error window”).
-
-`filesMaximized` defaults to `false`. It resets when all file tabs close.
-`seedLoadingTab` already defaults Markdown/HTML to **preview** mode
-(`previewFileTabIds`); that is independent of maximize.
-
-### Close / shortcuts
-
-`FileWorkspaceTabBar` handles close-current / close-all via configurable
-shortcuts (`close_current_tab` defaults to `Mod+W`). There is no Escape handler
-for file tabs today.
-
-### Title agent
-
-Backend owns `auto_title` with:
-
-- Settings: `auto_title_agent: Option<AgentType>`
-- `HiddenAgentRunner`: isolated one-turn ACP session
-  (`ConnectionPurpose::InternalTitle`, `EventEmitter::Noop`)
-- Sessions registered in `InternalAgentSessionRegistry` so they never appear in
-  Codeg conversation lists
-- Prompt language driven by `AppLocale` (system / interface language)
-
-Document translation reuses this agent setting and the same class of hidden
-runner, not the durable auto-title job table.
+| Cold file open fail | Toast + close tab (no error body) |
+| Warm user reload fail | Keep prior content + toast; clear loading |
+| Watcher external delete | Keep existing `rejectFileTab` policy (replace with error) |
+| Office runtime fail | OfficePreview owns UI; not cold-close |
+| Maximize | On first **successful** settle of creating gen if tab still active |
+| Maximize scope | User-initiated file opens (file tree / openFilePreview); not auto-office, not silent |
+| Existing tab click | Activate only |
+| Escape | Close current file tab via existing close path |
+| Translate types | `.md`, `.markdown`, `.txt` only |
+| Translate agent | Global `auto_title_agent` |
+| Agent off | Toast → settings |
+| Output | Transient readonly tab + Save as… |
+| Code protection | Structural placeholders; fail-closed |
+| Technical English | Best-effort prompt only |
+| Open architecture | Seed loading first; cold fail close + toast |
+| Save as | Dedicated API; exclusive create; no overwrite |
+| Cancellation (v1) | No user cancel; busy rejection if at capacity |
+| Same UI language as source | Still run model (no auto language detection) |
 
 ---
 
 ## Architecture
 
-### Component map
+### Components
 
-| Unit | Responsibility | Depends on |
-| --- | --- | --- |
-| `openFilePreview` / load settle path | Cold-fail close + toast; maximize on new seed | `toast`, `setFilesMaximized`, tab state |
-| `seedLoadingTab` | When inserting a **new** file tab, maximize | files maximized state |
-| `FileWorkspaceTabBar` keyboard handler | Escape → `closeFileTab(active)` with guards | shortcuts, view state |
-| Translate toolbar control | Visibility, busy state, invoke translate | file tab, settings, API |
-| `translate_document` command/API | Validate, protect code, run agent, return text | title agent, locale, runner |
-| `DocumentTranslateRunner` (or extended hidden runner) | One-shot internal ACP prompt/collect | ConnectionManager, internal registry |
-| Markdown protect/restore helpers | Fence + inline code placeholders | pure functions, unit-tested |
-| Translation result tab | Read-only in-memory tab + Save as… | file tabs, `saveFileCopy` / save dialog |
+| Unit | Responsibility |
+| --- | --- |
+| `openFilePreview` settle/reject paths | Cold close + toast; warm toast-only; set `hasLoadedSuccessfully`; maximize on success |
+| Keyboard handler (files chrome) | Escape → close with precedence |
+| Translate toolbar | Eligibility, busy, invoke, request gen |
+| `DocumentTranslationService` | Process-wide admission (capacity 1 or 2), run lifecycle |
+| `DocumentTranslateRunner` | Parallel to title runner; shared hidden lifecycle helpers |
+| Markdown protect/restore | Pure; fail-closed integrity |
+| `save_translation_as` | Workspace-scoped exclusive write |
+| Transient tab insert | Typed `transient` metadata; no disk watch/reload/evict as pathless dirty |
 
-### Data flow — open failure
+### Hidden generation policy
+
+Title and translate share a single predicate, e.g.
+`ConnectionPurpose::is_hidden_generation()` (or equivalent on purpose enum),
+used everywhere `InternalTitle` is special-cased today:
+
+- MCP injection suppressed
+- Prompt admission / tools disabled for utility runs
+- Title-capture bypass
+- Terminal-prefix / background-watch suppression
+- Permission and question rejection
+- Noop event emitter
+- Internal session registry purpose filter
+
+**Working directory**: always under `InternalAgentSessionRegistry::reserved_root()`
++ unique UUID subdir (same as titles). **Never** the source file parent or
+workspace root. Source path is frontend display metadata only; full document
+text is in the prompt payload.
+
+Add `InternalSessionPurpose::Translate` and migrate
+`internal_agent_sessions.purpose` CHECK to allow `title|translate`.
+
+### Data flow — open
 
 ```text
-User clicks file
-  → openFilePreview
-  → seedLoadingTab (new) → filesMaximized = true
-  → readFileForEdit / image / office path
-  → success: settle content
-  → cold failure:
-        closeFileTab(tabId)   // or remove without rejectTab body
-        toast.error(message)
-        // do NOT rejectTab with unableLoadContent for cold opens
+openFilePreview
+  → resolve path (pre-seed failure → toast only, no tab)
+  → seedLoadingTab (loading; hasLoadedSuccessfully=false; NO maximize yet)
+  → fetch
+  → success settle:
+        hasLoadedSuccessfully=true
+        if this gen created the tab and tab still active → filesMaximized=true
+  → cold failure (never successfully loaded):
+        closeFileTab(tabId) + toast.error(i18n)
+  → warm failure (hasLoadedSuccessfully):
+        clear loading + toast; keep content
 ```
 
 ### Data flow — translate
 
 ```text
-User clicks Translate
-  → FE checks: file kind whitelist, non-empty content, agent configured
-  → FE optional busy UI on source tab / button
-  → FE calls translate_document({ path?, content, locale?, sourceLanguage? })
-  → BE:
-        load auto_title_agent; if None → error code AgentNotConfigured
-        protect markdown code spans → placeholders
-        build translate prompt (target locale + rules)
-        Hidden-style runner one turn
-        restore placeholders
-        return { translatedText, locale, titleHint }
-  → FE opens read-only tab with translated content (preview mode for md)
-  → User may Save as… → path picker / derived name → write new file → open that path
+Click Translate (snapshot content + requestGen++)
+  → FE: agent configured? size OK? → else toast
+  → call translate_document({ content, format, locale, folderId? }, timeoutMs=195000)
+  → BE DocumentTranslationService:
+        admit or translation_busy
+        protect → run hidden agent in reserved dir → restore exact
+        integrity fail → error, no partial body
+  → FE: if requestGen still current and source tab still open context:
+        insert transient translation tab (readonly)
+     else: drop late result
+  → Save as… → save_translation_as → open real path → close transient after load OK
 ```
 
 ---
 
 ## 1. File open / close UX
 
-### 1.1 Cold-load failure: no error tab
+### 1.1 Failure matrix
 
-**Definition — cold load**: the tab was created in this open attempt and has
-never reached a successful ready state with real content (only loading or empty
-seed). Includes first open and first open after the user closed the tab.
-
-**Definition — warm failure**: the tab already had successfully loaded content
-(or the user is forcing `reload` on an existing ready tab).
-
-| Case | Behavior |
+| Call site | Behavior |
 | --- | --- |
-| Cold load failure | Remove the tab; `toast.error` with a short message (path basename + reason). Do not call today’s `rejectTab` content-write path. |
-| Warm reload failure | Keep the previous content; `toast.error`. Do **not** replace the body with `unableLoadContent` and do **not** close the tab. |
-| In-flight superseded (stale gen) | No toast, no UI change (existing `settleFetch` false). |
-| User closed tab mid-load | No resurrection (existing reload-skip); no toast. |
+| `openFilePreview` cold fail (never `hasLoadedSuccessfully`) | Close tab + toast `unableOpenFile` |
+| `openFilePreview` warm fail / user reload | Keep content + toast; `loading=false` |
+| Path resolve / split fail **before** seed | Toast only; no tab |
+| `reloadOpenFileBackground` | Keep existing background semantics; do not invent error tabs for closed tabs; toast only if tab still open and warm |
+| `rejectFileTab` (watcher: external delete / unreadable) | **Unchanged**: mark error body so user does not keep believing stale disk content |
+| Diff / rich-diff open fail | Close cold diff tab + toast (same cold rule); warm rare for diffs |
+| Office shell seed success then OfficePreview runtime error | **Excluded** from cold-close; OfficePreview retry/setup UI stays |
+| Stale gen (`settleFetch` false) | No toast |
 
-Implementation sketch:
+Add `hasLoadedSuccessfully: boolean` on `FileWorkspaceTab` (default false;
+true after successful file/image/office settle).
 
-- Introduce `rejectColdOpen(tabId, errorMessage)` or a flag on reject:
-  - cold: if tab still exists and never ready → `closeFileTab` + toast
-  - warm: toast only; leave content; clear `loading`
-- Track “ever successfully loaded” per tab (e.g. `readyOnce` on the tab, or
-  infer: cold seed has empty content + loading, never settled success). Prefer
-  an explicit `hasLoadedSuccessfully: boolean` on `FileWorkspaceTab` defaulting
-  false, set true on successful settle for file/image/office.
+Toast: localized generic message + basename; put raw technical detail in
+console/log only (avoid dumping absolute paths in toast when possible). Use
+`<bdi>` for filenames in UI chrome where mixed scripts appear.
 
-Office and image paths follow the same cold/warm rules.
+### 1.2 Maximize
 
-Toast copy (i18n, all 10 locales): e.g. `unableOpenFile` —
-“Could not open {name}: {message}”.
+**Normative rule:** set `filesMaximized = true` only when:
 
-### 1.2 Default maximize on new file tab
+1. A successful settle completes for generation G that was started by a **new
+   tab insert** for that tab id, and
+2. The active file tab id is still that tab, and
+3. The open was **user-initiated** via `openFilePreview` / explicit open
+   actions (not office auto-preview, not automatic silent opens).
 
-In `seedLoadingTab` (or immediately after deciding a **new** tab is created):
+Do **not** maximize at `seedLoadingTab` time (avoids maximize flash on failure
+when other tabs already exist).
 
-```text
-setFilesMaximized(true)
+Provide a single internal helper used by insert paths:
+
+```ts
+insertFileTab(tab, { maximizeOnSuccess: boolean }): void
 ```
 
-Rules:
+Translation result insert uses `maximizeOnSuccess: true` (user-initiated
+translate). Auto-office open uses `maximizeOnSuccess: false`.
 
-- Only when a **new** tab is inserted (not cache-hit activate, not in-flight
-  dedup activate).
-- Diff / rich-diff tabs: apply the same maximize-on-new-seed for consistency
-  when opened from the tree/git UI (single layout rule: any new file-workspace
-  tab seeds maximized).
-- Existing effect that clears maximize when `fileTabs.length === 0` remains.
-- `activateConversationPane` still clears maximize (existing).
-- Mobile layout has no maximize overlay; maximize state may still flip but the
-  mobile shell continues to show the files section when `activePane === "files"`.
-  No separate mobile-only maximize UI is required.
+### 1.3 Escape
 
-### 1.3 Escape closes current file tab
+In files keyboard handler (same gate as close-current:
+`mode === "fusion" && (activePane === "files" || filesMaximized)`):
 
-Extend the keyboard handler in `FileWorkspaceTabBar` (or a co-located hook used
-by the files chrome):
+1. If `event.defaultPrevented` → return.
+2. If an open dialog/sheet/alertdialog focus scope contains focus → return
+   (Radix owns Escape).
+3. If focus is inside a portaled popover/menu that handles Escape → return.
+4. Monaco suggest/find widgets: if they consume Escape first, respect
+   `defaultPrevented`; do not force-close the tab over editor chrome.
+5. Else `preventDefault` + `closeFileTab(activeFileTabId)`.
 
-```text
-if key !== Escape → return
-if should not handle files shortcuts → return
-  (fusion && (activePane === "files" || filesMaximized))  // same as close tab
-if event defaultPrevented or target is editable inside a modal → respect
-if no activeFileTabId → return
-preventDefault
-closeFileTab(activeFileTabId)
-```
+`closeFileTab` already `window.confirm`s dirty tabs — Escape uses that path;
+confirm cancel leaves the tab open. Test confirm/cancel.
 
-Precedence:
+Escape is a **fixed** additional binding (not rebindable in v1), independent of
+`close_current_tab` shortcut.
 
-1. Open modal/dialog/sheet that uses Escape (Radix) — do not steal if focus is
-   inside dialog content, or if a higher-priority listener already handled it.
-2. Prefer listening in **bubble** phase after dialogs, or skip when
-   `event.defaultPrevented`.
-3. Do not close when focus is in the chat composer even if files are maximized
-   and conversation is `inert` — when maximized, conversation is inert so
-   Escape on files is correct.
-4. Configurable shortcut for close remains; Escape is an **additional** fixed
-   binding for close-current file tab in the files context (not rebindable in
-   v1 unless shortcuts system already supports a free key — keep Escape fixed
-   to match user request).
+### 1.4 Loading flash
 
-When the last tab closes, existing logic returns mode to `conversation` and
-clears maximize.
-
-### 1.4 Loading flash on cold failure
-
-Approach 1 accepts a brief loading tab that disappears on failure. No extra
-global spinner is required. If the failure is faster than paint, the user may
-only see the toast.
+Accepted: brief loading tab may paint then disappear on cold failure.
 
 ---
 
 ## 2. Document translation
 
-### 2.1 Eligibility (toolbar)
+### 2.1 Eligibility
 
-Show the Translate control when **all** hold:
+Show Translate when all hold:
 
-- Active tab `kind === "file"`
-- Not loading, not cold-error path
-- Path extension in whitelist (case-insensitive):
+- `kind === "file"` and not transient-translation (do not re-translate result)
+- Not loading
+- Extension in `{ .md, .markdown, .txt }` (case-insensitive)
+- Non-empty content (trim)
+- Not image/office languages
 
-  | Extension | Included |
-  | --- | --- |
-  | `.md`, `.mdx`, `.markdown` | yes |
-  | `.txt` | yes |
-  | others | no |
-
-- Content is non-empty after trim (or file has length > 0)
-- Not an image/office language shell
-
-Hide (do not disable-with-tooltip only) when ineligible, to reduce chrome noise.
-Optional: if agent is off, still show the button; click → toast to configure
-(so users discover the dependency).
+If agent is off, **show** button; click → `translateAgentNotConfigured` toast.
 
 ### 2.2 Locale and agent
 
-- **Target language**: current application interface language
-  (`AppLocale` / system language settings already used by auto-title). Frontend
-  may pass the active UI locale wire id; backend validates and falls back to
-  loaded system language if missing/invalid.
-- **Agent**: `load_auto_title_agent_from` — same as titles. No second setting.
-- **Unavailable agent**: if set but not enabled/installed at run time → error
-  `AgentUnavailable` with toast; do not silently pick another agent.
+- Target: current UI language. FE converts BCP-47-like intl locale to backend
+  wire via existing/`fromIntlLocale` mapping before call; BE re-validates with
+  `parse_supported_app_locale` and falls back to system language settings if
+  missing/invalid.
+- Agent: `load_auto_title_agent_from` only; no silent fallback agent.
+- Response returns typed locale wire id used for the run.
 
-### 2.3 API surface
-
-Shared core + Tauri command + Axum handler:
+### 2.3 API
 
 ```rust
-// Request
-pub struct TranslateDocumentParams {
-    /// Absolute path for display / default Save-as name; optional if content-only.
-    pub path: Option<String>,
-    /// Full document text (UTF-8). Required.
-    pub content: String,
-    /// Optional wire locale; backend resolves AppLocale.
-    pub locale: Option<String>,
+pub enum DocumentTranslateFormat {
+    Markdown,
+    PlainText,
 }
 
-// Response
+pub struct TranslateDocumentParams {
+    pub content: String,
+    pub format: DocumentTranslateFormat,
+    /// Optional wire locale (snake_case).
+    pub locale: Option<String>,
+    /// Optional display basename only (not used for FS access).
+    pub display_name: Option<String>,
+}
+
 pub struct TranslateDocumentResult {
     pub translated_content: String,
-    pub locale: String, // wire id
-    pub source_path: Option<String>,
+    pub locale: String,
+    pub format: DocumentTranslateFormat,
 }
 ```
 
-Errors (typed / string messages consistent with project patterns):
+**Size limits (authoritative on backend):**
 
-| Code / message key | When |
-| --- | --- |
-| `agent_not_configured` | `auto_title_agent` is None |
-| `agent_unavailable` | agent not enabled or not installed |
-| `content_empty` | empty content |
-| `content_too_large` | over size limit |
-| `unsupported_type` | optional BE check if path extension present and not whitelisted |
-| `cancelled` / `timeout` | runner cancelled or deadline |
-| `translate_failed` | runner/normalize failure |
+- Input: max **24_000** Unicode scalars (conservative for one-shot default
+  models without chunking). FE may pre-check with same constant shared or
+  duplicated and documented.
+- Output: max **96_000** UTF-8 bytes collected from the runner; over →
+  `TaskExecutionFailed` / translate failed.
+- Backend scalar count is authoritative (not JS UTF-16 `.length` alone).
 
-**Size limit**: reject when `content` char length > **120_000** Unicode scalars
-(~large README). Toast explains the limit. No chunking in v1.
+**Deadline:** backend overall **120s**. Frontend transport call uses
+`timeoutMs: 195_000` on Web and remote-desktop proxies (Tauri invoke has no
+client timeout). Document this in the API client helper.
 
-**Timeout**: overall deadline **180s** (documents are larger than titles; titles
-use 90s). Cancellation token if the client disconnects or user cancels (v1:
-button shows busy; optional cancel if transport supports abort — at least
-disable double-submit).
+**Admission:** process-wide `DocumentTranslationService` with capacity **1**
+in-flight. Additional requests return immediately with busy error (no queue
+wait in v1).
 
-### 2.4 Runner design
+**No v1 cancel API.** Runner always disconnects and removes run dir on all
+exit paths even if the HTTP client is gone.
 
-Reuse the hidden-agent pattern without coupling to `auto_title_jobs`:
+### 2.4 Errors (typed)
 
-- Add `ConnectionPurpose::InternalTranslate` (or a shared `InternalUtility`
-  with purpose tag in `InternalSessionPurpose`).
-- Register external session IDs in `InternalAgentSessionRegistry` with a
-  translate purpose so discovery ignores them (same as titles).
-- `EventEmitter::Noop`; unlinked one-turn prompt; no tools required in prompt
-  instructions (“Do not use tools”).
-- Working directory: source file’s parent if path known and under a workspace
-  root; else a neutral temp/workdir policy consistent with title runner
-  (prefer the active folder root when available from FE).
-- Collect final visible assistant text only (same delta collection style as
-  title runner, but **do not** apply 80-scalar title normalization).
-- Light post-process: trim outer markdown fences if the model wraps the entire
-  document in a single ``` pair incorrectly; do not strip internal structure.
+Map domain outcomes to `AppCommandError` with existing or added codes:
 
-Extract shared “spawn internal → register → prompt → collect → disconnect”
-from title runner only if the diff stays small; otherwise duplicate a thin
-`HiddenDocumentRunner` beside `HiddenAgentRunner` to avoid risky title
-regressions. Prefer shared private helpers over a forced mega-refactor.
+| Outcome | AppErrorCode | HTTP | i18n key |
+| --- | --- | --- | --- |
+| Agent None | `ConfigurationMissing` | 400 | `translateAgentNotConfigured` |
+| Agent unavailable | `DependencyMissing` | 400 | `translateAgentUnavailable` |
+| Empty content | `InvalidInput` | 400 | `translateContentEmpty` |
+| Too large | `InvalidInput` | 400 | `translateContentTooLarge` |
+| Unsupported format | `InvalidInput` | 400 | `translateUnsupportedFormat` |
+| Busy | `TurnInProgress` or new `RegistryOverloaded`-style if preferred; **use `TaskExecutionFailed` with stable `i18n_key` in detail if no perfect code** — prefer adding `Busy` only if project accepts enum growth; v1: **`InvalidRequest` is wrong**; use **`TurnInProgress` (409)** for busy | 409 | `translateBusy` |
+| Timeout | `SourceTimeout` is search-specific; prefer **`TaskExecutionFailed`** + i18n `translateTimeout` | 500/408 | `translateTimeout` |
+| Placeholder integrity | `InvalidInput` or `TaskExecutionFailed` + i18n | 500 | `translatePlaceholderIntegrityFailed` |
+| Runner/spawn fail | `TaskExecutionFailed` | 500 | `translateFailed` |
+| Save path invalid | `InvalidInput` / `PermissionDenied` | 400 | `translateSavePathRejected` |
+| Save exists | `AlreadyExists` | 409 | `translateSaveAlreadyExists` |
 
-### 2.5 Code and proper-English protection
+FE maps `error.i18n_key` / code to toasts; never parse English `message` for
+control flow.
 
-#### Structural protection (Markdown)
+### 2.5 Runner
 
-Before the model sees the text:
+- New `DocumentTranslateRunner` (parallel type), not methods on
+  `TitleAgentRunner` / `HiddenAgentRunner` title trait.
+- Extract shared helpers only where low-risk: reserved dir, discovery lease,
+  disconnect cleanup, private stream collect with **output byte cap**.
+- Purpose: `InternalTranslate` under `is_hidden_generation()`.
+- Register purpose `translate` in DB.
+- Prompt: no tools; return full body only; no outer commentary; placeholder
+  rules; best-effort technical English retention; target language display name.
+- **No** 80-scalar title normalization.
+- **No** outer-fence stripping heuristic (unsafe for legitimate fence-only
+  docs). Rely on prompt.
+- Rate limit: max **10** successful translate runs per process hour soft
+  counter optional; hard: capacity 1. Document that each run leaves a durable
+  internal session registry row (same class as titles); do not redesign
+  registry GC in v1 beyond purpose migration + tests that translate purpose
+  is filtered.
 
-1. Replace fenced code blocks (```` ``` ```` / `~~~`, with optional language
-   tag) with stable tokens: `⟦CODE_0⟧`, `⟦CODE_1⟧`, …
-2. Replace inline code `` `...` `` with `⟦INLINE_n⟧`.
-3. Do **not** protect indented-code-only edge cases in v1 if ambiguous; fenced
-   + inline cover the common case.
+### 2.6 Code protection (fail-closed)
 
-After the model returns:
+**Markdown format:**
 
-1. Restore all placeholders by index. If any placeholder is missing or altered,
-   attempt fuzzy restore (exact token search); on failure, append a short note
-   in toast that some code regions may need manual check, still show best-effort
-   text.
-2. Placeholders that appear **extra** in the output are stripped.
+1. Generate a per-request nonce; tokens like `⟦CGCODE_{nonce}_{n}⟧` and
+   `⟦CGINLINE_{nonce}_{n}⟧` that must not appear in source (collision check:
+   if source contains the nonce, regenerate).
+2. Replace fenced blocks (``` / ~~~ with optional info string) then inline
+   backticks (single-level; no nested fancy cases in v1).
+3. After model output: require **exactly** the same multiset of tokens in the
+   **same order** of first occurrence as emitted; restore 1:1.
+4. Any missing, duplicated, reordered, or altered token →
+   `translatePlaceholderIntegrityFailed`; **no result tab**.
 
-Helpers live in a pure module (Rust preferred so BE is source of truth;
-optional TS mirror only for tests if FE previews protection — default **BE
-only**).
+**PlainText format:** no structural protect; prompt-only for “do not alter
+code-like lines” best-effort.
 
-#### Prompt rules (semantic protection)
+### 2.7 Frontend result tab
 
-Prompt sketch (locale name from `locale_display_name`):
-
-```text
-Translate the following document into {Language}.
-Return only the full translated document body.
-Do not use tools. Do not wrap the entire answer in an outer code fence.
-Do not add a preface or commentary.
-
-Rules:
-- Preserve Markdown structure (headings, lists, links, tables).
-- Leave every placeholder like ⟦CODE_0⟧ and ⟦INLINE_1⟧ exactly unchanged.
-- Do not translate source code, shell commands, file paths, URLs, or
-  identifiers.
-- Keep proper nouns, product names, API names, and established technical
-  English terms in English when that is standard practice
-  (e.g. pull request, commit, endpoint names, library names).
-- Translate surrounding prose and documentation narrative into {Language}.
-
-Document:
-{protected_content}
+```ts
+transient: {
+  type: "translation"
+  sourceTabId: string
+  sourcePath: string | null
+  sourceContentHash: string // hash of snapshot
+  locale: string
+  format: "markdown" | "plainText"
+  suggestedName: string // e.g. README.zh_cn.md
+}
 ```
 
-“专有英语” is enforced primarily by these instructions; structural protection
-hard-guarantees code. No glossary UI in v1.
+- `path: null`, `readonly: true`, `kind: "file"`
+- Tab id: `translate:{sourceTabId}:{locale}:{requestGen}`
+- Title: i18n `translationTabTitle` with basename + locale label
+- Exclude from disk watch, stale reload, path-based eviction of clean
+  pathless tabs (pin transient tabs until user closes)
+- Maximize on successful insert (user action)
+- Request generation: ignore late responses when gen mismatch or user closed
+  source context (still allow showing result if only source closed? **Normative:
+  show result if gen matches and user did not start a newer translate on that
+  sourceTabId**; closing source tab does not cancel in-flight — result may still
+  open. Closing app mid-flight: drop.)
 
-### 2.6 Frontend result tab and Save as…
+### 2.8 Save as…
 
-**Result tab**:
+**API** `save_translation_as`:
 
-- New `FileWorkspaceTab` with `kind: "file"`, `readonly: true`,
-  `path: null` or a synthetic display path.
-- Prefer a dedicated id scheme: `translate:{sourceTabId}:{locale}:{stamp}` so it
-  does not collide with real paths.
-- `title`: `{basename} ({localeDisplay})` e.g. `README.md (简体中文)` or
-  `README.md (zh-CN)` — use short locale label from existing i18n helpers.
-- `content`: translated markdown/text; for `.md*` enable preview mode by default
-  (same as normal md seed).
-- Opening a result tab counts as a **new** tab → maximize (consistent rule).
-- Dirty state: false; editing disabled until Save as… produces a real path tab.
+```rust
+pub struct SaveTranslationAsParams {
+    pub folder_id: i32,
+    /// Relative path under that folder root (no absolute, no `..`).
+    pub relative_path: String,
+    pub content: String,
+}
+```
 
-**Save as…**:
+Server:
 
-- Button on the translation tab toolbar (or file tab bar overflow when the
-  active tab is a translation result).
-- Default filename: `{stem}.{localeWire}{ext}` e.g. `README.zh_cn.md` or
-  `README.zh-CN.md` — pick one convention and document it:
-  **`{stem}.{localeWire}{ext}`** with wire id as stored (`zh_cn`) →
-  `README.zh_cn.md`.
-- Default directory: same directory as source path when known; else active
-  folder root.
-- Use existing write APIs (`save_file_copy` / create + save) after path
-  confirmation. On web, follow existing file-write permission patterns.
-- After successful write: open the real file via `openFilePreview` (new tab or
-  replace flow per existing open rules) and optionally close the ephemeral
-  translation tab.
+1. Resolve `folder_id` → registered workspace root.
+2. Join and **canonicalize** parent; require parent is still under root.
+3. Reject symlink parents; reject absolute segments; reject `..`.
+4. Exclusive create (`create_new` / O_EXCL); if exists → `AlreadyExists`.
+5. Never overwrite source or any existing file in v1.
+6. Atomic write (write temp in same dir + rename) where OS allows; else
+   exclusive create + write + fsync best-effort.
 
-**Concurrency**:
+Default relative name: `{stem}.{locale_wire}{ext}` with backend wire id
+(`zh_cn` → `README.zh_cn.md`).
 
-- One in-flight translation per source tab id (button disabled / spinner).
-- A second click while busy is ignored.
-- Global multi-tab: allow different source tabs to translate in parallel up to
-  a small backend semaphore (e.g. 2) to avoid spawning many CLIs; excess waits
-  or returns busy error.
+**Post-save:** open absolute path via `openFilePreview` (reload if tab exists);
+on successful load, **close** the transient translation tab. Do not leave
+duplicate transient + real tabs.
 
-### 2.7 Settings / discovery
+### 2.9 Provider disclosure
 
-No new setting. Conversation-experience settings copy may add one sentence:
-“The automatic title agent is also used for document translation.”
-
-Toast when not configured: link-like text is plain toast in v1 (“Set an
-automatic title agent in Settings → …”). Exact settings path string uses
-existing navigation labels.
+Settings blurb and/or first-use toast: document text is sent to the configured
+title agent / its provider; sessions may remain in that CLI’s storage; Codeg
+only hides internal sessions from Codeg lists.
 
 ---
 
-## 3. Error handling matrix
+## 3. Internationalization
 
-| Situation | UX |
-| --- | --- |
-| Cold open fail | Close tab + error toast |
-| Warm reload fail | Keep content + error toast |
-| Translate, agent off | Error toast, stay on source tab |
-| Translate, agent unavailable | Error toast |
-| Translate, too large | Error toast with limit |
-| Translate, timeout/fail | Error toast; no empty result tab |
-| Translate, placeholder restore partial | Open tab + warning toast |
-| Save as cancelled | No-op |
-| Save as fail | Error toast; keep ephemeral tab |
+Namespaces:
 
----
+- Open errors: `Folder.workspaceContext` (or existing workspace keys)
+- Controls: `Folder.fileWorkspace`
 
-## 4. Internationalization
+Keys (all 10 catalogs):
 
-Add keys to all 10 locale catalogs under `Folder.fileWorkspace` (or adjacent):
-
-- `unableOpenFile`
-- `translateToCurrentLanguage` (button)
+- `unableOpenFile` — `{name}`
+- `translateToCurrentLanguage`
 - `translating`
 - `translateAgentNotConfigured`
 - `translateAgentUnavailable`
-- `translateContentTooLarge`
+- `translateContentEmpty`
+- `translateContentTooLarge` — `{limit}`
+- `translateUnsupportedFormat`
+- `translateBusy`
+- `translateTimeout`
 - `translateFailed`
-- `translatePlaceholderWarning`
+- `translatePlaceholderIntegrityFailed`
+- `translateSavePathRejected`
+- `translateSaveAlreadyExists`
 - `saveTranslationAs`
-- `translationTabTitle` (`{name}`, `{locale}`)
-
-Reuse existing maximize/close strings where possible.
+- `translationTabTitle` — `{name}`, `{locale}`
+- `translateProviderDisclosure` (settings help)
 
 ---
 
-## 5. Testing
+## 4. Testing
 
 ### Frontend
 
-- `openFilePreview` cold failure: no residual tab; toast called; maximize reset
-  if no tabs remain.
-- Warm reload failure: tab remains with prior content; toast called.
-- New seed sets `filesMaximized` true; activate existing does not toggle.
-- Escape closes active file tab when files context active; ignored when no
-  active tab.
-- Translate button visibility for md/txt vs `.rs` / image.
-- Translate success opens readonly tab; agent-null path toasts.
+- Cold open fail: no residual tab; toast; no maximize stuck when other tabs
+  existed.
+- Warm reload fail: content preserved.
+- Pre-resolve fail: toast, no tab.
+- Maximize only after success; not on failed cold open.
+- Escape: closes; dirty confirm cancel; defaultPrevented skips.
+- Translate button visibility; agent-null toast; busy double-click.
+- Late result gen mismatch dropped.
+- Transient tab not disk-watched; save-as flow closes transient after open.
 
-### Backend / pure
+### Backend
 
-- Markdown protect/restore round-trip with nested fences, inline code, multiple
-  blocks.
-- Prompt includes locale display name and placeholder rule (unit on builder).
-- `translate_document` core: agent none → error; empty → error; oversize →
-  error.
-- Runner integration tests with fake connection driver (mirror title runner
-  style) for happy path and timeout.
-- Internal session registration uses translate purpose and is filtered from
-  discovery.
+- Protect/restore happy path; missing/dup/reorder/collision fail.
+- Agent none / unavailable / empty / oversize.
+- Busy second concurrent call.
+- Timeout path disconnects and removes run dir.
+- Hidden policy guards for `InternalTranslate` (each manager special case).
+- DB migration purpose check; discovery filters translate purpose.
+- `save_translation_as`: traversal, symlink, absolute, exists, happy exclusive.
+- Output byte cap.
+- Transport client uses 195s timeout (unit on API wrapper).
 
 ### Manual smoke
 
-- Open missing file from tree → toast only.
-- Open README.md → maximized; Escape closes.
-- Translate README with code fences → code unchanged; prose in UI language.
-- Save as → new file on disk opens correctly.
+- Missing file → toast only.
+- Open md → maximize after load; Escape closes.
+- Translate with fences → code identical; prose translated.
+- Save as new name → file on disk; transient gone.
 
 ---
 
-## 6. Implementation sequence (for later planning)
+## 5. Implementation phases (single plan, ordered)
 
-1. Open UX: cold-fail close + toast; `hasLoadedSuccessfully`; maximize on seed;
-   Escape handler; tests.
-2. Protect/restore pure helpers + unit tests.
-3. Translate runner + command/handler + API client.
-4. Toolbar button, busy state, result tab, Save as….
-5. i18n strings (10 locales).
-6. Docs tweak on conversation-experience settings blurb.
+Plan may be one file with tasks ordered so each is shippable:
+
+1. Open UX (fail matrix, maximize-on-success, Escape) + tests  
+2. Hidden purpose migration + `is_hidden_generation` generalization + tests  
+3. Protect/restore pure module + tests  
+4. DocumentTranslateRunner + service + command/handler + API client  
+5. FE toolbar, transient tab, request gen  
+6. `save_translation_as` + FE Save as…  
+7. i18n (10 locales) + settings disclosure  
 
 ---
 
-## 7. Risks and mitigations
+## 6. Risks
 
 | Risk | Mitigation |
 | --- | --- |
-| Model still translates code despite prompt | Placeholder protection |
-| Model corrupts placeholders | Restore validation + warning toast |
-| Long docs hit agent limits | 120k scalar cap + 180s deadline |
-| Title runner refactors break titles | Prefer thin parallel runner or shared helpers with title tests green |
-| Escape steals from dialogs | defaultPrevented / focus checks |
-| Maximize surprises power users | Only on **new** tab seed; manual restore still available |
-| Ephemeral tab has no path for watchers | No workspace watch; readonly |
+| Model context too small | 24k scalar input cap |
+| Placeholder corruption | Fail-closed, no tab |
+| Title regressions | Parallel runner; shared helpers only with title tests green |
+| Escape vs Monaco | defaultPrevented |
+| Path escape on save | folder_id + relative + canonicalize + exclusive |
+| Provider privacy | Disclosure copy |
+| Registry growth | Capacity 1; accept title-like retention in v1 |
 
 ---
 
-## 8. Open implementation notes (resolved defaults)
+## 7. Fixed defaults
 
-These are fixed defaults for implementers; change only if implementation hits a
-hard platform constraint:
-
-- Size limit: **120_000** Unicode scalars.
-- Translate deadline: **180** seconds.
-- Save-as default name: `{stem}.{locale_wire}{ext}`.
-- Whitelist: `.md`, `.mdx`, `.markdown`, `.txt`.
-- Escape: fixed key, files context only.
-- No chunked translation in v1.
+| Parameter | Value |
+| --- | --- |
+| Input max scalars | 24_000 |
+| Output max UTF-8 bytes | 96_000 |
+| Backend deadline | 120s |
+| FE transport timeoutMs | 195_000 |
+| In-flight capacity | 1 |
+| Extensions | `.md`, `.markdown`, `.txt` |
+| Save-as name | `{stem}.{locale_wire}{ext}` |
+| Save overwrite | Never in v1 |
+| Cwd | reserved_root only |
 
 ---
 
 ## Spec self-review
 
-- No TBD/TODO placeholders left for product decisions.
-- Open UX and translation share layout (maximize) but not failure paths.
-- Scope is one feature slice suitable for a single implementation plan with
-  ordered tasks.
-- “专有英语” interpreted as proper nouns + established technical English, with
-  structural code protection explicit.
+- Critical Codex items addressed with normative text (no optional forks).
+- Open and translate remain one plan with phased tasks.
+- Hard vs soft guarantees for code vs terminology explicit.
+- No reliance on non-existent `save_file_copy` destination semantics.
