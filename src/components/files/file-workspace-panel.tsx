@@ -27,6 +27,7 @@ import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
   type FileWorkspaceTab,
+  type OpenFileSettleResult,
 } from "@/contexts/workspace-context"
 import { ImagePreview } from "@/components/files/image-preview"
 import { HtmlPreview } from "@/components/files/html-preview"
@@ -878,7 +879,7 @@ function DiffFileList({
   badge?: string | null
   description?: string | null
   onOpenDiff: (path: string) => Promise<void>
-  openFilePreview: (path: string) => Promise<void>
+  openFilePreview: (path: string) => Promise<OpenFileSettleResult>
 }) {
   const t = useTranslations("Folder.fileWorkspacePanel")
   return (

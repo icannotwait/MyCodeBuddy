@@ -235,6 +235,7 @@ beforeEach(() => {
 const mockedApi = api as unknown as {
   getHomeDirectory: ReturnType<typeof vi.fn>
   readFileForEdit: ReturnType<typeof vi.fn>
+  readFileBase64: ReturnType<typeof vi.fn>
   gitIsTracked: ReturnType<typeof vi.fn>
   gitShowFile: ReturnType<typeof vi.fn>
   saveFileContent: ReturnType<typeof vi.fn>
@@ -3582,6 +3583,253 @@ describe("openFilePreview failure matrix and maximize-on-success", () => {
 
     expect(snap.tabCount).toBe(1)
     expect(snap.content).toBe("bg-kept")
+    expect(snap.loading).toBe(false)
+    expect(toastMock.error).toHaveBeenCalled()
+  })
+
+  it("concurrent openFilePreview awaits shared settle (does not claim ok while in-flight)", async () => {
+    let resolveRead: ((v: ReturnType<typeof editPayload>) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((res) => (resolveRead = res))
+    )
+
+    const settles: unknown[] = []
+    function Probe() {
+      const { openFilePreview } = useWorkspaceContext()
+      return (
+        <div>
+          <button
+            onClick={() => {
+              void openFilePreview("a.ts").then((r) => settles.push(r))
+            }}
+          >
+            open-1
+          </button>
+          <button
+            onClick={() => {
+              void openFilePreview("a.ts").then((r) => settles.push(r))
+            }}
+          >
+            open-2
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-1").click()
+      screen.getByText("open-2").click()
+    })
+
+    // Neither concurrent caller may resolve as ok before the read settles.
+    expect(settles).toEqual([])
+    expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveRead!(editPayload("a.ts", "shared"))
+    })
+
+    expect(settles).toHaveLength(2)
+    expect(settles[0]).toEqual({
+      ok: true,
+      tabId: fileTabId("/repo/a.ts"),
+    })
+    expect(settles[1]).toEqual({
+      ok: true,
+      tabId: fileTabId("/repo/a.ts"),
+    })
+  })
+
+  it("concurrent openFilePreview shares failure settle (not premature ok)", async () => {
+    let rejectRead: ((err: Error) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () =>
+        new Promise((_res, rej) => {
+          rejectRead = rej
+        })
+    )
+
+    const settles: unknown[] = []
+    function Probe() {
+      const { openFilePreview, fileTabs } = useWorkspaceContext()
+      return (
+        <div>
+          <output data-testid="tab-count">{fileTabs.length}</output>
+          <button
+            onClick={() => {
+              void openFilePreview("missing.ts").then((r) => settles.push(r))
+            }}
+          >
+            open-1
+          </button>
+          <button
+            onClick={() => {
+              void openFilePreview("missing.ts").then((r) => settles.push(r))
+            }}
+          >
+            open-2
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-1").click()
+      screen.getByText("open-2").click()
+    })
+    expect(settles).toEqual([])
+
+    await act(async () => {
+      rejectRead!(new Error("ENOENT"))
+    })
+
+    expect(settles).toHaveLength(2)
+    expect(settles[0]).toEqual({ ok: false, reason: "load" })
+    expect(settles[1]).toEqual({ ok: false, reason: "load" })
+    expect(screen.getByTestId("tab-count")).toHaveTextContent("0")
+  })
+
+  it("warm fail after rejectFileTab retry keeps non-empty last-good content", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(editPayload("a.ts", "prior-body"))
+      .mockRejectedValueOnce(new Error("retry-fail"))
+
+    let snap: {
+      content: string
+      loading: boolean
+      saveState?: string
+      tabCount: number
+      hasLoadedSuccessfully?: boolean
+    } = { content: "", loading: false, tabCount: 0 }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openFilePreview, activeFileTab, rejectFileTab, fileTabs } =
+        useWorkspaceContext()
+      onCapture({
+        content: activeFileTab?.content ?? "",
+        loading: activeFileTab?.loading ?? false,
+        saveState: activeFileTab?.saveState,
+        tabCount: fileTabs.length,
+        hasLoadedSuccessfully: activeFileTab?.hasLoadedSuccessfully,
+      })
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("a.ts")}>open</button>
+          <button
+            onClick={() => rejectFileTab("/repo/a.ts", "ENOENT: file removed")}
+          >
+            reject
+          </button>
+          <button
+            onClick={() => void openFilePreview("a.ts", { reload: true })}
+          >
+            retry
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.content).toBe("prior-body")
+
+    await act(async () => {
+      screen.getByText("reject").click()
+    })
+    expect(snap.saveState).toBe("error")
+    expect(snap.content).not.toBe("prior-body")
+
+    await act(async () => {
+      screen.getByText("retry").click()
+    })
+
+    // Warm: tab stays, last-good content restored, no saveState error body.
+    expect(snap.tabCount).toBe(1)
+    expect(snap.content).toBe("prior-body")
+    expect(snap.loading).toBe(false)
+    expect(snap.saveState).not.toBe("error")
+    expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(toastMock.error).toHaveBeenCalled()
+  })
+
+  it("image open sets hasLoadedSuccessfully; warm fail does not cold-close", async () => {
+    mockedApi.readFileBase64
+      .mockResolvedValueOnce("aaa")
+      .mockRejectedValueOnce(new Error("image-io-fail"))
+
+    let snap: {
+      content: string
+      loading: boolean
+      language?: string
+      tabCount: number
+      hasLoadedSuccessfully?: boolean
+    } = { content: "", loading: false, tabCount: 0 }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openFilePreview, activeFileTab, fileTabs } = useWorkspaceContext()
+      onCapture({
+        content: activeFileTab?.content ?? "",
+        loading: activeFileTab?.loading ?? false,
+        language: activeFileTab?.language,
+        tabCount: fileTabs.length,
+        hasLoadedSuccessfully: activeFileTab?.hasLoadedSuccessfully,
+      })
+      return (
+        <div>
+          <button onClick={() => void openFilePreview("photo.png")}>
+            open-image
+          </button>
+          <button
+            onClick={() => void openFilePreview("photo.png", { reload: true })}
+          >
+            reload-image
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-image").click()
+    })
+
+    expect(snap.language).toBe("image")
+    expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(snap.content).toContain("data:image/png;base64,aaa")
+    expect(snap.tabCount).toBe(1)
+
+    await act(async () => {
+      screen.getByText("reload-image").click()
+    })
+
+    // Warm fail: tab remains with prior image content (not cold-removed).
+    expect(snap.tabCount).toBe(1)
+    expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(snap.content).toContain("data:image/png;base64,aaa")
     expect(snap.loading).toBe(false)
     expect(toastMock.error).toHaveBeenCalled()
   })

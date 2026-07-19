@@ -411,6 +411,18 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   //       matches — preventing an orphaned fetch (after close+reopen, or
   //       a superseding refresh) from clobbering the tab.
   const inFlightLoadsRef = useRef<Map<string, number>>(new Map())
+  // tabId -> shared settle Deferred for the current openFilePreview gen.
+  // Concurrent openFilePreview calls that hit the in-flight dedup await this
+  // so they observe the real settle outcome (not a premature ok:true).
+  const openSettleDeferredRef = useRef<
+    Map<
+      string,
+      {
+        promise: Promise<OpenFileSettleResult>
+        resolve: (result: OpenFileSettleResult) => void
+      }
+    >
+  >(new Map())
   const nextLoadGenRef = useRef(0)
   // Most-recently-active tab ids, most recent first. Drives the memory
   // guardrail's least-recently-active eviction order.
@@ -635,28 +647,35 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     )
   }, [])
 
-  // Reset an errored tab to a clean cold-load state. The previous error
-  // message is currently stored in `content`; clear it so the next load
-  // re-enters the placeholder branch instead of flashing the error string.
+  // Reset an errored tab for retry. Prefer last-known-good buffer
+  // (`savedContent`) so a warm fail cannot leave the tab blank after
+  // rejectFileTab wrote an error body into `content`.
   const markErrorRetry = useCallback(
     (tabId: string, kind: FileWorkspaceTabKind) => {
-      setFileTabs((prev) =>
-        prev.map((tab) =>
-          tab.id === tabId
-            ? {
-                ...tab,
-                loading: true,
-                content: "",
-                originalContent:
-                  kind === "rich-diff" ? undefined : tab.originalContent,
-                modifiedContent:
-                  kind === "rich-diff" ? undefined : tab.modifiedContent,
-                saveState: "idle",
-                saveError: null,
-              }
-            : tab
-        )
-      )
+      const patchTab = (tab: FileWorkspaceTab): FileWorkspaceTab => {
+        if (tab.id !== tabId) return tab
+        // Error body is in content; restore from savedContent when present.
+        // Otherwise keep prior content only if it was not an error state.
+        const restoreContent =
+          typeof tab.savedContent === "string" && tab.savedContent.length > 0
+            ? tab.savedContent
+            : tab.saveState === "error"
+              ? ""
+              : tab.content
+        return {
+          ...tab,
+          loading: true,
+          content: restoreContent,
+          originalContent:
+            kind === "rich-diff" ? undefined : tab.originalContent,
+          modifiedContent:
+            kind === "rich-diff" ? undefined : tab.modifiedContent,
+          saveState: "idle" as const,
+          saveError: null,
+        }
+      }
+      setFileTabs((prev) => prev.map(patchTab))
+      fileTabsRef.current = fileTabsRef.current.map(patchTab)
     },
     []
   )
@@ -674,9 +693,40 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return updated
       })
       setActiveFileTabId(nextTab.id)
+      activeFileTabIdRef.current = nextTab.id
       activateFilePane()
     },
     [activateFilePane]
+  )
+
+  const startOpenSettle = useCallback((tabId: string) => {
+    let resolve!: (result: OpenFileSettleResult) => void
+    const promise = new Promise<OpenFileSettleResult>((res) => {
+      resolve = res
+    })
+    openSettleDeferredRef.current.set(tabId, { promise, resolve })
+    return promise
+  }, [])
+
+  const finishOpenSettle = useCallback(
+    (tabId: string, result: OpenFileSettleResult) => {
+      const deferred = openSettleDeferredRef.current.get(tabId)
+      if (!deferred) return
+      openSettleDeferredRef.current.delete(tabId)
+      deferred.resolve(result)
+    },
+    []
+  )
+
+  // Eager same-turn ref patch so warm/cold classification after await does
+  // not depend on React committing the matching setFileTabs.
+  const patchFileTabRef = useCallback(
+    (tabId: string, patch: Partial<FileWorkspaceTab>) => {
+      fileTabsRef.current = fileTabsRef.current.map((tab) =>
+        tab.id === tabId ? { ...tab, ...patch } : tab
+      )
+    },
+    []
   )
 
   // Orchestrates the "I want to start (or restart) a load for this tab" flow.
@@ -795,25 +845,22 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const resolveTab = useCallback(
     (tabId: string, content: string, loading = false) => {
+      const patch = loading
+        ? { content, loading }
+        : {
+            content,
+            loading: false,
+            hasLoadedSuccessfully: true as const,
+            saveState: "idle" as const,
+          }
       setFileTabs((prev) =>
-        prev.map((tab) =>
-          tab.id === tabId
-            ? {
-                ...tab,
-                content,
-                loading,
-                ...(loading
-                  ? {}
-                  : {
-                      hasLoadedSuccessfully: true,
-                      saveState: "idle" as const,
-                    }),
-              }
-            : tab
-        )
+        prev.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab))
       )
+      if (!loading) {
+        patchFileTabRef(tabId, patch)
+      }
     },
-    []
+    [patchFileTabRef]
   )
 
   // Remove a tab without dirty confirm (cold-open / cold-diff failure path).
@@ -821,6 +868,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const removeFileTabId = useCallback(
     (tabId: string) => {
       pendingMaximizeOnSuccessRef.current.delete(tabId)
+      // Do not finishOpenSettle here: cold-fail callers still need to
+      // resolve the Deferred with reason "load". User close paths finish
+      // settle themselves with reason "closed".
       setFileTabs((prev) => {
         const idx = prev.findIndex((tab) => tab.id === tabId)
         if (idx < 0) return prev
@@ -871,15 +921,19 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       pendingMaximizeOnSuccessRef.current.delete(tabId)
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
       if (existing?.hasLoadedSuccessfully) {
-        setFileTabs((prev) =>
-          prev.map((tab) =>
-            tab.id === tabId ? { ...tab, loading: false } : tab
-          )
-        )
-        const next = fileTabsRef.current.map((tab) =>
-          tab.id === tabId ? { ...tab, loading: false } : tab
-        )
-        fileTabsRef.current = next
+        // Warm keep: restore last-known-good if markErrorRetry / reject left
+        // content empty or only an error body while savedContent still holds
+        // the prior buffer.
+        const patchTab = (tab: FileWorkspaceTab): FileWorkspaceTab => {
+          if (tab.id !== tabId) return tab
+          const hasBody = tab.content.length > 0
+          const saved =
+            typeof tab.savedContent === "string" ? tab.savedContent : ""
+          const content = hasBody ? tab.content : saved
+          return { ...tab, content, loading: false }
+        }
+        setFileTabs((prev) => prev.map(patchTab))
+        fileTabsRef.current = fileTabsRef.current.map(patchTab)
       } else {
         removeFileTabId(tabId)
       }
@@ -895,22 +949,28 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       modifiedContent: string,
       loading = false
     ) => {
+      const patch = loading
+        ? {
+            originalContent,
+            modifiedContent,
+            content: "",
+            loading: true,
+          }
+        : {
+            originalContent,
+            modifiedContent,
+            content: "",
+            loading: false,
+            hasLoadedSuccessfully: true as const,
+          }
       setFileTabs((prev) =>
-        prev.map((tab) =>
-          tab.id === tabId
-            ? {
-                ...tab,
-                originalContent,
-                modifiedContent,
-                content: "",
-                loading,
-                ...(loading ? {} : { hasLoadedSuccessfully: true }),
-              }
-            : tab
-        )
+        prev.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab))
       )
+      if (!loading) {
+        patchFileTabRef(tabId, patch)
+      }
     },
-    []
+    [patchFileTabRef]
   )
 
   const consumePendingFileReveal = useCallback((requestId: number) => {
@@ -951,22 +1011,22 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             t("previewRequestTimedOut")
           )
           if (!settleFetch(tabId, gen)) return
+          const imagePatch = {
+            content: `data:${mime};base64,${b64}`,
+            savedContent: `data:${mime};base64,${b64}`,
+            readonly: true as const,
+            loading: false,
+            saveState: "idle" as const,
+            saveError: null,
+            stale: false,
+            hasLoadedSuccessfully: true as const,
+          }
           setFileTabs((prev) =>
             prev.map((tab) =>
-              tab.id === tabId
-                ? {
-                    ...tab,
-                    content: `data:${mime};base64,${b64}`,
-                    readonly: true,
-                    loading: false,
-                    saveState: "idle",
-                    saveError: null,
-                    stale: false,
-                    hasLoadedSuccessfully: true,
-                  }
-                : tab
+              tab.id === tabId ? { ...tab, ...imagePatch } : tab
             )
           )
+          patchFileTabRef(tabId, imagePatch)
           return
         }
 
@@ -979,28 +1039,25 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           t("previewRequestTimedOut")
         )
         if (!settleFetch(tabId, gen)) return
+        const textPatch = {
+          content: result.content,
+          gitBaseContent: dedupeGitBase(result.content, gitBaseContent),
+          savedContent: result.content,
+          isDirty: false,
+          etag: result.etag,
+          mtimeMs: result.mtime_ms,
+          readonly: result.readonly,
+          lineEnding: result.line_ending,
+          saveState: "idle" as const,
+          saveError: null,
+          loading: false,
+          stale: false,
+          hasLoadedSuccessfully: true as const,
+        }
         setFileTabs((prev) =>
-          prev.map((tab) =>
-            tab.id === tabId
-              ? {
-                  ...tab,
-                  content: result.content,
-                  gitBaseContent: dedupeGitBase(result.content, gitBaseContent),
-                  savedContent: result.content,
-                  isDirty: false,
-                  etag: result.etag,
-                  mtimeMs: result.mtime_ms,
-                  readonly: result.readonly,
-                  lineEnding: result.line_ending,
-                  saveState: "idle",
-                  saveError: null,
-                  loading: false,
-                  stale: false,
-                  hasLoadedSuccessfully: true,
-                }
-              : tab
-          )
+          prev.map((tab) => (tab.id === tabId ? { ...tab, ...textPatch } : tab))
         )
+        patchFileTabRef(tabId, textPatch)
       } catch (error) {
         if (!settleFetch(tabId, gen)) return
         // Warm toast if previously loaded; no-op path when tab was closed
@@ -1015,6 +1072,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       failOpenTab,
       fetchGitBase,
       markTabRefreshing,
+      patchFileTabRef,
       settleFetch,
       t,
     ]
@@ -1191,8 +1249,15 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           // typically also call markTabsStale, so this is usually
           // idempotent; the in-updater write protects direct callers.
           if (tab.isDirty) return { ...tab, stale: true }
+          // Preserve last-known-good buffer (text savedContent or image data
+          // URL in content) so markErrorRetry / warm fail can restore it.
+          const preservedSaved =
+            typeof tab.savedContent === "string" && tab.savedContent.length > 0
+              ? tab.savedContent
+              : tab.content
           return {
             ...tab,
+            savedContent: preservedSaved,
             content: t("unableLoadContent", { message: errorMessage }),
             loading: false,
             stale: false,
@@ -1201,6 +1266,23 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           }
         })
       )
+      // Mirror ref so same-turn openFilePreview retry sees savedContent.
+      fileTabsRef.current = fileTabsRef.current.map((tab) => {
+        if (tab.id !== tabId || tab.kind !== "file" || tab.isDirty) return tab
+        const preservedSaved =
+          typeof tab.savedContent === "string" && tab.savedContent.length > 0
+            ? tab.savedContent
+            : tab.content
+        return {
+          ...tab,
+          savedContent: preservedSaved,
+          content: t("unableLoadContent", { message: errorMessage }),
+          loading: false,
+          stale: false,
+          saveState: "error" as const,
+          saveError: errorMessage,
+        }
+      })
       settleFetch(tabId, gen)
     },
     [beginFetchGeneration, settleFetch, t]
@@ -1256,34 +1338,46 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       if (decision.kind === "skip") {
         const stillOpen = fileTabsRef.current.some((t) => t.id === tabId)
         if (!stillOpen) return { ok: false, reason: "closed" }
+        // Concurrent open while first request is still in flight: await the
+        // shared Deferred so callers observe the real settle outcome.
+        const pending = openSettleDeferredRef.current.get(tabId)
+        if (pending) return pending.promise
         return { ok: true, tabId }
       }
       const { gen } = decision
+      // Share settle outcome with concurrent openFilePreview callers.
+      startOpenSettle(tabId)
+
+      const settle = (result: OpenFileSettleResult): OpenFileSettleResult => {
+        finishOpenSettle(tabId, result)
+        return result
+      }
 
       try {
         // Office files (.docx/.xlsx/.pptx) are binary OpenXML — never read as
         // text. The OfficePreview component renders them via the OfficeCLI
         // backend on its own, so just settle the tab as a ready preview shell.
         if (office) {
-          if (!settleFetch(tabId, gen)) return { ok: false, reason: "stale" }
+          if (!settleFetch(tabId, gen)) {
+            return settle({ ok: false, reason: "stale" })
+          }
+          const officePatch = {
+            content: "",
+            readonly: true as const,
+            loading: false,
+            saveState: "idle" as const,
+            saveError: null,
+            stale: false,
+            hasLoadedSuccessfully: true as const,
+          }
           setFileTabs((prev) =>
             prev.map((tab) =>
-              tab.id === tabId
-                ? {
-                    ...tab,
-                    content: "",
-                    readonly: true,
-                    loading: false,
-                    saveState: "idle",
-                    saveError: null,
-                    stale: false,
-                    hasLoadedSuccessfully: true,
-                  }
-                : tab
+              tab.id === tabId ? { ...tab, ...officePatch } : tab
             )
           )
+          patchFileTabRef(tabId, officePatch)
           maybeMaximizeAfterSuccess(tabId)
-          return { ok: true, tabId }
+          return settle({ ok: true, tabId })
         }
 
         if (image) {
@@ -1294,25 +1388,28 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             15_000,
             t("previewRequestTimedOut")
           )
-          if (!settleFetch(tabId, gen)) return { ok: false, reason: "stale" }
+          if (!settleFetch(tabId, gen)) {
+            return settle({ ok: false, reason: "stale" })
+          }
+          const imageContent = `data:${mime};base64,${b64}`
+          const imagePatch = {
+            content: imageContent,
+            savedContent: imageContent,
+            readonly: true as const,
+            loading: false,
+            saveState: "idle" as const,
+            saveError: null,
+            stale: false,
+            hasLoadedSuccessfully: true as const,
+          }
           setFileTabs((prev) =>
             prev.map((tab) =>
-              tab.id === tabId
-                ? {
-                    ...tab,
-                    content: `data:${mime};base64,${b64}`,
-                    readonly: true,
-                    loading: false,
-                    saveState: "idle",
-                    saveError: null,
-                    stale: false,
-                    hasLoadedSuccessfully: true,
-                  }
-                : tab
+              tab.id === tabId ? { ...tab, ...imagePatch } : tab
             )
           )
+          patchFileTabRef(tabId, imagePatch)
           maybeMaximizeAfterSuccess(tabId)
-          return { ok: true, tabId }
+          return settle({ ok: true, tabId })
         }
 
         const [result, gitBaseContent] = await withTimeout(
@@ -1323,60 +1420,54 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           15_000,
           t("previewRequestTimedOut")
         )
-        if (!settleFetch(tabId, gen)) return { ok: false, reason: "stale" }
+        if (!settleFetch(tabId, gen)) {
+          return settle({ ok: false, reason: "stale" })
+        }
+        const textPatch = {
+          content: result.content,
+          gitBaseContent: dedupeGitBase(result.content, gitBaseContent),
+          savedContent: result.content,
+          isDirty: false,
+          etag: result.etag,
+          mtimeMs: result.mtime_ms,
+          readonly: result.readonly,
+          lineEnding: result.line_ending,
+          saveState: "idle" as const,
+          saveError: null,
+          loading: false,
+          stale: false,
+          hasLoadedSuccessfully: true as const,
+        }
         setFileTabs((prev) =>
-          prev.map((tab) =>
-            tab.id === tabId
-              ? {
-                  ...tab,
-                  content: result.content,
-                  gitBaseContent: dedupeGitBase(result.content, gitBaseContent),
-                  savedContent: result.content,
-                  isDirty: false,
-                  etag: result.etag,
-                  mtimeMs: result.mtime_ms,
-                  readonly: result.readonly,
-                  lineEnding: result.line_ending,
-                  saveState: "idle",
-                  saveError: null,
-                  loading: false,
-                  stale: false,
-                  hasLoadedSuccessfully: true,
-                }
-              : tab
-          )
+          prev.map((tab) => (tab.id === tabId ? { ...tab, ...textPatch } : tab))
         )
         // Keep ref current for immediate warm-fail checks / concurrent paths.
-        fileTabsRef.current = fileTabsRef.current.map((tab) =>
-          tab.id === tabId
-            ? {
-                ...tab,
-                content: result.content,
-                hasLoadedSuccessfully: true,
-                loading: false,
-              }
-            : tab
-        )
+        patchFileTabRef(tabId, textPatch)
         maybeMaximizeAfterSuccess(tabId)
-        return { ok: true, tabId }
+        return settle({ ok: true, tabId })
       } catch (error) {
-        if (!settleFetch(tabId, gen)) return { ok: false, reason: "stale" }
+        if (!settleFetch(tabId, gen)) {
+          return settle({ ok: false, reason: "stale" })
+        }
         if (requestedLine) {
           setPendingFileReveal((prev) =>
             prev && prev.path === absPath ? null : prev
           )
         }
         failOpenTab(tabId, displayName, error)
-        return { ok: false, reason: "load" }
+        return settle({ ok: false, reason: "load" })
       }
     },
     [
       decideLoad,
       failOpenTab,
       fetchGitBase,
+      finishOpenSettle,
       maybeMaximizeAfterSuccess,
+      patchFileTabRef,
       resolveOpenAbsolutePath,
       settleFetch,
+      startOpenSettle,
       t,
     ]
   )
@@ -2293,12 +2384,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         // Drop any in-flight marker so reopening this path does not get
         // deduped against a now-orphaned fetch.
         inFlightLoadsRef.current.delete(tabId)
+        finishOpenSettle(tabId, { ok: false, reason: "closed" })
         pendingMaximizeOnSuccessRef.current.delete(tabId)
 
         return next
       })
     },
-    [activateConversationPane, t]
+    [activateConversationPane, finishOpenSettle, t]
   )
 
   const closeOtherFileTabs = useCallback(
@@ -2315,14 +2407,17 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
         for (const closing of closingTabs) {
           inFlightLoadsRef.current.delete(closing.id)
+          finishOpenSettle(closing.id, { ok: false, reason: "closed" })
+          pendingMaximizeOnSuccessRef.current.delete(closing.id)
         }
 
         setActiveFileTabId(tabId)
+        activeFileTabIdRef.current = tabId
         activateFilePane()
         return remaining
       })
     },
-    [activateFilePane, t]
+    [activateFilePane, finishOpenSettle, t]
   )
 
   const closeAllFileTabs = useCallback(() => {
@@ -2332,7 +2427,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         if (!confirmed) return prev
       }
 
+      for (const tab of prev) {
+        finishOpenSettle(tab.id, { ok: false, reason: "closed" })
+      }
       inFlightLoadsRef.current.clear()
+      openSettleDeferredRef.current.clear()
       pendingMaximizeOnSuccessRef.current.clear()
       setActiveFileTabId(null)
       activeFileTabIdRef.current = null
@@ -2340,7 +2439,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       activateConversationPane()
       return []
     })
-  }, [activateConversationPane, t])
+  }, [activateConversationPane, finishOpenSettle, t])
 
   const reorderFileTabs = useCallback((tabs: FileWorkspaceTab[]) => {
     setFileTabs(tabs)
