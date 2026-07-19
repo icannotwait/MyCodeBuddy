@@ -11,7 +11,7 @@ use sea_orm::{
 };
 
 #[cfg(any(test, feature = "test-utils"))]
-use crate::acp::connection::matching_config_pair;
+use crate::acp::connection::{connection_channel, matching_config_pair, LaneSender};
 use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
     RouteBootstrapOutcome, SpawnHandshake, SuspensionAck,
@@ -49,13 +49,13 @@ use crate::models::system::AppLocale;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
 
 #[cfg(any(test, feature = "test-utils"))]
-fn test_control_sender() -> tokio::sync::mpsc::Sender<ConnectionControl> {
+fn test_control_sender() -> LaneSender<ConnectionControl> {
     // Synthetic connections have no conversation loop. Retain their bounded
     // receivers so manager control sends preserve the prior enqueue contract.
     static RECEIVERS: std::sync::OnceLock<
         std::sync::Mutex<Vec<tokio::sync::mpsc::Receiver<ConnectionControl>>>,
     > = std::sync::OnceLock::new();
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let (tx, rx, _liveness_rx) = connection_channel(32);
     RECEIVERS
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
         .lock()
@@ -492,7 +492,7 @@ impl ConnectionManager {
         emitter: EventEmitter,
     ) {
         use crate::acp::session_state::SessionState;
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx, _liveness_rx) = connection_channel(1);
         let mut state = SessionState::new(
             id.to_string(),
             agent_type,
@@ -549,7 +549,7 @@ impl ConnectionManager {
         emitter: EventEmitter,
     ) -> tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand> {
         use crate::acp::session_state::SessionState;
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx, _liveness_rx) = connection_channel(4);
         let mut state = SessionState::new(
             id.to_string(),
             agent_type,
@@ -4019,7 +4019,7 @@ mod tests {
     }
 
     fn fake_connection(id: &str, conv_id: Option<i32>) -> AgentConnection {
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx, _liveness_rx) = connection_channel(1);
         let mut state = SessionState::new(
             id.to_string(),
             crate::models::agent::AgentType::ClaudeCode,
@@ -4190,7 +4190,7 @@ mod tests {
         shell: &str,
         route: &str,
     ) -> AgentConnection {
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx, _liveness_rx) = connection_channel(1);
         let mut state = SessionState::new(
             "synth".into(),
             AgentType::Codex,
@@ -5232,7 +5232,7 @@ mod tests {
     ) -> tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand> {
         use crate::acp::connection::AgentConnection;
         use crate::acp::session_state::SessionState;
-        let (tx, rx) = mpsc::channel::<crate::acp::connection::ConnectionCommand>(4);
+        let (tx, rx, _liveness_rx) = connection_channel(4);
         let mut state = SessionState::new(
             conn_id.to_string(),
             agent_type,
@@ -5774,7 +5774,7 @@ mod tests {
 
         // Connection with a GATED fake fork reply: withheld until `go_tx` fires,
         // so we can drop the caller before the reply (and thus the persistence).
-        let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(4);
+        let (tx, mut rx, _liveness_rx) = connection_channel(4);
         let mut state = SessionState::new(
             "c-shield".to_string(),
             AgentType::ClaudeCode,
@@ -7788,7 +7788,7 @@ mod tests {
         original_session_id: &str,
     ) -> (Arc<ConnectionManager>, tokio::task::JoinHandle<()>) {
         use crate::acp::connection::ConnectionCommand;
-        let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(4);
+        let (tx, mut rx, _liveness_rx) = connection_channel(4);
         let mut state = SessionState::new(
             conn_id.to_string(),
             crate::models::agent::AgentType::ClaudeCode,
@@ -8272,7 +8272,7 @@ mod tests {
 
         // A connection with NO linked conversation_id — mirrors a fresh resume
         // of a historical conversation that hasn't sent a prompt yet.
-        let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(4);
+        let (tx, mut rx, _liveness_rx) = connection_channel(4);
         let mut state = SessionState::new(
             "c-relink".to_string(),
             AgentType::ClaudeCode,
@@ -9064,7 +9064,6 @@ mod tests {
         use crate::acp::delegation::types::DelegationError;
         use crate::acp::types::ConnectionStatus;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::sync::mpsc;
 
         struct EmptyLookup;
         #[async_trait::async_trait]
@@ -9125,7 +9124,7 @@ mod tests {
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
         let state = Arc::new(RwLock::new(state));
-        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = codeg_plan_for_late_close();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -9256,7 +9255,6 @@ mod tests {
         use crate::acp::delegation::types::DelegationError;
         use crate::acp::types::ConnectionStatus;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::mpsc;
 
         struct EmptyLookup;
         #[async_trait::async_trait]
@@ -9315,7 +9313,7 @@ mod tests {
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
         let state = Arc::new(RwLock::new(state));
-        let (tx, _rx) = mpsc::channel::<ConnectionCommand>(4);
+        let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = codeg_plan_for_late_close();
         let (spawn_config, observed_config) = matching_config_pair(

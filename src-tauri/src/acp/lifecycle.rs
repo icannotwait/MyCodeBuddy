@@ -2247,14 +2247,16 @@ mod tests {
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::EventEmitter;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::RwLock;
 
     fn fake_connection_with_state(
         id: &str,
         conv_id: Option<i32>,
     ) -> crate::acp::connection::AgentConnection {
-        let (tx, _rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (tx, _rx, _cmd_liveness_rx) =
+            crate::acp::connection::connection_channel(1);
+        let (control_tx, _control_rx, _control_liveness_rx) =
+            crate::acp::connection::connection_channel(1);
         let mut state = SessionState::new(
             id.to_string(),
             AgentType::ClaudeCode,

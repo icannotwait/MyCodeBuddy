@@ -28,7 +28,7 @@ use sacp::{
     UntypedMessage,
 };
 use sacp_tokio::AcpAgent;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
@@ -231,6 +231,84 @@ pub enum ConnectionControl {
     Disconnect,
 }
 
+struct LaneLiveness {
+    sender_owners: std::sync::atomic::AtomicUsize,
+    closed_tx: watch::Sender<bool>,
+}
+
+pub struct LaneSender<T> {
+    tx: mpsc::Sender<T>,
+    liveness: Arc<LaneLiveness>,
+}
+
+impl<T> Clone for LaneSender<T> {
+    fn clone(&self) -> Self {
+        let tx = self.tx.clone();
+        let liveness = Arc::clone(&self.liveness);
+        liveness
+            .sender_owners
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { tx, liveness }
+    }
+}
+
+impl<T> Drop for LaneSender<T> {
+    fn drop(&mut self) {
+        if self
+            .liveness
+            .sender_owners
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.liveness.closed_tx.send_replace(true);
+        }
+    }
+}
+
+impl<T> LaneSender<T> {
+    pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.tx.send(value).await
+    }
+
+    pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
+        self.tx.try_send(value)
+    }
+
+    pub async fn reserve(&self) -> Result<mpsc::Permit<'_, T>, mpsc::error::SendError<()>> {
+        self.tx.reserve().await
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    pub fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+}
+
+pub(crate) fn connection_channel<T>(
+    capacity: usize,
+) -> (LaneSender<T>, mpsc::Receiver<T>, watch::Receiver<bool>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let (closed_tx, closed_rx) = watch::channel(false);
+    let liveness = Arc::new(LaneLiveness {
+        sender_owners: std::sync::atomic::AtomicUsize::new(1),
+        closed_tx,
+    });
+    (LaneSender { tx, liveness }, rx, closed_rx)
+}
+
+fn both_connection_lanes_closed(
+    normal_lane_closed: bool,
+    control_lane_closed: bool,
+    cmd_liveness_rx: &watch::Receiver<bool>,
+    control_liveness_rx: &watch::Receiver<bool>,
+) -> bool {
+    (normal_lane_closed || *cmd_liveness_rx.borrow())
+        && (control_lane_closed || *control_liveness_rx.borrow())
+}
+
 struct SuspensionLease {
     continuation_id: String,
     parent_turn_generation: u64,
@@ -332,9 +410,9 @@ pub struct AgentConnection {
     pub status: ConnectionStatus,
     pub owner_window_label: String,
     /// Bounded FIFO for prompts, settings, permissions, and forks.
-    pub cmd_tx: mpsc::Sender<ConnectionCommand>,
+    pub cmd_tx: LaneSender<ConnectionCommand>,
     /// Bounded FIFO for suspension, user cancellation, and disconnect.
-    pub control_tx: mpsc::Sender<ConnectionControl>,
+    pub control_tx: LaneSender<ConnectionControl>,
     /// Abort handle for the connection background task. Used by
     /// `teardown_unexposed_attempt` to terminate before `run_conversation_loop`
     /// starts (where a queued control-lane `Disconnect` would never drain).
@@ -1074,8 +1152,9 @@ pub async fn spawn_agent_connection(
     // them right after install (before install.ps1's User-PATH change lands).
     prepend_officecli_path(&mut terminal_base_env);
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ConnectionCommand>(32);
-    let (control_tx, control_rx) = mpsc::channel::<ConnectionControl>(32);
+    let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel::<ConnectionCommand>(32);
+    let (control_tx, control_rx, control_liveness_rx) =
+        connection_channel::<ConnectionControl>(32);
     let conn_id = connection_id.clone();
     let emitter_clone = emitter.clone();
     let cleanup_connections = connections.clone();
@@ -1138,6 +1217,8 @@ pub async fn spawn_agent_connection(
             session_id,
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             emitter_clone.clone(),
             Arc::clone(&state_clone),
             terminal_base_env,
@@ -2587,6 +2668,8 @@ async fn run_connection(
     session_id: Option<String>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
     mut control_rx: mpsc::Receiver<ConnectionControl>,
+    mut cmd_liveness_rx: watch::Receiver<bool>,
+    mut control_liveness_rx: watch::Receiver<bool>,
     emitter: EventEmitter,
     state: Arc<RwLock<SessionState>>,
     terminal_base_env: BTreeMap<String, String>,
@@ -3063,6 +3146,8 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 &mut control_rx,
+                                &mut cmd_liveness_rx,
+                                &mut control_liveness_rx,
                                 terminal_runtime.clone(),
                                 terminal_assoc.clone(),
                                 file_system_runtime.clone(),
@@ -3093,6 +3178,8 @@ async fn run_connection(
                                 &perms,
                                 &mut cmd_rx,
                                 &mut control_rx,
+                                &mut cmd_liveness_rx,
+                                &mut control_liveness_rx,
                                 terminal_runtime.clone(),
                                 terminal_assoc.clone(),
                                 file_system_runtime.clone(),
@@ -3259,6 +3346,8 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             &mut control_rx,
+                            &mut cmd_liveness_rx,
+                            &mut control_liveness_rx,
                             terminal_runtime.clone(),
                             terminal_assoc.clone(),
                             file_system_runtime.clone(),
@@ -3285,6 +3374,8 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             &mut control_rx,
+                            &mut cmd_liveness_rx,
+                            &mut control_liveness_rx,
                             terminal_runtime.clone(),
                             terminal_assoc.clone(),
                             file_system_runtime.clone(),
@@ -3430,6 +3521,8 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             &mut control_rx,
+                            &mut cmd_liveness_rx,
+                            &mut control_liveness_rx,
                             terminal_runtime.clone(),
                             terminal_assoc.clone(),
                             file_system_runtime.clone(),
@@ -3455,6 +3548,8 @@ async fn run_connection(
                             &perms,
                             &mut cmd_rx,
                             &mut control_rx,
+                            &mut cmd_liveness_rx,
+                            &mut control_liveness_rx,
                             terminal_runtime.clone(),
                             terminal_assoc.clone(),
                             file_system_runtime.clone(),
@@ -3537,6 +3632,8 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     &mut control_rx,
+                    &mut cmd_liveness_rx,
+                    &mut control_liveness_rx,
                     terminal_runtime.clone(),
                     terminal_assoc.clone(),
                     file_system_runtime.clone(),
@@ -3563,6 +3660,8 @@ async fn run_connection(
                     &perms,
                     &mut cmd_rx,
                     &mut control_rx,
+                    &mut cmd_liveness_rx,
+                    &mut control_liveness_rx,
                     terminal_runtime.clone(),
                     terminal_assoc.clone(),
                     file_system_runtime.clone(),
@@ -4650,6 +4749,8 @@ async fn handle_fork_or_exit(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     control_rx: &mut mpsc::Receiver<ConnectionControl>,
+    cmd_liveness_rx: &mut watch::Receiver<bool>,
+    control_liveness_rx: &mut watch::Receiver<bool>,
     terminal_runtime: Arc<TerminalRuntime>,
     terminal_assoc: Arc<std::sync::Mutex<TerminalAssocFallback>>,
     file_system_runtime: Arc<FileSystemRuntime>,
@@ -4743,6 +4844,8 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         control_rx,
+        cmd_liveness_rx,
+        control_liveness_rx,
         terminal_runtime.clone(),
         terminal_assoc.clone(),
         file_system_runtime.clone(),
@@ -4771,6 +4874,8 @@ async fn handle_fork_or_exit(
         perms,
         cmd_rx,
         control_rx,
+        cmd_liveness_rx,
+        control_liveness_rx,
         terminal_runtime,
         terminal_assoc,
         file_system_runtime,
@@ -5559,6 +5664,8 @@ async fn run_conversation_loop<'a>(
     perms: &PendingPermissions,
     cmd_rx: &mut mpsc::Receiver<ConnectionCommand>,
     control_rx: &mut mpsc::Receiver<ConnectionControl>,
+    cmd_liveness_rx: &mut watch::Receiver<bool>,
+    control_liveness_rx: &mut watch::Receiver<bool>,
     terminal_runtime: Arc<TerminalRuntime>,
     terminal_assoc: Arc<std::sync::Mutex<TerminalAssocFallback>>,
     file_system_runtime: Arc<FileSystemRuntime>,
@@ -5595,6 +5702,8 @@ async fn run_conversation_loop<'a>(
     let mut ancillary_command: Option<AncillaryCommandFuture> = None;
     let mut normal_lane_closed = false;
     let mut control_lane_closed = false;
+    let mut normal_liveness_observed = false;
+    let mut control_liveness_observed = false;
     loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let input = loop {
@@ -5609,6 +5718,28 @@ async fn run_conversation_loop<'a>(
                                 break ConversationInput::ChannelsClosed;
                             }
                         }
+                    }
+                }
+                _ = control_liveness_rx.changed(), if !control_liveness_observed => {
+                    control_liveness_observed = true;
+                    if both_connection_lanes_closed(
+                        normal_lane_closed,
+                        control_lane_closed,
+                        cmd_liveness_rx,
+                        control_liveness_rx,
+                    ) {
+                        break ConversationInput::ChannelsClosed;
+                    }
+                }
+                _ = cmd_liveness_rx.changed(), if !normal_liveness_observed => {
+                    normal_liveness_observed = true;
+                    if both_connection_lanes_closed(
+                        normal_lane_closed,
+                        control_lane_closed,
+                        cmd_liveness_rx,
+                        control_liveness_rx,
+                    ) {
+                        break ConversationInput::ChannelsClosed;
                     }
                 }
                 _ = async {
@@ -5874,6 +6005,21 @@ async fn run_conversation_loop<'a>(
                                 }
                                 None => {}
                             }
+                            if both_connection_lanes_closed(
+                                normal_lane_closed,
+                                control_lane_closed,
+                                cmd_liveness_rx,
+                                control_liveness_rx,
+                            ) {
+                                if let Some(mut lease) = suspension.take() {
+                                    reject_suspension_lease(
+                                        &mut lease,
+                                        "suspend_parent_disconnected",
+                                    );
+                                }
+                                disconnect_requested = true;
+                                break;
+                            }
                             let outcome = finalize_bound_prompt_response(
                                 prompt_result,
                                 &mut suspension,
@@ -5945,6 +6091,21 @@ async fn run_conversation_loop<'a>(
                                     break;
                                 }
                                 None => {}
+                            }
+                            if both_connection_lanes_closed(
+                                normal_lane_closed,
+                                control_lane_closed,
+                                cmd_liveness_rx,
+                                control_liveness_rx,
+                            ) {
+                                if let Some(mut lease) = suspension.take() {
+                                    reject_suspension_lease(
+                                        &mut lease,
+                                        "suspend_parent_disconnected",
+                                    );
+                                }
+                                disconnect_requested = true;
+                                break;
                             }
                             let _ = finalize_turn_terminal(
                                 TurnTerminalSource::SuspensionDrainTimeout,
@@ -6034,6 +6195,42 @@ async fn run_conversation_loop<'a>(
                                         break;
                                     }
                                 }
+                            }
+                        }
+                        _ = control_liveness_rx.changed(), if !control_liveness_observed => {
+                            control_liveness_observed = true;
+                            if both_connection_lanes_closed(
+                                normal_lane_closed,
+                                control_lane_closed,
+                                cmd_liveness_rx,
+                                control_liveness_rx,
+                            ) {
+                                if let Some(mut lease) = suspension.take() {
+                                    reject_suspension_lease(
+                                        &mut lease,
+                                        "suspend_parent_disconnected",
+                                    );
+                                }
+                                disconnect_requested = true;
+                                break;
+                            }
+                        }
+                        _ = cmd_liveness_rx.changed(), if !normal_liveness_observed => {
+                            normal_liveness_observed = true;
+                            if both_connection_lanes_closed(
+                                normal_lane_closed,
+                                control_lane_closed,
+                                cmd_liveness_rx,
+                                control_liveness_rx,
+                            ) {
+                                if let Some(mut lease) = suspension.take() {
+                                    reject_suspension_lease(
+                                        &mut lease,
+                                        "suspend_parent_disconnected",
+                                    );
+                                }
+                                disconnect_requested = true;
+                                break;
                             }
                         }
                         _ = async {
@@ -7820,6 +8017,7 @@ mod tests {
             let prompt_responders = self.prompts;
             let prompt_connection = self.agent_connection.clone();
             let mode_responders = self.modes;
+            let mode_connection = self.agent_connection;
             let cancel_count = self.cancel_count;
             Agent
                 .builder()
@@ -7838,7 +8036,8 @@ mod tests {
                                 responder: sacp::Responder<
                         sacp::schema::SetSessionModeResponse,
                     >,
-                                _connection: ConnectionTo<Client>| {
+                                connection: ConnectionTo<Client>| {
+                        *mode_connection.lock().unwrap() = Some(connection);
                         mode_responders.lock().unwrap().push(responder);
                         Ok(())
                     },
@@ -7931,12 +8130,58 @@ mod tests {
         panic!("timed out waiting for ModeChanged({expected_mode_id})");
     }
 
+    fn send_suspension_content_barrier(
+        agent_connection: &Arc<std::sync::Mutex<Option<ConnectionTo<Client>>>>,
+        text: &str,
+    ) {
+        let update = SessionNotification::new(
+            SessionId::new("session-1".to_string()),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            ))),
+        );
+        agent_connection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("mock agent connection")
+            .send_notification(update)
+            .unwrap();
+    }
+
+    async fn wait_for_suspension_content_event(
+        state: &Arc<RwLock<SessionState>>,
+        expected_text: &str,
+    ) {
+        for _ in 0..200 {
+            let found = state
+                .read()
+                .await
+                .recent_events_after(0)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.payload,
+                        AcpEvent::ContentDelta { text } if text == expected_text
+                    )
+                });
+            if found {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for ContentDelta({expected_text})");
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_suspension_test_loop(
         mock_agent: SuspensionLoopMockAgent,
         state: Arc<RwLock<SessionState>>,
         mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
         mut control_rx: mpsc::Receiver<ConnectionControl>,
+        mut cmd_liveness_rx: watch::Receiver<bool>,
+        mut control_liveness_rx: watch::Receiver<bool>,
         injection: DelegationInjection,
         seed_aux_stop_reason: bool,
     ) -> Result<(), sacp::Error> {
@@ -7976,6 +8221,8 @@ mod tests {
                     &pending_perms,
                     &mut cmd_rx,
                     &mut control_rx,
+                    &mut cmd_liveness_rx,
+                    &mut control_liveness_rx,
                     terminal_runtime,
                     terminal_assoc,
                     file_system_runtime,
@@ -8096,6 +8343,27 @@ mod tests {
             .status
     }
 
+    #[test]
+    fn active_terminal_arbitration_observes_last_sender_closure() {
+        let (cmd_tx, _cmd_rx, cmd_liveness_rx) =
+            connection_channel::<ConnectionCommand>(1);
+        let (control_tx, _control_rx, control_liveness_rx) =
+            connection_channel::<ConnectionControl>(1);
+        let cmd_clone = cmd_tx.clone();
+
+        drop(cmd_clone);
+        assert!(!*cmd_liveness_rx.borrow());
+        drop(cmd_tx);
+        drop(control_tx);
+
+        assert!(both_connection_lanes_closed(
+            false,
+            false,
+            &cmd_liveness_rx,
+            &control_liveness_rx,
+        ));
+    }
+
     #[tokio::test]
     async fn delegation_suspend_rejects_wrong_generation() {
         let state = delegation_suspend_state(2);
@@ -8126,8 +8394,8 @@ mod tests {
             agent_connection: agent_connection.clone(),
             cancel_count: cancel_count.clone(),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8141,9 +8409,11 @@ mod tests {
             .unwrap();
         let loop_task = tokio::spawn(run_suspension_test_loop(
             mock_agent,
-            state,
+            state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             true,
         ));
@@ -8231,8 +8501,8 @@ mod tests {
             agent_connection: Arc::new(std::sync::Mutex::new(None)),
             cancel_count: Arc::new(AtomicUsize::new(0)),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8249,6 +8519,8 @@ mod tests {
             state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8321,8 +8593,8 @@ mod tests {
             agent_connection: Arc::new(std::sync::Mutex::new(None)),
             cancel_count: cancel_count.clone(),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8339,6 +8611,8 @@ mod tests {
             state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8405,7 +8679,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn delegation_suspend_closed_lanes_abort_hung_ancillary() {
+    async fn delegation_suspend_reverse_closed_lanes_abort_hung_ancillary() {
         use std::sync::atomic::AtomicUsize;
 
         let state = delegation_suspend_state(1);
@@ -8413,14 +8687,15 @@ mod tests {
         let injection = delegation_suspend_injection(broker);
         let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_connection = Arc::new(std::sync::Mutex::new(None));
         let mock_agent = SuspensionLoopMockAgent {
             prompts: prompts.clone(),
             modes: modes.clone(),
-            agent_connection: Arc::new(std::sync::Mutex::new(None)),
+            agent_connection: agent_connection.clone(),
             cancel_count: Arc::new(AtomicUsize::new(0)),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8434,9 +8709,11 @@ mod tests {
             .unwrap();
         let loop_task = tokio::spawn(run_suspension_test_loop(
             mock_agent,
-            state,
+            state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8464,8 +8741,14 @@ mod tests {
             modes.lock().unwrap().len() == 1
         })
         .await;
-        drop(cmd_tx);
         drop(control_tx);
+        send_suspension_content_barrier(&agent_connection, "control-close-observed");
+        wait_for_suspension_content_event(&state, "control-close-observed").await;
+        drop(cmd_tx);
+        tokio::time::advance(std::time::Duration::from_millis(
+            SUSPENSION_DRAIN_TIMEOUT_MS,
+        ))
+        .await;
         for _ in 0..200 {
             tokio::task::yield_now().await;
         }
@@ -8477,6 +8760,159 @@ mod tests {
         assert!(error.to_string().contains("suspend_parent_disconnected"));
         assert!(loop_task.is_finished());
         loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegation_suspend_closed_lanes_beat_ready_bound_response() {
+        use std::sync::atomic::AtomicUsize;
+
+        let state = delegation_suspend_state(1);
+        let (broker, _spawner, _task_id) = delegation_suspend_broker_with_running_child().await;
+        let injection = delegation_suspend_injection(broker);
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_connection = Arc::new(std::sync::Mutex::new(None));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: prompts.clone(),
+            modes: modes.clone(),
+            agent_connection: agent_connection.clone(),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
+        cmd_tx
+            .send(ConnectionCommand::Prompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "ready response and closed lanes prompt".into(),
+                }],
+                user_message: None,
+                mark_awaiting_reply: false,
+                turn_generation: 1,
+            })
+            .await
+            .unwrap();
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state.clone(),
+            cmd_rx,
+            control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
+            injection,
+            false,
+        ));
+
+        wait_for_suspension_loop_condition("bound prompt request", || {
+            prompts.lock().unwrap().len() == 1
+        })
+        .await;
+        let (reply, mut receiver) = oneshot::channel();
+        control_tx
+            .send(ConnectionControl::SuspendForDelegation {
+                continuation_id: "continuation-1".into(),
+                parent_turn_generation: 1,
+                reply,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(ConnectionCommand::SetMode {
+                mode_id: "hung-mode".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("hung session/set_mode request", || {
+            modes.lock().unwrap().len() == 1
+        })
+        .await;
+        drop(control_tx);
+        send_suspension_content_barrier(&agent_connection, "control-close-observed");
+        wait_for_suspension_content_event(&state, "control-close-observed").await;
+
+        prompts
+            .lock()
+            .unwrap()
+            .remove(0)
+            .respond(sacp::schema::PromptResponse::new(StopReason::Cancelled))
+            .unwrap();
+        drop(cmd_tx);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        let error = receiver
+            .try_recv()
+            .expect("closed lanes must override ready bound response")
+            .unwrap_err();
+        assert!(error.to_string().contains("suspend_parent_disconnected"));
+        assert!(loop_task.is_finished());
+        loop_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegation_suspend_idle_reverse_closed_lanes_exit_hung_ancillary() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut idle_state = SessionState::new(
+            "parent-conn".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        idle_state.status = ConnectionStatus::Connected;
+        let state = Arc::new(RwLock::new(idle_state));
+        let (broker, spawner, _task_id) = delegation_suspend_broker_with_running_child().await;
+        let injection = delegation_suspend_injection(broker);
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent_connection = Arc::new(std::sync::Mutex::new(None));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            modes: modes.clone(),
+            agent_connection: agent_connection.clone(),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state.clone(),
+            cmd_rx,
+            control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
+            injection,
+            false,
+        ));
+
+        cmd_tx
+            .send(ConnectionCommand::SetMode {
+                mode_id: "idle-hung-mode".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("idle hung session/set_mode request", || {
+            modes.lock().unwrap().len() == 1
+        })
+        .await;
+        drop(control_tx);
+        send_suspension_content_barrier(&agent_connection, "idle-control-close-observed");
+        wait_for_suspension_content_event(&state, "idle-control-close-observed").await;
+        drop(cmd_tx);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(loop_task.is_finished());
+        loop_task.await.unwrap().unwrap();
+        wait_for_suspension_loop_condition("idle ParentDisconnected child cancel", || {
+            spawner
+                .cancels
+                .try_lock()
+                .map(|cancels| cancels.as_slice() == ["child-conn"])
+                .unwrap_or(false)
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -8494,8 +8930,8 @@ mod tests {
             agent_connection: Arc::new(std::sync::Mutex::new(None)),
             cancel_count: Arc::new(AtomicUsize::new(0)),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8512,6 +8948,8 @@ mod tests {
             state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8586,8 +9024,8 @@ mod tests {
             agent_connection: Arc::new(std::sync::Mutex::new(None)),
             cancel_count: Arc::new(AtomicUsize::new(0)),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8604,6 +9042,8 @@ mod tests {
             state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8719,8 +9159,8 @@ mod tests {
             agent_connection: Arc::new(std::sync::Mutex::new(None)),
             cancel_count: cancel_count.clone(),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8737,6 +9177,8 @@ mod tests {
             state,
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
@@ -8863,8 +9305,8 @@ mod tests {
             agent_connection,
             cancel_count: cancel_count.clone(),
         };
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
         cmd_tx
             .send(ConnectionCommand::Prompt {
                 blocks: vec![PromptInputBlock::Text {
@@ -8881,6 +9323,8 @@ mod tests {
             state.clone(),
             cmd_rx,
             control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
             injection,
             false,
         ));
