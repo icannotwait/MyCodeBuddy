@@ -197,10 +197,7 @@ describe("shouldHandleFilesEscape", () => {
 
   it("returns false when there is no active file tab", () => {
     expect(
-      shouldHandleFilesEscape(
-        escapeEvent(),
-        baseCtx({ activeFileTabId: null })
-      )
+      shouldHandleFilesEscape(escapeEvent(), baseCtx({ activeFileTabId: null }))
     ).toBe(false)
   })
 
