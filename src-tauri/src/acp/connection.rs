@@ -4990,6 +4990,14 @@ async fn cleanup_delegation_parent(
     connection_id: &str,
     state: &Arc<RwLock<SessionState>>,
 ) {
+    // First cleanup action: cancel every live continuation worker for this
+    // parent connection before any await, state read, lease/token revocation,
+    // or Broker drain. Preserve the Weak/no-cycle fallback when upgrade fails.
+    let coordinator = injection.continuation_coordinator.upgrade();
+    if let Some(ref coordinator) = coordinator {
+        coordinator.cancel_workers_for_parent(connection_id);
+    }
+
     let (token, conversation_id) = {
         let state = state.read().await;
         (state.delegation_token.clone(), state.conversation_id)
@@ -4999,7 +5007,7 @@ async fn cleanup_delegation_parent(
         injection.tokens.revoke(&token).await;
     }
     let cause = injection.parent_connection_exit_causes.take(connection_id);
-    if let Some(coordinator) = injection.continuation_coordinator.upgrade() {
+    if let Some(coordinator) = coordinator {
         coordinator
             .handle_parent_connection_exit(connection_id, conversation_id, cause)
             .await;
@@ -8474,6 +8482,223 @@ mod tests {
             failed.failure_code,
             Some(ContinuationFailureCode::SuspendDrainTimeout)
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_connection_cancels_workers_before_state_read() {
+        use crate::acp::delegation::continuation::coordinator::{
+            JoinArmRequest, JoinArmOutcome, ParentContinuationPort, ParentTurnSnapshot,
+            PromptAdmissionResult, SuspendRequest, SystemContinuationClock,
+        };
+        use crate::acp::delegation::continuation::store::{
+            ContinuationStore, InMemoryContinuationStore,
+        };
+        use crate::acp::delegation::continuation::types::{
+            ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
+        };
+        use crate::acp::connection::SuspensionAck;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        struct LiveSuspendPort {
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            admit_calls: AtomicUsize,
+            fail_calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ParentContinuationPort for LiveSuspendPort {
+            async fn snapshot_parent(
+                &self,
+                connection_id: &str,
+            ) -> Result<
+                ParentTurnSnapshot,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                Ok(ParentTurnSnapshot {
+                    connection_id: connection_id.into(),
+                    conversation_id: 1,
+                    session_id: "parent-session".into(),
+                    turn_generation: 1,
+                    turn_in_flight: true,
+                })
+            }
+
+            async fn suspend_parent(
+                &self,
+                request: SuspendRequest,
+            ) -> Result<
+                SuspensionAck,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                if let Some(release) = self.release.lock().await.take() {
+                    let _ = release.await;
+                }
+                Ok(SuspensionAck {
+                    continuation_id: request.continuation_id,
+                    parent_turn_generation: request.parent_turn_generation,
+                })
+            }
+
+            async fn admit_continuation(
+                &self,
+                _request: crate::acp::delegation::continuation::coordinator::ContinuationPromptRequest,
+            ) -> Result<
+                PromptAdmissionResult,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                self.admit_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(PromptAdmissionResult::Admitted)
+            }
+
+            async fn publish_waiting(
+                &self,
+                _connection_id: &str,
+                _waiting: Option<ContinuationWaitingProjection>,
+            ) -> Result<(), crate::acp::delegation::continuation::coordinator::ContinuationError>
+            {
+                Ok(())
+            }
+
+            async fn publish_failure(
+                &self,
+                _connection_id: &str,
+                _code: ContinuationFailureCode,
+            ) -> Result<(), crate::acp::delegation::continuation::coordinator::ContinuationError>
+            {
+                self.fail_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        struct CleanupEmptyDepth;
+        #[async_trait::async_trait]
+        impl crate::acp::delegation::broker::ConversationDepthLookup for CleanupEmptyDepth {
+            async fn parent_of(
+                &self,
+                _id: i32,
+            ) -> Result<Option<i32>, crate::acp::delegation::types::DelegationError> {
+                Ok(None)
+            }
+        }
+        let broker = Arc::new(crate::acp::delegation::broker::DelegationBroker::new(
+            Arc::new(crate::acp::delegation::spawner::mock::MockSpawner::default())
+                as Arc<dyn crate::acp::delegation::spawner::ConnectionSpawner>,
+            Arc::new(CleanupEmptyDepth)
+                as Arc<dyn crate::acp::delegation::broker::ConversationDepthLookup>,
+        ));
+        broker
+            .seed_live_task_for_test("parent-conn", "task-1")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        store.seed_parent_status(1, "in_progress").await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let port = Arc::new(LiveSuspendPort {
+            entered: Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            admit_calls: AtomicUsize::new(0),
+            fail_calls: AtomicUsize::new(0),
+        });
+        let coordinator = Arc::new(
+            crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator::new(
+                store.clone() as Arc<dyn ContinuationStore>,
+                broker.clone(),
+                Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+                port.clone() as Arc<dyn ParentContinuationPort>,
+                Arc::new(SystemContinuationClock::new()),
+            ),
+        );
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        entered_rx
+            .await
+            .expect("live worker must reach suspend gate");
+
+        let mut injection = delegation_suspend_injection(broker);
+        injection.continuation_coordinator = Arc::downgrade(&coordinator);
+        injection
+            .parent_connection_exit_causes
+            .record_suspension_drain_timeout("parent-conn");
+        let state = delegation_suspend_state(1);
+        state.write().await.conversation_id = Some(1);
+        // Hold the session write lock so any pre-cancel state.read() blocks.
+        // Cancellation must still become visible first.
+        let write_guard = state.write().await;
+        let mut cleanup = tokio::spawn({
+            let injection = injection.clone();
+            let state = state.clone();
+            async move { cleanup_delegation_parent(&injection, "parent-conn", &state).await }
+        });
+        let arm_result = tokio::select! {
+            result = completion => result.expect("worker join"),
+            _ = &mut cleanup => panic!("cleanup finished before cancel observed by worker"),
+        };
+        assert!(matches!(
+            arm_result,
+            Err(crate::acp::delegation::continuation::coordinator::ContinuationError::ArmWorkerDropped)
+        ));
+        assert!(
+            !cleanup.is_finished(),
+            "cleanup must still be blocked on state.read after cancel"
+        );
+        let mid = store.load(&continuation_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(
+                mid.state,
+                ContinuationState::Failed | ContinuationState::Completed | ContinuationState::Cancelled
+            ),
+            "worker must not terminalize while cleanup is blocked before drain: {mid:?}"
+        );
+        assert_eq!(port.admit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.fail_calls.load(Ordering::SeqCst), 0);
+
+        drop(write_guard);
+        let _ = release_tx.send(());
+        cleanup.await.unwrap();
+        for _ in 0..30 {
+            if coordinator.worker_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let failed = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(failed.state, ContinuationState::Failed);
+        assert_eq!(
+            failed.failure_code,
+            Some(ContinuationFailureCode::SuspendDrainTimeout)
+        );
+        assert_eq!(
+            store.parent_status(1).await.as_deref(),
+            Some("cancelled"),
+            "parent status must flip atomically with terminal persistence"
+        );
+        assert_eq!(coordinator.worker_count(), 0);
     }
 
     #[test]

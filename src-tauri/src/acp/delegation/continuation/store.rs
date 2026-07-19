@@ -1503,7 +1503,7 @@ struct InMemoryState {
 #[cfg(any(test, feature = "test-utils"))]
 impl InMemoryContinuationStore {
     #[cfg(test)]
-    async fn seed_parent_status(&self, conversation_id: i32, status: &str) {
+    pub(crate) async fn seed_parent_status(&self, conversation_id: i32, status: &str) {
         self.inner
             .lock()
             .await
@@ -1512,7 +1512,7 @@ impl InMemoryContinuationStore {
     }
 
     #[cfg(test)]
-    async fn parent_status(&self, conversation_id: i32) -> Option<String> {
+    pub(crate) async fn parent_status(&self, conversation_id: i32) -> Option<String> {
         self.inner
             .lock()
             .await

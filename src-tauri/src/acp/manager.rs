@@ -10036,6 +10036,280 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn continuation_cleanup_stop_persistence_failure_fences_queued_attempt_zero_admission() {
+        use crate::acp::connection::SuspensionAck;
+        use crate::acp::delegation::continuation::coordinator::{
+            ContinuationPromptRequest, JoinArmOutcome, JoinArmRequest, ParentContinuationPort,
+            ParentTurnSnapshot, PromptAdmissionResult, SuspendRequest, SystemContinuationClock,
+        };
+        use crate::acp::delegation::continuation::store::ContinuationStore;
+        use crate::acp::delegation::continuation::types::{
+            ContinuationState, ContinuationWaitingProjection,
+        };
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        struct QueuedAdmitPort {
+            manager: Arc<ConnectionManager>,
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ParentContinuationPort for QueuedAdmitPort {
+            async fn snapshot_parent(
+                &self,
+                connection_id: &str,
+            ) -> Result<
+                ParentTurnSnapshot,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                Ok(ParentTurnSnapshot {
+                    connection_id: connection_id.into(),
+                    conversation_id: 1,
+                    session_id: "session".into(),
+                    turn_generation: 1,
+                    turn_in_flight: true,
+                })
+            }
+
+            async fn suspend_parent(
+                &self,
+                request: SuspendRequest,
+            ) -> Result<
+                SuspensionAck,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                Ok(SuspensionAck {
+                    continuation_id: request.continuation_id,
+                    parent_turn_generation: request.parent_turn_generation,
+                })
+            }
+
+            async fn admit_continuation(
+                &self,
+                request: ContinuationPromptRequest,
+            ) -> Result<
+                PromptAdmissionResult,
+                crate::acp::delegation::continuation::coordinator::ContinuationError,
+            > {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                if let Some(release) = self.release.lock().await.take() {
+                    let _ = release.await;
+                }
+                // Contends for the same prompt_lock Stop holds through cleanup.
+                self.manager.admit_delegation_continuation(request).await
+            }
+
+            async fn publish_waiting(
+                &self,
+                _connection_id: &str,
+                _waiting: Option<ContinuationWaitingProjection>,
+            ) -> Result<(), crate::acp::delegation::continuation::coordinator::ContinuationError>
+            {
+                Ok(())
+            }
+
+            async fn publish_failure(
+                &self,
+                _connection_id: &str,
+                _code: crate::acp::delegation::continuation::types::ContinuationFailureCode,
+            ) -> Result<(), crate::acp::delegation::continuation::coordinator::ContinuationError>
+            {
+                Ok(())
+            }
+        }
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "C:/cleanup-queued").await;
+        crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let inner = Arc::new(
+            crate::acp::delegation::continuation::store::InMemoryContinuationStore::default(),
+        );
+        let (stop_entered_tx, stop_entered_rx) = tokio::sync::oneshot::channel();
+        let (stop_release_tx, stop_release_rx) = tokio::sync::oneshot::channel();
+        let store = Arc::new(CleanupGateStore {
+            inner: inner.clone(),
+            gate: tokio::sync::Mutex::new(Some((stop_entered_tx, stop_release_rx))),
+            fail_active_load: true,
+        });
+        let manager = Arc::new(ConnectionManager::new());
+        let (cmd_tx, mut cmd_rx, _) = connection_channel(4);
+        let (control_tx, mut control_rx, _) = connection_channel(4);
+        let mut connection = fake_connection("cleanup-parent", Some(1));
+        connection.cmd_tx = cmd_tx;
+        connection.control_tx = control_tx;
+        {
+            let mut state = connection.state.write().await;
+            state.external_id = Some("session".into());
+            state.parent_turn_generation = 1;
+            state.last_suspended_turn_generation = Some(1);
+            state.turn_in_flight = false;
+            state.active_turn_generation = None;
+        }
+        manager
+            .connections
+            .lock()
+            .await
+            .insert("cleanup-parent".to_string(), connection);
+        manager.install_continuation_store(store.clone());
+
+        let broker = Arc::new(crate::acp::delegation::broker::DelegationBroker::new(
+            Arc::new(crate::acp::delegation::spawner::mock::MockSpawner::default())
+                as Arc<dyn crate::acp::delegation::spawner::ConnectionSpawner>,
+            Arc::new(CleanupEmptyDepth)
+                as Arc<dyn crate::acp::delegation::broker::ConversationDepthLookup>,
+        ));
+        broker
+            .seed_live_task_for_test("cleanup-parent", "task-1")
+            .await;
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (admit_release_tx, admit_release_rx) = tokio::sync::oneshot::channel();
+        let port = Arc::new(QueuedAdmitPort {
+            manager: manager.clone(),
+            entered: Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(admit_release_rx)),
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = Arc::new(
+            crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator::new(
+                store,
+                broker.clone(),
+                metrics.clone(),
+                port.clone() as Arc<dyn ParentContinuationPort>,
+                Arc::new(SystemContinuationClock::new()),
+            ),
+        );
+        let tokens = Arc::new(
+            crate::acp::delegation::listener::TokenRegistry::with_continuation_coordinator(
+                coordinator.clone(),
+            ),
+        );
+        manager.install_delegation(crate::acp::connection::DelegationInjection {
+            broker: broker.clone(),
+            tokens,
+            leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
+            socket_path: std::path::PathBuf::from("cleanup-queued.sock"),
+            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
+            ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            questions: Arc::new(ConnectionManagerQuestionLookup {
+                manager: manager.clone(),
+            }),
+            supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
+            metrics,
+            continuation_coordinator: Arc::downgrade(&coordinator),
+            parent_connection_exit_causes: Arc::new(
+                crate::acp::connection::ParentConnectionExitCauses::default(),
+            ),
+        });
+
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "cleanup-parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        completion.await.unwrap().unwrap();
+        broker
+            .complete_call(
+                "task-1",
+                crate::acp::delegation::types::DelegationOutcome::Ok(
+                    crate::acp::delegation::types::DelegationSuccess {
+                        text: "done".into(),
+                        child_conversation_id: 99,
+                        child_agent_type: AgentType::Codex,
+                        turn_count: 1,
+                        duration_ms: 1,
+                        token_usage: None,
+                    },
+                ),
+            )
+            .await;
+        entered_rx
+            .await
+            .expect("live worker must reach attempt-zero admission gate");
+
+        let stop_db = db.conn.clone();
+        let stop_manager = manager.clone();
+        let stop =
+            tokio::spawn(async move { stop_manager.cancel(&stop_db, "cleanup-parent").await });
+        stop_entered_rx
+            .await
+            .expect("Stop must own prompt_lock and enter store cleanup");
+        // Worker was gated before manager.admit; release it so it queues on the
+        // lock Stop currently holds.
+        admit_release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !stop.is_finished(),
+            "Stop must still hold prompt_lock during cleanup"
+        );
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "admission must not complete while Stop holds prompt_lock"
+        );
+
+        stop_release_tx.send(()).unwrap();
+        let stop_result = stop.await.unwrap();
+        assert!(
+            stop_result.is_err(),
+            "stop persistence failure must surface: {stop_result:?}"
+        );
+        assert!(stop_result
+            .unwrap_err()
+            .to_string()
+            .contains("injected stop read failure"));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ConnectionControl::Cancel)
+        ));
+        for _ in 0..30 {
+            if coordinator.worker_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(coordinator.worker_count(), 0);
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "queued admission must not send a hidden prompt after Stop releases prompt_lock"
+        );
+        let durable = inner.load(&continuation_id).await.unwrap().unwrap();
+        assert_ne!(durable.state, ContinuationState::Completed);
+        assert!(durable.prompt_admitted_at.is_none());
+        assert!(port.calls.load(Ordering::SeqCst) >= 1);
+    }
+
     async fn apply_companion_closed(
         state: &Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
     ) {

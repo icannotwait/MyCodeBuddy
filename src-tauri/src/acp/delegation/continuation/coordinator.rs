@@ -413,7 +413,7 @@ impl DelegationContinuationCoordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn worker_count(&self) -> usize {
+    pub(crate) fn worker_count(&self) -> usize {
         self.workers
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -441,7 +441,9 @@ impl DelegationContinuationCoordinator {
         parent_connection_id: &str,
         parent_conversation_id: i32,
     ) -> Result<usize, ContinuationError> {
-        self.cancel_workers_for_parent(parent_connection_id);
+        // Detect a durable admission winner before cancelling any worker. Once
+        // `prompt_admitted_at` is set the row must finish `Completed` and Stop
+        // follows the ordinary active-turn Cancel path.
         let active = match self
             .store
             .load_active_for_conversation(parent_conversation_id)
@@ -449,6 +451,7 @@ impl DelegationContinuationCoordinator {
         {
             Ok(active) => active,
             Err(error) => {
+                self.cancel_workers_for_parent(parent_connection_id);
                 self.broker
                     .cancel_by_parent_turn(
                         parent_connection_id,
@@ -458,6 +461,14 @@ impl DelegationContinuationCoordinator {
                 return Err(error.into());
             }
         };
+        if active.as_ref().is_some_and(|record| {
+            record.parent_connection_id.as_deref() == Some(parent_connection_id)
+                && record.prompt_admitted_at.is_some()
+        }) {
+            return Ok(0);
+        }
+
+        self.cancel_workers_for_parent(parent_connection_id);
         if !active.as_ref().is_some_and(|record| {
             record.parent_connection_id.as_deref() == Some(parent_connection_id)
         }) {
@@ -475,6 +486,11 @@ impl DelegationContinuationCoordinator {
             return Ok(0);
         };
         if current.parent_connection_id.as_deref() != Some(parent_connection_id) {
+            return Ok(0);
+        }
+        // Re-check after the drain: a concurrent admission winner must not be
+        // overwritten as Cancelled (direct coordinator calls without prompt_lock).
+        if current.prompt_admitted_at.is_some() {
             return Ok(0);
         }
         let mut cancelled = keep_patch(ContinuationState::Cancelled);
@@ -956,6 +972,10 @@ async fn run_worker_owned(
     mut record: ContinuationRecord,
     completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
 ) {
+    if context.cancel.is_cancelled() {
+        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+        return;
+    }
     let notifier = context.broker.join_notifier();
     let mut notified = Box::pin(notifier.notified());
     notified.as_mut().enable();
@@ -968,6 +988,10 @@ async fn run_worker_owned(
         )
         .await;
 
+    if context.cancel.is_cancelled() {
+        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+        return;
+    }
     let mut suspend_patch = keep_patch(ContinuationState::Arming);
     suspend_patch.suspend_requested_at = FieldPatch::Set(context.clock.now_utc());
     record = match context
@@ -994,6 +1018,10 @@ async fn run_worker_owned(
         }
     };
 
+    if context.cancel.is_cancelled() {
+        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+        return;
+    }
     let suspend_request = SuspendRequest {
         continuation_id: record.continuation_id.clone(),
         parent_connection_id: record.parent_connection_id.clone().unwrap_or_default(),
@@ -1006,28 +1034,50 @@ async fn run_worker_owned(
 
     let mut claimed = match post_insert {
         JoinEvaluation::Ready(batch) => match wake_reason(&batch) {
-            Some(reason) => match claim_wake(context, record.clone(), reason).await {
-                Ok(claimed) => Some(claimed),
-                Err(error) => {
-                    let _ = completion.send(Err(error));
-                    retain_if_active(context, &record.continuation_id).await;
+            Some(reason) => {
+                if context.cancel.is_cancelled() {
+                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                     return;
                 }
-            },
+                match claim_wake(context, record.clone(), reason).await {
+                    Ok(claimed) => Some(claimed),
+                    Err(error) => {
+                        let _ = completion.send(Err(error));
+                        retain_if_active(context, &record.continuation_id).await;
+                        return;
+                    }
+                }
+            }
             None => None,
         },
         JoinEvaluation::Waiting(_) => None,
     };
 
     let ack = if claimed.is_some() {
-        suspend.await
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => {
+                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                return;
+            }
+            result = &mut suspend => result,
+        }
     } else {
         loop {
             tokio::select! {
+                biased;
+                _ = context.cancel.cancelled() => {
+                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                    return;
+                }
                 result = &mut suspend => break result,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
                     notified.as_mut().enable();
+                    if context.cancel.is_cancelled() {
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        return;
+                    }
                     let evaluation = context.broker.evaluate_join_snapshot(
                         record.parent_connection_id.as_deref().unwrap_or_default(),
                         record.parent_conversation_id,
@@ -1035,10 +1085,21 @@ async fn run_worker_owned(
                     ).await;
                     if let JoinEvaluation::Ready(batch) = evaluation {
                         if let Some(reason) = wake_reason(&batch) {
+                            if context.cancel.is_cancelled() {
+                                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                return;
+                            }
                             match claim_wake(context, record.clone(), reason).await {
                                 Ok(winner) => {
                                     claimed = Some(winner);
-                                    break suspend.await;
+                                    break tokio::select! {
+                                        biased;
+                                        _ = context.cancel.cancelled() => {
+                                            let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                            return;
+                                        }
+                                        result = &mut suspend => result,
+                                    };
                                 }
                                 Err(error) => {
                                     let _ = completion.send(Err(error));
@@ -1050,6 +1111,10 @@ async fn run_worker_owned(
                     }
                 }
                 _ = context.clock.sleep_until(record.wake_at) => {
+                    if context.cancel.is_cancelled() {
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        return;
+                    }
                     match claim_wake(
                         context,
                         record.clone(),
@@ -1057,7 +1122,14 @@ async fn run_worker_owned(
                     ).await {
                         Ok(winner) => {
                             claimed = Some(winner);
-                            break suspend.await;
+                            break tokio::select! {
+                                biased;
+                                _ = context.cancel.cancelled() => {
+                                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                    return;
+                                }
+                                result = &mut suspend => result,
+                            };
                         }
                         Err(error) => {
                             let _ = completion.send(Err(error));
@@ -1065,10 +1137,6 @@ async fn run_worker_owned(
                             return;
                         }
                     }
-                }
-                _ = context.cancel.cancelled() => {
-                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
-                    return;
                 }
             }
         }
@@ -1186,6 +1254,9 @@ async fn run_worker_owned(
 
     if record.state == ContinuationState::Waiting {
         loop {
+            if context.cancel.is_cancelled() {
+                return;
+            }
             let notified = notifier.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -1208,6 +1279,9 @@ async fn run_worker_owned(
                         .await;
                         return;
                     };
+                    if context.cancel.is_cancelled() {
+                        return;
+                    }
                     match claim_wake(context, record.clone(), reason).await {
                         Ok(claimed) => {
                             record = claimed;
@@ -1227,8 +1301,13 @@ async fn run_worker_owned(
                 JoinEvaluation::Waiting(_) => {}
             }
             tokio::select! {
+                biased;
+                _ = context.cancel.cancelled() => return,
                 _ = &mut notified => {}
                 _ = context.clock.sleep_until(record.wake_at) => {
+                    if context.cancel.is_cancelled() {
+                        return;
+                    }
                     match claim_wake(
                         context,
                         record.clone(),
@@ -1249,16 +1328,21 @@ async fn run_worker_owned(
                         }
                     }
                 }
-                _ = context.cancel.cancelled() => return,
             }
         }
     }
 
+    if context.cancel.is_cancelled() {
+        return;
+    }
     resume_and_finish(context, record).await;
 }
 
 #[allow(dead_code, reason = "Task 7 activates coordinator prompt resumption")]
 async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationRecord) {
+    if context.cancel.is_cancelled() {
+        return;
+    }
     let connection_id = record.parent_connection_id.clone().unwrap_or_default();
     match context.port.snapshot_parent(&connection_id).await {
         Ok(snapshot)
@@ -1269,6 +1353,9 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict).await;
             return;
         }
+    }
+    if context.cancel.is_cancelled() {
+        return;
     }
     let patch = keep_patch(ContinuationState::Resuming);
     record = match context
@@ -1299,10 +1386,13 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             let deadline = context.clock.now_utc()
                 + chrono::Duration::milliseconds(retry_delays_ms[attempt - 1] as i64);
             tokio::select! {
-                _ = context.clock.sleep_until(deadline) => {}
+                biased;
                 _ = context.cancel.cancelled() => return,
+                _ = context.clock.sleep_until(deadline) => {}
             }
             context.metrics.record_continuation_prompt_delivery_retry();
+        } else if context.cancel.is_cancelled() {
+            return;
         }
 
         let current = match context.store.load(&record.continuation_id).await {
@@ -1318,6 +1408,9 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
                 return;
             }
         };
+        if context.cancel.is_cancelled() {
+            return;
+        }
         match context.port.snapshot_parent(&connection_id).await {
             Ok(snapshot)
                 if snapshot.connection_id == connection_id
@@ -1328,6 +1421,9 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
                     .await;
                 return;
             }
+        }
+        if context.cancel.is_cancelled() {
+            return;
         }
         let snapshot = match context
             .broker
@@ -1359,10 +1455,23 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
             snapshot,
         };
 
-        match context.port.admit_continuation(request).await {
+        if context.cancel.is_cancelled() {
+            return;
+        }
+        let admission = tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => {
+                return;
+            }
+            result = context.port.admit_continuation(request) => result,
+        };
+
+        match admission {
             Ok(
                 result @ (PromptAdmissionResult::Admitted | PromptAdmissionResult::AlreadyAdmitted),
             ) => {
+                // Admission's no-await tail has already won. Finish Completed even
+                // if Stop later observes the worker token; item 1 owns arbitration.
                 if result == PromptAdmissionResult::Admitted {
                     context.metrics.record_continuation_prompt_admitted();
                 }
@@ -1435,10 +1544,14 @@ async fn resume_and_finish(context: &WorkerContext, mut record: ContinuationReco
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::acp::connection::SuspensionAck;
     use crate::acp::delegation::broker::ConversationDepthLookup;
     use crate::acp::delegation::continuation::store::InMemoryContinuationStore;
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
+    use crate::models::AgentType;
 
     #[derive(Default)]
     struct RecordingPort {
@@ -1742,5 +1855,609 @@ mod cleanup_tests {
                 ContinuationFailureCode::ParentConnectionLost
             )]
         );
+    }
+
+    /// Gated port that durably stamps `prompt_admitted_at` then blocks before
+    /// returning from admission, leaving the worker between admission and the
+    /// `Completed` CAS.
+    struct PostAdmissionGatePort {
+        store: Arc<InMemoryContinuationStore>,
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        admissions: AtomicUsize,
+    }
+
+    impl PostAdmissionGatePort {
+        fn new(
+            store: Arc<InMemoryContinuationStore>,
+        ) -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    store,
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                    admissions: AtomicUsize::new(0),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for PostAdmissionGatePort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: false,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admissions.fetch_add(1, Ordering::SeqCst);
+            let current = self
+                .store
+                .load(request.origin.continuation_id())
+                .await
+                .map_err(|_| ContinuationError::StateConflict)?
+                .ok_or(ContinuationError::StateConflict)?;
+            let mut patch = cleanup_patch(ContinuationState::Resuming);
+            patch.prompt_admitted_at = FieldPatch::Set(request.admitted_at);
+            self.store
+                .cas_transition(
+                    &current.continuation_id,
+                    current.generation,
+                    current.version,
+                    ContinuationState::Resuming,
+                    patch,
+                )
+                .await
+                .map_err(|_| ContinuationError::StateConflict)?
+                .ok_or(ContinuationError::StateConflict)?;
+            if let Some(tx) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    /// Blocks inside `suspend_parent` until released so cancellation can race
+    /// the direct claimed-suspension await.
+    struct SuspendGatePort {
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        admit_calls: AtomicUsize,
+    }
+
+    impl SuspendGatePort {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                    admit_calls: AtomicUsize::new(0),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for SuspendGatePort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: true,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            if let Some(tx) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    /// Blocks at attempt-zero admission before returning so Stop can cancel a
+    /// worker queued for prompt admission.
+    struct AdmitGatePort {
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        admit_calls: AtomicUsize,
+    }
+
+    impl AdmitGatePort {
+        fn new() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                    admit_calls: AtomicUsize::new(0),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for AdmitGatePort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 1,
+                session_id: "parent-session".into(),
+                turn_generation: 1,
+                turn_in_flight: false,
+            })
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+
+        async fn admit_continuation(
+            &self,
+            _request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            Ok(PromptAdmissionResult::Admitted)
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+
+    async fn complete_cleanup_task(broker: &DelegationBroker, task_id: &str) {
+        broker
+            .complete_call(
+                task_id,
+                crate::acp::delegation::types::DelegationOutcome::Ok(
+                    crate::acp::delegation::types::DelegationSuccess {
+                        text: "done".into(),
+                        child_conversation_id: 99,
+                        child_agent_type: AgentType::Codex,
+                        turn_count: 1,
+                        duration_ms: 1,
+                        token_usage: None,
+                    },
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_stop_after_admission_before_completed_preserves_completed() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, admitted_rx, release_tx) = PostAdmissionGatePort::new(store.clone());
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        // Arm while Waiting so a worker is spawned; then complete the join.
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        // Arm-time identity requires turn_in_flight; admit port stamps prompt_admitted_at.
+        let (arm_port, _suspend_entered, suspend_release) = SuspendGatePort::new();
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(DelegationMetrics::default()),
+            Arc::new(CompositeAdmitPort {
+                suspend: arm_port,
+                admit: port.clone(),
+            }) as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        suspend_release.send(()).unwrap();
+        completion.await.unwrap().unwrap();
+        complete_cleanup_task(&broker, "task-1").await;
+        admitted_rx
+            .await
+            .expect("worker must reach durable admission before Completed");
+
+        let mid = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(mid.state, ContinuationState::Resuming);
+        assert!(mid.prompt_admitted_at.is_some());
+
+        assert_eq!(
+            coordinator.handle_parent_stop("parent", 1).await.unwrap(),
+            0,
+            "admitted winner must skip Cancelled CAS"
+        );
+        let still = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(still.state, ContinuationState::Resuming);
+        assert!(still.prompt_admitted_at.is_some());
+        assert!(coordinator
+            .metrics
+            .snapshot()
+            .continuation_cancelled
+            .is_empty());
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if store.load(&continuation_id).await.unwrap().unwrap().state
+                == ContinuationState::Completed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let done = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(done.state, ContinuationState::Completed);
+        assert!(done.prompt_admitted_at.is_some());
+        assert_eq!(coordinator.worker_count(), 0);
+        assert_eq!(port.admissions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Suspends via one port and admits via another so arm-time identity and
+    /// post-admission barriers can be controlled independently.
+    struct CompositeAdmitPort {
+        suspend: Arc<SuspendGatePort>,
+        admit: Arc<PostAdmissionGatePort>,
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for CompositeAdmitPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            self.suspend.snapshot_parent(connection_id).await
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            self.suspend.suspend_parent(request).await
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit.admit_continuation(request).await
+        }
+
+        async fn publish_waiting(
+            &self,
+            connection_id: &str,
+            waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            self.admit.publish_waiting(connection_id, waiting).await
+        }
+
+        async fn publish_failure(
+            &self,
+            connection_id: &str,
+            code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            self.admit.publish_failure(connection_id, code).await
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cancel_fences_direct_claimed_suspension_await() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, entered_rx, release_tx) = SuspendGatePort::new();
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(DelegationMetrics::default()),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        entered_rx.await.expect("suspend entered");
+        // Complete the join while suspension is still gated so the worker claims
+        // wake and re-enters the cancel-vs-suspend select with claimed=Some.
+        complete_cleanup_task(&broker, "task-1").await;
+        for _ in 0..50 {
+            if store.load(&continuation_id).await.unwrap().unwrap().state
+                == ContinuationState::WakePending
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.load(&continuation_id).await.unwrap().unwrap().state,
+            ContinuationState::WakePending,
+            "worker must claim wake before cancel races the claimed suspend await"
+        );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+        let arm_result = completion.await.unwrap();
+        assert!(matches!(
+            arm_result,
+            Err(ContinuationError::ArmWorkerDropped)
+        ));
+        let _ = release_tx.send(());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(port.admit_calls.load(Ordering::SeqCst), 0);
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(
+                row.state,
+                ContinuationState::Completed | ContinuationState::Failed
+            ),
+            "cancelled pre-admission worker must not invent a terminal failure/completion: {row:?}"
+        );
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_cancel_fences_attempt_zero_admission_wait() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, entered_rx, release_tx) = AdmitGatePort::new();
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker.seed_live_task_for_test("parent", "task-1").await;
+        // AdmitGatePort reports turn_in_flight=false; arm needs in-flight.
+        let (suspend_port, _entered, suspend_release) = SuspendGatePort::new();
+        let composite = Arc::new(CompositeAttemptPort {
+            suspend: suspend_port,
+            admit: port.clone(),
+        });
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(DelegationMetrics::default()),
+            composite as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 1,
+                task_ids: vec!["task-1".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("expected arming worker");
+        };
+        suspend_release.send(()).unwrap();
+        completion.await.unwrap().unwrap();
+        complete_cleanup_task(&broker, "task-1").await;
+        entered_rx.await.expect("attempt-zero admission entered");
+
+        assert_eq!(
+            coordinator.handle_parent_stop("parent", 1).await.unwrap(),
+            1
+        );
+        let _ = release_tx.send(());
+        for _ in 0..20 {
+            if coordinator.worker_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        assert!(row.prompt_admitted_at.is_none());
+        assert_eq!(
+            port.admit_calls.load(Ordering::SeqCst),
+            1,
+            "admission may enter the port but must not complete after cancel"
+        );
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    struct CompositeAttemptPort {
+        suspend: Arc<SuspendGatePort>,
+        admit: Arc<AdmitGatePort>,
+    }
+
+    #[async_trait]
+    impl ParentContinuationPort for CompositeAttemptPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            self.suspend.snapshot_parent(connection_id).await
+        }
+
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            self.suspend.suspend_parent(request).await
+        }
+
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admit.admit_continuation(request).await
+        }
+
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
     }
 }
