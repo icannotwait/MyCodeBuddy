@@ -2167,17 +2167,26 @@ mod tests {
         );
     }
 
-    /// REQUIRED: two concurrent completions with distinct tokens on the same
-    /// Ready job must advance `usable_turn_seq` by +2 via atomic SQL increment
-    /// (not a lost concurrent current_seq+1 RMW).
+    /// REQUIRED WAL + dual pre-write barrier: two concurrent completions with
+    /// distinct tokens on the same Ready job must both reach the progress UPDATE
+    /// site before either writes, so atomic `usable_turn_seq = usable_turn_seq + 1`
+    /// is forced under true concurrent updates (not serialized full apply paths
+    /// that could hide a lost concurrent current_seq+1 RMW).
     #[tokio::test]
     async fn two_distinct_usable_tokens_advance_seq_twice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
 
         use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+        use tokio::sync::Barrier;
 
         use crate::db::test_helpers::fresh_disk_db;
+
+        /// Bound for the dual pre-write handshake so a stuck barrier cannot hang
+        /// the suite indefinitely.
+        const BARRIER_SEQ_TIMEOUT: Duration = Duration::from_secs(5);
+        const GATE_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
@@ -2190,13 +2199,13 @@ mod tests {
         let _ = auto_title_job::Entity::delete_by_id(conversation_id)
             .exec(&migrate.conn)
             .await;
-        // Already Ready after deadline: seq=1, assistant write-once set.
+        // Ready with seq=0 so two concurrent distinct-token advances → seq=2.
         seed_ready_claim_job(
             &migrate.conn,
             conversation_id,
             Some("user task"),
             Some("deadline snap"),
-            1,
+            0,
         )
         .await;
         migrate.conn.close().await.expect("close migrate pool");
@@ -2225,6 +2234,12 @@ mod tests {
         let pool_a = Arc::new(open_wal_pool(&path).await);
         let pool_b = Arc::new(open_wal_pool(&path).await);
 
+        // Task-local completion pre-write hooks park both apply paths at the
+        // progress UPDATE gate; Barrier(2) releases only after both arrive so
+        // the atomic increments run under concurrent open transactions.
+        let barrier = Arc::new(Barrier::new(2));
+        let at_gate = Arc::new(AtomicUsize::new(0));
+
         let snap_a = TurnCompletionSnapshot {
             conversation_id,
             turn_token: "tok-a".into(),
@@ -2241,38 +2256,83 @@ mod tests {
         let handle_a = tokio::spawn({
             let pool = pool_a.clone();
             let snap = snap_a.clone();
+            let barrier = barrier.clone();
+            let at_gate = at_gate.clone();
             async move {
-                let txn = pool.conn.begin().await.expect("begin a");
-                let result = apply_usable_completion(&txn, &snap, "end_turn")
-                    .await
-                    .expect("apply a");
-                txn.commit().await.expect("commit a");
-                result
+                first_ready_race_hooks::scope_completion(
+                    Arc::new(move || {
+                        let barrier = barrier.clone();
+                        let at_gate = at_gate.clone();
+                        Box::pin(async move {
+                            at_gate.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::timeout(GATE_STEP_TIMEOUT, barrier.wait())
+                                .await
+                                .expect("completion A pre-write barrier must release");
+                        })
+                    }),
+                    async move {
+                        let txn = pool.conn.begin().await.expect("begin a");
+                        let result = apply_usable_completion(&txn, &snap, "end_turn")
+                            .await
+                            .expect("apply a");
+                        txn.commit().await.expect("commit a");
+                        result
+                    },
+                )
+                .await
             }
         });
         let handle_b = tokio::spawn({
             let pool = pool_b.clone();
             let snap = snap_b.clone();
+            let barrier = barrier.clone();
+            let at_gate = at_gate.clone();
             async move {
-                let txn = pool.conn.begin().await.expect("begin b");
-                let result = apply_usable_completion(&txn, &snap, "end_turn")
-                    .await
-                    .expect("apply b");
-                txn.commit().await.expect("commit b");
-                result
+                first_ready_race_hooks::scope_completion(
+                    Arc::new(move || {
+                        let barrier = barrier.clone();
+                        let at_gate = at_gate.clone();
+                        Box::pin(async move {
+                            at_gate.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::timeout(GATE_STEP_TIMEOUT, barrier.wait())
+                                .await
+                                .expect("completion B pre-write barrier must release");
+                        })
+                    }),
+                    async move {
+                        let txn = pool.conn.begin().await.expect("begin b");
+                        let result = apply_usable_completion(&txn, &snap, "end_turn")
+                            .await
+                            .expect("apply b");
+                        txn.commit().await.expect("commit b");
+                        result
+                    },
+                )
+                .await
             }
         });
 
-        let (ta, tb) = tokio::join!(handle_a, handle_b);
+        let (ta, tb) = tokio::time::timeout(BARRIER_SEQ_TIMEOUT, async {
+            tokio::join!(handle_a, handle_b)
+        })
+        .await
+        .expect("dual completion must not hang past barrier sequence timeout");
         let ta = ta.expect("join a");
         let tb = tb.expect("join b");
+
+        assert_eq!(
+            at_gate.load(Ordering::SeqCst),
+            2,
+            "both apply paths must hit the shared pre-write gate before either progress UPDATE"
+        );
+
         // Each completion reports the seq it observed after its progress write;
-        // together they must cover +2 from the seeded seq=1.
+        // together they must cover +2 from the seeded seq=0.
         let reported: std::collections::HashSet<i32> =
             [ta.usable_turn_seq, tb.usable_turn_seq].into_iter().collect();
         assert_eq!(
             reported,
-            [2, 3].into_iter().collect(),
+            [1, 2].into_iter().collect(),
             "concurrent distinct tokens must each advance seq once (got {ta:?} / {tb:?})"
         );
         assert!(!ta.became_ready);
@@ -2284,7 +2344,7 @@ mod tests {
             .unwrap()
             .expect("job");
         assert_eq!(
-            job.usable_turn_seq, 3,
+            job.usable_turn_seq, 2,
             "usable_turn_seq must become +2, not +1 from lost concurrent RMW"
         );
         assert_eq!(
