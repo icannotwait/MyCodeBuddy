@@ -592,6 +592,7 @@ describe("FileWorkspaceTabBar Save as translation", () => {
       content: "你好世界",
     })
     expect(openFilePreview).toHaveBeenCalledWith("/ws/README.zh_cn.md", {
+      reload: true,
       maximizeOnSuccess: false,
     })
     expect(closeFileTab).toHaveBeenCalledWith("translate:file-1:zh_cn:1")

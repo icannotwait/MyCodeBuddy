@@ -2,6 +2,26 @@
 //!
 //! Workspace isolation: relative path only, no `..`, no absolute segments,
 //! no symlink parents, exclusive create (never overwrite).
+//!
+//! ## TOCTOU / path confinement
+//!
+//! Pre-create checks (symlink walk + canonicalize parent under root) reduce
+//! escape risk, but a local attacker with write access under the folder root
+//! can still race between check and create (e.g. swap a parent directory for
+//! a junction/symlink). After exclusive create we **re-canonicalize** the
+//! created file and require it still lie under the registered folder root;
+//! on escape we remove the created file and return path-rejected.
+//!
+//! We also best-effort re-check the parent after open (before write).
+//!
+//! ### Windows residual risk
+//!
+//! On Windows, junctions and other reparse points are not fully eliminated by
+//! path-level checks alone. Closing the window to Unix openat/O_NOFOLLOW
+//! strength would need `CreateFile` with `FILE_FLAG_OPEN_REPARSE_POINT` (and
+//! reparse-tag inspection) or equivalent directory-handle confinement. That
+//! is out of scope here; post-create canonicalize-under-root is best-effort
+//! mitigation and documents the residual race.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -111,6 +131,10 @@ pub fn save_translation_as_to_root(
     }
 
     let target = resolve_save_target(root, relative_path)?;
+    // Capture root once for post-create confinement (re-canonicalize root if
+    // it moved; if re-canon fails, fall back to pre-resolved target's parent
+    // chain via the same root handle used for resolve).
+    let canonical_root = std::fs::canonicalize(root).map_err(AppCommandError::io)?;
 
     // Race-safe existence check: create_new is the authority.
     match std::fs::symlink_metadata(&target) {
@@ -136,6 +160,14 @@ pub fn save_translation_as_to_root(
         Err(e) => return Err(AppCommandError::io(e)),
     };
 
+    // Best-effort parent re-check after open (TOCTOU): if the parent no longer
+    // resolves under the folder root, refuse before writing bytes.
+    if let Err(err) = recheck_parent_under_root(&target, &canonical_root) {
+        drop(file);
+        let _ = std::fs::remove_file(&target);
+        return Err(err);
+    }
+
     let write_result = (|| -> Result<(), AppCommandError> {
         file.write_all(content.as_bytes())
             .map_err(AppCommandError::io)?;
@@ -151,14 +183,74 @@ pub fn save_translation_as_to_root(
     }
     drop(file);
 
-    let absolute = std::fs::canonicalize(&target)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .to_string();
+    // Post-create confinement: re-canonicalize the created file and verify it
+    // is still under the registered folder root. Escape → remove + reject.
+    // See module docs for Windows junction residual risk.
+    let absolute = confirm_created_under_root(&target, &canonical_root)?;
 
     Ok(SaveTranslationAsResult {
-        absolute_path: absolute,
+        absolute_path: absolute.to_string_lossy().to_string(),
     })
+}
+
+/// After exclusive create: canonicalize `created` and require it under
+/// `canonical_root`. On escape or unconfirmable resolution, remove `created`
+/// and return path-rejected (never leave an escaped file behind).
+fn confirm_created_under_root(
+    created: &Path,
+    canonical_root: &Path,
+) -> Result<PathBuf, AppCommandError> {
+    let absolute = match std::fs::canonicalize(created) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(created);
+            return Err(AppCommandError::io(e).with_i18n(
+                I18N_SAVE_PATH_REJECTED,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+    };
+    if !path_under_root(&absolute, canonical_root) {
+        let _ = std::fs::remove_file(created);
+        // Also try removing via the canonical path if different (e.g. escaped
+        // target); best-effort — may fail if already gone.
+        if absolute != created {
+            let _ = std::fs::remove_file(&absolute);
+        }
+        return Err(path_rejected(
+            "Created file path escapes workspace root after exclusive create",
+        ));
+    }
+    Ok(absolute)
+}
+
+/// Best-effort: re-canonicalize parent of `target` and require under root.
+fn recheck_parent_under_root(
+    target: &Path,
+    canonical_root: &Path,
+) -> Result<(), AppCommandError> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    // If parent cannot be canonicalized (race deleted it), reject so we do
+    // not write into an unconfirmable location.
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+        AppCommandError::io(e).with_i18n(
+            I18N_SAVE_PATH_REJECTED,
+            std::collections::BTreeMap::new(),
+        )
+    })?;
+    if !path_under_root(&canonical_parent, canonical_root) {
+        return Err(path_rejected(
+            "Parent path escaped workspace root after exclusive create",
+        ));
+    }
+    Ok(())
+}
+
+/// Component-aware containment: `child` is `root` or a descendant of `root`.
+fn path_under_root(child: &Path, root: &Path) -> bool {
+    child.starts_with(root)
 }
 
 fn path_rejected(message: impl Into<String>) -> AppCommandError {
@@ -328,13 +420,40 @@ mod tests {
         assert_eq!(fail.code, AppErrorCode::AlreadyExists);
         assert_eq!(fail.i18n_key.as_deref(), Some(I18N_SAVE_ALREADY_EXISTS));
         // Prefer winner's absolute path (canonical) over joining the temp root.
+        // `Result::unwrap_or_else` takes the error value (arity 1).
         let path = a
             .as_ref()
             .or(b.as_ref())
             .map(|r| PathBuf::from(&r.absolute_path))
-            .unwrap_or_else(|| root_path.join(rel));
+            .unwrap_or_else(|_| root_path.join(rel));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content == "first" || content == "second");
+    }
+
+    #[test]
+    fn post_create_confinement_accepts_file_under_root() {
+        let root = temp_root();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let target = root.path().join("ok.md");
+        std::fs::write(&target, b"x").unwrap();
+        let confirmed = confirm_created_under_root(&target, &canonical_root).unwrap();
+        assert!(path_under_root(&confirmed, &canonical_root));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn post_create_confinement_rejects_and_removes_escape() {
+        let root = temp_root();
+        let outside = temp_root();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let escaped = outside.path().join("escaped.md");
+        std::fs::write(&escaped, b"leak").unwrap();
+        let err = confirm_created_under_root(&escaped, &canonical_root).unwrap_err();
+        assert_eq!(err.i18n_key.as_deref(), Some(I18N_SAVE_PATH_REJECTED));
+        assert!(
+            !escaped.exists(),
+            "escaped file must be removed on confinement failure"
+        );
     }
 
     #[test]

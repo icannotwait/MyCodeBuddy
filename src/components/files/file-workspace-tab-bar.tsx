@@ -312,7 +312,10 @@ export function FileWorkspaceTabBar() {
         relativePath,
         content,
       })
+      // reload:true so an already-open tab for this path picks up the newly
+      // saved bytes before we close the transient translation tab.
       const settle = await openFilePreview(saved.absolutePath, {
+        reload: true,
         maximizeOnSuccess: false,
       })
       // Close the transient tab only after the real path loaded successfully.
