@@ -153,10 +153,49 @@ fn replace_fenced(
 }
 
 fn is_line_start(s: &str, i: usize) -> bool {
-    i == 0 || s.as_bytes().get(i - 1) == Some(&b'\n')
+    if i == 0 {
+        return true;
+    }
+    // CommonMark line endings: \n, \r\n, or bare \r.
+    // When i sits on the LF of a CRLF pair, that is not a content line start.
+    let b = s.as_bytes();
+    match b[i - 1] {
+        b'\n' => true,
+        b'\r' => b.get(i) != Some(&b'\n'),
+        _ => false,
+    }
 }
 
-/// If a complete fenced block starts at `i`, return exclusive end index.
+/// Length of a CommonMark line ending at `bytes[idx]`, or 0 if none.
+fn line_ending_len(bytes: &[u8], idx: usize) -> usize {
+    match bytes.get(idx) {
+        Some(b'\n') => 1,
+        Some(b'\r') if bytes.get(idx + 1) == Some(&b'\n') => 2,
+        Some(b'\r') => 1,
+        _ => 0,
+    }
+}
+
+/// Exclusive end of the line that begins at `pos` (includes any trailing
+/// line ending), or `bytes.len()` when the line runs to EOF.
+fn line_end_exclusive(bytes: &[u8], pos: usize) -> usize {
+    let mut k = pos;
+    while k < bytes.len() {
+        let le = line_ending_len(bytes, k);
+        if le > 0 {
+            return k + le;
+        }
+        k += 1;
+    }
+    bytes.len()
+}
+
+/// If a fenced block starts at `i`, return exclusive end index.
+///
+/// Matches CommonMark: optional ≤3 space indent, `` ` `` / `~` fence ≥3,
+/// info string (no backticks for `` ` `` fences), then body until a matching
+/// close line **or EOF** (unclosed fences protect through end of document).
+/// Line endings may be `\n`, `\r\n`, or bare `\r`.
 fn match_fenced_block(s: &str, i: usize) -> Option<usize> {
     let rest = &s[i..];
     let bytes = rest.as_bytes();
@@ -184,21 +223,33 @@ fn match_fenced_block(s: &str, i: usize) -> Option<usize> {
     }
 
     // Opening info string: backtick fences cannot contain backticks in info.
+    // Scan until line ending or EOF (opening fence may be the last line).
     let mut k = j + fence_len;
-    while k < bytes.len() && bytes[k] != b'\n' {
+    while k < bytes.len() {
+        let le = line_ending_len(bytes, k);
+        if le > 0 {
+            break;
+        }
         if fence_char == b'`' && bytes[k] == b'`' {
             return None;
         }
         k += 1;
     }
-    // Require a newline after the opening line (block body / close search).
-    if k >= bytes.len() {
-        return None;
-    }
-    // k is the '\n' after the opening fence line.
-    let mut pos = k + 1;
+
+    // Body starts after the opening line's ending; at EOF the body is empty
+    // and the unclosed fence spans through end of document.
+    let mut pos = if k < bytes.len() {
+        k + line_ending_len(bytes, k)
+    } else {
+        bytes.len()
+    };
 
     loop {
+        if pos >= bytes.len() {
+            // Unclosed fence: protect opening line through EOF.
+            return Some(s.len());
+        }
+
         // Examine the line starting at `pos`.
         let mut m = pos;
         let mut spaces = 0usize;
@@ -217,22 +268,24 @@ fn match_fenced_block(s: &str, i: usize) -> Option<usize> {
             while end < bytes.len() && (bytes[end] == b' ' || bytes[end] == b'\t') {
                 end += 1;
             }
-            if end >= bytes.len() || bytes[end] == b'\n' {
-                // Include trailing newline of the closing fence line when present.
-                let block_end = if end < bytes.len() && bytes[end] == b'\n' {
-                    i + end + 1
-                } else {
-                    i + end
-                };
-                return Some(block_end);
+            let le = line_ending_len(bytes, end);
+            if end >= bytes.len() || le > 0 {
+                // Include trailing line ending of the closing fence when present.
+                return Some(i + if le > 0 { end + le } else { end });
             }
         }
 
-        // Advance to next line.
-        match rest[pos..].find('\n') {
-            Some(nl) => pos = pos + nl + 1,
-            None => return None,
+        // Advance past this line (content + line ending), or to EOF.
+        let next = line_end_exclusive(bytes, pos);
+        if next <= pos {
+            // Safety: always make progress.
+            return Some(s.len());
         }
+        if next >= bytes.len() {
+            // No further lines and no closer → unclosed through EOF.
+            return Some(s.len());
+        }
+        pos = next;
     }
 }
 
@@ -255,12 +308,19 @@ fn replace_inline(
                 open_len += 1;
             }
             if open_len == 1 {
-                // Find closing single backtick before newline / EOF.
-                if let Some(rel) = source[i + 1..].find('`') {
-                    let close = i + 1 + rel;
-                    // Reject if the run is longer than 1 (start of ``` etc.)
-                    // or if a newline is inside.
+                // Find closing single backtick before any line ending / EOF.
+                // Prefer the first candidate close-run of length 1 so
+                // `` `a` `` style nesting is not required in v1.
+                let search = &source[i + 1..];
+                let mut search_off = 0usize;
+                let mut matched = false;
+                while let Some(rel) = search[search_off..].find('`') {
+                    let close = i + 1 + search_off + rel;
                     let inner = &source[i + 1..close];
+                    // Inline code cannot span lines (LF / CRLF / CR).
+                    if inner.contains('\n') || inner.contains('\r') {
+                        break;
+                    }
                     let close_run = {
                         let mut n = 0usize;
                         while close + n < bytes.len() && bytes[close + n] == b'`' {
@@ -268,7 +328,7 @@ fn replace_inline(
                         }
                         n
                     };
-                    if close_run == 1 && !inner.contains('\n') {
+                    if close_run == 1 {
                         let end = close + 1;
                         let original = &source[i..end];
                         let token = inline_token(nonce, *inline_idx);
@@ -279,8 +339,14 @@ fn replace_inline(
                         });
                         out.push_str(&token);
                         i = end;
-                        continue;
+                        matched = true;
+                        break;
                     }
+                    // Multi-backtick close is not a v1 closer; keep scanning.
+                    search_off = search_off + rel + close_run.max(1);
+                }
+                if matched {
+                    continue;
                 }
             }
             // Not a v1 inline span — copy the opening run as-is.
@@ -515,5 +581,106 @@ console.log('`quoted`');
         let output = protected.text.replace("Hello", "Hola").replace("end", "fin");
         let restored = restore_markdown(&output, &protected).unwrap();
         assert_eq!(restored, "Hola `world` fin");
+    }
+
+    #[test]
+    fn crlf_fenced_blocks_are_protected_and_round_trip() {
+        // Windows-style \r\n fences must close and protect like LF fences.
+        let source = "Intro\r\n```rust\r\nfn main() {}\r\n```\r\nOutro `x`\r\n";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        assert!(
+            protected.text.contains("⟦CGCODE_n0_0⟧"),
+            "CRLF fenced block must become CGCODE: {}",
+            protected.text
+        );
+        assert!(
+            protected.text.contains("⟦CGINLINE_n0_0⟧"),
+            "inline after CRLF fence: {}",
+            protected.text
+        );
+        assert!(
+            !protected.text.contains("fn main"),
+            "CRLF fence body must be stripped: {}",
+            protected.text
+        );
+        let restored = restore_markdown(&protected.text, &protected).unwrap();
+        assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn crlf_tilde_fence_and_bare_cr_line_endings() {
+        let crlf = "~~~\r\necho hi\r\n~~~\r\n";
+        let protected = protect_markdown_with_nonce(crlf, NONCE).unwrap();
+        assert!(protected.text.contains("⟦CGCODE_n0_0⟧"));
+        assert_eq!(
+            restore_markdown(&protected.text, &protected).unwrap(),
+            crlf
+        );
+
+        // Bare CR line endings (less common, still CommonMark).
+        let cr = "```\rcode\r```\r";
+        let protected = protect_markdown_with_nonce(cr, NONCE).unwrap();
+        assert!(
+            protected.text.contains("⟦CGCODE_n0_0⟧"),
+            "bare CR fence: {}",
+            protected.text
+        );
+        assert_eq!(restore_markdown(&protected.text, &protected).unwrap(), cr);
+    }
+
+    #[test]
+    fn unclosed_fence_protects_through_eof() {
+        let source = "Before\n```js\nconst x = 1;\n// no closing fence";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        assert!(
+            protected.text.contains("⟦CGCODE_n0_0⟧"),
+            "unclosed fence must be protected: {}",
+            protected.text
+        );
+        assert!(
+            !protected.text.contains("const x"),
+            "body through EOF must be inside placeholder: {}",
+            protected.text
+        );
+        assert!(
+            !protected.text.contains("CGINLINE"),
+            "backticks inside unclosed fence must not become inline"
+        );
+        // Prose before the fence remains; fence+body is one token.
+        assert!(protected.text.starts_with("Before\n⟦CGCODE_n0_0⟧"));
+        let restored = restore_markdown(&protected.text, &protected).unwrap();
+        assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn unclosed_fence_crlf_protects_through_eof() {
+        let source = "Lead\r\n```\r\nbody line\r\nstill open";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        assert!(
+            protected.text.contains("⟦CGCODE_n0_0⟧"),
+            "unclosed CRLF fence: {}",
+            protected.text
+        );
+        assert!(!protected.text.contains("body line"));
+        assert_eq!(
+            restore_markdown(&protected.text, &protected).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn unclosed_fence_at_eof_without_body_newline() {
+        // Opening fence is the last line of the document (no body).
+        let source = "text\n```";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        assert!(
+            protected.text.contains("⟦CGCODE_n0_0⟧"),
+            "opening fence at EOF: {}",
+            protected.text
+        );
+        assert_eq!(
+            restore_markdown(&protected.text, &protected).unwrap(),
+            source
+        );
     }
 }
