@@ -236,6 +236,7 @@ const mockedApi = api as unknown as {
   getHomeDirectory: ReturnType<typeof vi.fn>
   readFileForEdit: ReturnType<typeof vi.fn>
   readFileBase64: ReturnType<typeof vi.fn>
+  readFilePreview: ReturnType<typeof vi.fn>
   gitIsTracked: ReturnType<typeof vi.fn>
   gitShowFile: ReturnType<typeof vi.fn>
   saveFileContent: ReturnType<typeof vi.fn>
@@ -3125,6 +3126,7 @@ describe("unified absolute-path file tabs (outside-workspace opens)", () => {
 describe("openFilePreview failure matrix and maximize-on-success", () => {
   beforeEach(() => {
     mockedApi.readFileForEdit.mockReset()
+    mockedApi.readFilePreview.mockReset()
     mockedApi.gitIsTracked.mockReset()
     mockedApi.gitShowFile.mockReset()
     mockedApi.gitIsTracked.mockResolvedValue(false)
@@ -3768,6 +3770,156 @@ describe("openFilePreview failure matrix and maximize-on-success", () => {
     expect(snap.loading).toBe(false)
     expect(snap.saveState).not.toBe("error")
     expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(toastMock.error).toHaveBeenCalled()
+  })
+
+  it("close mid-open then reopen is independent of late old settle", async () => {
+    let rejectFirst: ((err: Error) => void) | null = null
+    let resolveSecond: ((v: ReturnType<typeof editPayload>) => void) | null =
+      null
+
+    mockedApi.readFileForEdit
+      .mockImplementationOnce(
+        () =>
+          new Promise((_res, rej) => {
+            rejectFirst = rej
+          })
+      )
+      .mockImplementationOnce(() => new Promise((res) => (resolveSecond = res)))
+
+    const settles: unknown[] = []
+    let snap: {
+      tabCount: number
+      content: string
+      loading: boolean
+      hasLoadedSuccessfully?: boolean
+    } = { tabCount: 0, content: "", loading: false }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const {
+        openFilePreview,
+        closeFileTab,
+        fileTabs,
+        activeFileTab,
+        activeFileTabId,
+      } = useWorkspaceContext()
+      onCapture({
+        tabCount: fileTabs.length,
+        content: activeFileTab?.content ?? "",
+        loading: activeFileTab?.loading ?? false,
+        hasLoadedSuccessfully: activeFileTab?.hasLoadedSuccessfully,
+      })
+      return (
+        <div>
+          <button
+            onClick={() => {
+              void openFilePreview("a.ts").then((r) => settles.push(r))
+            }}
+          >
+            open
+          </button>
+          <button
+            onClick={() => {
+              if (activeFileTabId) closeFileTab(activeFileTabId)
+            }}
+          >
+            close
+          </button>
+        </div>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    // Gen1: start open, leave read hanging.
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.tabCount).toBe(1)
+    expect(snap.loading).toBe(true)
+    expect(settles).toEqual([])
+
+    // Close mid-flight → gen1 settles closed.
+    await act(async () => {
+      screen.getByText("close").click()
+    })
+    expect(snap.tabCount).toBe(0)
+    expect(settles).toEqual([{ ok: false, reason: "closed" }])
+
+    // Gen2: reopen same path while gen1 is still pending at the API.
+    await act(async () => {
+      screen.getByText("open").click()
+    })
+    expect(snap.tabCount).toBe(1)
+    expect(snap.loading).toBe(true)
+
+    // Late gen1 failure must not resolve/delete gen2's Deferred or cold-close.
+    await act(async () => {
+      rejectFirst!(new Error("stale-gen1-fail"))
+    })
+    expect(snap.tabCount).toBe(1)
+    expect(snap.loading).toBe(true)
+    expect(settles).toHaveLength(1)
+
+    // Gen2 succeeds independently.
+    await act(async () => {
+      resolveSecond!(editPayload("a.ts", "reopen-ok"))
+    })
+    expect(settles).toHaveLength(2)
+    expect(settles[1]).toEqual({
+      ok: true,
+      tabId: fileTabId("/repo/a.ts"),
+    })
+    expect(snap.content).toBe("reopen-ok")
+    expect(snap.loading).toBe(false)
+    expect(snap.hasLoadedSuccessfully).toBe(true)
+    expect(snap.tabCount).toBe(1)
+  })
+
+  it("rich-diff both-side read failures cold-close tab and toast", async () => {
+    mockedApi.gitShowFile.mockRejectedValue(new Error("git-show-fail"))
+    mockedApi.readFilePreview.mockRejectedValue(new Error("preview-fail"))
+
+    let snap: {
+      tabCount: number
+      kind?: string
+      loading?: boolean
+      hasLoadedSuccessfully?: boolean
+    } = { tabCount: 0 }
+
+    function Probe({ onCapture }: { onCapture: (s: typeof snap) => void }) {
+      const { openWorkingTreeDiff, fileTabs, activeFileTab } =
+        useWorkspaceContext()
+      onCapture({
+        tabCount: fileTabs.length,
+        kind: activeFileTab?.kind,
+        loading: activeFileTab?.loading,
+        hasLoadedSuccessfully: activeFileTab?.hasLoadedSuccessfully,
+      })
+      return (
+        <button onClick={() => void openWorkingTreeDiff("a.ts")}>
+          open-diff
+        </button>
+      )
+    }
+
+    render(
+      <WorkspaceProvider>
+        <Probe onCapture={(s) => (snap = s)} />
+      </WorkspaceProvider>
+    )
+
+    await act(async () => {
+      screen.getByText("open-diff").click()
+    })
+
+    // Both sides failed → cold fail: tab removed, no successful load.
+    expect(snap.tabCount).toBe(0)
+    expect(snap.hasLoadedSuccessfully).not.toBe(true)
     expect(toastMock.error).toHaveBeenCalled()
   })
 
