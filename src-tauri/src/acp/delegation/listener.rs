@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -85,7 +85,7 @@ impl TokenEntry {
 #[derive(Default)]
 pub struct TokenRegistry {
     inner: RwLock<HashMap<String, TokenEntry>>,
-    continuation_coordinator: OnceLock<Arc<DelegationContinuationCoordinator>>,
+    continuation_coordinator: OnceLock<Weak<DelegationContinuationCoordinator>>,
 }
 
 impl TokenRegistry {
@@ -94,12 +94,12 @@ impl TokenRegistry {
     ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            continuation_coordinator: OnceLock::from(coordinator),
+            continuation_coordinator: OnceLock::from(Arc::downgrade(&coordinator)),
         }
     }
 
     fn continuation_coordinator(&self) -> Option<Arc<DelegationContinuationCoordinator>> {
-        self.continuation_coordinator.get().cloned()
+        self.continuation_coordinator.get()?.upgrade()
     }
 
     pub async fn register(&self, token: String, entry: TokenEntry) {
@@ -599,6 +599,16 @@ impl DelegationListener {
             )),
             Some(DelegationReturnWhen::AllTerminalOrAttention) if req.wait_ms == Some(0) => {
                 if !entry.delegation_continuation_v1 {
+                    return Ok(self
+                        .broker
+                        .join_tasks_status(
+                            &entry.parent_connection_id,
+                            parent_conversation_id,
+                            &req.task_ids,
+                        )
+                        .await);
+                }
+                if req.task_ids.is_empty() {
                     return Ok(self
                         .broker
                         .join_tasks_status(
@@ -1122,6 +1132,11 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::acp::connection::SuspensionAck;
+    use crate::acp::delegation::attention::{
+        mock::MemoryDelegationAttentionStore, AttentionOpenResult, AttentionRecord,
+        AttentionRequestSummary, AttentionResolutionCode, AttentionResolveResult,
+        AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
+    };
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
     use crate::acp::delegation::continuation::coordinator::{
         ContinuationError, ContinuationPromptRequest, DelegationContinuationCoordinator,
@@ -1276,6 +1291,100 @@ mod tests {
             })
             .await;
         broker
+    }
+
+    async fn make_broker_with_attention(
+        mock: Arc<MockSpawner>,
+        attention: Arc<dyn DelegationAttentionStore>,
+    ) -> Arc<DelegationBroker> {
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_attention_store(attention),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+        broker
+    }
+
+    struct JoinEntryAttentionStore {
+        inner: MemoryDelegationAttentionStore,
+        list_calls: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl JoinEntryAttentionStore {
+        fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+            let (list_calls, receiver) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    inner: MemoryDelegationAttentionStore::new(),
+                    list_calls,
+                }),
+                receiver,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl DelegationAttentionStore for JoinEntryAttentionStore {
+        async fn open_or_recover(
+            &self,
+            request: NewAttentionRequest,
+        ) -> Result<AttentionOpenResult, AttentionStoreError> {
+            self.inner.open_or_recover(request).await
+        }
+
+        async fn list_open_for_tasks(
+            &self,
+            parent_conversation_id: i32,
+            task_ids: &[String],
+        ) -> Result<Vec<AttentionRequestSummary>, AttentionStoreError> {
+            let _ = self.list_calls.send(());
+            self.inner
+                .list_open_for_tasks(parent_conversation_id, task_ids)
+                .await
+        }
+
+        async fn wait_snapshot(
+            &self,
+            request_id: &str,
+        ) -> Result<AttentionRecord, AttentionStoreError> {
+            self.inner.wait_snapshot(request_id).await
+        }
+
+        async fn reply(
+            &self,
+            parent_conversation_id: i32,
+            request_id: &str,
+            reply: &str,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<AttentionResolveResult, AttentionStoreError> {
+            self.inner
+                .reply(parent_conversation_id, request_id, reply, at)
+                .await
+        }
+
+        async fn resolve_task(
+            &self,
+            task_id: &str,
+            code: AttentionResolutionCode,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<Option<AttentionRecord>, AttentionStoreError> {
+            self.inner.resolve_task(task_id, code, at).await
+        }
+
+        async fn reconcile_open(
+            &self,
+            at: chrono::DateTime<Utc>,
+        ) -> Result<Vec<AttentionRecord>, AttentionStoreError> {
+            self.inner.reconcile_open(at).await
+        }
     }
 
     struct ContinuationTestPort {
@@ -1457,6 +1566,40 @@ mod tests {
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
         }
+    }
+
+    #[tokio::test]
+    async fn continuation_registry_weak_owner_drops_and_is_instance_scoped() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (tokens, coordinator) =
+            continuation_registry(broker.clone(), store, ContinuationTestPort::ready());
+        let weak = Arc::downgrade(&coordinator);
+        assert!(Arc::ptr_eq(
+            &tokens
+                .continuation_coordinator()
+                .expect("registry resolves its live AppState coordinator"),
+            &coordinator,
+        ));
+
+        drop(coordinator);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the registry must not keep the AppState coordinator alive"
+        );
+        assert!(tokens.continuation_coordinator().is_none());
+
+        let second_store = Arc::new(InMemoryContinuationStore::default());
+        let (second_tokens, second_coordinator) =
+            continuation_registry(broker, second_store, ContinuationTestPort::ready());
+        assert!(tokens.continuation_coordinator().is_none());
+        assert!(Arc::ptr_eq(
+            &second_tokens
+                .continuation_coordinator()
+                .expect("a separate registry resolves only its own coordinator"),
+            &second_coordinator,
+        ));
     }
 
     fn make_listener(
@@ -1751,7 +1894,12 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_capability_off_keeps_existing_parked_join() {
-        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let (attention, mut join_evaluations) = JoinEntryAttentionStore::new();
+        let broker = make_broker_with_attention(
+            Arc::new(MockSpawner::new()),
+            attention as Arc<dyn DelegationAttentionStore>,
+        )
+        .await;
         let task_id = broker
             .seed_live_task_for_test("parent-conn", "continuation-off-running")
             .await;
@@ -1760,18 +1908,27 @@ mod tests {
             .register("tok".into(), continuation_token_entry(false))
             .await;
         let listener = make_listener(broker.clone(), tokens, Some(1));
+        let request_task_id = task_id.clone();
 
         let join = tokio::spawn(async move {
             listener
                 .process_status(BrokerStatusRequest {
                     token: "tok".into(),
-                    task_ids: vec![task_id],
+                    task_ids: vec![request_task_id],
                     wait_ms: Some(0),
                     return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
                 })
                 .await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), join_evaluations.recv())
+            .await
+            .expect("the old Join must enter its first real Broker evaluation")
+            .expect("the evaluation observer must remain installed");
+        broker.notify_result_for_test(&task_id);
+        tokio::time::timeout(Duration::from_secs(1), join_evaluations.recv())
+            .await
+            .expect("an unrelated wake must drive a second parked Join evaluation")
+            .expect("the evaluation observer must remain installed");
         assert!(
             !join.is_finished(),
             "capability-off Join must retain the existing parked listener behavior"
@@ -1781,6 +1938,44 @@ mod tests {
         let batch = join.await.unwrap().unwrap();
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
         assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn continuation_capability_empty_join_returns_unavailable_without_row() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = ContinuationTestPort::ready();
+        let (tokens, _coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port.clone());
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: Vec::new(),
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        let response: BrokerResponse = read_frame(&mut client).await.unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(response.outcome["wake_reason"], "unavailable");
+        assert_eq!(response.outcome["tasks"], json!([]));
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+        assert_eq!(
+            port.snapshot_calls.load(Ordering::SeqCst),
+            0,
+            "empty Join must not construct or dispatch a JoinArmRequest"
+        );
     }
 
     #[tokio::test]
@@ -1828,12 +2023,10 @@ mod tests {
             invalid_batch.wake_reason,
             Some(DelegationWakeReason::Unavailable)
         );
-        assert!(
-            invalid_batch
-                .tasks
-                .iter()
-                .all(|task| task.status == TaskStatus::Unknown)
-        );
+        assert!(invalid_batch
+            .tasks
+            .iter()
+            .all(|task| task.status == TaskStatus::Unknown));
         assert!(store.list_non_terminal().await.unwrap().is_empty());
         assert_eq!(
             port.snapshot_calls.load(Ordering::SeqCst),
@@ -2160,7 +2353,78 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_status_peer_close_leaves_children_running() {
-        assert_status_peer_close_leaves_children_running().await;
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "status-peer-close-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, _coordinator) = continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec![task_id.clone()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        suspend_entered
+            .await
+            .expect("canonical Join must cross the durable row/worker boundary");
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("peer EOF must release the canonical status request")
+            .unwrap()
+            .unwrap();
+        assert_eq!(broker.pending_count().await, 1);
+        assert_eq!(store.list_non_terminal().await.unwrap().len(), 1);
+        assert_eq!(
+            broker
+                .metrics()
+                .snapshot()
+                .wait_return_reasons
+                .get("peer_closed"),
+            Some(&1),
+        );
+
+        suspend_release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows
+                    .first()
+                    .is_some_and(|row| row.state == ContinuationState::Waiting)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the independently owned worker must survive peer close");
+        assert_eq!(broker.pending_count().await, 1);
+
+        complete_running_task(&broker, &task_id).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !store.list_non_terminal().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the independent child terminal action must finish continuation");
+        assert_eq!(broker.pending_count().await, 0);
     }
 
     /// Batch status over the listener: two tasks, one completed and one still
@@ -3411,9 +3675,6 @@ mod tests {
 
     // -- Role-aware parent decision tools (Task 6) -------------------------
 
-    use crate::acp::delegation::attention::{
-        mock::MemoryDelegationAttentionStore, AttentionResolutionCode, DelegationAttentionStore,
-    };
     use crate::acp::delegation::store::mock::MockTaskStore;
     use crate::acp::delegation::store::DelegationTaskStore;
     use crate::acp::delegation::transport::{
