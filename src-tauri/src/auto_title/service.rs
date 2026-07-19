@@ -1820,6 +1820,135 @@ mod tests {
         );
     }
 
+    /// Pre-migration rows keep NULL `first_prompt_at` after upgrade (Task 1).
+    /// They must never deadline-promote, but end-turn + later capture must still
+    /// work without backfilling the timestamp.
+    #[tokio::test]
+    async fn legacy_null_first_prompt_at_end_turn_only() {
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn, AgentType::Codex).await;
+        let folder = seed_folder(&db, "/tmp/title-legacy-null-prompt-at").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let conversation_id = conversation.id;
+        // Even far past a nominal 300s window, NULL first_prompt_at is ineligible.
+        let now = Utc::now();
+
+        // Simulate upgraded legacy row: first_user set, first_prompt_at NULL.
+        seed_deadline_fields(
+            &db.conn,
+            conversation_id,
+            Some("legacy task"),
+            None,
+            AutoTitleJobState::AwaitingTurn,
+            None,
+        )
+        .await;
+
+        let params = DeadlinePromoteParams {
+            now,
+            deadline: Duration::from_secs(300),
+            batch_limit: 32,
+        };
+        let candidates = list_deadline_candidates(&db.conn, &params)
+            .await
+            .expect("list");
+        assert!(
+            !candidates.contains(&conversation_id),
+            "legacy NULL first_prompt_at must never be a deadline candidate"
+        );
+
+        let mut partials = HashMap::new();
+        partials.insert(conversation_id, "partial must not land".to_string());
+        let promoted = promote_deadline_jobs_by_ids(
+            &db.conn,
+            &params,
+            &[conversation_id],
+            &partials,
+        )
+        .await
+        .expect("promote");
+        assert_eq!(promoted, 0, "legacy NULL first_prompt_at must not promote");
+
+        let before_end = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(before_end.state, AutoTitleJobState::AwaitingTurn);
+        assert!(before_end.first_assistant_text.is_none());
+        assert!(before_end.first_prompt_at.is_none());
+
+        // End-turn still arms Ready with first assistant snapshot.
+        let snapshot = TurnCompletionSnapshot {
+            conversation_id,
+            turn_token: "legacy-tok".into(),
+            locale: AppLocale::En,
+            final_text: Arc::from("legacy final answer"),
+        };
+        let txn = db.conn.begin().await.expect("begin");
+        let transition = apply_usable_completion(&txn, &snapshot, "end_turn")
+            .await
+            .expect("end_turn");
+        txn.commit().await.expect("commit");
+        assert!(transition.became_ready);
+        assert_eq!(transition.usable_turn_seq, 1);
+
+        let after_end = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(after_end.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            after_end.first_assistant_text.as_deref(),
+            Some("legacy final answer")
+        );
+        assert_eq!(after_end.first_user_text.as_deref(), Some("legacy task"));
+        assert!(
+            after_end.first_prompt_at.is_none(),
+            "end-turn must not invent first_prompt_at for legacy rows"
+        );
+
+        // Capture with first_user already set must not backfill first_prompt_at.
+        let capture = PromptCaptureContext::new(
+            Some("should not replace legacy task".into()),
+            Some(AppLocale::Ja),
+        );
+        capture_prompt_context(
+            &db.conn,
+            conversation_id,
+            &[],
+            Some(&capture),
+            AppLocale::En,
+        )
+        .await
+        .expect("capture after legacy");
+
+        let after_capture = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(
+            after_capture.first_user_text.as_deref(),
+            Some("legacy task"),
+            "first_user_text stays write-once for legacy rows"
+        );
+        assert!(
+            after_capture.first_prompt_at.is_none(),
+            "capture must not backfill first_prompt_at when first_user already set"
+        );
+        assert_eq!(
+            after_capture.locale.as_deref(),
+            Some("ja"),
+            "locale still refreshes on surviving job"
+        );
+    }
+
     #[tokio::test]
     async fn promote_cas_loses_to_end_turn() {
         let fixture = awaiting_job_fixture().await;

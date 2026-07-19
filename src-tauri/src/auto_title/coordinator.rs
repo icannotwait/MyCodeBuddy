@@ -2023,4 +2023,93 @@ mod tests {
             Some("Sweep Promoted Title")
         );
     }
+
+    /// Full path: enroll → capture (stamps first_prompt_at) → deadline promote →
+    /// claim → mock runner finalize. Preferred Task 9 e2e coverage.
+    #[tokio::test]
+    async fn full_path_capture_promote_claim_finalize() {
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let runner = FakeRunner::succeed_once("Full Path Generated Title");
+        let partial: Arc<dyn PartialAssistantTextSource> = Arc::new(FixedPartialSource {
+            text: "live partial for title".into(),
+        });
+        // deadline ZERO: any stamped first_prompt_at is immediately eligible.
+        let fixture = coordinator_with_sweep(
+            runner,
+            partial,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        )
+        .await;
+
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        // create() enrolls awaiting_turn with NULL first fields — capture stamps both.
+        let job_before = auto_title_job::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .expect("enrolled");
+        assert!(job_before.first_user_text.is_none());
+        assert!(job_before.first_prompt_at.is_none());
+
+        let capture =
+            PromptCaptureContext::new(Some("ship the deadline sweep".into()), Some(AppLocale::En));
+        capture_prompt_context(
+            &fixture.db.conn,
+            cid,
+            &[],
+            Some(&capture),
+            AppLocale::En,
+        )
+        .await
+        .expect("capture");
+
+        let job_captured = auto_title_job::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .expect("job after capture");
+        assert_eq!(
+            job_captured.first_user_text.as_deref(),
+            Some("ship the deadline sweep")
+        );
+        assert!(
+            job_captured.first_prompt_at.is_some(),
+            "capture must stamp first_prompt_at for new jobs"
+        );
+        assert_eq!(job_captured.state, AutoTitleJobState::AwaitingTurn);
+        assert!(job_captured.first_assistant_text.is_none());
+
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+
+        fixture.wait_for_job_deleted(cid).await;
+        assert_eq!(
+            fixture.runner.call_count(),
+            1,
+            "mock runner must claim and generate exactly once"
+        );
+        assert_eq!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("Full Path Generated Title")
+        );
+
+        let conversation = crate::db::entities::conversation::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .expect("conv query")
+            .expect("conversation");
+        assert!(
+            conversation.auto_title_finalized,
+            "finalize must mark auto_title_finalized"
+        );
+    }
 }
