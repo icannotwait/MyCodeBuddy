@@ -27,6 +27,21 @@
 - Desktop + server (`--no-default-features`) must both build
 - Every behavior starts with a focused failing test (TDD)
 - Frontend: no new API or settings
+- **Concurrency tests are mandatory:** pooled WAL (or multi-connection on the same
+  file DB) with barriers for capture races, deadline-vs-end-turn both orders,
+  completion-vs-claim, and select-then-delete/Off. Sequential “pre-seed winner”
+  tests are **not** substitutes for those cases.
+- Usable-turn progress must use **atomic** `usable_turn_seq` advance (SQL
+  `+ 1` or reload/retry on CAS miss), never a stale in-memory `current_seq + 1`
+  without a sequence guard.
+
+## Review History
+
+- 2026-07-19: Initial plan committed (`54509cba`).
+- 2026-07-19: Codex plan review (`fd756a51-ec24-48c4-b4c7-652fef839aed`) — seven
+  Important findings incorporated below (atomic completion, claim retry, real
+  concurrency tests, coordinator liveness hooks, correct state Arc collection,
+  migration TDD discoverability, TurnComplete `live_message = None` case).
 
 ## File Map
 
@@ -50,131 +65,70 @@
 
 **Files:**
 - Create: `src-tauri/src/db/migration/m20260719_000001_auto_title_first_prompt_at.rs`
-- Modify: `src-tauri/src/db/migration/mod.rs`
+- Modify: `src-tauri/src/db/migration/mod.rs` (declare module + register **last** in Step 1 skeleton)
 - Modify: `src-tauri/src/db/entities/auto_title_job.rs`
-- Touch every `auto_title_job::ActiveModel { ... }` initializer in tests that exhaustively set fields (grep `first_user_text: Set` under `src-tauri/`)
+- Modify: `src-tauri/src/auto_title/service.rs` — `enroll_new_conversation` ActiveModel must set `first_prompt_at: Set(None)` as soon as the entity field exists
+- Touch **every** exhaustive `auto_title_job::ActiveModel { ... }` under `src-tauri/` (grep `first_user_text: Set`)
 
 **Interfaces:**
 - Produces: `auto_title_job::Model.first_prompt_at: Option<DateTimeUtc>`
-- Produces: index name `idx_auto_title_jobs_deadline` on `(state, first_prompt_at, conversation_id)`
+- Produces: index name `idx_auto_title_jobs_deadline` on `(state, first_prompt_at, conversation_id)` in that column order
 - Preserves: `idx_auto_title_jobs_queue` on `(state, updated_at, conversation_id)`
 
-- [ ] **Step 1: Write the failing migration test**
+- [ ] **Step 1: Register a compilable skeleton + write failing assertions**
+
+In **the same step** (so cargo discovers the test):
+
+1. Add `mod m20260719_000001_auto_title_first_prompt_at;` and
+   `Box::new(m20260719_000001_auto_title_first_prompt_at::Migration)` as the
+   **last** entry in `Migrator::migrations()`.
+2. Skeleton `Migration` with `up`/`down` that currently **no-op** `Ok(())` so the
+   crate compiles.
+3. Entity field `first_prompt_at: Option<DateTimeUtc>` + fix
+   `enroll_new_conversation` and all ActiveModel seeds with `Set(None)`.
+4. Migration unit test that **fails** until real up/down land:
 
 ```rust
-// In m20260719_000001_auto_title_first_prompt_at.rs
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+#[tokio::test]
+async fn up_adds_first_prompt_at_and_deadline_index() {
+    // Build minimal conversation + auto_title_jobs + existing queue index
+    // (same SQL as previously listed in plan history).
+    // Seed row with first_user_text = 'old task', first_prompt_at absent.
+    Migration.up(&SchemaManager::new(&conn)).await.unwrap();
 
-    #[tokio::test]
-    async fn up_adds_first_prompt_at_and_deadline_index() {
-        let conn = Database::connect("sqlite::memory:").await.unwrap();
-        conn.execute_unprepared("PRAGMA foreign_keys=ON").await.unwrap();
-        // Minimal tables matching prior auto_title shape (conversation + auto_title_jobs).
-        conn.execute_unprepared(
-            "CREATE TABLE conversation (id INTEGER PRIMARY KEY NOT NULL)",
-        )
-        .await
-        .unwrap();
-        conn.execute_unprepared(
-            "CREATE TABLE auto_title_jobs (
-                conversation_id INTEGER PRIMARY KEY NOT NULL,
-                state TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                first_user_text TEXT,
-                first_assistant_text TEXT,
-                locale TEXT,
-                usable_turn_seq INTEGER NOT NULL DEFAULT 0,
-                attempt_turn_seq INTEGER NOT NULL DEFAULT 0,
-                last_usable_turn_token TEXT,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
-            )",
-        )
-        .await
-        .unwrap();
-        conn.execute_unprepared(
-            "CREATE INDEX idx_auto_title_jobs_queue
-             ON auto_title_jobs (state, updated_at, conversation_id)",
-        )
-        .await
-        .unwrap();
-        conn.execute_unprepared(
-            "INSERT INTO conversation (id) VALUES (1);
-             INSERT INTO auto_title_jobs
-               (conversation_id, state, updated_at, first_user_text)
-             VALUES (1, 'awaiting_turn', '2026-07-01T00:00:00Z', 'old task')",
-        )
-        .await
-        .unwrap();
+    // PRAGMA table_info: first_prompt_at present; legacy row NULL.
+    // PRAGMA index_list: both idx_auto_title_jobs_queue and
+    // idx_auto_title_jobs_deadline present.
+    // PRAGMA index_info(idx_auto_title_jobs_deadline): columns in order
+    // state, first_prompt_at, conversation_id.
+    Migration.down(...).await.unwrap();
+    // column gone; queue index still present.
+}
 
-        Migration.up(&SchemaManager::new(&conn)).await.unwrap();
+#[tokio::test]
+async fn migrator_registers_deadline_migration_last() {
+    let migrations = Migrator::migrations();
+    let last = migrations.last().expect("non-empty");
+    assert_eq!(last.name(), "m20260719_000001_auto_title_first_prompt_at");
+}
 
-        let cols = conn
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA table_info(auto_title_jobs)".into(),
-            ))
-            .await
-            .unwrap();
-        assert!(cols.iter().any(|r| {
-            r.try_get::<String>("", "name").ok().as_deref() == Some("first_prompt_at")
-        }));
-
-        let first_prompt: Option<String> = conn
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT first_prompt_at FROM auto_title_jobs WHERE conversation_id = 1".into(),
-            ))
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get("", "first_prompt_at")
-            .unwrap();
-        assert!(first_prompt.is_none());
-
-        let indexes = conn
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA index_list(auto_title_jobs)".into(),
-            ))
-            .await
-            .unwrap();
-        let names: Vec<String> = indexes
-            .iter()
-            .filter_map(|r| r.try_get::<String>("", "name").ok())
-            .collect();
-        assert!(names.iter().any(|n| n == "idx_auto_title_jobs_queue"));
-        assert!(names.iter().any(|n| n == "idx_auto_title_jobs_deadline"));
-
-        Migration.down(&SchemaManager::new(&conn)).await.unwrap();
-        let cols_after = conn
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA table_info(auto_title_jobs)".into(),
-            ))
-            .await
-            .unwrap();
-        assert!(!cols_after.iter().any(|r| {
-            r.try_get::<String>("", "name").ok().as_deref() == Some("first_prompt_at")
-        }));
-    }
+#[tokio::test]
+async fn legacy_captured_prompt_keeps_null_first_prompt_at_after_upgrade() {
+    // After up: row with pre-existing first_user_text has first_prompt_at NULL.
+    // Document: later capture path (Task 3) must NOT backfill when first_user
+    // already set — assert here only the migration NULL default.
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run (from `src-tauri/`):
+- [ ] **Step 2: Run tests — expect FAIL on assertions (not “0 tests”)**
 
 ```powershell
 cargo test --features test-utils m20260719_000001_auto_title_first_prompt_at -- --nocapture
 ```
 
-Expected: FAIL (module / Migration not found).
+Expected: tests **run** and FAIL (column/index missing), not filter with zero tests.
 
-- [ ] **Step 3: Implement migration + entity field + register**
+- [ ] **Step 3: Implement real migration up/down**
 
 ```rust
 // m20260719_000001_auto_title_first_prompt_at.rs — core of up/down
@@ -304,10 +258,19 @@ fn visible_assistant_text_none_and_thinking_only_are_empty() {
 }
 
 #[tokio::test]
-async fn turn_complete_clears_stale_last_assistant_when_no_answer_text() {
-    // Build SessionState with last_assistant_text = Some("stale")
-    // and live_message with only ToolCallRef (no trailing Text).
+async fn turn_complete_clears_stale_when_live_message_is_none() {
+    // Current code leaves stale last_assistant_text when live_message is None
+    // (no re-assembly). This is the failing case that forces the helper path.
+    // Setup: last_assistant_text = Some("stale"), live_message = None.
     // apply TurnComplete; assert last_assistant_text is None.
+}
+
+#[tokio::test]
+async fn turn_complete_matches_visible_assistant_text_helper() {
+    // Same LiveMessage content fed to visible_assistant_text and to a
+    // SessionState that only has that live_message; after TurnComplete,
+    // last_assistant_text.as_deref().unwrap_or("") equals the helper output
+    // (trim-empty ⇒ both empty/None).
 }
 ```
 
@@ -390,16 +353,15 @@ async fn capture_sets_first_user_and_first_prompt_at_once() {
 
 #[tokio::test]
 async fn concurrent_captures_only_one_writes_first_fields() {
-    // Two sequential CAS simulations are acceptable if true threads are hard:
-    // 1) capture A succeeds
-    // 2) second path that only updates locale when first fields already set
-    // Prefer: begin two transactions if SQLite allows; otherwise document
-    // sequential CAS proof that second update uses
-    // WHERE first_user_text IS NULL AND first_prompt_at IS NULL → 0 rows.
+    // REQUIRED: two Database connections on one WAL temp file (not sequential
+    // simulation). Barrier both threads immediately before the first-fields
+    // UPDATE. Exactly one writer sets first_user_text + first_prompt_at;
+    // the other only refreshes locale. first_user_text must equal the winner's
+    // visible text; first_prompt_at set once.
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (no `first_prompt_at` write)
+- [ ] **Step 2: Run — expect FAIL** (no `first_prompt_at` write / no CAS)
 
 - [ ] **Step 3: Implement conditional capture**
 
@@ -470,64 +432,70 @@ git commit -m "fix(auto-title): conditional first_prompt_at capture"
 
 ```rust
 #[tokio::test]
-async fn claim_accepts_empty_assistant_some_empty_string() { /* seed Ready, user Some("t"), assistant Some("") → Some(claim) */ }
+async fn claim_accepts_empty_assistant_some_empty_string() { /* Ready + Some("") → Some(claim) */ }
 
 #[tokio::test]
-async fn claim_deletes_ready_with_none_assistant() { /* seed Ready assistant None → None claim, job gone */ }
+async fn claim_deletes_ready_with_none_assistant() { /* Ready + None → job deleted, no claim */ }
 
 #[tokio::test]
 async fn claim_still_deletes_empty_user() { /* unchanged */ }
+
+#[tokio::test]
+async fn claim_retries_after_usable_turn_seq_changes_between_read_and_cas() {
+    // REQUIRED barrier: thread A reads Ready candidate with seq=1;
+    // thread B applies usable completion advancing seq to 2 (or updates seq);
+    // A then CAS with stale seq must not hang and must not return
+    // attempt_turn_seq mismatched from the row actually claimed.
+    // Preferred implementation under test: lost CAS → rollback txn, loop with
+    // a fresh begin(); OR atomic update-returning that sets attempt_turn_seq
+    // from the row's current usable_turn_seq in one statement.
+}
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (current code deletes empty assistant)
+- [ ] **Step 2: Run — expect FAIL** (current code deletes empty assistant; no seq race handling)
 
 - [ ] **Step 3: Implement**
 
 ```rust
-let first_user = match job.first_user_text.as_deref().map(str::trim) {
-    Some(u) if !u.is_empty() => job.first_user_text.clone().unwrap(),
-    _ => {
-        auto_title_job::Entity::delete_by_id(job.conversation_id)
-            .exec(&txn)
-            .await?;
-        continue;
-    }
-};
-let first_assistant = match &job.first_assistant_text {
-    Some(text) => text.clone(), // includes ""
-    None => {
-        auto_title_job::Entity::delete_by_id(job.conversation_id)
-            .exec(&txn)
-            .await?;
-        continue;
-    }
-};
+// Empty-user / None-assistant delete rules as in the table above.
 
-// Prefer CAS that also matches observed usable_turn_seq:
-let updated = auto_title_job::Entity::update_many()
-    .col_expr(..., Running)
-    .col_expr(..., new_attempts)
-    .col_expr(..., attempt_turn_seq) // = job.usable_turn_seq observed
-    ...
-    .filter(Column::ConversationId.eq(...))
-    .filter(Column::State.eq(Ready))
-    .filter(Column::UsableTurnSeq.eq(job.usable_turn_seq))
-    .exec(&txn)
-    .await?;
+// Claim loop MUST not keep a single long-lived transaction that reuses a
+// stale candidate after a lost CAS. Required pattern:
+
+loop {
+    let txn = conn.begin().await?;
+    let job = /* select oldest Ready under txn */;
+    let Some(job) = job else { txn.commit().await?; return Ok(None); };
+
+    // validate user/assistant; delete bad rows inside txn; commit; continue
+
+    // Option A (preferred if SeaORM allows): single UPDATE … RETURNING that
+    // sets state=running, attempts=attempts+1, attempt_turn_seq=usable_turn_seq
+    // WHERE state=ready AND conversation_id=?  (no stale seq filter needed
+    // if attempt_turn_seq is taken from the same row version being updated).
+
+    // Option B: UPDATE with filters state=ready AND usable_turn_seq = observed
+    // If rows_affected == 0: txn.rollback().await?; continue; // fresh txn
+
+    // On success: commit; return AutoTitleClaim { attempt_turn_seq: claimed_seq, ... }
+}
 ```
+
+Do **not** leave a zero-row CAS inside one open transaction that then selects
+the next candidate with a dirty snapshot without documenting SQLite isolation
+behavior — always rollback/re-begin after a lost claim CAS.
 
 - [ ] **Step 4: Run claim tests — PASS**
 
 ```powershell
-cargo test --features test-utils claim_next_ready -- --nocapture
-cargo test --features test-utils claim_
+cargo test --features test-utils claim_ -- --nocapture
 ```
 
 - [ ] **Step 5: Commit**
 
 ```powershell
 git add src-tauri/src/auto_title/service.rs
-git commit -m "fix(auto-title): claim empty-assistant and CAS usable_turn_seq"
+git commit -m "fix(auto-title): claim empty-assistant and safe claim CAS retry"
 ```
 
 ---
@@ -548,67 +516,75 @@ git commit -m "fix(auto-title): claim empty-assistant and CAS usable_turn_seq"
 ```rust
 #[tokio::test]
 async fn end_turn_does_not_overwrite_deadline_assistant_snapshot() {
-    // Job: awaiting_turn → manually set ready + first_assistant Some("partial")
-    // OR: promote first then apply_usable_completion with different final text
-    // assert first_assistant still "partial"; usable_turn_seq still increments
+    // Concurrent or ordered: deadline promote writes Some("partial");
+    // then usable completion with different final text.
+    // first_assistant remains "partial"; seq still advances.
 }
 
 #[tokio::test]
-async fn end_turn_from_awaiting_sets_assistant_and_ready() {
-    // classic path still works
+async fn concurrent_end_turn_and_deadline_both_orders_wal() {
+    // REQUIRED: two connections + barriers for promote vs apply_usable_completion
+    // in BOTH orders. Exactly one first-assistant snapshot; job ends Ready or
+    // progresses without panic; no double first-ready corruption.
 }
+
+#[tokio::test]
+async fn two_distinct_usable_tokens_advance_seq_twice() {
+    // REQUIRED: two concurrent completions with different turn tokens on the
+    // same job (e.g. already Ready after deadline). usable_turn_seq must become
+    // +2, not +1 from lost concurrent current_seq+1 writes.
+}
+
+#[tokio::test]
+async fn end_turn_from_awaiting_sets_assistant_and_ready() { /* classic path */ }
 
 #[tokio::test]
 async fn retry_wait_becomes_ready_without_replacing_assistant() {
-    // job retry_wait, first_assistant Some("snap"), usable completion
-    // state ready, first_assistant unchanged
+    // retry_wait + Some("snap") + usable completion → ready, assistant unchanged
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** where overwrite still happens via ActiveModel
+- [ ] **Step 2: Run — expect FAIL** where overwrite / lost seq still happens
 
-- [ ] **Step 3: Implement split updates**
+- [ ] **Step 3: Implement atomic progress + conditional first-ready**
 
-Recommended structure (exact SeaORM API may use `update_many` + Expr):
+**Forbidden:** read `current_seq`, compute `new_seq = current_seq + 1` in Rust,
+then unconditional PK update without a sequence/token guard.
+
+**Required pattern inside the lifecycle transaction:**
 
 ```rust
-// After token/usable checks:
-let bounded = bound_context(snapshot.final_text.trim());
-let new_seq = current_seq + 1;
-let now = Utc::now();
-let locale_wire = app_locale_to_wire(snapshot.locale).to_string();
+// 0) Early exit if stop_reason unusable or final_text empty (unchanged).
 
-// 1) Progress for any existing job (token not yet seen):
-//    UPDATE … SET usable_turn_seq, last_usable_turn_token, locale, updated_at
-//    WHERE conversation_id = ? AND (last_usable_turn_token IS NULL OR <> token)
-//    — or keep in-memory check then update by id with attempt filters carefully.
-// Prefer: single transaction with:
+// 1) Atomic progress (token idempotent):
+// UPDATE auto_title_jobs SET
+//   usable_turn_seq = usable_turn_seq + 1,
+//   last_usable_turn_token = $token,
+//   locale = $locale,
+//   updated_at = $now
+// WHERE conversation_id = $id
+//   AND (last_usable_turn_token IS NULL OR last_usable_turn_token <> $token)
 //
-// A) Conditional first-ready from awaiting_turn:
-update_many()
-  .set first_assistant = bounded, state = ready, seq, token, locale, updated_at
-  .filter state = awaiting_turn
-  .filter first_assistant_text IS NULL
-  .filter conversation_id = ?
-//
-// B) If A rows_affected == 0:
-//    Conditional retry_wait → ready WITHOUT first_assistant:
-update_many()
-  .set state = ready, seq, token, locale, updated_at
-  .filter state = retry_wait
-  .filter conversation_id = ?
-//
-// C) If still 0: progress-only for ready/running (seq/token/locale) so retries work:
-update_many()
-  .set seq, token, locale, updated_at
-  .filter conversation_id = ?
-  .filter state IN (ready, running, awaiting_turn, retry_wait)
-// Ensure token idempotency still holds before any of these.
+// If rows_affected == 0 → duplicate token or missing job → return no-op transition.
 
-// Return became_ready based on whether A or B transitioned into ready from non-ready.
+// 2) First-ready from awaiting_turn (write-once assistant):
+// UPDATE … SET first_assistant_text = $bounded, state = 'ready', updated_at = $now
+// WHERE conversation_id = $id
+//   AND state = 'awaiting_turn'
+//   AND first_assistant_text IS NULL
+// became_ready |= rows_affected == 1
+
+// 3) retry_wait → ready WITHOUT touching first_assistant_text:
+// UPDATE … SET state = 'ready', updated_at = $now
+// WHERE conversation_id = $id AND state = 'retry_wait'
+// became_ready |= rows_affected == 1
+
+// 4) Read back usable_turn_seq for CompletionTransition return value
+//    (SELECT after updates, or RETURNING if available).
 ```
 
-Implement carefully so a duplicate token remains a no-op and `became_ready` matches lifecycle expectations (notify coordinator only when true).
+Duplicate token must remain a full no-op (no seq bump, no locale thrash if the
+progress UPDATE already filtered it).
 
 - [ ] **Step 4: Run completion tests — PASS**
 
@@ -667,7 +643,13 @@ async fn promote_skips_young_and_retry_wait_and_null_prompt_at() {}
 
 #[tokio::test]
 async fn promote_cas_loses_to_end_turn() {
-    // set first_assistant Some("final") and state ready first; promote returns 0
+    // End-turn wins first; promote returns 0 and leaves final assistant.
+}
+
+#[tokio::test]
+async fn promote_select_then_delete_before_cas_is_noop() {
+    // REQUIRED: list candidates (or hold ids), then cancel_job / soft-delete /
+    // Off deletes the job, then promote_by_ids → promoted == 0, no panic.
 }
 ```
 
@@ -782,36 +764,60 @@ Selection rule when multiple connections share an id:
 
 - [ ] **Step 1: Write failing tests**
 
-Unit-test selection logic with two fake candidates if extracting a pure function:
-
 ```rust
 #[test]
-fn picks_newest_live_message_among_matches() { ... }
-```
+fn picks_newest_live_message_among_matches() { /* pure scorer if extracted */ }
 
-Manager test: two connections same conversation_id, different live started_at → correct partial.
+#[test]
+fn equal_started_at_tie_breaks_by_connection_id_ascending() { ... }
+
+#[tokio::test]
+async fn snapshot_does_not_call_find_connection_by_conversation_id() {
+    // Multi-match: two AgentConnections, same conversation_id, different
+    // live_message.started_at → returns newer live text only.
+}
+
+#[tokio::test]
+async fn snapshot_releases_map_lock_before_state_read() {
+    // Optional lock-order test: while a state write lock is held on one conn,
+    // snapshot still completes (map lock not held across state.read).
+}
+```
 
 - [ ] **Step 2: FAIL**
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement — exact lock pattern**
+
+`AgentConnection` is **not** `Clone`. The clonable handle is
+`conn.state: Arc<RwLock<SessionState>>` (`src-tauri/src/acp/connection.rs`).
 
 ```rust
-// Inside one `let connections = self.connections.lock().await;`:
-// for each conn: read state with try_read or read (prefer try_read only if documented;
-// spec wants correctness — use read().await carefully: cannot await while holding
-// MutexGuard if lock is std::sync::Mutex — ConnectionManager uses tokio Mutex.
-// Pattern: collect Arc<Connection> clones for matching ids WITHOUT nested await
-// on the same guard if possible.
+// REQUIRED pattern for snapshot_partial_assistant_text_for_conversations:
 //
-// Correct pattern:
-// 1) lock map
-// 2) collect Vec<(conn_id, Arc<Inner>)> for all connections
-// 3) drop map lock
-// 4) for each, state.read().await and score by conversation_id
-// 5) reduce best per conversation_id
+// let handles: Vec<(String /*conn id*/, i32 /*conv*/, Arc<RwLock<SessionState>>)> = {
+//     let guard = self.connections.lock().await;
+//     guard.iter()
+//         .map(|(id, conn)| (id.clone(), conn.state.clone()))
+//         // conversation_id is inside state — either:
+//         //  (a) only clone state Arcs here, filter after drop, OR
+//         //  (b) if conversation_id is only in state, collect all state Arcs
+//         //      then filter after releasing the map lock.
+//     .collect()
+// }; // map MutexGuard dropped HERE — end of block
+//
+// // ONLY NOW await state reads:
+// for (conn_id, state) in handles {
+//     let s = state.read().await;
+//     let Some(cid) = s.conversation_id else { continue };
+//     if !wanted.contains(&cid) { continue };
+//     // score: prefer live_message.is_some(), max started_at, then conn_id
+// }
+//
+// PROHIBITED:
+// - find_connection_by_conversation_id (holds map lock across state.read)
+// - awaiting state.read() while `connections` MutexGuard is still in scope
+// - assuming AgentConnection: Clone
 ```
-
-This avoids holding the global map lock across many state reads.
 
 - [ ] **Step 4: PASS**
 
@@ -891,28 +897,49 @@ Immediate first pass: call `run_deadline_sweep_once` once before entering sleep 
 
 Empty source for inert tests: `struct EmptyPartialSource; async fn partials_for(...) { HashMap::new() }`.
 
-- [ ] **Step 1: Write failing coordinator tests**
+- [ ] **Step 1: Write failing coordinator tests (mandatory liveness)**
+
+Add `#[cfg(any(test, feature = "test-utils"))]` hooks on the coordinator:
+
+- `sweep_pass_count: AtomicU64`
+- `sweep_fail_once: AtomicBool` (or mutex) — first `run_deadline_sweep_once` body
+  returns an error without promoting; clears itself
+- `notification_loop_starts: AtomicU64` / `sweep_loop_starts: AtomicU64`
 
 ```rust
+#[tokio::test(start_paused = true)]
+async fn startup_runs_immediate_sweep_before_interval() {
+    // recover_and_start; do NOT advance time; wait until sweep_pass_count >= 1
+    // (use yield/timeout helpers). Proves immediate pass, not only after 101s.
+}
+
+#[tokio::test(start_paused = true)]
+async fn sweep_continues_after_transient_failure() {
+    // arm sweep_fail_once; recover_and_start; after first pass error,
+    // advance_time(sweep_interval); assert sweep_pass_count increases again.
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_wake_ready_row_is_renotified_and_claimed() {
+    // Insert Ready job while suppress_ready_notify or without notify.
+    // Next sweep pass must notify_ready; inert/mock runner or claim_calls
+    // proves drain attempted (not merely state == Ready).
+}
+
+#[tokio::test]
+async fn double_recover_and_start_single_notification_and_sweep_loops() {
+    // call recover_and_start twice; notification_loop_starts == 1 and
+    // sweep_loop_starts == 1.
+}
+
 #[tokio::test]
 async fn sweep_promotes_and_notifies_ready_drain() {
-    // inert runner that returns a fixed title OR just assert state becomes Ready
-    // and claim_calls / notify path
-}
-
-#[tokio::test]
-async fn double_recover_and_start_starts_single_sweep() {
-    // started CAS — second call does not panic; use a counter if test-only
-}
-
-#[tokio::test]
-async fn sweep_error_does_not_kill_loop() {
-    // optional: inject DB close — at least unit-test that run_deadline_sweep_once
-    // error is returned to loop body without panic
+    // eligible awaiting_turn + stub partial source; after recover_and_start,
+    // job becomes Ready and worker observes claim (claim_calls or finalize).
 }
 ```
 
-For timing, construct coordinator with `deadline: Duration::from_secs(0)` and `sweep_interval: Duration::from_millis(50)` in tests.
+Construct with `deadline: Duration::ZERO` (or 0s), `sweep_interval: Duration::from_secs(1)` under paused time, and `EmptyPartialSource` / stub partials as needed.
 
 - [ ] **Step 2: FAIL**
 
@@ -965,23 +992,25 @@ git commit -m "feat(auto-title): 101s deadline sweep with ready re-notify"
 
 **Coverage checklist (must all exist somewhere after Tasks 1–8):**
 
-| # | Case |
-| --- | --- |
-| 1 | Capture write-once first_prompt_at |
-| 2 | Concurrent/sequential CAS second capture loses first fields |
-| 3 | Promote age ≥ deadline with partial / empty |
-| 4 | Young job not promoted |
-| 5 | retry_wait / ready / running not promoted |
-| 6 | Deadline then end-turn does not overwrite assistant |
-| 7 | End-turn then deadline promote CAS 0 |
-| 8 | Claim Some("") ok; None deleted |
-| 9 | Claim CAS usable_turn_seq |
-| 10 | visible_assistant_text parity + clear stale |
-| 11 | Multi-connection newest live wins |
-| 12 | Sweep notifies; double start safe |
-| 13 | Migration up/down + queue index retained |
-| 14 | Pre-migration NULL first_prompt_at never deadline-promoted |
-| 15 | Optional: full path capture → promote → claim → finalize with mock runner |
+| # | Case | Concurrency |
+| --- | --- | --- |
+| 1 | Capture write-once first_prompt_at | — |
+| 2 | Two-connection capture: one first-field writer | **WAL barrier** |
+| 3 | Promote age ≥ deadline with partial / empty | — |
+| 4 | Young job not promoted | — |
+| 5 | retry_wait / ready / running not promoted | — |
+| 6 | Deadline vs end-turn **both orders** | **WAL barrier** |
+| 7 | Two distinct tokens advance `usable_turn_seq` twice | **WAL barrier** |
+| 8 | Claim `Some("")` ok; `None` deleted | — |
+| 9 | Claim lost-race: completion between read and CAS | **WAL barrier** |
+| 10 | Select candidates then delete/Off before promote CAS | barrier or two-step |
+| 11 | `live_message = None` clears stale; helper equality | — |
+| 12 | Multi-connection newest live + id tie-break | — |
+| 13 | Immediate startup sweep; fail-once continues; lost-wake re-notify | paused time |
+| 14 | Double `recover_and_start` → one notify loop + one sweeper | — |
+| 15 | Migration last + index column order + down preserves queue index | — |
+| 16 | Legacy NULL `first_prompt_at` never deadline-promoted; end-turn still works | — |
+| 17 | Full path capture → promote → claim → finalize (mock runner) | preferred |
 
 - [ ] **Step 1: Add any missing tests from the table**
 
@@ -1013,19 +1042,21 @@ git commit -m "test(auto-title): complete deadline sweep coverage"
 | `first_prompt_at` + new migration + deadline index + keep claim index | Task 1 |
 | Conditional capture both NULL | Task 3 |
 | Dual ready paths + no refine | Tasks 5–6 |
-| Completion CAS / claim CAS | Tasks 4–5 |
-| `Some("")` vs `None` | Task 4 |
-| Pure visible_assistant_text + TurnComplete clear | Task 2 |
-| Multi-connection batch snapshot | Task 7 |
+| Atomic usable_turn_seq + completion CAS | Task 5 |
+| Claim empty/`None` + lost-CAS retry | Task 4 |
+| Pure visible_assistant_text + TurnComplete clear including `live=None` | Task 2 |
+| Multi-connection batch snapshot without map lock across await | Task 7 |
 | Two-phase sweep, error isolation, ready re-notify, single start | Task 8 |
 | retry_wait not deadline-promoted | Task 6 filters |
-| Legacy NULL first_prompt_at end-turn only | Task 6 + Task 9 |
+| Legacy NULL first_prompt_at end-turn only | Task 1 + Task 6 + Task 9 |
+| Real concurrency + liveness tests | Tasks 3–9 (Codex review) |
 | No frontend / settings | Global constraints |
-| Tests for races and liveness | Tasks 3–9 |
 
-**Placeholder scan:** No TBD steps; concrete signatures and commands included.
+**Placeholder scan:** No TBD; sequential race simulations removed after Codex review.
 
-**Type consistency:** `DeadlinePromoteParams`, `promote_deadline_jobs_by_ids`, `PartialAssistantTextSource::partials_for`, `visible_assistant_text` used consistently across tasks.
+**Type consistency:** `DeadlinePromoteParams`, `promote_deadline_jobs_by_ids`,
+`PartialAssistantTextSource::partials_for`, `visible_assistant_text`,
+`AgentConnection.state: Arc<RwLock<SessionState>>` collection pattern.
 
 ---
 
