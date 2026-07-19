@@ -2,11 +2,11 @@
  * Recognizing the backend's "a turn is already in flight on this connection"
  * rejection across transports.
  *
- * The ACP command-error *code* channel isn't surfaced for these commands:
- * `AcpError` serializes to its Display string on Tauri, and the web path wraps
- * the same string as `AppCommandError.message` (plus a stable `code`). So we
- * recognize the rejection by a backend-controlled marker (substring of the
- * Display string) or, on the web path, the stable error code. Kept in its own
+ * Tauri and web both surface structured `AppCommandError` for
+ * `TurnInProgress` (stable code `turn_in_progress`) and related busy signals
+ * such as `ContinuationInProgress`. Recognition prefers that stable `code`
+ * when present, and also accepts a backend-controlled marker substring of the
+ * Display/`message` text for string-shaped rejections. Kept in its own
  * dependency-free module so the recognition is unit-testable without loading
  * the full API client.
  */
@@ -29,20 +29,21 @@ export class TurnBusyError extends Error {
 // later elaborates the message.
 const TURN_IN_PROGRESS_MARKER = "turn already in progress"
 
-// Stable code from the web `AppErrorCode::TurnInProgress` (HTTP 409) body and
-// `AcpError::code()`.
+// Stable code from structured `AppCommandError` for `TurnInProgress` (Tauri and
+// web HTTP 409) and `AcpError::code()`.
 const TURN_IN_PROGRESS_CODE = "turn_in_progress"
 
 /**
  * True when `err` is the backend's turn-in-progress rejection, in any of the
- * shapes the transports produce: a bare string (Tauri), an object with a
- * `message` carrying the marker (web), or an object with the stable `code`
- * (web). Anything else is a genuine error and returns false.
+ * shapes the transports produce: a bare string (legacy Display), an object
+ * with a `message` carrying the marker, or an object with the stable `code`
+ * (structured `AppCommandError` on Tauri and web). Anything else is a genuine
+ * error and returns false.
  */
 export function isTurnInProgressRejection(err: unknown): boolean {
   if (typeof err === "string") return err.includes(TURN_IN_PROGRESS_MARKER)
   if (err && typeof err === "object") {
-    // Web path: the AppCommandError body carries a stable `code`.
+    // Structured AppCommandError (Tauri and web): prefer stable `code`.
     if ((err as { code?: unknown }).code === TURN_IN_PROGRESS_CODE) return true
     const message = (err as { message?: unknown }).message
     if (typeof message === "string")

@@ -1723,6 +1723,12 @@ impl ConnectionManager {
             .await
             .map_err(|_| ContinuationError::PromptDelivery(AcpError::ProcessExited))?;
 
+        // Crash/race fence: keep the session write guard across the durable
+        // admission CAS. After CAS completes, InternalPromptAdmission,
+        // turn-generation mutation, turn_in_flight, and reserved Permit::send
+        // form one no-await tail. Releasing/reacquiring the write lock between
+        // CAS and enqueue would open a durable-admitted / not-enqueued window
+        // on crash and race with Stop/prompt admission (plan:1091-1105).
         let mut state = state_arc.write().await;
         if state.connection_id != request.parent_connection_id
             || state.conversation_id != Some(request.parent_conversation_id)

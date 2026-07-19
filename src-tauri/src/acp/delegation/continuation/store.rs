@@ -67,12 +67,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(memory_winners.len(), 1);
-        assert_eq!(memory_winners[0].state, ContinuationState::Failed);
+        assert_eq!(memory_winners[0].prior_state, ContinuationState::Arming);
+        assert_eq!(memory_winners[0].record.state, ContinuationState::Failed);
         assert_eq!(
-            memory_winners[0].failure_code,
+            memory_winners[0].record.failure_code,
             Some(ContinuationFailureCode::ParentConnectionLost)
         );
-        assert_eq!(memory_winners[0].finished_at, Some(finished_at));
+        assert_eq!(memory_winners[0].record.finished_at, Some(finished_at));
         assert_eq!(memory.parent_status(1).await.as_deref(), Some("cancelled"));
         assert!(memory
             .fail_non_terminal_on_startup(finished_at + Duration::seconds(1))
@@ -90,12 +91,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sqlite_winners.len(), 1);
-        assert_eq!(sqlite_winners[0].state, ContinuationState::Failed);
+        assert_eq!(sqlite_winners[0].prior_state, ContinuationState::Arming);
+        assert_eq!(sqlite_winners[0].record.state, ContinuationState::Failed);
         assert_eq!(
-            sqlite_winners[0].failure_code,
+            sqlite_winners[0].record.failure_code,
             Some(ContinuationFailureCode::ParentConnectionLost)
         );
-        assert_eq!(sqlite_winners[0].finished_at, Some(finished_at));
+        assert_eq!(sqlite_winners[0].record.finished_at, Some(finished_at));
         assert_eq!(sqlite_parent_status(&db, 1).await, "cancelled");
         assert!(sqlite
             .fail_non_terminal_on_startup(finished_at + Duration::seconds(1))
@@ -275,6 +277,113 @@ mod tests {
             Err(ContStoreError::ActiveExists)
         ));
         drop(db);
+    }
+
+    #[tokio::test]
+    async fn continuation_store_in_memory_rejects_duplicate_continuation_id() {
+        let memory = InMemoryContinuationStore::default();
+        let first = memory
+            .insert_arming(new_continuation("dup-continuation", 1))
+            .await
+            .unwrap();
+        memory
+            .cas_transition(
+                &first.continuation_id,
+                first.generation,
+                first.version,
+                ContinuationState::Arming,
+                transition(ContinuationState::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let mut duplicate = new_continuation("dup-continuation", 1);
+        duplicate.internal_prompt_id = "prompt-other".to_string();
+        duplicate.internal_prompt_marker = "marker-other".to_string();
+        let err = memory.insert_arming(duplicate).await.unwrap_err();
+        assert!(
+            matches!(err, ContStoreError::Database(_)),
+            "duplicate continuation_id must reject with Database parity, got {err:?}"
+        );
+
+        let preserved = memory.load("dup-continuation").await.unwrap().unwrap();
+        assert_eq!(preserved.state, ContinuationState::Cancelled);
+        assert_eq!(preserved.internal_prompt_id, "prompt-dup-continuation");
+        assert_eq!(preserved.internal_prompt_marker, "marker-dup-continuation");
+    }
+
+    #[tokio::test]
+    async fn continuation_store_in_memory_rejects_duplicate_internal_prompt_id() {
+        let memory = InMemoryContinuationStore::default();
+        let first = memory
+            .insert_arming(new_continuation("prompt-owner", 1))
+            .await
+            .unwrap();
+        memory
+            .cas_transition(
+                &first.continuation_id,
+                first.generation,
+                first.version,
+                ContinuationState::Arming,
+                transition(ContinuationState::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let mut duplicate = new_continuation("prompt-challenger", 1);
+        duplicate.internal_prompt_id = first.internal_prompt_id.clone();
+        let err = memory.insert_arming(duplicate).await.unwrap_err();
+        assert!(
+            matches!(err, ContStoreError::Database(_)),
+            "duplicate internal_prompt_id must reject with Database parity, got {err:?}"
+        );
+        assert!(memory.load("prompt-challenger").await.unwrap().is_none());
+        assert_eq!(
+            memory
+                .load("prompt-owner")
+                .await
+                .unwrap()
+                .unwrap()
+                .internal_prompt_id,
+            "prompt-prompt-owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_store_in_memory_rejects_duplicate_internal_prompt_marker() {
+        let memory = InMemoryContinuationStore::default();
+        let first = memory
+            .insert_arming(new_continuation("marker-owner", 1))
+            .await
+            .unwrap();
+        memory
+            .cas_transition(
+                &first.continuation_id,
+                first.generation,
+                first.version,
+                ContinuationState::Arming,
+                transition(ContinuationState::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let mut duplicate = new_continuation("marker-challenger", 1);
+        duplicate.internal_prompt_marker = first.internal_prompt_marker.clone();
+        let err = memory.insert_arming(duplicate).await.unwrap_err();
+        assert!(
+            matches!(err, ContStoreError::Database(_)),
+            "duplicate internal_prompt_marker must reject with Database parity, got {err:?}"
+        );
+        assert!(memory.load("marker-challenger").await.unwrap().is_none());
+        assert_eq!(
+            memory
+                .load("marker-owner")
+                .await
+                .unwrap()
+                .unwrap()
+                .internal_prompt_marker,
+            "marker-marker-owner"
+        );
     }
 
     #[tokio::test]
@@ -891,6 +1000,16 @@ pub struct ContinuationPatch {
     pub failure_code: FieldPatch<ContinuationFailureCode>,
 }
 
+/// Startup CAS winner carrying the prior active phase plus terminal record.
+///
+/// Metrics must label `prior_state` (arming|waiting|wake_pending|resuming);
+/// `record` is the durable Failed row after the guarded update.
+#[derive(Debug, Clone)]
+pub struct StartupReconciliationWinner {
+    pub prior_state: ContinuationState,
+    pub record: ContinuationRecord,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ContStoreError {
     #[error("an active continuation already owns this conversation")]
@@ -921,7 +1040,7 @@ pub trait ContinuationStore: Send + Sync {
     async fn fail_non_terminal_on_startup(
         &self,
         _finished_at: DateTime<Utc>,
-    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+    ) -> Result<Vec<StartupReconciliationWinner>, ContStoreError> {
         Err(ContStoreError::InvalidRecord(
             "startup reconciliation is not implemented by this continuation store".to_string(),
         ))
@@ -1083,7 +1202,7 @@ impl ContinuationStore for DbContinuationStore {
     async fn fail_non_terminal_on_startup(
         &self,
         finished_at: DateTime<Utc>,
-    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+    ) -> Result<Vec<StartupReconciliationWinner>, ContStoreError> {
         let txn = self.db.begin().await?;
         let candidates = txn
             .query_all(Self::statement(
@@ -1097,6 +1216,7 @@ impl ContinuationStore for DbContinuationStore {
             .collect::<Result<_, _>>()?;
         let mut winners = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            let prior_state = candidate.state;
             let row = txn
                 .query_one(Self::statement(
                     CAS_FAIL_SQL,
@@ -1121,7 +1241,10 @@ impl ContinuationStore for DbContinuationStore {
                 vec![record.parent_conversation_id.into()],
             ))
             .await?;
-            winners.push(record);
+            winners.push(StartupReconciliationWinner {
+                prior_state,
+                record,
+            });
         }
         txn.commit().await?;
         Ok(winners)
@@ -1540,6 +1663,30 @@ impl ContinuationStore for InMemoryContinuationStore {
         }) {
             return Err(ContStoreError::ActiveExists);
         }
+        if inner.records.contains_key(&new.continuation_id) {
+            return Err(ContStoreError::Database(DbErr::Custom(
+                "UNIQUE constraint failed: delegation_continuations.continuation_id".to_string(),
+            )));
+        }
+        if inner
+            .records
+            .values()
+            .any(|record| record.internal_prompt_id == new.internal_prompt_id)
+        {
+            return Err(ContStoreError::Database(DbErr::Custom(
+                "UNIQUE constraint failed: delegation_continuations.internal_prompt_id".to_string(),
+            )));
+        }
+        if inner
+            .records
+            .values()
+            .any(|record| record.internal_prompt_marker == new.internal_prompt_marker)
+        {
+            return Err(ContStoreError::Database(DbErr::Custom(
+                "UNIQUE constraint failed: delegation_continuations.internal_prompt_marker"
+                    .to_string(),
+            )));
+        }
         let generation = inner
             .records
             .values()
@@ -1625,7 +1772,7 @@ impl ContinuationStore for InMemoryContinuationStore {
     async fn fail_non_terminal_on_startup(
         &self,
         finished_at: DateTime<Utc>,
-    ) -> Result<Vec<ContinuationRecord>, ContStoreError> {
+    ) -> Result<Vec<StartupReconciliationWinner>, ContStoreError> {
         let mut inner = self.inner.lock().await;
         let fail_before_commit = std::mem::take(&mut inner.fail_next_startup_before_commit);
         let mut transaction = inner.clone();
@@ -1633,15 +1780,22 @@ impl ContinuationStore for InMemoryContinuationStore {
             .records
             .iter()
             .filter(|(_, record)| is_active(record.state))
-            .map(|(id, record)| (id.clone(), record.parent_conversation_id, record.generation))
+            .map(|(id, record)| {
+                (
+                    id.clone(),
+                    record.parent_conversation_id,
+                    record.generation,
+                    record.state,
+                )
+            })
             .collect();
-        keys.sort_by_key(|(_, conversation_id, generation)| (*conversation_id, *generation));
+        keys.sort_by_key(|(_, conversation_id, generation, _)| (*conversation_id, *generation));
         let mut winners = Vec::with_capacity(keys.len());
-        for (continuation_id, conversation_id, _) in keys {
+        for (continuation_id, conversation_id, _, prior_state) in keys {
             let Some(record) = transaction.records.get_mut(&continuation_id) else {
                 continue;
             };
-            if !is_active(record.state) {
+            if !is_active(record.state) || record.state != prior_state {
                 continue;
             }
             record.state = ContinuationState::Failed;
@@ -1649,7 +1803,10 @@ impl ContinuationStore for InMemoryContinuationStore {
             record.finished_at = Some(finished_at);
             record.version += 1;
             record.updated_at = finished_at;
-            winners.push(record.clone());
+            winners.push(StartupReconciliationWinner {
+                prior_state,
+                record: record.clone(),
+            });
             if transaction
                 .parent_statuses
                 .get(&conversation_id)

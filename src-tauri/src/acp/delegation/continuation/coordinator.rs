@@ -628,26 +628,34 @@ impl DelegationContinuationCoordinator {
     }
 
     pub async fn reconcile_on_startup(&self) -> Result<usize, ContStoreError> {
-        let rows = self
+        let winners = self
             .store
             .fail_non_terminal_on_startup(self.clock.now_utc())
             .await?;
-        for row in &rows {
-            self.metrics.record_continuation_reconciled(row.state);
-            let connection_id = row.parent_connection_id.as_deref().unwrap_or_default();
-            let code = row
+        for winner in &winners {
+            // Label the prior active phase from the store CAS result — never
+            // infer from the terminal Failed record.
+            self.metrics
+                .record_continuation_reconciled(winner.prior_state);
+            let connection_id = winner
+                .record
+                .parent_connection_id
+                .as_deref()
+                .unwrap_or_default();
+            let code = winner
+                .record
                 .failure_code
                 .unwrap_or(ContinuationFailureCode::ParentConnectionLost);
             if let Err(error) = self.port.publish_failure(connection_id, code).await {
                 tracing::warn!(
                     parent_connection_id = connection_id,
-                    conversation_id = row.parent_conversation_id,
+                    conversation_id = winner.record.parent_conversation_id,
                     code = code.as_str(),
                     "failed to publish startup continuation failure: {error}"
                 );
             }
         }
-        Ok(rows.len())
+        Ok(winners.len())
     }
 
     #[allow(dead_code, reason = "Task 7 invokes the Join coordinator entry")]
@@ -1621,6 +1629,14 @@ mod cleanup_tests {
         store: Arc<dyn ContinuationStore>,
         port: Arc<RecordingPort>,
     ) -> DelegationContinuationCoordinator {
+        cleanup_coordinator_with_metrics(store, port, Arc::new(DelegationMetrics::default()))
+    }
+
+    fn cleanup_coordinator_with_metrics(
+        store: Arc<dyn ContinuationStore>,
+        port: Arc<RecordingPort>,
+        metrics: Arc<DelegationMetrics>,
+    ) -> DelegationContinuationCoordinator {
         let broker = Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
             Arc::new(EmptyDepth) as Arc<dyn ConversationDepthLookup>,
@@ -1628,7 +1644,7 @@ mod cleanup_tests {
         DelegationContinuationCoordinator::new(
             store,
             broker,
-            Arc::new(DelegationMetrics::default()),
+            metrics,
             port,
             Arc::new(SystemContinuationClock::new()),
         )
@@ -1854,6 +1870,55 @@ mod cleanup_tests {
                 "parent".to_string(),
                 ContinuationFailureCode::ParentConnectionLost
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_cleanup_startup_records_prior_active_phase_metrics() {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let phases = [
+            ContinuationState::Arming,
+            ContinuationState::Waiting,
+            ContinuationState::WakePending,
+            ContinuationState::Resuming,
+        ];
+        for (index, phase) in phases.into_iter().enumerate() {
+            let conversation_id = (index + 1) as i32;
+            let record = store
+                .insert_arming(cleanup_new(
+                    &format!("startup-phase-{index}"),
+                    "parent",
+                    conversation_id,
+                ))
+                .await
+                .unwrap();
+            advance_to(&store, record, phase).await;
+        }
+        let metrics = Arc::new(DelegationMetrics::default());
+        let coordinator = cleanup_coordinator_with_metrics(
+            store,
+            Arc::new(RecordingPort::default()),
+            metrics.clone(),
+        );
+
+        assert_eq!(coordinator.reconcile_on_startup().await.unwrap(), 4);
+        let snapshot = metrics.snapshot();
+        let reconciled: Vec<_> = snapshot
+            .continuation_reconciled
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            reconciled,
+            ["arming", "resuming", "waiting", "wake_pending"],
+            "startup metrics must label the prior active phase, not the terminal failed state"
+        );
+        for phase in ["arming", "waiting", "wake_pending", "resuming"] {
+            assert_eq!(snapshot.continuation_reconciled.get(phase), Some(&1));
+        }
+        assert!(
+            !snapshot.continuation_reconciled.contains_key("failed"),
+            "terminal failed must not appear as a reconcile label"
         );
     }
 
