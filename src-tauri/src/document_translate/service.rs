@@ -3,11 +3,16 @@
 //! Capacity 1: busy reject (no queue). Detached owned task holds the permit
 //! until the runner finishes disconnect+rmdir even if the request future is
 //! dropped (HTTP client gone).
+//!
+//! Overall deadline starts at service entry (before protect/locale) so the
+//! total wall budget stays within [`DEADLINE_SECS`] before cleanup.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{oneshot, Semaphore};
+use tokio::time::Instant;
 
 use crate::acp::manager::ConnectionManager;
 use crate::auto_title::app_locale_to_wire;
@@ -24,7 +29,7 @@ use crate::document_translate::runner::{
 use crate::document_translate::runner::InertDocumentTranslateAgent;
 use crate::document_translate::types::{
     DocumentTranslateError, DocumentTranslateFormat, TranslateDocumentParams,
-    TranslateDocumentResult, MAX_INPUT_SCALARS, TRANSLATE_CAPACITY,
+    TranslateDocumentResult, DEADLINE_SECS, MAX_INPUT_SCALARS, TRANSLATE_CAPACITY,
 };
 use crate::models::system::AppLocale;
 
@@ -55,6 +60,10 @@ impl DocumentTranslationService {
         self: &Arc<Self>,
         params: TranslateDocumentParams,
     ) -> Result<TranslateDocumentResult, DocumentTranslateError> {
+        // Wall-clock overall deadline arms at service entry so protect/locale/
+        // agent load count toward the 120s budget (cleanup is outside it).
+        let overall_deadline = Instant::now() + Duration::from_secs(DEADLINE_SECS);
+
         // --- cheap validation before admission ---
         if params.content.trim().is_empty() {
             return Err(DocumentTranslateError::ContentEmpty);
@@ -62,6 +71,7 @@ impl DocumentTranslationService {
         if params.content.chars().count() > MAX_INPUT_SCALARS {
             return Err(DocumentTranslateError::ContentTooLarge);
         }
+        let format = DocumentTranslateFormat::parse_wire(&params.format)?;
 
         let agent = match load_auto_title_agent_from(&self.db.conn).await {
             Ok(Some(a)) => a,
@@ -74,7 +84,6 @@ impl DocumentTranslationService {
         };
 
         let locale = resolve_locale(&self.db, params.locale.as_deref()).await;
-        let format = params.format;
 
         // Protect Markdown before acquiring so integrity setup does not hold
         // capacity on collision (rare). Protect is pure/fast.
@@ -104,7 +113,9 @@ impl DocumentTranslationService {
         // Owned task: permit held until run (including cleanup) completes,
         // even if the request future is cancelled / client disconnects.
         tokio::spawn(async move {
-            let result = runner.run(agent, locale, &body_for_agent).await;
+            let result = runner
+                .run(agent, locale, &body_for_agent, overall_deadline)
+                .await;
             let mapped = match result {
                 Ok(raw) => {
                     if let Some(ref protected) = protected {
@@ -185,6 +196,7 @@ mod tests {
         holding: AtomicUsize,
         response: StdMutex<Result<String, DocumentTranslateError>>,
         last_body: StdMutex<Option<String>>,
+        last_deadline: StdMutex<Option<Instant>>,
     }
 
     impl ControllableAgent {
@@ -196,6 +208,7 @@ mod tests {
                 holding: AtomicUsize::new(0),
                 response: StdMutex::new(response),
                 last_body: StdMutex::new(None),
+                last_deadline: StdMutex::new(None),
             })
         }
 
@@ -215,9 +228,11 @@ mod tests {
             _agent: AgentType,
             _locale: AppLocale,
             body: &str,
+            overall_deadline: Instant,
         ) -> Result<String, DocumentTranslateError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_body.lock().unwrap() = Some(body.to_string());
+            *self.last_deadline.lock().unwrap() = Some(overall_deadline);
             if self.block.load(Ordering::SeqCst) != 0 {
                 self.holding.fetch_add(1, Ordering::SeqCst);
                 self.release.notified().await;
@@ -249,10 +264,10 @@ mod tests {
         db
     }
 
-    fn params(content: &str, format: DocumentTranslateFormat) -> TranslateDocumentParams {
+    fn params(content: &str, format: &str) -> TranslateDocumentParams {
         TranslateDocumentParams {
             content: content.into(),
-            format,
+            format: format.into(),
             locale: Some("en".into()),
             display_name: Some("doc.md".into()),
         }
@@ -265,7 +280,7 @@ mod tests {
         let svc =
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
         let err = svc
-            .translate(params("hello", DocumentTranslateFormat::PlainText))
+            .translate(params("hello", "plainText"))
             .await
             .expect_err("agent none");
         assert_eq!(err, DocumentTranslateError::AgentNotConfigured);
@@ -279,7 +294,7 @@ mod tests {
         let svc =
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
         let err = svc
-            .translate(params("   \n\t  ", DocumentTranslateFormat::PlainText))
+            .translate(params("   \n\t  ", "plainText"))
             .await
             .expect_err("empty");
         assert_eq!(err, DocumentTranslateError::ContentEmpty);
@@ -294,11 +309,30 @@ mod tests {
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
         let big = "a".repeat(MAX_INPUT_SCALARS + 1);
         let err = svc
-            .translate(params(&big, DocumentTranslateFormat::PlainText))
+            .translate(params(&big, "plainText"))
             .await
             .expect_err("oversize");
         assert_eq!(err, DocumentTranslateError::ContentTooLarge);
         assert_eq!(agent.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_format_rejects_with_domain_error() {
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        let agent = ControllableAgent::new(Ok("x".into()));
+        let svc =
+            DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
+        let err = svc
+            .translate(params("hello", "docx"))
+            .await
+            .expect_err("unsupported");
+        assert_eq!(err, DocumentTranslateError::UnsupportedFormat);
+        assert_eq!(agent.calls.load(Ordering::SeqCst), 0);
+        let app = err.into_app_command_error();
+        assert_eq!(
+            app.i18n_key.as_deref(),
+            Some(crate::document_translate::types::I18N_UNSUPPORTED_FORMAT)
+        );
     }
 
     #[tokio::test]
@@ -313,15 +347,14 @@ mod tests {
 
         let svc1 = Arc::clone(&svc);
         let first = tokio::spawn(async move {
-            svc1.translate(params("first document", DocumentTranslateFormat::PlainText))
-                .await
+            svc1.translate(params("first document", "plainText")).await
         });
 
         wait_until_holding(&agent).await;
         assert_eq!(agent.holding.load(Ordering::SeqCst), 1);
 
         let err = svc
-            .translate(params("second", DocumentTranslateFormat::PlainText))
+            .translate(params("second", "plainText"))
             .await
             .expect_err("busy");
         assert_eq!(err, DocumentTranslateError::Busy);
@@ -339,13 +372,24 @@ mod tests {
         let svc =
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
         let result = svc
-            .translate(params("Hello", DocumentTranslateFormat::PlainText))
+            .translate(params("Hello", "plainText"))
             .await
             .expect("ok");
         assert_eq!(result.translated_content, "translated");
         assert_eq!(result.format, DocumentTranslateFormat::PlainText);
         assert_eq!(agent.calls.load(Ordering::SeqCst), 1);
         assert_eq!(agent.last_body.lock().unwrap().as_deref(), Some("Hello"));
+        // Deadline is armed before the runner is invoked (service entry).
+        let deadline = agent.last_deadline.lock().unwrap().expect("deadline");
+        assert!(
+            deadline > Instant::now(),
+            "deadline should still be in the future on a fast path"
+        );
+        let remaining = deadline.duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_secs(DEADLINE_SECS),
+            "remaining must not exceed DEADLINE_SECS"
+        );
     }
 
     #[tokio::test]
@@ -355,7 +399,7 @@ mod tests {
         let agent = ControllableAgent::new(Ok("Hello again".into()));
         let svc =
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
-        let mut p = params("Hello", DocumentTranslateFormat::PlainText);
+        let mut p = params("Hello", "plainText");
         p.locale = Some("en".into());
         let _ = svc.translate(p).await.expect("ok");
         assert_eq!(agent.calls.load(Ordering::SeqCst), 1);
@@ -370,7 +414,7 @@ mod tests {
             DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
         let content = "See `code` here";
         let err = svc
-            .translate(params(content, DocumentTranslateFormat::Markdown))
+            .translate(params(content, "markdown"))
             .await
             .expect_err("integrity");
         assert_eq!(err, DocumentTranslateError::PlaceholderIntegrity);
@@ -391,6 +435,7 @@ mod tests {
                 _agent: AgentType,
                 _locale: AppLocale,
                 body: &str,
+                _overall_deadline: Instant,
             ) -> Result<String, DocumentTranslateError> {
                 // Simulate model keeping placeholders, translating prose.
                 Ok(format!("TR: {body}"))
@@ -399,7 +444,7 @@ mod tests {
         let svc = DocumentTranslationService::new(db, Arc::new(EchoAgent));
         let content = "Hello `code` world";
         let result = svc
-            .translate(params(content, DocumentTranslateFormat::Markdown))
+            .translate(params(content, "markdown"))
             .await
             .expect("ok");
         assert!(result.translated_content.starts_with("TR: "));
@@ -412,7 +457,7 @@ mod tests {
         let db = db_with_agent(Some(AgentType::Codex)).await;
         let agent = ControllableAgent::new(Ok("ok".into()));
         let svc = DocumentTranslationService::new(db, agent as Arc<dyn DocumentTranslateAgent>);
-        let mut p = params("Hello", DocumentTranslateFormat::PlainText);
+        let mut p = params("Hello", "plainText");
         p.locale = Some("not-a-locale".into());
         let result = svc.translate(p).await.expect("ok");
         // System default is English.

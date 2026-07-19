@@ -22,7 +22,7 @@ use crate::commands::acp::acp_get_agent_status_core;
 use crate::commands::delegation::DelegationRuntimeSnapshot;
 use crate::db::AppDatabase;
 use crate::document_translate::types::{
-    build_translate_prompt, DocumentTranslateError, DEADLINE_SECS, MAX_OUTPUT_BYTES,
+    build_translate_prompt, DocumentTranslateError, MAX_OUTPUT_BYTES,
 };
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
@@ -35,6 +35,9 @@ const DISCOVERY_LEASE_SECS: u64 = 15;
 const DISCONNECT_CLEANUP_SECS: u64 = 5;
 
 /// Production-facing translate runner contract (service consumes this).
+///
+/// `overall_deadline` is armed at service entry (before protect/locale) so the
+/// full wall budget stays within [`DEADLINE_SECS`] before cleanup.
 #[async_trait]
 pub trait DocumentTranslateAgent: Send + Sync {
     async fn run(
@@ -42,6 +45,7 @@ pub trait DocumentTranslateAgent: Send + Sync {
         agent: AgentType,
         locale: AppLocale,
         body: &str,
+        overall_deadline: Instant,
     ) -> Result<String, DocumentTranslateError>;
 }
 
@@ -165,9 +169,8 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
         agent: AgentType,
         locale: AppLocale,
         body: &str,
+        overall_deadline: Instant,
     ) -> Result<String, DocumentTranslateError> {
-        let overall_deadline = Instant::now() + Duration::from_secs(DEADLINE_SECS);
-
         // --- status / availability ---
         let status = match phase(
             overall_deadline,
@@ -224,25 +227,30 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
             };
         let mut lease = Some(guard);
 
-        let spawn_result = phase(
+        // Spawn on a JoinHandle so a deadline hit mid-spawn still observes any
+        // conn_id that was created and disconnects it (no orphan). Title-runner
+        // style: once we hold conn_id, every exit path disconnects exactly once.
+        let conn_id = match spawn_internal_with_deadline(
+            Arc::clone(&self.driver),
+            agent,
+            run_dir.clone(),
+            launch_inputs,
+            locale,
             overall_deadline,
-            self.driver
-                .spawn_internal_translate(agent, run_dir.clone(), launch_inputs, locale),
+            &mut lease,
         )
-        .await;
-
-        let conn_id = match spawn_result {
-            PhaseOutcome::Timeout => {
-                drop(lease.take());
-                let _ = best_effort_remove_dir(&run_dir);
-                return Err(DocumentTranslateError::Timeout);
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // Timeout detaches cleanup that disconnects (if a conn_id was
+                // created) and rmdirs after spawn settles — do not rmdir here.
+                // Hard spawn errors never exposed a conn_id; rmdir immediately.
+                if !matches!(e, DocumentTranslateError::Timeout) {
+                    let _ = best_effort_remove_dir(&run_dir);
+                }
+                return Err(e);
             }
-            PhaseOutcome::Ready(Err(e)) => {
-                drop(lease.take());
-                let _ = best_effort_remove_dir(&run_dir);
-                return Err(DocumentTranslateError::Spawn(e.to_string()));
-            }
-            PhaseOutcome::Ready(Ok(id)) => id,
         };
 
         let outcome = self
@@ -258,9 +266,75 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
             .await;
 
         // Cleanup always: disconnect + rmdir even if caller dropped.
+        // Runs outside the overall deadline (cleanup budget is separate).
         cleanup_after_run(self.driver.as_ref(), &conn_id, &run_dir, lease.take()).await;
 
         outcome
+    }
+}
+
+/// Spawn under the overall deadline without orphaning a connection that
+/// completes after the deadline fires.
+///
+/// `timeout_at` on the spawn future alone would drop it mid-flight and lose
+/// any conn_id production `spawn_agent` already inserted. Instead we join a
+/// detached task: on deadline we detach a cleanup that still awaits the spawn
+/// result and disconnects if a connection was created.
+async fn spawn_internal_with_deadline(
+    driver: Arc<dyn DocumentConnectionDriver>,
+    agent: AgentType,
+    run_dir: PathBuf,
+    launch_inputs: AcpLaunchInputs,
+    locale: AppLocale,
+    overall_deadline: Instant,
+    lease: &mut Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+) -> Result<String, DocumentTranslateError> {
+    let driver_for_spawn = Arc::clone(&driver);
+    let run_dir_for_spawn = run_dir.clone();
+    let mut spawn_handle = tokio::spawn(async move {
+        driver_for_spawn
+            .spawn_internal_translate(agent, run_dir_for_spawn, launch_inputs, locale)
+            .await
+    });
+
+    tokio::select! {
+        biased;
+        join = &mut spawn_handle => {
+            match join {
+                Ok(Ok(id)) => Ok(id),
+                Ok(Err(e)) => {
+                    drop(lease.take());
+                    Err(DocumentTranslateError::Spawn(e.to_string()))
+                }
+                Err(e) => {
+                    drop(lease.take());
+                    Err(DocumentTranslateError::Spawn(format!("spawn task join: {e}")))
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(overall_deadline) => {
+            drop(lease.take());
+            // Detach cleanup: if spawn still returns a conn_id, disconnect it.
+            let cleanup_driver = Arc::clone(&driver);
+            let cleanup_dir = run_dir;
+            tokio::spawn(async move {
+                match spawn_handle.await {
+                    Ok(Ok(conn_id)) => {
+                        cleanup_after_run(
+                            cleanup_driver.as_ref(),
+                            &conn_id,
+                            &cleanup_dir,
+                            None,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        let _ = best_effort_remove_dir(&cleanup_dir);
+                    }
+                }
+            });
+            Err(DocumentTranslateError::Timeout)
+        }
     }
 }
 
@@ -527,6 +601,7 @@ impl DocumentTranslateAgent for InertDocumentTranslateAgent {
         _agent: AgentType,
         _locale: AppLocale,
         _body: &str,
+        _overall_deadline: Instant,
     ) -> Result<String, DocumentTranslateError> {
         Err(DocumentTranslateError::Failed(
             "inert document translate agent".into(),
@@ -540,7 +615,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
+    use tokio::sync::Notify;
+
     use crate::web::event_bridge::emit_with_state;
+
+    /// Simple async gate for spawn/timeout tests (enter → wait → release).
+    #[derive(Default)]
+    struct Gate {
+        entered: AtomicBool,
+        release: Notify,
+        armed: AtomicBool,
+    }
+
+    impl Gate {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn was_entered(&self) -> bool {
+            self.entered.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+
+        async fn wait_if_armed(&self) {
+            if self.armed.load(Ordering::SeqCst) {
+                self.entered.store(true, Ordering::SeqCst);
+                self.release.notified().await;
+            }
+        }
+    }
 
     struct FakeAgent {
         conn_id: String,
@@ -554,6 +660,10 @@ mod tests {
         finish_text: StdMutex<Option<String>>,
         force_spawn_fail: AtomicBool,
         emit_started_before_subscribe: AtomicBool,
+        /// When set, insert connection first then block until `spawn_gate` release.
+        /// Models production: map entry can exist before spawn returns.
+        block_spawn_after_insert: AtomicBool,
+        spawn_gate: Gate,
         last_prompt: StdMutex<Option<String>>,
         last_working_dir: StdMutex<Option<PathBuf>>,
     }
@@ -570,6 +680,8 @@ mod tests {
                 finish_text: StdMutex::new(None),
                 force_spawn_fail: AtomicBool::new(false),
                 emit_started_before_subscribe: AtomicBool::new(false),
+                block_spawn_after_insert: AtomicBool::new(false),
+                spawn_gate: Gate::default(),
                 last_prompt: StdMutex::new(None),
                 last_working_dir: StdMutex::new(None),
             })
@@ -635,6 +747,14 @@ mod tests {
                 s.purpose = ConnectionPurpose::InternalTranslate;
             }
             *self.agent._cmd_rx.lock().unwrap() = Some(rx);
+
+            // Production spawn can leave a map entry before returning. When
+            // armed, block after insert so a deadline mid-spawn still cleans up.
+            if self.agent.block_spawn_after_insert.load(Ordering::SeqCst) {
+                self.agent.spawn_gate.arm();
+                self.agent.spawn_gate.wait_if_armed().await;
+            }
+
             if self
                 .agent
                 .emit_started_before_subscribe
@@ -728,6 +848,10 @@ mod tests {
         (runner, agent, data_dir, registry)
     }
 
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(120)
+    }
+
     #[tokio::test]
     async fn fake_driver_happy_path_returns_body_and_disconnects() {
         let (runner, agent, _dir, registry) = fixture().await;
@@ -735,7 +859,12 @@ mod tests {
         agent.finish_with("Bonjour le monde");
 
         let out = runner
-            .run(AgentType::Codex, AppLocale::Fr, "Hello world")
+            .run(
+                AgentType::Codex,
+                AppLocale::Fr,
+                "Hello world",
+                far_deadline(),
+            )
             .await
             .expect("translate");
         assert_eq!(out, "Bonjour le monde");
@@ -759,7 +888,7 @@ mod tests {
         let (runner, agent, _dir, registry) = fixture().await;
         agent.force_spawn_fail.store(true, Ordering::SeqCst);
         let err = runner
-            .run(AgentType::Codex, AppLocale::En, "x")
+            .run(AgentType::Codex, AppLocale::En, "x", far_deadline())
             .await
             .expect_err("spawn fail");
         assert!(matches!(err, DocumentTranslateError::Spawn(_)));
@@ -774,11 +903,98 @@ mod tests {
         let huge = "x".repeat(MAX_OUTPUT_BYTES + 1);
         agent.finish_with(&huge);
         let err = runner
-            .run(AgentType::Codex, AppLocale::En, "doc")
+            .run(AgentType::Codex, AppLocale::En, "doc", far_deadline())
             .await
             .expect_err("oversize output");
         assert!(matches!(err, DocumentTranslateError::OutputTooLarge));
         assert!(agent.disconnect_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_timeout_after_partial_insert_still_disconnects() {
+        // Models production: connection map entry exists before spawn returns.
+        // Deadline fires while spawn is blocked after insert → runner returns
+        // Timeout and detached cleanup must still disconnect the partial conn.
+        let (runner, agent, _dir, _registry) = fixture().await;
+        agent
+            .block_spawn_after_insert
+            .store(true, Ordering::SeqCst);
+
+        // Arm a real-time deadline long enough for status/lease/insert; freeze
+        // and advance only after spawn is blocked past insert.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let agent_watch = Arc::clone(&agent);
+        let handle = tokio::spawn(async move {
+            runner
+                .run(AgentType::Codex, AppLocale::En, "body", deadline)
+                .await
+        });
+
+        // Wall-clock wait until spawn has inserted and is blocked.
+        let wait_start = std::time::Instant::now();
+        while wait_start.elapsed() < Duration::from_secs(5) {
+            if agent_watch.spawn_gate.was_entered() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            agent_watch.spawn_gate.was_entered(),
+            "spawn must reach gate after insert"
+        );
+        assert!(
+            agent_watch
+                .manager
+                .get_state(&agent_watch.conn_id)
+                .await
+                .is_some(),
+            "partial connection must exist before deadline"
+        );
+
+        // Fire overall deadline while spawn is still blocked after insert.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("runner must settle after deadline advance")
+            .expect("join");
+        assert!(
+            matches!(result, Err(DocumentTranslateError::Timeout)),
+            "expected Timeout, got {result:?}"
+        );
+
+        // Resume wall clock and release spawn so detached cleanup can disconnect.
+        tokio::time::resume();
+        agent_watch.spawn_gate.release();
+
+        let cleanup_start = std::time::Instant::now();
+        while cleanup_start.elapsed() < Duration::from_secs(5) {
+            if agent_watch.disconnect_count.load(Ordering::SeqCst) > 0
+                && agent_watch
+                    .manager
+                    .get_state(&agent_watch.conn_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            agent_watch.disconnect_count.load(Ordering::SeqCst) >= 1,
+            "spawn timeout must disconnect partial connection"
+        );
+        assert!(
+            agent_watch
+                .manager
+                .get_state(&agent_watch.conn_id)
+                .await
+                .is_none(),
+            "no orphan manager entry after spawn timeout cleanup"
+        );
     }
 
     #[test]

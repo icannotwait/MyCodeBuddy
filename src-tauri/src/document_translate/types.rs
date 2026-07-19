@@ -33,11 +33,32 @@ pub enum DocumentTranslateFormat {
     PlainText,
 }
 
+impl DocumentTranslateFormat {
+    /// Parse the wire format string (`markdown` | `plainText`).
+    ///
+    /// Unknown values become [`DocumentTranslateError::UnsupportedFormat`] so
+    /// callers can stamp the stable i18n key (serde enum reject cannot).
+    pub fn parse_wire(raw: &str) -> Result<Self, DocumentTranslateError> {
+        match raw {
+            "markdown" => Ok(Self::Markdown),
+            "plainText" => Ok(Self::PlainText),
+            _ => Err(DocumentTranslateError::UnsupportedFormat),
+        }
+    }
+}
+
+/// Request body / IPC payload for `translate_document`.
+///
+/// `format` is a plain string so unknown values reach the service as
+/// [`DocumentTranslateError::UnsupportedFormat`] rather than a generic serde
+/// rejection. Tauri commands accept the same fields as **flat** camelCase args
+/// (not a nested `params` object) to match `api.ts` / `reference_search`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslateDocumentParams {
     pub content: String,
-    pub format: DocumentTranslateFormat,
+    /// Wire format: `"markdown"` | `"plainText"`.
+    pub format: String,
     /// Optional wire locale (snake_case). Invalid/missing → system language.
     #[serde(default)]
     pub locale: Option<String>,
@@ -220,10 +241,37 @@ mod tests {
     }
 
     #[test]
+    fn format_parse_wire_accepts_known_and_rejects_unknown() {
+        assert_eq!(
+            DocumentTranslateFormat::parse_wire("markdown").unwrap(),
+            DocumentTranslateFormat::Markdown
+        );
+        assert_eq!(
+            DocumentTranslateFormat::parse_wire("plainText").unwrap(),
+            DocumentTranslateFormat::PlainText
+        );
+        assert_eq!(
+            DocumentTranslateFormat::parse_wire("docx").unwrap_err(),
+            DocumentTranslateError::UnsupportedFormat
+        );
+        assert_eq!(
+            DocumentTranslateFormat::parse_wire("plain_text").unwrap_err(),
+            DocumentTranslateError::UnsupportedFormat
+        );
+    }
+
+    #[test]
+    fn unsupported_format_maps_to_invalid_input_with_i18n() {
+        let err = DocumentTranslateError::UnsupportedFormat.into_app_command_error();
+        assert_eq!(err.code, AppErrorCode::InvalidInput);
+        assert_eq!(err.i18n_key.as_deref(), Some(I18N_UNSUPPORTED_FORMAT));
+    }
+
+    #[test]
     fn params_result_serde_camel_case_roundtrip() {
         let params = TranslateDocumentParams {
             content: "hi".into(),
-            format: DocumentTranslateFormat::Markdown,
+            format: "markdown".into(),
             locale: Some("zh_cn".into()),
             display_name: Some("README.md".into()),
         };
@@ -231,6 +279,20 @@ mod tests {
         assert!(v.get("content").is_some());
         assert!(v.get("displayName").is_some());
         assert!(v.get("display_name").is_none());
+        // Flat body: no nested `params` envelope.
+        assert!(v.get("params").is_none());
+        assert_eq!(v["format"], "markdown");
+
+        // Flat JS object keys deserialize directly (HTTP + constructed core).
+        let from_flat: TranslateDocumentParams = serde_json::from_value(serde_json::json!({
+            "content": "hi",
+            "format": "plainText",
+            "locale": "en",
+            "displayName": "a.txt",
+        }))
+        .unwrap();
+        assert_eq!(from_flat.format, "plainText");
+        assert_eq!(from_flat.display_name.as_deref(), Some("a.txt"));
 
         let result = TranslateDocumentResult {
             translated_content: "你好".into(),
