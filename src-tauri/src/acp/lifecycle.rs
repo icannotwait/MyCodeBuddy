@@ -2254,6 +2254,7 @@ mod tests {
         conv_id: Option<i32>,
     ) -> crate::acp::connection::AgentConnection {
         let (tx, _rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
         let mut state = SessionState::new(
             id.to_string(),
             AgentType::ClaudeCode,
@@ -2268,6 +2269,7 @@ mod tests {
             status: crate::acp::types::ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx,
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,

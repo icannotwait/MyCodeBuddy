@@ -13,8 +13,8 @@ use sea_orm::{
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::connection::matching_config_pair;
 use crate::acp::connection::{
-    spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
-    SpawnHandshake, SuspensionAck,
+    spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
+    RouteBootstrapOutcome, SpawnHandshake, SuspensionAck,
 };
 use crate::acp::delegation::continuation::store::ContinuationStore;
 use crate::acp::delegation::metrics::PromptAdmissionSource;
@@ -47,6 +47,22 @@ use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
+
+#[cfg(any(test, feature = "test-utils"))]
+fn test_control_sender() -> tokio::sync::mpsc::Sender<ConnectionControl> {
+    // Synthetic connections have no conversation loop. Retain their bounded
+    // receivers so manager control sends preserve the prior enqueue contract.
+    static RECEIVERS: std::sync::OnceLock<
+        std::sync::Mutex<Vec<tokio::sync::mpsc::Receiver<ConnectionControl>>>,
+    > = std::sync::OnceLock::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    RECEIVERS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("test control receiver lock")
+        .push(rx);
+    tx
+}
 
 /// Cap on the number of prompt-text chars kept in the `user_prompt_sent`
 /// preview. Past this, `truncate_str` keeps this many chars and appends a short
@@ -498,6 +514,7 @@ impl ConnectionManager {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
@@ -554,6 +571,7 @@ impl ConnectionManager {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
@@ -861,13 +879,13 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         // Snapshot handles under the map lock, then release before awaiting
         // state/token locks so we never hold connections + state together.
-        let (task_abort, state, cmd_tx) = {
+        let (task_abort, state, control_tx) = {
             let map = self.connections.lock().await;
             match map.get(connection_id) {
                 Some(conn) => (
                     conn.task_abort.clone(),
                     Some(Arc::clone(&conn.state)),
-                    Some(conn.cmd_tx.clone()),
+                    Some(conn.control_tx.clone()),
                 ),
                 None => (None, None, None),
             }
@@ -892,8 +910,8 @@ impl ConnectionManager {
         if let Some(abort) = task_abort {
             abort.abort();
         }
-        if let Some(tx) = cmd_tx {
-            let _ = tx.try_send(ConnectionCommand::Disconnect);
+        if let Some(tx) = control_tx {
+            let _ = tx.try_send(ConnectionControl::Disconnect);
         }
 
         // 3) Observe actual map removal before Ok (no force-remove race).
@@ -1564,17 +1582,17 @@ impl ConnectionManager {
         continuation_id: String,
         parent_turn_generation: u64,
     ) -> Result<SuspensionAck, AcpError> {
-        let cmd_tx = {
+        let control_tx = {
             let connections = self.connections.lock().await;
             connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
-                .cmd_tx
+                .control_tx
                 .clone()
         };
         let (reply, receiver) = tokio::sync::oneshot::channel();
-        cmd_tx
-            .send(ConnectionCommand::SuspendForDelegation {
+        control_tx
+            .send(ConnectionControl::SuspendForDelegation {
                 continuation_id,
                 parent_turn_generation,
                 reply,
@@ -2198,19 +2216,19 @@ impl ConnectionManager {
     }
 
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
-        let (cmd_tx, state_arc, emitter) = {
+        let (control_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             (
-                conn.cmd_tx.clone(),
+                conn.control_tx.clone(),
                 conn.state.clone(),
                 conn.emitter.clone(),
             )
         };
-        cmd_tx
-            .send(ConnectionCommand::Cancel)
+        control_tx
+            .send(ConnectionControl::Cancel)
             .await
             .map_err(|_| AcpError::ProcessExited)?;
 
@@ -2632,13 +2650,13 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        let cmd_tx = {
+        let control_tx = {
             let mut connections = self.connections.lock().await;
-            connections.remove(conn_id).map(|conn| conn.cmd_tx)
+            connections.remove(conn_id).map(|conn| conn.control_tx)
         };
-        if let Some(cmd_tx) = cmd_tx {
+        if let Some(control_tx) = control_tx {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+            let _ = control_tx.send(ConnectionControl::Disconnect).await;
             Ok(())
         } else {
             Err(AcpError::ConnectionNotFound(conn_id.into()))
@@ -2813,7 +2831,7 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_by_owner_window(&self, owner_window_label: &str) -> usize {
-        let cmd_txs = {
+        let control_txs = {
             let mut connections = self.connections.lock().await;
             let ids: Vec<String> = connections
                 .iter()
@@ -2829,15 +2847,15 @@ impl ConnectionManager {
             let mut txs = Vec::with_capacity(ids.len());
             for id in ids {
                 if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.cmd_tx);
+                    txs.push(conn.control_tx);
                 }
             }
             txs
         };
 
-        let disconnected = cmd_txs.len();
-        for cmd_tx in cmd_txs {
-            let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+        let disconnected = control_txs.len();
+        for control_tx in control_txs {
+            let _ = control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
@@ -2848,13 +2866,16 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_all(&self) -> usize {
-        let cmd_txs: Vec<_> = {
+        let control_txs: Vec<_> = {
             let mut connections = self.connections.lock().await;
-            connections.drain().map(|(_, conn)| conn.cmd_tx).collect()
+            connections
+                .drain()
+                .map(|(_, conn)| conn.control_tx)
+                .collect()
         };
-        let disconnected = cmd_txs.len();
-        for cmd_tx in cmd_txs {
-            let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+        let disconnected = control_txs.len();
+        for control_tx in control_txs {
+            let _ = control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
         disconnected
@@ -4014,6 +4035,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -4185,6 +4207,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".into(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -5224,6 +5247,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -5766,6 +5790,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -7779,6 +7804,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -8262,6 +8288,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
             cmd_tx: tx,
+            control_tx: test_control_sender(),
             task_abort: None,
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
@@ -9149,6 +9176,7 @@ mod tests {
                 status: ConnectionStatus::Connecting,
                 owner_window_label: "test".into(),
                 cmd_tx: tx,
+                control_tx: test_control_sender(),
                 task_abort: Some(abort),
                 state: Arc::clone(&state),
                 emitter: EventEmitter::Noop,
@@ -9311,6 +9339,7 @@ mod tests {
                 status: ConnectionStatus::Connecting,
                 owner_window_label: "test".into(),
                 cmd_tx: tx,
+                control_tx: test_control_sender(),
                 task_abort: Some(abort),
                 state: Arc::clone(&state),
                 emitter: EventEmitter::Noop,
