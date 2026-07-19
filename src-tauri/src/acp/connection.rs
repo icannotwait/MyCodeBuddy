@@ -8745,10 +8745,6 @@ mod tests {
         send_suspension_content_barrier(&agent_connection, "control-close-observed");
         wait_for_suspension_content_event(&state, "control-close-observed").await;
         drop(cmd_tx);
-        tokio::time::advance(std::time::Duration::from_millis(
-            SUSPENSION_DRAIN_TIMEOUT_MS,
-        ))
-        .await;
         for _ in 0..200 {
             tokio::task::yield_now().await;
         }
