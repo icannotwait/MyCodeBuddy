@@ -9025,7 +9025,10 @@ mod tests {
             .remove(0)
             .respond(sacp::schema::PromptResponse::new(StopReason::Cancelled))
             .unwrap();
-        let ack_result = tokio::time::timeout(std::time::Duration::from_secs(1), receiver).await;
+        // Bounded non-starvation under a native duplicate-control producer, not a
+        // 1s latency SLA. Match the 5s causal barriers above so loaded CI can
+        // schedule the biased prompt arm without false failure.
+        let ack_result = tokio::time::timeout(std::time::Duration::from_secs(5), receiver).await;
         stop_producer.store(true, Ordering::SeqCst);
         duplicate_producer.join().expect("duplicate producer join");
         ack_result
