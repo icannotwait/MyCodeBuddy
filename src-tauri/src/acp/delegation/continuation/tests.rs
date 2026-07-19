@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::coordinator::{
     ContinuationError, ContinuationPromptRequest, DelegationContinuationCoordinator,
-    JoinArmRequest, ManagerContinuationPort, ParentContinuationPort, ParentTurnSnapshot,
-    PromptAdmissionResult, SuspendRequest, SystemContinuationClock,
+    JoinArmOutcome, JoinArmRequest, ManagerContinuationPort, ParentConnectionExitCause,
+    ParentContinuationPort, ParentTurnSnapshot, PromptAdmissionResult, SuspendRequest,
+    SystemContinuationClock,
 };
 use super::store::{
     ContStoreError, ContinuationPatch, ContinuationRecord, ContinuationStore,
@@ -18,7 +19,9 @@ use super::types::{
     ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
     ContinuationWakeReason, CONTINUATION_CHECKPOINT_MS,
 };
-use super::{filter_internal_continuation_turns, internal_prompt_marker};
+use super::{
+    build_continuation_prompt_text, filter_internal_continuation_turns, internal_prompt_marker,
+};
 use crate::acp::connection::{ConnectionControl, SuspensionAck};
 use crate::acp::delegation::attention::{
     mock::MemoryDelegationAttentionStore, DelegationAttentionStore, NewAttentionRequest,
@@ -3089,4 +3092,1058 @@ fn continuation_waiting_terminal_event_clears_snapshot() {
     });
 
     assert_eq!(state.to_snapshot().waiting_for_subagents, None);
+}
+
+// ── Task 10: Codex-shaped end-to-end regression matrix ─────────────────────
+// Shared fixture exercises real broker + in-memory store + coordinator workers
+// with a recording parent port (and manager admission where the hidden-prompt
+// boundary matters). Tests are causal, paused-time when timers matter, and
+// named with the `delegation_continuation_e2e_` cargo filter prefix.
+
+struct E2eRecordingPort {
+    suspend_count: AtomicUsize,
+    admit_count: AtomicUsize,
+    last_wake_reason: Mutex<Option<ContinuationWakeReason>>,
+    waiting_publications: Mutex<Vec<Option<ContinuationWaitingProjection>>>,
+    failures: Mutex<Vec<ContinuationFailureCode>>,
+    suspend_started: Mutex<Option<tokio::sync::oneshot::Sender<SuspendRequest>>>,
+    suspend_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    admission_started: Mutex<Option<tokio::sync::oneshot::Sender<ContinuationPromptRequest>>>,
+    admission_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    turn_generation: AtomicUsize,
+}
+
+impl E2eRecordingPort {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            suspend_count: AtomicUsize::new(0),
+            admit_count: AtomicUsize::new(0),
+            last_wake_reason: Mutex::new(None),
+            waiting_publications: Mutex::new(Vec::new()),
+            failures: Mutex::new(Vec::new()),
+            suspend_started: Mutex::new(None),
+            suspend_release: tokio::sync::Mutex::new(None),
+            admission_started: Mutex::new(None),
+            admission_release: tokio::sync::Mutex::new(None),
+            turn_generation: AtomicUsize::new(3),
+        })
+    }
+
+    async fn install_suspend_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<SuspendRequest>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .suspend_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(entered_tx);
+        *self.suspend_release.lock().await = Some(release_rx);
+        (entered_rx, release_tx)
+    }
+
+    async fn install_admission_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<ContinuationPromptRequest>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .admission_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(entered_tx);
+        *self.admission_release.lock().await = Some(release_rx);
+        (entered_rx, release_tx)
+    }
+}
+
+#[async_trait]
+impl ParentContinuationPort for E2eRecordingPort {
+    async fn snapshot_parent(
+        &self,
+        connection_id: &str,
+    ) -> Result<ParentTurnSnapshot, ContinuationError> {
+        Ok(ParentTurnSnapshot {
+            connection_id: connection_id.into(),
+            conversation_id: 7,
+            session_id: "session-7".into(),
+            turn_generation: self.turn_generation.load(Ordering::Relaxed) as u64,
+            turn_in_flight: true,
+        })
+    }
+
+    async fn suspend_parent(
+        &self,
+        request: SuspendRequest,
+    ) -> Result<SuspensionAck, ContinuationError> {
+        self.suspend_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = self
+            .suspend_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = tx.send(request.clone());
+        }
+        if let Some(release) = self.suspend_release.lock().await.take() {
+            let _ = release.await;
+        }
+        Ok(SuspensionAck {
+            continuation_id: request.continuation_id,
+            parent_turn_generation: request.parent_turn_generation,
+        })
+    }
+
+    async fn admit_continuation(
+        &self,
+        request: ContinuationPromptRequest,
+    ) -> Result<PromptAdmissionResult, ContinuationError> {
+        self.admit_count.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_wake_reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(request.origin.wake_reason());
+        if let Some(tx) = self
+            .admission_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = tx.send(request);
+        }
+        if let Some(release) = self.admission_release.lock().await.take() {
+            let _ = release.await;
+        }
+        Ok(PromptAdmissionResult::Admitted)
+    }
+
+    async fn publish_waiting(
+        &self,
+        _connection_id: &str,
+        waiting: Option<ContinuationWaitingProjection>,
+    ) -> Result<(), ContinuationError> {
+        self.waiting_publications
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(waiting);
+        Ok(())
+    }
+
+    async fn publish_failure(
+        &self,
+        _connection_id: &str,
+        code: ContinuationFailureCode,
+    ) -> Result<(), ContinuationError> {
+        self.failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(code);
+        Ok(())
+    }
+}
+
+struct E2eMatrix {
+    broker: Arc<DelegationBroker>,
+    store: Arc<InMemoryContinuationStore>,
+    port: Arc<E2eRecordingPort>,
+    coordinator: Arc<DelegationContinuationCoordinator>,
+    metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+}
+
+impl E2eMatrix {
+    fn new() -> Self {
+        let broker = Arc::new(test_broker());
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = E2eRecordingPort::new();
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            metrics.clone(),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        Self {
+            broker,
+            store,
+            port,
+            coordinator,
+            metrics,
+        }
+    }
+
+    fn with_attention(attention: Arc<dyn DelegationAttentionStore>) -> Self {
+        let broker = Arc::new(test_broker().with_attention_store(attention));
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = E2eRecordingPort::new();
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            metrics.clone(),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        Self {
+            broker,
+            store,
+            port,
+            coordinator,
+            metrics,
+        }
+    }
+
+    async fn seed_running(&self, task_id: &str) {
+        self.broker.seed_live_task_for_test("parent", task_id).await;
+    }
+
+    async fn arm_running(
+        &self,
+        task_id: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<Result<SuspensionAck, ContinuationError>>,
+    ) {
+        let outcome = self
+            .coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 7,
+                task_ids: vec![task_id.into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .expect("arm must succeed");
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("running Join must arm a continuation, got Immediate")
+        };
+        (continuation_id, completion)
+    }
+
+    async fn await_waiting(&self, continuation_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let row = self.store.load(continuation_id).await.unwrap().unwrap();
+                if row.state == ContinuationState::Waiting {
+                    break;
+                }
+                if matches!(
+                    row.state,
+                    ContinuationState::Completed
+                        | ContinuationState::Cancelled
+                        | ContinuationState::Failed
+                ) {
+                    panic!("reached terminal before Waiting: {row:?}");
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuation must reach Waiting");
+    }
+
+    async fn await_terminal(&self, continuation_id: &str) -> ContinuationRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let row = self.store.load(continuation_id).await.unwrap().unwrap();
+                if matches!(
+                    row.state,
+                    ContinuationState::Completed
+                        | ContinuationState::Cancelled
+                        | ContinuationState::Failed
+                ) {
+                    return row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuation must reach a terminal state")
+    }
+
+    async fn await_worker_gone(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while self.coordinator.worker_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workers must drain");
+    }
+}
+
+/// 2. capability-on running Join inserts one row and sends SuspendForDelegation.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_capability_on_running_join_inserts_and_suspends() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-arm").await;
+    let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
+    let (continuation_id, mut completion) = fx.arm_running("e2e-arm").await;
+
+    let suspend = tokio::select! {
+        request = suspend_entered => request.expect("SuspendForDelegation dispatched"),
+        result = &mut completion => panic!("arm ended before suspend: {result:?}"),
+    };
+    assert_eq!(suspend.continuation_id, continuation_id);
+    assert_eq!(suspend.parent_connection_id, "parent");
+    assert_eq!(suspend.parent_turn_generation, 3);
+    let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Arming);
+    assert_eq!(fx.store.list_non_terminal().await.unwrap().len(), 1);
+    assert_eq!(fx.port.suspend_count.load(Ordering::Relaxed), 1);
+    assert_eq!(fx.metrics.snapshot().continuation_armed, 1);
+
+    suspend_release.send(()).unwrap();
+    completion.await.unwrap().unwrap();
+    fx.await_waiting(&continuation_id).await;
+    assert_eq!(fx.broker.pending_count().await, 1);
+    assert_eq!(fx.coordinator.worker_count(), 1);
+
+    // cleanup
+    assert_eq!(fx.coordinator.cancel_workers_for_parent("parent"), 1);
+    fx.await_worker_gone().await;
+}
+
+/// 3. peer-close is waiter-only at the coordinator boundary: cancelling the
+/// Join waiter after durable insert keeps the arm worker and children alive.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-peer-close").await;
+    let (store, _wake) = ObservedStore::new();
+    let (insert_entered_tx, insert_entered_rx) = tokio::sync::oneshot::channel();
+    let (insert_release_tx, insert_release_rx) = tokio::sync::oneshot::channel();
+    store
+        .install_insert_gate(insert_entered_tx, insert_release_rx)
+        .await;
+    let port = E2eRecordingPort::new();
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        fx.broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port.clone() as Arc<dyn ParentContinuationPort>,
+        Arc::new(SystemContinuationClock::new()),
+    ));
+    let waiter_closed = CancellationToken::new();
+    let arm = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let waiter_closed = waiter_closed.clone();
+        async move {
+            coordinator
+                .begin_arm_from_join(JoinArmRequest {
+                    parent_connection_id: "parent".into(),
+                    parent_conversation_id: 7,
+                    task_ids: vec!["e2e-peer-close".into()],
+                    waiter_closed,
+                })
+                .await
+        }
+    });
+    insert_entered_rx
+        .await
+        .expect("insert boundary establishes durable ownership");
+    // Peer-close of the Join socket cancels only the waiter token.
+    waiter_closed.cancel();
+    insert_release_tx.send(()).unwrap();
+    let outcome = arm.await.unwrap().unwrap();
+    let JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("post-insert peer-close must keep the durable arm")
+    };
+    completion.await.unwrap().unwrap();
+    assert_eq!(
+        fx.broker.pending_count().await,
+        1,
+        "children remain Running"
+    );
+    assert_eq!(coordinator.worker_count(), 1);
+    assert_eq!(
+        store.load(&continuation_id).await.unwrap().unwrap().state,
+        ContinuationState::Waiting
+    );
+
+    complete_seeded_task(&fx.broker, "e2e-peer-close").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned worker finishes after child terminal");
+    assert_eq!(
+        store.load(&continuation_id).await.unwrap().unwrap().state,
+        ContinuationState::Completed
+    );
+    assert_eq!(port.admit_count.load(Ordering::Relaxed), 1);
+}
+
+/// 4. No parent prompt while children merely run before the checkpoint.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_no_prompt_while_children_merely_running() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-no-periodic").await;
+    let (continuation_id, completion) = fx.arm_running("e2e-no-periodic").await;
+    completion.await.unwrap().unwrap();
+    fx.await_waiting(&continuation_id).await;
+
+    tokio::time::advance(std::time::Duration::from_millis(
+        CONTINUATION_CHECKPOINT_MS - 1,
+    ))
+    .await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        fx.port.admit_count.load(Ordering::Relaxed),
+        0,
+        "no hidden prompt before checkpoint or child terminal"
+    );
+    assert_eq!(
+        fx.store
+            .load(&continuation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ContinuationState::Waiting
+    );
+    assert_eq!(fx.broker.pending_count().await, 1);
+
+    // cleanup via stop so we do not wait the full remaining ms in other tests
+    assert_eq!(
+        fx.coordinator
+            .handle_parent_stop("parent", 7)
+            .await
+            .unwrap(),
+        1
+    );
+    fx.await_worker_gone().await;
+}
+
+/// 5a. All-terminal admits exactly one hidden prompt.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_wake_all_terminal_admits_once() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-terminal").await;
+    let (continuation_id, completion) = fx.arm_running("e2e-terminal").await;
+    completion.await.unwrap().unwrap();
+    fx.await_waiting(&continuation_id).await;
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
+
+    complete_seeded_task(&fx.broker, "e2e-terminal").await;
+    let row = fx.await_terminal(&continuation_id).await;
+    assert_eq!(row.state, ContinuationState::Completed);
+    assert_eq!(row.wake_reason, Some(ContinuationWakeReason::AllTerminal));
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 1);
+    assert_eq!(fx.coordinator.worker_count(), 0);
+    assert_eq!(fx.broker.pending_count().await, 0);
+}
+
+/// 5b. Attention admits exactly one hidden prompt.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_wake_attention_admits_once() {
+    let attention = Arc::new(MemoryDelegationAttentionStore::new());
+    let fx = E2eMatrix::with_attention(attention.clone() as Arc<dyn DelegationAttentionStore>);
+    fx.seed_running("e2e-attention").await;
+    let (continuation_id, completion) = fx.arm_running("e2e-attention").await;
+    completion.await.unwrap().unwrap();
+    fx.await_waiting(&continuation_id).await;
+
+    attention
+        .open_or_recover(NewAttentionRequest {
+            task_id: "e2e-attention".into(),
+            parent_conversation_id: 7,
+            child_conversation_id: 99,
+            child_tool_call_id: "child-tool".into(),
+            message: "Need a decision".into(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    fx.broker.notify_attention_changed_for_test();
+
+    let row = fx.await_terminal(&continuation_id).await;
+    assert_eq!(row.state, ContinuationState::Completed);
+    assert_eq!(
+        row.wake_reason,
+        Some(ContinuationWakeReason::AttentionRequired)
+    );
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 1);
+    // child remains running after attention wake
+    assert_eq!(fx.broker.pending_count().await, 1);
+    assert_eq!(fx.coordinator.cancel_workers_for_parent("parent"), 0);
+    // drain leftover child for isolation
+    complete_seeded_task(&fx.broker, "e2e-attention").await;
+}
+
+/// 5c. Unavailable admits exactly one hidden prompt after mid-wait loss of the live task.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-unavailable").await;
+    let (continuation_id, completion) = fx.arm_running("e2e-unavailable").await;
+    completion.await.unwrap().unwrap();
+    fx.await_waiting(&continuation_id).await;
+
+    assert!(
+        fx.broker.forget_live_task_for_test("e2e-unavailable").await,
+        "seeded live task must be forgettable for Unavailable reclassification"
+    );
+    let row = fx.await_terminal(&continuation_id).await;
+    assert_eq!(row.state, ContinuationState::Completed);
+    assert_eq!(row.wake_reason, Some(ContinuationWakeReason::Unavailable));
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 1);
+    assert_eq!(fx.coordinator.worker_count(), 0);
+}
+
+/// 5d. Checkpoint admits exactly one hidden prompt at the logical 240s deadline.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-checkpoint").await;
+    let (continuation_id, completion) = fx.arm_running("e2e-checkpoint").await;
+    completion.await.unwrap().unwrap();
+    let waiting = fx.store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(waiting.state, ContinuationState::Waiting);
+
+    tokio::time::advance(std::time::Duration::from_millis(
+        CONTINUATION_CHECKPOINT_MS - 1,
+    ))
+    .await;
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+
+    let row = fx.await_terminal(&continuation_id).await;
+    assert_eq!(row.state, ContinuationState::Completed);
+    assert_eq!(row.wake_reason, Some(ContinuationWakeReason::Checkpoint));
+    assert_eq!(
+        row.wake_claimed_at
+            .expect("claim")
+            .signed_duration_since(row.armed_at)
+            .num_milliseconds(),
+        CONTINUATION_CHECKPOINT_MS as i64
+    );
+    assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 1);
+    assert_eq!(fx.broker.pending_count().await, 1);
+    complete_seeded_task(&fx.broker, "e2e-checkpoint").await;
+}
+
+/// 6 + 7. Prompt contains latest typed snapshot and durable marker; no public
+/// UserMessage / cold user turn exposes the hidden prompt.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_public() {
+    let manager = Arc::new(crate::acp::manager::ConnectionManager::new());
+    let store = Arc::new(InMemoryContinuationStore::default());
+    manager.install_continuation_store(store.clone() as Arc<dyn ContinuationStore>);
+    let mut command_rx = manager
+        .insert_test_connection_live("parent", AgentType::ClaudeCode, None, EventEmitter::Noop)
+        .await;
+    let state = manager.get_state("parent").await.unwrap();
+    {
+        let mut state = state.write().await;
+        state.conversation_id = Some(7);
+        state.external_id = Some("session-7".into());
+        state.parent_turn_generation = 3;
+        state.last_suspended_turn_generation = Some(3);
+    }
+    let mut events = state.read().await.event_stream().subscribe();
+
+    let broker = Arc::new(test_broker());
+    broker.seed_live_task_for_test("parent", "e2e-hidden").await;
+    // Use a recording port that forwards admission through the manager so the
+    // hidden-prompt enqueue boundary is the real one.
+    struct ManagerAdmitPort {
+        manager: Arc<crate::acp::manager::ConnectionManager>,
+        admits: AtomicUsize,
+    }
+    #[async_trait]
+    impl ParentContinuationPort for ManagerAdmitPort {
+        async fn snapshot_parent(
+            &self,
+            connection_id: &str,
+        ) -> Result<ParentTurnSnapshot, ContinuationError> {
+            Ok(ParentTurnSnapshot {
+                connection_id: connection_id.into(),
+                conversation_id: 7,
+                session_id: "session-7".into(),
+                turn_generation: 3,
+                turn_in_flight: true,
+            })
+        }
+        async fn suspend_parent(
+            &self,
+            request: SuspendRequest,
+        ) -> Result<SuspensionAck, ContinuationError> {
+            // Mirror production: suspension leaves the parent turn non-in-flight
+            // so admission can open a new generation.
+            if let Some(state) = self.manager.get_state(&request.parent_connection_id).await {
+                let mut state = state.write().await;
+                state.turn_in_flight = false;
+                state.active_turn_generation = None;
+                state.last_suspended_turn_generation = Some(request.parent_turn_generation);
+            }
+            Ok(SuspensionAck {
+                continuation_id: request.continuation_id,
+                parent_turn_generation: request.parent_turn_generation,
+            })
+        }
+        async fn admit_continuation(
+            &self,
+            request: ContinuationPromptRequest,
+        ) -> Result<PromptAdmissionResult, ContinuationError> {
+            self.admits.fetch_add(1, Ordering::Relaxed);
+            self.manager.admit_delegation_continuation(request).await
+        }
+        async fn publish_waiting(
+            &self,
+            _connection_id: &str,
+            _waiting: Option<ContinuationWaitingProjection>,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+        async fn publish_failure(
+            &self,
+            _connection_id: &str,
+            _code: ContinuationFailureCode,
+        ) -> Result<(), ContinuationError> {
+            Ok(())
+        }
+    }
+    let port = Arc::new(ManagerAdmitPort {
+        manager: manager.clone(),
+        admits: AtomicUsize::new(0),
+    });
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port.clone() as Arc<dyn ParentContinuationPort>,
+        Arc::new(SystemContinuationClock::new()),
+    );
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["e2e-hidden".into()],
+            waiter_closed: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm")
+    };
+    completion.await.unwrap().unwrap();
+    complete_seeded_task(&broker, "e2e-hidden").await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while store.load(&continuation_id).await.unwrap().unwrap().state
+            != ContinuationState::Completed
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager-admitted continuation completes");
+
+    let command = command_rx
+        .recv()
+        .await
+        .expect("continuation Prompt command");
+    let crate::acp::connection::ConnectionCommand::Prompt {
+        blocks,
+        user_message,
+        mark_awaiting_reply,
+        ..
+    } = command
+    else {
+        panic!("expected Prompt command")
+    };
+    assert!(
+        user_message.is_none(),
+        "hidden prompt must not carry a public user_message"
+    );
+    assert!(mark_awaiting_reply);
+    let prompt_text = match blocks.into_iter().next().unwrap() {
+        crate::acp::types::PromptInputBlock::Text { text } => text,
+        _ => panic!("continuation prompt must be text"),
+    };
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert!(prompt_text.starts_with(&row.internal_prompt_marker));
+    assert!(prompt_text.contains("\"wake_reason\":\"all_terminal\""));
+    assert!(prompt_text.contains("e2e-hidden"));
+    // Reconstruct from the admitted origin fields and confirm the durable
+    // marker line is exactly the store marker (snapshot body is server-typed).
+    let rebuilt = build_continuation_prompt_text(
+        &super::DelegationContinuationOrigin::new(
+            row.continuation_id.clone(),
+            row.generation,
+            ContinuationWakeReason::AllTerminal,
+            row.internal_prompt_id.clone(),
+            row.internal_prompt_marker.clone(),
+        ),
+        &crate::acp::delegation::types::DelegationStatusBatch::legacy(vec![]),
+    )
+    .unwrap();
+    assert_eq!(
+        prompt_text.lines().next(),
+        Some(row.internal_prompt_marker.as_str())
+    );
+    assert_eq!(
+        rebuilt.lines().next(),
+        Some(row.internal_prompt_marker.as_str())
+    );
+
+    // No public UserMessage event for the hidden prompt.
+    while let Ok(event) = events.try_recv() {
+        if let AcpEvent::UserMessage { blocks, .. } = &event.payload {
+            for block in blocks {
+                if let crate::acp::types::UserMessageBlock::Text { text } = block {
+                    assert!(
+                        !text.contains(&row.internal_prompt_marker),
+                        "UserMessage must not expose the continuation marker"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut turns = vec![MessageTurn {
+        id: "internal".into(),
+        role: TurnRole::User,
+        blocks: vec![ContentBlock::Text {
+            text: prompt_text.clone(),
+        }],
+        timestamp: Utc::now(),
+        usage: None,
+        duration_ms: None,
+        model: None,
+        completed_at: None,
+    }];
+    filter_internal_continuation_turns(store.as_ref(), 7, &mut turns)
+        .await
+        .unwrap();
+    assert!(
+        turns.is_empty(),
+        "cold transcript must suppress the admitted hidden prompt"
+    );
+    assert_eq!(port.admits.load(Ordering::Relaxed), 1);
+}
+
+/// 8. Re-Join from the continuation turn creates a larger generation and new wake_at.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_rejoin_creates_larger_generation_and_new_wake_at() {
+    let fx = E2eMatrix::new();
+    fx.seed_running("e2e-rejoin-1").await;
+    let (first_id, first_completion) = fx.arm_running("e2e-rejoin-1").await;
+    first_completion.await.unwrap().unwrap();
+    let first_waiting = fx.store.load(&first_id).await.unwrap().unwrap();
+    complete_seeded_task(&fx.broker, "e2e-rejoin-1").await;
+    let first_done = fx.await_terminal(&first_id).await;
+    assert_eq!(first_done.state, ContinuationState::Completed);
+    assert_eq!(fx.coordinator.worker_count(), 0);
+
+    // Advance clock so the next generation's wake_at is observably later.
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    fx.port.turn_generation.store(4, Ordering::Relaxed);
+    fx.seed_running("e2e-rejoin-2").await;
+    let (second_id, second_completion) = fx.arm_running("e2e-rejoin-2").await;
+    second_completion.await.unwrap().unwrap();
+    let second = fx.store.load(&second_id).await.unwrap().unwrap();
+    assert!(
+        second.generation > first_waiting.generation,
+        "re-Join must allocate a strictly larger store generation: first={}, second={}",
+        first_waiting.generation,
+        second.generation
+    );
+    assert!(
+        second.wake_at > first_waiting.wake_at,
+        "re-Join must mint a fresh wake_at beyond the prior deadline"
+    );
+    assert_eq!(
+        second
+            .wake_at
+            .signed_duration_since(second.armed_at)
+            .num_milliseconds(),
+        CONTINUATION_CHECKPOINT_MS as i64
+    );
+
+    assert_eq!(
+        fx.coordinator
+            .handle_parent_stop("parent", 7)
+            .await
+            .unwrap(),
+        1
+    );
+    fx.await_worker_gone().await;
+}
+
+/// 9. User Stop at Arming / Waiting / WakePending / Resuming yields no duplicate
+/// prompt and no orphan child.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_stop_at_each_phase_no_duplicate_or_orphan() {
+    // --- Arming ---
+    {
+        let fx = E2eMatrix::new();
+        fx.seed_running("e2e-stop-arming").await;
+        let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
+        let (continuation_id, mut completion) = fx.arm_running("e2e-stop-arming").await;
+        let _ = tokio::select! {
+            request = suspend_entered => request.expect("suspend entered Arming"),
+            result = &mut completion => panic!("ended early: {result:?}"),
+        };
+        assert_eq!(
+            fx.store
+                .load(&continuation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ContinuationState::Arming
+        );
+        assert_eq!(
+            fx.coordinator
+                .handle_parent_stop("parent", 7)
+                .await
+                .unwrap(),
+            1
+        );
+        let _ = suspend_release.send(());
+        let _ = completion.await;
+        fx.await_worker_gone().await;
+        let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(fx.broker.pending_count().await, 0, "no orphan child");
+    }
+
+    // --- Waiting ---
+    {
+        let fx = E2eMatrix::new();
+        fx.seed_running("e2e-stop-waiting").await;
+        let (continuation_id, completion) = fx.arm_running("e2e-stop-waiting").await;
+        completion.await.unwrap().unwrap();
+        fx.await_waiting(&continuation_id).await;
+        assert_eq!(
+            fx.coordinator
+                .handle_parent_stop("parent", 7)
+                .await
+                .unwrap(),
+            1
+        );
+        fx.await_worker_gone().await;
+        let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(fx.broker.pending_count().await, 0);
+    }
+
+    // --- WakePending (complete child while suspend still gated) ---
+    {
+        let fx = E2eMatrix::new();
+        fx.seed_running("e2e-stop-wake-pending").await;
+        let (suspend_entered, suspend_release) = fx.port.install_suspend_gate().await;
+        let (continuation_id, mut completion) = fx.arm_running("e2e-stop-wake-pending").await;
+        let _ = tokio::select! {
+            request = suspend_entered => request.expect("suspend entered"),
+            result = &mut completion => panic!("ended early: {result:?}"),
+        };
+        complete_seeded_task(&fx.broker, "e2e-stop-wake-pending").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+                if row.state == ContinuationState::WakePending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("must claim WakePending before suspend ack");
+        assert_eq!(
+            fx.coordinator
+                .handle_parent_stop("parent", 7)
+                .await
+                .unwrap(),
+            1
+        );
+        let _ = suspend_release.send(());
+        let _ = completion.await;
+        fx.await_worker_gone().await;
+        let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        assert_eq!(fx.port.admit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(fx.broker.pending_count().await, 0);
+    }
+
+    // --- Resuming (gate admission after wake) ---
+    {
+        let fx = E2eMatrix::new();
+        fx.seed_running("e2e-stop-resuming").await;
+        let (admission_entered, admission_release) = fx.port.install_admission_gate().await;
+        let (continuation_id, completion) = fx.arm_running("e2e-stop-resuming").await;
+        completion.await.unwrap().unwrap();
+        fx.await_waiting(&continuation_id).await;
+        complete_seeded_task(&fx.broker, "e2e-stop-resuming").await;
+        let _request = admission_entered.await.expect("admission entered Resuming");
+        assert_eq!(
+            fx.store
+                .load(&continuation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ContinuationState::Resuming
+        );
+        assert_eq!(
+            fx.coordinator
+                .handle_parent_stop("parent", 7)
+                .await
+                .unwrap(),
+            1
+        );
+        let _ = admission_release.send(());
+        fx.await_worker_gone().await;
+        let row = fx.store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Cancelled);
+        // admit_continuation was entered once (gated) but Stop owns cleanup;
+        // the durable row must not complete with an extra public prompt cycle.
+        assert!(fx.port.admit_count.load(Ordering::Relaxed) <= 1);
+        assert_eq!(fx.broker.pending_count().await, 0);
+    }
+}
+
+/// 10. Parent disconnect and startup reconciliation release the lock only after cleanup.
+#[tokio::test(start_paused = true)]
+async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_cleanup() {
+    // Disconnect while Waiting: children drain before Failed row.
+    {
+        let task_store = Arc::new(MockTaskStore::with_running("e2e-disconnect", 99));
+        let broker = Arc::new(
+            test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>),
+        );
+        broker
+            .seed_live_task_for_test("parent", "e2e-disconnect")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = E2eRecordingPort::new();
+        let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker.clone(),
+            Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        ));
+        let outcome = coordinator
+            .begin_arm_from_join(JoinArmRequest {
+                parent_connection_id: "parent".into(),
+                parent_conversation_id: 7,
+                task_ids: vec!["e2e-disconnect".into()],
+                waiter_closed: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let JoinArmOutcome::Arming {
+            continuation_id,
+            completion,
+        } = outcome
+        else {
+            panic!("must arm")
+        };
+        completion.await.unwrap().unwrap();
+        assert_eq!(
+            store.load(&continuation_id).await.unwrap().unwrap().state,
+            ContinuationState::Waiting
+        );
+
+        coordinator
+            .handle_parent_connection_exit(
+                "parent",
+                Some(7),
+                ParentConnectionExitCause::Disconnected,
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while coordinator.worker_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect cancels workers");
+        let row = store.load(&continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Failed);
+        assert_eq!(
+            row.failure_code,
+            Some(ContinuationFailureCode::ParentConnectionLost)
+        );
+        assert_eq!(broker.pending_count().await, 0);
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+        assert_eq!(port.admit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            port.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[ContinuationFailureCode::ParentConnectionLost]
+        );
+    }
+
+    // Startup reconciliation: active row becomes Failed and second reconcile is a no-op.
+    {
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = E2eRecordingPort::new();
+        let broker = Arc::new(test_broker());
+        let coordinator = DelegationContinuationCoordinator::new(
+            store.clone() as Arc<dyn ContinuationStore>,
+            broker,
+            Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+            port.clone() as Arc<dyn ParentContinuationPort>,
+            Arc::new(SystemContinuationClock::new()),
+        );
+        let armed = store
+            .insert_arming(NewContinuation {
+                continuation_id: "e2e-startup".into(),
+                parent_conversation_id: 7,
+                parent_session_id: "session-7".into(),
+                parent_connection_id: "parent".into(),
+                parent_turn_generation: 3,
+                task_ids: super::types::ContinuationTaskIds(vec!["ghost".into()]),
+                armed_at: Utc::now(),
+                wake_at: Utc::now() + ChronoDuration::seconds(240),
+                internal_prompt_id: "prompt-startup".into(),
+                internal_prompt_marker: internal_prompt_marker("e2e-startup", "prompt-startup"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.list_non_terminal().await.unwrap().len(), 1);
+        assert_eq!(coordinator.reconcile_on_startup().await.unwrap(), 1);
+        assert_eq!(coordinator.reconcile_on_startup().await.unwrap(), 0);
+        let row = store.load(&armed.continuation_id).await.unwrap().unwrap();
+        assert_eq!(row.state, ContinuationState::Failed);
+        assert_eq!(
+            row.failure_code,
+            Some(ContinuationFailureCode::ParentConnectionLost)
+        );
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+        assert_eq!(
+            port.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[ContinuationFailureCode::ParentConnectionLost]
+        );
+    }
 }

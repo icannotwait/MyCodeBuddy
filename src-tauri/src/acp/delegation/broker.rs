@@ -5438,6 +5438,20 @@ impl DelegationBroker {
         self.result_notify.notify_waiters();
     }
 
+    /// Drop a seeded live task without durable settlement so Join reclassifies
+    /// it as unavailable (e2e mid-wait Unavailable path).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn forget_live_task_for_test(&self, task_id: &str) -> bool {
+        let removed = {
+            let mut inner = self.pending.inner.lock().await;
+            inner.running.remove(task_id).is_some() || inner.settling.remove(task_id).is_some()
+        };
+        if removed {
+            self.result_notify.notify_waiters();
+        }
+        removed
+    }
+
     /// Wake Join waiters as if an attention open/close transition fired.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn notify_attention_changed_for_test(&self) {
