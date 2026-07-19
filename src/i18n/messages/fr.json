@@ -2452,7 +2452,17 @@
           "active": "Actif",
           "waitingInput": "En attente d’entrée",
           "stalled": "Aucune activité récente de l’agent"
-        }
+        },
+        "waitingParentDecision": "En attente de la décision parente",
+        "editFilesCount": "{count, plural, one {# fichier} other {# fichiers}}",
+        "editFilesTruncated": "{count}+ fichiers",
+        "editCallsDetected": "{count, plural, one {# appel d’édition} other {# appels d’édition}}",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "Fichiers touchés",
+        "outsideWorkspace": "Hors espace de travail",
+        "filesTruncatedNotice": "Liste tronquée aux {count} premiers chemins",
+        "showFileDetails": "Afficher les détails des fichiers",
+        "hideFileDetails": "Masquer les détails des fichiers"
       },
       "contentParts": {
         "showingTailOutput": "Affichage de la fin de la sortie pendant le streaming pour de meilleures performances.",

@@ -138,15 +138,11 @@ describe("SubAgentOverlay", () => {
         overlayKey="k-truncate"
       />
     )
-    const row = screen.getByTestId("sub-agent-row")
-    const taskEl = Array.from(row.querySelectorAll("div")).find((el) =>
-      el.classList.contains("truncate")
-    )
-    expect(taskEl).toBeDefined()
-    expect(taskEl).toHaveClass("truncate")
-    expect(taskEl).not.toHaveClass("break-words")
-    expect(taskEl).toHaveAttribute("title", longTask)
-    expect(taskEl?.textContent).toContain("Line one of a very long")
+    const secondary = screen.getByTestId("delegation-secondary")
+    expect(secondary).toHaveClass("truncate")
+    expect(secondary).not.toHaveClass("break-words")
+    expect(secondary).toHaveAttribute("title", longTask)
+    expect(secondary).toHaveTextContent("Line one of a very long")
   })
 
   it("collapses to a pill summarizing the count when defaultExpanded is false", () => {
@@ -187,7 +183,7 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByText("Write the fix")).toBeInTheDocument()
   })
 
-  it("opens the child session dialog when a row with a child id is clicked", () => {
+  it("opens the child session dialog from the separate open control", () => {
     bindings["pt-1"] = bindingOf({
       parentToolUseId: "pt-1",
       childConversationId: 77,
@@ -207,13 +203,59 @@ describe("SubAgentOverlay", () => {
       screen.queryByTestId("sub-agent-session-dialog")
     ).not.toBeInTheDocument()
 
-    fireEvent.click(
-      screen.getByText("Investigate flaky test").closest("button")!
-    )
+    // Row container is not a button — open is a sibling control.
+    const row = screen.getByTestId("sub-agent-row")
+    expect(row.tagName.toLowerCase()).toBe("div")
+    fireEvent.click(screen.getByTestId("sub-agent-open"))
 
     const dialog = screen.getByTestId("sub-agent-session-dialog")
     expect(dialog).toBeInTheDocument()
     expect(dialog).toHaveAttribute("data-conversation-id", "77")
+  })
+
+  it("expands touched files on the row without opening the session dialog", () => {
+    bindings["pt-1"] = bindingOf({
+      parentToolUseId: "pt-1",
+      childConversationId: 77,
+      status: "running",
+      runtimeStats: {
+        started_at: "2026-07-19T00:00:00.000Z",
+        tool_call_count: 4,
+        edit_tool_call_count: 1,
+        touched_files: [
+          {
+            path: "src/overlay.ts",
+            outside_workspace: false,
+            additions: 1,
+            deletions: 0,
+          },
+        ],
+        touched_files_truncated: false,
+        line_counts_complete: true,
+        additions: 1,
+        deletions: 0,
+      },
+    })
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+        ]}
+        overlayKey="k-expand"
+        defaultExpanded
+      />
+    )
+
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId("delegation-files-toggle"))
+    expect(screen.getByTestId("delegation-files-panel")).toHaveTextContent(
+      "src/overlay.ts"
+    )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("renders a graceful fallback row for a delegation with unparseable input", () => {

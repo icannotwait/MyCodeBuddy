@@ -383,6 +383,97 @@ describe("DelegatedSubThread", () => {
       expect(screen.getByText(expectedTask)).toBeInTheDocument()
     }
   )
+
+  it("shows runtime ops, attention, and expands files without opening the dialog", () => {
+    mockedHook.mockReturnValue({
+      binding: bindingOf({
+        status: "running",
+        attentionRequest: {
+          request_id: "req-1",
+          task_id: "task-1",
+          message: "Choose A or B",
+          created_at: "2026-07-19T00:01:00.000Z",
+        },
+        runtimeStats: {
+          started_at: "2026-07-19T00:00:00.000Z",
+          tool_call_count: 5,
+          edit_tool_call_count: 1,
+          touched_files: [
+            {
+              path: "src/card.ts",
+              outside_workspace: false,
+              additions: 2,
+              deletions: 0,
+            },
+            {
+              path: "/tmp/out.log",
+              outside_workspace: true,
+            },
+          ],
+          touched_files_truncated: true,
+          line_counts_complete: true,
+          additions: 2,
+          deletions: 0,
+        },
+      }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+
+    expect(screen.getByTestId("delegation-attention-badge")).toHaveTextContent(
+      "Waiting for parent decision"
+    )
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "5 tool uses"
+    )
+    // Truncated path list uses the "N+ files" form (not exact "N files").
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "2+ files"
+    )
+
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId("delegation-files-toggle"))
+    expect(screen.getByTestId("delegation-files-panel")).toHaveTextContent(
+      "src/card.ts"
+    )
+    expect(screen.getByTestId("delegation-outside-workspace")).toHaveTextContent(
+      "Outside workspace"
+    )
+    // Expand must not open the child conversation dialog.
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
+  })
+
+  it("does not show a files toggle when only edit-call counts exist (no paths)", () => {
+    mockedHook.mockReturnValue({
+      binding: bindingOf({
+        status: "running",
+        runtimeStats: {
+          started_at: "2026-07-19T00:00:00.000Z",
+          tool_call_count: 3,
+          edit_tool_call_count: 2,
+          touched_files: [],
+          touched_files_truncated: false,
+          line_counts_complete: false,
+        },
+      }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+    expect(screen.getByTestId("delegation-operational")).toHaveTextContent(
+      "2 edit calls"
+    )
+    expect(
+      screen.queryByTestId("delegation-files-toggle")
+    ).not.toBeInTheDocument()
+  })
 })
 
 // Async delegation: the parent `delegate_to_agent` output is a *running ack*

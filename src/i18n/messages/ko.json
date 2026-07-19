@@ -2452,7 +2452,17 @@
           "active": "활성",
           "waitingInput": "입력 대기",
           "stalled": "최근 에이전트 활동 없음"
-        }
+        },
+        "waitingParentDecision": "부모 에이전트 결정 대기",
+        "editFilesCount": "파일 {count}개",
+        "editFilesTruncated": "파일 {count}+개",
+        "editCallsDetected": "편집 호출 {count}회",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "변경된 파일",
+        "outsideWorkspace": "작업 공간 외부",
+        "filesTruncatedNotice": "목록이 처음 {count}개 경로로 잘렸습니다",
+        "showFileDetails": "파일 세부정보 표시",
+        "hideFileDetails": "파일 세부정보 숨기기"
       },
       "contentParts": {
         "showingTailOutput": "성능을 위해 스트리밍 중에는 출력의 끝부분만 표시합니다.",

@@ -2452,7 +2452,17 @@
           "active": "نشط",
           "waitingInput": "بانتظار الإدخال",
           "stalled": "لا نشاط حديث للوكيل"
-        }
+        },
+        "waitingParentDecision": "في انتظار قرار الوكيل الأب",
+        "editFilesCount": "{count, plural, one {# ملف} other {# ملفات}}",
+        "editFilesTruncated": "{count}+ ملفات",
+        "editCallsDetected": "{count, plural, one {# استدعاء تعديل} other {# استدعاءات تعديل}}",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "الملفات المتأثرة",
+        "outsideWorkspace": "خارج مساحة العمل",
+        "filesTruncatedNotice": "تم اقتطاع القائمة إلى أول {count} مسارات",
+        "showFileDetails": "إظهار تفاصيل الملفات",
+        "hideFileDetails": "إخفاء تفاصيل الملفات"
       },
       "contentParts": {
         "showingTailOutput": "يتم عرض نهاية المخرجات أثناء البث لتحسين الأداء.",

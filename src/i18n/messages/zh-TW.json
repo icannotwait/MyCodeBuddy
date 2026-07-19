@@ -2452,7 +2452,17 @@
           "active": "活動中",
           "waitingInput": "等待輸入",
           "stalled": "近期無代理活動"
-        }
+        },
+        "waitingParentDecision": "等待父代理決策",
+        "editFilesCount": "{count} 個檔案",
+        "editFilesTruncated": "{count}+ 個檔案",
+        "editCallsDetected": "{count} 次編輯呼叫",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "涉及檔案",
+        "outsideWorkspace": "工作區外",
+        "filesTruncatedNotice": "清單已截斷為前 {count} 條路徑",
+        "showFileDetails": "顯示檔案詳情",
+        "hideFileDetails": "隱藏檔案詳情"
       },
       "contentParts": {
         "showingTailOutput": "為確保效能，串流輸出時僅顯示尾端內容。",

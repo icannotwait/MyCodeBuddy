@@ -7,13 +7,11 @@
  * delegating: task" instead of "mcp__codeg-delegate__delegate_to_agent: codex".
  *
  * The card is intentionally a status + navigation affordance ONLY: it does not
- * render the child's output inline and does not expand. The child's result is
- * delivered to the LLM via `get_delegation_status` and to the user by opening
- * the child session ("查看会话" → SubAgentSessionDialog, which also hosts the
- * child's permission prompts). When the child is awaiting a permission decision
- * the status badge reflects it, cueing the user to open the session.
+ * render the child's output inline. Secondary title, runtime stats, attention,
+ * and expandable touched-file detail live in shared `DelegationCardChrome`.
+ * The child's transcript is opened via SubAgentSessionDialog.
  *
- * All agent-type / task / status / child-id resolution lives in
+ * All agent-type / task / status / child-id / projection resolution lives in
  * `useDelegationCardModel` (shared with the top-right `SubAgentOverlay`), so the
  * card and the overlay never disagree about a sub-agent.
  */
@@ -25,6 +23,7 @@ import { useTranslations } from "next-intl"
 import { AgentIcon } from "@/components/agent-icon"
 import { AGENT_LABELS } from "@/lib/types"
 import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
+import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
 import { SubAgentSessionDialog } from "@/components/message/sub-agent-session-dialog"
 import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
@@ -60,6 +59,15 @@ export function DelegatedSubThread({
 }: Props) {
   const t = useTranslations("Folder.chat.delegation")
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [filesExpanded, setFilesExpanded] = useState(false)
+  const model = useDelegationCardModel({
+    parentToolUseId,
+    input,
+    output,
+    errorText,
+    state,
+    meta,
+  })
   const {
     agentType,
     agentDisplayLabel,
@@ -70,14 +78,14 @@ export function DelegatedSubThread({
     childConversationId,
     childConnectionId,
     hasModel,
-  } = useDelegationCardModel({
-    parentToolUseId,
-    input,
-    output,
-    errorText,
-    state,
-    meta,
-  })
+    displaySecondary,
+    conversationTitle,
+    elapsedMs,
+    toolCallCount,
+    editRollup,
+    attentionRequest,
+    runtimeStats,
+  } = model
 
   // A snapshot replay with an empty/unparseable input AND no live binding has
   // no useful card to draw — fall through to the standard renderer instead of
@@ -92,16 +100,16 @@ export function DelegatedSubThread({
       className="@container/delegcard rounded-lg border border-border bg-card"
     >
       <div className="flex w-full items-stretch rounded-lg overflow-hidden">
-        <div className="flex flex-1 min-w-0 items-center gap-3 px-3 py-2.5 text-left">
-          <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
+        <div className="flex flex-1 min-w-0 items-start gap-3 px-3 py-2.5 text-left">
+          <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground mt-0.5">
             {agentType ? (
               <AgentIcon agentType={agentType} className="h-5 w-5" />
             ) : (
               <span className="h-2.5 w-2.5 rounded-sm bg-muted-foreground/60" />
             )}
           </span>
-          <div className="min-w-0 flex-1 space-y-0.5">
-            <div className="flex items-center gap-2">
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-semibold text-foreground">
                 {agentDisplayLabel ??
                   (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
@@ -116,11 +124,18 @@ export function DelegatedSubThread({
               )}
               <StatusBadge status={status} errorCode={errorCode} />
             </div>
-            {task && (
-              <div className="text-xs text-muted-foreground whitespace-pre-wrap break-words line-clamp-1">
-                {task}
-              </div>
-            )}
+            <DelegationCardChrome
+              displaySecondary={displaySecondary}
+              conversationTitle={conversationTitle}
+              task={task}
+              elapsedMs={elapsedMs}
+              toolCallCount={toolCallCount}
+              editRollup={editRollup}
+              attentionRequest={attentionRequest}
+              runtimeStats={runtimeStats}
+              filesExpanded={filesExpanded}
+              onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+            />
           </div>
         </div>
         {childConversationId != null && (
