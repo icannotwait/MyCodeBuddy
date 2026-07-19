@@ -1912,15 +1912,8 @@ impl ConnectionManager {
         // respect to the same status value, so re-writing `InProgress` is a
         // benign no-op on the row (touches `updated_at` only) and returns the
         // patch for the global state broadcast.
-        // Logged inside `update_status_with_patch` (prev→new); tag here so
-        // post-CAS → InProgress races are attributable to a real prompt send.
         let conversation_id_for_status = state_arc.read().await.conversation_id;
         if let Some(cid) = conversation_id_for_status {
-            tracing::info!(
-                connection_id = %conn_id,
-                conversation_id = cid,
-                "[manager] send_prompt_linked → InProgress (pre-send status write)"
-            );
             let patch = conversation_service::update_status_with_patch(
                 &db.conn,
                 cid,
