@@ -6,6 +6,7 @@
 pub mod context;
 pub mod coordinator;
 pub mod internal_sessions;
+pub mod partial_source;
 pub mod runner;
 pub mod service;
 pub mod types;
@@ -18,6 +19,7 @@ pub use internal_sessions::{
 };
 
 pub use context::{bound_context, project_visible_prompt};
+pub use partial_source::{ManagerPartialSource, PartialAssistantTextSource};
 pub use runner::{
     normalize_generated_title, HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner,
 };
