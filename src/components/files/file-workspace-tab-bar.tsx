@@ -35,6 +35,44 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
 
+/** Escape close gate for files chrome (export for unit tests). */
+export function shouldHandleFilesEscape(
+  event: KeyboardEvent,
+  ctx: {
+    mode: string
+    activePane: string
+    filesMaximized: boolean
+    activeFileTabId: string | null
+  }
+): boolean {
+  if (event.key !== "Escape") return false
+  if (event.defaultPrevented) return false
+  if (ctx.mode !== "fusion") return false
+  if (!(ctx.activePane === "files" || ctx.filesMaximized)) return false
+  if (!ctx.activeFileTabId) return false
+
+  // Overlay guard: open modal/dialog or focus inside portaled menus.
+  if (typeof document !== "undefined") {
+    if (
+      document.querySelector('[role="dialog"][data-state="open"]') ||
+      document.querySelector('[role="alertdialog"]')
+    ) {
+      return false
+    }
+    const active = document.activeElement
+    if (
+      active instanceof Element &&
+      active.closest(
+        "[data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-dropdown-menu-content], [role='menu']"
+      )
+    ) {
+      return false
+    }
+  }
+
+  return true
+}
+
 export function FileWorkspaceTabBar() {
   const t = useTranslations("Folder.fileWorkspace")
   const { mode, activePane, filesMaximized } = useWorkspaceView()
@@ -85,11 +123,27 @@ export function FileWorkspaceTabBar() {
         closeAllFileTabs()
         return
       }
-      if (!matchShortcutEvent(event, shortcuts.close_current_tab)) return
+      if (matchShortcutEvent(event, shortcuts.close_current_tab)) {
+        if (!activeFileTabId) return
+        event.preventDefault()
+        closeFileTab(activeFileTabId)
+        return
+      }
 
-      if (!activeFileTabId) return
-      event.preventDefault()
-      closeFileTab(activeFileTabId)
+      // Fixed Escape binding (not rebindable): close active file tab with
+      // overlay precedence. Independent of close_current_tab shortcut.
+      if (
+        shouldHandleFilesEscape(event, {
+          mode,
+          activePane,
+          filesMaximized,
+          activeFileTabId,
+        }) &&
+        activeFileTabId
+      ) {
+        event.preventDefault()
+        closeFileTab(activeFileTabId)
+      }
     }
 
     window.addEventListener("keydown", onKeyDown)
