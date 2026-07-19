@@ -30,6 +30,14 @@ pub struct ActiveTurnContext {
     pub locale: AppLocale,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InternalPromptAdmission {
+    pub continuation_id: String,
+    pub continuation_generation: u64,
+    pub internal_prompt_id: String,
+    pub admitted_turn_generation: u64,
+}
+
 /// Immutable route plan plus the one mutable post-ready availability bit.
 /// Carried on live snapshots so attach payloads have one stable shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +471,17 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// Monotonic, connection-lifetime parent-turn fence. Internal only: never
+    /// copied into live snapshots or public events.
+    pub parent_turn_generation: u64,
+    /// Generation currently owned by the active prompt, if any.
+    pub active_turn_generation: Option<u64>,
+    /// Last generation whose bound prompt response completed a suspension.
+    pub last_suspended_turn_generation: Option<u64>,
+    /// Session-scoped dedup fence for a continuation's internal wake prompt.
+    #[allow(dead_code)] // Task 6 installs and consumes this session-scoped fence.
+    pub(crate) last_internal_prompt_admission: Option<InternalPromptAdmission>,
+
     /// True when the agent's effective settings changed after this connection
     /// was spawned — the running process is still on its launch-time config and
     /// needs a restart to pick up the change. Set/cleared by
@@ -544,6 +563,10 @@ impl SessionState {
             pending_user_message: None,
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            parent_turn_generation: 0,
+            active_turn_generation: None,
+            last_suspended_turn_generation: None,
+            last_internal_prompt_admission: None,
             config_stale: false,
             config_stale_kind: None,
             // Placeholder until spawn installs the real plan snapshot; tests
@@ -556,6 +579,29 @@ impl SessionState {
             effective_locale: AppLocale::En,
             active_turn: None,
         }
+    }
+
+    /// Clear only the active turn fenced by `generation`, retaining session
+    /// identity, history/route state, live delegation projections, and the
+    /// latest internal-prompt admission fence.
+    pub fn clear_suspended_turn(&mut self, generation: u64) -> bool {
+        if self.active_turn_generation != Some(generation) {
+            return false;
+        }
+
+        self.last_suspended_turn_generation = Some(generation);
+        self.active_turn_generation = None;
+        self.active_turn = None;
+        self.live_message = None;
+        self.active_tool_calls.clear();
+        self.pending_permission = None;
+        self.pending_question = None;
+        self.pending_user_message = None;
+        self.pending_user_message_started_at = None;
+        self.feedback.clear();
+        self.turn_in_flight = false;
+        self.supervisor_wake.notify();
+        true
     }
 
     /// Mark real agent-side progress for the soft watchdog. Does **not** touch
@@ -860,6 +906,7 @@ impl SessionState {
                     _ => None,
                 };
                 self.active_turn = None;
+                self.active_turn_generation = None;
                 self.live_message = None;
                 self.active_tool_calls.clear();
                 // The turn's user prompt is no longer "in flight" — the

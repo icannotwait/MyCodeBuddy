@@ -14,7 +14,7 @@ use sea_orm::{
 use crate::acp::connection::matching_config_pair;
 use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, RouteBootstrapOutcome,
-    SpawnHandshake,
+    SpawnHandshake, SuspensionAck,
 };
 use crate::acp::delegation::continuation::store::ContinuationStore;
 use crate::acp::delegation::metrics::PromptAdmissionSource;
@@ -1532,19 +1532,56 @@ impl ConnectionManager {
             }
         }
 
-        state.turn_in_flight = true;
         // Synchronous tail: mandatory routes then permit.send. No await.
         if let Some(ids) = pending_mandatory_ids {
             if let Some(injection) = self.delegation_snapshot() {
                 injection.broker.set_mandatory_profile_routes(conn_id, ids);
             }
         }
+        let turn_generation = match state.parent_turn_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                state.active_turn = None;
+                return Err(AcpError::protocol("parent_turn_generation_overflow"));
+            }
+        };
+        state.parent_turn_generation = turn_generation;
+        state.active_turn_generation = Some(turn_generation);
+        state.turn_in_flight = true;
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
             mark_awaiting_reply,
+            turn_generation,
         });
         Ok(())
+    }
+
+    #[allow(dead_code)] // Task 6 wires the continuation port to this narrow entry point.
+    pub(crate) async fn suspend_for_delegation(
+        &self,
+        conn_id: &str,
+        continuation_id: String,
+        parent_turn_generation: u64,
+    ) -> Result<SuspensionAck, AcpError> {
+        let cmd_tx = {
+            let connections = self.connections.lock().await;
+            connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
+                .cmd_tx
+                .clone()
+        };
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::SuspendForDelegation {
+                continuation_id,
+                parent_turn_generation,
+                reply,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        receiver.await.map_err(|_| AcpError::ProcessExited)?
     }
 
     /// Clone the connection's `prompt_lock` under a short connections-map lock.
@@ -4605,6 +4642,7 @@ mod tests {
                 blocks: one_text_block(),
                 user_message: None,
                 mark_awaiting_reply: false,
+                turn_generation: 1,
             })
             .await
             .unwrap();
@@ -4682,6 +4720,8 @@ mod tests {
             assert_eq!(active.locale, AppLocale::ZhCn);
             assert!(!active.token.is_empty());
             assert_eq!(state.effective_locale, AppLocale::ZhCn);
+            assert_eq!(state.parent_turn_generation, 1);
+            assert_eq!(state.active_turn_generation, Some(1));
         }
 
         // Immediate completion path: receive the queued command with no delay.
@@ -4689,7 +4729,13 @@ mod tests {
             .command_receiver
             .try_recv()
             .expect("prompt must already be enqueued after successful admission");
-        assert!(matches!(cmd, ConnectionCommand::Prompt { .. }));
+        let ConnectionCommand::Prompt {
+            turn_generation, ..
+        } = cmd
+        else {
+            panic!("expected prompt command");
+        };
+        assert_eq!(turn_generation, 1);
     }
 
     #[tokio::test]
@@ -5841,6 +5887,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                turn_generation: 1,
             })
             .await
             .unwrap();
