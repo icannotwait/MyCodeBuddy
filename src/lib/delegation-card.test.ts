@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest"
 
-import { parseInput, resolveDelegationStatus } from "@/lib/delegation-card"
+import {
+  parseDelegationMeta,
+  parseInput,
+  resolveDelegationStatus,
+} from "@/lib/delegation-card"
 import type { DelegationBinding } from "@/contexts/delegation-context"
-import { AGENT_LABELS, ALL_AGENT_TYPES } from "@/lib/types"
+import {
+  AGENT_LABELS,
+  ALL_AGENT_TYPES,
+  emptyRuntimeStats,
+} from "@/lib/types"
 
 function binding(
   overrides: Partial<DelegationBinding> = {}
@@ -18,6 +26,120 @@ function binding(
     ...overrides,
   }
 }
+
+describe("parseDelegationMeta", () => {
+  it("forwards full projection fields", () => {
+    const runtimeStats = {
+      ...emptyRuntimeStats("2026-07-19T10:00:00.000Z"),
+      finished_at: "2026-07-19T10:05:00.000Z",
+      tool_call_count: 3,
+      edit_tool_call_count: 1,
+      touched_files: [
+        {
+          path: "src/lib/foo.ts",
+          outside_workspace: false,
+          additions: 4,
+          deletions: 1,
+        },
+      ],
+      touched_files_truncated: false,
+      additions: 4,
+      deletions: 1,
+      line_counts_complete: true,
+    }
+    const attentionRequest = {
+      request_id: "req-1",
+      task_id: "task-abc",
+      message: "Need parent decision",
+      created_at: "2026-07-19T10:02:00.000Z",
+    }
+
+    const parsed = parseDelegationMeta({
+      "codeg.delegation": {
+        status: "completed",
+        task_id: "task-abc",
+        child_connection_id: "child-conn",
+        child_conversation_id: 42,
+        error_code: null,
+        text_preview: "done preview",
+        started_at: "2026-07-19T10:00:00.000Z",
+        finished_at: "2026-07-19T10:05:00.000Z",
+        runtime_stats: runtimeStats,
+        attention_request: attentionRequest,
+      },
+    })
+
+    expect(parsed).toEqual({
+      status: "ok",
+      taskId: "task-abc",
+      childConnectionId: "child-conn",
+      childConversationId: 42,
+      errorCode: null,
+      startedAt: "2026-07-19T10:00:00.000Z",
+      finishedAt: "2026-07-19T10:05:00.000Z",
+      runtimeStats,
+      attentionRequest,
+      textPreview: "done preview",
+    })
+  })
+
+  it("returns null runtimeStats when shape invalid", () => {
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": {
+          status: "running",
+          child_conversation_id: 1,
+          runtime_stats: { tool_call_count: "nope" },
+        },
+      })?.runtimeStats
+    ).toBeNull()
+  })
+
+  it("returns null attentionRequest when shape invalid", () => {
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": {
+          status: "running",
+          child_conversation_id: 1,
+          attention_request: { request_id: 123 },
+        },
+      })?.attentionRequest
+    ).toBeNull()
+  })
+
+  it("normalizes empty task_id to null", () => {
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": {
+          status: "running",
+          task_id: "",
+          child_conversation_id: 1,
+        },
+      })?.taskId
+    ).toBeNull()
+  })
+
+  it("omits absent nested projection fields as null", () => {
+    const parsed = parseDelegationMeta({
+      "codeg.delegation": {
+        status: "running",
+        child_conversation_id: 7,
+      },
+    })
+    expect(parsed).toMatchObject({
+      status: "running",
+      taskId: null,
+      childConnectionId: null,
+      childConversationId: 7,
+      errorCode: null,
+      startedAt: null,
+      finishedAt: null,
+      runtimeStats: null,
+      attentionRequest: null,
+      textPreview: null,
+    })
+  })
+})
 
 describe("resolveDelegationStatus — live binding observation", () => {
   it.each([
