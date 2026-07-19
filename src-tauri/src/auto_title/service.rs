@@ -4,8 +4,8 @@
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, Order, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, Order, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::acp::types::PromptInputBlock;
@@ -176,62 +176,116 @@ pub async fn capture_prompt_context<C: ConnectionTrait>(
 /// Apply a usable turn completion to the auto-title job inside an open transaction.
 ///
 /// Only `end_turn` with non-empty trimmed final text advances the job. Duplicate
-/// turn tokens are idempotent. Moves `awaiting_turn` / `retry_wait` → `ready`
-/// and writes write-once `first_assistant_text` through [`bound_context`].
+/// turn tokens are full no-ops (no seq bump, no locale thrash). Progress uses
+/// atomic `usable_turn_seq = usable_turn_seq + 1` with a token guard so concurrent
+/// distinct tokens cannot lose increments via stale RMW.
+///
+/// First-assistant is write-once (`awaiting_turn` + `first_assistant_text IS NULL`).
+/// Deadline snapshots (`Some(partial)` / `Some("")`) are never refined. `retry_wait
+/// → ready` advances state without touching `first_assistant_text`.
 pub async fn apply_usable_completion(
     txn: &DatabaseTransaction,
     snapshot: &TurnCompletionSnapshot,
     stop_reason: &str,
 ) -> Result<CompletionTransition, DbError> {
-    let job = auto_title_job::Entity::find_by_id(snapshot.conversation_id)
-        .one(txn)
+    // 0) Early exit if stop_reason unusable or final_text empty.
+    if stop_reason != "end_turn" || snapshot.final_text.trim().is_empty() {
+        let job = auto_title_job::Entity::find_by_id(snapshot.conversation_id)
+            .one(txn)
+            .await?;
+        return Ok(CompletionTransition {
+            usable_turn_seq: job.map(|j| j.usable_turn_seq).unwrap_or(0),
+            became_ready: false,
+        });
+    }
+
+    let now = Utc::now();
+    let locale_wire = app_locale_to_wire(snapshot.locale).to_string();
+    let bounded = bound_context(snapshot.final_text.trim());
+
+    // 1) Atomic progress (token idempotent) — any live job state.
+    let progress = auto_title_job::Entity::update_many()
+        .col_expr(
+            auto_title_job::Column::UsableTurnSeq,
+            Expr::col(auto_title_job::Column::UsableTurnSeq).add(1),
+        )
+        .col_expr(
+            auto_title_job::Column::LastUsableTurnToken,
+            Expr::value(snapshot.turn_token.clone()),
+        )
+        .col_expr(
+            auto_title_job::Column::Locale,
+            Expr::value(locale_wire),
+        )
+        .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+        .filter(auto_title_job::Column::ConversationId.eq(snapshot.conversation_id))
+        .filter(
+            Condition::any()
+                .add(auto_title_job::Column::LastUsableTurnToken.is_null())
+                .add(
+                    auto_title_job::Column::LastUsableTurnToken
+                        .ne(snapshot.turn_token.clone()),
+                ),
+        )
+        .exec(txn)
         .await?;
 
-    let Some(job) = job else {
+    if progress.rows_affected == 0 {
+        // Duplicate token or missing job — full no-op (no first-ready side effects).
+        let job = auto_title_job::Entity::find_by_id(snapshot.conversation_id)
+            .one(txn)
+            .await?;
         return Ok(CompletionTransition {
-            usable_turn_seq: 0,
-            became_ready: false,
-        });
-    };
-
-    let current_seq = job.usable_turn_seq;
-
-    if stop_reason != "end_turn" || snapshot.final_text.trim().is_empty() {
-        return Ok(CompletionTransition {
-            usable_turn_seq: current_seq,
+            usable_turn_seq: job.map(|j| j.usable_turn_seq).unwrap_or(0),
             became_ready: false,
         });
     }
 
-    if job.last_usable_turn_token.as_deref() == Some(snapshot.turn_token.as_str()) {
-        return Ok(CompletionTransition {
-            usable_turn_seq: current_seq,
-            became_ready: false,
-        });
-    }
+    // 2) First-ready from awaiting_turn (write-once assistant; shared guard with
+    //    deadline promote so end-turn cannot refine a deadline snapshot).
+    let first_ready = auto_title_job::Entity::update_many()
+        .col_expr(
+            auto_title_job::Column::FirstAssistantText,
+            Expr::value(bounded),
+        )
+        .col_expr(
+            auto_title_job::Column::State,
+            Expr::value(AutoTitleJobState::Ready),
+        )
+        .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+        .filter(auto_title_job::Column::ConversationId.eq(snapshot.conversation_id))
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::AwaitingTurn))
+        .filter(auto_title_job::Column::FirstAssistantText.is_null())
+        .exec(txn)
+        .await?;
 
-    let bounded = bound_context(snapshot.final_text.trim());
-    let new_seq = current_seq + 1;
-    let became_ready = matches!(
-        job.state,
-        AutoTitleJobState::AwaitingTurn | AutoTitleJobState::RetryWait
-    );
+    let mut became_ready = first_ready.rows_affected == 1;
 
-    let mut active: auto_title_job::ActiveModel = job.clone().into();
-    active.usable_turn_seq = Set(new_seq);
-    active.last_usable_turn_token = Set(Some(snapshot.turn_token.clone()));
-    if job.first_assistant_text.is_none() {
-        active.first_assistant_text = Set(Some(bounded));
-    }
-    active.locale = Set(Some(app_locale_to_wire(snapshot.locale).to_string()));
-    if became_ready {
-        active.state = Set(AutoTitleJobState::Ready);
-    }
-    active.updated_at = Set(Utc::now());
-    active.update(txn).await?;
+    // 3) retry_wait → ready WITHOUT touching first_assistant_text.
+    let retry_ready = auto_title_job::Entity::update_many()
+        .col_expr(
+            auto_title_job::Column::State,
+            Expr::value(AutoTitleJobState::Ready),
+        )
+        .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+        .filter(auto_title_job::Column::ConversationId.eq(snapshot.conversation_id))
+        .filter(auto_title_job::Column::State.eq(AutoTitleJobState::RetryWait))
+        .exec(txn)
+        .await?;
+    became_ready |= retry_ready.rows_affected == 1;
+
+    // 4) Read back usable_turn_seq after atomic progress.
+    let job = auto_title_job::Entity::find_by_id(snapshot.conversation_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| {
+            DbError::Validation(
+                "auto-title job disappeared after usable completion progress".into(),
+            )
+        })?;
 
     Ok(CompletionTransition {
-        usable_turn_seq: new_seq,
+        usable_turn_seq: job.usable_turn_seq,
         became_ready,
     })
 }
@@ -1281,6 +1335,489 @@ mod tests {
         assert_eq!(job.usable_turn_seq, 0);
         assert!(job.first_assistant_text.is_none());
         assert!(job.last_usable_turn_token.is_none());
+    }
+
+    /// Deadline promote CAS used by completion races (Task 6 owns the real
+    /// sweep; tests mirror the required write-once predicates).
+    async fn simulate_deadline_promote<C: ConnectionTrait>(
+        conn: &C,
+        conversation_id: i32,
+        partial: &str,
+    ) -> u64 {
+        let result = auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(AutoTitleJobState::Ready),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstAssistantText,
+                Expr::value(partial.to_string()),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::AwaitingTurn))
+            .filter(auto_title_job::Column::FirstAssistantText.is_null())
+            .exec(conn)
+            .await
+            .expect("simulate deadline promote");
+        result.rows_affected
+    }
+
+    #[tokio::test]
+    async fn end_turn_from_awaiting_sets_assistant_and_ready() {
+        let fixture = awaiting_job_fixture().await;
+        let snapshot = fixture.snapshot("tok-first", "full final answer");
+        let transition = fixture.apply_completion(&snapshot).await;
+
+        assert!(transition.became_ready);
+        assert_eq!(transition.usable_turn_seq, 1);
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::Ready);
+        assert_eq!(job.usable_turn_seq, 1);
+        assert_eq!(job.last_usable_turn_token.as_deref(), Some("tok-first"));
+        assert_eq!(
+            job.first_assistant_text.as_deref(),
+            Some("full final answer")
+        );
+        assert_eq!(job.locale.as_deref(), Some("en"));
+    }
+
+    #[tokio::test]
+    async fn end_turn_does_not_overwrite_deadline_assistant_snapshot() {
+        let fixture = awaiting_job_fixture().await;
+        // Deadline first: write-once Some("partial") into ready.
+        let promoted = simulate_deadline_promote(
+            &fixture.db.conn,
+            fixture.conversation_id,
+            "partial",
+        )
+        .await;
+        assert_eq!(promoted, 1, "deadline promote must win first-ready");
+
+        let job_after_deadline = fixture.job().await;
+        assert_eq!(job_after_deadline.state, AutoTitleJobState::Ready);
+        assert_eq!(
+            job_after_deadline.first_assistant_text.as_deref(),
+            Some("partial")
+        );
+        assert_eq!(job_after_deadline.usable_turn_seq, 0);
+
+        // Later usable completion with different final text must advance seq
+        // and locale/token, but must not refine the deadline snapshot.
+        let snapshot = fixture.snapshot("tok-end", "full final that must not win");
+        let transition = fixture.apply_completion(&snapshot).await;
+        assert!(!transition.became_ready, "already Ready after deadline");
+        assert_eq!(transition.usable_turn_seq, 1);
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::Ready);
+        assert_eq!(job.usable_turn_seq, 1);
+        assert_eq!(job.last_usable_turn_token.as_deref(), Some("tok-end"));
+        assert_eq!(
+            job.first_assistant_text.as_deref(),
+            Some("partial"),
+            "end-turn must not overwrite deadline assistant snapshot"
+        );
+
+        // Same rule for deadline empty partial Some("").
+        let fixture_empty = awaiting_job_fixture().await;
+        assert_eq!(
+            simulate_deadline_promote(
+                &fixture_empty.db.conn,
+                fixture_empty.conversation_id,
+                "",
+            )
+            .await,
+            1
+        );
+        let empty_snap = fixture_empty.snapshot("tok-after-empty", "later full text");
+        let t = fixture_empty.apply_completion(&empty_snap).await;
+        assert_eq!(t.usable_turn_seq, 1);
+        let job_empty = fixture_empty.job().await;
+        assert_eq!(
+            job_empty.first_assistant_text.as_deref(),
+            Some(""),
+            "Some(\"\") deadline snapshot is also write-once"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_wait_becomes_ready_without_replacing_assistant() {
+        let fixture = awaiting_job_fixture().await;
+        // Seed first snapshot + retry_wait (attempt-1 failure path).
+        let now = Utc::now();
+        auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(AutoTitleJobState::RetryWait),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstAssistantText,
+                Expr::value("snap".to_string()),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstUserText,
+                Expr::value("task".to_string()),
+            )
+            .col_expr(auto_title_job::Column::UsableTurnSeq, Expr::value(1))
+            .col_expr(
+                auto_title_job::Column::LastUsableTurnToken,
+                Expr::value("tok-1".to_string()),
+            )
+            .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
+            .filter(auto_title_job::Column::ConversationId.eq(fixture.conversation_id))
+            .exec(&fixture.db.conn)
+            .await
+            .expect("seed retry_wait");
+
+        let snapshot = fixture.snapshot("tok-2", "later turn text must not replace snap");
+        let transition = fixture.apply_completion(&snapshot).await;
+        assert!(transition.became_ready);
+        assert_eq!(transition.usable_turn_seq, 2);
+
+        let job = fixture.job().await;
+        assert_eq!(job.state, AutoTitleJobState::Ready);
+        assert_eq!(job.usable_turn_seq, 2);
+        assert_eq!(job.last_usable_turn_token.as_deref(), Some("tok-2"));
+        assert_eq!(
+            job.first_assistant_text.as_deref(),
+            Some("snap"),
+            "retry_wait → ready must not replace first_assistant_text"
+        );
+    }
+
+    /// REQUIRED: two concurrent completions with distinct tokens on the same
+    /// Ready job must advance `usable_turn_seq` by +2 via atomic SQL increment
+    /// (not a lost concurrent current_seq+1 RMW).
+    #[tokio::test]
+    async fn two_distinct_usable_tokens_advance_seq_twice() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+
+        use crate::db::test_helpers::fresh_disk_db;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migrate = fresh_disk_db(dir.path()).await;
+        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        let folder = seed_folder(&migrate, "/tmp/title-dual-token-seq").await;
+        let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let conversation_id = conversation.id;
+        let _ = auto_title_job::Entity::delete_by_id(conversation_id)
+            .exec(&migrate.conn)
+            .await;
+        // Already Ready after deadline: seq=1, assistant write-once set.
+        seed_ready_claim_job(
+            &migrate.conn,
+            conversation_id,
+            Some("user task"),
+            Some("deadline snap"),
+            1,
+        )
+        .await;
+        migrate.conn.close().await.expect("close migrate pool");
+
+        let path = dir.path().join("source.db");
+        async fn open_wal_pool(path: &std::path::Path) -> crate::db::AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal pool");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            crate::db::AppDatabase { conn }
+        }
+
+        let pool_a = Arc::new(open_wal_pool(&path).await);
+        let pool_b = Arc::new(open_wal_pool(&path).await);
+
+        let snap_a = TurnCompletionSnapshot {
+            conversation_id,
+            turn_token: "tok-a".into(),
+            locale: AppLocale::En,
+            final_text: Arc::from("later turn a"),
+        };
+        let snap_b = TurnCompletionSnapshot {
+            conversation_id,
+            turn_token: "tok-b".into(),
+            locale: AppLocale::ZhCn,
+            final_text: Arc::from("later turn b"),
+        };
+
+        let handle_a = tokio::spawn({
+            let pool = pool_a.clone();
+            let snap = snap_a.clone();
+            async move {
+                let txn = pool.conn.begin().await.expect("begin a");
+                let result = apply_usable_completion(&txn, &snap, "end_turn")
+                    .await
+                    .expect("apply a");
+                txn.commit().await.expect("commit a");
+                result
+            }
+        });
+        let handle_b = tokio::spawn({
+            let pool = pool_b.clone();
+            let snap = snap_b.clone();
+            async move {
+                let txn = pool.conn.begin().await.expect("begin b");
+                let result = apply_usable_completion(&txn, &snap, "end_turn")
+                    .await
+                    .expect("apply b");
+                txn.commit().await.expect("commit b");
+                result
+            }
+        });
+
+        let (ta, tb) = tokio::join!(handle_a, handle_b);
+        let ta = ta.expect("join a");
+        let tb = tb.expect("join b");
+        // Each completion reports the seq it observed after its progress write;
+        // together they must cover +2 from the seeded seq=1.
+        let reported: std::collections::HashSet<i32> =
+            [ta.usable_turn_seq, tb.usable_turn_seq].into_iter().collect();
+        assert_eq!(
+            reported,
+            [2, 3].into_iter().collect(),
+            "concurrent distinct tokens must each advance seq once (got {ta:?} / {tb:?})"
+        );
+        assert!(!ta.became_ready);
+        assert!(!tb.became_ready);
+
+        let job = auto_title_job::Entity::find_by_id(conversation_id)
+            .one(&pool_a.conn)
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(
+            job.usable_turn_seq, 3,
+            "usable_turn_seq must become +2, not +1 from lost concurrent RMW"
+        );
+        assert_eq!(
+            job.first_assistant_text.as_deref(),
+            Some("deadline snap"),
+            "progress must not refine first assistant"
+        );
+        assert!(
+            job.last_usable_turn_token.as_deref() == Some("tok-a")
+                || job.last_usable_turn_token.as_deref() == Some("tok-b"),
+            "last token must be one of the two concurrent tokens"
+        );
+
+        drop(dir);
+    }
+
+    /// REQUIRED WAL: deadline promote vs end-turn in BOTH orders — exactly one
+    /// first-assistant snapshot; job ends Ready without double first-ready
+    /// corruption.
+    #[tokio::test]
+    async fn concurrent_end_turn_and_deadline_both_orders_wal() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+
+        use crate::db::test_helpers::fresh_disk_db;
+
+        const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migrate = fresh_disk_db(dir.path()).await;
+        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        let folder = seed_folder(&migrate, "/tmp/title-deadline-vs-endturn").await;
+
+        async fn open_wal_pool(path: &std::path::Path) -> crate::db::AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal pool");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            crate::db::AppDatabase { conn }
+        }
+
+        // Seed two independent conversations so both orderings share one DB file.
+        let mut conversation_ids = Vec::new();
+        for _ in 0..2 {
+            let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create");
+            let job = auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&migrate.conn)
+                .await
+                .unwrap()
+                .expect("enrolled");
+            assert_eq!(job.state, AutoTitleJobState::AwaitingTurn);
+            assert!(job.first_assistant_text.is_none());
+            conversation_ids.push(conversation.id);
+        }
+        migrate.conn.close().await.expect("close migrate");
+
+        let path = dir.path().join("source.db");
+        let pool_end = Arc::new(open_wal_pool(&path).await);
+        let pool_deadline = Arc::new(open_wal_pool(&path).await);
+
+        // Order A: deadline promote commits, then usable completion.
+        {
+            let cid = conversation_ids[0];
+            let promoted =
+                simulate_deadline_promote(&pool_deadline.conn, cid, "partial-a").await;
+            assert_eq!(promoted, 1);
+
+            let snap = TurnCompletionSnapshot {
+                conversation_id: cid,
+                turn_token: "tok-order-a".into(),
+                locale: AppLocale::En,
+                final_text: Arc::from("full-a must not win"),
+            };
+            let txn = pool_end.conn.begin().await.expect("begin order a");
+            let transition = apply_usable_completion(&txn, &snap, "end_turn")
+                .await
+                .expect("apply order a");
+            txn.commit().await.expect("commit order a");
+            assert_eq!(transition.usable_turn_seq, 1);
+            assert!(!transition.became_ready);
+
+            let job = auto_title_job::Entity::find_by_id(cid)
+                .one(&pool_end.conn)
+                .await
+                .unwrap()
+                .expect("job order a");
+            assert_eq!(job.state, AutoTitleJobState::Ready);
+            assert_eq!(job.first_assistant_text.as_deref(), Some("partial-a"));
+            assert_eq!(job.usable_turn_seq, 1);
+        }
+
+        // Order B: usable completion commits, then deadline promote no-ops.
+        {
+            let cid = conversation_ids[1];
+            let snap = TurnCompletionSnapshot {
+                conversation_id: cid,
+                turn_token: "tok-order-b".into(),
+                locale: AppLocale::En,
+                final_text: Arc::from("full-b wins first"),
+            };
+            let txn = pool_end.conn.begin().await.expect("begin order b");
+            let transition = apply_usable_completion(&txn, &snap, "end_turn")
+                .await
+                .expect("apply order b");
+            txn.commit().await.expect("commit order b");
+            assert!(transition.became_ready);
+            assert_eq!(transition.usable_turn_seq, 1);
+
+            let promoted =
+                simulate_deadline_promote(&pool_deadline.conn, cid, "partial-b-must-lose").await;
+            assert_eq!(promoted, 0, "deadline must lose after end-turn first-ready");
+
+            let job = auto_title_job::Entity::find_by_id(cid)
+                .one(&pool_deadline.conn)
+                .await
+                .unwrap()
+                .expect("job order b");
+            assert_eq!(job.state, AutoTitleJobState::Ready);
+            assert_eq!(
+                job.first_assistant_text.as_deref(),
+                Some("full-b wins first")
+            );
+            assert_eq!(job.usable_turn_seq, 1);
+        }
+
+        // Concurrent race on a third conversation: both writers fire together.
+        {
+            let conversation = {
+                // Re-open migrate connection via a third pool to create another job.
+                let seed = open_wal_pool(&path).await;
+                enable_auto_title(&seed.conn, AgentType::Codex).await;
+                let conversation =
+                    create(&seed.conn, folder, AgentType::ClaudeCode, None, None)
+                        .await
+                        .expect("create concurrent");
+                conversation.id
+            };
+            let cid = conversation;
+
+            let end_pool = pool_end.clone();
+            let deadline_pool = pool_deadline.clone();
+            let end_handle = tokio::spawn(async move {
+                let snap = TurnCompletionSnapshot {
+                    conversation_id: cid,
+                    turn_token: "tok-race".into(),
+                    locale: AppLocale::En,
+                    final_text: Arc::from("race-full"),
+                };
+                let txn = end_pool.conn.begin().await.expect("begin race end");
+                let result = apply_usable_completion(&txn, &snap, "end_turn")
+                    .await
+                    .expect("apply race");
+                txn.commit().await.expect("commit race end");
+                result
+            });
+            let deadline_handle = tokio::spawn(async move {
+                simulate_deadline_promote(&deadline_pool.conn, cid, "race-partial").await
+            });
+
+            let (end_res, deadline_res) = tokio::time::timeout(
+                ORDER_TIMEOUT,
+                async { tokio::join!(end_handle, deadline_handle) },
+            )
+            .await
+            .expect("deadline vs end-turn race must not hang");
+            let transition = end_res.expect("join end");
+            let promoted = deadline_res.expect("join deadline");
+
+            let job = auto_title_job::Entity::find_by_id(cid)
+                .one(&pool_end.conn)
+                .await
+                .unwrap()
+                .expect("job race");
+            assert_eq!(job.state, AutoTitleJobState::Ready);
+            assert_eq!(transition.usable_turn_seq, 1);
+            assert_eq!(job.usable_turn_seq, 1);
+            let assistant = job
+                .first_assistant_text
+                .as_deref()
+                .expect("exactly one first-assistant snapshot");
+            assert!(
+                assistant == "race-full" || assistant == "race-partial",
+                "unexpected assistant snapshot {assistant:?}"
+            );
+            // Exactly one first-ready writer wins: either promote rows=1 and
+            // end-turn does not re-write assistant, or end-turn became_ready
+            // and promote rows=0. Never both writing distinct snapshots.
+            if assistant == "race-full" {
+                assert_eq!(promoted, 0);
+                assert!(transition.became_ready);
+            } else {
+                assert_eq!(promoted, 1);
+                assert!(!transition.became_ready);
+            }
+        }
+
+        drop(dir);
     }
 
     async fn seed_ready_claim_job(
