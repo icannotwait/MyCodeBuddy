@@ -172,7 +172,11 @@ describe("DelegationChildProjectionCache", () => {
 
   it("applies upsert for a tracked/cached id without waiting for fetch", async () => {
     fetchConversation.mockResolvedValue(
-      makeDetail({ id: 9, title: "From fetch", delegation_task_status: "running" })
+      makeDetail({
+        id: 9,
+        title: "From fetch",
+        delegation_task_status: "running",
+      })
     )
     cache.ensure(9)
     await vi.waitFor(() => {
@@ -243,9 +247,7 @@ describe("DelegationChildProjectionCache", () => {
   })
 
   it("isolates entries by backend cache key", async () => {
-    fetchConversation.mockResolvedValue(
-      makeDetail({ id: 2, title: "On A" })
-    )
+    fetchConversation.mockResolvedValue(makeDetail({ id: 2, title: "On A" }))
     cache.ensure(2)
     await vi.waitFor(() => {
       expect(cache.get(2)?.title).toBe("On A")
@@ -254,9 +256,7 @@ describe("DelegationChildProjectionCache", () => {
     getBackendKey.mockReturnValue("backend-b")
     expect(cache.get(2)).toBeNull()
 
-    fetchConversation.mockResolvedValue(
-      makeDetail({ id: 2, title: "On B" })
-    )
+    fetchConversation.mockResolvedValue(makeDetail({ id: 2, title: "On B" }))
     cache.ensure(2)
     await vi.waitFor(() => {
       expect(cache.get(2)?.title).toBe("On B")

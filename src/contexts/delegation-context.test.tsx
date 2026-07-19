@@ -6,10 +6,7 @@ import {
   DelegationProvider,
   useDelegation,
 } from "@/contexts/delegation-context"
-import {
-  emptyRuntimeStats,
-  type EventEnvelope,
-} from "@/lib/types"
+import { emptyRuntimeStats, type EventEnvelope } from "@/lib/types"
 
 const STARTED_AT = "2026-07-19T00:00:00.000Z"
 
@@ -107,12 +104,8 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
       <div data-testid="agent">{binding.agentType}</div>
       <div data-testid="task-id">{binding.taskId}</div>
       <div data-testid="started-at">{binding.startedAt}</div>
-      <div data-testid="tool-count">
-        {binding.runtimeStats.tool_call_count}
-      </div>
-      <div data-testid="duration-ms">
-        {binding.completedDurationMs ?? "-"}
-      </div>
+      <div data-testid="tool-count">{binding.runtimeStats.tool_call_count}</div>
+      <div data-testid="duration-ms">{binding.completedDurationMs ?? "-"}</div>
       <div data-testid="attention">
         {binding.attentionRequest?.request_id ?? "-"}
       </div>

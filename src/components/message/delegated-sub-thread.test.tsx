@@ -440,9 +440,9 @@ describe("DelegatedSubThread", () => {
     expect(screen.getByTestId("delegation-files-panel")).toHaveTextContent(
       "src/card.ts"
     )
-    expect(screen.getByTestId("delegation-outside-workspace")).toHaveTextContent(
-      "Outside workspace"
-    )
+    expect(
+      screen.getByTestId("delegation-outside-workspace")
+    ).toHaveTextContent("Outside workspace")
     // Expand must not open the child conversation dialog.
     expect(
       screen.queryByTestId("sub-agent-session-dialog")

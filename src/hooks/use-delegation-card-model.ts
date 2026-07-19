@@ -16,12 +16,7 @@
  * shared running ticker.
  */
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useSyncExternalStore,
-} from "react"
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react"
 
 import {
   type AgentType,
@@ -140,6 +135,10 @@ function lifecycleFromProjection(
  * Resolve lifecycle from highest-priority source. Lower sources cannot
  * reopen a terminal higher source; a higher running source is not overridden
  * by a terminal lower source either.
+ *
+ * After binding/meta: **terminal** child projection wins over tool state, but
+ * a non-terminal (running) projection must not block a terminal tool outcome
+ * (anti-stale summary vs completed parent output).
  */
 function resolveLifecycleStatus(input: {
   binding: DelegationBinding | undefined
@@ -158,7 +157,8 @@ function resolveLifecycleStatus(input: {
   const fromProj = childProjection
     ? lifecycleFromProjection(childProjection)
     : null
-  if (fromProj) return fromProj
+  // Terminal summary locks lifecycle even when parent still shows ack.
+  if (fromProj === "ok" || fromProj === "err") return fromProj
 
   if (state === "output-error" || errorText) {
     if (toolOutput?.kind === "outcome") {
@@ -166,11 +166,13 @@ function resolveLifecycleStatus(input: {
     }
     return "err"
   }
-  if (toolOutput?.kind === "ack") return "running"
+  // Terminal tool outcome outranks a still-running lower summary.
   if (toolOutput?.kind === "outcome") {
     return toolOutput.isError ? "err" : "ok"
   }
+  if (toolOutput?.kind === "ack") return "running"
   if (state === "output-available") return "ok"
+  if (fromProj === "running") return "running"
   return "running"
 }
 
@@ -254,11 +256,7 @@ function pickFinishedAt(
   }
 
   if (binding) {
-    return (
-      binding.finishedAt ??
-      binding.runtimeStats.finished_at ??
-      null
-    )
+    return binding.finishedAt ?? binding.runtimeStats.finished_at ?? null
   }
   if (parsedMeta) {
     if (parsedMeta.finishedAt) return parsedMeta.finishedAt
@@ -275,11 +273,7 @@ function pickFinishedAt(
     }
     return null
   }
-  return (
-    childProjection?.finishedAt ??
-    runtimeStats?.finished_at ??
-    null
-  )
+  return childProjection?.finishedAt ?? runtimeStats?.finished_at ?? null
 }
 
 function pickCompletedDurationMs(
@@ -352,6 +346,7 @@ export function buildDelegationCardModel(input: {
     state,
     errorText,
     childAwaitingPermission,
+    childTaskStatus: childProjection?.taskStatus ?? null,
   })
 
   const runtimeStats = pickRuntimeStats(binding, parsedMeta, childProjection)
@@ -376,10 +371,7 @@ export function buildDelegationCardModel(input: {
   const completedDurationMs = pickCompletedDurationMs(binding, toolOutput)
 
   const brokerTaskId =
-    binding?.taskId ??
-    parsedMeta?.taskId ??
-    childProjection?.taskId ??
-    null
+    binding?.taskId ?? parsedMeta?.taskId ?? childProjection?.taskId ?? null
 
   const childConnectionId =
     binding?.childConnectionId ?? parsedMeta?.childConnectionId ?? null
@@ -390,9 +382,14 @@ export function buildDelegationCardModel(input: {
     childProjection?.childConversationId ??
     null
 
-  const agentType: AgentType | null = binding?.agentType ?? parsedInput.agentType
+  const agentType: AgentType | null =
+    binding?.agentType ?? parsedInput.agentType
+  // Cold recovery may only have summary error_code — fold projection last.
   const errorCode =
-    binding?.errorCode ?? parsedMeta?.errorCode ?? undefined
+    binding?.errorCode ??
+    parsedMeta?.errorCode ??
+    childProjection?.errorCode ??
+    undefined
 
   const conversationTitle = childProjection?.title ?? null
   const task = parsedInput.task

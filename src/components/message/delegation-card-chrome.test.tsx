@@ -362,9 +362,9 @@ describe("DelegationCardChrome", () => {
     expect(panel).toHaveTextContent("src/in-workspace.ts")
     expect(panel).toHaveTextContent("+3 -1")
     expect(panel).toHaveTextContent("/tmp/outside.log")
-    expect(screen.getByTestId("delegation-outside-workspace")).toHaveTextContent(
-      "Outside workspace"
-    )
+    expect(
+      screen.getByTestId("delegation-outside-workspace")
+    ).toHaveTextContent("Outside workspace")
     expect(screen.getByTestId("delegation-files-truncated")).toHaveTextContent(
       "List truncated to first 2 paths"
     )

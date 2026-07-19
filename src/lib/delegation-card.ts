@@ -689,12 +689,37 @@ export function isDelegateToAgentToolName(name: string): boolean {
 }
 
 /**
+ * Map durable child-conversation `delegation_task_status` into a card badge
+ * terminal/running signal. Null/unknown → null (no contribution).
+ */
+export function badgeFromChildTaskStatus(
+  taskStatus: "running" | "completed" | "failed" | "canceled" | null | undefined
+): "running" | "ok" | "err" | null {
+  switch (taskStatus) {
+    case "completed":
+      return "ok"
+    case "failed":
+    case "canceled":
+      return "err"
+    case "running":
+      return "running"
+    default:
+      return null
+  }
+}
+
+/**
  * Resolve the card status from the live binding / persisted meta / parsed tool
  * output, in priority order. Pure mirror of the resolution that used to live
  * inline in `DelegatedSubThread`.
  *
  *   waiting (child blocked on permission) > live binding > snapshot meta
- *   > error channel > running ack > terminal outcome > output-available > starting
+ *   > terminal child projection > error channel / terminal tool outcome
+ *   > running ack / running projection > output-available > starting
+ *
+ * Terminal child projection must win over a still-present parent **ack** so
+ * cold recovery does not show a spinning badge against a finished summary.
+ * Non-terminal projection must NOT block a terminal tool outcome.
  */
 export function resolveDelegationStatus({
   binding,
@@ -703,6 +728,7 @@ export function resolveDelegationStatus({
   state,
   errorText,
   childAwaitingPermission,
+  childTaskStatus = null,
 }: {
   binding: DelegationBinding | undefined
   parsedMeta: ParsedMeta | null
@@ -710,6 +736,11 @@ export function resolveDelegationStatus({
   state: ToolCallState | undefined
   errorText: string | null | undefined
   childAwaitingPermission: boolean
+  /**
+   * Durable child summary status when binding/meta are absent
+   * (`delegation_task_status` from the projection cache).
+   */
+  childTaskStatus?: "running" | "completed" | "failed" | "canceled" | null
 }): DelegationCardStatus {
   // A child awaiting a permission decision is blocked until the user acts;
   // surface it over the plain running state so the card cues opening "查看会话".
@@ -725,11 +756,18 @@ export function resolveDelegationStatus({
     return binding.status
   }
   if (parsedMeta) return parsedMeta.status
+
+  const fromProj = badgeFromChildTaskStatus(childTaskStatus)
+  // Terminal projection outranks ack / non-terminal tool state.
+  if (fromProj === "ok" || fromProj === "err") return fromProj
+
   if (state === "output-error" || errorText) return "err"
+  // Terminal tool outcome outranks a still-running summary projection.
+  if (toolOutput?.kind === "outcome") return toolOutput.isError ? "err" : "ok"
   // Async: the parent output is a running ack while the child runs — keep
   // "running" rather than letting output-available flip the badge to "ok".
   if (toolOutput?.kind === "ack") return "running"
-  if (toolOutput?.kind === "outcome") return toolOutput.isError ? "err" : "ok"
+  if (fromProj === "running") return "running"
   if (state === "output-available") return "ok"
   // No binding, no meta, parent tool call not yet terminal: the sub-agent
   // connection is still being set up. Flips the instant a binding, meta, or

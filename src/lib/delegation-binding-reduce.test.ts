@@ -41,7 +41,9 @@ function runningBinding(
   }
 }
 
-function mapOf(...bindings: DelegationBinding[]): Map<string, DelegationBinding> {
+function mapOf(
+  ...bindings: DelegationBinding[]
+): Map<string, DelegationBinding> {
   const m = new Map<string, DelegationBinding>()
   for (const b of bindings) m.set(b.parentToolUseId, b)
   return m
@@ -303,10 +305,7 @@ describe("applyDelegationEnvelope", () => {
     }
     const { next, acceptedCompletionToolUseId } = applyDelegationEnvelope(
       prev,
-      completed(
-        { kind: "ok", duration_ms: 1500 },
-        { runtime_stats: stats }
-      )
+      completed({ kind: "ok", duration_ms: 1500 }, { runtime_stats: stats })
     )
     expect(acceptedCompletionToolUseId).toBe("pt-1")
     expect(next.get("pt-1")).toMatchObject({
@@ -339,10 +338,7 @@ describe("applyDelegationEnvelope", () => {
     const prev = mapOf(runningBinding({ taskId: "task-1" }))
     const { next, acceptedCompletionToolUseId } = applyDelegationEnvelope(
       prev,
-      completed(
-        { kind: "ok", duration_ms: 100 },
-        { task_id: "other-task" }
-      )
+      completed({ kind: "ok", duration_ms: 100 }, { task_id: "other-task" })
     )
     expect(acceptedCompletionToolUseId).toBeNull()
     expect(next).toBe(prev)

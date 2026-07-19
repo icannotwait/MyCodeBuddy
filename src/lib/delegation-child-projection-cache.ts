@@ -65,12 +65,8 @@ function encodeKey(backend: string, id: number): CacheKey {
   return `${backend}\0${id}`
 }
 
-function isTerminalStatus(
-  status: Exclude<ChildTaskStatus, null>
-): boolean {
-  return (
-    status === "completed" || status === "failed" || status === "canceled"
-  )
+function isTerminalStatus(status: Exclude<ChildTaskStatus, null>): boolean {
+  return status === "completed" || status === "failed" || status === "canceled"
 }
 
 /** Normalize wire `delegation_task_status` to the locked card contract. */
@@ -129,8 +125,7 @@ export class DelegationChildProjectionCache {
 
   constructor(options: DelegationChildProjectionCacheOptions = {}) {
     this.fetchConversation =
-      options.fetchConversation ??
-      ((id) => getFolderConversation(id))
+      options.fetchConversation ?? ((id) => getFolderConversation(id))
     this.getBackendKey = options.getBackendKey ?? getActiveBackendCacheKey
     this.maxSoftEntries = options.maxSoftEntries ?? DEFAULT_MAX_SOFT_ENTRIES
     this.maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
@@ -395,9 +390,7 @@ export class DelegationChildProjectionCache {
     })
   }
 
-  private async fetchWithRetry(
-    id: number
-  ): Promise<DbConversationDetail> {
+  private async fetchWithRetry(id: number): Promise<DbConversationDetail> {
     try {
       return await this.fetchConversation(id)
     } catch {

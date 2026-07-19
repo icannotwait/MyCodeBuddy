@@ -239,7 +239,10 @@ describe("SubAgentOverlay", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[
-          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+          source("pt-1", {
+            agent_type: "codex",
+            task: "Investigate flaky test",
+          }),
         ]}
         overlayKey="k-expand"
         defaultExpanded

@@ -225,6 +225,51 @@ describe("resolveDelegationStatus — live binding observation", () => {
       })
     ).toBe("running")
   })
+
+  it("terminal childTaskStatus wins over parent ack (cold recovery)", () => {
+    expect(
+      resolveDelegationStatus({
+        binding: undefined,
+        parsedMeta: null,
+        toolOutput: { kind: "ack", childConversationId: 1 },
+        state: "output-available",
+        errorText: null,
+        childAwaitingPermission: false,
+        childTaskStatus: "completed",
+      })
+    ).toBe("ok")
+    expect(
+      resolveDelegationStatus({
+        binding: undefined,
+        parsedMeta: null,
+        toolOutput: { kind: "ack", childConversationId: 1 },
+        state: "output-available",
+        errorText: null,
+        childAwaitingPermission: false,
+        childTaskStatus: "failed",
+      })
+    ).toBe("err")
+  })
+
+  it("terminal tool outcome wins over running childTaskStatus", () => {
+    expect(
+      resolveDelegationStatus({
+        binding: undefined,
+        parsedMeta: null,
+        toolOutput: {
+          kind: "outcome",
+          text: "",
+          isError: false,
+          childConversationId: 1,
+          durationMs: 1000,
+        },
+        state: "output-available",
+        errorText: null,
+        childAwaitingPermission: false,
+        childTaskStatus: "running",
+      })
+    ).toBe("ok")
+  })
 })
 
 describe("parseInput — historical agent types", () => {
@@ -518,8 +563,8 @@ describe("buildEditRollupViewModel", () => {
           additions: 4,
           deletions: null,
         })
-      ).showLineTotals
-    ).toBe(false)
+      )
+    ).toMatchObject({ mode: "files", showLineTotals: false })
     expect(
       buildEditRollupViewModel(
         stats({
@@ -528,8 +573,8 @@ describe("buildEditRollupViewModel", () => {
           additions: 4,
           deletions: 1,
         })
-      ).showLineTotals
-    ).toBe(false)
+      )
+    ).toMatchObject({ mode: "files", showLineTotals: false })
   })
 
   it("falls back to editCalls when paths empty but edit_tool_call_count > 0", () => {

@@ -61,10 +61,7 @@ type EditSegmentTranslator = {
     values: { count: number }
   ): string
   (key: "editFilesTruncated", values: { count: number }): string
-  (
-    key: "lineTotals",
-    values: { additions: number; deletions: number }
-  ): string
+  (key: "lineTotals", values: { additions: number; deletions: number }): string
 }
 
 function buildEditSegment(
@@ -125,15 +122,17 @@ export function DelegationCardChrome({
     if (toolCallCount != null) {
       segments.push(tLive("toolUseCount", { count: toolCallCount }))
     }
-    const editSegment = buildEditSegment(editRollup, t)
+    // next-intl's Translator is a deep generic; narrow to the keys we call.
+    const editSegment = buildEditSegment(
+      editRollup,
+      t as unknown as EditSegmentTranslator
+    )
     if (editSegment) segments.push(editSegment)
     return segments
   }, [elapsedMs, toolCallCount, editRollup, t, tLive])
 
   const operationalLine =
-    operationalSegments.length > 0
-      ? operationalSegments.join(" | ")
-      : null
+    operationalSegments.length > 0 ? operationalSegments.join(" | ") : null
 
   const touchedFiles = runtimeStats?.touched_files ?? []
   const canExpandFiles = touchedFiles.length > 0
@@ -176,10 +175,7 @@ export function DelegationCardChrome({
           data-testid="delegation-operational"
           className="flex min-w-0 items-start gap-1.5 text-[11px] leading-snug text-muted-foreground"
         >
-          <div
-            className="min-w-0 flex-1 truncate"
-            title={operationalLine}
-          >
+          <div className="min-w-0 flex-1 truncate" title={operationalLine}>
             <span className="inline-flex max-w-full items-center gap-1">
               {elapsedMs != null && (
                 <Timer
@@ -248,9 +244,7 @@ export function DelegationCardChrome({
               onToggleFilesExpanded()
             }}
             className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[11px] font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
-            title={
-              filesExpanded ? t("hideFileDetails") : t("showFileDetails")
-            }
+            title={filesExpanded ? t("hideFileDetails") : t("showFileDetails")}
             aria-label={
               filesExpanded ? t("hideFileDetails") : t("showFileDetails")
             }
@@ -278,8 +272,9 @@ export function DelegationCardChrome({
           </div>
           <ul className="space-y-0.5">
             {touchedFiles.map((file) => {
-              const hasLineCounts =
-                file.additions != null && file.deletions != null
+              const additions = file.additions
+              const deletions = file.deletions
+              const hasLineCounts = additions != null && deletions != null
               return (
                 <li
                   key={file.path}
@@ -304,8 +299,8 @@ export function DelegationCardChrome({
                     {hasLineCounts && (
                       <span className="shrink-0 tabular-nums text-muted-foreground">
                         {t("lineTotals", {
-                          additions: file.additions,
-                          deletions: file.deletions,
+                          additions,
+                          deletions,
                         })}
                       </span>
                     )}

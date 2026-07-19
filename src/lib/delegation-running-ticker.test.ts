@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from "vitest"
 import {
   getRunningTickerVersion,
   retainRunningTicker,
@@ -6,8 +14,11 @@ import {
 } from "@/lib/delegation-running-ticker"
 
 describe("delegation-running-ticker", () => {
-  let setIntervalSpy: ReturnType<typeof vi.spyOn>
-  let clearIntervalSpy: ReturnType<typeof vi.spyOn>
+  // MockInstance without type params — setInterval/clearInterval overload
+  // signatures make ReturnType<typeof vi.spyOn> fail assignability under
+  // DOM+Node lib dual typings.
+  let setIntervalSpy: MockInstance
+  let clearIntervalSpy: MockInstance
   const releases: Array<() => void> = []
   const unsubs: Array<() => void> = []
 

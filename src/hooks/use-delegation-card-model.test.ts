@@ -358,6 +358,71 @@ describe("buildDelegationCardModel — lifecycle vs badge / ticker", () => {
 })
 
 describe("buildDelegationCardModel — synthetic / cold path", () => {
+  it("ack + terminal projection aligns badge and lifecycle (no split brain)", () => {
+    const model = build({
+      toolOutput: { kind: "ack", childConversationId: 77 },
+      childProjection: projection({
+        childConversationId: 77,
+        taskStatus: "completed",
+        isTerminal: true,
+        finishedAt: FINISHED_AT,
+        runtimeStats: LIVE_STATS,
+        attentionRequest: null,
+        errorCode: null,
+      }),
+    })
+    expect(model.lifecycleStatus).toBe("ok")
+    expect(model.status).toBe("ok")
+    expect(isTickerEligible(model)).toBe(false)
+    expect(model.runtimeStats).toEqual(LIVE_STATS)
+  })
+
+  it("terminal tool outcome beats stale running projection", () => {
+    const model = build({
+      toolOutput: {
+        kind: "outcome",
+        text: "",
+        isError: false,
+        childConversationId: 77,
+        durationMs: 45_000,
+      },
+      state: "output-available",
+      childProjection: projection({
+        childConversationId: 77,
+        taskStatus: "running",
+        isTerminal: false,
+        runtimeStats: RUNNING_SUMMARY_STATS,
+        finishedAt: null,
+      }),
+    })
+    expect(model.lifecycleStatus).toBe("ok")
+    expect(model.status).toBe("ok")
+    expect(isTickerEligible(model)).toBe(false)
+    // Running lower summary stats must not be adopted under terminal tool.
+    // pickRuntimeStats with no binding/meta still returns projection stats —
+    // that is intentional fill when higher has no stats object. Lifecycle is
+    // what locks ticker/elapsed.
+    expect(model.completedDurationMs).toBe(45_000)
+  })
+
+  it("failed projection supplies errorCode on cold recovery", () => {
+    const model = build({
+      toolOutput: { kind: "ack", childConversationId: 77 },
+      childProjection: projection({
+        childConversationId: 77,
+        taskStatus: "failed",
+        isTerminal: true,
+        errorCode: "child_failed",
+        finishedAt: FINISHED_AT,
+        runtimeStats: null,
+        attentionRequest: null,
+      }),
+    })
+    expect(model.lifecycleStatus).toBe("err")
+    expect(model.status).toBe("err")
+    expect(model.errorCode).toBe("child_failed")
+  })
+
   it("ack-only (no binding/meta) fabricates neither stats nor attention zeros", () => {
     const model = build({
       toolOutput: { kind: "ack", childConversationId: 77 },
