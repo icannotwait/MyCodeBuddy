@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  buildEditRollupViewModel,
+  computeDelegationElapsedMs,
+  formatDelegationDisplaySecondary,
   parseDelegationMeta,
   parseInput,
+  parseToolOutput,
   resolveDelegationStatus,
 } from "@/lib/delegation-card"
 import type { DelegationBinding } from "@/contexts/delegation-context"
@@ -10,6 +14,7 @@ import {
   AGENT_LABELS,
   ALL_AGENT_TYPES,
   emptyRuntimeStats,
+  type DelegationRuntimeStats,
 } from "@/lib/types"
 
 function binding(
@@ -244,5 +249,413 @@ describe("parseInput — historical agent types", () => {
       )
       expect(parsed.agentType).toBe(agentType)
     }
+  })
+})
+
+describe("formatDelegationDisplaySecondary", () => {
+  it("prefers a non-empty formatted title over task", () => {
+    expect(
+      formatDelegationDisplaySecondary("Fix the login bug", "raw task text")
+    ).toBe("Fix the login bug")
+  })
+
+  it("trims title whitespace before use", () => {
+    expect(
+      formatDelegationDisplaySecondary("  padded title  ", "task fallback")
+    ).toBe("padded title")
+  })
+
+  it("falls through whitespace-only title to task", () => {
+    expect(formatDelegationDisplaySecondary("   \t  ", "use the task")).toBe(
+      "use the task"
+    )
+  })
+
+  it("folds reference-link titles via formatConversationTitle", () => {
+    expect(
+      formatDelegationDisplaySecondary(
+        "[README.md](file:///Users/x/README.md)",
+        "ignored task"
+      )
+    ).toBe("README.md")
+  })
+
+  it("uses task when title is null/undefined/empty", () => {
+    expect(formatDelegationDisplaySecondary(null, "only task")).toBe(
+      "only task"
+    )
+    expect(formatDelegationDisplaySecondary(undefined, "only task")).toBe(
+      "only task"
+    )
+    expect(formatDelegationDisplaySecondary("", "only task")).toBe("only task")
+  })
+
+  it("returns null when title and task are both empty", () => {
+    expect(formatDelegationDisplaySecondary(null, null)).toBeNull()
+    expect(formatDelegationDisplaySecondary(undefined, undefined)).toBeNull()
+    expect(formatDelegationDisplaySecondary("", "")).toBeNull()
+    expect(formatDelegationDisplaySecondary("  ", null)).toBeNull()
+  })
+})
+
+describe("computeDelegationElapsedMs", () => {
+  const startedAt = "2026-07-19T10:00:00.000Z"
+  const finishedAt = "2026-07-19T10:00:05.000Z"
+  const startedMs = Date.parse(startedAt)
+  const finishedMs = Date.parse(finishedAt)
+
+  it("running uses now - started when started is valid", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt,
+        finishedAt: null,
+        completedDurationMs: null,
+        nowMs: startedMs + 2500,
+      })
+    ).toBe(2500)
+  })
+
+  it("running ignores finishedAt and completedDurationMs", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt,
+        finishedAt,
+        completedDurationMs: 99999,
+        nowMs: startedMs + 1000,
+      })
+    ).toBe(1000)
+  })
+
+  it("terminal prefers finished - started when both valid", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt,
+        finishedAt,
+        completedDurationMs: 99999,
+        nowMs: finishedMs + 10_000,
+      })
+    ).toBe(finishedMs - startedMs)
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "err",
+        startedAt,
+        finishedAt,
+        completedDurationMs: null,
+        nowMs: finishedMs + 10_000,
+      })
+    ).toBe(finishedMs - startedMs)
+  })
+
+  it("terminal falls back to completedDurationMs when timestamps incomplete", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt,
+        finishedAt: null,
+        completedDurationMs: 1234,
+        nowMs: startedMs + 99_000,
+      })
+    ).toBe(1234)
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt: null,
+        finishedAt,
+        completedDurationMs: 42,
+        nowMs: finishedMs,
+      })
+    ).toBe(42)
+  })
+
+  it("returns null for invalid timestamps without duration fallback", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt: "not-a-date",
+        finishedAt: null,
+        completedDurationMs: null,
+        nowMs: Date.now(),
+      })
+    ).toBeNull()
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt: "bad",
+        finishedAt: "also-bad",
+        completedDurationMs: null,
+        nowMs: Date.now(),
+      })
+    ).toBeNull()
+  })
+
+  it("returns null for negative elapsed or negative duration", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt,
+        finishedAt: null,
+        completedDurationMs: null,
+        nowMs: startedMs - 1,
+      })
+    ).toBeNull()
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt: finishedAt,
+        finishedAt: startedAt,
+        completedDurationMs: null,
+        nowMs: finishedMs,
+      })
+    ).toBeNull()
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt: null,
+        finishedAt: null,
+        completedDurationMs: -5,
+        nowMs: Date.now(),
+      })
+    ).toBeNull()
+  })
+
+  it("treats zero elapsed and zero duration as valid", () => {
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "running",
+        startedAt,
+        finishedAt: null,
+        completedDurationMs: null,
+        nowMs: startedMs,
+      })
+    ).toBe(0)
+    expect(
+      computeDelegationElapsedMs({
+        lifecycleStatus: "ok",
+        startedAt: null,
+        finishedAt: null,
+        completedDurationMs: 0,
+        nowMs: Date.now(),
+      })
+    ).toBe(0)
+  })
+})
+
+describe("buildEditRollupViewModel", () => {
+  function stats(
+    overrides: Partial<DelegationRuntimeStats> = {}
+  ): DelegationRuntimeStats {
+    return {
+      ...emptyRuntimeStats("2026-07-19T10:00:00.000Z"),
+      ...overrides,
+    }
+  }
+
+  it("returns files mode when touched_files is non-empty", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [
+            { path: "a.ts", outside_workspace: false },
+            { path: "b.ts", outside_workspace: false },
+          ],
+          touched_files_truncated: false,
+        })
+      )
+    ).toEqual({
+      mode: "files",
+      fileCount: 2,
+      fileCountTruncated: false,
+      additions: null,
+      deletions: null,
+      showLineTotals: false,
+    })
+  })
+
+  it("marks fileCountTruncated when touched_files_truncated is true", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [{ path: "a.ts", outside_workspace: false }],
+          touched_files_truncated: true,
+        })
+      )
+    ).toMatchObject({
+      mode: "files",
+      fileCount: 1,
+      fileCountTruncated: true,
+    })
+  })
+
+  it("shows line totals only when complete and both sides non-null", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [{ path: "a.ts", outside_workspace: false }],
+          line_counts_complete: true,
+          additions: 4,
+          deletions: 1,
+        })
+      )
+    ).toEqual({
+      mode: "files",
+      fileCount: 1,
+      fileCountTruncated: false,
+      additions: 4,
+      deletions: 1,
+      showLineTotals: true,
+    })
+  })
+
+  it("hides line totals when counts are partial or incomplete", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [{ path: "a.ts", outside_workspace: false }],
+          line_counts_complete: true,
+          additions: 4,
+          deletions: null,
+        })
+      ).showLineTotals
+    ).toBe(false)
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [{ path: "a.ts", outside_workspace: false }],
+          line_counts_complete: false,
+          additions: 4,
+          deletions: 1,
+        })
+      ).showLineTotals
+    ).toBe(false)
+  })
+
+  it("falls back to editCalls when paths empty but edit_tool_call_count > 0", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [],
+          edit_tool_call_count: 3,
+        })
+      )
+    ).toEqual({ mode: "editCalls", editCallCount: 3 })
+  })
+
+  it("omits when no paths and no edit calls", () => {
+    expect(
+      buildEditRollupViewModel(
+        stats({
+          touched_files: [],
+          edit_tool_call_count: 0,
+        })
+      )
+    ).toEqual({ mode: "omit" })
+  })
+
+  it("omits when stats is null", () => {
+    expect(buildEditRollupViewModel(null)).toEqual({ mode: "omit" })
+  })
+})
+
+describe("parseToolOutput — durationMs retention", () => {
+  it("retains non-negative duration_ms on completed reports", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        status: "completed",
+        text: "done",
+        child_conversation_id: 7,
+        duration_ms: 1500,
+      })
+    )
+    expect(parsed).toEqual({
+      kind: "outcome",
+      text: "done",
+      isError: false,
+      childConversationId: 7,
+      durationMs: 1500,
+    })
+  })
+
+  it("accepts zero duration_ms", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        status: "completed",
+        text: "instant",
+        duration_ms: 0,
+      })
+    )
+    expect(parsed).toMatchObject({
+      kind: "outcome",
+      durationMs: 0,
+    })
+  })
+
+  it("drops negative or non-finite duration_ms", () => {
+    expect(
+      parseToolOutput(
+        JSON.stringify({
+          status: "completed",
+          text: "x",
+          duration_ms: -1,
+        })
+      )
+    ).toMatchObject({ kind: "outcome", durationMs: null })
+    expect(
+      parseToolOutput(
+        JSON.stringify({
+          status: "completed",
+          text: "x",
+          duration_ms: Number.NaN,
+        })
+      )
+    ).toMatchObject({ kind: "outcome", durationMs: null })
+  })
+
+  it("sets durationMs null when duration_ms is absent", () => {
+    expect(
+      parseToolOutput(
+        JSON.stringify({
+          status: "completed",
+          text: "no duration",
+        })
+      )
+    ).toMatchObject({ kind: "outcome", durationMs: null })
+  })
+
+  it("preserves duration_ms through MCP structuredContent envelopes", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        content: [{ type: "text", text: "ok" }],
+        structuredContent: {
+          status: "completed",
+          text: "from structured",
+          duration_ms: 42,
+          child_conversation_id: 3,
+        },
+      })
+    )
+    expect(parsed).toEqual({
+      kind: "outcome",
+      text: "from structured",
+      isError: false,
+      childConversationId: 3,
+      durationMs: 42,
+    })
+  })
+
+  it("does not attach durationMs to running acks", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        status: "running",
+        child_conversation_id: 1,
+        duration_ms: 99,
+      })
+    )
+    expect(parsed).toEqual({
+      kind: "ack",
+      childConversationId: 1,
+    })
   })
 })

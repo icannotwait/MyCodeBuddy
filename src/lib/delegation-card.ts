@@ -11,6 +11,7 @@
  */
 
 import { extractEmbeddedJsonObject } from "@/lib/embedded-json"
+import { formatConversationTitle } from "@/lib/conversation-title"
 import {
   ALL_AGENT_TYPES,
   type AgentType,
@@ -387,6 +388,9 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
  * Returning `ack` — rather than letting the raw ack JSON fall through as an
  * "outcome" — is what stops the card from painting the ack as the result and
  * from prematurely flipping the status badge to "ok".
+ *
+ * `durationMs` is retained from non-negative wire `duration_ms` on terminal
+ * reports so cold cards can fall back when `finishedAt - startedAt` is absent.
  */
 export type ParsedToolOutput =
   | { kind: "ack"; childConversationId: number | null }
@@ -395,12 +399,22 @@ export type ParsedToolOutput =
       text: string
       isError: boolean
       childConversationId: number | null
+      durationMs: number | null
     }
 
 function readChildConversationId(obj: Record<string, unknown>): number | null {
   return typeof obj.child_conversation_id === "number"
     ? obj.child_conversation_id
     : null
+}
+
+/** Non-negative finite `duration_ms` only; invalid / negative → null. */
+function readDurationMs(obj: Record<string, unknown>): number | null {
+  const value = obj.duration_ms
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value
+  }
+  return null
 }
 
 /**
@@ -413,6 +427,7 @@ function interpretReport(
   obj: Record<string, unknown>
 ): ParsedToolOutput | null {
   const childConversationId = readChildConversationId(obj)
+  const durationMs = readDurationMs(obj)
   const status = typeof obj.status === "string" ? obj.status : null
   if (status) {
     switch (status) {
@@ -426,6 +441,7 @@ function interpretReport(
           text: typeof obj.text === "string" ? obj.text : "",
           isError: false,
           childConversationId,
+          durationMs,
         }
       case "failed":
       case "canceled": {
@@ -436,6 +452,7 @@ function interpretReport(
           text: message || code || "Delegation failed.",
           isError: true,
           childConversationId,
+          durationMs,
         }
       }
       default:
@@ -450,6 +467,7 @@ function interpretReport(
       text: typeof obj.text === "string" ? obj.text : "",
       isError: false,
       childConversationId,
+      durationMs,
     }
   }
   if (kind === "err") {
@@ -460,6 +478,7 @@ function interpretReport(
       text: message || code || "Delegation failed.",
       isError: true,
       childConversationId,
+      durationMs,
     }
   }
   return null
@@ -531,6 +550,7 @@ export function parseToolOutput(
         text: String(v),
         isError: forceError,
         childConversationId: null,
+        durationMs: null,
       }
     }
   } catch {
@@ -543,6 +563,7 @@ export function parseToolOutput(
       text: trimmed,
       isError: forceError,
       childConversationId: null,
+      durationMs: null,
     }
   }
 
@@ -588,6 +609,7 @@ export function parseToolOutput(
           text,
           isError: obj.isError === true || forceError,
           childConversationId: inner ? readChildConversationId(inner) : null,
+          durationMs: null,
         }
       }
     }
@@ -607,6 +629,7 @@ export function parseToolOutput(
     text: "```json\n" + JSON.stringify(obj, null, 2) + "\n```",
     isError: forceError,
     childConversationId: null,
+    durationMs: null,
   }
 }
 
@@ -712,4 +735,119 @@ export function resolveDelegationStatus({
   // connection is still being set up. Flips the instant a binding, meta, or
   // terminal output arrives.
   return "starting"
+}
+
+/**
+ * Title-first secondary line for delegation cards.
+ * `formatConversationTitle(title).trim()` then fall through to task; empty → null.
+ */
+export function formatDelegationDisplaySecondary(
+  title: string | null | undefined,
+  task: string | null | undefined
+): string | null {
+  const formatted = formatConversationTitle(title).trim()
+  if (formatted) return formatted
+  if (typeof task === "string" && task.length > 0) return task
+  return null
+}
+
+function parseTimestampMs(value: string | null): number | null {
+  if (value == null || value === "") return null
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
+}
+
+/**
+ * Elapsed milliseconds for the operational line. Uses **lifecycle** status
+ * (`running` | `ok` | `err`), not badge refinements (active/stalled/…).
+ *
+ * - running → `nowMs - startedAt` when started is valid
+ * - terminal → `finishedAt - startedAt` when both valid; else `completedDurationMs`
+ * - invalid / negative spans → null (never NaN)
+ */
+export function computeDelegationElapsedMs(args: {
+  lifecycleStatus: "running" | "ok" | "err"
+  startedAt: string | null
+  finishedAt: string | null
+  completedDurationMs: number | null
+  nowMs: number
+}): number | null {
+  const { lifecycleStatus, startedAt, finishedAt, completedDurationMs, nowMs } =
+    args
+
+  if (lifecycleStatus === "running") {
+    const startedMs = parseTimestampMs(startedAt)
+    if (startedMs == null) return null
+    const elapsed = nowMs - startedMs
+    return elapsed >= 0 ? elapsed : null
+  }
+
+  // Terminal (ok | err): prefer finished - started, else broker duration.
+  const startedMs = parseTimestampMs(startedAt)
+  const finishedMs = parseTimestampMs(finishedAt)
+  if (startedMs != null && finishedMs != null) {
+    const elapsed = finishedMs - startedMs
+    if (elapsed >= 0) return elapsed
+    // Negative span is invalid — fall through to completedDurationMs.
+  }
+  if (
+    typeof completedDurationMs === "number" &&
+    Number.isFinite(completedDurationMs) &&
+    completedDurationMs >= 0
+  ) {
+    return completedDurationMs
+  }
+  return null
+}
+
+/**
+ * Compact edit-rollup view model for the operational line.
+ * Paths win over edit-call counts; null stats → omit (tool count omitted separately).
+ */
+export type EditRollupViewModel =
+  | {
+      mode: "files"
+      fileCount: number
+      fileCountTruncated: boolean
+      additions: number | null
+      deletions: number | null
+      showLineTotals: boolean
+    }
+  | { mode: "editCalls"; editCallCount: number }
+  | { mode: "omit" }
+
+export function buildEditRollupViewModel(
+  stats: DelegationRuntimeStats | null
+): EditRollupViewModel {
+  if (!stats) return { mode: "omit" }
+
+  if (stats.touched_files.length > 0) {
+    const additions =
+      stats.additions === undefined || stats.additions === null
+        ? null
+        : stats.additions
+    const deletions =
+      stats.deletions === undefined || stats.deletions === null
+        ? null
+        : stats.deletions
+    const showLineTotals =
+      stats.line_counts_complete && additions != null && deletions != null
+    return {
+      mode: "files",
+      fileCount: stats.touched_files.length,
+      fileCountTruncated: stats.touched_files_truncated,
+      additions,
+      deletions,
+      showLineTotals,
+    }
+  }
+
+  if (stats.edit_tool_call_count > 0) {
+    return {
+      mode: "editCalls",
+      editCallCount: stats.edit_tool_call_count,
+    }
+  }
+
+  return { mode: "omit" }
 }
