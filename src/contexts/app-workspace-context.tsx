@@ -3,6 +3,7 @@
 import { useEffect, type ReactNode } from "react"
 import { getGitHead } from "@/lib/api"
 import { selectAcpAgentsFresh, useAcpAgents } from "@/hooks/use-acp-agents"
+import { delegationChildProjectionCache } from "@/lib/delegation-child-projection-cache"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { referenceSearchCache } from "@/lib/reference-search-cache"
 import { getActiveBackendCacheKey } from "@/lib/transport"
@@ -80,6 +81,9 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
               change.patch.status
             )
           }
+          // Cold child projection for delegation cards (title + summary fields).
+          // Only AppWorkspaceProvider installs this listener — see plan Task 5.
+          delegationChildProjectionCache.applyConversationChange(change)
         }
       )
       if (disposed) dispose()
@@ -91,6 +95,8 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     // null on desktop IPC (no disconnect window) → no-op there.
     const offReconnect = onTransportReconnect(() => {
       void useAppWorkspaceStore.getState().refreshConversations()
+      // Refetch interest-held child projections dropped while the WS was down.
+      delegationChildProjectionCache.refetchTracked()
     })
 
     return () => {
