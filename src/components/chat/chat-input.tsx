@@ -174,7 +174,10 @@ export const ChatInput = memo(function ChatInput({
         defaultPath={defaultPath}
         folderId={folderId}
         disabled={sendDisabled}
-        isPrompting={isPrompting}
+        // Waiting is not ordinary turn-busy: suppress isPrompting so MessageInput
+        // does not take the disabled+prompting enqueue bypass. Stop still comes
+        // from showCancel (isPrompting || isWaitingForSubagents).
+        isPrompting={isPrompting && !isWaitingForSubagents}
         showCancel={showCancel}
         onCancel={onCancel}
         modes={modes}

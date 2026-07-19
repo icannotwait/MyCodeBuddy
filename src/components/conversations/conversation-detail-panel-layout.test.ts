@@ -261,10 +261,30 @@ describe("ConversationDetailPanel continuation waiting / draft-safe wiring", () 
     expect(flushStart).toBeGreaterThan(-1)
     expect(flushEnd).toBeGreaterThan(flushStart)
     const flushBlock = source.slice(flushStart, flushEnd)
-    expect(flushBlock).toMatch(/waitingForSubagents/)
     expect(flushBlock).toContain("setTimeout")
     // Dependency array includes waiting projection.
     expect(flushBlock).toMatch(/conn\.waitingForSubagents/)
+
+    // Pin the *in-timer* runtime guard specifically. Pre-schedule alone must not
+    // satisfy this: removing only `if (waitingForSubagentsRef.current) return`
+    // inside setTimeout must fail the test.
+    const beforeTimer = flushBlock.slice(0, flushBlock.indexOf("setTimeout"))
+    expect(beforeTimer).toMatch(/if \(conn\.waitingForSubagents\) return/)
+    const timerMatch = flushBlock.match(
+      /setTimeout\(\s*\(\)\s*=>\s*\{([\s\S]*?)\n    \}, wait\)/
+    )
+    expect(timerMatch).not.toBeNull()
+    const timerBody = timerMatch![1]
+    expect(timerBody).toMatch(
+      /if\s*\(\s*waitingForSubagentsRef\.current\s*\)\s*return/
+    )
+    // Guard must run before dequeue/auto-send of the queue head.
+    const refGuard = timerBody.search(
+      /if\s*\(\s*waitingForSubagentsRef\.current\s*\)\s*return/
+    )
+    const autoSend = timerBody.indexOf("autoSendQueueRef")
+    expect(refGuard).toBeGreaterThan(-1)
+    expect(autoSend).toBeGreaterThan(refGuard)
   })
 
   it("handleSend returns early when snapshot already says waiting", () => {
@@ -303,9 +323,9 @@ describe("ConversationDetailPanel continuation waiting / draft-safe wiring", () 
     expect(source).toMatch(
       /continuation_failure[\s\S]{0,800}(code|finished_at)[\s\S]{0,200}(finished_at|code)/
     )
-    // Uses localized mapping, not raw failure text.
+    // Toast must use the shared failure-code mapping (not raw DB text / free t()).
     expect(source).toMatch(
-      /toast\.error\([\s\S]{0,120}continuationFailureI18nKey|tAcp\(|t\(/
+      /toast\.error\(\s*tAcpConnections\(\s*continuationFailureI18nKey\(\s*failure\.code\s*\)\s*\)\s*\)/
     )
   })
 

@@ -628,7 +628,7 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
     })
 
     await waitFor(() =>
-      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+      expect(composerHandle.current?.getEditor()).toBeTruthy()
     )
 
     const cancelTitle = enMessages.Folder.chat.messageInput.cancel
@@ -641,11 +641,21 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
     const textbox = container.querySelector('[role="textbox"]') as HTMLElement
     expect(textbox.getAttribute("contenteditable")).toBe("true")
 
-    // isPrompting is false → Enter does not enqueue.
-    composerHandle.current?.setText("would enqueue if prompting")
-    await act(async () => {
-      // No programmatic submit of enqueue path — assert no enqueue button mode.
+    // Real submit: isPrompting false + disabled → neither enqueue nor send.
+    act(() => {
+      composerHandle.current?.setText("would enqueue if prompting")
+    })
+    const dom = composerHandle.current?.getEditor()?.view.dom as HTMLElement
+    act(() => {
+      dom.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "Enter",
+        })
+      )
     })
     expect(onEnqueue).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
   })
 })
