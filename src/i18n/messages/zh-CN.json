@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent}（不可用）",
     "autoTitleSaveFailed": "保存自动标题智能体失败：{message}",
     "autoTitleLoading": "正在加载自动标题设置...",
+    "translateProviderDisclosure": "自动标题智能体也用于文档翻译。文档正文会发送到该智能体/提供商；Codeg 会从自身列表中隐藏内部会话，但不会删除智能体 CLI 的存储。",
     "referenceSearchLimit": "引用结果上限",
     "referenceSearchLimitHint": "每个资源来源最多缓存和搜索的结果数（10-500）。",
     "referenceSearchLimitSave": "保存引用上限",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "翻译超时。",
       "translateFailed": "翻译失败。",
       "translatePlaceholderIntegrityFailed": "翻译失败：无法安全保留代码块。",
-      "translationTabTitle": "{name}（{locale}）"
+      "translateSavePathRejected": "不允许该保存路径。请使用文件夹下的相对路径，且不要包含 “..”。",
+      "translateSaveAlreadyExists": "该路径已存在文件。请选择其他名称。",
+      "saveTranslationAs": "另存为…",
+      "translationTabTitle": "{name}（{locale}）",
+      "translateProviderDisclosure": "自动标题智能体也用于文档翻译。文档正文会发送到该智能体/提供商；Codeg 会从自身列表中隐藏内部会话，但不会删除智能体 CLI 的存储。"
     },
     "terminal": {
       "rename": "重命名",

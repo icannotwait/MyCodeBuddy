@@ -1208,6 +1208,7 @@ mod tauri_app {
                 crate::commands::conversation_experience::set_auto_title_agent,
                 crate::commands::conversation_experience::set_reference_search_limit,
                 crate::commands::document_translate::translate_document,
+                crate::commands::document_translate::save_translation_as,
                 crate::commands::reference_search::start_reference_search,
                 crate::commands::reference_search::next_reference_search_page,
                 crate::commands::reference_search::cancel_reference_search,

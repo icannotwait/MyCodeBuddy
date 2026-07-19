@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent} (Nicht verfügbar)",
     "autoTitleSaveFailed": "Agent für automatische Titel konnte nicht gespeichert werden: {message}",
     "autoTitleLoading": "Einstellungen für automatische Titel werden geladen...",
+    "translateProviderDisclosure": "Der Agent für automatische Titel wird auch für die Dokumentübersetzung verwendet. Dokumenttext wird an diesen Agenten/Anbieter gesendet; Codeg blendet interne Sitzungen in den eigenen Listen aus, löscht aber nicht den Speicher des Agent-CLI.",
     "referenceSearchLimit": "Limit für Referenzergebnisse",
     "referenceSearchLimitHint": "Maximale Anzahl zwischengespeicherter und durchsuchter Ergebnisse pro Ressourcenquelle (10-500).",
     "referenceSearchLimitSave": "Referenzlimit speichern",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "Zeitüberschreitung bei der Übersetzung.",
       "translateFailed": "Übersetzung fehlgeschlagen.",
       "translatePlaceholderIntegrityFailed": "Übersetzung fehlgeschlagen: Codeblöcke konnten nicht sicher erhalten werden.",
-      "translationTabTitle": "{name} ({locale})"
+      "translateSavePathRejected": "Dieser Speicherpfad ist nicht erlaubt. Verwenden Sie einen relativen Pfad im Ordner ohne „..“.",
+      "translateSaveAlreadyExists": "Unter diesem Pfad existiert bereits eine Datei. Wählen Sie einen anderen Namen.",
+      "saveTranslationAs": "Speichern unter…",
+      "translationTabTitle": "{name} ({locale})",
+      "translateProviderDisclosure": "Der Agent für automatische Titel wird auch für die Dokumentübersetzung verwendet. Dokumenttext wird an diesen Agenten/Anbieter gesendet; Codeg blendet interne Sitzungen in den eigenen Listen aus, löscht aber nicht den Speicher des Agent-CLI."
     },
     "terminal": {
       "rename": "Umbenennen",

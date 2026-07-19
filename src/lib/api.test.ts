@@ -14,6 +14,7 @@ import {
   cancelReferenceSearch,
   matchReferenceRegex,
   nextReferenceSearchPage,
+  saveTranslationAs,
   startReferenceSearch,
   translateDocument,
   validateReferenceCandidate,
@@ -72,6 +73,29 @@ describe("translateDocument transport payload", () => {
       params,
       { timeoutMs: 195_000 }
     )
+  })
+})
+
+describe("saveTranslationAs transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({
+      absolutePath: "/ws/README.zh_cn.md",
+    })
+  })
+
+  it("sends flat folderId relativePath content payload", async () => {
+    const params = {
+      folderId: 7,
+      relativePath: "README.zh_cn.md",
+      content: "你好",
+    }
+    const result = await saveTranslationAs(params)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "save_translation_as",
+      params
+    )
+    expect(result.absolutePath).toBe("/ws/README.zh_cn.md")
   })
 })
 

@@ -12,12 +12,14 @@ import {
   Loader2,
   Maximize2,
   Minimize2,
+  Save,
   X,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { openPath } from "@/lib/platform"
 import { isHtmlPreviewable } from "@/lib/language-detect"
+import { useActiveFolder } from "@/contexts/active-folder-context"
 import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
@@ -37,7 +39,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
-import { translateDocument } from "@/lib/api"
+import { saveTranslationAs, translateDocument } from "@/lib/api"
 import {
   formatFromTranslatablePath,
   hashDocumentContent,
@@ -106,7 +108,9 @@ export function FileWorkspaceTabBar() {
     toggleFilesMaximized,
     beginTranslateRequest,
     openTranslationResultTab,
+    openFilePreview,
   } = useWorkspaceActions()
+  const { activeFolder } = useActiveFolder()
   const autoTitleAgent = useConversationExperienceStore(
     (s) => s.settings?.auto_title_agent ?? null
   )
@@ -121,6 +125,8 @@ export function FileWorkspaceTabBar() {
   // In-flight translate guard (button busy + double-click).
   const [translateBusy, setTranslateBusy] = useState(false)
   const translateBusyRef = useRef(false)
+  const [saveAsBusy, setSaveAsBusy] = useState(false)
+  const saveAsBusyRef = useRef(false)
 
   const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
     if (e.deltaY !== 0 && scrollRef.current) {
@@ -211,6 +217,10 @@ export function FileWorkspaceTabBar() {
       ? previewFileTabIds.has(activeFileTabId)
       : false
   const canTranslate = activeTab != null && isTranslationEligible(activeTab)
+  const canSaveTranslation =
+    activeTab != null &&
+    activeTab.kind === "file" &&
+    activeTab.transient?.type === "translation"
 
   const handleTranslate = useCallback(async () => {
     if (!activeTab || !isTranslationEligible(activeTab)) return
@@ -269,6 +279,57 @@ export function FileWorkspaceTabBar() {
     t,
     tRoot,
   ])
+
+  const handleSaveTranslationAs = useCallback(async () => {
+    if (!activeTab || activeTab.transient?.type !== "translation") return
+    if (saveAsBusyRef.current) return
+    if (activeFolder?.id == null) {
+      toast.error(t("translateSavePathRejected"))
+      return
+    }
+
+    const suggested =
+      activeTab.transient.suggestedName || activeTab.title || "translation.md"
+    const entered =
+      typeof window !== "undefined"
+        ? window.prompt(t("saveTranslationAs"), suggested)
+        : null
+    if (entered == null) return
+    const relativePath = entered.trim()
+    if (!relativePath) {
+      toast.error(t("translateSavePathRejected"))
+      return
+    }
+
+    const transientTabId = activeTab.id
+    const content = activeTab.content
+
+    saveAsBusyRef.current = true
+    setSaveAsBusy(true)
+    try {
+      const saved = await saveTranslationAs({
+        folderId: activeFolder.id,
+        relativePath,
+        content,
+      })
+      const settle = await openFilePreview(saved.absolutePath, {
+        maximizeOnSuccess: false,
+      })
+      // Close the transient tab only after the real path loaded successfully.
+      if (settle.ok) {
+        closeFileTab(transientTabId)
+      }
+    } catch (error) {
+      const appError = extractAppCommandError(error)
+      const message = appError?.i18n_key
+        ? toLocalizedErrorMessage(error, tRoot as unknown as AppErrorTranslator)
+        : t("translateFailed")
+      toast.error(message)
+    } finally {
+      saveAsBusyRef.current = false
+      setSaveAsBusy(false)
+    }
+  }, [activeFolder?.id, activeTab, closeFileTab, openFilePreview, t, tRoot])
 
   if (fileTabs.length === 0) {
     return (
@@ -380,6 +441,29 @@ export function FileWorkspaceTabBar() {
             <Loader2 className="h-4 w-4 animate-spin" />
           ) : (
             <Languages className="h-4 w-4" />
+          )}
+        </button>
+      )}
+      {canSaveTranslation && (
+        <button
+          type="button"
+          onClick={() => {
+            void handleSaveTranslationAs()
+          }}
+          disabled={saveAsBusy}
+          className={cn(
+            "shrink-0 flex items-center justify-center w-10 border-b border-border hover:bg-primary/8 transition-colors",
+            "disabled:opacity-50 disabled:pointer-events-none"
+          )}
+          aria-label={t("saveTranslationAs")}
+          title={t("saveTranslationAs")}
+          aria-busy={saveAsBusy}
+          data-testid="save-translation-as"
+        >
+          {saveAsBusy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Save className="h-4 w-4" />
           )}
         </button>
       )}

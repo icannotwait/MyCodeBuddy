@@ -25,6 +25,8 @@ pub const I18N_BUSY: &str = "Folder.fileWorkspace.translateBusy";
 pub const I18N_TIMEOUT: &str = "Folder.fileWorkspace.translateTimeout";
 pub const I18N_PLACEHOLDER: &str = "Folder.fileWorkspace.translatePlaceholderIntegrityFailed";
 pub const I18N_FAILED: &str = "Folder.fileWorkspace.translateFailed";
+pub const I18N_SAVE_PATH_REJECTED: &str = "Folder.fileWorkspace.translateSavePathRejected";
+pub const I18N_SAVE_ALREADY_EXISTS: &str = "Folder.fileWorkspace.translateSaveAlreadyExists";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,25 @@ pub struct TranslateDocumentResult {
     pub translated_content: String,
     pub locale: String,
     pub format: DocumentTranslateFormat,
+}
+
+/// Request body / IPC payload for `save_translation_as`.
+///
+/// Tauri commands accept the same fields as **flat** camelCase args
+/// (`folderId`, `relativePath`, `content`) matching `api.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTranslationAsParams {
+    pub folder_id: i32,
+    /// Relative path under the folder root (no absolute, no `..`).
+    pub relative_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTranslationAsResult {
+    pub absolute_path: String,
 }
 
 /// Domain outcome of a document translation attempt.
@@ -316,5 +337,36 @@ mod tests {
         let err = DocumentTranslateError::AgentNotConfigured.into_app_command_error();
         assert_eq!(err.code, AppErrorCode::ConfigurationMissing);
         assert_eq!(err.i18n_key.as_deref(), Some(I18N_AGENT_NOT_CONFIGURED));
+    }
+
+    #[test]
+    fn save_translation_as_params_result_serde_camel_case() {
+        let params = SaveTranslationAsParams {
+            folder_id: 7,
+            relative_path: "docs/README.zh_cn.md".into(),
+            content: "你好".into(),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["folderId"], 7);
+        assert_eq!(v["relativePath"], "docs/README.zh_cn.md");
+        assert_eq!(v["content"], "你好");
+        assert!(v.get("folder_id").is_none());
+        assert!(v.get("params").is_none());
+
+        let from_flat: SaveTranslationAsParams = serde_json::from_value(serde_json::json!({
+            "folderId": 3,
+            "relativePath": "a.md",
+            "content": "x",
+        }))
+        .unwrap();
+        assert_eq!(from_flat.folder_id, 3);
+        assert_eq!(from_flat.relative_path, "a.md");
+
+        let result = SaveTranslationAsResult {
+            absolute_path: "/tmp/ws/a.md".into(),
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["absolutePath"], "/tmp/ws/a.md");
+        assert!(v.get("absolute_path").is_none());
     }
 }

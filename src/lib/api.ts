@@ -3445,6 +3445,19 @@ export async function translateDocument(params: {
   })
 }
 
+export interface SaveTranslationAsResult {
+  absolutePath: string
+}
+
+/** Exclusive create of a translation result under a workspace folder. */
+export async function saveTranslationAs(params: {
+  folderId: number
+  relativePath: string
+  content: string
+}): Promise<SaveTranslationAsResult> {
+  return getTransport().call("save_translation_as", params)
+}
+
 // ─── Incremental reference search ───────────────────────────────────────────
 // Flat protocol payloads (no nested `request`). Start/page use 35s so the
 // backend's 30s page deadline remains authoritative.

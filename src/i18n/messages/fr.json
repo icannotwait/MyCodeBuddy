@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent} (Indisponible)",
     "autoTitleSaveFailed": "Impossible d'enregistrer l'agent de titre automatique : {message}",
     "autoTitleLoading": "Chargement des paramètres de titre automatique...",
+    "translateProviderDisclosure": "L’agent de titres automatiques est aussi utilisé pour la traduction de documents. Le texte est envoyé à cet agent/fournisseur ; Codeg masque les sessions internes dans ses propres listes, mais ne supprime pas le stockage du CLI de l’agent.",
     "referenceSearchLimit": "Limite de résultats de référence",
     "referenceSearchLimitHint": "Nombre maximal de résultats mis en cache et recherchés par source de ressources (10-500).",
     "referenceSearchLimitSave": "Enregistrer la limite de références",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "La traduction a expiré.",
       "translateFailed": "Échec de la traduction.",
       "translatePlaceholderIntegrityFailed": "Échec de la traduction : les blocs de code n’ont pas pu être conservés en toute sécurité.",
-      "translationTabTitle": "{name} ({locale})"
+      "translateSavePathRejected": "Ce chemin d’enregistrement n’est pas autorisé. Utilisez un chemin relatif dans le dossier sans « .. ».",
+      "translateSaveAlreadyExists": "Un fichier existe déjà à ce chemin. Choisissez un autre nom.",
+      "saveTranslationAs": "Enregistrer sous…",
+      "translationTabTitle": "{name} ({locale})",
+      "translateProviderDisclosure": "L’agent de titres automatiques est aussi utilisé pour la traduction de documents. Le texte est envoyé à cet agent/fournisseur ; Codeg masque les sessions internes dans ses propres listes, mais ne supprime pas le stockage du CLI de l’agent."
     },
     "terminal": {
       "rename": "Renommer",

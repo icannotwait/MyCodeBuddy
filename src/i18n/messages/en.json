@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent} (Unavailable)",
     "autoTitleSaveFailed": "Failed to save automatic title agent: {message}",
     "autoTitleLoading": "Loading automatic title settings...",
+    "translateProviderDisclosure": "The automatic title agent is also used for document translation. Document text is sent to that agent/provider; Codeg hides internal sessions from its own lists but does not delete the agent CLI’s storage.",
     "referenceSearchLimit": "Reference result limit",
     "referenceSearchLimitHint": "Maximum cached and searched results per resource source (10-500).",
     "referenceSearchLimitSave": "Save reference limit",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "Translation timed out.",
       "translateFailed": "Translation failed.",
       "translatePlaceholderIntegrityFailed": "Translation failed: code blocks could not be preserved safely.",
-      "translationTabTitle": "{name} ({locale})"
+      "translateSavePathRejected": "That save path is not allowed. Use a relative path under the folder without “..”.",
+      "translateSaveAlreadyExists": "A file already exists at that path. Choose a different name.",
+      "saveTranslationAs": "Save as…",
+      "translationTabTitle": "{name} ({locale})",
+      "translateProviderDisclosure": "The automatic title agent is also used for document translation. Document text is sent to that agent/provider; Codeg hides internal sessions from its own lists but does not delete the agent CLI’s storage."
     },
     "terminal": {
       "rename": "Rename",

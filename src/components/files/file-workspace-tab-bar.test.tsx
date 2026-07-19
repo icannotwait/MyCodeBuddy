@@ -12,6 +12,10 @@ const toggleFileTabPreview = vi.fn()
 const toggleFilesMaximized = vi.fn()
 const beginTranslateRequest = vi.fn(() => 1)
 const openTranslationResultTab = vi.fn(() => "translate:file-1:zh_cn:1")
+const openFilePreview = vi.fn(
+  async () =>
+    ({ ok: true as const, tabId: "file:/ws/README.zh_cn.md" }) as const
+)
 
 const viewState = {
   mode: "fusion" as string,
@@ -25,6 +29,10 @@ const tabsState = {
   previewFileTabIds: new Set<string>(),
 }
 
+const activeFolderState = vi.hoisted(() => ({
+  id: 7 as number | null,
+}))
+
 const experienceState = vi.hoisted(() => ({
   autoTitleAgent: "codex" as string | null,
 }))
@@ -34,6 +42,12 @@ const translateDocument = vi.hoisted(() =>
     translatedContent: "你好",
     locale: "zh_cn",
     format: "markdown" as const,
+  }))
+)
+
+const saveTranslationAs = vi.hoisted(() =>
+  vi.fn(async () => ({
+    absolutePath: "/ws/README.zh_cn.md",
   }))
 )
 
@@ -58,6 +72,7 @@ vi.mock("@/lib/platform", () => ({
 
 vi.mock("@/lib/api", () => ({
   translateDocument: (...args: unknown[]) => translateDocument(...args),
+  saveTranslationAs: (...args: unknown[]) => saveTranslationAs(...args),
 }))
 
 vi.mock("@/stores/conversation-experience-store", () => ({
@@ -69,6 +84,16 @@ vi.mock("@/stores/conversation-experience-store", () => ({
     selector({
       settings: { auto_title_agent: experienceState.autoTitleAgent },
     }),
+}))
+
+vi.mock("@/contexts/active-folder-context", () => ({
+  useActiveFolder: () => ({
+    activeFolderId: activeFolderState.id,
+    activeFolder:
+      activeFolderState.id != null
+        ? { id: activeFolderState.id, path: "/ws", name: "ws" }
+        : null,
+  }),
 }))
 
 vi.mock("@/hooks/use-is-coarse-pointer", () => ({
@@ -107,6 +132,7 @@ vi.mock("@/contexts/workspace-context", () => ({
     toggleFilesMaximized,
     beginTranslateRequest,
     openTranslationResultTab,
+    openFilePreview,
   }),
 }))
 
@@ -494,5 +520,104 @@ describe("FileWorkspaceTabBar Translate", () => {
         format: "markdown",
       })
     })
+  })
+})
+
+describe("FileWorkspaceTabBar Save as translation", () => {
+  const translationTab = (): FileWorkspaceTab =>
+    ({
+      id: "translate:file-1:zh_cn:1",
+      kind: "file",
+      title: "README.zh_cn.md",
+      path: null,
+      folderId: null,
+      content: "你好世界",
+      language: "markdown",
+      loading: false,
+      isDirty: false,
+      saveState: "idle",
+      saveError: null,
+      readonly: true,
+      stale: false,
+      hasLoadedSuccessfully: true,
+      transient: {
+        type: "translation",
+        sourceTabId: "file-1",
+        sourcePath: "/proj/README.md",
+        sourceContentHash: "abc",
+        locale: "zh_cn",
+        format: "markdown",
+        suggestedName: "README.zh_cn.md",
+      },
+    }) as FileWorkspaceTab
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    openFilePreview.mockResolvedValue({
+      ok: true,
+      tabId: "file:/ws/README.zh_cn.md",
+    })
+    saveTranslationAs.mockResolvedValue({
+      absolutePath: "/ws/README.zh_cn.md",
+    })
+    activeFolderState.id = 7
+    viewState.mode = "fusion"
+    viewState.activePane = "files"
+    viewState.filesMaximized = false
+    tabsState.fileTabs = [translationTab()]
+    tabsState.activeFileTabId = "translate:file-1:zh_cn:1"
+    tabsState.previewFileTabIds = new Set()
+    vi.spyOn(window, "prompt").mockReturnValue("README.zh_cn.md")
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it("shows Save as for transient translation tabs", () => {
+    render(<FileWorkspaceTabBar />)
+    expect(screen.getByTestId("save-translation-as")).toBeTruthy()
+    expect(screen.queryByTestId("translate-document")).toBeNull()
+  })
+
+  it("saves with folderId + suggested path, opens preview, closes transient on ok", async () => {
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("save-translation-as").click()
+    })
+    expect(saveTranslationAs).toHaveBeenCalledWith({
+      folderId: 7,
+      relativePath: "README.zh_cn.md",
+      content: "你好世界",
+    })
+    expect(openFilePreview).toHaveBeenCalledWith("/ws/README.zh_cn.md", {
+      maximizeOnSuccess: false,
+    })
+    expect(closeFileTab).toHaveBeenCalledWith("translate:file-1:zh_cn:1")
+  })
+
+  it("does not close the transient tab when open settle is not ok", async () => {
+    openFilePreview.mockResolvedValueOnce({
+      ok: false,
+      reason: "load",
+    })
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("save-translation-as").click()
+    })
+    expect(saveTranslationAs).toHaveBeenCalled()
+    expect(openFilePreview).toHaveBeenCalled()
+    expect(closeFileTab).not.toHaveBeenCalled()
+  })
+
+  it("cancels when the user dismisses the prompt", async () => {
+    vi.spyOn(window, "prompt").mockReturnValueOnce(null)
+    render(<FileWorkspaceTabBar />)
+    await act(async () => {
+      screen.getByTestId("save-translation-as").click()
+    })
+    expect(saveTranslationAs).not.toHaveBeenCalled()
+    expect(openFilePreview).not.toHaveBeenCalled()
   })
 })

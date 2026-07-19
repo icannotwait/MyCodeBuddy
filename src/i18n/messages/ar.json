@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent} (غير متاح)",
     "autoTitleSaveFailed": "تعذر حفظ وكيل العنوان التلقائي: {message}",
     "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي...",
+    "translateProviderDisclosure": "يُستخدم وكيل العنوان التلقائي أيضًا لترجمة المستندات. يُرسل نص المستند إلى ذلك الوكيل/المزوّد؛ يخفي Codeg الجلسات الداخلية من قوائمه لكنه لا يحذف تخزين واجهة سطر أوامر الوكيل.",
     "referenceSearchLimit": "حد نتائج المراجع",
     "referenceSearchLimitHint": "الحد الأقصى للنتائج المخزنة مؤقتًا والتي يجري البحث عنها لكل مصدر موارد (10-500).",
     "referenceSearchLimitSave": "حفظ حد المراجع",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "انتهت مهلة الترجمة.",
       "translateFailed": "فشلت الترجمة.",
       "translatePlaceholderIntegrityFailed": "فشلت الترجمة: تعذر الحفاظ على كتل التعليمات البرمجية بأمان.",
-      "translationTabTitle": "{name} ({locale})"
+      "translateSavePathRejected": "مسار الحفظ هذا غير مسموح. استخدم مسارًا نسبيًا داخل المجلد دون «..».",
+      "translateSaveAlreadyExists": "يوجد ملف بالفعل في هذا المسار. اختر اسمًا آخر.",
+      "saveTranslationAs": "حفظ باسم…",
+      "translationTabTitle": "{name} ({locale})",
+      "translateProviderDisclosure": "يُستخدم وكيل العنوان التلقائي أيضًا لترجمة المستندات. يُرسل نص المستند إلى ذلك الوكيل/المزوّد؛ يخفي Codeg الجلسات الداخلية من قوائمه لكنه لا يحذف تخزين واجهة سطر أوامر الوكيل."
     },
     "terminal": {
       "rename": "إعادة تسمية",

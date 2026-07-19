@@ -110,6 +110,10 @@ pub fn build_router(
             post(handlers::document_translate::translate_document),
         )
         .route(
+            "/save_translation_as",
+            post(handlers::document_translate::save_translation_as),
+        )
+        .route(
             "/start_reference_search",
             post(handlers::reference_search::start_reference_search),
         )

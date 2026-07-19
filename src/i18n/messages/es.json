@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent} (No disponible)",
     "autoTitleSaveFailed": "No se pudo guardar el agente de títulos automáticos: {message}",
     "autoTitleLoading": "Cargando la configuración de títulos automáticos...",
+    "translateProviderDisclosure": "El agente de títulos automáticos también se usa para la traducción de documentos. El texto se envía a ese agente/proveedor; Codeg oculta las sesiones internas en sus propias listas, pero no elimina el almacenamiento del CLI del agente.",
     "referenceSearchLimit": "Límite de resultados de referencia",
     "referenceSearchLimitHint": "Máximo de resultados en caché y buscados por cada fuente de recursos (10-500).",
     "referenceSearchLimitSave": "Guardar límite de referencias",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "La traducción agotó el tiempo de espera.",
       "translateFailed": "La traducción falló.",
       "translatePlaceholderIntegrityFailed": "La traducción falló: no se pudieron conservar los bloques de código de forma segura.",
-      "translationTabTitle": "{name} ({locale})"
+      "translateSavePathRejected": "Esa ruta de guardado no está permitida. Use una ruta relativa dentro de la carpeta sin “..”.",
+      "translateSaveAlreadyExists": "Ya existe un archivo en esa ruta. Elija otro nombre.",
+      "saveTranslationAs": "Guardar como…",
+      "translationTabTitle": "{name} ({locale})",
+      "translateProviderDisclosure": "El agente de títulos automáticos también se usa para la traducción de documentos. El texto se envía a ese agente/proveedor; Codeg oculta las sesiones internas en sus propias listas, pero no elimina el almacenamiento del CLI del agente."
     },
     "terminal": {
       "rename": "Renombrar",

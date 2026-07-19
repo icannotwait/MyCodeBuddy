@@ -1104,6 +1104,7 @@
     "autoTitleUnavailable": "{agent}（利用不可）",
     "autoTitleSaveFailed": "自動タイトルエージェントを保存できませんでした: {message}",
     "autoTitleLoading": "自動タイトル設定を読み込んでいます...",
+    "translateProviderDisclosure": "自動タイトルエージェントはドキュメント翻訳にも使用されます。文書本文はそのエージェント/プロバイダに送信されます。Codeg は内部セッションを自身の一覧から非表示にしますが、エージェント CLI の保存データは削除しません。",
     "referenceSearchLimit": "参照結果の上限",
     "referenceSearchLimitHint": "リソースソースごとにキャッシュおよび検索する結果の最大数（10～500）。",
     "referenceSearchLimitSave": "参照上限を保存",
@@ -1473,7 +1474,11 @@
       "translateTimeout": "翻訳がタイムアウトしました。",
       "translateFailed": "翻訳に失敗しました。",
       "translatePlaceholderIntegrityFailed": "翻訳に失敗しました：コードブロックを安全に保持できませんでした。",
-      "translationTabTitle": "{name}（{locale}）"
+      "translateSavePathRejected": "この保存パスは許可されていません。フォルダ内の相対パスを使い、「..」を含めないでください。",
+      "translateSaveAlreadyExists": "そのパスには既にファイルがあります。別の名前を選んでください。",
+      "saveTranslationAs": "名前を付けて保存…",
+      "translationTabTitle": "{name}（{locale}）",
+      "translateProviderDisclosure": "自動タイトルエージェントはドキュメント翻訳にも使用されます。文書本文はそのエージェント/プロバイダに送信されます。Codeg は内部セッションを自身の一覧から非表示にしますが、エージェント CLI の保存データは削除しません。"
     },
     "terminal": {
       "rename": "名前を変更",
