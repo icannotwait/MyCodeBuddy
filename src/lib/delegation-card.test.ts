@@ -22,6 +22,9 @@ function binding(
     childConversationId: 99,
     agentType: "codex",
     status: "running",
+    taskId: "task-1",
+    startedAt: "2026-07-19T00:00:00.000Z",
+    runtimeStats: emptyRuntimeStats("2026-07-19T00:00:00.000Z"),
     observation: "active",
     ...overrides,
   }

@@ -72,6 +72,16 @@ function bindingOf(overrides: Partial<DelegationBinding>): DelegationBinding {
     childConversationId: 99,
     agentType: "codex",
     status: "running",
+    taskId: "task-1",
+    startedAt: "2026-07-19T00:00:00.000Z",
+    runtimeStats: {
+      started_at: "2026-07-19T00:00:00.000Z",
+      tool_call_count: 0,
+      edit_tool_call_count: 0,
+      touched_files: [],
+      touched_files_truncated: false,
+      line_counts_complete: false,
+    },
     ...overrides,
   }
 }

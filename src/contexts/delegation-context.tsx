@@ -13,6 +13,10 @@
  * filters the two delegation variants and exposes a tool-use-id-keyed lookup
  * so ToolCallBlock can resolve the binding by the field it already has in hand.
  *
+ * Map transitions are pure (`applyDelegationEnvelope`). Attach / detach grace
+ * timers are the only side effects here — detach runs only when a completion
+ * is accepted (matching `task_id` or synthesized when no binding exists).
+ *
  * Scope intentionally minimal for Phase 8:
  *   * State stays in-memory; persistence across reloads relies on the
  *     parent_tool_use_id stored on the child's DB row (Phase 7).
@@ -31,24 +35,15 @@ import {
   useState,
 } from "react"
 
-import type { AgentType, EventEnvelope, TaskObservation } from "@/lib/types"
+import type { EventEnvelope } from "@/lib/types"
+import {
+  applyDelegationEnvelope,
+  type DelegationBinding,
+  type DelegationStatus,
+} from "@/lib/delegation-binding-reduce"
 import { useAcpActions, useAcpEvent } from "@/contexts/acp-connections-context"
 
-export type DelegationStatus = "running" | "ok" | "err"
-
-export interface DelegationBinding {
-  parentConnectionId: string
-  parentToolUseId: string
-  childConnectionId: string
-  childConversationId: number
-  agentType: AgentType
-  status: DelegationStatus
-  errorCode?: string
-  /** Soft-watchdog observation for a still-running binding. */
-  observation?: TaskObservation | null
-  lastAgentActivityAt?: string | null
-  stalledSince?: string | null
-}
+export type { DelegationBinding, DelegationStatus }
 
 interface DelegationContextValue {
   findByParentToolUseId(id: string): DelegationBinding | undefined
@@ -77,6 +72,14 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
     Map<string, DelegationBinding>
   >(() => new Map())
 
+  // Mirror of map state so sequential envelopes in one tick apply in order
+  // without waiting for React to commit (and so detach decisions use the
+  // same pure transition as the map update).
+  const mapRef = useRef(byToolUseId)
+  useEffect(() => {
+    mapRef.current = byToolUseId
+  }, [byToolUseId])
+
   // Stable refs so the event-subscription effect doesn't tear down on
   // every action identity change (the actions object is memoized but
   // its members are stable callbacks; still, defensive ref-pinning
@@ -91,7 +94,7 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
   }, [detachDelegationChild])
 
   // Pending detach timers — one per parent_tool_use_id. Started on
-  // `delegation_completed`, cleared if a fresh `delegation_started`
+  // accepted `delegation_completed`, cleared if a fresh `delegation_started`
   // arrives for the same parent_tool_use_id before the timer fires.
   const detachTimersRef = useRef(
     new Map<string, ReturnType<typeof setTimeout>>()
@@ -108,26 +111,14 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
 
   const handleEnvelope = useCallback(
     (envelope: EventEnvelope) => {
+      const { next, acceptedCompletionToolUseId } = applyDelegationEnvelope(
+        mapRef.current,
+        envelope
+      )
+      mapRef.current = next
+      setByToolUseId(next)
+
       if (envelope.type === "delegation_started") {
-        const next: DelegationBinding = {
-          parentConnectionId: envelope.parent_connection_id,
-          parentToolUseId: envelope.parent_tool_use_id,
-          childConnectionId: envelope.child_connection_id,
-          childConversationId: envelope.child_conversation_id,
-          agentType: envelope.agent_type,
-          // Lifecycle stays running. Observation is non-terminal health only;
-          // live starts default to active; snapshot seeds may carry stalled /
-          // waiting_input from ActiveDelegationState.
-          status: "running",
-          observation: envelope.observation ?? "active",
-          lastAgentActivityAt: envelope.last_agent_activity_at ?? null,
-          stalledSince: envelope.stalled_since ?? null,
-        }
-        setByToolUseId((prev) => {
-          const m = new Map(prev)
-          m.set(envelope.parent_tool_use_id, next)
-          return m
-        })
         // Cancel any pending detach for this parent_tool_use_id —
         // delegation_started can be replayed after a partial flow
         // (e.g. reconnect), and an in-flight detach would tear the
@@ -144,63 +135,14 @@ export function DelegationProvider({ children }: { children: ReactNode }) {
         })
         return
       }
-      if (envelope.type === "delegation_observation_changed") {
-        setByToolUseId((prev) => {
-          const existing = prev.get(envelope.parent_tool_use_id)
-          // Apply-only: never create a card for an unknown tool use.
-          if (!existing || existing.status !== "running") return prev
-          const m = new Map(prev)
-          m.set(envelope.parent_tool_use_id, {
-            ...existing,
-            observation: envelope.observation,
-            lastAgentActivityAt: envelope.last_agent_activity_at,
-            stalledSince: envelope.stalled_since ?? null,
-          })
-          return m
-        })
-        return
-      }
-      if (envelope.type === "delegation_completed") {
-        setByToolUseId((prev) => {
-          const existing = prev.get(envelope.parent_tool_use_id)
-          // If we missed the start event (e.g. context mounted mid-flight,
-          // reconnect, or snapshot replay that only re-delivered the
-          // completion), synthesize a minimal binding so the parent UI still
-          // shows the result — with the real agent_type the event now carries,
-          // so the card renders the correct agent icon/label.
-          const base: DelegationBinding = existing ?? {
-            parentConnectionId: envelope.parent_connection_id,
-            parentToolUseId: envelope.parent_tool_use_id,
-            childConnectionId: envelope.child_connection_id,
-            childConversationId: envelope.child_conversation_id,
-            agentType: envelope.agent_type,
-            status: "running",
-          }
-          const updated: DelegationBinding =
-            envelope.result.kind === "ok"
-              ? {
-                  ...base,
-                  status: "ok",
-                  observation: null,
-                  stalledSince: null,
-                }
-              : {
-                  ...base,
-                  status: "err",
-                  errorCode: envelope.result.error_code,
-                  observation: null,
-                  stalledSince: null,
-                }
-          const m = new Map(prev)
-          m.set(envelope.parent_tool_use_id, updated)
-          return m
-        })
 
-        // Schedule detach of the synthetic child entry. We keep it
-        // around briefly so the final assistant text rendered from
-        // live state survives long enough for the user to read it
-        // before the parent UI falls back to the DB-persisted view.
-        const parentToolUseId = envelope.parent_tool_use_id
+      // Detach ONLY when completion was accepted (match or synthesize).
+      // Mismatched task_id → acceptedCompletionToolUseId is null → no timer.
+      if (
+        acceptedCompletionToolUseId !== null &&
+        envelope.type === "delegation_completed"
+      ) {
+        const parentToolUseId = acceptedCompletionToolUseId
         const childConnectionId = envelope.child_connection_id
         cancelDetachTimer(parentToolUseId)
         const timer = setTimeout(() => {
