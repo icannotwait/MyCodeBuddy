@@ -885,6 +885,7 @@ mod tests {
             attempts: Set(attempts),
             first_user_text: Set(Some("user task".into())),
             first_assistant_text: Set(Some("assistant reply".into())),
+            first_prompt_at: Set(None),
             locale: Set(Some("en".into())),
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(attempt_turn_seq),

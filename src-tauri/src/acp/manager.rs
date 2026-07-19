@@ -7611,6 +7611,7 @@ mod tests {
             attempts: Set(0),
             first_user_text: Set(None),
             first_assistant_text: Set(None),
+            first_prompt_at: Set(None),
             locale: Set(None),
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),

@@ -29,6 +29,9 @@ pub struct Model {
     pub first_user_text: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub first_assistant_text: Option<String>,
+    /// Instant when `first_user_text` was first written; deadline origin.
+    /// NULL for pre-migration rows that already had a captured prompt (end-turn only).
+    pub first_prompt_at: Option<DateTimeUtc>,
     pub locale: Option<String>,
     pub usable_turn_seq: i32,
     pub attempt_turn_seq: i32,
