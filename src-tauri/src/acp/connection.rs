@@ -6434,11 +6434,7 @@ async fn finalize_bound_prompt_response(
         .await;
     }
     let raw_reason_str = stop_reason_to_str(reason);
-    let reason_str = if raw_reason_str == "end_turn" && !turn_had_agent_output {
-        "empty"
-    } else {
-        raw_reason_str
-    };
+    let reason_str = rewrite_end_turn_if_empty(raw_reason_str, turn_had_agent_output);
     if reason_str == "end_turn" {
         journal_turn_span(turn_timing_probe, conn_id, &sid.0).await;
     }
@@ -6821,12 +6817,19 @@ async fn run_conversation_loop<'a>(
                                 )
                                 .await
                                 .otherwise(async |dispatch| {
-                                    if maybe_emit_claude_sdk_ext_notification(&st, &h, dispatch)
-                                        .await
+                                    let mut compact_flag = false;
+                                    if maybe_emit_private_ext_notification(
+                                        &st,
+                                        &h,
+                                        dispatch,
+                                        crate::acp::xai_session_notification::PrivateExtEmitMode::IdleUsageOnly,
+                                        &mut compact_flag,
+                                    )
+                                    .await
                                     {
-                                        // Only when a normalizer advanced
-                                        // transcript/tool state (currently never
-                                        // for api_retry-only envelopes).
+                                        // ContentDelta path (not used for idle
+                                        // compact); keep activity mark for any
+                                        // future private ext that returns true.
                                         st.write().await.mark_agent_activity(chrono::Utc::now());
                                     }
                                     Ok(())
@@ -7000,6 +7003,9 @@ async fn run_conversation_loop<'a>(
                 // reason so the user gets an error toast instead of a
                 // confusing `PendingReview` on a blank conversation.
                 let mut turn_had_agent_output = false;
+                // Tracks whether a Grok compact lifecycle ContentDelta was already
+                // emitted this turn so subsequent lifecycle strings get a leading `\n`.
+                let mut compact_text_emitted_this_turn = false;
                 // A CodeBuddy native sub-agent's full lifecycle (Agent tool call
                 // open → completed) happens within one turn, so reset the
                 // suppression window at each turn start. This bounds the tracking
@@ -7078,6 +7084,24 @@ async fn run_conversation_loop<'a>(
                                 disconnect_requested = true;
                                 break;
                             }
+                            // Drain ready session updates so private compact cannot
+                            // lose a race to biased prompt_response completion.
+                            drain_ready_in_prompt_updates(
+                                &mut ReadyUpdateSource::Live(session),
+                                state,
+                                emitter,
+                                agent_type,
+                                &sid,
+                                cwd,
+                                &terminal_runtime,
+                                &terminal_assoc,
+                                &mut tracked_terminal_tool_calls,
+                                &mut raw_output_cache,
+                                &mut cb_state,
+                                &mut turn_had_agent_output,
+                                &mut compact_text_emitted_this_turn,
+                            )
+                            .await;
                             let outcome = finalize_bound_prompt_response(
                                 prompt_result,
                                 &mut suspension,
@@ -7400,6 +7424,22 @@ async fn run_conversation_loop<'a>(
                                     if let Some(ext_reason) =
                                         parse_extension_turn_completed(&dispatch)
                                     {
+                                        drain_ready_in_prompt_updates(
+                                            &mut ReadyUpdateSource::Live(session),
+                                            state,
+                                            emitter,
+                                            agent_type,
+                                            &sid,
+                                            cwd,
+                                            &terminal_runtime,
+                                            &terminal_assoc,
+                                            &mut tracked_terminal_tool_calls,
+                                            &mut raw_output_cache,
+                                            &mut cb_state,
+                                            &mut turn_had_agent_output,
+                                            &mut compact_text_emitted_this_turn,
+                                        )
+                                        .await;
                                         let _ = merge_terminal_assoc_binds(
                                             sid.0.as_ref(),
                                             terminal_assoc.as_ref(),
@@ -7415,10 +7455,11 @@ async fn run_conversation_loop<'a>(
                                             )
                                             .await;
                                         }
-                                        let mut reason_str = ext_reason;
-                                        if reason_str == "end_turn" && !turn_had_agent_output {
-                                            reason_str = "empty".into();
-                                        }
+                                        let reason_str = rewrite_end_turn_if_empty(
+                                            &ext_reason,
+                                            turn_had_agent_output,
+                                        )
+                                        .to_string();
                                         if record_suspension_terminal_diagnostic(
                                             suspension.as_ref(),
                                             &mut suspension_terminal_diagnostic,
@@ -7538,11 +7579,16 @@ async fn run_conversation_loop<'a>(
                                         )
                                         .await
                                         .otherwise(async |dispatch| {
-                                            if maybe_emit_claude_sdk_ext_notification(
-                                                &st, &h, dispatch,
+                                            if maybe_emit_private_ext_notification(
+                                                &st,
+                                                &h,
+                                                dispatch,
+                                                crate::acp::xai_session_notification::PrivateExtEmitMode::InPrompt,
+                                                &mut compact_text_emitted_this_turn,
                                             )
                                             .await
                                             {
+                                                turn_had_agent_output = true;
                                                 st.write()
                                                     .await
                                                     .mark_agent_activity(chrono::Utc::now());
@@ -7555,6 +7601,22 @@ async fn run_conversation_loop<'a>(
                                     }
                                 }
                                 SessionMessage::StopReason(reason) => {
+                                    drain_ready_in_prompt_updates(
+                                        &mut ReadyUpdateSource::Live(session),
+                                        state,
+                                        emitter,
+                                        agent_type,
+                                        &sid,
+                                        cwd,
+                                        &terminal_runtime,
+                                        &terminal_assoc,
+                                        &mut tracked_terminal_tool_calls,
+                                        &mut raw_output_cache,
+                                        &mut cb_state,
+                                        &mut turn_had_agent_output,
+                                        &mut compact_text_emitted_this_turn,
+                                    )
+                                    .await;
                                     let _ = merge_terminal_assoc_binds(
                                         sid.0.as_ref(),
                                         terminal_assoc.as_ref(),
@@ -7571,13 +7633,10 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     }
                                     let raw_reason_str = stop_reason_to_str(reason);
-                                    let reason_str = if raw_reason_str == "end_turn"
-                                        && !turn_had_agent_output
-                                    {
-                                        "empty"
-                                    } else {
-                                        raw_reason_str
-                                    };
+                                    let reason_str = rewrite_end_turn_if_empty(
+                                        raw_reason_str,
+                                        turn_had_agent_output,
+                                    );
                                     if record_suspension_terminal_diagnostic(
                                         suspension.as_ref(),
                                         &mut suspension_terminal_diagnostic,
@@ -8652,14 +8711,75 @@ fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpE
     })
 }
 
-/// Emit adapter-specific raw SDK notifications. Returns `true` only when a
-/// normalizer advanced the same live transcript / tool state that the soft
-/// watchdog treats as agent activity. Claude `api_retry` system messages are
-/// UI status only and return `false`.
-async fn maybe_emit_claude_sdk_ext_notification(
+/// Shared empty-rewrite used by all three turn-completion sites.
+fn rewrite_end_turn_if_empty(raw_reason: &str, turn_had_agent_output: bool) -> &str {
+    if raw_reason == "end_turn" && !turn_had_agent_output {
+        "empty"
+    } else {
+        raw_reason
+    }
+}
+
+fn resolve_context_window_size(state: &SessionState) -> u64 {
+    use crate::acp::xai_session_notification::resolve_context_window_size_from_parts;
+    let existing = state.usage.as_ref().map(|u| u.size);
+    let model = current_grok_model_id_from_opts(state.config_options.as_deref().unwrap_or(&[]));
+    resolve_context_window_size_from_parts(existing, model.as_deref())
+}
+
+async fn map_and_emit_xai_session_notification(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    notification: &UntypedMessage,
+    mode: crate::acp::xai_session_notification::PrivateExtEmitMode,
+    compact_text_emitted_this_turn: &mut bool,
+) -> bool {
+    use crate::acp::xai_session_notification::{
+        map_xai_session_notification, with_lifecycle_separator, PrivateExtEmitMode,
+        XaiSessionAction,
+    };
+
+    if matches!(mode, PrivateExtEmitMode::LoadDrainNoop) {
+        return false;
+    }
+    let Some(actions) = map_xai_session_notification(notification) else {
+        return false;
+    };
+    let allow_text = matches!(mode, PrivateExtEmitMode::InPrompt);
+    let mut emitted_text = false;
+    for action in actions {
+        match action {
+            XaiSessionAction::AgentText(text) if allow_text => {
+                let text = with_lifecycle_separator(text, *compact_text_emitted_this_turn);
+                emit_with_state(state, emitter, AcpEvent::ContentDelta { text }).await;
+                *compact_text_emitted_this_turn = true;
+                emitted_text = true;
+            }
+            XaiSessionAction::AgentText(_) => {}
+            XaiSessionAction::Usage { used } if used > 0 => {
+                let size = {
+                    let st = state.read().await;
+                    resolve_context_window_size(&st)
+                };
+                emit_with_state(state, emitter, AcpEvent::UsageUpdate { used, size }).await;
+            }
+            XaiSessionAction::Usage { .. } => {}
+        }
+    }
+    if emitted_text {
+        tracing::debug!("mapped x.ai private compact notification with ContentDelta");
+    }
+    emitted_text
+}
+
+/// Single otherwise entry for private extensions (Claude SDK + Grok compact).
+/// Returns `true` iff at least one ContentDelta was emitted (agent-output equivalent).
+async fn maybe_emit_private_ext_notification(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     dispatch: Dispatch,
+    mode: crate::acp::xai_session_notification::PrivateExtEmitMode,
+    compact_text_emitted_this_turn: &mut bool,
 ) -> bool {
     let Dispatch::Notification(notification) = dispatch else {
         return false;
@@ -8670,7 +8790,187 @@ async fn maybe_emit_claude_sdk_ext_notification(
         emit_with_state(state, emitter, event).await;
         return false;
     }
-    false
+    map_and_emit_xai_session_notification(
+        state,
+        emitter,
+        &notification,
+        mode,
+        compact_text_emitted_this_turn,
+    )
+    .await
+}
+
+/// Back-compat name used only where load-drain historically called Claude-only
+/// helper; routes through private-ext with LoadDrainNoop for Grok compact.
+async fn maybe_emit_claude_sdk_ext_notification(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    dispatch: Dispatch,
+) -> bool {
+    let mut compact_flag = false;
+    maybe_emit_private_ext_notification(
+        state,
+        emitter,
+        dispatch,
+        crate::acp::xai_session_notification::PrivateExtEmitMode::LoadDrainNoop,
+        &mut compact_flag,
+    )
+    .await
+}
+
+/// Test seam for pre-finalization drain: live zero-timeout reads vs fake queue.
+enum ReadyUpdateSource<'borrow, 'responder> {
+    Live(&'borrow mut sacp::ActiveSession<'responder, Agent>),
+    /// Used by unit tests that inject preloaded session messages.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    Fake(&'borrow mut std::collections::VecDeque<SessionMessage>),
+}
+
+impl<'borrow, 'responder> ReadyUpdateSource<'borrow, 'responder> {
+    async fn try_next_ready(&mut self) -> Option<Result<SessionMessage, sacp::Error>> {
+        match self {
+            ReadyUpdateSource::Live(session) => {
+                tokio::time::timeout(std::time::Duration::ZERO, session.read_update())
+                    .await
+                    .ok()
+            }
+            #[cfg(test)]
+            ReadyUpdateSource::Fake(q) => q.pop_front().map(Ok),
+        }
+    }
+}
+
+/// Drain already-ready session updates before empty-rewrite finalization.
+/// Never finalizes a turn; secondary terminals are suppressed (primary T wins).
+#[allow(clippy::too_many_arguments)]
+async fn drain_ready_in_prompt_updates(
+    source: &mut ReadyUpdateSource<'_, '_>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    sid: &SessionId,
+    cwd: &str,
+    terminal_runtime: &Arc<TerminalRuntime>,
+    terminal_assoc: &Arc<std::sync::Mutex<TerminalAssocFallback>>,
+    tracked_terminal_tool_calls: &mut HashMap<String, TrackedTerminalToolCall>,
+    raw_output_cache: &mut ToolCallOutputCache,
+    cb_state: &mut CodeBuddyLiveState,
+    turn_had_agent_output: &mut bool,
+    compact_text_emitted_this_turn: &mut bool,
+) {
+    let cwd_opt = Some(cwd);
+    let mut drained = 0u32;
+    loop {
+        if drained >= 64 {
+            tracing::warn!("[ACP] pre-finalize drain hit 64-message cap");
+            break;
+        }
+        let Some(msg_res) = source.try_next_ready().await else {
+            break;
+        };
+        drained += 1;
+        let Ok(msg) = msg_res else {
+            tracing::warn!(
+                "[ACP] session update error during pre-finalize drain; stopping drain"
+            );
+            break;
+        };
+        match msg {
+            SessionMessage::StopReason(_) => {
+                tracing::debug!(
+                    secondary_terminal_suppressed = true,
+                    kind = "stop_reason",
+                    "pre-finalize drain"
+                );
+                continue;
+            }
+            SessionMessage::SessionMessage(dispatch) => {
+                let dispatch = fix_usage_update_nulls(dispatch);
+                if parse_extension_turn_completed(&dispatch).is_some() {
+                    tracing::debug!(
+                        secondary_terminal_suppressed = true,
+                        kind = "extension_turn_completed",
+                        "pre-finalize drain"
+                    );
+                    continue;
+                }
+                let h = emitter.clone();
+                let st = Arc::clone(state);
+                let runtime = terminal_runtime.clone();
+                let session_id = sid.clone();
+                if let Err(e) = MatchDispatch::new(dispatch)
+                    .if_notification(async |notif: SessionNotification| {
+                        observe_terminal_assoc_from_update(
+                            &notif.update,
+                            session_id.0.as_ref(),
+                            terminal_assoc.as_ref(),
+                        );
+                        let should_poll_now = track_terminal_tool_calls(
+                            &notif.update,
+                            tracked_terminal_tool_calls,
+                        );
+                        let bound = merge_terminal_assoc_binds(
+                            session_id.0.as_ref(),
+                            terminal_assoc.as_ref(),
+                            tracked_terminal_tool_calls,
+                        );
+                        if is_agent_output_update(&notif.update) {
+                            *turn_had_agent_output = true;
+                        }
+                        if advances_agent_activity(&notif.update) {
+                            st.write().await.mark_agent_activity(chrono::Utc::now());
+                        }
+                        emit_conversation_update(
+                            &st,
+                            &h,
+                            agent_type,
+                            notif.update,
+                            cwd_opt,
+                            raw_output_cache,
+                            cb_state,
+                        )
+                        .await;
+                        if should_poll_now || bound {
+                            poll_tracked_terminal_tool_calls(
+                                runtime.as_ref(),
+                                &session_id,
+                                &st,
+                                &h,
+                                tracked_terminal_tool_calls,
+                            )
+                            .await;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .otherwise(async |dispatch| {
+                        if maybe_emit_private_ext_notification(
+                            &st,
+                            &h,
+                            dispatch,
+                            crate::acp::xai_session_notification::PrivateExtEmitMode::InPrompt,
+                            compact_text_emitted_this_turn,
+                        )
+                        .await
+                        {
+                            *turn_had_agent_output = true;
+                            st.write().await.mark_agent_activity(chrono::Utc::now());
+                            tracing::debug!(
+                                drain_hit_private_compact = true,
+                                "pre-finalize drain mapped ContentDelta"
+                            );
+                        }
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::warn!("[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Grok (and potentially other hosts) emit turn completion as an extension
@@ -12759,6 +13059,236 @@ mod tests {
             }
             _ => panic!("expected ClaudeSdkMessage"),
         }
+    }
+
+    #[test]
+    fn rewrite_end_turn_if_empty_is_production_fn() {
+        use crate::acp::delegation::types::ParentTurnEndReason;
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", false), "empty");
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", true), "end_turn");
+        assert_eq!(
+            parent_turn_end_reason(rewrite_end_turn_if_empty("end_turn", true)),
+            ParentTurnEndReason::JoinAbandoned
+        );
+        assert_eq!(
+            parent_turn_end_reason(rewrite_end_turn_if_empty("end_turn", false)),
+            ParentTurnEndReason::ParentTurnFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_private_in_prompt_completed_returns_true_and_sets_usage() {
+        use crate::acp::xai_session_notification::PrivateExtEmitMode;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let raw = include_str!("fixtures/grok_auto_compact_completed.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let dispatch = Dispatch::Notification(notif);
+        let mut compact_flag = false;
+        let agent_out = maybe_emit_private_ext_notification(
+            &state,
+            &emitter,
+            dispatch,
+            PrivateExtEmitMode::InPrompt,
+            &mut compact_flag,
+        )
+        .await;
+        assert!(agent_out, "ContentDelta must mark agent output");
+        assert!(compact_flag);
+        let used = state.read().await.usage.as_ref().map(|u| u.used);
+        assert_eq!(used, Some(18060));
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_private_load_drain_noop_no_usage() {
+        use crate::acp::xai_session_notification::PrivateExtEmitMode;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let raw = include_str!("fixtures/grok_auto_compact_completed.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let mut compact_flag = false;
+        let agent_out = maybe_emit_private_ext_notification(
+            &state,
+            &emitter,
+            Dispatch::Notification(notif),
+            PrivateExtEmitMode::LoadDrainNoop,
+            &mut compact_flag,
+        )
+        .await;
+        assert!(!agent_out);
+        assert!(!compact_flag);
+        assert!(state.read().await.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_private_idle_usage_only_returns_false() {
+        use crate::acp::xai_session_notification::PrivateExtEmitMode;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let raw = include_str!("fixtures/grok_auto_compact_completed.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let mut compact_flag = false;
+        let agent_out = maybe_emit_private_ext_notification(
+            &state,
+            &emitter,
+            Dispatch::Notification(notif),
+            PrivateExtEmitMode::IdleUsageOnly,
+            &mut compact_flag,
+        )
+        .await;
+        assert!(!agent_out);
+        assert!(!compact_flag);
+        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+    }
+
+    fn compact_completed_session_message() -> SessionMessage {
+        let raw = include_str!("fixtures/grok_auto_compact_completed.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        SessionMessage::SessionMessage(Dispatch::Notification(notif))
+    }
+
+    #[tokio::test]
+    async fn drain_with_fake_queue_sets_flag_before_rewrite() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+        use sacp::schema::SessionId;
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(compact_completed_session_message());
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Grok),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &emitter,
+            AgentType::Grok,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(turn_had, "drain must set agent-output flag via private emit");
+        assert!(compact_flag);
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
+        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+    }
+
+    #[tokio::test]
+    async fn drain_suppresses_secondary_terminal_continues_for_compact() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+        use sacp::schema::{SessionId, StopReason};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
+        let mut q = std::collections::VecDeque::new();
+        // Secondary terminal first, then compact — drain must not finalize and
+        // must still process compact.
+        q.push_back(SessionMessage::StopReason(StopReason::EndTurn));
+        q.push_back(compact_completed_session_message());
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Grok),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &emitter,
+            AgentType::Grok,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(q.is_empty(), "drain must consume full fake queue");
+        assert!(turn_had);
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
     }
 
     #[test]

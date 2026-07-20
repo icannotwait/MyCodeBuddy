@@ -33,6 +33,7 @@ pub mod terminal_assoc;
 pub mod terminal_context;
 pub mod terminal_runtime;
 pub mod types;
+pub mod xai_session_notification;
 
 #[cfg(feature = "tauri-runtime")]
 pub use desktop_event_batcher::{

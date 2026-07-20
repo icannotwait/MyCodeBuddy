@@ -1,0 +1,12 @@
+{
+  "method": "_x.ai/session_notification",
+  "params": {
+    "sessionId": "fixture-session",
+    "update": {
+      "sessionUpdate": "auto_compact_completed",
+      "tokens_before": 18592,
+      "tokens_after": 18060,
+      "summary_preview": null
+    }
+  }
+}
