@@ -34,8 +34,10 @@ pub async fn translate_document(
     format: String,
     locale: Option<String>,
     display_name: Option<String>,
-    #[cfg(feature = "tauri-runtime")]
-    service: tauri::State<'_, std::sync::Arc<DocumentTranslationService>>,
+    #[cfg(feature = "tauri-runtime")] service: tauri::State<
+        '_,
+        std::sync::Arc<DocumentTranslationService>,
+    >,
 ) -> Result<TranslateDocumentResult, AppCommandError> {
     let params = TranslateDocumentParams {
         content,

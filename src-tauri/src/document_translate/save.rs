@@ -29,7 +29,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::document_translate::types::{
-    I18N_SAVE_ALREADY_EXISTS, I18N_SAVE_PATH_REJECTED, SaveTranslationAsResult,
+    SaveTranslationAsResult, I18N_SAVE_ALREADY_EXISTS, I18N_SAVE_PATH_REJECTED,
 };
 
 /// Soft size guard aligned with editor save limits (bytes of UTF-8).
@@ -39,10 +39,7 @@ const SAVE_CONTENT_HARD_LIMIT: usize = 50_000_000;
 ///
 /// Parent directory must already exist. Rejects absolute paths, `..`, empty
 /// names, and any symlink in the path chain from root through the parent.
-pub fn resolve_save_target(
-    root: &Path,
-    relative_path: &str,
-) -> Result<PathBuf, AppCommandError> {
+pub fn resolve_save_target(root: &Path, relative_path: &str) -> Result<PathBuf, AppCommandError> {
     let trimmed = relative_path.trim();
     if trimmed.is_empty() {
         return Err(path_rejected("Relative path cannot be empty"));
@@ -81,20 +78,19 @@ pub fn resolve_save_target(
     }
 
     let joined = root.join(rel);
-    let parent = joined.parent().ok_or_else(|| {
-        path_rejected("Cannot determine parent directory for target file")
-    })?;
+    let parent = joined
+        .parent()
+        .ok_or_else(|| path_rejected("Cannot determine parent directory for target file"))?;
 
     // Walk root → parent; reject symlink components (do not follow).
     ensure_no_symlink_in_chain(root, parent)?;
 
     if !parent.exists() {
-        return Err(AppCommandError::not_found("Parent directory does not exist")
-            .with_detail(parent.display().to_string())
-            .with_i18n(
-                I18N_SAVE_PATH_REJECTED,
-                std::collections::BTreeMap::new(),
-            ));
+        return Err(
+            AppCommandError::not_found("Parent directory does not exist")
+                .with_detail(parent.display().to_string())
+                .with_i18n(I18N_SAVE_PATH_REJECTED, std::collections::BTreeMap::new()),
+        );
     }
 
     let parent_meta = std::fs::symlink_metadata(parent).map_err(AppCommandError::io)?;
@@ -111,9 +107,9 @@ pub fn resolve_save_target(
         return Err(path_rejected("Resolved path escapes workspace root"));
     }
 
-    let file_name = joined.file_name().ok_or_else(|| {
-        path_rejected("Relative path must include a file name")
-    })?;
+    let file_name = joined
+        .file_name()
+        .ok_or_else(|| path_rejected("Relative path must include a file name"))?;
     Ok(canonical_parent.join(file_name))
 }
 
@@ -124,10 +120,8 @@ pub fn save_translation_as_to_root(
     content: &str,
 ) -> Result<SaveTranslationAsResult, AppCommandError> {
     if content.len() > SAVE_CONTENT_HARD_LIMIT {
-        return Err(AppCommandError::invalid_input(
-            "File is too large to save",
-        )
-        .with_detail(format!("max_bytes={SAVE_CONTENT_HARD_LIMIT}")));
+        return Err(AppCommandError::invalid_input("File is too large to save")
+            .with_detail(format!("max_bytes={SAVE_CONTENT_HARD_LIMIT}")));
     }
 
     let target = resolve_save_target(root, relative_path)?;
@@ -204,10 +198,8 @@ fn confirm_created_under_root(
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_file(created);
-            return Err(AppCommandError::io(e).with_i18n(
-                I18N_SAVE_PATH_REJECTED,
-                std::collections::BTreeMap::new(),
-            ));
+            return Err(AppCommandError::io(e)
+                .with_i18n(I18N_SAVE_PATH_REJECTED, std::collections::BTreeMap::new()));
         }
     };
     if !path_under_root(&absolute, canonical_root) {
@@ -225,20 +217,14 @@ fn confirm_created_under_root(
 }
 
 /// Best-effort: re-canonicalize parent of `target` and require under root.
-fn recheck_parent_under_root(
-    target: &Path,
-    canonical_root: &Path,
-) -> Result<(), AppCommandError> {
+fn recheck_parent_under_root(target: &Path, canonical_root: &Path) -> Result<(), AppCommandError> {
     let Some(parent) = target.parent() else {
         return Ok(());
     };
     // If parent cannot be canonicalized (race deleted it), reject so we do
     // not write into an unconfirmable location.
     let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
-        AppCommandError::io(e).with_i18n(
-            I18N_SAVE_PATH_REJECTED,
-            std::collections::BTreeMap::new(),
-        )
+        AppCommandError::io(e).with_i18n(I18N_SAVE_PATH_REJECTED, std::collections::BTreeMap::new())
     })?;
     if !path_under_root(&canonical_parent, canonical_root) {
         return Err(path_rejected(
@@ -260,10 +246,7 @@ fn path_rejected(message: impl Into<String>) -> AppCommandError {
 
 fn already_exists_err() -> AppCommandError {
     AppCommandError::already_exists("A file already exists at the save path")
-        .with_i18n(
-            I18N_SAVE_ALREADY_EXISTS,
-            std::collections::BTreeMap::new(),
-        )
+        .with_i18n(I18N_SAVE_ALREADY_EXISTS, std::collections::BTreeMap::new())
 }
 
 /// Walk from `root` toward `target` (inclusive of intermediate segments).
@@ -286,7 +269,11 @@ fn ensure_no_symlink_in_chain(root: &Path, target: &Path) -> Result<(), AppComma
         let segment = match component {
             Component::Normal(s) => s,
             Component::CurDir => continue,
-            _ => return Err(path_rejected("Invalid path component while validating save target")),
+            _ => {
+                return Err(path_rejected(
+                    "Invalid path component while validating save target",
+                ))
+            }
         };
         current.push(segment);
         match std::fs::symlink_metadata(&current) {
@@ -360,8 +347,7 @@ mod tests {
     #[test]
     fn happy_path_exclusive_create_writes_content() {
         let root = temp_root();
-        let result =
-            save_translation_as_to_root(root.path(), "README.zh_cn.md", "你好").unwrap();
+        let result = save_translation_as_to_root(root.path(), "README.zh_cn.md", "你好").unwrap();
         let path = PathBuf::from(&result.absolute_path);
         assert!(path.is_absolute());
         assert!(path.starts_with(std::fs::canonicalize(root.path()).unwrap()));
@@ -376,7 +362,10 @@ mod tests {
         let err = save_translation_as_to_root(root.path(), rel, "new").unwrap_err();
         assert_eq!(err.code, AppErrorCode::AlreadyExists);
         assert_eq!(err.i18n_key.as_deref(), Some(I18N_SAVE_ALREADY_EXISTS));
-        assert_eq!(std::fs::read_to_string(root.path().join(rel)).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(rel)).unwrap(),
+            "old"
+        );
     }
 
     #[test]
@@ -412,10 +401,9 @@ mod tests {
             fails, 1,
             "exactly one exclusive create must fail; a={a:?} b={b:?}"
         );
-        let fail = if a.is_err() {
-            a.as_ref().unwrap_err()
-        } else {
-            b.as_ref().unwrap_err()
+        let fail = match (&a, &b) {
+            (Err(e), _) | (_, Err(e)) => e,
+            _ => panic!("expected one exclusive create failure"),
         };
         assert_eq!(fail.code, AppErrorCode::AlreadyExists);
         assert_eq!(fail.i18n_key.as_deref(), Some(I18N_SAVE_ALREADY_EXISTS));
@@ -472,8 +460,7 @@ mod tests {
     #[test]
     fn missing_parent_directory_is_rejected() {
         let root = temp_root();
-        let err =
-            save_translation_as_to_root(root.path(), "nope/nested.md", "x").unwrap_err();
+        let err = save_translation_as_to_root(root.path(), "nope/nested.md", "x").unwrap_err();
         assert_eq!(err.code, AppErrorCode::NotFound);
     }
 
@@ -484,8 +471,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let link = root.path().join("linked");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-        let err =
-            save_translation_as_to_root(root.path(), "linked/out.md", "x").unwrap_err();
+        let err = save_translation_as_to_root(root.path(), "linked/out.md", "x").unwrap_err();
         assert_eq!(err.i18n_key.as_deref(), Some(I18N_SAVE_PATH_REJECTED));
         assert!(!outside.path().join("out.md").exists());
     }

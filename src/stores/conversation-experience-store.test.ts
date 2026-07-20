@@ -91,9 +91,7 @@ describe("useConversationExperienceStore", () => {
       reference_search_limit: 25,
       revision: 3,
     })
-    await useConversationExperienceStore
-      .getState()
-      .setReferenceSearchLimit(25)
+    await useConversationExperienceStore.getState().setReferenceSearchLimit(25)
     expect(h.setLimit).toHaveBeenCalledWith(25)
     expect(useConversationExperienceStore.getState().settings).toEqual({
       auto_title_agent: null,

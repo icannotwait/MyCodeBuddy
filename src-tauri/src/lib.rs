@@ -20,13 +20,13 @@ mod network;
 pub mod office_watch;
 pub mod parsers;
 pub mod paths;
-pub mod reference_search;
 pub mod pet_sessions;
 pub mod pet_state_mapper;
 pub mod pets;
 #[cfg(feature = "tauri-runtime")]
 pub mod preferences;
 pub mod process;
+pub mod reference_search;
 pub mod supervise;
 mod terminal;
 pub mod update;

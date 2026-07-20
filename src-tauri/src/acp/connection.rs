@@ -1153,8 +1153,7 @@ pub async fn spawn_agent_connection(
     prepend_officecli_path(&mut terminal_base_env);
 
     let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel::<ConnectionCommand>(32);
-    let (control_tx, control_rx, control_liveness_rx) =
-        connection_channel::<ConnectionControl>(32);
+    let (control_tx, control_rx, control_liveness_rx) = connection_channel::<ConnectionControl>(32);
     let conn_id = connection_id.clone();
     let emitter_clone = emitter.clone();
     let cleanup_connections = connections.clone();
@@ -4492,16 +4491,10 @@ fn observe_terminal_assoc_from_update(
                 .unwrap_or_default();
             ToolCallAssocHint {
                 tool_call_id: tcu.tool_call_id.to_string(),
-                kind: tcu
-                    .fields
-                    .kind
-                    .map(|k| format!("{:?}", k).to_lowercase()),
+                kind: tcu.fields.kind.map(|k| format!("{:?}", k).to_lowercase()),
                 title: tcu.fields.title.clone(),
                 has_terminal_content: !terminal_ids.is_empty(),
-                status: tcu
-                    .fields
-                    .status
-                    .map(|s| format!("{:?}", s).to_lowercase()),
+                status: tcu.fields.status.map(|s| format!("{:?}", s).to_lowercase()),
             }
         }
         _ => return,
@@ -5344,12 +5337,8 @@ fn drain_ready_active_controls(
                 sid,
                 cx,
             ),
-            Ok(ConnectionControl::Cancel) => {
-                return Some(ActiveTerminalControl::UserCancel)
-            }
-            Ok(ConnectionControl::Disconnect) => {
-                return Some(ActiveTerminalControl::Disconnect)
-            }
+            Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
+            Ok(ConnectionControl::Disconnect) => return Some(ActiveTerminalControl::Disconnect),
             Err(_) => break,
         }
     }
@@ -5397,26 +5386,12 @@ fn start_ancillary_command(
             value_id,
         } => Ok(Box::pin(async move {
             let set_result = if agent_type == AgentType::Grok {
-                set_grok_config_option(
-                    &cx,
-                    &sid,
-                    &state,
-                    &emitter,
-                    config_id,
-                    value_id,
-                )
-                .await
+                set_grok_config_option(&cx, &sid, &state, &emitter, config_id, value_id).await
             } else {
                 let is_mode = config_id == "mode";
                 let mode_value = value_id.clone();
                 let result = set_session_config_option(
-                    &cx,
-                    &sid,
-                    &state,
-                    &emitter,
-                    agent_type,
-                    config_id,
-                    value_id,
+                    &cx, &sid, &state, &emitter, agent_type, config_id, value_id,
                 )
                 .await;
                 if result.is_ok() && is_mode {
@@ -5542,10 +5517,7 @@ async fn finalize_bound_prompt_response(
     Ok(BoundPromptFinalization {
         status_restored_by_suspension,
         disconnect_requested: reason_str == "cancelled"
-            && matches!(
-                disposition,
-                TurnFinalizationDisposition::SuspensionFailed
-            ),
+            && matches!(disposition, TurnFinalizationDisposition::SuspensionFailed),
     })
 }
 
@@ -5605,7 +5577,6 @@ async fn finalize_active_disconnect(
         .release_all_for_session(sid.0.as_ref())
         .await;
 }
-
 
 /// Classify a `session/load` failure into a stable frontend `code` when the
 /// historical session cannot be restored — either the agent has no record of
@@ -7589,9 +7560,7 @@ fn parse_extension_turn_completed(dispatch: &Dispatch) -> Option<String> {
     parse_extension_turn_completed_notification(notification)
 }
 
-fn parse_extension_turn_completed_notification(
-    notification: &UntypedMessage,
-) -> Option<String> {
+fn parse_extension_turn_completed_notification(notification: &UntypedMessage) -> Option<String> {
     let method = notification.method();
     if method != "_x.ai/session/update" && method != "session/update" {
         return None;
@@ -7611,8 +7580,8 @@ fn parse_extension_turn_completed_notification(
 /// consumed by lifecycle (`end_turn` / `cancelled` / …).
 fn normalize_extension_stop_reason(raw: &str) -> String {
     match raw {
-        "end_turn" | "cancelled" | "refusal" | "max_tokens" | "max_turn_requests"
-        | "empty" | "unknown" => raw.to_string(),
+        "end_turn" | "cancelled" | "refusal" | "max_tokens" | "max_turn_requests" | "empty"
+        | "unknown" => raw.to_string(),
         "EndTurn" => "end_turn".into(),
         "Cancelled" | "canceled" | "Canceled" => "cancelled".into(),
         "Refusal" => "refusal".into(),
@@ -8092,10 +8061,7 @@ mod tests {
     }
 
     impl sacp::ConnectTo<Client> for SuspensionLoopMockAgent {
-        async fn connect_to(
-            self,
-            client: impl sacp::ConnectTo<Agent>,
-        ) -> Result<(), sacp::Error> {
+        async fn connect_to(self, client: impl sacp::ConnectTo<Agent>) -> Result<(), sacp::Error> {
             use std::sync::atomic::Ordering;
 
             let prompt_responders = self.prompts;
@@ -8165,9 +8131,7 @@ mod tests {
             continuation_coordinator: std::sync::Weak::new(),
             parent_connection_exit_causes: Arc::new(ParentConnectionExitCauses::default()),
             tokens: Arc::new(crate::acp::delegation::listener::TokenRegistry::default()),
-            leases: Arc::new(
-                crate::acp::delegation::lease::CompanionLeaseRegistry::default(),
-            ),
+            leases: Arc::new(crate::acp::delegation::lease::CompanionLeaseRegistry::default()),
             socket_path: PathBuf::from("/tmp/codeg-suspension-test.sock"),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
@@ -8275,10 +8239,8 @@ mod tests {
             .builder()
             .connect_with(mock_agent, async move |cx| {
                 let session_id = SessionId::new("session-1".to_string());
-                let mut session = cx.attach_session(
-                    NewSessionResponse::new(session_id),
-                    Default::default(),
-                )?;
+                let mut session =
+                    cx.attach_session(NewSessionResponse::new(session_id), Default::default())?;
                 if seed_aux_stop_reason {
                     session.send_prompt("auxiliary terminal producer")?;
                 }
@@ -8288,9 +8250,8 @@ mod tests {
                     shell.spec.clone(),
                     adapter_for(AgentType::Codex),
                 ));
-                let terminal_assoc = Arc::new(std::sync::Mutex::new(
-                    TerminalAssocFallback::new(false),
-                ));
+                let terminal_assoc =
+                    Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
                 let file_system_runtime = Arc::new(FileSystemRuntime::new(PathBuf::from(".")));
                 let prompt_ledger = background_watch::PromptLedger::shared();
                 let terminal_prompt_context = TerminalPromptContext::new(shell.spec.clone());
@@ -8486,8 +8447,9 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_cleanup_connection_cancels_workers_before_state_read() {
+        use crate::acp::connection::SuspensionAck;
         use crate::acp::delegation::continuation::coordinator::{
-            JoinArmRequest, JoinArmOutcome, ParentContinuationPort, ParentTurnSnapshot,
+            JoinArmOutcome, JoinArmRequest, ParentContinuationPort, ParentTurnSnapshot,
             PromptAdmissionResult, SuspendRequest, SystemContinuationClock,
         };
         use crate::acp::delegation::continuation::store::{
@@ -8496,7 +8458,6 @@ mod tests {
         use crate::acp::delegation::continuation::types::{
             ContinuationFailureCode, ContinuationState, ContinuationWaitingProjection,
         };
-        use crate::acp::connection::SuspensionAck;
         use async_trait::async_trait;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
@@ -8671,7 +8632,9 @@ mod tests {
         assert!(
             !matches!(
                 mid.state,
-                ContinuationState::Failed | ContinuationState::Completed | ContinuationState::Cancelled
+                ContinuationState::Failed
+                    | ContinuationState::Completed
+                    | ContinuationState::Cancelled
             ),
             "worker must not terminalize while cleanup is blocked before drain: {mid:?}"
         );
@@ -8703,8 +8666,7 @@ mod tests {
 
     #[test]
     fn active_terminal_arbitration_observes_last_sender_closure() {
-        let (cmd_tx, _cmd_rx, cmd_liveness_rx) =
-            connection_channel::<ConnectionCommand>(1);
+        let (cmd_tx, _cmd_rx, cmd_liveness_rx) = connection_channel::<ConnectionCommand>(1);
         let (control_tx, _control_rx, control_liveness_rx) =
             connection_channel::<ConnectionControl>(1);
         let cmd_clone = cmd_tx.clone();
@@ -8840,7 +8802,10 @@ mod tests {
         );
         assert!(spawner.cancels.lock().await.is_empty());
 
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         loop_task.await.unwrap().unwrap();
     }
 
@@ -8932,7 +8897,10 @@ mod tests {
             .respond(sacp::schema::SetSessionModeResponse::new())
             .expect("started mode RPC remains owned after suspension");
         wait_for_suspension_mode_event(&state, "durable-mode").await;
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         loop_task.await.unwrap().unwrap();
     }
 
@@ -9035,7 +9003,10 @@ mod tests {
             .expect("ready bound response must not be starved by duplicate controls")
             .expect("bound prompt suspension reply")
             .expect("bound prompt suspension success");
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         loop_task.await.unwrap().unwrap();
     }
 
@@ -9334,7 +9305,10 @@ mod tests {
             modes.lock().unwrap().len() == 1
         })
         .await;
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         control_tx.send(ConnectionControl::Cancel).await.unwrap();
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -9446,7 +9420,10 @@ mod tests {
             .expect("started mode RPC must remain owned across user cancel");
         wait_for_suspension_mode_event(&state, "post-cancel-mode").await;
 
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         loop_task.await.unwrap().unwrap();
     }
 
@@ -9602,7 +9579,10 @@ mod tests {
             crate::acp::delegation::types::TaskStatus::Canceled
         );
 
-        control_tx.send(ConnectionControl::Disconnect).await.unwrap();
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
         loop_task.await.unwrap().unwrap();
     }
 
@@ -11386,15 +11366,9 @@ mod tests {
         let adapter = adapter_for(AgentType::Grok);
         let plan = native_plan(AgentType::Grok);
 
-        let new_req = build_new_session_request(
-            AgentType::Grok,
-            &cwd,
-            Vec::new(),
-            &spec,
-            adapter,
-            &plan,
-        )
-        .unwrap();
+        let new_req =
+            build_new_session_request(AgentType::Grok, &cwd, Vec::new(), &spec, adapter, &plan)
+                .unwrap();
         let load_req = build_load_session_request(
             AgentType::Grok,
             SessionId::new("sess-load".to_string()),

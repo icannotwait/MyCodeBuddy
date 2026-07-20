@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react"
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react"
 import {
   forwardRef,
   type ReactNode,
@@ -680,18 +687,15 @@ describe("MessageScrollProvider footerScroll access", () => {
       scrollToBottom: vi.fn() as never,
       stopScroll: vi.fn(),
     })
-    let seen: ReturnType<typeof useMessageScroll> = null
-    function Probe() {
-      seen = useMessageScroll()
-      return null
-    }
-    render(
-      <MessageScrollProvider
-        value={{ scrollToIndex: vi.fn(), footerScroll: coordinator }}
-      >
-        <Probe />
-      </MessageScrollProvider>
-    )
-    expect(seen?.footerScroll).toBe(coordinator)
+    const { result } = renderHook(() => useMessageScroll(), {
+      wrapper: ({ children }) => (
+        <MessageScrollProvider
+          value={{ scrollToIndex: vi.fn(), footerScroll: coordinator }}
+        >
+          {children}
+        </MessageScrollProvider>
+      ),
+    })
+    expect(result.current?.footerScroll).toBe(coordinator)
   })
 })

@@ -61,20 +61,12 @@ impl TerminalAssocFallback {
             return;
         }
 
-        let session = self
-            .sessions
-            .entry(session_id.to_string())
-            .or_default();
+        let session = self.sessions.entry(session_id.to_string()).or_default();
 
-        let is_final = hint
-            .status
-            .as_deref()
-            .is_some_and(is_final_tool_status);
+        let is_final = hint.status.as_deref().is_some_and(is_final_tool_status);
 
         if hint.has_terminal_content || is_final {
-            session
-                .candidates
-                .retain(|id| id != &hint.tool_call_id);
+            session.candidates.retain(|id| id != &hint.tool_call_id);
             // Official association or completion: no further guessing for this id.
             try_unique_bind(session);
             return;
@@ -101,33 +93,20 @@ impl TerminalAssocFallback {
 
     /// Called after a successful `terminal/create` for `session_id`.
     /// Returns the tool_call_id when a unique bind was recorded.
-    pub fn on_terminal_created(
-        &mut self,
-        session_id: &str,
-        terminal_id: &str,
-    ) -> Option<String> {
+    pub fn on_terminal_created(&mut self, session_id: &str, terminal_id: &str) -> Option<String> {
         if !self.enabled {
             return None;
         }
 
-        let session = self
-            .sessions
-            .entry(session_id.to_string())
-            .or_default();
+        let session = self.sessions.entry(session_id.to_string()).or_default();
 
         if session.candidates.len() > 1 {
             // Ambiguous — refuse to queue or bind.
             return None;
         }
 
-        if !session
-            .unbound_terminals
-            .iter()
-            .any(|id| id == terminal_id)
-        {
-            session
-                .unbound_terminals
-                .push(terminal_id.to_string());
+        if !session.unbound_terminals.iter().any(|id| id == terminal_id) {
+            session.unbound_terminals.push(terminal_id.to_string());
         }
 
         try_unique_bind(session)
@@ -163,10 +142,7 @@ fn try_unique_bind(session: &mut SessionAssoc) -> Option<String> {
 }
 
 fn is_final_tool_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "cancelled" | "canceled"
-    )
+    matches!(status, "completed" | "failed" | "cancelled" | "canceled")
 }
 
 /// Heuristic: treat execute-kind tools and common shell titles as candidates.
@@ -329,10 +305,7 @@ mod tests {
     fn is_shell_like_recognizes_execute_and_titles() {
         assert!(is_shell_like_tool(Some("execute"), None));
         assert!(is_shell_like_tool(Some("Execute"), Some("whatever")));
-        assert!(is_shell_like_tool(
-            None,
-            Some("run_terminal_command")
-        ));
+        assert!(is_shell_like_tool(None, Some("run_terminal_command")));
         assert!(!is_shell_like_tool(Some("read"), Some("read_file")));
         assert!(!is_shell_like_tool(None, None));
     }

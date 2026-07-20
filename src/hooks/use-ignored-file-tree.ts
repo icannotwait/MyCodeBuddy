@@ -173,10 +173,7 @@ export function useIgnoredFileTree({
       active.folderPath === config.folderPath
     ) {
       if (!(active.reason === "enable" && reason === "enable")) {
-        queuedReasonRef.current = queuedReason(
-          queuedReasonRef.current,
-          reason
-        )
+        queuedReasonRef.current = queuedReason(queuedReasonRef.current, reason)
       }
       return active.promise
     }
@@ -291,19 +288,27 @@ export function useIgnoredFileTree({
       lastEnvelopeSeqRef.current = workspaceSeq
       void runRefresh("background")
     }
-  }, [folderPath, restored, runRefresh, showIgnored, treeGeneration, workspaceSeq])
+  }, [
+    folderPath,
+    restored,
+    runRefresh,
+    showIgnored,
+    treeGeneration,
+    workspaceSeq,
+  ])
 
   const refresh = useCallback(() => runRefresh("manual"), [runRefresh])
   const hasCurrentOverlay =
-    overlay?.folderPath === folderPath &&
-    overlay.generation === treeGeneration
+    overlay?.folderPath === folderPath && overlay.generation === treeGeneration
 
   return {
     tree: showIgnored && hasCurrentOverlay ? overlay.tree : fallbackTree,
     showIgnored,
     setShowIgnored,
     restored,
-    loading: Boolean(restored && showIgnored && folderPath && !hasCurrentOverlay),
+    loading: Boolean(
+      restored && showIgnored && folderPath && !hasCurrentOverlay
+    ),
     refresh,
     treeGeneration,
   }

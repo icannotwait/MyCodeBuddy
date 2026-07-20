@@ -29,8 +29,8 @@ use crate::reference_search::sources::{
 };
 use crate::reference_search::types::{
     parse_canonical_uuid_v4, validate_source_scope, CancelReferenceSearchRequest,
-    NextReferenceSearchPageRequest, ReferenceSearchPage, ReferenceSearchSource,
-    RequestFingerprint, SearchIdentity, StartReferenceSearchRequest,
+    NextReferenceSearchPageRequest, ReferenceSearchPage, ReferenceSearchSource, RequestFingerprint,
+    SearchIdentity, StartReferenceSearchRequest,
 };
 
 /// Production factory that opens file / conversation / commit source cursors.
@@ -55,18 +55,15 @@ impl ReferenceSourceFactory for ProductionReferenceSourceFactory {
                 let cursor = FileCursor::open(&self.db, workspace, pattern, limit).await?;
                 Ok(Box::new(cursor))
             }
-            ReferenceSearchSource::Conversation => {
-                Ok(Box::new(ConversationCursor::open(
-                    self.db.clone(),
-                    pattern,
-                    limit,
-                )))
-            }
+            ReferenceSearchSource::Conversation => Ok(Box::new(ConversationCursor::open(
+                self.db.clone(),
+                pattern,
+                limit,
+            ))),
             ReferenceSearchSource::Commit => {
-                let workspace = request
-                    .workspace_path
-                    .as_deref()
-                    .ok_or_else(|| error_invalid_request("commit search requires workspace_path"))?;
+                let workspace = request.workspace_path.as_deref().ok_or_else(|| {
+                    error_invalid_request("commit search requires workspace_path")
+                })?;
                 let cursor = CommitCursor::open(&self.db, workspace, pattern, limit).await?;
                 Ok(Box::new(cursor))
             }
@@ -158,7 +155,7 @@ impl ReferenceSearchRegistry {
     pub fn new(limit: u16, factory: Arc<dyn ReferenceSourceFactory>) -> Arc<Self> {
         #[cfg(test)]
         {
-            return Self::new_with_counter(limit, factory, Arc::new(AtomicUsize::new(0)));
+            Self::new_with_counter(limit, factory, Arc::new(AtomicUsize::new(0)))
         }
         #[cfg(not(test))]
         {
@@ -250,8 +247,8 @@ impl ReferenceSearchRegistry {
                 &request.request_id,
             )
             .map_err(AppCommandError::from)?;
-            let request_id = parse_canonical_uuid_v4(&identity.request_id)
-                .map_err(AppCommandError::from)?;
+            let request_id =
+                parse_canonical_uuid_v4(&identity.request_id).map_err(AppCommandError::from)?;
 
             if let Some(guard) = state.guards.get(&key) {
                 if request.source_sequence < guard.source_sequence {
@@ -283,10 +280,7 @@ impl ReferenceSearchRegistry {
                         }
                     }
 
-                    if let Some(terminal) = state
-                        .guards
-                        .get(&key)
-                        .and_then(|g| g.terminal.clone())
+                    if let Some(terminal) = state.guards.get(&key).and_then(|g| g.terminal.clone())
                     {
                         return Err(terminal);
                     }
@@ -343,8 +337,6 @@ impl ReferenceSearchRegistry {
         self.await_page(key, 0).await
     }
 
-
-
     pub async fn next_page(
         self: &Arc<Self>,
         request: NextReferenceSearchPageRequest,
@@ -365,8 +357,8 @@ impl ReferenceSearchRegistry {
                 &request.request_id,
             )
             .map_err(AppCommandError::from)?;
-            let request_id = parse_canonical_uuid_v4(&identity.request_id)
-                .map_err(AppCommandError::from)?;
+            let request_id =
+                parse_canonical_uuid_v4(&identity.request_id).map_err(AppCommandError::from)?;
 
             if let Some(guard) = state.guards.get(&key) {
                 if request.source_sequence < guard.source_sequence {
@@ -596,12 +588,12 @@ impl ReferenceSearchRegistry {
                     }
                 }
 
-                if page_index != 0 && page_index != job.next_expected {
-                    if job.latest_page.as_ref().map(|p| p.page_index) != Some(page_index)
-                        && job.page_zero.as_ref().map(|p| p.page_index) != Some(page_index)
-                    {
-                        return Err(error_stale_page());
-                    }
+                if page_index != 0
+                    && page_index != job.next_expected
+                    && job.latest_page.as_ref().map(|p| p.page_index) != Some(page_index)
+                    && job.page_zero.as_ref().map(|p| p.page_index) != Some(page_index)
+                {
+                    return Err(error_stale_page());
                 }
 
                 if job.in_flight != Some(page_index) {
@@ -648,10 +640,7 @@ impl ReferenceSearchRegistry {
             )
         };
 
-        let permits = match self
-            .acquire_scan_permits(source, &cancel, deadline)
-            .await
-        {
+        let permits = match self.acquire_scan_permits(source, &cancel, deadline).await {
             Ok(permits) => permits,
             Err(error) => {
                 self.fail_job(key, error).await;
@@ -949,8 +938,7 @@ fn job_still_current(
 
 impl RegistryState {
     fn sweep_guards(&mut self, now: Instant) {
-        self.guards
-            .retain(|_, guard| guard.retain_until > now);
+        self.guards.retain(|_, guard| guard.retain_until > now);
     }
 }
 
@@ -962,9 +950,7 @@ fn source_job_cap(source: ReferenceSearchSource) -> usize {
     }
 }
 
-fn validate_start_arguments(
-    request: &StartReferenceSearchRequest,
-) -> Result<(), AppCommandError> {
+fn validate_start_arguments(request: &StartReferenceSearchRequest) -> Result<(), AppCommandError> {
     validate_source_scope(request.source, request.workspace_path.as_deref())
         .map_err(AppCommandError::from)
 }
@@ -1129,10 +1115,7 @@ fn error_stale_page() -> AppCommandError {
 }
 
 fn error_job_expired() -> AppCommandError {
-    AppCommandError::new(
-        AppErrorCode::JobExpired,
-        "reference search job expired",
-    )
+    AppCommandError::new(AppErrorCode::JobExpired, "reference search job expired")
 }
 
 fn error_limit_epoch_changed() -> AppCommandError {
@@ -1557,9 +1540,7 @@ mod tests {
                     return count;
                 }
                 if Instant::now() >= deadline {
-                    panic!(
-                        "timed out waiting for {source:?} scan count {target}, have {count}"
-                    );
+                    panic!("timed out waiting for {source:?} scan count {target}, have {count}");
                 }
                 tokio::task::yield_now().await;
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1694,7 +1675,11 @@ mod tests {
         seed_registered(&registry, ReferenceSearchSource::Conversation, 32).await;
         seed_registered(&registry, ReferenceSearchSource::Commit, 8).await;
         assert_eq!(registry.registered_count().await, 64);
-        assert_overloaded(registry.start(unique_start(ReferenceSearchSource::File)).await);
+        assert_overloaded(
+            registry
+                .start(unique_start(ReferenceSearchSource::File))
+                .await,
+        );
 
         let scans = blocked_scan_fixture().await;
         scans.start_distinct_sources_to_global_cap(12).await;
@@ -1703,9 +1688,7 @@ mod tests {
         assert!(timeout(Duration::from_millis(20), &mut thirteenth)
             .await
             .is_err());
-        scans
-            .release_one(ReferenceSearchSource::Conversation)
-            .await;
+        scans.release_one(ReferenceSearchSource::Conversation).await;
         assert_eq!(scans.wait_for_started_scan_count(13).await, 13);
         scans.release_all().await;
         thirteenth.await.unwrap().unwrap();
@@ -1718,9 +1701,7 @@ mod tests {
         assert!(timeout(Duration::from_millis(20), &mut fifth)
             .await
             .is_err());
-        per_source
-            .release_one(ReferenceSearchSource::Commit)
-            .await;
+        per_source.release_one(ReferenceSearchSource::Commit).await;
         assert_eq!(per_source.wait_for_started_scan_count(5).await, 5);
         per_source.release_all().await;
         fifth.await.unwrap().unwrap();
@@ -1769,13 +1750,19 @@ mod tests {
         tokio::time::advance(Duration::from_secs(30)).await;
         registry.sweep_expired(Instant::now()).await;
 
-        let expired = registry.start(request.clone()).await.expect_err("job expired");
+        let expired = registry
+            .start(request.clone())
+            .await
+            .expect_err("job expired");
         assert_eq!(expired.code, AppErrorCode::JobExpired);
         assert_eq!(registry.registered_count().await, 0);
 
         // Lower and equal sequences stay rejected while the five-minute guard lives.
         let lower = start_request(ReferenceSearchSource::Conversation, 1, UUID_A);
-        let lower_err = registry.start(lower).await.expect_err("equal still expired");
+        let lower_err = registry
+            .start(lower)
+            .await
+            .expect_err("equal still expired");
         assert_eq!(lower_err.code, AppErrorCode::JobExpired);
 
         let older = StartReferenceSearchRequest {
@@ -1807,9 +1794,7 @@ mod tests {
             let start = start.clone();
             tokio::spawn(async move { registry.start(start).await })
         };
-        scans
-            .wait_for_started_scan_count(1)
-            .await;
+        scans.wait_for_started_scan_count(1).await;
 
         let epoch = registry.set_limit(25).await;
         assert!(epoch >= 1);
@@ -1818,7 +1803,10 @@ mod tests {
         assert_eq!(error.code, AppErrorCode::LimitEpochChanged);
 
         // Exact equal-sequence retry replays the guard error without a slot.
-        let replay = registry.start(start.clone()).await.expect_err("replay epoch");
+        let replay = registry
+            .start(start.clone())
+            .await
+            .expect_err("replay epoch");
         assert_eq!(replay.code, AppErrorCode::LimitEpochChanged);
         assert_eq!(registry.registered_count().await, 0);
 

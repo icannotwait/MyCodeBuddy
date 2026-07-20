@@ -3,9 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { WorkspaceEnvelopeListener } from "./use-workspace-state-store"
 import type { FileTreeNode } from "@/lib/types"
-import {
-  FILE_TREE_SHOW_IGNORED_STORAGE_KEY,
-} from "@/lib/file-tree-display-prefs"
+import { FILE_TREE_SHOW_IGNORED_STORAGE_KEY } from "@/lib/file-tree-display-prefs"
 import {
   shouldRefreshIgnoredTree,
   useIgnoredFileTree,

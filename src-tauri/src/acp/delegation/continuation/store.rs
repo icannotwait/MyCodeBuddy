@@ -1479,7 +1479,7 @@ fn patch_control<T>(patch: &FieldPatch<T>) -> i64 {
 
 fn datetime_patch_value(patch: &FieldPatch<DateTime<Utc>>) -> sea_orm::Value {
     match patch {
-        FieldPatch::Set(value) => value.clone().into(),
+        FieldPatch::Set(value) => (*value).into(),
         FieldPatch::Keep | FieldPatch::Clear => Option::<String>::None.into(),
     }
 }

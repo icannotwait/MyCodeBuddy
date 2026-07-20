@@ -583,44 +583,38 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
     use crate::acp::delegation::meta_writer::DelegationMetaSnapshot;
     use crate::db::entities::conversation::DelegationTaskStatus;
 
-    let (status, error_code): (String, Option<String>) =
-        if let Some(task_status) = child.delegation_task_status.as_ref() {
-            match task_status {
-                DelegationTaskStatus::Running => ("running".into(), None),
-                DelegationTaskStatus::Completed => ("completed".into(), None),
-                DelegationTaskStatus::Failed => {
-                    ("failed".into(), child.delegation_error_code.clone())
-                }
-                DelegationTaskStatus::Canceled => {
-                    ("failed".into(), child.delegation_error_code.clone())
-                }
+    let (status, error_code): (String, Option<String>) = if let Some(task_status) =
+        child.delegation_task_status.as_ref()
+    {
+        match task_status {
+            DelegationTaskStatus::Running => ("running".into(), None),
+            DelegationTaskStatus::Completed => ("completed".into(), None),
+            DelegationTaskStatus::Failed => ("failed".into(), child.delegation_error_code.clone()),
+            DelegationTaskStatus::Canceled => {
+                ("failed".into(), child.delegation_error_code.clone())
             }
-        } else {
-            // Pre-lifecycle conversation-status mapping (no durable task row).
-            // `cancelled` covers both user-cancel and turn-failure modes; the
-            // DB does not persist a distinct error_code for those rows.
-            let status = match child.status.as_str() {
-                "in_progress" => "running",
-                "pending_review" | "completed" => "completed",
-                "cancelled" => "failed",
-                _ => "running",
-            };
-            (status.into(), None)
+        }
+    } else {
+        // Pre-lifecycle conversation-status mapping (no durable task row).
+        // `cancelled` covers both user-cancel and turn-failure modes; the
+        // DB does not persist a distinct error_code for those rows.
+        let status = match child.status.as_str() {
+            "in_progress" => "running",
+            "pending_review" | "completed" => "completed",
+            "cancelled" => "failed",
+            _ => "running",
         };
+        (status.into(), None)
+    };
 
     let snapshot = DelegationMetaSnapshot {
         status,
-        task_id: child
-            .delegation_call_id
-            .clone()
-            .unwrap_or_default(),
+        task_id: child.delegation_call_id.clone().unwrap_or_default(),
         child_connection_id: None,
         child_conversation_id: child.id,
         error_code,
         text_preview: None,
-        started_at: child
-            .delegation_started_at
-            .unwrap_or(child.created_at),
+        started_at: child.delegation_started_at.unwrap_or(child.created_at),
         finished_at: child.delegation_finished_at,
         // Historical null → omit; never fabricate zero counts.
         runtime_stats: child.delegation_runtime_stats.clone(),
@@ -2109,7 +2103,9 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 
 #[cfg(test)]
 mod tests {
-    fn inert_title_coordinator(db: &crate::db::AppDatabase) -> std::sync::Arc<crate::auto_title::AutoTitleCoordinator> {
+    fn inert_title_coordinator(
+        db: &crate::db::AppDatabase,
+    ) -> std::sync::Arc<crate::auto_title::AutoTitleCoordinator> {
         crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone())
     }
 
@@ -3321,9 +3317,13 @@ mod tests {
             .unwrap()
             .is_some());
 
-        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
-            .await
-            .expect("delete conversation");
+        delete_conversation_core(
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            res.conversation_id,
+        )
+        .await
+        .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
 
         // After cleanup the hidden folder is soft-deleted (no longer returned),
@@ -3414,9 +3414,13 @@ mod tests {
         )
         .await
         .expect("create");
-        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
-            .await
-            .expect("delete conversation");
+        delete_conversation_core(
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            res.conversation_id,
+        )
+        .await
+        .expect("delete conversation");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
         // Cleanup soft-deletes the folder row but intentionally leaves the dir.
         assert!(std::path::Path::new(&res.folder.path).is_dir());
@@ -3582,9 +3586,13 @@ mod tests {
                 .expect("second conversation");
 
         // Deleting the first must NOT retire the folder — the second remains.
-        delete_conversation_core(&db.conn, inert_title_coordinator(&db).as_ref(), res.conversation_id)
-            .await
-            .expect("delete first");
+        delete_conversation_core(
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            res.conversation_id,
+        )
+        .await
+        .expect("delete first");
         cleanup_chat_folder_for_deleted_conversation(&db.conn, res.folder_id).await;
         assert!(
             folder_service::get_folder_by_id(&db.conn, res.folder_id)
@@ -4101,9 +4109,14 @@ mod tests {
         let conv_id = create_conversation_core(&db.conn, folder_id, AgentType::Gemini, None, None)
             .await
             .expect("create");
-        update_conversation_title_core(&db.conn, inert_title_coordinator(&db).as_ref(), conv_id, "Renamed".into())
-            .await
-            .expect("update");
+        update_conversation_title_core(
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            conv_id,
+            "Renamed".into(),
+        )
+        .await
+        .expect("update");
         let summary = conversation_service::get_by_id(&db.conn, conv_id)
             .await
             .expect("read back");
@@ -4533,9 +4546,14 @@ mod tests {
         .expect("child");
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_with_cleanup_core(&emitter, &db.conn, inert_title_coordinator(&db).as_ref(), child.id)
-            .await
-            .expect("delete child");
+        delete_conversation_with_cleanup_core(
+            &emitter,
+            &db.conn,
+            inert_title_coordinator(&db).as_ref(),
+            child.id,
+        )
+        .await
+        .expect("delete child");
         let mut saw_deleted = false;
         let mut saw_parent_upsert = false;
         while let Ok(evt) = rx.try_recv() {

@@ -127,22 +127,16 @@ mod tests {
         conn
     }
 
-    fn has_column(
-        columns: &[sea_orm_migration::sea_orm::QueryResult],
-        name: &str,
-    ) -> bool {
-        columns.iter().any(|row| {
-            row.try_get::<String>("", "name").ok().as_deref() == Some(name)
-        })
+    fn has_column(columns: &[sea_orm_migration::sea_orm::QueryResult], name: &str) -> bool {
+        columns
+            .iter()
+            .any(|row| row.try_get::<String>("", "name").ok().as_deref() == Some(name))
     }
 
-    fn has_index(
-        indexes: &[sea_orm_migration::sea_orm::QueryResult],
-        name: &str,
-    ) -> bool {
-        indexes.iter().any(|row| {
-            row.try_get::<String>("", "name").ok().as_deref() == Some(name)
-        })
+    fn has_index(indexes: &[sea_orm_migration::sea_orm::QueryResult], name: &str) -> bool {
+        indexes
+            .iter()
+            .any(|row| row.try_get::<String>("", "name").ok().as_deref() == Some(name))
     }
 
     async fn job_columns(
@@ -186,8 +180,7 @@ mod tests {
         let first_prompt_at: Option<String> = conn
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT first_prompt_at FROM auto_title_jobs WHERE conversation_id = 7"
-                    .to_owned(),
+                "SELECT first_prompt_at FROM auto_title_jobs WHERE conversation_id = 7".to_owned(),
             ))
             .await
             .expect("legacy row query")
@@ -281,12 +274,10 @@ mod tests {
             .await
             .expect("legacy query")
             .expect("legacy row");
-        let first_user_text: Option<String> = row
-            .try_get("", "first_user_text")
-            .expect("first_user_text");
-        let first_prompt_at: Option<String> = row
-            .try_get("", "first_prompt_at")
-            .expect("first_prompt_at");
+        let first_user_text: Option<String> =
+            row.try_get("", "first_user_text").expect("first_user_text");
+        let first_prompt_at: Option<String> =
+            row.try_get("", "first_prompt_at").expect("first_prompt_at");
 
         assert_eq!(first_user_text.as_deref(), Some("old task"));
         assert!(

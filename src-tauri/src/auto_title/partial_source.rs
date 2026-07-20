@@ -160,10 +160,7 @@ mod tests {
             EventEmitter::Noop,
         )
         .await;
-        let state = mgr
-            .get_state(conn_id)
-            .await
-            .expect("test connection state");
+        let state = mgr.get_state(conn_id).await.expect("test connection state");
         let mut guard = state.write().await;
         guard.conversation_id = Some(conversation_id);
         guard.live_message = live_message;

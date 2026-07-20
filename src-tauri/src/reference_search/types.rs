@@ -65,7 +65,11 @@ pub struct ValidateReferenceCandidateRequest {
 
 /// Outcome of validating a selected reference candidate against live state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ReferenceCandidateValidation {
     Match {
         validation_request_id: String,
@@ -116,7 +120,11 @@ pub struct ReferenceFieldMatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ReferenceCandidateMetadata {
     File {
         canonical_workspace_root: String,
@@ -272,9 +280,8 @@ impl From<ReferenceSearchError> for AppCommandError {
 /// form (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`). Uppercase, braced, simple,
 /// and URN spellings are rejected even when the UUID crate could parse them.
 pub fn parse_canonical_uuid_v4(value: &str) -> Result<Uuid, ReferenceSearchError> {
-    let parsed = Uuid::parse_str(value).map_err(|_| {
-        ReferenceSearchError::invalid_request(format!("invalid UUID: {value}"))
-    })?;
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| ReferenceSearchError::invalid_request(format!("invalid UUID: {value}")))?;
     if parsed.get_version_num() != 4 {
         return Err(ReferenceSearchError::invalid_request(format!(
             "UUID must be version 4: {value}"

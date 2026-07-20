@@ -286,8 +286,7 @@ pub struct ActiveDelegationState {
     /// Open parent-decision request, if any. Cleared by
     /// `DelegationAttentionChanged { attention_request: None }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attention_request:
-        Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    pub attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     /// Soft-watchdog health for this still-running card. Absent until the
     /// supervisor publishes; cleared only when the card is removed on complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2416,7 +2415,9 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn empty_stats(started: DateTime<Utc>) -> crate::acp::delegation::runtime_stats::DelegationRuntimeStats {
+    fn empty_stats(
+        started: DateTime<Utc>,
+    ) -> crate::acp::delegation::runtime_stats::DelegationRuntimeStats {
         crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started)
     }
 
@@ -2537,15 +2538,13 @@ mod tests {
         });
         let snapshot = state.to_snapshot();
         assert_eq!(snapshot.active_delegations[0].task_id, "task-1");
-        assert_eq!(snapshot.active_delegations[0].runtime_stats.tool_call_count, 3);
+        assert_eq!(
+            snapshot.active_delegations[0].runtime_stats.tool_call_count,
+            3
+        );
         assert_eq!(snapshot.active_delegations[0].attention_request, None);
 
-        state.apply_event(&delegation_completed_with(
-            "tool-1",
-            "task-1",
-            99,
-            changed,
-        ));
+        state.apply_event(&delegation_completed_with("tool-1", "task-1", 99, changed));
         assert!(state.active_delegations.is_empty());
     }
 
@@ -2576,14 +2575,12 @@ mod tests {
         state.apply_event(&AcpEvent::DelegationAttentionChanged {
             parent_tool_use_id: "tool-1".into(),
             task_id: "task-1".into(),
-            attention_request: Some(
-                crate::acp::delegation::attention::AttentionRequestSummary {
-                    request_id: "req-1".into(),
-                    task_id: "task-1".into(),
-                    message: "q".into(),
-                    created_at: dt("2026-07-17T10:01:00Z"),
-                },
-            ),
+            attention_request: Some(crate::acp::delegation::attention::AttentionRequestSummary {
+                request_id: "req-1".into(),
+                task_id: "task-1".into(),
+                message: "q".into(),
+                created_at: dt("2026-07-17T10:01:00Z"),
+            }),
         });
         state.apply_event(&back);
         assert_eq!(
@@ -2600,7 +2597,12 @@ mod tests {
     fn runtime_and_attention_events_ignore_mismatched_task_id() {
         let mut state = fresh_state();
         let started = empty_stats(dt("2026-07-17T10:00:00Z"));
-        state.apply_event(&delegation_started_with("tool-1", "task-1", 1, started.clone()));
+        state.apply_event(&delegation_started_with(
+            "tool-1",
+            "task-1",
+            1,
+            started.clone(),
+        ));
         let mut other = started;
         other.tool_call_count = 9;
         state.apply_event(&AcpEvent::DelegationRuntimeStatsChanged {
@@ -2611,14 +2613,12 @@ mod tests {
         state.apply_event(&AcpEvent::DelegationAttentionChanged {
             parent_tool_use_id: "tool-1".into(),
             task_id: "task-other".into(),
-            attention_request: Some(
-                crate::acp::delegation::attention::AttentionRequestSummary {
-                    request_id: "x".into(),
-                    task_id: "task-other".into(),
-                    message: "no".into(),
-                    created_at: dt("2026-07-17T10:01:00Z"),
-                },
-            ),
+            attention_request: Some(crate::acp::delegation::attention::AttentionRequestSummary {
+                request_id: "x".into(),
+                task_id: "task-other".into(),
+                message: "no".into(),
+                created_at: dt("2026-07-17T10:01:00Z"),
+            }),
         });
         let card = state.active_delegations.get("tool-1").unwrap();
         assert_eq!(card.runtime_stats.tool_call_count, 0);
@@ -2946,9 +2946,7 @@ mod tests {
         let live = LiveMessage {
             id: "m".into(),
             role: MessageRole::Assistant,
-            content: vec![LiveContentBlock::Thinking {
-                text: "…".into(),
-            }],
+            content: vec![LiveContentBlock::Thinking { text: "…".into() }],
             started_at: Utc::now(),
         };
         assert_eq!(visible_assistant_text(Some(&live)), "");

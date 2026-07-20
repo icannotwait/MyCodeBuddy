@@ -1967,7 +1967,9 @@ mod tests {
         .to_string();
 
         let response = unwrap_respond(dispatch_with_features(COORDINATION, &line).await);
-        let error = response.error.expect("positive coordination wait must fail");
+        let error = response
+            .error
+            .expect("positive coordination wait must fail");
         assert_eq!(error.code, -32602);
         assert_eq!(
             error.message,
@@ -3165,6 +3167,7 @@ mod tests {
             socket_path: sock,
             token: "tok".into(),
             features: FEEDBACK_ONLY,
+            role: CompanionRole::Root,
         };
         let inflight = Arc::new(InflightCalls::new());
         // tools/call → Spawn (registers the inflight entry).

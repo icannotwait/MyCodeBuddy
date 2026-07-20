@@ -119,11 +119,23 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         seed_parent_conversation(&db).await;
 
-        db.execute(continuation_insert("continuation-1", 1, "waiting", "prompt-1", "marker-1"))
-            .await
-            .unwrap();
+        db.execute(continuation_insert(
+            "continuation-1",
+            1,
+            "waiting",
+            "prompt-1",
+            "marker-1",
+        ))
+        .await
+        .unwrap();
         assert!(db
-            .execute(continuation_insert("continuation-2", 2, "arming", "prompt-2", "marker-2"))
+            .execute(continuation_insert(
+                "continuation-2",
+                2,
+                "arming",
+                "prompt-2",
+                "marker-2"
+            ))
             .await
             .is_err());
 
@@ -132,20 +144,44 @@ mod tests {
         ))
         .await
         .unwrap();
-        db.execute(continuation_insert("continuation-2", 2, "arming", "prompt-2", "marker-2"))
-            .await
-            .unwrap();
+        db.execute(continuation_insert(
+            "continuation-2",
+            2,
+            "arming",
+            "prompt-2",
+            "marker-2",
+        ))
+        .await
+        .unwrap();
 
         assert!(db
-            .execute(continuation_insert("continuation-3", 2, "completed", "prompt-3", "marker-3"))
+            .execute(continuation_insert(
+                "continuation-3",
+                2,
+                "completed",
+                "prompt-3",
+                "marker-3"
+            ))
             .await
             .is_err());
         assert!(db
-            .execute(continuation_insert("continuation-3", 3, "completed", "prompt-2", "marker-3"))
+            .execute(continuation_insert(
+                "continuation-3",
+                3,
+                "completed",
+                "prompt-2",
+                "marker-3"
+            ))
             .await
             .is_err());
         assert!(db
-            .execute(continuation_insert("continuation-3", 3, "completed", "prompt-3", "marker-2"))
+            .execute(continuation_insert(
+                "continuation-3",
+                3,
+                "completed",
+                "prompt-3",
+                "marker-2"
+            ))
             .await
             .is_err());
     }
@@ -155,10 +191,7 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
-        Migration
-            .down(&SchemaManager::new(&db))
-            .await
-            .unwrap();
+        Migration.down(&SchemaManager::new(&db)).await.unwrap();
 
         assert!(db
             .query_one(sql("SELECT 1 FROM delegation_continuations"))

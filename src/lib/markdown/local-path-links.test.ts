@@ -153,7 +153,9 @@ describe("findAbsoluteLocalPathRanges", () => {
 
   it("still accepts POSIX paths that contain ASCII after CJK prose", () => {
     expect(
-      links("进度走 /Users/me/app.ts 与 /tmp/目录/a.ts").map((item) => item.label)
+      links("进度走 /Users/me/app.ts 与 /tmp/目录/a.ts").map(
+        (item) => item.label
+      )
     ).toEqual(["/Users/me/app.ts", "/tmp/目录/a.ts"])
   })
 

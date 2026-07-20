@@ -4063,7 +4063,7 @@ mod tests {
             .unwrap();
 
         let still_open = attention
-            .list_open_for_tasks(11, &[task_id.clone()])
+            .list_open_for_tasks(11, std::slice::from_ref(&task_id))
             .await
             .unwrap();
         assert_eq!(still_open.len(), 1);
@@ -4088,7 +4088,7 @@ mod tests {
         // Let recover settle; row still open with same id.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let open_again = attention
-            .list_open_for_tasks(11, &[task_id.clone()])
+            .list_open_for_tasks(11, std::slice::from_ref(&task_id))
             .await
             .unwrap();
         assert_eq!(open_again.len(), 1);
@@ -4362,7 +4362,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let grand_request_id = loop {
             if let Ok(open) = attention
-                .list_open_for_tasks(2, &[grandchild.clone()])
+                .list_open_for_tasks(2, std::slice::from_ref(&grandchild))
                 .await
             {
                 if let Some(s) = open.into_iter().next() {
@@ -4408,7 +4408,7 @@ mod tests {
         });
         let mid_request_id = loop {
             if let Ok(open) = attention
-                .list_open_for_tasks(1, &[root_child.clone()])
+                .list_open_for_tasks(1, std::slice::from_ref(&root_child))
                 .await
             {
                 if let Some(s) = open.into_iter().next() {

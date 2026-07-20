@@ -152,11 +152,7 @@ impl MigrationTrait for Migration {
         // Reverse dependency order: registry → jobs (index drops with table) →
         // conversation column.
         manager
-            .drop_table(
-                Table::drop()
-                    .table(InternalAgentSessions::Table)
-                    .to_owned(),
-            )
+            .drop_table(Table::drop().table(InternalAgentSessions::Table).to_owned())
             .await?;
 
         manager
@@ -230,13 +226,10 @@ mod tests {
         conn
     }
 
-    fn has_column(
-        columns: &[sea_orm_migration::sea_orm::QueryResult],
-        name: &str,
-    ) -> bool {
-        columns.iter().any(|row| {
-            row.try_get::<String>("", "name").ok().as_deref() == Some(name)
-        })
+    fn has_column(columns: &[sea_orm_migration::sea_orm::QueryResult], name: &str) -> bool {
+        columns
+            .iter()
+            .any(|row| row.try_get::<String>("", "name").ok().as_deref() == Some(name))
     }
 
     #[tokio::test]
@@ -330,8 +323,7 @@ mod tests {
             .expect("index list");
         assert!(
             indexes.iter().any(|row| {
-                row.try_get::<String>("", "name").ok().as_deref()
-                    == Some(IDX_AUTO_TITLE_JOBS_QUEUE)
+                row.try_get::<String>("", "name").ok().as_deref() == Some(IDX_AUTO_TITLE_JOBS_QUEUE)
             }),
             "queue index missing"
         );
@@ -383,7 +375,10 @@ mod tests {
                  VALUES (7, 'ready', 0, -1, 0, '2026-01-01T00:00:00Z')",
             )
             .await;
-        assert!(bad_usable.is_err(), "negative usable_turn_seq must be rejected");
+        assert!(
+            bad_usable.is_err(),
+            "negative usable_turn_seq must be rejected"
+        );
         let bad_attempt_seq = conn
             .execute_unprepared(
                 "INSERT INTO auto_title_jobs \
@@ -436,7 +431,10 @@ mod tests {
             .expect("cascade count row")
             .try_get("", "count")
             .expect("count");
-        assert_eq!(after_cascade, 0, "job must cascade-delete with conversation");
+        assert_eq!(
+            after_cascade, 0,
+            "job must cascade-delete with conversation"
+        );
 
         // down removes all three schema additions.
         // Re-insert conversation so down only needs to drop schema objects

@@ -62,8 +62,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::acp::delegation::attention::{
     validate_attention_payload, AttentionOpenResult, AttentionRecord, AttentionResolutionCode,
-    AttentionResolveResult,
-    AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
+    AttentionResolveResult, AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
     NoopDelegationAttentionStore,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
@@ -3639,9 +3638,7 @@ impl DelegationBroker {
                         attention_request,
                     )
                     .await;
-                    runtime
-                        .started_published
-                        .store(true, Ordering::Release);
+                    runtime.started_published.store(true, Ordering::Release);
                 }
             }
         }
@@ -4013,11 +4010,7 @@ impl DelegationBroker {
 
     /// Project a structured child ToolCall / ToolCallUpdate into the live
     /// runtime stats for the coordinating task (if any).
-    pub async fn project_child_tool_event(
-        &self,
-        child_connection_id: &str,
-        event: &AcpEvent,
-    ) {
+    pub async fn project_child_tool_event(&self, child_connection_id: &str, event: &AcpEvent) {
         if !matches!(
             event,
             AcpEvent::ToolCall { .. } | AcpEvent::ToolCallUpdate { .. }
@@ -4087,11 +4080,7 @@ impl DelegationBroker {
         self.schedule_runtime_flush(identity.task_id.clone(), identity.runtime);
     }
 
-    fn record_runtime_projection_error(
-        &self,
-        kind: RuntimeProjectionErrorKind,
-        task_id: &str,
-    ) {
+    fn record_runtime_projection_error(&self, kind: RuntimeProjectionErrorKind, task_id: &str) {
         tracing::error!(
             %task_id,
             kind = kind.as_str(),
@@ -4100,10 +4089,7 @@ impl DelegationBroker {
     }
 
     fn schedule_runtime_flush(&self, task_id: String, state: Arc<LiveRuntimeState>) {
-        if state
-            .coalesced_persistence_disabled
-            .load(Ordering::Acquire)
-        {
+        if state.coalesced_persistence_disabled.load(Ordering::Acquire) {
             return;
         }
         if state
@@ -4214,10 +4200,7 @@ impl DelegationBroker {
                         }
                     }
                 }
-                if state
-                    .coalesced_persistence_disabled
-                    .load(Ordering::Acquire)
-                {
+                if state.coalesced_persistence_disabled.load(Ordering::Acquire) {
                     state.flush_scheduled.store(false, Ordering::Release);
                     return;
                 }
@@ -4691,11 +4674,8 @@ impl DelegationBroker {
                 false,
             )
             .await;
-        self.settle_drained_for_parent_end(
-            drained,
-            ParentTurnEndReason::ParentDisconnected,
-        )
-        .await;
+        self.settle_drained_for_parent_end(drained, ParentTurnEndReason::ParentDisconnected)
+            .await;
     }
 
     /// Cascade-cancel every live descendant under `parent_connection_id` for a
@@ -6136,7 +6116,9 @@ mod tests {
         spawner.queue_spawn(Ok(child_conn.into())).await;
         // Distinct child conversation ids per child connection name.
         let child_conv = child_conn.bytes().map(|b| b as i32).sum::<i32>().abs() + 1;
-        spawner.queue_send(Ok(accepted(child_conv, Utc::now()))).await;
+        spawner
+            .queue_send(Ok(accepted(child_conv, Utc::now())))
+            .await;
         let mut req = request(parent_conv, child_conn);
         req.parent_connection_id = parent_conn.into();
         broker
@@ -6700,8 +6682,10 @@ mod tests {
         async fn load(
             &self,
             task_id: &str,
-        ) -> Result<Option<crate::acp::delegation::store::PersistedTask>, crate::acp::delegation::store::TaskStoreError>
-        {
+        ) -> Result<
+            Option<crate::acp::delegation::store::PersistedTask>,
+            crate::acp::delegation::store::TaskStoreError,
+        > {
             self.inner.load(task_id).await
         }
         async fn settle(
@@ -6778,9 +6762,7 @@ mod tests {
             _task_id: &str,
             _started_at: DateTime<Utc>,
             _runtime_stats: DelegationRuntimeStats,
-            _attention_request: Option<
-                crate::acp::delegation::attention::AttentionRequestSummary,
-            >,
+            _attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
         ) {
         }
         async fn emit_completed(
@@ -6810,9 +6792,7 @@ mod tests {
             _parent_connection_id: &str,
             _parent_tool_use_id: &str,
             _task_id: &str,
-            _attention_request: Option<
-                crate::acp::delegation::attention::AttentionRequestSummary,
-            >,
+            _attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
         ) {
             self.log.lock().await.push("attention_event".into());
         }
@@ -6840,9 +6820,7 @@ mod tests {
         let (broker, spawner, store, _attention) = coordination_broker().await;
         spawner.queue_spawn(Ok("child-conn".into())).await;
         let persisted_start = dt("2026-07-17T10:00:00Z");
-        spawner
-            .queue_send(Ok(accepted(22, persisted_start)))
-            .await;
+        spawner.queue_send(Ok(accepted(22, persisted_start))).await;
         let release = spawner.install_send_gate().await;
         let start = tokio::spawn({
             let broker = broker.clone();
@@ -6875,7 +6853,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            store.latest_runtime(&task_id).await.unwrap().tool_call_count,
+            store
+                .latest_runtime(&task_id)
+                .await
+                .unwrap()
+                .tool_call_count,
             1
         );
         assert_eq!(
@@ -6893,9 +6875,7 @@ mod tests {
             tool_update("tc-1", Some("Edit"), edit_meta("a.rs", "+x")),
             tool_call("tc-2", "search", "Search"),
         ] {
-            broker
-                .project_child_tool_event("child-conn", &event)
-                .await;
+            broker.project_child_tool_event("child-conn", &event).await;
         }
         assert_eq!(store.runtime_write_count(&task_id).await, 0);
 
@@ -6993,14 +6973,13 @@ mod tests {
             .project_child_tool_event("child-conn", &tool_call("tc-1", "edit", "Edit"))
             .await;
 
-        let report = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(1),
             broker.complete_call(&task_id, completed_outcome("done")),
         )
         .await
-        .unwrap();
+        .expect("complete_call must finish");
         // complete_call returns (); inspect store status.
-        let _ = report;
         assert_eq!(
             store.load(&task_id).await.unwrap().unwrap().status,
             TaskStatus::Completed
@@ -7033,9 +7012,7 @@ mod tests {
         let (broker, spawner, store, _attention) = coordination_broker().await;
         spawner.queue_spawn(Ok("child-conn".into())).await;
         let persisted_start = dt("2026-07-17T11:00:00Z");
-        spawner
-            .queue_send(Ok(accepted(22, persisted_start)))
-            .await;
+        spawner.queue_send(Ok(accepted(22, persisted_start))).await;
         let release = spawner.install_send_gate().await;
         let start = tokio::spawn({
             let broker = broker.clone();
@@ -7208,18 +7185,13 @@ mod tests {
         // --- Event wins projector lock before terminal ---
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        runtime
-            .install_projector_gate(entered_tx, release_rx)
-            .await;
+        runtime.install_projector_gate(entered_tx, release_rx).await;
 
         let project = tokio::spawn({
             let broker = broker.clone();
             async move {
                 broker
-                    .project_child_tool_event(
-                        "child-conn",
-                        &tool_call("tc-before", "read", "Read"),
-                    )
+                    .project_child_tool_event("child-conn", &tool_call("tc-before", "read", "Read"))
                     .await;
             }
         });
@@ -7392,7 +7364,7 @@ mod tests {
             store.load(&task_id).await.unwrap().unwrap().status,
             TaskStatus::Completed
         );
-        let _ = report;
+        let _status = report.status;
     }
 
     #[tokio::test]
@@ -7406,9 +7378,7 @@ mod tests {
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("child-conn".into())).await;
         let persisted_start = dt("2026-07-17T13:00:00Z");
-        spawner
-            .queue_send(Ok(accepted(33, persisted_start)))
-            .await;
+        spawner.queue_send(Ok(accepted(33, persisted_start))).await;
         let send_release = spawner.install_send_gate().await;
         let store = Arc::new(MockTaskStore::accept_any_running_loadable(33));
         let meta = Arc::new(MockMetaWriter::new());
@@ -7727,7 +7697,10 @@ mod tests {
     async fn parent_failure_and_disconnect_keep_distinct_codes() {
         for (reason, expected) in [
             (ParentTurnEndReason::ParentTurnFailed, "parent_turn_failed"),
-            (ParentTurnEndReason::ParentDisconnected, "parent_disconnected"),
+            (
+                ParentTurnEndReason::ParentDisconnected,
+                "parent_disconnected",
+            ),
         ] {
             let (broker, spawner, store, _attention) = coordination_broker().await;
             let task = spawn_running(&broker, &spawner, "parent", 1, "child").await;
@@ -7822,10 +7795,7 @@ mod tests {
         wait_for_terminal(&store, &task).await;
         let stored = {
             use crate::acp::delegation::attention::DelegationAttentionStore;
-            attention
-                .wait_snapshot(&request.request_id)
-                .await
-                .unwrap()
+            attention.wait_snapshot(&request.request_id).await.unwrap()
         };
         assert_eq!(
             attention.resolution_winner_count(&request.request_id).await,
@@ -7901,18 +7871,13 @@ mod tests {
             (broker, spawner, store, attention, events)
         }
 
-        fn assert_exclusive_attention_resolution(
-            ordered: &[ProjectionEmit],
-            expect_clear: bool,
-        ) {
+        fn assert_exclusive_attention_resolution(ordered: &[ProjectionEmit], expect_clear: bool) {
             let mut clears = 0usize;
             let mut completed = 0usize;
             let mut clear_after_completed = false;
             for item in ordered {
                 match item {
-                    ProjectionEmit::AttentionChanged(call)
-                        if call.attention_request.is_none() =>
-                    {
+                    ProjectionEmit::AttentionChanged(call) if call.attention_request.is_none() => {
                         clears += 1;
                         if completed > 0 {
                             clear_after_completed = true;
@@ -8126,14 +8091,13 @@ mod tests {
         mock.queue_spawn(Ok("c-gate".into())).await;
         mock.queue_send(Ok(accepted(91, Utc::now()))).await;
         let release = mock.install_spawn_gate().await;
-        let store = Arc::new(crate::acp::delegation::store::mock::MockTaskStore::accept_any_running(91));
-        let broker = DelegationBroker::new(
-            mock.clone() as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        )
-        .with_task_store(
-            store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
-        );
+        let store =
+            Arc::new(crate::acp::delegation::store::mock::MockTaskStore::accept_any_running(91));
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(
+                    store.clone() as Arc<dyn crate::acp::delegation::store::DelegationTaskStore>
+                );
         enable_delegation(&broker).await;
 
         let driver = {
@@ -11501,10 +11465,7 @@ mod tests {
         }
         // Wrong-parent cancel — a no-op for this setup.
         broker
-            .cancel_by_parent_turn(
-                "some-other-parent",
-                ParentTurnEndReason::ParentCanceled,
-            )
+            .cancel_by_parent_turn("some-other-parent", ParentTurnEndReason::ParentCanceled)
             .await;
         let _ = release.send(());
 
@@ -12942,10 +12903,7 @@ mod tests {
                             agent_type: AgentType::ClaudeCode,
                             external_handle: None,
                             started_at: Instant::now(),
-                            runtime: Arc::new(LiveRuntimeState::new(
-                                Utc::now(),
-                                PathBuf::new(),
-                            )),
+                            runtime: Arc::new(LiveRuntimeState::new(Utc::now(), PathBuf::new())),
                         },
                     );
                 }
@@ -13743,7 +13701,8 @@ mod tests {
         for (i, label) in labels.iter().enumerate() {
             let child = format!("child-{label}");
             mock.queue_spawn(Ok(child)).await;
-            mock.queue_send(Ok(accepted((i + 1) as i32, Utc::now()))).await;
+            mock.queue_send(Ok(accepted((i + 1) as i32, Utc::now())))
+                .await;
             let task_id = broker
                 .start_delegation(request(1, &format!("pt-{label}")))
                 .await

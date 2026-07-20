@@ -429,8 +429,8 @@ fn strip_verbatim_unc_prefix(rest: &str) -> Option<&str> {
 /// encoded colon, UNC authority form).
 pub fn build_file_uri(path: &Path) -> String {
     let normalized = normalize_path_for_uri(path);
-    if normalized.starts_with("//") {
-        let encoded = normalized[2..]
+    if let Some(rest) = normalized.strip_prefix("//") {
+        let encoded = rest
             .split('/')
             .map(encode_uri_component)
             .collect::<Vec<_>>()
@@ -539,7 +539,8 @@ mod tests {
     #[test]
     fn best_field_rank_cannot_be_replaced_by_secondary_match() {
         let pattern = SearchPattern::parse("read").unwrap();
-        let rank = match_fields(&pattern, &["README.md"], &["project/read archive"]).expect("match");
+        let rank =
+            match_fields(&pattern, &["README.md"], &["project/read archive"]).expect("match");
         assert_eq!(rank.field_tier, 1);
     }
 
@@ -570,7 +571,11 @@ mod tests {
         let m = match_reference_candidate(&pattern, &commit).expect("subject match");
         // subject is primary[2]; "matcher" is substring of "fix matcher" at a
         // word boundary after space → tier 2 (not secondary message).
-        assert!(m.field_tier <= 3, "subject is primary, got tier {}", m.field_tier);
+        assert!(
+            m.field_tier <= 3,
+            "subject is primary, got tier {}",
+            m.field_tier
+        );
 
         // Regex flattened ordinals: File primary=0 secondary=1;
         // Conversation primary=0, secondary id=1..project_path=6;

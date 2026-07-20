@@ -478,7 +478,6 @@ async fn handle_turn_complete_internal(
             let db_conn = db_conn.clone();
             let manager = manager.clone_ref();
             let connection_id = connection_id.to_string();
-            let mark_awaiting_reply = mark_awaiting_reply;
             tokio::spawn(async move {
                 for delay in [Duration::from_secs(1), Duration::from_secs(5)] {
                     tokio::time::sleep(delay).await;
@@ -2496,8 +2495,7 @@ mod tests {
         id: &str,
         conv_id: Option<i32>,
     ) -> crate::acp::connection::AgentConnection {
-        let (tx, _rx, _cmd_liveness_rx) =
-            crate::acp::connection::connection_channel(1);
+        let (tx, _rx, _cmd_liveness_rx) = crate::acp::connection::connection_channel(1);
         let (control_tx, _control_rx, _control_liveness_rx) =
             crate::acp::connection::connection_channel(1);
         let mut state = SessionState::new(

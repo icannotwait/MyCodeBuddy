@@ -21,12 +21,12 @@ use crate::auto_title::parse_supported_app_locale;
 use crate::commands::conversation_experience::load_auto_title_agent_from;
 use crate::db::AppDatabase;
 use crate::document_translate::protect::{protect_markdown, restore_markdown};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::document_translate::runner::InertDocumentTranslateAgent;
 use crate::document_translate::runner::{
     DocumentConnectionDriver, DocumentTranslateAgent, DocumentTranslateRunner,
     ManagerDocumentConnectionDriver,
 };
-#[cfg(any(test, feature = "test-utils"))]
-use crate::document_translate::runner::InertDocumentTranslateAgent;
 use crate::document_translate::types::{
     DocumentTranslateError, DocumentTranslateFormat, TranslateDocumentParams,
     TranslateDocumentResult, DEADLINE_SECS, MAX_INPUT_SCALARS, TRANSLATE_CAPACITY,
@@ -346,9 +346,10 @@ mod tests {
         );
 
         let svc1 = Arc::clone(&svc);
-        let first = tokio::spawn(async move {
-            svc1.translate(params("first document", "plainText")).await
-        });
+        let first =
+            tokio::spawn(
+                async move { svc1.translate(params("first document", "plainText")).await },
+            );
 
         wait_until_holding(&agent).await;
         assert_eq!(agent.holding.load(Ordering::SeqCst), 1);
@@ -380,9 +381,10 @@ mod tests {
         );
 
         let svc1 = Arc::clone(&svc);
-        let first = tokio::spawn(async move {
-            svc1.translate(params("first document", "plainText")).await
-        });
+        let first =
+            tokio::spawn(
+                async move { svc1.translate(params("first document", "plainText")).await },
+            );
 
         wait_until_holding(&agent).await;
         assert_eq!(agent.holding.load(Ordering::SeqCst), 1);

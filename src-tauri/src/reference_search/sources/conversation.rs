@@ -11,8 +11,8 @@ use sea_orm::{
 use tokio_util::sync::CancellationToken;
 
 use crate::app_error::{AppCommandError, AppErrorCode};
-use crate::db::entities::{conversation, folder};
 use crate::db::entities::conversation::{ConversationKind, ConversationStatus};
+use crate::db::entities::{conversation, folder};
 use crate::models::agent::AgentType;
 use crate::parsers::fold_reference_links;
 use crate::reference_search::matcher::{
@@ -58,6 +58,7 @@ impl ConversationCursor {
 
 /// Build the authoritative conversation candidate (no regex rank). Shared with
 /// Task 5 validation so field mapping cannot diverge.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_conversation_candidate(
     conversation_id: i32,
     title: Option<&str>,

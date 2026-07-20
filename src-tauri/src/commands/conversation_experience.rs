@@ -268,22 +268,14 @@ pub async fn set_auto_title_agent_persisted_core(
         }
     }
 
-    write_settings_field(
-        &db.conn,
-        SettingsFieldMutation::AutoTitleAgent(agent),
-    )
-    .await
+    write_settings_field(&db.conn, SettingsFieldMutation::AutoTitleAgent(agent)).await
 }
 
 pub async fn set_reference_search_limit_persisted_core(
     conn: &DatabaseConnection,
     limit: u16,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
-    write_settings_field(
-        conn,
-        SettingsFieldMutation::ReferenceSearchLimit(limit),
-    )
-    .await
+    write_settings_field(conn, SettingsFieldMutation::ReferenceSearchLimit(limit)).await
 }
 
 /// Settings setter wrapper: holds the shared mutation gate through the
@@ -352,10 +344,14 @@ pub async fn set_auto_title_agent(
     agent: Option<AgentType>,
     #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
-    #[cfg(feature = "tauri-runtime")]
-    coordinator: tauri::State<'_, std::sync::Arc<AutoTitleCoordinator>>,
-    #[cfg(feature = "tauri-runtime")]
-    mutation_gate: tauri::State<'_, std::sync::Arc<ConversationExperienceMutationGate>>,
+    #[cfg(feature = "tauri-runtime")] coordinator: tauri::State<
+        '_,
+        std::sync::Arc<AutoTitleCoordinator>,
+    >,
+    #[cfg(feature = "tauri-runtime")] mutation_gate: tauri::State<
+        '_,
+        std::sync::Arc<ConversationExperienceMutationGate>,
+    >,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
@@ -374,19 +370,19 @@ pub async fn set_reference_search_limit(
     limit: u16,
     #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
-    #[cfg(feature = "tauri-runtime")]
-    registry: tauri::State<
+    #[cfg(feature = "tauri-runtime")] registry: tauri::State<
         '_,
         std::sync::Arc<crate::reference_search::ReferenceSearchRegistry>,
     >,
-    #[cfg(feature = "tauri-runtime")]
-    mutation_gate: tauri::State<'_, std::sync::Arc<ConversationExperienceMutationGate>>,
+    #[cfg(feature = "tauri-runtime")] mutation_gate: tauri::State<
+        '_,
+        std::sync::Arc<ConversationExperienceMutationGate>,
+    >,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
         let emitter = EventEmitter::Tauri(app);
-        set_reference_search_limit_core(&db.conn, &emitter, &registry, &mutation_gate, limit)
-            .await
+        set_reference_search_limit_core(&db.conn, &emitter, &registry, &mutation_gate, limit).await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
@@ -537,10 +533,7 @@ mod tests {
         let read_low = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("read low");
-        assert_eq!(
-            read_low.reference_search_limit,
-            MIN_REFERENCE_SEARCH_LIMIT
-        );
+        assert_eq!(read_low.reference_search_limit, MIN_REFERENCE_SEARCH_LIMIT);
 
         app_metadata_service::upsert_value(&db.conn, KEY_REFERENCE_SEARCH_LIMIT, "900")
             .await
@@ -548,10 +541,7 @@ mod tests {
         let read_high = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("read high");
-        assert_eq!(
-            read_high.reference_search_limit,
-            MAX_REFERENCE_SEARCH_LIMIT
-        );
+        assert_eq!(read_high.reference_search_limit, MAX_REFERENCE_SEARCH_LIMIT);
     }
 
     #[tokio::test]
@@ -571,13 +561,9 @@ mod tests {
     #[tokio::test]
     async fn revision_overflow_returns_database_error() {
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_SETTINGS_REVISION,
-            "9223372036854775807",
-        )
-        .await
-        .expect("max signed revision");
+        app_metadata_service::upsert_value(&db.conn, KEY_SETTINGS_REVISION, "9223372036854775807")
+            .await
+            .expect("max signed revision");
 
         let error = set_reference_search_limit_persisted_core(&db.conn, 50)
             .await
@@ -643,13 +629,11 @@ mod tests {
             .expect("turn off");
         assert_eq!(off.auto_title_agent, None);
         assert_eq!(off.revision, 2);
-        assert!(
-            auto_title_job::Entity::find()
-                .all(&db.conn)
-                .await
-                .expect("count after off")
-                .is_empty()
-        );
+        assert!(auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("count after off")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -752,11 +736,14 @@ mod tests {
         emitter: EventEmitter,
         registry: Arc<ReferenceSearchRegistry>,
         mutation_gate: ConversationExperienceMutationGate,
+        #[allow(dead_code)]
         broadcaster: Arc<WebEventBroadcaster>,
         settings_rx: tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>,
         started: Arc<std::sync::atomic::AtomicUsize>,
+        #[allow(dead_code)]
         releases: Arc<tokio::sync::Mutex<Vec<oneshot::Sender<()>>>>,
-        blocked_job: Option<JoinHandle<Result<ReferenceSearchPage, crate::app_error::AppCommandError>>>,
+        blocked_job:
+            Option<JoinHandle<Result<ReferenceSearchPage, crate::app_error::AppCommandError>>>,
         blocked_request: Option<StartReferenceSearchRequest>,
     }
 
@@ -864,7 +851,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_limit_saves_hold_the_gate_through_registry_application() {
         let mut fixture = live_registry_fixture(50).await;
-        let (arrival, release) = fixture.registry.pause_next_limit_apply_before_effect().await;
+        let (arrival, release) = fixture
+            .registry
+            .pause_next_limit_apply_before_effect()
+            .await;
 
         let db = fixture.db.conn.clone();
         let emitter = fixture.emitter.clone();

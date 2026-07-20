@@ -1145,10 +1145,7 @@ export function FileTreeTab() {
       const requestShowIgnored = showIgnored
       const requestTreeGeneration = treeGeneration
       const requestGeneration = lazyLoadGenerationRef.current
-      lazyLoadingDirPathsRef.current.set(
-        normalizedDirPath,
-        requestGeneration
-      )
+      lazyLoadingDirPathsRef.current.set(normalizedDirPath, requestGeneration)
       try {
         const subtree = await getFileTree(
           joinFsPath(requestRootPath, normalizedDirPath),
@@ -1390,10 +1387,7 @@ export function FileTreeTab() {
           const matcher = ignore()
           for (const ignoreNode of ignoreNodes) {
             try {
-              const result = await readFilePreview(
-                folder.path,
-                ignoreNode.path
-              )
+              const result = await readFilePreview(folder.path, ignoreNode.path)
               matcher.add(result.content)
             } catch {
               // skip unreadable ignore file; others in this dir still apply

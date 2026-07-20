@@ -411,6 +411,7 @@ async fn persist_settings_keys<C: sea_orm::ConnectionTrait>(
 ///
 /// 1. Insert the revision row at `0` with `ON CONFLICT(key) DO NOTHING`.
 /// 2. Unconditionally advance revision with the signed-64-bit-safe CASE update.
+///
 /// Returns the new revision only via a subsequent catalog load from the same txn.
 async fn advance_catalog_revision_in_txn(
     txn: &sea_orm::DatabaseTransaction,
@@ -476,10 +477,9 @@ pub async fn load_delegation_profile_catalog_from<C: ConnectionTrait>(
         .await
         .map_err(AppCommandError::from)?;
     let document = load_delegation_profiles_from(conn).await?;
-    let revision_raw =
-        app_metadata_service::get_value_conn(conn, KEY_DELEGATION_PROFILE_REVISION)
-            .await
-            .map_err(AppCommandError::from)?;
+    let revision_raw = app_metadata_service::get_value_conn(conn, KEY_DELEGATION_PROFILE_REVISION)
+        .await
+        .map_err(AppCommandError::from)?;
     Ok(DelegationProfileCatalog {
         profiles: document.profiles,
         delegation_enabled: settings.enabled,
@@ -812,8 +812,7 @@ pub async fn set_delegation_profiles(
 ) -> Result<DelegationProfileDocument, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let mutation =
-            set_delegation_profiles_core(&db.conn, broker.inner(), document).await?;
+        let mutation = set_delegation_profiles_core(&db.conn, broker.inner(), document).await?;
         emit_event(
             &EventEmitter::Tauri(app),
             DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
@@ -1330,10 +1329,7 @@ mod tests {
             &db.conn,
             &broker,
             DelegationProfileDocument {
-                profiles: vec![profile(
-                    "11111111-1111-4111-8111-111111111111",
-                    "A",
-                )],
+                profiles: vec![profile("11111111-1111-4111-8111-111111111111", "A")],
             },
         )
         .await
@@ -1372,10 +1368,7 @@ mod tests {
                 &db.conn,
                 &broker,
                 DelegationProfileDocument {
-                    profiles: vec![profile(
-                        "11111111-1111-4111-8111-111111111111",
-                        "A",
-                    )],
+                    profiles: vec![profile("11111111-1111-4111-8111-111111111111", "A",)],
                 },
             ),
         );

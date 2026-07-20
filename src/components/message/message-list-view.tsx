@@ -1356,8 +1356,11 @@ export function MessageListView({
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
   // -1 when empty so finish does not call scrollToIndex on a vacant virtua.
-  lastHistoryIndexRef.current =
-    threadItems.length > 0 ? threadItems.length - 1 : -1
+  // Keep this out of render so react-hooks/refs does not treat it as a side effect.
+  useLayoutEffect(() => {
+    lastHistoryIndexRef.current =
+      threadItems.length > 0 ? threadItems.length - 1 : -1
+  }, [threadItems.length])
 
   const hasPersistedHistoryRows = threadItems.some(
     (item) => item.kind === "turn" && item.phase === "persisted"

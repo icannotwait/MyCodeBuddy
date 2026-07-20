@@ -60,9 +60,7 @@ pub async fn get_delegation_profiles(
 pub async fn get_delegation_profile_catalog(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<DelegationProfileCatalog>, AppCommandError> {
-    Ok(Json(
-        load_delegation_profile_catalog(&state.db.conn).await?,
-    ))
+    Ok(Json(load_delegation_profile_catalog(&state.db.conn).await?))
 }
 
 #[derive(Deserialize)]
@@ -74,12 +72,9 @@ pub async fn set_delegation_profiles(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SetDelegationProfilesParams>,
 ) -> Result<Json<DelegationProfileDocument>, AppCommandError> {
-    let mutation = set_delegation_profiles_core(
-        &state.db.conn,
-        &state.delegation_broker,
-        params.document,
-    )
-    .await?;
+    let mutation =
+        set_delegation_profiles_core(&state.db.conn, &state.delegation_broker, params.document)
+            .await?;
     emit_event(
         &state.emitter,
         DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,

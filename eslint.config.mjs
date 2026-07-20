@@ -19,6 +19,9 @@ const eslintConfig = defineConfig([
     "src-tauri/vendor/**",
     "public/vs/**",
     ".worktrees/**",
+    // Local agent notes / SDD helpers (not product code)
+    ".superpowers/**",
+    ".agents/**",
   ]),
   eslintConfigPrettier,
   eslintPluginPrettierRecommended,

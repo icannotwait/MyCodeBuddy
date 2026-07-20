@@ -214,7 +214,9 @@ impl DocumentTranslateAgent for DocumentTranslateRunner {
             .reserved_root()
             .join(uuid::Uuid::new_v4().to_string());
         if let Err(e) = std::fs::create_dir_all(&run_dir) {
-            return Err(DocumentTranslateError::Spawn(format!("create run dir: {e}")));
+            return Err(DocumentTranslateError::Spawn(format!(
+                "create run dir: {e}"
+            )));
         }
 
         let (guard, lease_deadline) =
@@ -339,6 +341,7 @@ async fn spawn_internal_with_deadline(
 }
 
 impl DocumentTranslateRunner {
+    #[allow(clippy::too_many_arguments)]
     async fn run_after_spawn(
         &self,
         agent: AgentType,
@@ -365,7 +368,8 @@ impl DocumentTranslateRunner {
         let external_id = if let Some(id) = initial_id {
             id
         } else {
-            match wait_for_session_identity(overall_deadline, lease_deadline, lease, &mut rx).await {
+            match wait_for_session_identity(overall_deadline, lease_deadline, lease, &mut rx).await
+            {
                 Ok(id) => id,
                 Err(e) => return Err(e),
             }
@@ -802,9 +806,7 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::task::yield_now().await;
                     agent
-                        .emit(AcpEvent::ContentDelta {
-                            text: text.clone(),
-                        })
+                        .emit(AcpEvent::ContentDelta { text: text.clone() })
                         .await;
                     agent
                         .emit(AcpEvent::TurnComplete {
@@ -855,7 +857,9 @@ mod tests {
     #[tokio::test]
     async fn fake_driver_happy_path_returns_body_and_disconnects() {
         let (runner, agent, _dir, registry) = fixture().await;
-        agent.emit_started_before_subscribe.store(true, Ordering::SeqCst);
+        agent
+            .emit_started_before_subscribe
+            .store(true, Ordering::SeqCst);
         agent.finish_with("Bonjour le monde");
 
         let out = runner
@@ -899,7 +903,9 @@ mod tests {
     #[tokio::test]
     async fn output_byte_cap_fails_closed() {
         let (runner, agent, _dir, _registry) = fixture().await;
-        agent.emit_started_before_subscribe.store(true, Ordering::SeqCst);
+        agent
+            .emit_started_before_subscribe
+            .store(true, Ordering::SeqCst);
         let huge = "x".repeat(MAX_OUTPUT_BYTES + 1);
         agent.finish_with(&huge);
         let err = runner
@@ -917,9 +923,7 @@ mod tests {
         // await spawn settle + disconnect/rmdir *before* returning Timeout so
         // the service capacity permit covers orphan cleanup.
         let (runner, agent, _dir, _registry) = fixture().await;
-        agent
-            .block_spawn_after_insert
-            .store(true, Ordering::SeqCst);
+        agent.block_spawn_after_insert.store(true, Ordering::SeqCst);
 
         // Arm a real-time deadline long enough for status/lease/insert; freeze
         // and advance only after spawn is blocked past insert.

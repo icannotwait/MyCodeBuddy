@@ -9,16 +9,14 @@ use sea_orm::{ColumnTrait, EntityTrait, JoinType, QueryFilter, QuerySelect, Rela
 
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::commands::folders::{resolve_git_head, CommitSourceEpoch};
-use crate::db::entities::{conversation, folder};
 use crate::db::entities::conversation::ConversationKind;
+use crate::db::entities::{conversation, folder};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::reference_search::matcher::{
     build_file_uri, match_reference_candidate, normalize_path_for_uri, SearchPattern,
 };
-use crate::reference_search::sources::commit::{
-    build_commit_candidate, read_commit_show_fields,
-};
+use crate::reference_search::sources::commit::{build_commit_candidate, read_commit_show_fields};
 use crate::reference_search::sources::conversation::build_conversation_candidate;
 use crate::reference_search::sources::file::{path_is_under_root, resolve_open_workspace_root};
 use crate::reference_search::types::{
@@ -157,8 +155,7 @@ async fn validate_conversation_candidate(
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::ParentId.is_null())
         .filter(
-            conversation::Column::Kind
-                .is_in([ConversationKind::Regular, ConversationKind::Chat]),
+            conversation::Column::Kind.is_in([ConversationKind::Regular, ConversationKind::Chat]),
         )
         .filter(folder::Column::DeletedAt.is_null())
         .select_also(folder::Entity)
@@ -283,21 +280,17 @@ async fn validate_commit_candidate(
         .output()
         .await
         .map_err(|err| {
-            AppCommandError::new(
-                AppErrorCode::SourceFailed,
-                "failed to spawn git merge-base",
-            )
-            .with_detail(err.to_string())
+            AppCommandError::new(AppErrorCode::SourceFailed, "failed to spawn git merge-base")
+                .with_detail(err.to_string())
         })?;
     match merge.status.code() {
         Some(0) => {}
         Some(1) => return Ok(None),
         _ => {
-            return Err(AppCommandError::new(
-                AppErrorCode::SourceFailed,
-                "git merge-base failed",
-            )
-            .with_detail(String::from_utf8_lossy(&merge.stderr).into_owned()));
+            return Err(
+                AppCommandError::new(AppErrorCode::SourceFailed, "git merge-base failed")
+                    .with_detail(String::from_utf8_lossy(&merge.stderr).into_owned()),
+            );
         }
     }
 
@@ -513,8 +506,10 @@ fn percent_decode_component(input: &str) -> Result<String, String> {
                 if i + 2 >= bytes.len() {
                     return Err("truncated percent escape".into());
                 }
-                let h1 = from_hex(bytes[i + 1]).ok_or_else(|| "invalid percent escape".to_string())?;
-                let h2 = from_hex(bytes[i + 2]).ok_or_else(|| "invalid percent escape".to_string())?;
+                let h1 =
+                    from_hex(bytes[i + 1]).ok_or_else(|| "invalid percent escape".to_string())?;
+                let h2 =
+                    from_hex(bytes[i + 2]).ok_or_else(|| "invalid percent escape".to_string())?;
                 out.push((h1 << 4) | h2);
                 i += 3;
             }
@@ -547,8 +542,8 @@ fn invalid_request(message: impl Into<String>) -> AppCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::db::service::conversation_service;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
     use crate::reference_search::matcher::build_commit_uri;
     use std::fs;
@@ -615,13 +610,10 @@ mod tests {
         }
 
         pub fn commit(&self, message: &str) {
-            git_run(Path::new(&self.path), &[
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                message,
-            ]);
+            git_run(
+                Path::new(&self.path),
+                &["commit", "-q", "--allow-empty", "-m", message],
+            );
         }
     }
 
@@ -708,11 +700,17 @@ mod tests {
             ReferenceCandidateValidation::NotMatch { .. }
         ));
         assert!(matches!(
-            fixture.validate_file("missing.ts", "missing").await.unwrap(),
+            fixture
+                .validate_file("missing.ts", "missing")
+                .await
+                .unwrap(),
             ReferenceCandidateValidation::NotFound { .. }
         ));
         fixture.commit("new head");
-        let error = fixture.validate_old_commit_epoch().await.expect_err("epoch");
+        let error = fixture
+            .validate_old_commit_epoch()
+            .await
+            .expect_err("epoch");
         assert!(matches!(error.code, AppErrorCode::SourceEpochChanged));
     }
 

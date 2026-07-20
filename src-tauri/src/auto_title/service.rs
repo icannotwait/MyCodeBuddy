@@ -161,10 +161,7 @@ pub async fn capture_prompt_context<C: ConnectionTrait>(
         // Job may exist with first fields set (or be absent): refresh locale only.
         // When no job row exists both updates affect 0 rows — fine.
         auto_title_job::Entity::update_many()
-            .col_expr(
-                auto_title_job::Column::Locale,
-                Expr::value(locale_wire),
-            )
+            .col_expr(auto_title_job::Column::Locale, Expr::value(locale_wire))
             .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
             .filter(auto_title_job::Column::ConversationId.eq(conversation_id))
             .exec(conn)
@@ -223,19 +220,13 @@ pub async fn apply_usable_completion(
             auto_title_job::Column::LastUsableTurnToken,
             Expr::value(snapshot.turn_token.clone()),
         )
-        .col_expr(
-            auto_title_job::Column::Locale,
-            Expr::value(locale_wire),
-        )
+        .col_expr(auto_title_job::Column::Locale, Expr::value(locale_wire))
         .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(now))
         .filter(auto_title_job::Column::ConversationId.eq(snapshot.conversation_id))
         .filter(
             Condition::any()
                 .add(auto_title_job::Column::LastUsableTurnToken.is_null())
-                .add(
-                    auto_title_job::Column::LastUsableTurnToken
-                        .ne(snapshot.turn_token.clone()),
-                ),
+                .add(auto_title_job::Column::LastUsableTurnToken.ne(snapshot.turn_token.clone())),
         )
         .exec(txn)
         .await?;
@@ -497,7 +488,7 @@ pub async fn claim_next_ready(
             )
             .col_expr(
                 auto_title_job::Column::Attempts,
-                Expr::col(auto_title_job::Column::Attempts).add(1).into(),
+                Expr::col(auto_title_job::Column::Attempts).add(1),
             )
             .col_expr(
                 auto_title_job::Column::AttemptTurnSeq,
@@ -1163,15 +1154,9 @@ mod tests {
             .expect("first_prompt_at must be set on first capture");
 
         let second = PromptCaptureContext::new(Some("task B".into()), Some(AppLocale::ZhCn));
-        capture_prompt_context(
-            &db.conn,
-            conversation.id,
-            &[],
-            Some(&second),
-            AppLocale::En,
-        )
-        .await
-        .expect("second capture");
+        capture_prompt_context(&db.conn, conversation.id, &[], Some(&second), AppLocale::En)
+            .await
+            .expect("second capture");
 
         let after_second = auto_title_job::Entity::find_by_id(conversation.id)
             .one(&db.conn)
@@ -1251,8 +1236,7 @@ mod tests {
             async move {
                 // Barrier immediately before first-fields UPDATE (via capture).
                 barrier_a.wait().await;
-                let capture =
-                    PromptCaptureContext::new(Some("task A".into()), Some(AppLocale::En));
+                let capture = PromptCaptureContext::new(Some("task A".into()), Some(AppLocale::En));
                 capture_prompt_context(
                     &db_a.conn,
                     conversation_id,
@@ -1264,8 +1248,7 @@ mod tests {
             },
             async move {
                 barrier_b.wait().await;
-                let capture =
-                    PromptCaptureContext::new(Some("task B".into()), Some(AppLocale::Ja));
+                let capture = PromptCaptureContext::new(Some("task B".into()), Some(AppLocale::Ja));
                 capture_prompt_context(
                     &db_b.conn,
                     conversation_id,
@@ -1539,10 +1522,7 @@ mod tests {
     ) {
         let now = Utc::now();
         auto_title_job::Entity::update_many()
-            .col_expr(
-                auto_title_job::Column::State,
-                Expr::value(state),
-            )
+            .col_expr(auto_title_job::Column::State, Expr::value(state))
             .col_expr(
                 auto_title_job::Column::FirstUserText,
                 Expr::value(first_user_text.map(|s| s.to_string())),
@@ -1758,10 +1738,9 @@ mod tests {
             running_id,
             eligible_id,
         ];
-        let promoted =
-            promote_deadline_jobs_by_ids(&db.conn, &params, &all_ids, &partials)
-                .await
-                .expect("promote");
+        let promoted = promote_deadline_jobs_by_ids(&db.conn, &params, &all_ids, &partials)
+            .await
+            .expect("promote");
         assert_eq!(promoted, 1);
 
         let young_job = auto_title_job::Entity::find_by_id(young_id)
@@ -1863,14 +1842,10 @@ mod tests {
 
         let mut partials = HashMap::new();
         partials.insert(conversation_id, "partial must not land".to_string());
-        let promoted = promote_deadline_jobs_by_ids(
-            &db.conn,
-            &params,
-            &[conversation_id],
-            &partials,
-        )
-        .await
-        .expect("promote");
+        let promoted =
+            promote_deadline_jobs_by_ids(&db.conn, &params, &[conversation_id], &partials)
+                .await
+                .expect("promote");
         assert_eq!(promoted, 0, "legacy NULL first_prompt_at must not promote");
 
         let before_end = auto_title_job::Entity::find_by_id(conversation_id)
@@ -2027,10 +2002,9 @@ mod tests {
 
         let mut partials = HashMap::new();
         partials.insert(fixture.conversation_id, "stale partial".to_string());
-        let promoted =
-            promote_deadline_jobs_by_ids(&fixture.db.conn, &params, &ids, &partials)
-                .await
-                .expect("promote after delete must not panic");
+        let promoted = promote_deadline_jobs_by_ids(&fixture.db.conn, &params, &ids, &partials)
+            .await
+            .expect("promote after delete must not panic");
         assert_eq!(promoted, 0);
 
         assert!(
@@ -2067,12 +2041,8 @@ mod tests {
     async fn end_turn_does_not_overwrite_deadline_assistant_snapshot() {
         let fixture = awaiting_job_fixture().await;
         // Deadline first: write-once Some("partial") into ready.
-        let promoted = simulate_deadline_promote(
-            &fixture.db.conn,
-            fixture.conversation_id,
-            "partial",
-        )
-        .await;
+        let promoted =
+            simulate_deadline_promote(&fixture.db.conn, fixture.conversation_id, "partial").await;
         assert_eq!(promoted, 1, "deadline promote must win first-ready");
 
         let job_after_deadline = fixture.job().await;
@@ -2103,12 +2073,8 @@ mod tests {
         // Same rule for deadline empty partial Some("").
         let fixture_empty = awaiting_job_fixture().await;
         assert_eq!(
-            simulate_deadline_promote(
-                &fixture_empty.db.conn,
-                fixture_empty.conversation_id,
-                "",
-            )
-            .await,
+            simulate_deadline_promote(&fixture_empty.db.conn, fixture_empty.conversation_id, "",)
+                .await,
             1
         );
         let empty_snap = fixture_empty.snapshot("tok-after-empty", "later full text");
@@ -2328,8 +2294,9 @@ mod tests {
 
         // Each completion reports the seq it observed after its progress write;
         // together they must cover +2 from the seeded seq=0.
-        let reported: std::collections::HashSet<i32> =
-            [ta.usable_turn_seq, tb.usable_turn_seq].into_iter().collect();
+        let reported: std::collections::HashSet<i32> = [ta.usable_turn_seq, tb.usable_turn_seq]
+            .into_iter()
+            .collect();
         assert_eq!(
             reported,
             [1, 2].into_iter().collect(),
@@ -2481,9 +2448,11 @@ mod tests {
                 .expect("completion must reach pre-write gate before barrier timeout");
 
             // Promote commits first-assistant while completion is parked.
-            let promoted =
-                simulate_deadline_promote(&pool_deadline.conn, cid, "partial-a").await;
-            assert_eq!(promoted, 1, "deadline promote must win first-ready in order A");
+            let promoted = simulate_deadline_promote(&pool_deadline.conn, cid, "partial-a").await;
+            assert_eq!(
+                promoted, 1,
+                "deadline promote must win first-ready in order A"
+            );
 
             allow_completion.notify_one();
 
@@ -2542,12 +2511,8 @@ mod tests {
                         })
                     }),
                     async move {
-                        simulate_deadline_promote(
-                            &deadline_pool.conn,
-                            cid,
-                            "partial-b-must-lose",
-                        )
-                        .await
+                        simulate_deadline_promote(&deadline_pool.conn, cid, "partial-b-must-lose")
+                            .await
                     },
                 )
                 .await
@@ -2639,14 +2604,7 @@ mod tests {
         let _ = auto_title_job::Entity::delete_by_id(conversation.id)
             .exec(&db.conn)
             .await;
-        seed_ready_claim_job(
-            &db.conn,
-            conversation.id,
-            Some("user task"),
-            Some(""),
-            1,
-        )
-        .await;
+        seed_ready_claim_job(&db.conn, conversation.id, Some("user task"), Some(""), 1).await;
 
         let claim = claim_next_ready(&db.conn)
             .await
@@ -2710,14 +2668,7 @@ mod tests {
         let _ = auto_title_job::Entity::delete_by_id(conversation.id)
             .exec(&db.conn)
             .await;
-        seed_ready_claim_job(
-            &db.conn,
-            conversation.id,
-            Some("   "),
-            Some("assistant"),
-            1,
-        )
-        .await;
+        seed_ready_claim_job(&db.conn, conversation.id, Some("   "), Some("assistant"), 1).await;
 
         let claim = claim_next_ready(&db.conn).await.expect("claim");
         assert!(claim.is_none(), "empty trimmed user must not claim");

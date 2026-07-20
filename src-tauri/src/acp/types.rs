@@ -272,8 +272,7 @@ pub enum AcpEvent {
         started_at: chrono::DateTime<chrono::Utc>,
         runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        attention_request:
-            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+        attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     },
     /// Live replacement for the active card's runtime rollup. Idempotent: clients
     /// replace (do not accumulate) the prior `runtime_stats` when `task_id`
@@ -292,8 +291,7 @@ pub enum AcpEvent {
         parent_tool_use_id: String,
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        attention_request:
-            Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+        attention_request: Option<crate::acp::delegation::attention::AttentionRequestSummary>,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.

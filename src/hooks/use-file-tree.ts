@@ -21,11 +21,7 @@ export interface FlatFileEntry {
  * the frontend only uses the names to hide the ignore files themselves from
  * `@` mentions / command-palette file search.
  */
-export const IGNORE_FILE_NAMES = new Set([
-  ".gitignore",
-  ".ignore",
-  ".rgignore",
-])
+export const IGNORE_FILE_NAMES = new Set([".gitignore", ".ignore", ".rgignore"])
 
 export function isIgnoreFileName(name: string): boolean {
   return IGNORE_FILE_NAMES.has(name)

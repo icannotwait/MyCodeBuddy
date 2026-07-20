@@ -300,19 +300,20 @@ async fn async_main() -> ExitCode {
     );
     // Load the persisted reference-search limit before constructing the
     // production registry so the first start observes the operator's cap.
-    let reference_search_limit = codeg_lib::commands::conversation_experience::load_settings_from(
-        &db.conn,
-    )
-    .await
-    .map(|settings| settings.reference_search_limit)
-    .unwrap_or(
-        codeg_lib::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
-    );
+    let reference_search_limit =
+        codeg_lib::commands::conversation_experience::load_settings_from(&db.conn)
+            .await
+            .map(|settings| settings.reference_search_limit)
+            .unwrap_or(
+                codeg_lib::commands::conversation_experience::DEFAULT_REFERENCE_SEARCH_LIMIT,
+            );
     let reference_search_registry = codeg_lib::reference_search::ReferenceSearchRegistry::new(
         reference_search_limit,
-        Arc::new(codeg_lib::reference_search::ProductionReferenceSourceFactory {
-            db: db.conn.clone(),
-        }),
+        Arc::new(
+            codeg_lib::reference_search::ProductionReferenceSourceFactory {
+                db: db.conn.clone(),
+            },
+        ),
     );
     {
         let registry = Arc::clone(&reference_search_registry);

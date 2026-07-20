@@ -211,7 +211,11 @@ impl CommitCursor {
         }
     }
 
-    fn build_candidate(&self, fields: ParsedCommitFields, source_ordinal: u64) -> ReferenceCandidate {
+    fn build_candidate(
+        &self,
+        fields: ParsedCommitFields,
+        source_ordinal: u64,
+    ) -> ReferenceCandidate {
         let keywords = format!(
             "{} {} {} {}",
             fields.short_hash, fields.full_hash, fields.subject, fields.author
@@ -425,8 +429,11 @@ where
 
     loop {
         let buf = reader.fill_buf().await.map_err(|err| {
-            AppCommandError::new(AppErrorCode::SourceFailed, "failed reading git commit stream")
-                .with_detail(err.to_string())
+            AppCommandError::new(
+                AppErrorCode::SourceFailed,
+                "failed reading git commit stream",
+            )
+            .with_detail(err.to_string())
         })?;
         if buf.is_empty() {
             if nuls_seen == 0 && current.is_empty() && fields.is_empty() {
@@ -713,20 +720,21 @@ mod tests {
     #[tokio::test]
     async fn commit_cursor_streams_current_history_without_diff_payloads_and_kills_on_cancel() {
         let fixture = git_history_fixture(12).await;
-        let mut cursor = CommitCursor::open(&fixture.db.conn, fixture.path(), literal("commit"), 12)
-            .await
-            .expect("cursor");
-        let page = cursor
-            .next_page(5, CancellationToken::new())
-            .await
-            .unwrap();
+        let mut cursor =
+            CommitCursor::open(&fixture.db.conn, fixture.path(), literal("commit"), 12)
+                .await
+                .expect("cursor");
+        let page = cursor.next_page(5, CancellationToken::new()).await.unwrap();
         assert_eq!(page.items.len(), 5);
-        assert!(page.items.iter().all(|item| matches!(
-            &item.metadata,
-            ReferenceCandidateMetadata::Commit { .. }
-        )));
+        assert!(page
+            .items
+            .iter()
+            .all(|item| matches!(&item.metadata, ReferenceCandidateMetadata::Commit { .. })));
         assert!(!cursor.spawned_args_for_test().iter().any(|arg| {
-            matches!(arg.as_str(), "--raw" | "--numstat" | "--name-only" | "--stat")
+            matches!(
+                arg.as_str(),
+                "--raw" | "--numstat" | "--name-only" | "--stat"
+            )
         }));
         assert_eq!(
             cursor.spawned_args_for_test().last().map(String::as_str),
@@ -738,17 +746,17 @@ mod tests {
         // Advance the checked-out branch; the cursor must stay pinned to the
         // captured object id and continue that history.
         fixture.advance_branch("post-open commit should not appear");
-        let page2 = cursor
-            .next_page(5, CancellationToken::new())
-            .await
-            .unwrap();
+        let page2 = cursor.next_page(5, CancellationToken::new()).await.unwrap();
         assert_eq!(page2.items.len(), 5);
-        assert!(page2.items.iter().all(|item| item.id != captured_head
-            || first_page_ids.contains(&item.id)));
         assert!(page2
             .items
             .iter()
-            .all(|item| !item.detail.as_deref().unwrap_or("").contains("post-open")));
+            .all(|item| item.id != captured_head || first_page_ids.contains(&item.id)));
+        assert!(page2.items.iter().all(|item| !item
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("post-open")));
 
         let token = CancellationToken::new();
         token.cancel();
@@ -773,10 +781,7 @@ mod tests {
         let mut cursor = CommitCursor::open(&db.conn, &path, literal("commit"), 12)
             .await
             .expect("cursor");
-        let page = cursor
-            .next_page(5, CancellationToken::new())
-            .await
-            .unwrap();
+        let page = cursor.next_page(5, CancellationToken::new()).await.unwrap();
         assert!(page.items.is_empty());
         assert!(page.done);
         assert_eq!(page.done_reason, Some(ReferenceDoneReason::Exhausted));
@@ -790,7 +795,10 @@ mod tests {
         );
         let after = resolve_git_head(&path).await.expect("head after");
         assert!(after.head_sha.is_some());
-        assert_ne!(after.reference_source_epoch.as_deref(), Some(epoch.as_str()));
+        assert_ne!(
+            after.reference_source_epoch.as_deref(),
+            Some(epoch.as_str())
+        );
     }
 
     #[tokio::test]
@@ -838,10 +846,7 @@ mod tests {
         let mut cursor = CommitCursor::open(&db.conn, &path, literal("commit"), 12)
             .await
             .expect("cursor");
-        let page = cursor
-            .next_page(5, CancellationToken::new())
-            .await
-            .unwrap();
+        let page = cursor.next_page(5, CancellationToken::new()).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, older_hash);
         assert!(matches!(
@@ -856,8 +861,7 @@ mod tests {
                 && full_hash == &older_hash
         ));
         assert!(
-            cursor.max_retained_bytes_for_test()
-                <= MAX_REFERENCE_COMMIT_RECORD_BYTES + 64 * 1024,
+            cursor.max_retained_bytes_for_test() <= MAX_REFERENCE_COMMIT_RECORD_BYTES + 64 * 1024,
             "retained {} bytes",
             cursor.max_retained_bytes_for_test()
         );
@@ -906,10 +910,7 @@ mod tests {
         let mut cursor = CommitCursor::open(&db.conn, &path, literal("commit"), 12)
             .await
             .expect("cursor");
-        let page = cursor
-            .next_page(5, CancellationToken::new())
-            .await
-            .unwrap();
+        let page = cursor.next_page(5, CancellationToken::new()).await.unwrap();
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].id, newer_hash);
         assert_eq!(page.items[1].id, older_hash);

@@ -2,19 +2,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::acp::delegation::broker::DelegationBroker;
-use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::acp::delegation::continuation::coordinator::DelegationContinuationCoordinator;
+use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::listener::TokenRegistry;
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::InternalEventBus;
 use crate::auto_title::{AutoTitleCoordinator, InternalAgentSessionRegistry};
-use crate::document_translate::DocumentTranslationService;
 use crate::chat_channel::manager::ChatChannelManager;
 use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::commands::delegation::DelegationRuntimeSettings;
 use crate::db::AppDatabase;
+use crate::document_translate::DocumentTranslationService;
 use crate::pet_state_mapper::PetStateHandle;
 use crate::reference_search::ReferenceSearchRegistry;
 use crate::terminal::manager::TerminalManager;
@@ -202,8 +202,7 @@ pub fn build_delegation_stack(
     }) as Arc<dyn ChildLiveReplyLookup>;
     let event_emitter = Arc::new(ConnectionManagerEventEmitter {
         manager: cm_arc.clone(),
-    })
-        as Arc<dyn DelegationEventEmitter>;
+    }) as Arc<dyn DelegationEventEmitter>;
     let delegation_metrics = Arc::new(DelegationMetrics::default());
     let broker = Arc::new(
         DelegationBroker::with_writers(spawner, depth_lookup, meta_writer, event_emitter)
@@ -214,18 +213,14 @@ pub fn build_delegation_stack(
             .with_metrics(delegation_metrics.clone()),
     );
     let continuation_port = Arc::new(
-        crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(
-            cm_arc,
-        ),
+        crate::acp::delegation::continuation::coordinator::ManagerContinuationPort::new(cm_arc),
     );
     let continuation_coordinator = Arc::new(DelegationContinuationCoordinator::new(
         continuation_store.clone(),
         broker.clone(),
         delegation_metrics.clone(),
         continuation_port,
-        Arc::new(
-            crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new(),
-        ),
+        Arc::new(crate::acp::delegation::continuation::coordinator::SystemContinuationClock::new()),
     ));
     let tokens = Arc::new(TokenRegistry::with_continuation_coordinator(
         continuation_coordinator.clone(),

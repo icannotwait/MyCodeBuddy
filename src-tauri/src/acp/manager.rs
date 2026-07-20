@@ -3629,9 +3629,7 @@ impl ConnectionManager {
         conversation_ids: &[i32],
     ) -> HashMap<i32, String> {
         use crate::acp::session_state::visible_assistant_text;
-        use crate::auto_title::partial_source::{
-            fold_partial_candidates, PartialCandidate,
-        };
+        use crate::auto_title::partial_source::{fold_partial_candidates, PartialCandidate};
         use std::collections::HashSet;
 
         if conversation_ids.is_empty() {
@@ -3658,12 +3656,15 @@ impl ConnectionManager {
             if !wanted.contains(&cid) {
                 continue;
             }
-            by_conversation.entry(cid).or_default().push(PartialCandidate {
-                connection_id: conn_id,
-                has_live: s.live_message.is_some(),
-                started_at: s.live_message.as_ref().map(|m| m.started_at),
-                text: visible_assistant_text(s.live_message.as_ref()),
-            });
+            by_conversation
+                .entry(cid)
+                .or_default()
+                .push(PartialCandidate {
+                    connection_id: conn_id,
+                    has_live: s.live_message.is_some(),
+                    started_at: s.live_message.as_ref().map(|m| m.started_at),
+                    text: visible_assistant_text(s.live_message.as_ref()),
+                });
         }
 
         fold_partial_candidates(by_conversation)

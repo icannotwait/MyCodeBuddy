@@ -860,8 +860,9 @@ mod tests {
                 agent_type: crate::models::agent::AgentType::Codex,
                 task_id: "task-1".into(),
                 started_at: started,
-                runtime_stats:
-                    crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started),
+                runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(
+                    started,
+                ),
                 attention_request: None,
             },
         )
@@ -878,8 +879,9 @@ mod tests {
                 child_conversation_id: 1,
                 agent_type: crate::models::agent::AgentType::Codex,
                 task_id: "task-1".into(),
-                runtime_stats:
-                    crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(started),
+                runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(
+                    started,
+                ),
                 result: crate::acp::types::DelegationResultSummary::Ok {
                     duration_ms: 0,
                     text_preview: None,

@@ -49,12 +49,12 @@ export function preferHostCodexCandidate(
   { platform = process.platform, exists = existsSync } = {}
 ) {
   const usable = candidates
-    .map((candidate) =>
-      typeof candidate === "string" ? candidate.trim() : ""
-    )
+    .map((candidate) => (typeof candidate === "string" ? candidate.trim() : ""))
     .filter(
       (candidate) =>
-        candidate && isUsableHostCodexPath(candidate, platform) && exists(candidate)
+        candidate &&
+        isUsableHostCodexPath(candidate, platform) &&
+        exists(candidate)
     )
 
   if (platform === "win32") {
@@ -105,7 +105,9 @@ export function resolveHostCodexPath({
     }
   }
 
-  const pathHit = (findOnPath ?? (() => findCodexOnPath({ exists, platform })))()
+  const pathHit = (
+    findOnPath ?? (() => findCodexOnPath({ exists, platform }))
+  )()
   if (pathHit && exists(pathHit) && isUsableHostCodexPath(pathHit, platform)) {
     return pathHit
   }
@@ -190,9 +192,7 @@ export function isAuthenticationRequiredError(error) {
     return false
   }
   const message =
-    typeof error.message === "string"
-      ? error.message
-      : JSON.stringify(error)
+    typeof error.message === "string" ? error.message : JSON.stringify(error)
   return /authentication required/i.test(message)
 }
 
@@ -205,9 +205,7 @@ export function classifySessionNewResponse(message) {
     if (isAuthenticationRequiredError(message.error)) {
       return { kind: "auth_required" }
     }
-    throw new Error(
-      `ACP session/new failed: ${JSON.stringify(message.error)}`
-    )
+    throw new Error(`ACP session/new failed: ${JSON.stringify(message.error)}`)
   }
   const modelCount = assertDynamicModelList(message?.result)
   return { kind: "models", modelCount }

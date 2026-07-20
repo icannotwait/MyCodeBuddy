@@ -30,10 +30,7 @@ pub struct AcceptedDelegationPrompt {
 
 /// Test/fixture helper for an accepted prompt with an explicit durable start.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn accepted(
-    child_conversation_id: i32,
-    started_at: DateTime<Utc>,
-) -> AcceptedDelegationPrompt {
+pub fn accepted(child_conversation_id: i32, started_at: DateTime<Utc>) -> AcceptedDelegationPrompt {
     AcceptedDelegationPrompt {
         child_conversation_id,
         started_at,

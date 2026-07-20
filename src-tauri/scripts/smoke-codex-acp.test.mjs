@@ -111,10 +111,7 @@ test("Authentication required is recognized for clean CI packaging smoke", () =>
     }),
     true
   )
-  assert.equal(
-    isAuthenticationRequiredError("Authentication required"),
-    true
-  )
+  assert.equal(isAuthenticationRequiredError("Authentication required"), true)
   assert.equal(
     isAuthenticationRequiredError({ code: -32000, message: "other" }),
     false

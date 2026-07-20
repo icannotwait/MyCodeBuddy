@@ -131,11 +131,9 @@ pub fn build_router(
         )
         .route(
             "/match_reference_regex",
-            post(handlers::reference_search::match_reference_regex).layer(
-                DefaultBodyLimit::max(
-                    handlers::reference_search::MAX_REFERENCE_REGEX_HTTP_BODY_BYTES,
-                ),
-            ),
+            post(handlers::reference_search::match_reference_regex).layer(DefaultBodyLimit::max(
+                handlers::reference_search::MAX_REFERENCE_REGEX_HTTP_BODY_BYTES,
+            )),
         )
         .route(
             "/submit_session_feedback",

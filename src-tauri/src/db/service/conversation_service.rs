@@ -766,14 +766,14 @@ pub async fn fill_open_delegation_attention(
     let mut by_task: std::collections::HashMap<String, AttentionRequestSummary> =
         std::collections::HashMap::new();
     for row in rows {
-        by_task.entry(row.task_id.clone()).or_insert_with(|| {
-            AttentionRequestSummary {
+        by_task
+            .entry(row.task_id.clone())
+            .or_insert_with(|| AttentionRequestSummary {
                 request_id: row.request_id,
                 task_id: row.task_id,
                 message: row.message,
                 created_at: row.created_at,
-            }
-        });
+            });
     }
     for summary in summaries.iter_mut() {
         if let Some(task_id) = summary.delegation_call_id.as_ref() {

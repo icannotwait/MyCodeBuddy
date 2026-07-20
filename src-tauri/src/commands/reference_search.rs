@@ -11,8 +11,8 @@ use crate::db::AppDatabase;
 use crate::reference_search::matcher::match_reference_regex as rank_reference_descriptors;
 use crate::reference_search::types::{
     CancelReferenceSearchRequest, MatchReferenceRegexRequest, NextReferenceSearchPageRequest,
-    ReferenceCandidateValidation, ReferenceRegexMatch, ReferenceSearchPage,
-    ReferenceSearchSource, StartReferenceSearchRequest, ValidateReferenceCandidateRequest,
+    ReferenceCandidateValidation, ReferenceRegexMatch, ReferenceSearchPage, ReferenceSearchSource,
+    StartReferenceSearchRequest, ValidateReferenceCandidateRequest,
 };
 use crate::reference_search::validation::validate_reference_candidate_core;
 use crate::reference_search::ReferenceSearchRegistry;
@@ -72,8 +72,7 @@ pub async fn start_reference_search(
     source: ReferenceSearchSource,
     query: String,
     workspace_path: Option<String>,
-    #[cfg(feature = "tauri-runtime")]
-    registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
+    #[cfg(feature = "tauri-runtime")] registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
 ) -> Result<ReferenceSearchPage, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
@@ -111,8 +110,7 @@ pub async fn next_reference_search_page(
     request_id: String,
     source: ReferenceSearchSource,
     page_index: u32,
-    #[cfg(feature = "tauri-runtime")]
-    registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
+    #[cfg(feature = "tauri-runtime")] registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
 ) -> Result<ReferenceSearchPage, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
@@ -147,8 +145,7 @@ pub async fn cancel_reference_search(
     source_sequence: u64,
     request_id: String,
     source: ReferenceSearchSource,
-    #[cfg(feature = "tauri-runtime")]
-    registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
+    #[cfg(feature = "tauri-runtime")] registry: tauri::State<'_, Arc<ReferenceSearchRegistry>>,
 ) -> Result<bool, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
@@ -214,8 +211,5 @@ pub fn match_reference_regex(
     query: String,
     descriptors: Vec<crate::reference_search::types::ReferenceDescriptor>,
 ) -> Result<Vec<ReferenceRegexMatch>, AppCommandError> {
-    match_reference_regex_core(MatchReferenceRegexRequest {
-        query,
-        descriptors,
-    })
+    match_reference_regex_core(MatchReferenceRegexRequest { query, descriptors })
 }

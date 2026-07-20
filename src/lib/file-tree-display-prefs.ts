@@ -19,8 +19,7 @@ export function loadShowIgnoredFiles(): boolean {
   if (typeof window === "undefined") return false
   try {
     return (
-      window.localStorage.getItem(FILE_TREE_SHOW_IGNORED_STORAGE_KEY) ===
-      "true"
+      window.localStorage.getItem(FILE_TREE_SHOW_IGNORED_STORAGE_KEY) === "true"
     )
   } catch {
     return false

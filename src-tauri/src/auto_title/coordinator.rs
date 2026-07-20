@@ -2,9 +2,9 @@
 //! cancellation. The database remains the queue; notifications are wake hints.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1230,7 +1230,10 @@ mod tests {
         async fn wait_for_no_active_registration(&self, conversation_id: i32) {
             timeout(TokioDuration::from_secs(2), async {
                 loop {
-                    if !self.coordinator.has_active_registration(conversation_id).await
+                    if !self
+                        .coordinator
+                        .has_active_registration(conversation_id)
+                        .await
                     {
                         return;
                     }
@@ -1893,19 +1896,10 @@ mod tests {
 
         // Insert Ready only after end-of-pass + drain idle; no explicit wake.
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_job(
-            &fixture.db,
-            cid,
-            AutoTitleJobState::Ready,
-            0,
-            0,
-            1,
-        )
-        .await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
 
         // Next completed sweep pass must re-notify (lost-wake heal).
-        wait_for_sweep_passes(fixture.coordinator.as_ref(), passes_before_insert + 1)
-            .await;
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), passes_before_insert + 1).await;
 
         timeout(TokioDuration::from_secs(2), async {
             loop {
@@ -1979,22 +1973,12 @@ mod tests {
         let partial: Arc<dyn PartialAssistantTextSource> = Arc::new(FixedPartialSource {
             text: "partial assistant from live".into(),
         });
-        let fixture = coordinator_with_sweep(
-            runner,
-            partial,
-            Duration::ZERO,
-            sweep_interval,
-            false,
-        )
-        .await;
+        let fixture =
+            coordinator_with_sweep(runner, partial, Duration::ZERO, sweep_interval, false).await;
 
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_awaiting_deadline_job(
-            &fixture.db,
-            cid,
-            Utc::now() - chrono::Duration::seconds(1),
-        )
-        .await;
+        seed_awaiting_deadline_job(&fixture.db, cid, Utc::now() - chrono::Duration::seconds(1))
+            .await;
 
         fixture
             .coordinator
@@ -2057,15 +2041,9 @@ mod tests {
 
         let capture =
             PromptCaptureContext::new(Some("ship the deadline sweep".into()), Some(AppLocale::En));
-        capture_prompt_context(
-            &fixture.db.conn,
-            cid,
-            &[],
-            Some(&capture),
-            AppLocale::En,
-        )
-        .await
-        .expect("capture");
+        capture_prompt_context(&fixture.db.conn, cid, &[], Some(&capture), AppLocale::En)
+            .await
+            .expect("capture");
 
         let job_captured = auto_title_job::Entity::find_by_id(cid)
             .one(&fixture.db.conn)

@@ -100,9 +100,7 @@ describe("remarkRewriteFileUriLinks", () => {
   // survive as root-relative local paths (same shape file:// rewrite emits).
   it("prefixes a bare Windows drive href so harden does not block it", () => {
     expect(
-      rewrite(
-        "D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037"
-      )
+      rewrite("D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037")
     ).toBe("/D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037")
   })
 

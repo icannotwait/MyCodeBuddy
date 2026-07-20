@@ -1161,8 +1161,7 @@ pub(crate) async fn resolve_git_head(path: &str) -> Result<GitHeadInfo, AppComma
     // work tree with no resolvable branch still counts as a repo so the UI
     // offers git operations rather than "initialize".
     let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]).await?;
-    let is_repo =
-        inside.status.success() && git_stdout_trim(&inside) == "true";
+    let is_repo = inside.status.success() && git_stdout_trim(&inside) == "true";
     if is_repo {
         let canonical_repo = resolve_canonical_repo_wire(path).await?;
         // Unborn-like / unusual: no resolvable branch or tip.

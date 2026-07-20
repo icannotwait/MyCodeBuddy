@@ -565,10 +565,7 @@ console.log('`quoted`');
             "inner backticks must stay inside fenced placeholder: {}",
             protected.text
         );
-        assert!(
-            !protected.text.contains("template"),
-            "fence body stripped"
-        );
+        assert!(!protected.text.contains("template"), "fence body stripped");
         let restored = restore_markdown(&protected.text, &protected).unwrap();
         assert_eq!(restored, source);
     }
@@ -578,7 +575,10 @@ console.log('`quoted`');
         let source = "Hello `world` end";
         let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
         // Simulate model translating prose while leaving placeholders intact.
-        let output = protected.text.replace("Hello", "Hola").replace("end", "fin");
+        let output = protected
+            .text
+            .replace("Hello", "Hola")
+            .replace("end", "fin");
         let restored = restore_markdown(&output, &protected).unwrap();
         assert_eq!(restored, "Hola `world` fin");
     }
@@ -612,10 +612,7 @@ console.log('`quoted`');
         let crlf = "~~~\r\necho hi\r\n~~~\r\n";
         let protected = protect_markdown_with_nonce(crlf, NONCE).unwrap();
         assert!(protected.text.contains("⟦CGCODE_n0_0⟧"));
-        assert_eq!(
-            restore_markdown(&protected.text, &protected).unwrap(),
-            crlf
-        );
+        assert_eq!(restore_markdown(&protected.text, &protected).unwrap(), crlf);
 
         // Bare CR line endings (less common, still CommonMark).
         let cr = "```\rcode\r```\r";

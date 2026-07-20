@@ -1,5 +1,5 @@
-mod prompt;
 pub mod coordinator;
+mod prompt;
 pub mod store;
 pub mod types;
 

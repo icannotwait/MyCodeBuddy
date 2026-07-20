@@ -275,14 +275,7 @@ mod tests {
 
     #[test]
     fn build_meta_with_error_code() {
-        let v = build_delegation_meta(&snap(
-            "failed",
-            "task-7",
-            None,
-            7,
-            Some("timeout"),
-            None,
-        ));
+        let v = build_delegation_meta(&snap("failed", "task-7", None, 7, Some("timeout"), None));
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
         assert_eq!(inner.get("status").unwrap().as_str().unwrap(), "failed");
         assert_eq!(

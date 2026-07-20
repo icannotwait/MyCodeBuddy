@@ -246,11 +246,9 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
     // client will see "system cannot find the file specified".
     let mock = Arc::new(MockSpawner::new());
     mock.queue_spawn(Ok("child-1".into())).await;
-    mock.queue_send(Ok(accepted(1, fixture_started_at())))
-        .await;
+    mock.queue_send(Ok(accepted(1, fixture_started_at()))).await;
     mock.queue_spawn(Ok("child-2".into())).await;
-    mock.queue_send(Ok(accepted(2, fixture_started_at())))
-        .await;
+    mock.queue_send(Ok(accepted(2, fixture_started_at()))).await;
 
     let broker = Arc::new(DelegationBroker::new(
         mock.clone() as Arc<dyn ConnectionSpawner>,

@@ -149,11 +149,10 @@ impl DocumentTranslateError {
                 "Configured translation agent is unavailable or disabled",
             )
             .with_i18n(I18N_AGENT_UNAVAILABLE, BTreeMap::new()),
-            Self::ContentEmpty => AppCommandError::new(
-                AppErrorCode::InvalidInput,
-                "Document content is empty",
-            )
-            .with_i18n(I18N_CONTENT_EMPTY, BTreeMap::new()),
+            Self::ContentEmpty => {
+                AppCommandError::new(AppErrorCode::InvalidInput, "Document content is empty")
+                    .with_i18n(I18N_CONTENT_EMPTY, BTreeMap::new())
+            }
             Self::ContentTooLarge => {
                 let mut params = BTreeMap::new();
                 params.insert("limit".into(), MAX_INPUT_SCALARS.to_string());

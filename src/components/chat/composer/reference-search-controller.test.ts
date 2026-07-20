@@ -1216,16 +1216,14 @@ describe("ReferenceSearchController", () => {
     // Later page with a different canonical root is a protocol error; no merge
     // into either bucket and loading stops.
     const otherRootCandidate = fileCandidate("other.ts", "C:/other", 2)
-    sourceApi.file.resolveNext(
-      page("file", 1, [otherRootCandidate], true)
-    )
+    sourceApi.file.resolveNext(page("file", 1, [otherRootCandidate], true))
     await flushMicrotasks(10)
     expect(c2.getSnapshot().groups.file.error).toBe("source")
     expect(c2.getSnapshot().groups.file.loading).toBe(false)
     expect(c2.getSnapshot().groups.file.items).toHaveLength(1)
-    expect(
-      c2.getSnapshot().groups.file.items[0]?.reference.uri
-    ).toBe(fileCandidate("app.ts", "C:/real").uri)
+    expect(c2.getSnapshot().groups.file.items[0]?.reference.uri).toBe(
+      fileCandidate("app.ts", "C:/real").uri
+    )
     expect(
       cache2.literalPreview(
         { backend: BACKEND, source: "file", canonicalRoot: "C:/other" },
@@ -1269,7 +1267,10 @@ describe("ReferenceSearchController", () => {
       page(
         "file",
         0,
-        [fileCandidate("a.ts", "C:/real"), fileCandidate("b.ts", "C:/other", 2)],
+        [
+          fileCandidate("a.ts", "C:/real"),
+          fileCandidate("b.ts", "C:/other", 2),
+        ],
         true
       )
     )
@@ -1291,8 +1292,9 @@ describe("ReferenceSearchController", () => {
     await flushMicrotasks()
     const missingRoot = fileCandidate("x.ts", "C:/real")
     // Force missing canonicalWorkspaceRoot after construction.
-    ;(missingRoot.metadata as { canonicalWorkspaceRoot?: string }).canonicalWorkspaceRoot =
-      undefined as unknown as string
+    ;(
+      missingRoot.metadata as { canonicalWorkspaceRoot?: string }
+    ).canonicalWorkspaceRoot = undefined as unknown as string
     sourceApi.file.resolve(page("file", 0, [missingRoot], true))
     await flushMicrotasks(10)
     expect(c2.getSnapshot().groups.file.error).toBe("source")
@@ -1363,9 +1365,9 @@ describe("ReferenceSearchController", () => {
     )
     expect(clearedOld).toBe(true)
     expect(controller.getSnapshot().groups.file.items).toHaveLength(1)
-    expect(
-      controller.getSnapshot().groups.file.items[0]?.reference.uri
-    ).toBe(nextCandidate.uri)
+    expect(controller.getSnapshot().groups.file.items[0]?.reference.uri).toBe(
+      nextCandidate.uri
+    )
   })
 
   it("close_is_idempotent_and_reopen_allocates_new_source_identities", async () => {

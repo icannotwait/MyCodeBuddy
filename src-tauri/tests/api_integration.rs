@@ -246,11 +246,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use codeg_lib::acp::delegation::spawner::DelegationLink;
 use codeg_lib::acp::lifecycle::lifecycle_subscriber_task;
 use codeg_lib::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
-use codeg_lib::auto_title::{
-    capture_prompt_context, TitleAgentRunner, TurnCompletionSnapshot,
-};
+use codeg_lib::auto_title::{capture_prompt_context, TitleAgentRunner, TurnCompletionSnapshot};
 use codeg_lib::auto_title::{AutoTitleAttempt, AutoTitleRunError};
 use codeg_lib::commands::conversation_experience::{
     get_conversation_experience_settings_core, set_auto_title_agent_core,
@@ -261,7 +260,6 @@ use codeg_lib::db::service::conversation_service::{create, create_with_delegatio
 use codeg_lib::db::test_helpers::seed_folder;
 use codeg_lib::models::agent::AgentType;
 use codeg_lib::models::system::AppLocale;
-use codeg_lib::acp::delegation::spawner::DelegationLink;
 use sea_orm::EntityTrait;
 use tokio_util::sync::CancellationToken;
 
@@ -526,9 +524,7 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
         let gate = Arc::clone(&gate);
         let coord = Arc::clone(&coord);
         let emitter = emitter.clone();
-        async move {
-            set_auto_title_agent_core(&app_db, &emitter, &coord, &gate, None).await
-        }
+        async move { set_auto_title_agent_core(&app_db, &emitter, &coord, &gate, None).await }
     });
 
     // Wait until Off has committed and entered cancel_all.
