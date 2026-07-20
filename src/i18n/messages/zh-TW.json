@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} 無法在既有對話中切換到該模型，請新建工作階段以使用它。",
           "turnFailedEmpty": "{agent} 此輪沒有產生任何回覆就結束了，請檢查代理設定。",
           "terminalShellUnavailable": "{shell} 無法使用。請在「一般」設定中選擇可用的 Shell。",
-          "terminalShellUnsupported": "ACP 終端執行不支援 {shell}。請在「一般」設定中選擇支援的 Shell。"
+          "terminalShellUnsupported": "ACP 終端執行不支援 {shell}。請在「一般」設定中選擇支援的 Shell。",
+          "conversationWaitingForSubagents": "此對話正在等待子代理。",
+          "parentConnectionLost": "委派等待已結束，因為代理連線中斷。",
+          "suspendDrainTimeout": "委派等待已結束，因為代理回合未能及時停止。",
+          "continuationFailed": "委派等待已結束，因為無法恢復代理。"
         },
         "unableReadAgentConfig": "無法讀取 Agent 設定：{message}",
         "connectFailedTitle": "{agent} 連線失敗",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "連線中...",
         "agentResponding": "{agent} 正在回應...",
-        "sendMessage": "傳送訊息..."
+        "sendMessage": "傳送訊息...",
+        "waitingForSubagents": "正在等待子代理...",
+        "waitingForSubagentsHint": "對話等待期間仍可繼續編輯。"
       },
       "messageInput": {
         "askAnything": "請開始輸入...",

@@ -2078,7 +2078,11 @@
           "grokModelSwitchIncompatibleAgent": "{agent} kann in einer bestehenden Unterhaltung nicht zu diesem Modell wechseln. Starte eine neue Sitzung, um es zu verwenden.",
           "turnFailedEmpty": "{agent} hat die Runde ohne jegliche Antwort beendet. Bitte prüfen Sie die Agent-Konfiguration.",
           "terminalShellUnavailable": "{shell} ist nicht verfügbar. Wähle in den allgemeinen Einstellungen eine verfügbare Shell aus.",
-          "terminalShellUnsupported": "{shell} wird für die ACP-Terminalausführung nicht unterstützt. Wähle in den allgemeinen Einstellungen eine unterstützte Shell aus."
+          "terminalShellUnsupported": "{shell} wird für die ACP-Terminalausführung nicht unterstützt. Wähle in den allgemeinen Einstellungen eine unterstützte Shell aus.",
+          "conversationWaitingForSubagents": "Diese Unterhaltung wartet auf Subagenten.",
+          "parentConnectionLost": "Das Delegationswarten endete, weil die Agentenverbindung verloren ging.",
+          "suspendDrainTimeout": "Das Delegationswarten endete, weil der Agenten-Turn nicht rechtzeitig gestoppt wurde.",
+          "continuationFailed": "Das Delegationswarten endete, weil der Agent nicht fortgesetzt werden konnte."
         },
         "unableReadAgentConfig": "Agenten-Konfiguration kann nicht gelesen werden: {message}",
         "connectFailedTitle": "{agent} Verbindung fehlgeschlagen",
@@ -2124,7 +2128,9 @@
       "chatInput": {
         "connecting": "Verbinden...",
         "agentResponding": "{agent} antwortet...",
-        "sendMessage": "Nachricht senden..."
+        "sendMessage": "Nachricht senden...",
+        "waitingForSubagents": "Warte auf Subagenten...",
+        "waitingForSubagentsHint": "Du kannst weiter bearbeiten, während diese Unterhaltung wartet."
       },
       "messageInput": {
         "askAnything": "Fragen Sie alles...",

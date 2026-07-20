@@ -106,3 +106,39 @@ describe("denormalizeSnapshot — delegation route", () => {
     expect(patch.delegationRoute).toBeNull()
   })
 })
+
+describe("denormalizeSnapshot — waiting_for_subagents", () => {
+  const waiting = {
+    conversation_id: 42,
+    state: "waiting" as const,
+    generation: 3,
+    armed_at: "2026-01-01T00:00:00.000Z",
+    wake_at: "2026-01-01T00:04:00.000Z",
+  }
+
+  it("hydrates waiting_for_subagents into the patch so send can be gated", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        status: "connected",
+        waiting_for_subagents: waiting,
+      })
+    )
+    expect(patch.waitingForSubagents).toEqual(waiting)
+    // Waiting is independent of connection status / turn_in_flight.
+    expect(patch.status).toBe("connected")
+  })
+
+  it("defaults waitingForSubagents to null when the field is absent", () => {
+    const snap = baseSnapshot()
+    delete (snap as { waiting_for_subagents?: unknown }).waiting_for_subagents
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.waitingForSubagents).toBeNull()
+  })
+
+  it("clears waiting when snapshot projects null", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({ waiting_for_subagents: null })
+    )
+    expect(patch.waitingForSubagents).toBeNull()
+  })
+})

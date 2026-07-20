@@ -1152,8 +1152,8 @@ mod tests {
     use crate::acp::delegation::spawner::{
         accepted, mock::MockSpawner, ConnectionSpawner, SpawnerError,
     };
-    use chrono::Utc;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+    use chrono::Utc;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1938,6 +1938,142 @@ mod tests {
         let batch = join.await.unwrap().unwrap();
         assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
         assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+    }
+
+    /// Task 10 matrix sequence 1: capability-off canonical Join retains the
+    /// existing parked call at the real listener/broker boundary (no arm row).
+    #[tokio::test]
+    async fn delegation_continuation_e2e_capability_off_retains_parked_join() {
+        let (attention, mut join_evaluations) = JoinEntryAttentionStore::new();
+        let broker = make_broker_with_attention(
+            Arc::new(MockSpawner::new()),
+            attention as Arc<dyn DelegationAttentionStore>,
+        )
+        .await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "e2e-cap-off")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let port = ContinuationTestPort::ready();
+        let (tokens, coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port.clone());
+        tokens
+            .register("tok".into(), continuation_token_entry(false))
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let request_task_id = task_id.clone();
+        let join = tokio::spawn(async move {
+            listener
+                .process_status(BrokerStatusRequest {
+                    token: "tok".into(),
+                    task_ids: vec![request_task_id],
+                    wait_ms: Some(0),
+                    return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), join_evaluations.recv())
+            .await
+            .expect("capability-off Join must enter the parked Broker evaluation")
+            .expect("evaluation observer installed");
+        assert!(
+            !join.is_finished(),
+            "capability-off Join remains parked while children run"
+        );
+        assert!(
+            store.list_non_terminal().await.unwrap().is_empty(),
+            "capability-off must not insert a continuation row"
+        );
+        assert_eq!(port.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.worker_count(), 0);
+
+        broker.notify_result_for_test(&task_id);
+        tokio::time::timeout(Duration::from_secs(1), join_evaluations.recv())
+            .await
+            .expect("parked Join re-evaluates on wake without arming")
+            .expect("evaluation observer installed");
+        assert!(!join.is_finished());
+
+        complete_running_task(&broker, "e2e-cap-off").await;
+        let batch = join.await.unwrap().unwrap();
+        assert_eq!(batch.wake_reason, Some(DelegationWakeReason::AllTerminal));
+        assert_eq!(batch.tasks[0].status, TaskStatus::Completed);
+        assert!(store.list_non_terminal().await.unwrap().is_empty());
+        assert_eq!(coordinator.worker_count(), 0);
+    }
+
+    /// Task 10 matrix sequence 3 (listener transport): peer-close during arm
+    /// drops only the waiter; the owned worker and children continue.
+    #[tokio::test]
+    async fn delegation_continuation_e2e_peer_close_listener_keeps_children_running() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        broker
+            .seed_live_task_for_test("parent-conn", "e2e-peer-listener")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, _coordinator) = continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let (mut client, mut server) = duplex(8 * 1024);
+        let server_task = tokio::spawn(async move { listener.serve_one(&mut server).await });
+
+        write_frame(
+            &mut client,
+            &BrokerMessage::Status(BrokerStatusRequest {
+                token: "tok".into(),
+                task_ids: vec!["e2e-peer-listener".into()],
+                wait_ms: Some(0),
+                return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+            }),
+        )
+        .await
+        .unwrap();
+        let suspend = suspend_entered
+            .await
+            .expect("suspend proves row ownership before peer-close");
+        assert_eq!(suspend.parent_connection_id, "parent-conn");
+        assert_eq!(store.list_non_terminal().await.unwrap().len(), 1);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("peer EOF must release serve_one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.list_non_terminal().await.unwrap().len(),
+            1,
+            "peer-close must not abort the armed continuation"
+        );
+        assert_eq!(broker.pending_count().await, 1, "children remain Running");
+
+        suspend_release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows
+                    .first()
+                    .is_some_and(|row| row.state == ContinuationState::Waiting)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned worker reaches Waiting after peer-close");
+
+        complete_running_task(&broker, "e2e-peer-listener").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !store.list_non_terminal().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned worker finishes after child terminal");
     }
 
     #[tokio::test]
@@ -3396,7 +3532,10 @@ mod tests {
 
         let (mut primary_client, mut primary_server) = duplex(8 * 1024);
         let primary_task = tokio::spawn(async move {
-            listener_primary.serve_one(&mut primary_server).await.unwrap();
+            listener_primary
+                .serve_one(&mut primary_server)
+                .await
+                .unwrap();
         });
 
         write_frame(
@@ -3793,7 +3932,10 @@ mod tests {
     ) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            if let Ok(open) = attention.list_open_for_tasks(11, &[task_id.to_string()]).await {
+            if let Ok(open) = attention
+                .list_open_for_tasks(11, &[task_id.to_string()])
+                .await
+            {
                 if let Some(summary) = open.into_iter().next() {
                     return summary.request_id;
                 }
@@ -3852,7 +3994,10 @@ mod tests {
             read_frame::<_, BrokerResponse>(&mut child_client).await
         })
         .await;
-        assert!(early.is_err(), "ParentDecision must remain pending until reply");
+        assert!(
+            early.is_err(),
+            "ParentDecision must remain pending until reply"
+        );
 
         // Parent replies on a second connection.
         let (mut parent_client, mut parent_server) = duplex(8 * 1024);
@@ -3966,7 +4111,9 @@ mod tests {
         .await
         .unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            read_frame::<_, BrokerResponse>(&mut parent_client).await.unwrap()
+            read_frame::<_, BrokerResponse>(&mut parent_client)
+                .await
+                .unwrap()
         })
         .await;
         parent_task.await.unwrap();
@@ -4260,7 +4407,10 @@ mod tests {
             }
         });
         let mid_request_id = loop {
-            if let Ok(open) = attention.list_open_for_tasks(1, &[root_child.clone()]).await {
+            if let Ok(open) = attention
+                .list_open_for_tasks(1, &[root_child.clone()])
+                .await
+            {
                 if let Some(s) = open.into_iter().next() {
                     break s.request_id;
                 }

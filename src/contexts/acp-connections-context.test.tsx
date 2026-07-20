@@ -976,6 +976,155 @@ describe("AcpConnectionsProvider terminal shell config stale", () => {
   })
 })
 
+describe("AcpConnectionsProvider continuation waiting projection", () => {
+  const waiting = {
+    conversation_id: 42,
+    state: "waiting" as const,
+    generation: 2,
+    armed_at: "2026-01-01T00:00:00.000Z",
+    wake_at: "2026-01-01T00:04:00.000Z",
+  }
+
+  it("hydrates waitingForSubagents from snapshot without changing status", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: "s1",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      selectorsReady: true,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      backgroundOutstanding: 0,
+      eventSeq: 5,
+      activeDelegations: [],
+      delegationRoute: null,
+      waitingForSubagents: waiting,
+    })
+
+    hydrateSnapshot(latestAttachHandlers(), {
+      connection_id: "spawned-conn",
+      conversation_id: 42,
+      folder_id: 1,
+      status: "connected",
+      external_id: "s1",
+      live_message: null,
+      active_tool_calls: [],
+      pending_permission: null,
+      modes: null,
+      current_mode: null,
+      config_options: null,
+      prompt_capabilities: null,
+      usage: null,
+      fork_supported: false,
+      available_commands: [],
+      selectors_ready: true,
+      event_seq: 5,
+      waiting_for_subagents: waiting,
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.waitingForSubagents).toEqual(waiting)
+    expect(connection?.status).toBe("connected")
+  })
+
+  it("applies continuation_waiting_changed live events independently of status", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    // Ensure connected first.
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "continuation_waiting_changed",
+      conversation_id: 42,
+      waiting,
+    })
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.waitingForSubagents).toEqual(waiting)
+    expect(connection?.status).toBe("connected")
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "continuation_waiting_changed",
+      conversation_id: 42,
+      waiting: null,
+    })
+    expect(h.store!.getConnection(TAB)?.waitingForSubagents).toBeNull()
+  })
+
+  it("localizes live parent-loss, drain-timeout, and generic continuation errors", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    const handlers = latestAttachHandlers()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw parent lost",
+      agent_type: "claude_code",
+      code: "parent_connection_lost",
+    })
+    expect(h.pushAlert).toHaveBeenCalled()
+    let call = h.pushAlert.mock.calls.at(-1)!
+    expect(String(call[2])).toContain("backendErrors.parentConnectionLost")
+    expect(String(call[2])).not.toMatch(/raw parent lost/i)
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw drain",
+      agent_type: "claude_code",
+      code: "suspend_drain_timeout",
+    })
+    call = h.pushAlert.mock.calls.at(-1)!
+    expect(String(call[2])).toContain("backendErrors.suspendDrainTimeout")
+
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "error",
+      message: "raw arm failed",
+      agent_type: "claude_code",
+      code: "arm_failed",
+    })
+    call = h.pushAlert.mock.calls.at(-1)!
+    expect(String(call[2])).toContain("backendErrors.continuationFailed")
+  })
+})
+
 describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => {
   async function connectOwner(): Promise<AttachHandlers> {
     await mountProvider()
@@ -2502,6 +2651,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       backgroundOutstanding: 0,
       backgroundSettleSyncingSince: null,
       outOfTurnToolCalls: null,
+      waitingForSubagents: null,
       ...overrides,
     }
   }
@@ -2525,6 +2675,20 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         type: "STATUS_CHANGED",
         contextKey: "k1",
         status: "connected",
+      },
+    },
+    {
+      name: "CONTINUATION_WAITING_CHANGED",
+      action: {
+        type: "CONTINUATION_WAITING_CHANGED",
+        contextKey: "k1",
+        waiting: {
+          conversation_id: 9,
+          state: "waiting",
+          generation: 1,
+          armed_at: "2026-01-01T00:00:00.000Z",
+          wake_at: "2026-01-01T00:04:00.000Z",
+        },
       },
     },
     {
@@ -2786,6 +2950,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         "CLEAR_ASK_QUESTION",
         "CONFIG_STALE_CHANGED",
         "CONTENT_DELTA",
+        "CONTINUATION_WAITING_CHANGED",
         "ERROR",
         "FORK_SUPPORTED",
         "MODE_CHANGED",

@@ -5,6 +5,7 @@ import { useTranslations } from "next-intl"
 import type {
   AgentType,
   ConnectionStatus,
+  ContinuationWaitingProjection,
   PromptCapabilitiesInfo,
   PromptDraft,
   PromptInputBlock,
@@ -16,6 +17,7 @@ import type { QueuedMessage } from "@/hooks/use-message-queue"
 import {
   MessageInput,
   type ComposerInjectContent,
+  type PromptDraftRestore,
 } from "@/components/chat/message-input"
 import { MessageQueueDisplay } from "@/components/chat/message-queue-display"
 import { cn } from "@/lib/utils"
@@ -68,6 +70,14 @@ interface ChatInputProps {
    * disabled and the chat could never be started.
    */
   allowOfflineCompose?: boolean
+  /**
+   * Durable continuation waiting projection for this conversation. Independent
+   * of connection status / turn_in_flight. Disables send and shows Stop while
+   * set; does not set isPrompting (would enqueue the draft).
+   */
+  waitingForSubagents?: ContinuationWaitingProjection | null
+  /** Strictly newer revisions rehydrate the composer after a rejected direct send. */
+  draftRestore?: PromptDraftRestore | null
   injectContent?: ComposerInjectContent | null
   onInjectConsumed?: () => void
   /** Drop the input's own horizontal padding when an ancestor already supplies
@@ -117,6 +127,8 @@ export const ChatInput = memo(function ChatInput({
   onAddFeedback,
   feedbackAddDisabled,
   allowOfflineCompose = false,
+  waitingForSubagents = null,
+  draftRestore = null,
   injectContent,
   onInjectConsumed,
   flush = false,
@@ -126,6 +138,16 @@ export const ChatInput = memo(function ChatInput({
   const isConnected = status === "connected"
   const isPrompting = status === "prompting"
   const isConnecting = status === "connecting"
+  const isWaitingForSubagents = waitingForSubagents != null
+  // Waiting lock is independent of connection status and cannot be bypassed by
+  // allowOfflineCompose (that flag only relaxes the disconnected gate).
+  const sendDisabled =
+    isWaitingForSubagents ||
+    (!allowOfflineCompose &&
+      ((!isConnected && !isPrompting) || selectorsLoading))
+  // showCancel drives Stop visibility only — it must NOT set isPrompting, which
+  // would enqueue the draft instead of blocking send.
+  const showCancel = isPrompting || isWaitingForSubagents
 
   return (
     <div
@@ -151,12 +173,12 @@ export const ChatInput = memo(function ChatInput({
         onFocus={onFocus}
         defaultPath={defaultPath}
         folderId={folderId}
-        disabled={
-          allowOfflineCompose
-            ? false
-            : (!isConnected && !isPrompting) || selectorsLoading
-        }
-        isPrompting={isPrompting}
+        disabled={sendDisabled}
+        // Waiting is not ordinary turn-busy: suppress isPrompting so MessageInput
+        // does not take the disabled+prompting enqueue bypass. Stop still comes
+        // from showCancel (isPrompting || isWaitingForSubagents).
+        isPrompting={isPrompting && !isWaitingForSubagents}
+        showCancel={showCancel}
         onCancel={onCancel}
         modes={modes}
         configOptions={configOptions}
@@ -178,20 +200,28 @@ export const ChatInput = memo(function ChatInput({
         isEditingQueueItem={isEditingQueueItem}
         onSaveQueueEdit={onSaveQueueEdit}
         onCancelQueueEdit={onCancelQueueEdit}
-        onForkSend={onForkSend}
+        onForkSend={isWaitingForSubagents ? undefined : onForkSend}
         onAddFeedback={onAddFeedback}
         feedbackAddDisabled={feedbackAddDisabled}
+        draftRestore={draftRestore}
         injectContent={injectContent}
         onInjectConsumed={onInjectConsumed}
         placeholder={
-          isConnecting
-            ? t("connecting")
-            : isPrompting
-              ? t("agentResponding", { agent: agentName ?? "Agent" })
-              : t("sendMessage")
+          isWaitingForSubagents
+            ? t("waitingForSubagents")
+            : isConnecting
+              ? t("connecting")
+              : isPrompting
+                ? t("agentResponding", { agent: agentName ?? "Agent" })
+                : t("sendMessage")
         }
         className={cn(tall ? "min-h-30" : "min-h-24", "max-h-60")}
       />
+      {isWaitingForSubagents ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          {t("waitingForSubagentsHint")}
+        </p>
+      ) : null}
     </div>
   )
 })

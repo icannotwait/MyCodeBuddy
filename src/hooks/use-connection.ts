@@ -17,6 +17,7 @@ import type {
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  ContinuationWaitingProjection,
   DelegationRoutePolicy,
   DelegationRouteSnapshot,
   PendingQuestionState,
@@ -88,6 +89,11 @@ export interface UseConnectionReturn {
    * when the server omitted the field. Never derived from live settings.
    */
   delegationRoute: DelegationRouteSnapshot | null
+  /**
+   * Durable continuation waiting projection. Independent of connection status
+   * and turn_in_flight. `null` when this conversation is not waiting.
+   */
+  waitingForSubagents: ContinuationWaitingProjection | null
   connect: (
     agentType: AgentType,
     workingDir?: string,
@@ -234,6 +240,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const backgroundSettleSyncingSince =
     connection?.backgroundSettleSyncingSince ?? null
   const delegationRoute = connection?.delegationRoute ?? null
+  const waitingForSubagents = connection?.waitingForSubagents ?? null
 
   const connect = useCallback(
     (
@@ -338,6 +345,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       backgroundOutstanding,
       backgroundSettleSyncingSince,
       delegationRoute,
+      waitingForSubagents,
       connect,
       disconnect,
       reapplyConfig,
@@ -377,6 +385,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       backgroundOutstanding,
       backgroundSettleSyncingSince,
       delegationRoute,
+      waitingForSubagents,
       connect,
       disconnect,
       reapplyConfig,
