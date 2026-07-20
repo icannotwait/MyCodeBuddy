@@ -13,6 +13,11 @@ vi.mock("@/lib/api", () => ({
     phase: "handoff_complete",
   })),
   abortConversationPopoutOperation: vi.fn(async () => ({})),
+  getConversationPopoutOperation: vi.fn(async () => ({
+    phase: "aborted",
+    conversationId: 1,
+    operationId: "x",
+  })),
 }))
 
 const tabMocks = vi.hoisted(() => {
@@ -149,12 +154,19 @@ describe("popOutConversation compensation", () => {
     vi.mocked(api.openConversationWindow).mockResolvedValue("opened")
     vi.mocked(api.completeConversationPopoutOperation).mockResolvedValue({
       phase: "handoff_complete",
-    } as never)
+      conversationId: 1,
+      operationId: "op",
+    })
     vi.mocked(api.abortConversationPopoutOperation).mockClear()
     vi.mocked(api.closeConversationWindow).mockClear()
+    vi.mocked(api.getConversationPopoutOperation).mockResolvedValue({
+      phase: "aborted",
+      conversationId: 1,
+      operationId: "op",
+    })
   })
 
-  it("aborts and closes when detach CAS fails after ready", async () => {
+  it("aborts then restores when detach CAS fails after ready", async () => {
     tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
       accepted: false,
       version: 1,
@@ -185,9 +197,52 @@ describe("popOutConversation compensation", () => {
       })
     ).rejects.toThrow(/CAS rejected|opened_tabs/)
 
+    // reverse/abort before restore
     expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
-    expect(api.closeConversationWindow).toHaveBeenCalled()
     expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+    expect(api.closeConversationWindow).toHaveBeenCalled()
     expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("does not restore or close when status is already handoff_complete", async () => {
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.getConversationPopoutOperation).mockResolvedValue({
+      phase: "handoff_complete",
+      conversationId: 1,
+      operationId: "op",
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow()
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
+    // AlreadyComplete: no restore/close against successful handoff
+    expect(tabMocks.restoreDetachedTab).not.toHaveBeenCalled()
+    expect(api.closeConversationWindow).not.toHaveBeenCalled()
   })
 })

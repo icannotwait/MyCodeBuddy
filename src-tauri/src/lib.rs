@@ -1006,36 +1006,11 @@ mod tauri_app {
                     windows::close_pet_panel_on_blur(window.app_handle());
                 }
 
-                if label.starts_with("conversation-")
-                    && matches!(
-                        event,
-                        tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-                    )
-                {
-                    // Capture operation_id synchronously before spawn so a
-                    // delayed Destroyed for op A cannot resolve to op B after
-                    // the same label is reopened (ABA).
-                    let conversation_id =
-                        conversation_popout::parse_conversation_id_from_label(&label);
-                    let captured_op = conversation_id.and_then(|cid| {
-                        window
-                            .app_handle()
-                            .try_state::<conversation_popout::ConversationPopoutState>()
-                            .and_then(|popout| popout.capture_close_operation(cid))
-                    });
-                    if let Some(operation_id) = captured_op {
-                        let app = window.app_handle().clone();
-                        let label_clone = label.clone();
-                        tauri::async_runtime::spawn(async move {
-                            conversation_popout::handle_conversation_window_closed(
-                                &app,
-                                &label_clone,
-                                operation_id,
-                            )
-                            .await;
-                        });
-                    }
-                }
+                // conversation-* close cleanup is registered per-window at
+                // open time with an immutable operation_id (see
+                // register_conversation_window_close_handler). Do not look up
+                // by conversation id here — delayed Destroyed after reopen
+                // would resolve to the wrong incarnation.
 
                 if label == "main" {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {

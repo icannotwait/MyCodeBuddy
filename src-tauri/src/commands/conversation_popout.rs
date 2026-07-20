@@ -72,16 +72,10 @@ pub enum OpenConversationResult {
     FocusedExisting,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RebindResult {
-    pub rebound_count: usize,
-    pub ownership_generation: u64,
-    pub operation_id: String,
-}
+pub use crate::acp::owner_rebind::RebindResult;
 
 #[derive(Debug, Clone)]
-pub(crate) struct OpRecord {
+pub struct OpRecord {
     conversation_id: i32,
     operation_id: String,
     phase: PopoutPhase,
@@ -222,20 +216,28 @@ impl ConversationPopoutState {
         Ok(())
     }
 
-    /// Capture the operation_id currently bound to this conversation for close
-    /// cleanup. Must be called **synchronously** on the window event thread so a
-    /// delayed async Destroyed for op A cannot resolve to op B after reopen.
-    ///
-    /// Returns `None` if no current op, or if cleanup for that op already ran.
+    /// Reserve close cleanup for a known operation_id (per-window handler path).
+    /// Returns false if cleanup was already reserved for this op.
+    pub fn reserve_close_operation(&self, operation_id: &str) -> bool {
+        let Ok(mut done) = self.close_cleanup_done.lock() else {
+            return false;
+        };
+        if done.contains_key(operation_id) {
+            return false;
+        }
+        done.insert(operation_id.to_string(), ());
+        true
+    }
+
+    /// Fallback when only the label is known (should be rare). Prefer
+    /// per-window handlers that close over the immutable operation_id.
     pub fn capture_close_operation(&self, conversation_id: i32) -> Option<String> {
         let op = self.operation_for_conversation(conversation_id)?;
-        let mut done = self.close_cleanup_done.lock().ok()?;
-        if done.contains_key(&op) {
-            return None;
+        if self.reserve_close_operation(&op) {
+            Some(op)
+        } else {
+            None
         }
-        // Reserve immediately so CloseRequested + Destroyed only run once.
-        done.insert(op.clone(), ());
-        Some(op)
     }
 
     /// True if close cleanup was reserved/completed for this op.
@@ -476,11 +478,52 @@ pub async fn open_conversation_window(
             AppCommandError::window("Failed to open conversation window", e.to_string())
         })?;
     post_window_setup(&conv_window);
+    // Per-window close: close over THIS incarnation's operation_id so a delayed
+    // Destroyed after label reuse cannot resolve to a newer open's op.
+    register_conversation_window_close_handler(&conv_window, &operation_id);
     conv_window
         .set_focus()
         .map_err(|e| AppCommandError::window("Failed to focus conversation window", e.to_string()))?;
 
     Ok(OpenConversationResult::Opened)
+}
+
+/// Attach CloseRequested/Destroyed cleanup with an immutable operation_id
+/// captured at window creation (not looked up later by conversation id).
+#[cfg(feature = "tauri-runtime")]
+fn register_conversation_window_close_handler(
+    window: &tauri::WebviewWindow,
+    operation_id: &str,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let app = window.app_handle().clone();
+    let label = window.label().to_string();
+    let operation_id = operation_id.to_string();
+    let scheduled = Arc::new(AtomicBool::new(false));
+    window.on_window_event(move |event| {
+        if !matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) {
+            return;
+        }
+        // Dedupe CloseRequested + Destroyed for this window instance.
+        if scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let app = app.clone();
+        let label = label.clone();
+        let operation_id = operation_id.clone();
+        // Reserve close cleanup for this op (also fences global fallback).
+        if let Some(popout) = app.try_state::<ConversationPopoutState>() {
+            let _ = popout.reserve_close_operation(&operation_id);
+        }
+        tauri::async_runtime::spawn(async move {
+            handle_conversation_window_closed(&app, &label, operation_id).await;
+        });
+    });
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -850,6 +893,15 @@ mod tests {
         let second = state.capture_close_operation(1);
         assert_eq!(second.as_deref(), Some("opB"));
         assert_ne!(second.as_deref(), Some("opA"));
+    }
+
+    #[test]
+    fn reserve_close_is_per_operation_not_conversation() {
+        let state = ConversationPopoutState::new();
+        assert!(state.reserve_close_operation("opA"));
+        assert!(!state.reserve_close_operation("opA"));
+        // B is independent — delayed A close must not block B reservation.
+        assert!(state.reserve_close_operation("opB"));
     }
 
     #[test]

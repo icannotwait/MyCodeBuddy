@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   __resetTransferFencesForTests,
   clearTransferringOut,
@@ -6,6 +6,8 @@ import {
   isTransferringOut,
   markMainReleased,
   markTransferringOut,
+  registerPopoutAcpBridge,
+  releaseConnectionWithoutDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
 
 describe("conversation-popout-acp-bridge", () => {
@@ -28,5 +30,14 @@ describe("conversation-popout-acp-bridge", () => {
     expect(getTransferFence(7)?.mainReleased).toBe(false)
     markMainReleased(7, "op-1")
     expect(getTransferFence(7)?.mainReleased).toBe(true)
+  })
+
+  it("awaits registered releaseConnectionWithoutDisconnect", async () => {
+    const release = vi.fn(async () => {})
+    registerPopoutAcpBridge({ releaseConnectionWithoutDisconnect: release })
+    markTransferringOut(3, "op")
+    await releaseConnectionWithoutDisconnect(3, "op")
+    expect(release).toHaveBeenCalledWith(3, "op")
+    expect(getTransferFence(3)?.mainReleased).toBe(true)
   })
 })

@@ -48,7 +48,10 @@ import {
   acpReplayStreamingPerfFixture,
   getSystemRenderingSettings,
 } from "@/lib/api"
-import { isTransferringOut } from "@/lib/conversation-popout-acp-bridge"
+import {
+  isTransferringOut,
+  registerPopoutAcpBridge,
+} from "@/lib/conversation-popout-acp-bridge"
 import {
   streamingPerfRecorder,
   type PerfRateProfile,
@@ -4537,6 +4540,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
     return () => clearInterval(timer)
   }, [])
+
+  // Pop-out: register release-without-disconnect so orchestration can drop
+  // main owner UI without acpDisconnect. Cleared on unmount.
+  useEffect(() => {
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: (conversationId) => {
+        const store = storeRef.current
+        for (const [contextKey, conn] of store.connections) {
+          if (conn.conversationId !== conversationId) continue
+          if (conn.isDelegationChild || conn.isViewer) continue
+          // Viewer-style teardown: drop local tracking only.
+          teardownAttachSubscription(contextKey)
+          reverseMapRef.current.delete(conn.connectionId)
+          pendingUnmappedEventsRef.current.delete(conn.connectionId)
+          lastActivityRef.current.delete(contextKey)
+          dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        }
+      },
+    })
+    return () => {
+      registerPopoutAcpBridge(null)
+    }
+  }, [dispatch, teardownAttachSubscription])
 
   // ── Idle sweep timer ──
   // Complements the backend keepalive: this sweep targets connections

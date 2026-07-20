@@ -1054,7 +1054,10 @@ impl ConnectionManager {
             Ok(d) => d,
             Err(_) => return 0,
         };
-        let to_disconnect: Vec<String> = {
+        // Snapshot lease (id, owner_label, operation_id, generation) then
+        // re-validate under the same lock before remove so a concurrent rebind
+        // cannot be killed by a stale idle selection.
+        let candidates: Vec<(String, String, Option<String>, u64)> = {
             let connections = self.connections.lock().await;
             let mut victims = Vec::new();
             for (id, conn) in connections.iter() {
@@ -1075,15 +1078,53 @@ impl ConnectionManager {
                 }
                 let elapsed = now.signed_duration_since(state.last_activity_at);
                 if elapsed >= timeout {
-                    victims.push(id.clone());
+                    victims.push((
+                        id.clone(),
+                        conn.owner_window_label.clone(),
+                        conn.owner_operation_id.clone(),
+                        conn.ownership_generation,
+                    ));
                 }
             }
             victims
         };
         let mut disconnected = 0;
-        for id in to_disconnect {
-            tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
-            if self.disconnect(&id).await.is_ok() {
+        for (id, expected_owner, expected_op, expected_gen) in candidates {
+            let control_tx = {
+                let mut connections = self.connections.lock().await;
+                let Some(conn) = connections.get(&id) else {
+                    continue;
+                };
+                // Lease CAS: skip if rebind changed ownership incarnation.
+                if conn.owner_window_label != expected_owner
+                    || conn.owner_operation_id != expected_op
+                    || conn.ownership_generation != expected_gen
+                {
+                    tracing::info!(
+                        "[ACP] idle sweep skipped rebinding connection={}",
+                        id
+                    );
+                    continue;
+                }
+                let Ok(state) = conn.state.try_read() else {
+                    continue;
+                };
+                if state.status != ConnectionStatus::Connected
+                    || state.pending_permission.is_some()
+                    || state.has_active_background_work(now)
+                {
+                    continue;
+                }
+                let elapsed = now.signed_duration_since(state.last_activity_at);
+                if elapsed < timeout {
+                    continue;
+                }
+                drop(state);
+                connections.remove(&id).map(|c| c.control_tx)
+            };
+            if let Some(control_tx) = control_tx {
+                tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
+                let _ = control_tx.send(ConnectionControl::Disconnect).await;
                 disconnected += 1;
             }
         }
@@ -3120,10 +3161,10 @@ impl ConnectionManager {
         to_owner_window: &str,
         operation_id: &str,
         expected_generation: Option<u64>,
-    ) -> Result<crate::commands::conversation_popout::RebindResult, crate::app_error::AppCommandError>
+    ) -> Result<crate::acp::owner_rebind::RebindResult, crate::app_error::AppCommandError>
     {
         use crate::app_error::AppCommandError;
-        use crate::commands::conversation_popout::RebindResult;
+        use crate::acp::owner_rebind::RebindResult;
 
         let mut connections = self.connections.lock().await;
 
