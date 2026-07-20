@@ -617,10 +617,39 @@ fn native_suppression_invalid() -> AcpError {
     }
 }
 
-fn merge_codex_official_native_suppression(
+fn merge_codex_official_native_suppression<F>(
     env: &mut BTreeMap<String, String>,
-) -> Result<(), AcpError> {
-    let mut config = match env.get("CODEX_CONFIG") {
+    windows: bool,
+    inherited_config: F,
+) -> Result<(), AcpError>
+where
+    F: FnOnce() -> Option<std::ffi::OsString>,
+{
+    // Match the spawn layer's effective-key behavior: explicit launch entries
+    // override inherited env, and Windows env names are case-insensitive. When
+    // aliases exist, BTreeMap iteration order is the order applied to Command,
+    // so the last matching entry is effective.
+    let matching: Vec<String> = env
+        .keys()
+        .filter(|key| {
+            if windows {
+                key.eq_ignore_ascii_case("CODEX_CONFIG")
+            } else {
+                key.as_str() == "CODEX_CONFIG"
+            }
+        })
+        .cloned()
+        .collect();
+    let effective_key = matching.last().cloned();
+    let raw = if let Some(raw) = effective_key.as_ref().and_then(|key| env.get(key)) {
+        Some(raw.clone())
+    } else {
+        inherited_config()
+            .map(|raw| raw.into_string().map_err(|_| native_suppression_invalid()))
+            .transpose()?
+    };
+
+    let mut config = match raw.as_deref() {
         Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|_| native_suppression_invalid())?,
         None => serde_json::Value::Object(serde_json::Map::new()),
@@ -635,10 +664,41 @@ fn merge_codex_official_native_suppression(
         .as_object_mut()
         .ok_or_else(native_suppression_invalid)?;
     features.insert("multi_agent".into(), serde_json::Value::Bool(false));
+    let serialized = serde_json::to_string(&config).map_err(|_| native_suppression_invalid())?;
+
+    // Commit only after every fallible step succeeds. Remove case-equivalent
+    // Windows aliases so a stale later entry cannot override the merged value.
+    for key in matching {
+        env.remove(&key);
+    }
     env.insert(
-        "CODEX_CONFIG".into(),
-        serde_json::to_string(&config).map_err(|_| native_suppression_invalid())?,
+        effective_key.unwrap_or_else(|| "CODEX_CONFIG".into()),
+        serialized,
     );
+    Ok(())
+}
+
+fn apply_route_environment_with_inherited<F>(
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    env: &mut BTreeMap<String, String>,
+    windows: bool,
+    inherited_config: F,
+) -> Result<(), AcpError>
+where
+    F: FnOnce() -> Option<std::ffi::OsString>,
+{
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    match (&plan.native_suppression, agent_type) {
+        (NativeSuppressionPlan::CodexMultiAgentFalse, AgentType::Codex) => {
+            merge_codex_official_native_suppression(env, windows, inherited_config)?;
+        }
+        (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
+            env.insert("GROK_SUBAGENTS".into(), "0".into());
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -647,18 +707,9 @@ fn apply_route_environment(
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), AcpError> {
-    use crate::acp::delegation::route::NativeSuppressionPlan;
-
-    match (&plan.native_suppression, agent_type) {
-        (NativeSuppressionPlan::CodexMultiAgentFalse, AgentType::Codex) => {
-            merge_codex_official_native_suppression(env)?;
-        }
-        (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
-            env.insert("GROK_SUBAGENTS".into(), "0".into());
-        }
-        _ => {}
-    }
-    Ok(())
+    apply_route_environment_with_inherited(agent_type, plan, env, cfg!(windows), || {
+        std::env::var_os("CODEX_CONFIG")
+    })
 }
 
 /// Route-scoped argv tokens for Grok (`--no-subagents`) and CodeBuddy
@@ -11266,7 +11317,14 @@ mod tests {
     #[test]
     fn codex_codeg_route_sets_official_multi_agent_config() {
         let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
-        apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env).unwrap();
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &codeg_plan(AgentType::Codex),
+            &mut env,
+            false,
+            || None,
+        )
+        .unwrap();
 
         let config: serde_json::Value =
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
@@ -11327,6 +11385,168 @@ mod tests {
         apply_route_environment(AgentType::Codex, &native_plan(AgentType::Codex), &mut env)
             .unwrap();
         assert_eq!(env.get("CODEX_CONFIG").map(String::as_str), Some(raw));
+    }
+
+    #[test]
+    fn codex_inherited_config_merges_valid_parent_value() {
+        let inherited = serde_json::json!({
+            "model": "gpt-5.4",
+            "features": { "fast_mode": true, "multi_agent": true },
+            "nested": { "keep": [1, 2, 3] }
+        });
+        let inherited = serde_json::to_string(&inherited).unwrap();
+        let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
+
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &codeg_plan(AgentType::Codex),
+            &mut env,
+            false,
+            || Some(inherited.into()),
+        )
+        .unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(merged["model"], "gpt-5.4");
+        assert_eq!(merged["features"]["fast_mode"], true);
+        assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["nested"], serde_json::json!({ "keep": [1, 2, 3] }));
+        assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn codex_inherited_config_rejects_malformed_parent_value_atomically() {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+            let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
+            let original = env.clone();
+
+            let err = apply_route_environment_with_inherited(
+                AgentType::Codex,
+                &codeg_plan(AgentType::Codex),
+                &mut env,
+                false,
+                || Some(raw.into()),
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                err,
+                AcpError::RouteUnavailable {
+                    reason: RouteDegradedReason::NativeSuppressionInvalid
+                }
+            ));
+            assert_eq!(env, original);
+        }
+    }
+
+    #[test]
+    fn codex_inherited_config_defers_to_explicit_launch_value() {
+        let explicit = serde_json::json!({
+            "model": "explicit",
+            "features": { "multi_agent": true }
+        });
+        let mut env = BTreeMap::from([(
+            "CODEX_CONFIG".into(),
+            serde_json::to_string(&explicit).unwrap(),
+        )]);
+
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &codeg_plan(AgentType::Codex),
+            &mut env,
+            false,
+            || panic!("explicit CODEX_CONFIG must avoid inherited lookup"),
+        )
+        .unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(merged["model"], "explicit");
+        assert_eq!(merged["features"]["multi_agent"], false);
+    }
+
+    #[test]
+    fn codex_inherited_config_uses_windows_case_insensitive_explicit_key() {
+        let effective = serde_json::json!({
+            "model": "effective-explicit",
+            "features": { "multi_agent": true }
+        });
+        let mut env = BTreeMap::from([
+            ("CODEX_CONFIG".into(), "not-json".into()),
+            (
+                "codex_config".into(),
+                serde_json::to_string(&effective).unwrap(),
+            ),
+        ]);
+
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &codeg_plan(AgentType::Codex),
+            &mut env,
+            true,
+            || panic!("case-insensitive explicit key must avoid inherited lookup"),
+        )
+        .unwrap();
+
+        let matching: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("CODEX_CONFIG"))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].0, "codex_config");
+        let merged: serde_json::Value = serde_json::from_str(matching[0].1).unwrap();
+        assert_eq!(merged["model"], "effective-explicit");
+        assert_eq!(merged["features"]["multi_agent"], false);
+    }
+
+    #[test]
+    fn codex_inherited_config_preserves_unix_case_sensitive_explicit_key() {
+        let lower_raw = r#"{"model":"lowercase-unrelated"}"#;
+        let inherited = r#"{"model":"inherited"}"#;
+        let mut env = BTreeMap::from([("codex_config".into(), lower_raw.into())]);
+
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &codeg_plan(AgentType::Codex),
+            &mut env,
+            false,
+            || Some(inherited.into()),
+        )
+        .unwrap();
+
+        assert_eq!(env.get("codex_config").map(String::as_str), Some(lower_raw));
+        let merged: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(merged["model"], "inherited");
+        assert_eq!(merged["features"]["multi_agent"], false);
+    }
+
+    #[test]
+    fn codex_inherited_config_is_not_looked_up_for_native_or_unrelated_routes() {
+        let original = BTreeMap::from([("KEEP".into(), "yes".into())]);
+
+        let mut native_env = original.clone();
+        apply_route_environment_with_inherited(
+            AgentType::Codex,
+            &native_plan(AgentType::Codex),
+            &mut native_env,
+            false,
+            || panic!("native route must not look up inherited CODEX_CONFIG"),
+        )
+        .unwrap();
+        assert_eq!(native_env, original);
+
+        let mut unrelated_env = original.clone();
+        apply_route_environment_with_inherited(
+            AgentType::ClaudeCode,
+            &codeg_plan(AgentType::Codex),
+            &mut unrelated_env,
+            false,
+            || panic!("unrelated route must not look up inherited CODEX_CONFIG"),
+        )
+        .unwrap();
+        assert_eq!(unrelated_env, original);
     }
 
     #[test]
