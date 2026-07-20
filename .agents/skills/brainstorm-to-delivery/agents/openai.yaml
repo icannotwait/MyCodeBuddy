@@ -1,0 +1,7 @@
+interface:
+  display_name: "Brainstorm to Delivery"
+  short_description: "Deliver an approved Brainstorm locally"
+  default_prompt: "Use $brainstorm-to-delivery to take the referenced completed Brainstorm through local delivery."
+
+policy:
+  allow_implicit_invocation: false
