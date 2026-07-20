@@ -322,6 +322,14 @@ test("server installer validates and copies compliance files before install writ
 })
 
 test("server READMEs require manual Windows upgrades and current examples", () => {
+  const packageJson = JSON.parse(readRepositoryFile("package.json"))
+  const version = packageJson.version
+  const installerExample = new RegExp(
+    String.raw`\.\\install\.ps1 -Version v${version.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    )}`
+  )
   const paths = [
     "README.md",
     "docs/readme/README.ar.md",
@@ -347,7 +355,7 @@ test("server READMEs require manual Windows upgrades and current examples", () =
     assert.doesNotMatch(text, /v0\.5\.2/, `${path} has the old version`)
     assert.match(
       text,
-      /\.\\install\.ps1 -Version v0\.20\.2-mycodebuddy\.6/,
+      installerExample,
       `${path} lacks the current installer example`
     )
     assert.ok(

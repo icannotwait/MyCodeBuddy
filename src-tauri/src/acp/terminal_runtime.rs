@@ -1085,7 +1085,10 @@ mod tests {
     fn builtins_and_complete_lines_use_selected_shell() {
         let runtime = test_runtime(test_shell_spec());
         for line in [
-            "cd",
+            // Bare "cd" is a shell builtin on Windows. On some Unixes it also
+            // exists as /usr/bin/cd and would classify as DirectProgram — use
+            // a compound line so shell classification is unambiguous.
+            "cd .",
             "Get-Location",
             "Set-Location 'D:\\repo'; Get-Location",
             "cd /d D:\\repo && where cargo",
@@ -1703,7 +1706,12 @@ mod tests {
         );
         drop(reader_handles_guard);
 
-        for _ in 0..100 {
+        // kill_command is blocked in drain_readers() on READER_DRAIN_GRACE while
+        // time is paused. Advance past the grace so the detached cleanup task
+        // can finish and publish exit_status.
+        tokio::time::advance(READER_DRAIN_GRACE + Duration::from_millis(50)).await;
+
+        for _ in 0..200 {
             if terminal.snapshot().await.exit_status.is_some() {
                 return;
             }

@@ -908,12 +908,14 @@ earlier terminal context records.\n\
             msg.contains("agent type") || msg.contains("Grok") || msg.contains("Codex"),
             "expected agent mismatch detail, got {msg}"
         );
-        // Matching agent still works (public resolve uses managed host pin).
-        let ok = resolve_connect_route(
+        // Matching agent still works. Inject companion-available capability so
+        // CI runners without a staged codeg-mcp binary do not SafeFallback.
+        let ok = resolve_connect_route_with_capability(
             &db.conn,
             AgentType::Codex,
             AcpRouteRequest::root(Some(conversation_id), None),
             &runtime,
+            &crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
         )
         .await
         .expect("matching agent resolves");
@@ -935,8 +937,11 @@ earlier terminal context records.\n\
             stalled_after_seconds: 300,
         };
         // Empty env + ACP adapter installed id: managed host pin 0.144.1, not 1.1.2.
-        let capability =
+        // Companion is forced available so this host-contract assertion is not
+        // conflated with locate_codeg_mcp_binary() CI packaging gaps.
+        let mut capability =
             build_route_capability_snapshot(AgentType::Codex, Some("1.1.2"), &BTreeMap::new());
+        capability.companion_binary_available = true;
         assert!(
             capability.suppression.failure.is_none(),
             "ACP adapter version must not make host contract unsupported"
