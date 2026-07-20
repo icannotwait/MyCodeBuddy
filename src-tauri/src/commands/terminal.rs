@@ -112,6 +112,7 @@ pub async fn terminal_spawn(
             terminal_id,
             working_dir,
             owner_window_label: window.label().to_string(),
+            owner_operation_id: None,
             shell,
             initial_command,
             extra_env,

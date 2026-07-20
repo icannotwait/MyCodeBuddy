@@ -2,7 +2,7 @@
 
 Date: 2026-07-20
 
-Status: Design approved in brainstorming; awaiting implementation plan
+Status: Design approved (document review); implementation plan in progress
 
 ## Summary
 
@@ -13,8 +13,10 @@ manage each session independently.
 v1 is **menu-driven** (tab bar + sidebar context menu). Drag-out-to-detach is
 explicitly deferred. Restart does **not** restore detached windows.
 
-This is a **desktop (Tauri) only** feature. Web / server browser mode does not
-get OS windows; the menu entry is hidden (or no-ops with a short explanation).
+This is a **local desktop (Tauri) only** feature. Web / server browser mode and
+**remote-desktop workspace windows** do not get pop-out; the menu entry is
+hidden. Ownership handoff is **ready-gated** (open → takeover/rebind → then
+remove main tab) so live ACP sessions and delegation children are not killed.
 
 ## Problem
 
@@ -56,7 +58,7 @@ multiple monitors remains awkward.
 | What pops out | Conversation / chat panel only |
 | Trigger (v1) | Context menu only (tab + sidebar) |
 | Detach semantics | **Move** out of main tabs (not mirror) |
-| Last session | Cannot pop out if main would have fewer than 2 open tabs after remove |
+| Last session | Cannot pop out when the conversation is an open main tab **and** `tabs.length < 2` (would leave zero main tabs after remove) |
 | Main focus after pop | Switch to **MRU** remaining tab (last activated among remaining) |
 | Close detached window | No re-dock; remove from open tabs; sidebar list unchanged |
 | Sidebar left-click while detached | Focus existing window |
@@ -64,8 +66,9 @@ multiple monitors remains awkward.
 | Overlays | **Include** `SubAgentOverlay` + `AgentPlanOverlay` |
 | Sub-agent “view session” | Keep existing dialog; no nested OS window in v1 |
 | Restart | **Do not** restore detached windows |
-| Platform | Desktop Tauri only |
-| Architecture | New route + `WebviewWindow` (same pattern as settings/commit) |
+| Platform | **Local desktop Tauri only** (`isLocalDesktop()`). Hidden in web/server mode **and** remote-desktop workspace windows. |
+| Architecture | New route + `WebviewWindow` (same family as settings — no `.parent`) |
+| Remote workspaces (v1) | **Out of scope.** Do not accept / do not show pop-out when `getActiveRemoteConnectionId() !== null`. |
 
 ---
 
@@ -74,19 +77,24 @@ multiple monitors remains awkward.
 ### Approach
 
 **Independent route + new `WebviewWindow` per conversation** (same family as
-`open_settings_window` / `open_commit_window`).
+settings: independent top-level, no `.parent`).
 
 ```
 Main window (workspace)
-  tab / sidebar menu → open_conversation_window(conversation_id, …)
+  tab / sidebar menu → popOutConversation(conversation_id)
        │
-       ├─ remove tab from main opened-tabs (if present)
-       ├─ activate MRU remaining tab
-       └─ Rust: WebviewWindowBuilder → label conversation-{id}
-              URL: conversation?conversationId=…&folderId=…&…
+       ├─ prechecks (local desktop, not draft, not last tab if open)
+       ├─ mark tab detaching (suppress unmount disconnect) if open in main
+       ├─ Rust: open_conversation_window → label conversation-{id}
+       │        URL: conversation?conversationId=…&folderId=…&agentType=…&operationId=…
+       │
+       ├─ wait for detached-ready handoff event (timeout → abort + toast)
+       ├─ detachTab (MRU activate + persist with CAS; rollback on failure)
+       └─ registry cache: add conversation id (non-authoritative)
 
 Detached window (static export page)
-  AppTitleBar + ConversationTabView (or thin equivalent shell)
+  AppTitleBar + ConversationSessionSurface (props-driven shell)
+  Claims ACP ownership; emits ready; on close → disconnect by (label, operationId)
   Shares process: DB, ACP ConnectionManager, event bus
 ```
 
@@ -96,56 +104,197 @@ Detached window (static export page)
 | --- | --- |
 | In-app floating panes | No OS snap / multi-monitor ownership |
 | Mirror dual-mount | Contradicts move semantics; dual input/scroll complexity |
+| Open window then immediately remove main tab | Race: second webview attaches as **viewer**, main owner unmount disconnects idle sessions / idle-sweep reclaims busy ones |
+| Remote-desktop pop-out in v1 | Remote ACP owner is `"web"` on the server; local `disconnect_by_owner_window("conversation-*")` cannot clean them up; label collisions vs `remote-*` windows |
 
 ### Window identity
 
 | Item | Rule |
 | --- | --- |
-| Label | `conversation-{conversationId}` (positive DB id). Draft / unbound tabs **cannot** pop out until bound to a real conversation id. |
+| Label | `conversation-{conversationId}` (positive DB id, **local only**). Draft / unbound tabs **cannot** pop out until bound to a real conversation id. |
 | Focus existing | If label already exists → `unminimize` + `set_focus`; do not create a second window. |
 | Parent | **No** `.parent(&main)` — independent top-level window (like settings), so it can move/minimize freely and participate in Windows snap alone. |
 | Title | `{conversation title} · {agent}` (fallback untitled + id). Update on title change if cheap; else set at open. |
 | Size | Default ~960×720; `min_inner_size` reasonable (e.g. 480×400). Center on open (or near main). No geometry persistence in v1. |
 | Style | Same `apply_platform_window_style` / `post_window_setup` as other aux windows. |
+| Capabilities | Register `conversation-*` in `src-tauri/capabilities/default.json` and `desktop.json` (same permission set as other aux windows). |
 
 ### Routing (static export)
 
 Next.js is `output: "export"` — **no dynamic segments**. Use a fixed page:
 
-- Path: `src/app/conversation/page.tsx` (or equivalent static segment)
-- Query: `conversationId`, `folderId`, optional `agentType`, remote context params consistent with other windows (`remote_connection_id` / remote window id if already used by commit/settings)
+- Path: `src/app/conversation/page.tsx`
+- Query (local only): `conversationId`, `folderId`, `agentType`, `operationId` (required for session surface + incarnation)
+- **No** `remote_connection_id` / remote window id in v1 (feature gated off for remote)
 
 ### Frontend process model
 
 Each WebviewWindow loads its own React tree. Design constraints:
 
-1. **Reuse** `ConversationTabView` (or extract a `ConversationSessionSurface` if the tab view is too coupled to main tab chrome) so overlays, composer, and ACP wiring stay one path.
-2. Detached page mounts a **minimal provider set**: enough for session runtime, ACP events, i18n, theme, toaster, credentials if needed — **not** the full workspace sidebar/tab bar.
-3. Main window keeps a small **in-memory registry** of detached conversation ids → window labels (and optional last-focused timestamps). Registry is **not** persisted across restarts.
-4. Main `opened tabs` remain the source of truth for the main strip; detached sessions are **not** main tabs.
+1. **Extract** a props-driven `ConversationSessionSurface` (or equivalent) from `ConversationTabView` so folder/conversation/agent are **not** resolved only via `useTabStore` row lookup. Main tab view becomes a thin wrapper that supplies props from the tab row. Detached page supplies props from query params. One ACP/composer/overlay path.
+2. Detached page mounts a **minimal provider set**: session runtime, ACP connections, i18n, theme, toaster, task/alert as required by the surface — **not** full workspace sidebar/tab bar/aux panels.
+3. If any ephemeral tab-store seed is still required for shared hooks, it must run in **`persistOpenedTabs: false` / detached mode** so it never hydrates or CAS-saves into the main opened-tab set.
+4. Main window keeps a small **in-memory cache** of detached conversation ids → window labels. Cache is **not** authority and **not** persisted across restarts. Sidebar focus always prefers Rust `focus_conversation_window` / open-idempotent before opening a main tab.
+5. Main `opened tabs` remain the source of truth for the main strip; detached sessions are **not** main tabs after successful handoff.
 
-### Backend / ACP ownership
+### Backend / ACP ownership (required protocol)
 
 Connections already carry `owner_window_label`; main close runs
-`disconnect_by_owner_window("main")`.
+`disconnect_by_owner_window("main")`. Each WebviewWindow has an **independent**
+frontend ACP store. Second webview discovery currently attaches as a **viewer**.
+Owner unmount / idle sweep call `acpDisconnect` for local owners no longer in
+`openTabKeys`. Therefore **Rust label rebind alone is insufficient** — both
+webviews need an explicit transfer state machine.
+
+#### Transfer identity
+
+Every pop-out attempt generates:
+
+| Field | Purpose |
+| --- | --- |
+| `operationId` | UUID; single-flight per conversation; correlates ready/ack/abort |
+| `conversationId` | Positive DB id |
+| `connectionId` | Live backend connection id when one exists (null if cold session) |
+| `fromOwnerWindow` | Expected current Rust label (usually `"main"`) |
+| `toOwnerWindow` | `conversation-{id}` |
+| `ownershipGeneration` | Monotonic token written on rebind; child spawn inherits generation |
+
+**Single-flight:** a second pop-out for the same conversation while an operation
+is in flight focuses the existing attempt’s window or no-ops; it does not start
+a parallel transfer.
+
+**Rust guards:** `open_conversation_window` / rebind refuse when the **caller
+window** is a remote-workspace window (label `remote-workspace-*` or equivalent
+remote context). Frontend `isLocalDesktop()` is necessary but not sufficient.
+
+#### Frontend transfer state machine
+
+States per `(conversationId, operationId)` on main and detached:
+
+```
+Main:     Idle → Preparing → AwaitingReady → Releasing → DetachedDone
+                 ↘ Aborting → Idle
+Detached: Boot → Claiming → ReadyEmitted → Owning
+                 ↘ Aborting → Closed
+```
+
+**Main-side release-without-disconnect (required):** after detached is ready and
+before/during `detachTab`, main must:
+
+1. Mark contextKey **`transferredOut`** (or equivalent) so:
+   - unmount lifecycle **must not** `acpDisconnect`
+   - idle sweep **must not** `acpDisconnect` for that connection
+2. Drop local React ownership of the connection (detach subscription / remove
+   from main ACP store) **without** killing the backend process.
+3. Only then remove the tab from `openTabKeys` / `rawTabs`.
+
+Without step 1–2, after tab removal the stale main owner becomes idle and the
+existing sweep kills the agent even though detached owns it.
+
+**Detached-side claim (required):**
+
+1. Resolve conversation; discover live `connectionId` for this conversation.
+2. Refuse takeover if discovered owner is remote/`"web"` or unexpected (local
+   desktop only; no stealing server-owned connections).
+3. Attach as **owner UI** for that `connectionId` (not a permanent viewer):
+   promote/takeover API — sole controlling UI for local process.
+4. Invoke Rust rebind (below); on success emit ready with `operationId`.
+
+Must **not** spawn a second agent process for the same live conversation.
+
+#### Rust rebind (root tree only + spawn races)
+
+```text
+rebind_connection_owner_window(
+  conversation_id: i32,
+  connection_id: Option<String>,  // when known
+  from_owner_window: String,      // CAS expected label
+  to_owner_window: String,
+  operation_id: String,
+) -> Result<RebindResult, …>
+// RebindResult: { rebound_count, ownership_generation }
+```
+
+Rules:
+
+1. Locate the **root** connection by `connection_id` and/or `conversation_id`
+   (not “every connection with label main”).
+2. CAS: only rebind if current `owner_window_label == from_owner_window`
+   (or already `to_owner_window` **and** `owner_operation_id == operation_id`
+   for idempotency). Reject otherwise. Reverse requires matching
+   `expected_generation`.
+3. Rebind the root **and** its **descendant tree only** (delegation parent→child
+   edges / broker graph), never every child that happens to share `"main"`.
+4. **In-flight spawn race (required concrete fence):** child spawn must not
+   permanently keep a stale pre-rebind snapshot. Required mechanism:
+   - Track in-flight child spawns under the parent connection id; rebind waits
+     for those spawns to finish **or** marks them to adopt parent’s current
+     `(label, generation, operationId)` at registration via parent-generation CAS.
+   - A child becoming visible must pass parent-generation CAS; on mismatch,
+     re-read parent ownership and adopt before publish.
+5. Tests must cover: concurrent child spawn during rebind (barrier); unrelated
+   other roots under `"main"` remain untouched.
+
+#### Atomic handoff sequence
+
+1. **Precheck** (main): `isLocalDesktop()`, positive id, enablement, single-flight;
+   if window already exists → focus only (no transfer).
+2. Create `operationId`; register ready waiter **before** open (or use Rust-held
+   ack channel) so events cannot race past the listener.
+3. If open main tab: enter `Preparing` — set **`detaching`** + suppress unmount
+   disconnect; record `connectionId` if live.
+4. Open `conversation-{id}` with query including `operationId` (+ ids).
+5. Detached: Boot → Claiming (takeover + rebind) → emit
+   `conversation-window://ready` `{ conversationId, operationId, connectionId? }`.
+6. Main on matching ready (timeout ~15s; ignore wrong `operationId`):
+   - Enter `Releasing`: **release-without-disconnect** on main ACP store.
+   - `detachTab` with **awaited immediate CAS save** (not debounced fire-and-forget):
+     re-check last-tab; MRU activate; if CAS fails → **compensation** (below).
+   - Cache id; clear flags → `DetachedDone`.
+7. Abort paths: clear flags; main remains owner if rebind never committed.
+
+**Sidebar pop-out when not a main tab:** no `detachTab`; still operationId +
+ready; if a live main connection exists for that conversation, same transfer
+machine (release-without-disconnect without removing a tab).
+
+#### Compensation / rollback order (critical)
+
+On CAS failure or post-ready abort **after** rebind succeeded:
+
+1. **Reverse rebind first** (`toOwnerWindow` → `fromOwnerWindow`) with CAS on
+   **label + generation + operationId** for the same root tree.
+2. Main **reclaims** frontend ownership (re-attach as owner; clear
+   `transferredOut` for this operationId only).
+3. **Then** close detached via `close_conversation_window(conversation_id, expected_operation_id)`
+   (CAS: only closes if stored operationId matches — never closes a reopened
+   incarnation). Close cleanup reaps residual resources tagged with that
+   operationId only; reclaimed main-owned connections are untouched.
+4. Main tab remains; toast. **Never** close-detached-first while it still holds
+   live ownership for this operationId (that kills the session).
+
+If rebind never succeeded: safe to close detached for this operationId; main never released.
+
+#### Close / lifecycle
 
 | Event | Ownership rule |
 | --- | --- |
-| Pop-out of a live session | Re-bind that connection’s `owner_window_label` to the detached window label **or** ensure the detached window is the sole UI owner and cleanup on its close targets only that session. |
-| Close detached window | Disconnect ACP (and terminals) owned by that window label — same spirit as closing a main tab (`acpDisconnect`). Conversation row remains in DB. |
-| Close main while detached windows live | Do **not** disconnect sessions owned by detached labels. Main hide-to-tray behavior unchanged. Quitting the app still tears everything down. |
+| Close detached while `Owning` (`CloseRequested` **and** `Destroyed`) | Capture this window’s `operationId` at open. Cleanup is **incarnation-scoped**: disconnect/kill only ACP connections and terminals tagged `(owner_window_label=conversation-{id}, owner_operation_id=operationId)`. Emit `conversation-window://closed` `{ conversationId, operationId, abortOutcome? }`. Main drops cache. **No** re-dock. Never disconnect by label alone (label is reused on reopen). |
+| Close detached during abort after reverse rebind | Reverse reclaims main ownership; still reap residual resources still tagged with the aborted `operationId`; do not kill reclaimed main-owned connections. |
+| Close main while detached live | Disconnect only main-owned incarnations — must **not** touch detached operationIds. Hide-to-tray unchanged. App quit tears all down. |
+| Handoff timeout / claim failure before rebind | Clear detaching; toast; main remains owner; close half-open detached; reap aborted operationId resources. |
+| Stale disconnect / idle sweep vs rebind | Destructive disconnects re-validate owner+operationId under lock; frontend disconnects carry lease tokens captured at own/rebind time. |
 
-If re-binding owner labels is invasive, v1 may instead: keep process-global connections and on detached close explicitly disconnect by conversation/session id (preferred cleanup key must be documented in the plan). **Must not** leave orphan agent processes after the only UI for that session is closed.
+**Must not** leave orphan agent processes after the only UI for that session is closed. **Must not** kill a reopened window’s session when a prior incarnation’s delayed cleanup runs.
 
 ### Opened-tabs interaction
 
-| Action | Main tabs | Detached registry |
+| Action | Main tabs | Detached registry cache |
 | --- | --- | --- |
-| Pop-out (was open tab) | Remove that tab; persist opened tabs as today | Add id |
-| Pop-out (sidebar, not a tab) | Unchanged | Add id + open window |
-| Close detached window | No re-add | Remove id |
+| Pop-out (was open tab) after ready | **`detachTab`**: remove; MRU activate; persist CAS | Add id |
+| Pop-out (sidebar, not a tab) | Unchanged | Add id after ready |
+| Close detached window | No re-add | Remove id (event or probe) |
 | Open from sidebar (not detached) | Existing open-tab behavior | — |
-| Open from sidebar (detached) | No new main tab | Focus window |
+| Open from sidebar (maybe detached) | Only if Rust focus returns false | Prefer `focus_conversation_window` first |
 | Restart app | Hydrate main tabs only | Empty |
 
 **Draft / provisional tabs** (`conversationId == null`): menu item disabled with reason (need a real session first).
@@ -170,25 +319,30 @@ Both call one client helper, e.g. `popOutConversation(conversationId)`.
 
 | Condition | Menu |
 | --- | --- |
-| Not desktop / not local multi-window capable | Hidden |
+| Not **local** desktop (`!isLocalDesktop()`) — web/server or remote-desktop workspace | Hidden |
 | Draft tab without `conversationId` | Disabled |
-| Conversation already detached | Same menu label **「弹出窗口」**; action **focuses** the existing window (no second window) |
+| Conversation already detached (Rust window exists or cache hit) | Same menu label **「弹出窗口」**; action **focuses** the existing window (no second window) |
 | Conversation is an open main tab **and** `tabs.length === 1` | Disabled (“Cannot pop out the last tab”) |
-| Conversation is an open main tab **and** `tabs.length > 1` | Enabled → move + open |
-| Conversation **not** in main tabs | Enabled → open detached only |
+| Conversation is an open main tab **and** `tabs.length > 1` | Enabled → handoff + move |
+| Conversation **not** in main tabs | Enabled → open detached only (after ready) |
 
 ### After successful pop-out (from main tab)
 
-1. Open or focus `conversation-{id}` window.
-2. Remove tab from main `rawTabs` / persist.
+Follow the **atomic handoff** in Architecture (ready → release-without-disconnect → detachTab). After ready:
+
+1. Main release-without-disconnect (see ownership state machine).
+2. `detachTab`: remove from main `rawTabs` (never via bare `closeTab` replacement path).
 3. Set `activeTabId` to MRU among remaining:
-   - Prefer an explicit MRU stack if present; else last non-closed activation order; else nearest neighbor in previous order; else first remaining.
-4. If main has zero tabs after a bug, existing “ensure new conversation tab” effect still applies — pop-out must not intentionally produce zero tabs.
+   - Maintain a small activation ring / `lastActivatedAt` on tab activation (plan locks exact structure).
+   - Fallback: previous activation order → nearest neighbor in previous order → first remaining.
+4. **Awaited immediate CAS** for opened-tabs persist (flush/bypass debounce; surface failure). On failure run compensation order (reverse rebind → reclaim main → then close detached).
+5. **Cross-client note (intentional):** `opened_tabs` is workspace-global. Successful CAS removal drops this conversation from the open-tab set for **all** synchronized clients (other desktops/browsers). That matches move semantics and existing tab-close sync; document in UI only if needed. v1 does not special-case multi-client.
+6. Pop-out must not intentionally produce zero main tabs; existing “ensure new conversation tab” remains a safety net only.
 
 ### Close detached window
 
 - User clicks OS/window close.
-- Rust `on_window_event` CloseRequested for `conversation-*`: cleanup connections/terminals for that label; emit a frontend event (or rely on main polling window list) so main clears detached registry.
+- Rust `on_window_event` for `conversation-*` on **both** `CloseRequested` and `Destroyed`: capture the window’s `operationId`; cleanup connections/terminals matching **`(conversation-{id}, operationId)` only** (never label alone); emit `conversation-window://closed` with `{ conversationId, operationId, abortOutcome? }` so main drops registry cache.
 - **Do not** re-insert into main opened tabs.
 - User can reopen later via sidebar → opens **in main** as a normal tab (unless they choose pop-out again).
 
@@ -196,7 +350,7 @@ Both call one client helper, e.g. `popOutConversation(conversationId)`.
 
 | State | Behavior |
 | --- | --- |
-| Detached | Focus detached window; do not switch main to a new tab for that id |
+| Detached (prefer Rust focus truth) | `focus_conversation_window`; do not switch main to a new tab for that id |
 | Not detached | Existing behavior (open/activate main tab) |
 
 Optional: subtle indicator on sidebar row when detached (icon / badge). Nice-to-have; not required for MVP if focus behavior is correct.
@@ -206,7 +360,7 @@ Optional: subtle indicator on sidebar row when detached (icon / badge). Nice-to-
 - App title bar + window controls (match other Codeg windows on Windows).
 - Body: single conversation surface only.
 - **No** folder sidebar, **no** multi-tab bar, **no** aux file/git panel.
-- **Yes**: message list, composer, connection status, permission/question UI, plan + sub-agent overlays, export/actions already on the conversation surface if they live inside `ConversationTabView`.
+- **Yes**: message list, composer, connection status, permission/question UI, plan + sub-agent overlays, export/actions already on the conversation surface if they live inside `ConversationSessionSurface`.
 
 ---
 
@@ -218,42 +372,72 @@ Optional: subtle indicator on sidebar row when detached (icon / badge). Nice-to-
 open_conversation_window(
   conversation_id: i32,
   folder_id: i32,
-  agent_type: Option<String>,
+  agent_type: AgentType,
   locale: Option<AppLocale>,
-  remote_connection_id: Option<i32>,
+  operation_id: String,
 ) -> Result<(), AppCommandError>
+// local only; reject if caller window is remote-workspace
+
+focus_conversation_window(conversation_id: i32) -> Result<bool, AppCommandError>
+// true if focused, false if no such window
+
+rebind_connection_owner_window(
+  conversation_id: i32,
+  connection_id: Option<String>,
+  from_owner_window: String,
+  to_owner_window: String,
+  operation_id: String,
+  expected_generation: Option<u64>,
+) -> Result<RebindResult, AppCommandError>
+// root tree only; CAS on label + operationId; generation on reverse
+
+close_conversation_window(
+  conversation_id: i32,
+  expected_operation_id: String,
+) -> Result<bool, AppCommandError>
+// true if closed; false if no match (reopened under different operationId)
 ```
 
 - Idempotent focus if window exists.
-- Builds URL with query params; applies platform style; focus.
-
-Optional companion:
-
-```text
-focus_conversation_window(conversation_id: i32) -> Result<bool, …>
-// true if focused, false if no such window
-```
-
-Close is OS-driven; cleanup in `on_window_event` by label prefix `conversation-`.
+- Builds URL with query params including `operationId`; applies platform style; focus.
+- Close is OS-driven; cleanup in `on_window_event` for `conversation-*` is **incarnation-scoped** (`operationId` captured at open): disconnect/kill only matching `(label, operationId)` resources (CloseRequested + Destroyed). Reversed abort still reaps residual resources tagged with that operationId.
 
 ### Frontend
 
 ```text
-popOutConversation(conversationId: number): Promise<void>
-// orchestrates: prechecks → open_conversation_window → close main tab if needed → MRU switch → registry
+popOutConversation(args: {
+  conversationId: number
+  folderId: number
+  agentType: AgentType
+}): Promise<void>
+// single-flight → register ready waiter → detaching → open → wait ready(operationId)
+// → release-without-disconnect → detachTab + awaited CAS → cache / compensate
 
-isConversationDetached(conversationId: number): boolean
-// main-window memory only
+canPopOutConversation(...): { enabled: boolean; reason?: string }
+
+isConversationDetachedCache(conversationId: number): boolean
+// main-window memory only — not authority
 
 focusDetachedConversation(conversationId: number): Promise<boolean>
+// always invokes Rust focus; updates cache
+
+releaseConnectionWithoutDisconnect(contextKey | connectionId): void
+// main ACP store: suppress idle/unmount kill; drop local owner UI
+
+claimConnectionOwnership(...): Promise<void>
+// detached ACP store: promote/takeover live connection as owner UI
 ```
 
-Wire through `lib/api.ts` / transport like other window opens (`getShellTransport` / desktop-only).
+Wire through `lib/api.ts` / transport like other window opens (`getShellTransport` / `isLocalDesktop` gate).
 
 ### Events
 
-- Prefer: main listens for window destroyed / custom `conversation-window://closed` with `{ conversationId }` to drop registry entry.
+- `conversation-window://ready` `{ conversationId, operationId, connectionId?, ownershipGeneration? }`  
+  (`ownershipGeneration` required when a live rebind ran; omitted on cold boot)
+- `conversation-window://closed` `{ conversationId, operationId }`  
+  (operationId always set from window open state so main can cancel the matching handoff)
 - Title updates: optional later.
+- Durable backend `abort_conversation_popout_operation(operation_id)` for timeout/close-before-ready when main never received ready (generation-CAS reverse if rebind committed).
 
 ---
 
@@ -265,6 +449,7 @@ Add keys (all 10 locales) under something like `Folder.tabs` / `Folder.sidebar` 
 - `cannotPopOutLastTab` — disabled reason or toast  
 - `cannotPopOutDraft` — draft without id  
 - `popOutDesktopOnly` — if ever shown on web  
+- `popOutHandoffFailed` — ready timeout / rebind / takeover failure  
 
 Follow existing next-intl message file layout.
 
@@ -274,13 +459,16 @@ Follow existing next-intl message file layout.
 
 | Failure | Behavior |
 | --- | --- |
-| Window build fails | Toast; do **not** remove main tab |
+| Window build fails | Toast; do **not** remove main tab; clear detaching |
 | Conversation missing in DB | Toast; no window |
-| Race: last tab closed elsewhere during pop | Re-check count before remove; abort with toast |
-| Focus of missing window | Fall through to open or normal sidebar open |
-| ACP rebind fails | Prefer abort pop-out rather than orphan UI without session; log + toast |
+| Ready timeout / ownership claim fails | Toast; clear detaching; main remains owner; close half-open detached if rebind never committed |
+| Race: last tab closed elsewhere during pop | Re-check count before `detachTab`; abort with toast; compensation if rebind already committed |
+| Persist CAS reject after ready | **Compensation order:** reverse rebind → main reclaim → then close detached; toast; no mirror |
+| Focus of missing window | Fall through to normal sidebar open / open new pop-out |
+| ACP rebind fails | Abort; log + toast; main remains owner; close detached |
+| Stale ready (wrong `operationId`) | Ignore |
 
-Ordering must be **open window success → then remove main tab** (or transactional compensate: if remove fails after open, keep window and registry consistent).
+Ordering must be **open + ready → release-without-disconnect → detachTab + awaited CAS** with reverse-before-close compensation.
 
 ---
 
@@ -288,15 +476,27 @@ Ordering must be **open window success → then remove main tab** (or transactio
 
 ### Unit / component
 
-- Enablement matrix (last tab, draft, already detached, not open).
-- MRU selection after remove.
-- Sidebar click routes to focus when registry has id.
-- Menu items render desktop-only.
+- Enablement matrix (last tab, draft, already detached, not open, remote/web hidden).
+- MRU selection after `detachTab`.
+- Sidebar click prefers Rust focus before opening main tab.
+- Menu items render local-desktop-only.
+- Detaching flag suppresses unmount disconnect.
+
+### Ownership / handoff (required)
+
+- Idle connection: handoff → main release-without-disconnect → tab remove does not `acpDisconnect`; idle sweep skips `transferredOut`; detached becomes owner.
+- Prompting connection: same; agent continues; main unmount does not kill turn.
+- Delegation children (existing): rebind updates only root descendant tree; detached close cleans them.
+- In-flight child spawn during rebind: child ends on new owner (generation revalidation); unrelated main roots untouched.
+- Detached close during initialization: no orphan; main ownership restored or clean disconnect.
+- Tab-save CAS rejection after ready: reverse rebind + main reclaim **before** close detached; main tab remains.
+- Wrong `operationId` ready ignored; single-flight second pop focuses/no-ops.
 
 ### Integration / Rust (as feasible)
 
 - `open_conversation_window` idempotent focus.
-- Close path cleans owner resources for `conversation-*` labels without touching main-owned sessions.
+- `rebind_connection_owner_window` cascades to children sharing prior label.
+- Close path cleans `(conversation-*, operationId)` resources without touching main-owned or newer-incarnation sessions.
 
 ### Manual (Windows)
 
@@ -305,6 +505,7 @@ Ordering must be **open window success → then remove main tab** (or transactio
 - Close detached → sidebar still lists; reopen in main.
 - Only one tab → menu disabled.
 - Main hide-to-tray while detached still running; quit app cleans all.
+- Remote workspace window: menu hidden.
 
 ---
 
@@ -312,20 +513,21 @@ Ordering must be **open window success → then remove main tab** (or transactio
 
 ### Phase 1 — MVP (this design)
 
-1. Rust `open_conversation_window` + close cleanup.  
-2. Static `conversation` page + minimal providers + session surface.  
-3. `popOutConversation` orchestration + detached registry.  
-4. Tab + sidebar context menus.  
-5. Sidebar left-click focus.  
-6. i18n + desktop gating.  
-7. Tests for enablement / MRU / focus routing.
+1. Capabilities + Rust `open_conversation_window` / `focus_conversation_window` / `rebind_connection_owner_window` + close cleanup.  
+2. Props-driven `ConversationSessionSurface` + static `conversation` page + minimal providers.  
+3. Frontend ownership takeover + detaching suppress + ready event.  
+4. `detachTab` + MRU + `popOutConversation` orchestration + registry cache.  
+5. Tab + sidebar context menus + sidebar left-click focus.  
+6. i18n + `isLocalDesktop` gating.  
+7. Tests: enablement / MRU / focus routing / ownership handoff cases.
 
 ### Phase 2 — Later (out of scope)
 
 - Drag-out detach reusing the same API.  
 - Restart restore of detached set + geometry.  
 - Sidebar detached badge.  
-- Live title sync / badge for agent status on taskbar.
+- Live title sync / badge for agent status on taskbar.  
+- Remote-desktop multi-window pop-out (needs remote ownership model).
 
 ---
 
@@ -335,22 +537,25 @@ Ordering must be **open window success → then remove main tab** (or transactio
 | --- | --- |
 | Memory: N webviews | Accept for small N; document; no restore spam on boot |
 | Provider tree incomplete on detached page | Checklist against ConversationTabView dependencies; smoke test send + stream + overlays |
-| ACP owner disconnect kills wrong session | Explicit ownership rules + tests for multi-window close |
-| Tab remove before window open | Strict ordering + compensate |
+| ACP owner disconnect kills wrong session | Atomic handoff + detaching flag + cascade rebind + tests |
+| Tab remove before window ready | Ready-gated detachTab + rollback |
+| Viewer attach on second webview | Explicit ownership takeover before remove |
 | Static export query-only routing | Follow commit/settings window pattern |
+| Capability missing for new labels | Add `conversation-*` to capability manifests |
 
 ---
 
 ## Success criteria
 
-1. User can pop a non-last conversation from tab or sidebar menu into a real OS window.  
+1. User can pop a non-last conversation from tab or sidebar menu into a real OS window (local desktop).  
 2. Windows snap / independent move works per conversation window.  
 3. Plan + sub-agent overlays appear when the session has that data.  
 4. Last main tab cannot be popped; MRU tab activates after pop.  
 5. Close detached does not re-dock; sidebar can reopen in main.  
 6. Second activation focuses the existing window.  
 7. App restart does not recreate detached windows.  
-8. Web build does not expose a broken control.
+8. Web build and remote-desktop workspace do not expose a broken control.  
+9. Live/idle ACP sessions and delegation children survive handoff; detached close does not leave orphans.
 
 ---
 
@@ -359,9 +564,22 @@ Ordering must be **open window success → then remove main tab** (or transactio
 These are plan-time choices, not unresolved product decisions:
 
 - Exact MRU data structure (ring buffer in tab-store vs `lastActivatedAt` on tabs).  
-- Whether to extract `ConversationSessionSurface` vs reuse `ConversationTabView` with props.  
-- ACP owner rebind API vs disconnect-by-conversation-id on window close.  
+- Exact ready-channel (Tauri event vs Rust-held ack); must still be operationId-correlated and registered before open.  
+- Exact ACP store APIs for release-without-disconnect / claim-as-owner (names may differ; semantics fixed above).  
+- Rebind serialization primitive (lock vs ownership_generation revalidation loop) — both satisfy the race requirement.  
 - Precise default window size and whether to open centered vs offset from main.
+
+**Resolved by this revision (were review blockers):**
+
+- Full transfer state machine: main release-without-disconnect, detached claim, reverse-before-close compensation.  
+- Root-tree-only rebind + in-flight child spawn race + unrelated-root isolation.  
+- operationId single-flight ready correlation.  
+- Awaited immediate CAS for detachTab (not debounced).  
+- Rust caller-window guard + frontend `isLocalDesktop`.  
+- Remote workspaces out of v1.  
+- Props-driven session surface / non-persisting detached tab mode.  
+- Capability labels `conversation-*`.  
+- Intentional workspace-global opened_tabs sync on move.
 
 ---
 
@@ -372,4 +590,7 @@ These are plan-time choices, not unresolved product decisions:
 - Multi-window: `src-tauri/src/commands/windows.rs` (`open_settings_window`, etc.)  
 - Overlays: `src/components/chat/sub-agent-overlay.tsx`, `agent-plan-overlay.tsx`  
 - ACP ownership: `owner_window_label`, `disconnect_by_owner_window` in `src-tauri/src/acp/manager.rs`  
-)
+- Lifecycle unmount: `src/hooks/use-connection-lifecycle.ts`  
+- Platform gate: `isLocalDesktop()` in `src/lib/platform.ts`  
+- Capabilities: `src-tauri/capabilities/default.json`, `desktop.json`  
+

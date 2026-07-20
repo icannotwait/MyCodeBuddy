@@ -2630,6 +2630,8 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             status: crate::acp::types::ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx,
             task_abort: None,

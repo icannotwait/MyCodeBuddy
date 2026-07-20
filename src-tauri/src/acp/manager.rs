@@ -555,6 +555,8 @@ impl ConnectionManager {
             agent_type,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -612,6 +614,8 @@ impl ConnectionManager {
             agent_type,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -3059,6 +3063,183 @@ impl ConnectionManager {
         disconnected
     }
 
+    /// Disconnect connections owned by `owner_window_label` **and** matching
+    /// `owner_operation_id` incarnation. Connections without an operation stamp
+    /// are only matched when `operation_id` is empty (legacy main path).
+    pub async fn disconnect_by_owner_window_and_operation(
+        &self,
+        owner_window_label: &str,
+        operation_id: &str,
+    ) -> usize {
+        let control_txs = {
+            let mut connections = self.connections.lock().await;
+            let ids: Vec<String> = connections
+                .iter()
+                .filter_map(|(id, conn)| {
+                    if conn.owner_window_label != owner_window_label {
+                        return None;
+                    }
+                    let conn_op = conn.owner_operation_id.as_deref().unwrap_or("");
+                    if conn_op == operation_id {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut txs = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(conn) = connections.remove(&id) {
+                    txs.push(conn.control_tx);
+                }
+            }
+            txs
+        };
+
+        let disconnected = control_txs.len();
+        for control_tx in control_txs {
+            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        }
+        tracing::info!(
+            "[ACP] disconnect by owner window+op owner_window={} op={} count={}",
+            owner_window_label,
+            operation_id,
+            disconnected
+        );
+        disconnected
+    }
+
+    /// Rebind root (by conversation_id / connection_id) and descendants that
+    /// share the same prior owner label. Returns rebound count + generation.
+    pub async fn rebind_connection_owner_window(
+        &self,
+        conversation_id: i32,
+        connection_id: Option<&str>,
+        from_owner_window: &str,
+        to_owner_window: &str,
+        operation_id: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<crate::commands::conversation_popout::RebindResult, crate::app_error::AppCommandError>
+    {
+        use crate::app_error::AppCommandError;
+        use crate::commands::conversation_popout::RebindResult;
+
+        let mut connections = self.connections.lock().await;
+
+        // Locate root
+        let root_id = if let Some(cid) = connection_id {
+            if connections.contains_key(cid) {
+                cid.to_string()
+            } else {
+                return Err(AppCommandError::not_found(format!(
+                    "connection {cid} not found"
+                )));
+            }
+        } else {
+            let mut found: Option<String> = None;
+            for (id, conn) in connections.iter() {
+                let state = conn.state.read().await;
+                if state.conversation_id == Some(conversation_id) {
+                    // Prefer non-delegation-child roots when possible
+                    found = Some(id.clone());
+                    if !matches!(
+                        conn.origin,
+                        crate::acp::delegation::route::DelegationConnectionOrigin::CodegChild
+                    ) {
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| {
+                AppCommandError::not_found(format!(
+                    "no connection for conversation {conversation_id}"
+                ))
+            })?
+        };
+
+        let root = connections.get(&root_id).ok_or_else(|| {
+            AppCommandError::not_found(format!("connection {root_id} not found"))
+        })?;
+
+        // CAS on label / generation / operation
+        let current_label = root.owner_window_label.clone();
+        let current_gen = root.ownership_generation;
+        let current_op = root.owner_operation_id.clone();
+
+        if let Some(exp) = expected_generation {
+            if current_gen != exp {
+                return Err(AppCommandError::task_execution_failed(format!(
+                    "generation CAS failed: expected {exp}, have {current_gen}"
+                )));
+            }
+        }
+
+        let label_ok = current_label == from_owner_window
+            || (current_label == to_owner_window
+                && current_op.as_deref() == Some(operation_id));
+        if !label_ok {
+            return Err(AppCommandError::task_execution_failed(format!(
+                "owner label CAS failed: expected {from_owner_window}, have {current_label}"
+            )));
+        }
+
+        // If already at target with same op — idempotent
+        let new_gen = if current_label == to_owner_window
+            && current_op.as_deref() == Some(operation_id)
+        {
+            current_gen
+        } else {
+            current_gen.saturating_add(1).max(1)
+        };
+
+        let prior_label = current_label;
+        let mut rebound = 0usize;
+
+        // Root + descendants listed on the root's active_delegations (and nested).
+        let mut related_conversation_ids = std::collections::HashSet::new();
+        related_conversation_ids.insert(conversation_id);
+        if let Some(root_conn) = connections.get(&root_id) {
+            let st = root_conn.state.read().await;
+            for d in st.active_delegations.values() {
+                related_conversation_ids.insert(d.child_conversation_id);
+            }
+        }
+
+        let mut targets: Vec<String> = vec![root_id.clone()];
+        for (id, conn) in connections.iter() {
+            if id == &root_id {
+                continue;
+            }
+            if conn.owner_window_label != prior_label {
+                continue;
+            }
+            let st = conn.state.read().await;
+            if let Some(cid) = st.conversation_id {
+                if related_conversation_ids.contains(&cid) {
+                    targets.push(id.clone());
+                }
+            }
+        }
+
+        for id in targets {
+            if let Some(conn) = connections.get_mut(&id) {
+                conn.owner_window_label = to_owner_window.to_string();
+                conn.owner_operation_id = Some(operation_id.to_string());
+                conn.ownership_generation = new_gen;
+                let mut st = conn.state.write().await;
+                st.owner_window_label = to_owner_window.to_string();
+                rebound += 1;
+            }
+        }
+
+        Ok(RebindResult {
+            rebound_count: rebound,
+            ownership_generation: new_gen,
+            operation_id: operation_id.to_string(),
+        })
+    }
+
     pub async fn disconnect_all(&self) -> usize {
         let control_txs: Vec<_> = {
             let mut connections = self.connections.lock().await;
@@ -4289,6 +4470,8 @@ mod tests {
             agent_type: crate::models::agent::AgentType::ClaudeCode,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -4461,6 +4644,8 @@ mod tests {
             agent_type: AgentType::Codex,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".into(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -5542,6 +5727,8 @@ mod tests {
             agent_type,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -6085,6 +6272,8 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -8099,6 +8288,8 @@ mod tests {
             agent_type: crate::models::agent::AgentType::ClaudeCode,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -8584,6 +8775,8 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             status: ConnectionStatus::Connected,
             owner_window_label: "test-window".to_string(),
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -9475,6 +9668,8 @@ mod tests {
                 agent_type: AgentType::Codex,
                 status: ConnectionStatus::Connecting,
                 owner_window_label: "test".into(),
+                owner_operation_id: None,
+                ownership_generation: 0,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
                 task_abort: Some(abort),
@@ -9641,6 +9836,8 @@ mod tests {
                 agent_type: AgentType::Codex,
                 status: ConnectionStatus::Connecting,
                 owner_window_label: "test".into(),
+                owner_operation_id: None,
+                ownership_generation: 0,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
                 task_abort: Some(abort),

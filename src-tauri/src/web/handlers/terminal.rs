@@ -67,6 +67,7 @@ pub async fn terminal_spawn(
                 terminal_id,
                 working_dir: params.working_dir,
                 owner_window_label: "web".to_string(),
+                owner_operation_id: None,
                 shell,
                 initial_command: params.initial_command,
                 extra_env,
