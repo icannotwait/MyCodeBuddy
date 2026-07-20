@@ -81,6 +81,9 @@ pub struct OpRecord {
     phase: PopoutPhase,
     /// Generation written by forward rebind, if any.
     ownership_generation: Option<u64>,
+    /// True between admit_forward_rebind and record_rebind (or reverse-on-fail).
+    /// Abort must not treat this as NeverRebound — ownership may already have moved.
+    rebind_in_flight: bool,
     #[allow(dead_code)]
     from_owner: String,
     #[allow(dead_code)]
@@ -128,6 +131,7 @@ impl ConversationPopoutState {
                 operation_id: operation_id.clone(),
                 phase: PopoutPhase::Opening,
                 ownership_generation: None,
+                rebind_in_flight: false,
                 from_owner: "main".to_string(),
                 to_owner: to_owner.clone(),
                 abort_outcome: None,
@@ -176,12 +180,14 @@ impl ConversationPopoutState {
     }
 
     /// Pre-admit a forward rebind: reject if op is missing or already terminal.
+    /// Marks `rebind_in_flight` so concurrent abort cannot claim NeverRebound
+    /// while connection ownership is mid-flight.
     pub fn admit_forward_rebind(&self, operation_id: &str) -> Result<(), AppCommandError> {
-        let by_op = self
+        let mut by_op = self
             .by_operation
             .lock()
             .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
-        let rec = by_op.get(operation_id).ok_or_else(|| {
+        let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
         if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
@@ -189,7 +195,17 @@ impl ConversationPopoutState {
                 "cannot rebind terminal operation {operation_id}"
             )));
         }
+        rec.rebind_in_flight = true;
         Ok(())
+    }
+
+    /// Clear in-flight flag without recording generation (rebind itself failed).
+    pub fn clear_rebind_in_flight(&self, operation_id: &str) {
+        if let Ok(mut by_op) = self.by_operation.lock() {
+            if let Some(rec) = by_op.get_mut(operation_id) {
+                rec.rebind_in_flight = false;
+            }
+        }
     }
 
     /// Record forward rebind generation atomically with phase check.
@@ -207,11 +223,13 @@ impl ConversationPopoutState {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
         if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+            rec.rebind_in_flight = false;
             return Err(AppCommandError::task_execution_failed(format!(
                 "cannot rebind terminal operation {operation_id}"
             )));
         }
         rec.ownership_generation = Some(generation);
+        rec.rebind_in_flight = false;
         rec.phase = PopoutPhase::ReadyPending;
         Ok(())
     }
@@ -617,11 +635,11 @@ pub async fn rebind_connection_owner_window(
 
     let is_forward = to_owner_window.starts_with("conversation-");
     if is_forward {
-        // Reject terminal ops before mutating connection ownership.
+        // Reject terminal ops and mark rebind_in_flight before mutating ownership.
         popout.admit_forward_rebind(&operation_id)?;
     }
 
-    let result = cm
+    let result = match cm
         .rebind_connection_owner_window(
             conversation_id,
             connection_id.as_deref(),
@@ -630,7 +648,16 @@ pub async fn rebind_connection_owner_window(
             &operation_id,
             expected_generation,
         )
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if is_forward {
+                popout.clear_rebind_in_flight(&operation_id);
+            }
+            return Err(e);
+        }
+    };
 
     // Stamp forward rebind onto the op record. If the op was aborted between
     // rebind and record, reverse ownership immediately so we never leave a
@@ -647,6 +674,7 @@ pub async fn rebind_connection_owner_window(
                     Some(result.ownership_generation),
                 )
                 .await;
+            popout.clear_rebind_in_flight(&operation_id);
             if let Err(rev_err) = reverse {
                 tracing::error!(
                     "[popout] record_rebind failed and reverse also failed op={} gen={} record_err={} reverse_err={}",
@@ -685,6 +713,22 @@ pub async fn abort_conversation_popout_operation(
         return Ok(outcome);
     }
 
+    // Refuse destructive NeverRebound while a forward rebind is mid-flight
+    // (ownership may already have moved but generation not yet recorded).
+    {
+        let by_op = popout
+            .by_operation
+            .lock()
+            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
+        if let Some(rec) = by_op.get(&operation_id) {
+            if rec.rebind_in_flight {
+                return Err(AppCommandError::task_execution_failed(
+                    "cannot abort while forward rebind is in flight",
+                ));
+            }
+        }
+    }
+
     let gen = status.ownership_generation;
     let outcome = if let Some(generation) = gen {
         let to_label = conversation_window_label(status.conversation_id);
@@ -720,8 +764,12 @@ pub async fn abort_conversation_popout_operation(
                     // Already gone / already main.
                     popout.abort(&operation_id, |_| AbortOutcome::AlreadyMain)?
                 } else {
-                    // Unknown reverse failure: abort without claiming reverse success.
-                    popout.abort(&operation_id, |_| AbortOutcome::NeverRebound)?
+                    // Unknown reverse failure: do NOT mark NeverRebound (that
+                    // would authorize frontend to close and kill the session).
+                    // Leave op state unchanged and surface the error.
+                    return Err(AppCommandError::task_execution_failed(format!(
+                        "reverse rebind failed for op {operation_id}: {e}"
+                    )));
                 }
             }
         }
@@ -942,6 +990,17 @@ mod tests {
             .insert_opened(1, "op1".into(), "conversation-1".into())
             .unwrap();
         state.admit_forward_rebind("op1").unwrap();
+        // in-flight until record
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert!(by_op.get("op1").unwrap().rebind_in_flight);
+        }
+        state.record_rebind("op1", 1).unwrap();
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert!(!by_op.get("op1").unwrap().rebind_in_flight);
+            assert_eq!(by_op.get("op1").unwrap().ownership_generation, Some(1));
+        }
         state.complete("op1").unwrap();
         assert!(state.admit_forward_rebind("op1").is_err());
     }
