@@ -23,7 +23,7 @@ new nullable/additive conversation columns may remain in place.
 | Platform | Pinned version | Codeg route check | Native route check |
 | --- | --- | --- | --- |
 | Codex | CLI 0.144.1 | `features.multi_agent=false`; Codeg tools listed | no Codeg override; Codeg delegation hidden |
-| Grok | 0.2.98 | `--no-subagents` before `agent stdio`; Codeg tools listed | flag omitted; Codeg delegation hidden |
+| Grok | any installed (smoke: 0.2.103) | `--no-subagents` before `agent stdio`; Codeg tools listed | flag omitted; Codeg delegation hidden |
 | CodeBuddy | 2.118.2 | `--disallowedTools Agent Task`; Codeg tools listed | Codeg denies omitted; Codeg delegation hidden |
 | Claude Code | 2.1.205 / ACP 0.58.1 | `_meta` denies `Agent`,`Task`; Codeg tools listed | Codeg denies omitted; Codeg delegation hidden |
 
