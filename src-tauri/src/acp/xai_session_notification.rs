@@ -90,11 +90,18 @@ pub fn map_xai_session_notification(
     if !XAI_PRIVATE_METHODS.contains(&method) {
         return None;
     }
-    let update = notification.params().get("update")?;
-    let kind = update
+    let Some(update) = notification.params().get("update") else {
+        tracing::warn!("x.ai private notification missing params.update");
+        return None;
+    };
+    let Some(kind) = update
         .get("sessionUpdate")
         .or_else(|| update.get("session_update"))
-        .and_then(|v| v.as_str())?;
+        .and_then(|v| v.as_str())
+    else {
+        tracing::warn!("x.ai private notification missing sessionUpdate");
+        return None;
+    };
     if !kind.starts_with("auto_compact_") {
         return None;
     }

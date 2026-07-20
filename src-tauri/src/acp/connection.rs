@@ -8770,10 +8770,9 @@ impl<'borrow, 'responder> ReadyUpdateSource<'borrow, 'responder> {
     async fn try_next_ready(&mut self) -> Option<Result<SessionMessage, sacp::Error>> {
         match self {
             ReadyUpdateSource::Live(session) => {
-                match tokio::time::timeout(std::time::Duration::ZERO, session.read_update()).await {
-                    Ok(r) => Some(r),
-                    Err(_) => None,
-                }
+                tokio::time::timeout(std::time::Duration::ZERO, session.read_update())
+                    .await
+                    .ok()
             }
             #[cfg(test)]
             ReadyUpdateSource::Fake(q) => q.pop_front().map(Ok),
@@ -8800,10 +8799,16 @@ async fn drain_ready_in_prompt_updates(
     compact_text_emitted_this_turn: &mut bool,
 ) {
     let cwd_opt = Some(cwd);
-    for _ in 0..64 {
+    let mut drained = 0u32;
+    loop {
+        if drained >= 64 {
+            tracing::warn!("[ACP] pre-finalize drain hit 64-message cap");
+            break;
+        }
         let Some(msg_res) = source.try_next_ready().await else {
             break;
         };
+        drained += 1;
         let Ok(msg) = msg_res else {
             tracing::warn!(
                 "[ACP] session update error during pre-finalize drain; stopping drain"
@@ -13018,6 +13023,126 @@ mod tests {
         assert!(!agent_out);
         assert!(!compact_flag);
         assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+    }
+
+    fn compact_completed_session_message() -> SessionMessage {
+        let raw = include_str!("fixtures/grok_auto_compact_completed.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        SessionMessage::SessionMessage(Dispatch::Notification(notif))
+    }
+
+    #[tokio::test]
+    async fn drain_with_fake_queue_sets_flag_before_rewrite() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+        use sacp::schema::SessionId;
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(compact_completed_session_message());
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Grok),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &emitter,
+            AgentType::Grok,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(turn_had, "drain must set agent-output flag via private emit");
+        assert!(compact_flag);
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
+        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+    }
+
+    #[tokio::test]
+    async fn drain_suppresses_secondary_terminal_continues_for_compact() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+        use sacp::schema::{SessionId, StopReason};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let emitter = EventEmitter::test_web_only(Arc::new(WebEventBroadcaster::new()));
+        let mut q = std::collections::VecDeque::new();
+        // Secondary terminal first, then compact — drain must not finalize and
+        // must still process compact.
+        q.push_back(SessionMessage::StopReason(StopReason::EndTurn));
+        q.push_back(compact_completed_session_message());
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Grok),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &emitter,
+            AgentType::Grok,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(q.is_empty(), "drain must consume full fake queue");
+        assert!(turn_had);
+        assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
     }
 
     #[test]
