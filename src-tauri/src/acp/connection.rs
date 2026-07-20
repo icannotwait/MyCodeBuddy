@@ -145,17 +145,45 @@ fn apply_cursor_env_policy(
 /// to the browser-login credential in `~/.grok/auth.json` rather than a leaked
 /// shell/container export. An empty value tells the spawn layer (vendored
 /// sacp-tokio) to `env_remove` the inherited var. API-key, custom, legacy, and
-/// no-mode rows are left untouched.
+/// no-mode rows are left untouched. Windows environment names are
+/// case-insensitive, so every `XAI_API_KEY` alias is removed before the
+/// canonical empty marker is appended.
+fn apply_grok_env_policy_with_platform(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+    windows: bool,
+) {
+    // BTreeMap iteration order matches the order `merge_agent_env` passes to
+    // Command. On Windows, the last case-insensitive alias is effective.
+    let auth_mode = runtime_env
+        .iter()
+        .rfind(|(key, _)| {
+            if windows {
+                key.eq_ignore_ascii_case("GROK_AUTH_MODE")
+            } else {
+                key.as_str() == "GROK_AUTH_MODE"
+            }
+        })
+        .map(|(_, value)| value.as_str());
+    if auth_mode != Some("subscription") {
+        return;
+    }
+    let key = "XAI_API_KEY";
+    merged.retain(|(candidate, _)| {
+        if windows {
+            !candidate.eq_ignore_ascii_case(key)
+        } else {
+            candidate != key
+        }
+    });
+    merged.push((key.to_string(), String::new()));
+}
+
 fn apply_grok_env_policy(
     merged: &mut Vec<(String, String)>,
     runtime_env: &BTreeMap<String, String>,
 ) {
-    if runtime_env.get("GROK_AUTH_MODE").map(String::as_str) != Some("subscription") {
-        return;
-    }
-    let key = "XAI_API_KEY";
-    merged.retain(|(k, _)| k != key);
-    merged.push((key.to_string(), String::new()));
+    apply_grok_env_policy_with_platform(merged, runtime_env, cfg!(windows));
 }
 
 fn apply_npx_launch_env_policy(
@@ -12475,6 +12503,26 @@ mod tests {
             Some(""),
             "subscription mode must remove even a stale configured API key"
         );
+    }
+
+    #[test]
+    fn grok_env_policy_windows_removes_case_variant_keys() {
+        let runtime_env: BTreeMap<String, String> = [
+            ("grok_auth_mode".to_string(), "subscription".to_string()),
+            ("xai_api_key".to_string(), "xai-stale-key".to_string()),
+        ]
+        .into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_grok_env_policy_with_platform(&mut merged_env, &runtime_env, true);
+
+        let matching: Vec<_> = merged_env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("XAI_API_KEY"))
+            .collect();
+        assert_eq!(matching.len(), 1, "Windows launch env must have one key");
+        assert_eq!(matching[0].0, "XAI_API_KEY");
+        assert!(matching[0].1.is_empty());
     }
 
     #[test]
