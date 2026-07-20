@@ -16,8 +16,12 @@ pub const ROUTE_ADAPTER_CONTRACT_VERSION: &str = "delegation-route-v1";
 
 /// Pinned Codex CLI version covered by the route-adapter contract.
 pub const PINNED_CODEX_CLI_VERSION: &str = "0.144.1";
-/// Pinned Grok package version covered by the route-adapter contract.
-pub const PINNED_GROK_VERSION: &str = "0.2.98";
+/// Recommended Grok package version for smoke/docs and missing-install fallback.
+///
+/// Unlike Codex/CodeBuddy/Claude, Grok native suppression (`--no-subagents` /
+/// `GROK_SUBAGENTS=0`) is treated as available on **any** installed host
+/// version — this constant is not an exclusive capability gate.
+pub const PINNED_GROK_VERSION: &str = "0.2.103";
 /// Pinned CodeBuddy package version covered by the route-adapter contract.
 pub const PINNED_CODEBUDDY_VERSION: &str = "2.118.2";
 /// Pinned Claude Code product version covered by the route-adapter contract.
@@ -217,7 +221,9 @@ fn env_has_nonempty(runtime_env: &BTreeMap<String, String>, key: &str) -> bool {
 
 fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool {
     match agent_type {
-        AgentType::Grok => installed == PINNED_GROK_VERSION,
+        // Grok suppression is stable across current host builds; never treat a
+        // non-smoke version as an unverified custom executable.
+        AgentType::Grok => true,
         AgentType::CodeBuddy => installed == PINNED_CODEBUDDY_VERSION,
         AgentType::ClaudeCode => {
             installed == PINNED_CLAUDE_ACP_VERSION || installed == PINNED_CLAUDE_CODE_VERSION
@@ -234,10 +240,11 @@ fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool
 /// - **Codex:** explicit non-empty `CODEX_PATH` in user/runtime config → custom;
 ///   otherwise managed host contract is the pinned CLI `0.144.1` (never ACP
 ///   adapter `registry_version`).
-/// - **Grok / CodeBuddy / Claude:** an installed version that differs from the
-///   managed pin(s) → custom; missing installed version is treated as managed
-///   (uses the host contract pin). Claude accepts wrapper `0.58.1` or product
-///   `2.1.205`.
+/// - **Grok:** any installed host version is managed (native suppression is not
+///   exclusive-pinned). Missing installed version falls back to the smoke pin.
+/// - **CodeBuddy / Claude:** an installed version that differs from the managed
+///   pin(s) → custom; missing installed version is treated as managed (uses the
+///   host contract pin). Claude accepts wrapper `0.58.1` or product `2.1.205`.
 pub fn classify_managed_host_contract(
     agent_type: AgentType,
     installed_version: Option<&str>,
@@ -353,6 +360,9 @@ impl RouteCapabilitySnapshot {
 /// ACP adapter install id unless they are the same product. `custom_executable`
 /// is true when the user points at an unverified custom binary; that path is
 /// always unsupported without a per-connect `--help` probe.
+///
+/// **Grok exception:** native suppression is accepted for any non-custom host
+/// version (exact equality with [`PINNED_GROK_VERSION`] is not required).
 pub fn suppression_capability(
     agent_type: AgentType,
     version: Option<&str>,
@@ -372,7 +382,8 @@ pub fn suppression_capability(
 
     let compatible = match agent_type {
         AgentType::Codex => version == PINNED_CODEX_CLI_VERSION,
-        AgentType::Grok => version == PINNED_GROK_VERSION,
+        // Any installed Grok host build: suppression flags are stable.
+        AgentType::Grok => true,
         AgentType::CodeBuddy => version == PINNED_CODEBUDDY_VERSION,
         AgentType::ClaudeCode => {
             version == PINNED_CLAUDE_ACP_VERSION || version == PINNED_CLAUDE_CODE_VERSION
@@ -861,15 +872,64 @@ mod tests {
         .expect_err("child unavailable");
         assert_eq!(child_err.stable_code(), "route_unavailable");
 
-        // Grok/CodeBuddy non-pin installed version is custom.
+        // CodeBuddy non-pin installed version is still custom/unsupported.
         let empty = BTreeMap::new();
-        let grok = classify_managed_host_contract(AgentType::Grok, Some("0.1.0"), &empty);
-        assert!(grok.custom_executable);
-        let cap = resolve_managed_host_suppression(AgentType::Grok, Some("0.1.0"), &empty);
+        let codebuddy =
+            classify_managed_host_contract(AgentType::CodeBuddy, Some("1.0.0"), &empty);
+        assert!(codebuddy.custom_executable);
+        let cap = resolve_managed_host_suppression(AgentType::CodeBuddy, Some("1.0.0"), &empty);
         assert_eq!(
             cap.failure,
             Some(RouteDegradedReason::NativeSuppressionUnsupported)
         );
+    }
+
+    #[test]
+    fn grok_any_installed_version_supports_native_suppression() {
+        let empty = BTreeMap::new();
+        for version in ["0.1.0", "0.2.98", "0.2.103", "9.9.9"] {
+            let facts = classify_managed_host_contract(AgentType::Grok, Some(version), &empty);
+            assert!(
+                !facts.custom_executable,
+                "Grok {version} must not be treated as custom"
+            );
+            assert_eq!(facts.contract_version.as_deref(), Some(version));
+            let cap = resolve_managed_host_suppression(AgentType::Grok, Some(version), &empty);
+            assert!(
+                cap.failure.is_none(),
+                "Grok {version} must support native suppression"
+            );
+
+            let plan = resolve_route(RouteResolutionInput {
+                agent_type: AgentType::Grok,
+                origin: DelegationConnectionOrigin::Root,
+                session_override: None,
+                global_policy: DelegationRoutePolicy::Codeg,
+                delegation_enabled: true,
+                suppression: cap,
+                agent_mcp_supported: true,
+                companion_binary_available: true,
+            })
+            .expect("Grok root Codeg route");
+            assert_eq!(plan.effective, DelegationRoutePolicy::Codeg);
+            assert_eq!(plan.source, DelegationRouteSource::GlobalDefault);
+            assert_eq!(
+                plan.native_suppression,
+                NativeSuppressionPlan::GrokNoSubagents
+            );
+            assert!(plan.degraded_reason.is_none());
+        }
+
+        // Missing installed version still falls back to the smoke pin.
+        let missing = classify_managed_host_contract(AgentType::Grok, None, &empty);
+        assert!(!missing.custom_executable);
+        assert_eq!(
+            missing.contract_version.as_deref(),
+            Some(PINNED_GROK_VERSION)
+        );
+        assert!(resolve_managed_host_suppression(AgentType::Grok, None, &empty)
+            .failure
+            .is_none());
     }
 
     #[test]
