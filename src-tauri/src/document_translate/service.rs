@@ -61,7 +61,7 @@ impl DocumentTranslationService {
         params: TranslateDocumentParams,
     ) -> Result<TranslateDocumentResult, DocumentTranslateError> {
         // Wall-clock overall deadline arms at service entry so protect/locale/
-        // agent load count toward the 120s budget (cleanup is outside it).
+        // agent load count toward the DEADLINE_SECS budget (cleanup is outside it).
         let overall_deadline = Instant::now() + Duration::from_secs(DEADLINE_SECS);
 
         // --- cheap validation before admission ---

@@ -13,8 +13,12 @@ use crate::models::system::AppLocale;
 pub const MAX_INPUT_SCALARS: usize = 32_000;
 /// Max UTF-8 bytes collected from the runner before fail-closed.
 pub const MAX_OUTPUT_BYTES: usize = 96_000;
-/// Overall runner deadline (seconds).
-pub const DEADLINE_SECS: u64 = 120;
+/// Overall runner wall-clock deadline (seconds), armed at service entry.
+///
+/// Sized for post-protect max input (32k scalars): ~20s TTFT + ~16k output
+/// tokens at ~40 tok/s + margin ≈ 480s. FE `translateDocument` timeout must
+/// stay above this (see `api.ts`).
+pub const DEADLINE_SECS: u64 = 480;
 /// Process-wide in-flight capacity (v1: no queue).
 pub const TRANSLATE_CAPACITY: usize = 1;
 

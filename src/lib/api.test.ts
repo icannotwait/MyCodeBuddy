@@ -60,7 +60,7 @@ describe("translateDocument transport payload", () => {
     })
   })
 
-  it("passes timeoutMs 195000 for document translation", async () => {
+  it("passes timeoutMs 540000 for document translation", async () => {
     const params = {
       content: "# Hello",
       format: "markdown" as const,
@@ -71,7 +71,7 @@ describe("translateDocument transport payload", () => {
     expect(mockTransport.call).toHaveBeenCalledWith(
       "translate_document",
       params,
-      { timeoutMs: 195_000 }
+      { timeoutMs: 540_000 }
     )
   })
 })

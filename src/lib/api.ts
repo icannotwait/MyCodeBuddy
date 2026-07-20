@@ -3445,8 +3445,10 @@ export async function translateDocument(params: {
   locale?: string
   displayName?: string
 }): Promise<TranslateDocumentResult> {
+  // Must exceed backend DEADLINE_SECS (480s) so the service can return
+  // translateTimeout rather than the transport aborting first.
   return getTransport().call("translate_document", params, {
-    timeoutMs: 195_000,
+    timeoutMs: 540_000,
   })
 }
 
