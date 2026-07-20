@@ -106,6 +106,14 @@ pub fn build_router(
             post(handlers::conversation_experience::set_reference_search_limit),
         )
         .route(
+            "/translate_document",
+            post(handlers::document_translate::translate_document),
+        )
+        .route(
+            "/save_translation_as",
+            post(handlers::document_translate::save_translation_as),
+        )
+        .route(
             "/start_reference_search",
             post(handlers::reference_search::start_reference_search),
         )

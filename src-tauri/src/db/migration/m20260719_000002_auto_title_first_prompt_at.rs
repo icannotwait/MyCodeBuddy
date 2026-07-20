@@ -252,10 +252,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrator_registers_deadline_migration_last() {
+    async fn migrator_registers_deadline_migration() {
         let migrations = Migrator::migrations();
-        let last = migrations.last().expect("non-empty");
-        assert_eq!(last.name(), "m20260719_000002_auto_title_first_prompt_at");
+        assert!(
+            migrations
+                .iter()
+                .any(|m| m.name() == "m20260719_000002_auto_title_first_prompt_at"),
+            "deadline migration must be registered in Migrator"
+        );
     }
 
     #[tokio::test]

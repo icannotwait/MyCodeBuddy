@@ -97,6 +97,18 @@ pub enum ConnectionPurpose {
     Delegation,
     InternalProbe,
     InternalTitle,
+    /// Hidden document-translation run (reserved cwd, no UI / MCP injection).
+    InternalTranslate,
+}
+
+impl ConnectionPurpose {
+    /// Title and translate generation share hidden-lifecycle policy (no MCP
+    /// injection, no title capture, suppressed terminal prefix / bg watch,
+    /// auto-decline permissions). Probe is **not** hidden generation — it
+    /// keeps probe-only admission paths.
+    pub fn is_hidden_generation(self) -> bool {
+        matches!(self, Self::InternalTitle | Self::InternalTranslate)
+    }
 }
 
 /// Launch-time purpose and optional inherited locale for a connection.
@@ -206,5 +218,34 @@ pub async fn user_launch_context_from_db(conn: &DatabaseConnection) -> Connectio
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::User,
         inherited_locale: Some(language),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionPurpose;
+
+    #[test]
+    fn hidden_generation_matrix() {
+        assert!(
+            ConnectionPurpose::InternalTitle.is_hidden_generation(),
+            "title is hidden generation"
+        );
+        assert!(
+            ConnectionPurpose::InternalTranslate.is_hidden_generation(),
+            "translate is hidden generation"
+        );
+        assert!(
+            !ConnectionPurpose::User.is_hidden_generation(),
+            "user is not hidden generation"
+        );
+        assert!(
+            !ConnectionPurpose::Delegation.is_hidden_generation(),
+            "delegation is not hidden generation"
+        );
+        assert!(
+            !ConnectionPurpose::InternalProbe.is_hidden_generation(),
+            "probe stays probe-only, not hidden generation"
+        );
     }
 }

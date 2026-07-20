@@ -10,6 +10,7 @@ pub mod automation;
 pub mod chat_channel;
 pub mod commands;
 pub mod db;
+pub mod document_translate;
 pub mod git_credential;
 pub mod git_repo;
 pub mod keyring_store;
@@ -357,6 +358,23 @@ mod tauri_app {
                     app.manage(std::sync::Arc::new(
                         crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
                     ));
+                }
+
+                // Process-wide document translation service (shared with embedded Axum).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    let translate_db = std::sync::Arc::new(db::AppDatabase {
+                        conn: db.conn.clone(),
+                    });
+                    let cm = app.state::<ConnectionManager>().clone_ref();
+                    let service =
+                        crate::document_translate::build_production_document_translation_service(
+                            translate_db,
+                            cm,
+                            internal_sessions.clone(),
+                            effective_data_dir.clone(),
+                        );
+                    app.manage(service);
                 }
 
                 // Process-wide reference-search registry (shared with embedded Axum).
@@ -1204,6 +1222,8 @@ mod tauri_app {
                 crate::commands::conversation_experience::get_conversation_experience_settings,
                 crate::commands::conversation_experience::set_auto_title_agent,
                 crate::commands::conversation_experience::set_reference_search_limit,
+                crate::commands::document_translate::translate_document,
+                crate::commands::document_translate::save_translation_as,
                 crate::commands::reference_search::start_reference_search,
                 crate::commands::reference_search::next_reference_search_page,
                 crate::commands::reference_search::cancel_reference_search,

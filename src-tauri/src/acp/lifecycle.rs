@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
@@ -272,15 +272,24 @@ async fn handle_turn_complete_internal(
                     crate::auto_title::notify_live_coordinator_ready();
                 }
             }
-            if let Some(b) = broker {
-                // Empty broker text when no sidecar — never re-read SessionState.
-                let text = broker_text
+            // Broker settle (complete_call → durable CAS → parent tool_result)
+            // MUST NOT run under the lifecycle worker's 45s timeout. Production
+            // saw Codex child TurnComplete log "broker owns status CAS" then
+            // hang in complete_call for 5×45s; the first attempt moves the task
+            // into `settling`, the timeout cancels mid-settle, and retries
+            // no-op — child stays `running`/`in_progress` and the parent never
+            // receives the MCP tool_result (Join stuck forever).
+            // Auto-title stays on-worker (short DB write); settle is detached.
+            spawn_forward_turn_complete_to_broker(
+                db_conn,
+                broker,
+                cid,
+                stop_reason,
+                broker_text
                     .as_ref()
                     .map(|t| t.as_ref().to_string())
-                    .unwrap_or_default();
-                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
-                    .await;
-            }
+                    .unwrap_or_default(),
+            );
             return Ok(());
         }
         Ok(false) => {}
@@ -300,14 +309,16 @@ async fn handle_turn_complete_internal(
                     crate::auto_title::notify_live_coordinator_ready();
                 }
             }
-            if let Some(b) = broker {
-                let text = broker_text
+            spawn_forward_turn_complete_to_broker(
+                db_conn,
+                broker,
+                cid,
+                stop_reason,
+                broker_text
                     .as_ref()
                     .map(|t| t.as_ref().to_string())
-                    .unwrap_or_default();
-                forward_turn_complete_to_broker(db_conn, b.as_ref(), cid, stop_reason, Some(text))
-                    .await;
-            }
+                    .unwrap_or_default(),
+            );
             return Ok(());
         }
     }
@@ -373,6 +384,63 @@ async fn handle_turn_complete_internal(
         }
     }
 
+    // Immediate post-commit re-read: prove the row still holds the CAS winner.
+    // A concurrent unconditional `update_status_with_patch(InProgress)` (the
+    // #394-class bug) can land in the same millisecond and leave the sidebar
+    // spinning while logs claim "CAS won".
+    let expected_after_cas: Option<ConversationStatus> = match stop_reason {
+        "end_turn" if cas_patch.is_some() => Some(ConversationStatus::PendingReview),
+        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
+            if cas_patch.is_some() =>
+        {
+            Some(ConversationStatus::Cancelled)
+        }
+        _ => None,
+    };
+    if let Some(expected) = expected_after_cas {
+        match crate::db::entities::conversation::Entity::find_by_id(cid)
+            .one(db_conn)
+            .await
+        {
+            Ok(Some(row)) => {
+                if row.status != expected {
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        conversation_id = cid,
+                        stop_reason = %stop_reason,
+                        expected = ?expected,
+                        actual = ?row.status,
+                        "[lifecycle][ERROR] post-CAS re-read mismatch — status \
+                         overwritten after TurnComplete CAS"
+                    );
+                } else {
+                    tracing::info!(
+                        connection_id = %connection_id,
+                        conversation_id = cid,
+                        status = ?row.status,
+                        awaiting_reply_token_set = row.awaiting_reply_token.is_some(),
+                        "[lifecycle] post-CAS re-read ok"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    connection_id = %connection_id,
+                    conversation_id = cid,
+                    "[lifecycle] post-CAS re-read: conversation row missing"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    connection_id = %connection_id,
+                    conversation_id = cid,
+                    error = %e,
+                    "[lifecycle] post-CAS re-read failed"
+                );
+            }
+        }
+    }
+
     if let Some(patch) = cas_patch {
         let status = if stop_reason == "end_turn" {
             ConversationStatus::PendingReview
@@ -400,8 +468,119 @@ async fn handle_turn_complete_internal(
                 crate::commands::conversations::emit_conversation_state(&emitter, patch);
             });
         }
+
+        // Delayed orphan recovery: if something silent rewrote the row back to
+        // InProgress after a successful end_turn CAS, and no turn is in flight
+        // on this connection, re-apply pending_review and re-emit. Catches the
+        // #394/#385 class without racing a legitimate follow-up prompt (those
+        // set turn_in_flight before/with the InProgress write).
+        if stop_reason == "end_turn" {
+            let db_conn = db_conn.clone();
+            let manager = manager.clone_ref();
+            let connection_id = connection_id.to_string();
+            let mark_awaiting_reply = mark_awaiting_reply;
+            tokio::spawn(async move {
+                for delay in [Duration::from_secs(1), Duration::from_secs(5)] {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = reconcile_orphaned_in_progress_after_turn_complete(
+                        &db_conn,
+                        &manager,
+                        &connection_id,
+                        cid,
+                        mark_awaiting_reply,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            connection_id = %connection_id,
+                            conversation_id = cid,
+                            error = %e,
+                            "[lifecycle] orphan InProgress reconcile failed"
+                        );
+                    }
+                }
+            });
+        }
     }
 
+    Ok(())
+}
+
+/// If the row is still (or again) `in_progress` after a successful end_turn
+/// CAS, and this connection has no turn in flight, re-apply the end-turn CAS
+/// and fan out the state patch. No-op when a real follow-up turn owns the
+/// status, or when the row is already terminal/pending_review.
+async fn reconcile_orphaned_in_progress_after_turn_complete(
+    db_conn: &DatabaseConnection,
+    manager: &ConnectionManager,
+    connection_id: &str,
+    conversation_id: i32,
+    mark_awaiting_reply: bool,
+) -> Result<(), DbError> {
+    let turn_in_flight = match manager.get_state_and_emitter(connection_id).await {
+        Some((state_arc, _)) => state_arc.read().await.turn_in_flight,
+        // Connection gone: nothing can complete a turn for this row — safe to
+        // heal a stranded InProgress left after a prior CAS was clobbered.
+        None => false,
+    };
+    if turn_in_flight {
+        tracing::debug!(
+            connection_id = %connection_id,
+            conversation_id,
+            "[lifecycle] orphan reconcile skipped: turn still in flight"
+        );
+        return Ok(());
+    }
+
+    let Some(row) = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+        .one(db_conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    if row.status != ConversationStatus::InProgress {
+        return Ok(());
+    }
+
+    tracing::error!(
+        connection_id = %connection_id,
+        conversation_id,
+        "[lifecycle][ERROR] orphan InProgress after TurnComplete CAS — \
+         re-applying pending_review (no turn in flight)"
+    );
+
+    let Some(patch) = conversation_service::finish_end_turn_if_in_progress(
+        db_conn,
+        conversation_id,
+        mark_awaiting_reply,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    if let Some((state_arc, emitter)) = manager.get_state_and_emitter(connection_id).await {
+        emit_with_state(
+            &state_arc,
+            &emitter,
+            AcpEvent::ConversationStatusChanged {
+                conversation_id,
+                status: ConversationStatus::PendingReview,
+            },
+        )
+        .await;
+        crate::commands::conversations::emit_conversation_state(&emitter, patch);
+    } else {
+        // Connection already torn down: still try the durable state channel if
+        // any live connection emitter exists is not available — best-effort
+        // log only; next list refresh will load pending_review from DB.
+        tracing::info!(
+            connection_id = %connection_id,
+            conversation_id,
+            "[lifecycle] orphan reconcile wrote pending_review; connection gone \
+             (UI will converge on next refresh)"
+        );
+    }
     Ok(())
 }
 
@@ -576,6 +755,43 @@ async fn conversation_is_delegate(
     Ok(row.delegation_call_id.is_some())
 }
 
+/// Detach broker settlement from the lifecycle worker so a slow
+/// `complete_call` cannot be cancelled by the 45s handle timeout (which
+/// strands tasks in `settling` and blocks the parent Join forever).
+fn spawn_forward_turn_complete_to_broker(
+    db_conn: &DatabaseConnection,
+    broker: Option<&Arc<DelegationBroker>>,
+    conversation_id: i32,
+    stop_reason: &str,
+    last_text: String,
+) {
+    let Some(broker) = broker.map(Arc::clone) else {
+        tracing::warn!(
+            conversation_id,
+            "[lifecycle] delegate TurnComplete but no broker installed — \
+             child status will not settle"
+        );
+        return;
+    };
+    let db_conn = db_conn.clone();
+    let stop_reason = stop_reason.to_string();
+    tracing::info!(
+        conversation_id,
+        stop_reason = %stop_reason,
+        "[lifecycle] spawning broker complete_call off lifecycle worker"
+    );
+    tokio::spawn(async move {
+        forward_turn_complete_to_broker(
+            &db_conn,
+            broker.as_ref(),
+            conversation_id,
+            &stop_reason,
+            Some(last_text),
+        )
+        .await;
+    });
+}
+
 /// On TurnComplete for a delegation child, resolve the pending broker call
 /// and let the broker drive the rest of the lifecycle (meta write, the
 /// `AcpEvent::DelegationCompleted` emit against the parent stream, child
@@ -584,6 +800,9 @@ async fn conversation_is_delegate(
 /// paths (`timeout` / `cancel_by_child_connection` / `cancel_by_parent`)
 /// also surface the event — see
 /// `.docs/issues/2026-05-24-delegation-termination-cascade.md`.
+///
+/// Prefer [`spawn_forward_turn_complete_to_broker`] from the lifecycle worker
+/// so settlement is not cancelled by the worker handle timeout.
 async fn forward_turn_complete_to_broker(
     db_conn: &DatabaseConnection,
     broker: &DelegationBroker,
@@ -591,6 +810,12 @@ async fn forward_turn_complete_to_broker(
     stop_reason: &str,
     last_text: Option<String>,
 ) {
+    let started = std::time::Instant::now();
+    tracing::info!(
+        conversation_id,
+        stop_reason = %stop_reason,
+        "[delegation][lifecycle] forward_turn_complete_to_broker begin"
+    );
     let row = match conversation_service::get_by_id(db_conn, conversation_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -603,7 +828,13 @@ async fn forward_turn_complete_to_broker(
     };
     let call_id = match row.delegation_call_id.clone() {
         Some(id) => id,
-        None => return, // not a delegation child; nothing to do.
+        None => {
+            tracing::warn!(
+                conversation_id,
+                "[delegation][lifecycle] no delegation_call_id; cannot complete_call"
+            );
+            return; // not a delegation child; nothing to do.
+        }
     };
     if row.parent_tool_use_id.is_none() {
         tracing::info!(
@@ -648,7 +879,19 @@ async fn forward_turn_complete_to_broker(
             Some(conversation_id),
         ),
     };
+    tracing::info!(
+        conversation_id,
+        call_id = %call_id,
+        stop_reason = %stop_reason,
+        "[delegation][lifecycle] invoking broker.complete_call"
+    );
     broker.complete_call(&call_id, outcome).await;
+    tracing::info!(
+        conversation_id,
+        call_id = %call_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "[delegation][lifecycle] broker.complete_call finished"
+    );
 }
 
 /// Snapshot the connection's `(state, emitter)` into the lifecycle cache when

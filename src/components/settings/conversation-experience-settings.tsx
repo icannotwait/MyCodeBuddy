@@ -147,42 +147,53 @@ export function ConversationExperienceSettingsSection() {
         </p>
       ) : (
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1 min-w-0">
-              <label htmlFor="auto-title-agent" className="text-sm font-medium">
-                {t("autoTitleAgent")}
-              </label>
-            </div>
-            <Select
-              value={selectValue}
-              onValueChange={onChange}
-              disabled={saving || loading}
-            >
-              <SelectTrigger
-                id="auto-title-agent"
-                className="w-[220px] shrink-0"
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="space-y-1 min-w-0">
+                <label
+                  htmlFor="auto-title-agent"
+                  className="text-sm font-medium"
+                >
+                  {t("autoTitleAgent")}
+                </label>
+              </div>
+              <Select
+                value={selectValue}
+                onValueChange={onChange}
+                disabled={saving || loading}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={OFF_VALUE}>{t("autoTitleOff")}</SelectItem>
-                {choices.enabledAvailable.map((agent) => (
-                  <SelectItem key={agent.agent_type} value={agent.agent_type}>
-                    {agent.name}
-                  </SelectItem>
-                ))}
-                {choices.savedUnavailable && (
-                  <SelectItem
-                    value={choices.savedUnavailable.agent_type}
-                    disabled
-                  >
-                    {t("autoTitleUnavailable", {
-                      agent: choices.savedUnavailable.name,
-                    })}
-                  </SelectItem>
-                )}
-              </SelectContent>
-            </Select>
+                <SelectTrigger
+                  id="auto-title-agent"
+                  className="w-[220px] shrink-0"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={OFF_VALUE}>{t("autoTitleOff")}</SelectItem>
+                  {choices.enabledAvailable.map((agent) => (
+                    <SelectItem key={agent.agent_type} value={agent.agent_type}>
+                      {agent.name}
+                    </SelectItem>
+                  ))}
+                  {choices.savedUnavailable && (
+                    <SelectItem
+                      value={choices.savedUnavailable.agent_type}
+                      disabled
+                    >
+                      {t("autoTitleUnavailable", {
+                        agent: choices.savedUnavailable.name,
+                      })}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+            <p
+              className="text-xs text-muted-foreground leading-5"
+              data-testid="translate-provider-disclosure"
+            >
+              {t("translateProviderDisclosure")}
+            </p>
           </div>
 
           <div className="flex items-start justify-between gap-3">

@@ -4400,16 +4400,31 @@ impl DelegationBroker {
                     let duration_ms = task.started_at.elapsed().as_millis() as u64;
                     // running → settling under the same lock (CAS is out of lock).
                     inner.settling.insert(call_id.to_string(), task.clone());
+                    tracing::info!(
+                        call_id = %call_id,
+                        child_conversation_id = task.child_conversation_id,
+                        duration_ms,
+                        "[delegation] complete_call: running → settling"
+                    );
                     Some((task, duration_ms))
                 }
                 None if inner.settling.contains_key(call_id) => {
                     // Another producer already owns durable settlement.
+                    tracing::info!(
+                        call_id = %call_id,
+                        "[delegation] complete_call: already settling — no-op"
+                    );
                     None
                 }
                 None => {
                     // Buffer for the racing `start_delegation` to drain iff still
                     // reserved (mid-setup); a no-op otherwise, so the clone only
                     // materializes on the genuine pre-registration race.
+                    tracing::info!(
+                        call_id = %call_id,
+                        "[delegation] complete_call: not in running — buffer early complete \
+                         if reserved, else no-op"
+                    );
                     inner.buffer_early_complete(call_id, outcome.clone());
                     None
                 }
@@ -4418,7 +4433,18 @@ impl DelegationBroker {
         if let Some((task, duration_ms)) = task {
             let (terminal, result_text) = terminal_from_outcome(&outcome);
             let ctx = SettleContext::from_running(&task, duration_ms, false);
+            tracing::info!(
+                call_id = %call_id,
+                child_conversation_id = task.child_conversation_id,
+                "[delegation] complete_call: settle_task begin"
+            );
+            let started = std::time::Instant::now();
             self.settle_task(call_id, terminal, result_text, ctx).await;
+            tracing::info!(
+                call_id = %call_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "[delegation] complete_call: settle_task finished"
+            );
         }
     }
 

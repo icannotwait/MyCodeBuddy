@@ -2797,12 +2797,12 @@ async fn run_connection(
     // Shared across fork restarts of this conversation loop; browser/transport
     // reattachment reuses the live AgentConnection and never re-enters here.
     let terminal_prompt_context = Arc::new(TerminalPromptContext::new(terminal_shell.spec.clone()));
-    // Internal title runs must not start background transcript watchers.
-    let is_internal_title = {
+    // Hidden generation (title/translate) must not start background transcript watchers.
+    let is_hidden_generation = {
         let s = state.read().await;
-        s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+        s.purpose.is_hidden_generation()
     };
-    let _bg_watch = if is_internal_title {
+    let _bg_watch = if is_hidden_generation {
         None
     } else {
         background_watch::spawn_if_claude(
@@ -3827,13 +3827,13 @@ async fn handle_permission_request(
     req: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
 ) {
-    // Internal title runs have no interactive UI path: decline immediately and
+    // Hidden generation has no interactive UI path: decline immediately and
     // still emit so the private-stream runner observes Interactive failure.
-    let is_internal_title = {
+    let is_hidden_generation = {
         let s = state.read().await;
-        s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+        s.purpose.is_hidden_generation()
     };
-    if is_internal_title {
+    if is_hidden_generation {
         let request_id = uuid::Uuid::new_v4().to_string();
         let _ = responder.respond(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
@@ -5935,13 +5935,13 @@ async fn run_conversation_loop<'a>(
                 }
 
                 // Wire-only mutation: first prompt on this process gets the
-                // versioned shell context. Live UI / optimistic dedup / title
-                // paths never see this block (they use `user_message` below).
-                // InternalTitle must send the exact title prompt without a
-                // silent terminal-instruction prefix.
+                // versioned shell context. Live UI / optimistic dedup / hidden
+                // generation paths never see this block (they use
+                // `user_message` below). Title/translate must send the exact
+                // utility prompt without a silent terminal-instruction prefix.
                 let skip_terminal_prefix = {
                     let s = state.read().await;
-                    s.purpose == crate::auto_title::ConnectionPurpose::InternalTitle
+                    s.purpose.is_hidden_generation()
                 };
                 if !skip_terminal_prefix {
                     terminal_prompt_context.append_once(&mut prompt_blocks);

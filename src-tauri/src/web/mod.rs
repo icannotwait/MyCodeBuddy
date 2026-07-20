@@ -793,6 +793,10 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::auto_title::AutoTitleCoordinator>>()
             .inner()
             .clone(),
+        document_translation: app
+            .state::<Arc<crate::document_translate::DocumentTranslationService>>()
+            .inner()
+            .clone(),
         conversation_experience_gate: app
             .state::<Arc<crate::commands::conversation_experience::ConversationExperienceMutationGate>>()
             .inner()

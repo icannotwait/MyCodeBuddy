@@ -14,7 +14,9 @@ import {
   cancelReferenceSearch,
   matchReferenceRegex,
   nextReferenceSearchPage,
+  saveTranslationAs,
   startReferenceSearch,
+  translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
 
@@ -45,6 +47,55 @@ describe("acpPrompt transport payload", () => {
       visibleText: "README.md task",
       locale: "zh_cn",
     })
+  })
+})
+
+describe("translateDocument transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({
+      translatedContent: "你好",
+      locale: "zh_cn",
+      format: "markdown",
+    })
+  })
+
+  it("passes timeoutMs 195000 for document translation", async () => {
+    const params = {
+      content: "# Hello",
+      format: "markdown" as const,
+      locale: "zh_cn",
+      displayName: "README.md",
+    }
+    await translateDocument(params)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "translate_document",
+      params,
+      { timeoutMs: 195_000 }
+    )
+  })
+})
+
+describe("saveTranslationAs transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({
+      absolutePath: "/ws/README.zh_cn.md",
+    })
+  })
+
+  it("sends flat folderId relativePath content payload", async () => {
+    const params = {
+      folderId: 7,
+      relativePath: "README.zh_cn.md",
+      content: "你好",
+    }
+    const result = await saveTranslationAs(params)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "save_translation_as",
+      params
+    )
+    expect(result.absolutePath).toBe("/ws/README.zh_cn.md")
   })
 })
 

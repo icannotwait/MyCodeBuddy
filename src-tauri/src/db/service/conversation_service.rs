@@ -300,6 +300,11 @@ fn parse_route_override(raw: Option<String>) -> Option<DelegationRoutePolicy> {
 /// Unconditional status write: sets `status`, clears `awaiting_reply_token`,
 /// and bumps `updated_at` atomically. Returns the resulting state patch so
 /// callers can broadcast without a second read.
+///
+/// **Warning:** this is not CAS. Callers that must not clobber a concurrent
+/// `TurnComplete` winner should prefer `update_status_if_with_patch` or
+/// `finish_end_turn_if_in_progress`. Every write is logged (prev → new) so
+/// post-CAS overwrites that leave rows stuck at `in_progress` are diagnosable.
 pub async fn update_status_with_patch(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -309,12 +314,48 @@ pub async fn update_status_with_patch(
         .one(conn)
         .await?
         .ok_or_else(|| DbError::Migration(format!("Conversation not found: {conversation_id}")))?;
+    let prev_status = conv.status.clone();
     let now = Utc::now();
     let mut active: conversation::ActiveModel = conv.into();
     active.status = Set(status.clone());
     active.awaiting_reply_token = Set(None);
     active.updated_at = Set(now);
     active.update(conn).await?;
+    let prev_s = status_string(&prev_status);
+    let new_s = status_string(&status);
+    if prev_status != status {
+        tracing::info!(
+            conversation_id,
+            prev_status = %prev_s,
+            new_status = %new_s,
+            "[conversation_service] status write (unconditional)"
+        );
+        // High-signal: anything that re-opens a finished turn without going
+        // through the intentional send_prompt path is the #394-class bug.
+        if matches!(
+            (&prev_status, &status),
+            (
+                conversation::ConversationStatus::PendingReview
+                    | conversation::ConversationStatus::Completed
+                    | conversation::ConversationStatus::Cancelled,
+                conversation::ConversationStatus::InProgress
+            )
+        ) {
+            tracing::warn!(
+                conversation_id,
+                prev_status = %prev_s,
+                new_status = %new_s,
+                "[conversation_service][WARN] terminal/pending_review → in_progress \
+                 (clears awaiting_reply_token); expected only on a real new prompt"
+            );
+        }
+    } else {
+        tracing::debug!(
+            conversation_id,
+            status = %new_s,
+            "[conversation_service] status rewrite (same value; token cleared)"
+        );
+    }
     Ok(state_patch(conversation_id, status, None, now))
 }
 

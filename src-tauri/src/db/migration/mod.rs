@@ -32,6 +32,7 @@ mod m20260716_000003_delegation_route_reliability;
 mod m20260717_000001_event_driven_delegation_join;
 mod m20260719_000001_delegation_continuations;
 mod m20260719_000002_auto_title_first_prompt_at;
+mod m20260720_000001_internal_session_translate_purpose;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -70,6 +71,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260717_000001_event_driven_delegation_join::Migration),
             Box::new(m20260719_000001_delegation_continuations::Migration),
             Box::new(m20260719_000002_auto_title_first_prompt_at::Migration),
+            Box::new(m20260720_000001_internal_session_translate_purpose::Migration),
         ]
     }
 }
