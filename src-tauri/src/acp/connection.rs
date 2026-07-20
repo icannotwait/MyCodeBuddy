@@ -162,6 +162,16 @@ fn apply_grok_env_policy(
     }
 }
 
+fn apply_npx_launch_env_policy(
+    agent_type: AgentType,
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
+    if agent_type == AgentType::Grok {
+        apply_grok_env_policy(merged, runtime_env);
+    }
+}
+
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
 /// `env` has no PATH key of its own. Removes any pre-existing PATH key first
 /// (case-insensitively when `windows`, since Windows env keys are
@@ -852,6 +862,7 @@ async fn build_agent(
                 crate::commands::acp::seed_pi_workspace_trust(cwd, runtime_env);
             }
             let mut merged_env = merge_agent_env(env, runtime_env);
+            apply_npx_launch_env_policy(agent_type, &mut merged_env, runtime_env);
             // codex-acp 1.0.0 honors APP_SERVER_LOGS as a directory for its
             // adapter-side logs. Surface it only under CODEG_ACP_DEBUG so
             // default runs are unchanged; a directory-creation failure silently
@@ -12434,6 +12445,19 @@ mod tests {
             apply_grok_env_policy(&mut env, &rt);
             assert!(!env.iter().any(|(k, _)| k == "XAI_API_KEY"));
         }
+    }
+
+    #[test]
+    fn grok_npx_launch_env_policy_clears_inherited_key_for_subscription() {
+        let runtime_env: BTreeMap<String, String> =
+            [("GROK_AUTH_MODE".to_string(), "subscription".to_string())].into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
+
+        assert!(merged_env
+            .iter()
+            .any(|(key, value)| key == "XAI_API_KEY" && value.is_empty()));
     }
 
     #[test]

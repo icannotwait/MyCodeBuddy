@@ -3149,10 +3149,12 @@ fn score_workspace_file_match(
     if lower_name.starts_with(query) {
         return Some((FILE_SEARCH_TIER_NAME_PREFIX, 0, name_length));
     }
-    if let Some(position) = lower_name.find(query) {
+    if let Some(byte_position) = lower_name.find(query) {
+        let position = lower_name[..byte_position].chars().count();
         return Some((FILE_SEARCH_TIER_NAME_SUBSTRING, position, name_length));
     }
-    if let Some(position) = lower_path.find(query) {
+    if let Some(byte_position) = lower_path.find(query) {
+        let position = lower_path[..byte_position].chars().count();
         return Some((FILE_SEARCH_TIER_PATH_SUBSTRING, position, path_length));
     }
     if let Some(position) = subsequence_first_index(query, lower_name) {
@@ -4073,63 +4075,73 @@ pub async fn list_workspace_files(
 ) -> Result<Vec<WorkspaceFileEntry>, AppCommandError> {
     let root = PathBuf::from(&path);
 
-    // Conservative gitignore parity with the previous client-side pass: respect
-    // in-tree `.gitignore`/`.ignore`/`.git/info/exclude`, but not the global
-    // gitignore or parent-directory ignores (the workspace root is the
-    // boundary). `require_git(false)` keeps `.gitignore` effective even outside
-    // a git repo. `hidden(false)` keeps dotfiles visible. The `filter_entry`
-    // mirrors `get_file_tree`'s hardcoded ignores exactly.
-    let walker = WalkBuilder::new(&root)
-        .hidden(false)
-        .parents(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(false)
-        .require_git(false)
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
-            } else {
-                name != ".DS_Store"
+    run_file_io(move || {
+        // Respect in-tree `.gitignore`/`.ignore`/`.rgignore`/`.git/info/exclude`,
+        // but not global or parent-directory ignores (the workspace root is the
+        // boundary). `require_git(false)` keeps ignore files effective outside a
+        // Git repo. The filter mirrors `get_file_tree`'s hardcoded ignores.
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(false)
+            .parents(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(false)
+            .require_git(false)
+            .sort_by_file_name(|a, b| a.cmp(b))
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                if entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false)
+                {
+                    !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+                } else {
+                    name != ".DS_Store"
+                }
+            });
+        // `.rgignore` is not covered by `WalkBuilder::ignore(true)`.
+        builder.add_custom_ignore_filename(".rgignore");
+
+        let mut entries = Vec::new();
+        for result in builder.build() {
+            // Skip unreadable entries (permission errors, transient races)
+            // rather than failing the whole search.
+            let Ok(entry) = result else { continue };
+            let entry_path = entry.path();
+
+            // Skip the root directory itself.
+            if entry_path == root {
+                continue;
             }
-        })
-        .build();
 
-    let mut entries: Vec<WorkspaceFileEntry> = Vec::new();
-    for result in walker {
-        // Skip unreadable entries (permission errors, transient races) rather
-        // than failing the whole search.
-        let Ok(entry) = result else { continue };
-        let entry_path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel_path = entry_path
+                .strip_prefix(&root)
+                .unwrap_or(entry_path)
+                .to_string_lossy()
+                .replace('\\', "/");
 
-        // Skip the root directory itself.
-        if entry_path == root {
-            continue;
+            entries.push(WorkspaceFileEntry {
+                name,
+                path: rel_path,
+                kind: if is_dir {
+                    WorkspaceEntryKind::Dir
+                } else {
+                    WorkspaceEntryKind::File
+                },
+            });
         }
 
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let name = entry.file_name().to_string_lossy().to_string();
-        let rel_path = entry_path
-            .strip_prefix(&root)
-            .unwrap_or(entry_path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        entries.push(WorkspaceFileEntry {
-            name,
-            path: rel_path,
-            kind: if is_dir {
-                WorkspaceEntryKind::Dir
-            } else {
-                WorkspaceEntryKind::File
-            },
-        });
-    }
-
-    Ok(entries)
+        Ok(entries)
+    })
+    .await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -5343,6 +5355,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn list_workspace_files_honors_rgignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, ".rgignore", "rg-only/\nrg-only.txt\n");
+        write_file(root, "rg-only/nested.txt", "ignored");
+        write_file(root, "rg-only.txt", "ignored");
+        write_file(root, "kept.txt", "kept");
+
+        let entries = list_workspace_files(root.to_string_lossy().to_string())
+            .await
+            .expect("list_workspace_files");
+        let paths: std::collections::HashSet<&str> =
+            entries.iter().map(|entry| entry.path.as_str()).collect();
+
+        assert!(
+            paths.contains("kept.txt"),
+            "normal files must remain visible"
+        );
+        assert!(
+            !paths.iter().any(|path| path.starts_with("rg-only")),
+            ".rgignore directory pattern must prune its subtree: {paths:?}"
+        );
+        assert!(
+            !paths.contains("rg-only.txt"),
+            ".rgignore file pattern must hide matching files: {paths:?}"
+        );
+    }
+
     /// Run a git command in `dir`, supplying identity via env so the test does
     /// not depend on (or mutate) the developer's global git config.
     fn git_run(dir: &std::path::Path, args: &[&str]) {
@@ -5984,6 +6025,24 @@ branch refs/heads/main";
         assert_eq!(
             paths,
             vec!["a/app", "z/app", "y/app.ts", "x/myapp.ts", "a/app/index.ts",]
+        );
+    }
+
+    #[test]
+    fn search_workspace_files_ranks_multibyte_substrings_by_character_position() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let multibyte_name = "\u{00e9}xfoo";
+        write_tree_fixture(&root.path().join(multibyte_name), "match\n");
+        write_tree_fixture(&root.path().join("abfoo-long"), "match\n");
+
+        let token = CancellationToken::new();
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "foo", 1, &token)
+            .expect("search");
+
+        assert_eq!(
+            result.files.first().map(|hit| hit.path.as_str()),
+            Some(multibyte_name),
+            "equal character positions must prefer the shorter name"
         );
     }
 
