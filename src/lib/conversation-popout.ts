@@ -6,6 +6,11 @@ import {
   openConversationWindow,
   type OpenConversationResult,
 } from "@/lib/api"
+import {
+  clearTransferringOut,
+  markMainReleased,
+  markTransferringOut,
+} from "@/lib/conversation-popout-acp-bridge"
 import { isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
 import {
@@ -86,56 +91,76 @@ export async function focusDetachedConversation(
   }
 }
 
-function waitForReady(
+/**
+ * Register ready/closed listeners **before** open returns so a fast ready
+ * emission cannot race past an incomplete subscribe().
+ */
+function armReadyWait(
   operationId: string,
   conversationId: number,
   timeoutMs: number
-): Promise<ReadyPayload> {
-  return new Promise((resolve, reject) => {
-    let settled = false
-    let unsubReady: (() => void) | null = null
-    let unsubClosed: (() => void) | null = null
-    const timer = setTimeout(() => {
+): {
+  ready: Promise<ReadyPayload>
+  armed: Promise<void>
+} {
+  let settleReady!: (v: ReadyPayload) => void
+  let settleReject!: (e: Error) => void
+  let settled = false
+  let unsubReady: (() => void) | null = null
+  let unsubClosed: (() => void) | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  const ready = new Promise<ReadyPayload>((resolve, reject) => {
+    settleReady = resolve
+    settleReject = reject
+  })
+
+  const finish = (fn: () => void) => {
+    if (settled) return
+    settled = true
+    if (timer) clearTimeout(timer)
+    unsubReady?.()
+    unsubClosed?.()
+    fn()
+  }
+
+  const armed = (async () => {
+    unsubReady = await subscribe<ReadyPayload>(
+      "conversation-window://ready",
+      (payload) => {
+        if (
+          payload?.operationId === operationId &&
+          payload.conversationId === conversationId
+        ) {
+          finish(() => settleReady(payload))
+        }
+      }
+    )
+    unsubClosed = await subscribe<ClosedPayload>(
+      "conversation-window://closed",
+      (payload) => {
+        if (payload?.operationId === operationId) {
+          finish(() =>
+            settleReject(
+              new Error("pop-out window closed before handoff completed")
+            )
+          )
+        }
+      }
+    )
+    timer = setTimeout(() => {
       finish(() =>
-        reject(new Error("pop-out handoff timed out waiting for ready"))
+        settleReject(new Error("pop-out handoff timed out waiting for ready"))
       )
     }, timeoutMs)
+  })()
 
-    const finish = (fn: () => void) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      unsubReady?.()
-      unsubClosed?.()
-      fn()
-    }
-
-    void subscribe<ReadyPayload>("conversation-window://ready", (payload) => {
-      if (
-        payload?.operationId === operationId &&
-        payload.conversationId === conversationId
-      ) {
-        finish(() => resolve(payload))
-      }
-    }).then((u) => {
-      unsubReady = u
-    })
-
-    void subscribe<ClosedPayload>("conversation-window://closed", (payload) => {
-      if (payload?.operationId === operationId) {
-        finish(() =>
-          reject(new Error("pop-out window closed before handoff completed"))
-        )
-      }
-    }).then((u) => {
-      unsubClosed = u
-    })
-  })
+  return { ready, armed }
 }
 
 async function detachIfNeeded(
   tabId: string | undefined
-): Promise<{ restoreToken: DetachRestoreToken } | null> {
+): Promise<{ restoreToken: DetachRestoreToken; tabRemoved: boolean } | null> {
   if (!tabId) return null
   const result = useTabStore.getState().detachTab(tabId)
   if (!result.ok) {
@@ -147,11 +172,37 @@ async function detachIfNeeded(
     await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
     throw new Error("opened_tabs CAS rejected")
   }
-  return { restoreToken: result.restoreToken }
+  return { restoreToken: result.restoreToken, tabRemoved: true }
+}
+
+async function compensateAbortClose(args: {
+  conversationId: number
+  operationId: string
+  restoreToken?: DetachRestoreToken | null
+}): Promise<void> {
+  // reverse (via abort) → restore tab → close window
+  try {
+    await abortConversationPopoutOperation(args.operationId)
+  } catch {
+    /* best-effort reverse */
+  }
+  if (args.restoreToken) {
+    useTabStore.getState().restoreDetachedTab(args.restoreToken)
+    await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
+  }
+  try {
+    await closeConversationWindow(args.conversationId, args.operationId)
+  } catch {
+    /* ignore */
+  }
+  clearTransferringOut(args.conversationId, args.operationId)
 }
 
 /**
- * Orchestrate pop-out: open window → wait ready → detachTab + CAS → complete.
+ * Orchestrate pop-out: open window → wait ready → release + detachTab + CAS → complete.
+ *
+ * After ready, any detach/CAS failure MUST reverse/abort/close (no escape path
+ * that leaves ownership on the detached window while main tab is restored).
  */
 export async function popOutConversation(args: {
   conversationId: number
@@ -192,7 +243,16 @@ export async function popOutConversation(args: {
         ? crypto.randomUUID()
         : `op-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
-    const readyPromise = waitForReady(operationId, args.conversationId, 15_000)
+    // Fence main disconnect before open so unmount/idle cannot kill session.
+    markTransferringOut(args.conversationId, operationId)
+
+    const { ready: readyPromise, armed } = armReadyWait(
+      operationId,
+      args.conversationId,
+      15_000
+    )
+    // Listeners must be registered before open can emit ready.
+    await armed
 
     let openResult: OpenConversationResult
     try {
@@ -203,10 +263,12 @@ export async function popOutConversation(args: {
         operationId,
       })
     } catch (e) {
+      clearTransferringOut(args.conversationId, operationId)
       throw e
     }
 
     if (openResult === "focusedExisting") {
+      clearTransferringOut(args.conversationId, operationId)
       detachedCache.add(args.conversationId)
       return
     }
@@ -214,39 +276,33 @@ export async function popOutConversation(args: {
     try {
       await readyPromise
     } catch (e) {
-      try {
-        await abortConversationPopoutOperation(operationId)
-      } catch {
-        /* ignore */
-      }
-      try {
-        await closeConversationWindow(args.conversationId, operationId)
-      } catch {
-        /* ignore */
-      }
+      await compensateAbortClose({
+        conversationId: args.conversationId,
+        operationId,
+      })
       throw e
     }
 
-    const detachResult = await detachIfNeeded(tab?.id)
+    // Live path: mark main released (drop local UI ownership without disconnect).
+    // Full bridge release is consulted by ACP idle/unmount via isTransferringOut.
+    markMainReleased(args.conversationId, operationId)
 
+    let restoreToken: DetachRestoreToken | null = null
     try {
+      const detachResult = await detachIfNeeded(tab?.id)
+      restoreToken = detachResult?.restoreToken ?? null
+
       await completeConversationPopoutOperation(operationId)
       detachedCache.add(args.conversationId)
+      clearTransferringOut(args.conversationId, operationId)
     } catch (e) {
-      if (detachResult?.restoreToken) {
-        useTabStore.getState().restoreDetachedTab(detachResult.restoreToken)
-        await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
-      }
-      try {
-        await abortConversationPopoutOperation(operationId)
-      } catch {
-        /* ignore */
-      }
-      try {
-        await closeConversationWindow(args.conversationId, operationId)
-      } catch {
-        /* ignore */
-      }
+      // Critical: reverse → restore → close. Never leave ownership on detached
+      // after detach/CAS/complete failure without compensation.
+      await compensateAbortClose({
+        conversationId: args.conversationId,
+        operationId,
+        restoreToken,
+      })
       throw e
     }
   })()

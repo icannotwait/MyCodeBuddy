@@ -81,13 +81,15 @@ pub struct RebindResult {
 }
 
 #[derive(Debug, Clone)]
-struct OpRecord {
+pub(crate) struct OpRecord {
     conversation_id: i32,
     operation_id: String,
     phase: PopoutPhase,
     /// Generation written by forward rebind, if any.
     ownership_generation: Option<u64>,
+    #[allow(dead_code)]
     from_owner: String,
+    #[allow(dead_code)]
     to_owner: String,
     abort_outcome: Option<AbortOutcome>,
     /// In-flight registration refcount for tombstone retention.
@@ -101,6 +103,8 @@ pub struct ConversationPopoutState {
     current_by_conversation: Mutex<HashMap<i32, String>>,
     /// Closed incarnations still fencing late registration.
     tombstones: Mutex<HashMap<(String, String), u32>>, // (label, op) -> inflight
+    /// Ops whose close cleanup already ran (CloseRequested + Destroyed dedupe).
+    close_cleanup_done: Mutex<HashMap<String, ()>>,
 }
 
 impl ConversationPopoutState {
@@ -177,7 +181,25 @@ impl ConversationPopoutState {
         Ok(())
     }
 
+    /// Pre-admit a forward rebind: reject if op is missing or already terminal.
+    pub fn admit_forward_rebind(&self, operation_id: &str) -> Result<(), AppCommandError> {
+        let by_op = self
+            .by_operation
+            .lock()
+            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
+        let rec = by_op.get(operation_id).ok_or_else(|| {
+            AppCommandError::not_found(format!("popout operation {operation_id} not found"))
+        })?;
+        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+            return Err(AppCommandError::task_execution_failed(format!(
+                "cannot rebind terminal operation {operation_id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Record forward rebind generation atomically with phase check.
+    /// Returns Err if the op became terminal between rebind and record (caller must reverse).
     pub fn record_rebind(
         &self,
         operation_id: &str,
@@ -198,6 +220,31 @@ impl ConversationPopoutState {
         rec.ownership_generation = Some(generation);
         rec.phase = PopoutPhase::ReadyPending;
         Ok(())
+    }
+
+    /// Capture the operation_id currently bound to this conversation for close
+    /// cleanup. Must be called **synchronously** on the window event thread so a
+    /// delayed async Destroyed for op A cannot resolve to op B after reopen.
+    ///
+    /// Returns `None` if no current op, or if cleanup for that op already ran.
+    pub fn capture_close_operation(&self, conversation_id: i32) -> Option<String> {
+        let op = self.operation_for_conversation(conversation_id)?;
+        let mut done = self.close_cleanup_done.lock().ok()?;
+        if done.contains_key(&op) {
+            return None;
+        }
+        // Reserve immediately so CloseRequested + Destroyed only run once.
+        done.insert(op.clone(), ());
+        Some(op)
+    }
+
+    /// True if close cleanup was reserved/completed for this op.
+    pub fn is_close_cleanup_reserved(&self, operation_id: &str) -> bool {
+        self.close_cleanup_done
+            .lock()
+            .ok()
+            .map(|m| m.contains_key(operation_id))
+            .unwrap_or(false)
     }
 
     pub fn complete(&self, operation_id: &str) -> Result<PopoutOpStatus, AppCommandError> {
@@ -517,6 +564,12 @@ pub async fn rebind_connection_owner_window(
         }
     }
 
+    let is_forward = to_owner_window.starts_with("conversation-");
+    if is_forward {
+        // Reject terminal ops before mutating connection ownership.
+        popout.admit_forward_rebind(&operation_id)?;
+    }
+
     let result = cm
         .rebind_connection_owner_window(
             conversation_id,
@@ -528,9 +581,32 @@ pub async fn rebind_connection_owner_window(
         )
         .await?;
 
-    // Only stamp forward rebind (to conversation-*) onto the op record
-    if to_owner_window.starts_with("conversation-") {
-        popout.record_rebind(&operation_id, result.ownership_generation)?;
+    // Stamp forward rebind onto the op record. If the op was aborted between
+    // rebind and record, reverse ownership immediately so we never leave a
+    // generation-less forward rebind hanging.
+    if is_forward {
+        if let Err(e) = popout.record_rebind(&operation_id, result.ownership_generation) {
+            let reverse = cm
+                .rebind_connection_owner_window(
+                    conversation_id,
+                    connection_id.as_deref(),
+                    &to_owner_window,
+                    &from_owner_window,
+                    &operation_id,
+                    Some(result.ownership_generation),
+                )
+                .await;
+            if let Err(rev_err) = reverse {
+                tracing::error!(
+                    "[popout] record_rebind failed and reverse also failed op={} gen={} record_err={} reverse_err={}",
+                    operation_id,
+                    result.ownership_generation,
+                    e,
+                    rev_err
+                );
+            }
+            return Err(e);
+        }
     }
     Ok(result)
 }
@@ -554,10 +630,11 @@ pub async fn abort_conversation_popout_operation(
         }
     })?;
 
-    // Attempt reverse rebind when we had a generation
+    // Attempt reverse rebind when we had a generation. Log failures so
+    // residual disconnect still reaps incarnation-tagged resources only.
     if let AbortOutcome::Reversed { generation } = &outcome {
         let to_label = conversation_window_label(status.conversation_id);
-        let _ = cm
+        if let Err(e) = cm
             .rebind_connection_owner_window(
                 status.conversation_id,
                 None,
@@ -566,7 +643,15 @@ pub async fn abort_conversation_popout_operation(
                 &operation_id,
                 Some(*generation),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(
+                "[popout] reverse rebind on abort failed op={} gen={}: {}",
+                operation_id,
+                generation,
+                e
+            );
+        }
     }
 
     // Emit closed hint so main can compensate (window may still be open)
@@ -583,24 +668,26 @@ pub async fn abort_conversation_popout_operation(
 }
 
 /// Handle window close/destroy for conversation-* labels.
+///
+/// `operation_id` **must** be captured synchronously on the window-event
+/// thread via [`ConversationPopoutState::capture_close_operation`] before this
+/// async task is spawned. Looking up the current op here would allow a delayed
+/// Destroyed(A) to clean up a reopened incarnation B (label-reuse ABA).
 #[cfg(feature = "tauri-runtime")]
 pub async fn handle_conversation_window_closed(
     app: &AppHandle,
     label: &str,
+    operation_id: String,
 ) {
     let Some(conversation_id) = parse_conversation_id_from_label(label) else {
         return;
     };
+    if operation_id.is_empty() {
+        return;
+    }
     let Some(popout) = app.try_state::<ConversationPopoutState>() else {
         return;
     };
-    let operation_id = popout
-        .operation_for_conversation(conversation_id)
-        .unwrap_or_default();
-    if operation_id.is_empty() {
-        // Already cleared; nothing to do
-        return;
-    }
 
     let status = popout.get_status(&operation_id).ok();
     let phase = status.as_ref().map(|s| s.phase);
@@ -616,10 +703,10 @@ pub async fn handle_conversation_window_closed(
             .unwrap_or(AbortOutcome::NeverRebound)
     };
 
-    // Reverse if needed before disconnect
+    // Reverse if needed before disconnect — only resources for THIS operation.
     if let AbortOutcome::Reversed { generation } = &outcome {
         if let Some(cm) = app.try_state::<ConnectionManager>() {
-            let _ = cm
+            if let Err(e) = cm
                 .rebind_connection_owner_window(
                     conversation_id,
                     None,
@@ -628,20 +715,31 @@ pub async fn handle_conversation_window_closed(
                     &operation_id,
                     Some(*generation),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    "[popout] reverse rebind on close failed label={} op={} gen={}: {}",
+                    label,
+                    operation_id,
+                    generation,
+                    e
+                );
+            }
         }
     }
 
-    // Disconnect resources for this incarnation
+    // Disconnect / kill only resources matching this incarnation (label + op).
+    // A delayed close for op A must not touch op B resources even if the label
+    // was reused.
     let should_disconnect = matches!(
         outcome,
         AbortOutcome::AlreadyComplete
             | AbortOutcome::NeverRebound
             | AbortOutcome::Reversed { .. }
+            | AbortOutcome::Superseded { .. }
     );
-    // Superseded: still reap residual for this op id only (same filter)
 
-    if should_disconnect || matches!(outcome, AbortOutcome::Superseded { .. }) {
+    if should_disconnect {
         if let Some(cm) = app.try_state::<ConnectionManager>() {
             let n = cm
                 .disconnect_by_owner_window_and_operation(label, &operation_id)
@@ -725,5 +823,55 @@ mod tests {
             .unwrap();
         assert!(state.is_registration_accepted(1, "op1"));
         assert!(!state.is_registration_accepted(1, "op2"));
+    }
+
+    #[test]
+    fn capture_close_operation_is_idempotent_and_survives_reopen() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "opA".into(), "conversation-1".into())
+            .unwrap();
+        let first = state.capture_close_operation(1);
+        assert_eq!(first.as_deref(), Some("opA"));
+        // Second capture (Destroyed after CloseRequested) is a no-op
+        assert_eq!(state.capture_close_operation(1), None);
+
+        // Simulated reopen: insert B (overwrites current). Delayed close for A
+        // already reserved so it cannot re-capture; B gets its own capture.
+        state
+            .insert_opened(1, "opB".into(), "conversation-1".into())
+            .unwrap();
+        state.tombstone_on_close("conversation-1", "opA");
+        // current still B (tombstone only drops matching op value)
+        assert_eq!(
+            state.operation_for_conversation(1).as_deref(),
+            Some("opB")
+        );
+        let second = state.capture_close_operation(1);
+        assert_eq!(second.as_deref(), Some("opB"));
+        assert_ne!(second.as_deref(), Some("opA"));
+    }
+
+    #[test]
+    fn admit_forward_rebind_rejects_terminal() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op1").unwrap();
+        state.complete("op1").unwrap();
+        assert!(state.admit_forward_rebind("op1").is_err());
+    }
+
+    #[test]
+    fn record_rebind_rejects_after_abort() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        state
+            .abort("op1", |_| AbortOutcome::NeverRebound)
+            .unwrap();
+        assert!(state.record_rebind("op1", 1).is_err());
     }
 }

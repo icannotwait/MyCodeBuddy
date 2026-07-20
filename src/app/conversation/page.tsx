@@ -6,9 +6,12 @@ import { useTranslations } from "next-intl"
 import { Loader2 } from "lucide-react"
 import { AppTitleBar } from "@/components/layout/app-title-bar"
 import { AppToaster } from "@/components/ui/app-toaster"
-import { getConversation, rebindConnectionOwnerWindow } from "@/lib/api"
+import {
+  getFolderConversation,
+  rebindConnectionOwnerWindow,
+} from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
-import type { AgentType, ConversationDetail } from "@/lib/types"
+import type { AgentType, DbConversationDetail } from "@/lib/types"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 
 const TOAST_DURATION_MS = 6000
@@ -39,7 +42,7 @@ function ConversationPageInner() {
   const operationId = searchParams.get("operationId") ?? ""
   const agentType = parseAgentType(searchParams.get("agentType"))
 
-  const [conversation, setConversation] = useState<ConversationDetail | null>(
+  const [conversation, setConversation] = useState<DbConversationDetail | null>(
     null
   )
   const [error, setError] = useState<string | null>(null)
@@ -54,9 +57,10 @@ function ConversationPageInner() {
     operationId.length > 0
 
   useEffect(() => {
-    if (!valid || !agentType) return
+    if (!valid) return
     let cancelled = false
-    getConversation(agentType, String(conversationId))
+    // DB conversation id (integer) — not agent session-file id.
+    getFolderConversation(conversationId)
       .then((c) => {
         if (!cancelled) {
           setConversation(c)
@@ -72,7 +76,7 @@ function ConversationPageInner() {
     return () => {
       cancelled = true
     }
-  }, [valid, conversationId, agentType])
+  }, [valid, conversationId])
 
   // Handoff: try rebind if live connection, then emit ready
   useEffect(() => {
@@ -111,7 +115,7 @@ function ConversationPageInner() {
 
   const title = useMemo(() => {
     if (!conversation) return t("title")
-    return conversation.title?.trim() || t("untitled")
+    return conversation.summary.title?.trim() || t("untitled")
   }, [conversation, t])
 
   useEffect(() => {

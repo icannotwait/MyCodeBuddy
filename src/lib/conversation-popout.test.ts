@@ -15,8 +15,63 @@ vi.mock("@/lib/api", () => ({
   abortConversationPopoutOperation: vi.fn(async () => ({})),
 }))
 
-import { isLocalDesktop } from "@/lib/platform"
-import { canPopOutConversation } from "@/lib/conversation-popout"
+const tabMocks = vi.hoisted(() => {
+  const restoreDetachedTab = vi.fn()
+  const flushOpenedTabsSave = vi.fn(async () => ({
+    accepted: true,
+    version: 1,
+  }))
+  const detachTab = vi.fn(() => ({
+    ok: true as const,
+    nextActiveId: "b",
+    restoreToken: {
+      tab: {
+        id: "a",
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code" as const,
+      },
+      index: 0,
+      previousActiveTabId: "a",
+    },
+  }))
+  return { detachTab, restoreDetachedTab, flushOpenedTabsSave }
+})
+
+vi.mock("@/stores/tab-store", () => ({
+  useTabStore: {
+    getState: () => ({
+      rawTabs: [
+        {
+          id: "a",
+          conversationId: 1,
+          folderId: 1,
+          agentType: "claude_code",
+        },
+        {
+          id: "b",
+          conversationId: 2,
+          folderId: 1,
+          agentType: "claude_code",
+        },
+      ],
+      detachTab: tabMocks.detachTab,
+      restoreDetachedTab: tabMocks.restoreDetachedTab,
+      flushOpenedTabsSave: tabMocks.flushOpenedTabsSave,
+    }),
+  },
+}))
+
+import { isLocalDesktop, subscribe } from "@/lib/platform"
+import * as api from "@/lib/api"
+import {
+  canPopOutConversation,
+  popOutConversation,
+} from "@/lib/conversation-popout"
+import {
+  __resetTransferFencesForTests,
+  isTransferringOut,
+} from "@/lib/conversation-popout-acp-bridge"
 
 describe("canPopOutConversation", () => {
   beforeEach(() => {
@@ -62,5 +117,77 @@ describe("canPopOutConversation", () => {
         mainTabCount: 2,
       })
     ).toEqual({ enabled: false, reason: "not_local_desktop" })
+  })
+})
+
+describe("popOutConversation compensation", () => {
+  beforeEach(() => {
+    vi.mocked(isLocalDesktop).mockReturnValue(true)
+    __resetTransferFencesForTests()
+    tabMocks.detachTab.mockClear()
+    tabMocks.restoreDetachedTab.mockClear()
+    tabMocks.flushOpenedTabsSave.mockReset()
+    tabMocks.flushOpenedTabsSave.mockResolvedValue({
+      accepted: true,
+      version: 1,
+    })
+    tabMocks.detachTab.mockReturnValue({
+      ok: true,
+      nextActiveId: "b",
+      restoreToken: {
+        tab: {
+          id: "a",
+          conversationId: 1,
+          folderId: 1,
+          agentType: "claude_code",
+        },
+        index: 0,
+        previousActiveTabId: "a",
+      },
+    })
+    vi.mocked(api.focusConversationWindow).mockResolvedValue(false)
+    vi.mocked(api.openConversationWindow).mockResolvedValue("opened")
+    vi.mocked(api.completeConversationPopoutOperation).mockResolvedValue({
+      phase: "handoff_complete",
+    } as never)
+    vi.mocked(api.abortConversationPopoutOperation).mockClear()
+    vi.mocked(api.closeConversationWindow).mockClear()
+  })
+
+  it("aborts and closes when detach CAS fails after ready", async () => {
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/CAS rejected|opened_tabs/)
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
+    expect(api.closeConversationWindow).toHaveBeenCalled()
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+    expect(isTransferringOut(1)).toBe(false)
   })
 })
