@@ -144,9 +144,8 @@ fn apply_cursor_env_policy(
 /// `XAI_API_KEY` inherited from this process's environment so the CLI falls back
 /// to the browser-login credential in `~/.grok/auth.json` rather than a leaked
 /// shell/container export. An empty value tells the spawn layer (vendored
-/// sacp-tokio) to `env_remove` the inherited var. In api_key mode the key is
-/// present and non-empty, so nothing is cleared; legacy/no-mode rows are left
-/// untouched.
+/// sacp-tokio) to `env_remove` the inherited var. API-key, custom, legacy, and
+/// no-mode rows are left untouched.
 fn apply_grok_env_policy(
     merged: &mut Vec<(String, String)>,
     runtime_env: &BTreeMap<String, String>,
@@ -155,11 +154,8 @@ fn apply_grok_env_policy(
         return;
     }
     let key = "XAI_API_KEY";
-    let already_set = merged.iter().any(|(k, v)| k == key && !v.trim().is_empty());
-    if !already_set {
-        merged.retain(|(k, _)| k != key);
-        merged.push((key.to_string(), String::new()));
-    }
+    merged.retain(|(k, _)| k != key);
+    merged.push((key.to_string(), String::new()));
 }
 
 fn apply_npx_launch_env_policy(
@@ -12429,12 +12425,12 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
 
-        // A configured key is preserved even in subscription mode (explicit wins).
+        // Subscription mode always wins over a stale configured key.
         let mut with_key = vec![("XAI_API_KEY".to_string(), "xai-abc".to_string())];
         apply_grok_env_policy(&mut with_key, &sub);
         assert!(with_key
             .iter()
-            .any(|(k, v)| k == "XAI_API_KEY" && v == "xai-abc"));
+            .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
 
         // api_key mode and legacy/no-mode rows are left untouched.
         for mode in [Some("api_key"), None] {
@@ -12458,6 +12454,27 @@ mod tests {
         assert!(merged_env
             .iter()
             .any(|(key, value)| key == "XAI_API_KEY" && value.is_empty()));
+    }
+
+    #[test]
+    fn grok_npx_launch_env_policy_removes_explicit_key_for_subscription() {
+        let runtime_env: BTreeMap<String, String> = [
+            ("GROK_AUTH_MODE".to_string(), "subscription".to_string()),
+            ("XAI_API_KEY".to_string(), "xai-stale-key".to_string()),
+        ]
+        .into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
+
+        assert_eq!(
+            merged_env
+                .iter()
+                .find(|(key, _)| key == "XAI_API_KEY")
+                .map(|(_, value)| value.as_str()),
+            Some(""),
+            "subscription mode must remove even a stale configured API key"
+        );
     }
 
     #[test]

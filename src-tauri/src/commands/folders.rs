@@ -2987,6 +2987,9 @@ const IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".rgignore"];
 const WORKSPACE_FILE_SEARCH_MAX_LIMIT: usize = 500;
 /// Default search limit when the caller omits one (matches `@` mention cap).
 const WORKSPACE_FILE_SEARCH_DEFAULT_LIMIT: usize = 50;
+/// Legacy full-list endpoint ceiling. New callers should use the bounded,
+/// cancellable `search_workspace_files` command instead.
+const WORKSPACE_FILE_LIST_MAX_ENTRIES: usize = 10_000;
 const WORKSPACE_FILE_SEARCH_MAX_CONCURRENT_OPS: usize = 4;
 const WORKSPACE_FILE_SEARCH_ID_MAX_BYTES: usize = 128;
 
@@ -4063,85 +4066,97 @@ pub async fn cancel_workspace_file_search(
     ))
 }
 
+/// Collect a bounded, gitignore-aware flat listing. The legacy full-list API
+/// returns an explicit error rather than silently omitting entries past `limit`.
+fn collect_workspace_file_entries(
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<WorkspaceFileEntry>, AppCommandError> {
+    // Respect in-tree `.gitignore`/`.ignore`/`.rgignore`/`.git/info/exclude`,
+    // but not global or parent-directory ignores (the workspace root is the
+    // boundary). `require_git(false)` keeps ignore files effective outside a
+    // Git repo. The filter mirrors `get_file_tree`'s hardcoded ignores.
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+            {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            }
+        });
+    // `.rgignore` is not covered by `WalkBuilder::ignore(true)`.
+    builder.add_custom_ignore_filename(".rgignore");
+
+    let mut entries = Vec::new();
+    for result in builder.build() {
+        // Skip unreadable entries (permission errors, transient races) rather
+        // than failing the whole search.
+        let Ok(entry) = result else { continue };
+        let entry_path = entry.path();
+
+        // Skip the root directory itself.
+        if entry_path == root {
+            continue;
+        }
+        if entries.len() == limit {
+            return Err(
+                AppCommandError::invalid_input("Workspace file list is too large").with_detail(
+                    format!("max_entries={limit}; use search_workspace_files for bounded lookup"),
+                ),
+            );
+        }
+
+        let is_dir = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry_path
+            .strip_prefix(root)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        entries.push(WorkspaceFileEntry {
+            name,
+            path: rel_path,
+            kind: if is_dir {
+                WorkspaceEntryKind::Dir
+            } else {
+                WorkspaceEntryKind::File
+            },
+        });
+    }
+
+    Ok(entries)
+}
+
 /// Flat, gitignore-aware listing of every file and directory under `path`, for
-/// fuzzy file search. Unlike [`get_file_tree`], ignored directories
-/// (`node_modules`, `target`, `dist`, …) are pruned *during* the walk, so no
-/// depth cap is needed: deep files stay reachable while the heavy trees are
-/// never descended and the payload stays small. Gitignore handling that used to
-/// run client-side now happens here at native speed in a single pass.
+/// legacy callers. Unlike [`get_file_tree`], ignored directories
+/// (`node_modules`, `target`, `dist`, …) are pruned *during* the walk. The
+/// response is capped to prevent a single request from allocating an unbounded
+/// payload; new fuzzy-search callers should use `search_workspace_files`.
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn list_workspace_files(
     path: String,
 ) -> Result<Vec<WorkspaceFileEntry>, AppCommandError> {
-    let root = PathBuf::from(&path);
-
-    run_file_io(move || {
-        // Respect in-tree `.gitignore`/`.ignore`/`.rgignore`/`.git/info/exclude`,
-        // but not global or parent-directory ignores (the workspace root is the
-        // boundary). `require_git(false)` keeps ignore files effective outside a
-        // Git repo. The filter mirrors `get_file_tree`'s hardcoded ignores.
-        let mut builder = WalkBuilder::new(&root);
-        builder
-            .hidden(false)
-            .parents(false)
-            .ignore(true)
-            .git_ignore(true)
-            .git_exclude(true)
-            .git_global(false)
-            .require_git(false)
-            .sort_by_file_name(|a, b| a.cmp(b))
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                if entry
-                    .file_type()
-                    .map(|file_type| file_type.is_dir())
-                    .unwrap_or(false)
-                {
-                    !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
-                } else {
-                    name != ".DS_Store"
-                }
-            });
-        // `.rgignore` is not covered by `WalkBuilder::ignore(true)`.
-        builder.add_custom_ignore_filename(".rgignore");
-
-        let mut entries = Vec::new();
-        for result in builder.build() {
-            // Skip unreadable entries (permission errors, transient races)
-            // rather than failing the whole search.
-            let Ok(entry) = result else { continue };
-            let entry_path = entry.path();
-
-            // Skip the root directory itself.
-            if entry_path == root {
-                continue;
-            }
-
-            let is_dir = entry
-                .file_type()
-                .map(|file_type| file_type.is_dir())
-                .unwrap_or(false);
-            let name = entry.file_name().to_string_lossy().to_string();
-            let rel_path = entry_path
-                .strip_prefix(&root)
-                .unwrap_or(entry_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            entries.push(WorkspaceFileEntry {
-                name,
-                path: rel_path,
-                kind: if is_dir {
-                    WorkspaceEntryKind::Dir
-                } else {
-                    WorkspaceEntryKind::File
-                },
-            });
-        }
-
-        Ok(entries)
-    })
-    .await
+    let root = PathBuf::from(path);
+    run_file_io(move || collect_workspace_file_entries(&root, WORKSPACE_FILE_LIST_MAX_ENTRIES))
+        .await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -5381,6 +5396,19 @@ mod tests {
         assert!(
             !paths.contains("rg-only.txt"),
             ".rgignore file pattern must hide matching files: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn collect_workspace_file_entries_rejects_result_sets_over_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "first.txt", "first");
+        write_file(root, "second.txt", "second");
+
+        assert!(
+            collect_workspace_file_entries(root, 1).is_err(),
+            "a bounded listing must reject a result set that exceeds its limit"
         );
     }
 
