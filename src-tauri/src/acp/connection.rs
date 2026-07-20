@@ -48,7 +48,7 @@ use crate::acp::types::{
     SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
     ToolCallImageInfo, UserMessageBlock,
 };
-use crate::auto_title::ConnectionLaunchContext;
+use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 use crate::network::proxy;
@@ -1973,18 +1973,104 @@ fn merge_grok_ask_user_question_meta(
     meta
 }
 
-/// Merge Claude raw-SDK meta, Grok ask-user gate, route suppression, terminal
-/// snapshot, and adapter contributions. Consumes the immutable `route_plan`
-/// only for `native_suppression` (Claude deny list).
+/// Built-in Grok tool short names to strip for hidden generation sessions.
+///
+/// Sourced from grok-build docs / tool IDs (`run_terminal_cmd`, `read_file`, …)
+/// plus MCP meta-tools that a restrictive allowlist would otherwise keep
+/// (`search_tool` / `use_tool`). Applied via `_meta.agentProfile.disallowedTools`
+/// on ACP `session/new|load|resume` — the only reliable tool denylist path for
+/// `grok agent stdio` (CLI `--disallowed-tools` is headless-only).
+const GROK_HIDDEN_GENERATION_DISALLOWED_TOOLS: &[&str] = &[
+    // Core file / shell / search
+    "run_terminal_cmd",
+    "run_terminal_command",
+    "read_file",
+    "search_replace",
+    "write",
+    "grep",
+    "list_dir",
+    // Web / media
+    "web_search",
+    "web_fetch",
+    "image_gen",
+    "image_edit",
+    "image_to_video",
+    "reference_to_video",
+    // Task / plan / goal
+    "todo_write",
+    "task",
+    "get_task_output",
+    "kill_task",
+    "wait_tasks",
+    "monitor",
+    "update_goal",
+    "enter_plan_mode",
+    "exit_plan_mode",
+    "ask_user_question",
+    // Subagents
+    "Agent",
+    "spawn_subagent",
+    // MCP meta-tools (restrictive allowlists intentionally keep these)
+    "search_tool",
+    "use_tool",
+    // Scheduler / LSP / misc
+    "scheduler_create",
+    "scheduler_list",
+    "scheduler_delete",
+    "lsp",
+    "get_terminal_command_output",
+    "kill_terminal_command",
+];
+
+/// Grok ACP-only gate for InternalTitle / InternalTranslate: stamp a session
+/// `agentProfile` that denylists interactive tools so the model cannot call
+/// shell/MCP mid-title (or mid-translate). Priority #1 over config/CLI agent
+/// selection in Grok shell (`_meta.agentProfile`).
+///
+/// `tools: []` is intentionally omitted — empty allowlist means "inherit all"
+/// in Grok's AgentDefinition; denylist is the hard strip.
+fn merge_grok_hidden_generation_agent_profile(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    agent_type: AgentType,
+    purpose: ConnectionPurpose,
+) -> serde_json::Map<String, serde_json::Value> {
+    if agent_type != AgentType::Grok || !purpose.is_hidden_generation() {
+        return meta;
+    }
+    let disallowed: Vec<serde_json::Value> = GROK_HIDDEN_GENERATION_DISALLOWED_TOOLS
+        .iter()
+        .map(|name| serde_json::Value::String((*name).to_string()))
+        .collect();
+    meta.insert(
+        "agentProfile".to_string(),
+        serde_json::json!({
+            "name": "codeg-hidden-generation",
+            "description": "Codeg internal title/translate run: no interactive tools",
+            "disallowedTools": disallowed,
+            "agentsMd": false,
+            "discoverSkills": false,
+            "maxTurns": 1,
+            "permissionMode": "dontAsk",
+        }),
+    );
+    meta
+}
+
+/// Merge Claude raw-SDK meta, Grok ask-user gate, optional hidden-generation
+/// agent profile, route suppression, terminal snapshot, and adapter
+/// contributions. Consumes the immutable `route_plan` only for
+/// `native_suppression` (Claude deny list).
 fn session_request_meta(
     agent_type: AgentType,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    purpose: ConnectionPurpose,
 ) -> Result<Meta, AcpError> {
     let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
     let with_grok = merge_grok_ask_user_question_meta(existing, agent_type);
-    let with_route = merge_claude_route_meta(with_grok, route_plan)?;
+    let with_profile = merge_grok_hidden_generation_agent_profile(with_grok, agent_type, purpose);
+    let with_route = merge_claude_route_meta(with_profile, route_plan)?;
     terminal_metadata(with_route, spec, adapter)
 }
 
@@ -2013,8 +2099,9 @@ fn build_new_session_request(
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    purpose: ConnectionPurpose,
 ) -> Result<NewSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter, purpose)?;
     let mut req = NewSessionRequest::new(cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -2030,8 +2117,9 @@ fn build_load_session_request(
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    purpose: ConnectionPurpose,
 ) -> Result<LoadSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter, purpose)?;
     let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -2052,8 +2140,9 @@ fn build_resume_session_request(
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    purpose: ConnectionPurpose,
 ) -> Result<ResumeSessionRequest, AcpError> {
-    let meta = session_request_meta(agent_type, route_plan, spec, adapter)?;
+    let meta = session_request_meta(agent_type, route_plan, spec, adapter, purpose)?;
     let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf()).meta(meta);
     if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
@@ -3121,6 +3210,10 @@ async fn run_connection(
             // Prompts sent before run_conversation_loop are still buffered in
             // cmd_rx and processed as soon as the loop starts.
 
+            // Launch purpose is fixed for the connection lifetime (title /
+            // translate stamp a restrictive Grok agentProfile on session meta).
+            let purpose = state.read().await.purpose;
+
             if let Some(sid) = session_id {
                 // Prefer session/resume when the agent advertises the
                 // capability: it restores session context WITHOUT replaying
@@ -3138,6 +3231,7 @@ async fn run_connection(
                         &terminal_shell.spec,
                         adapter_for(agent_type),
                         &route_plan,
+                        purpose,
                     ) {
                         Ok(r) => r,
                         Err(e) => {
@@ -3284,6 +3378,7 @@ async fn run_connection(
                     &terminal_shell.spec,
                     adapter_for(agent_type),
                     &route_plan,
+                    purpose,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3520,6 +3615,7 @@ async fn run_connection(
                             &terminal_shell.spec,
                             adapter_for(agent_type),
                             &route_plan,
+                            purpose,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
@@ -3633,6 +3729,7 @@ async fn run_connection(
                     &terminal_shell.spec,
                     adapter_for(agent_type),
                     &route_plan,
+                    purpose,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -6749,11 +6846,13 @@ async fn run_conversation_loop<'a>(
                 // Same immutable route plan + shell snapshot as new/load/resume
                 // (Codeg Claude re-asserts Agent/Task deny; native unchanged).
                 // Never re-read global terminal settings during fork.
+                let purpose = state.read().await.purpose;
                 let terminal_meta = match session_request_meta(
                     agent_type,
                     route_plan,
                     shell_spec,
                     adapter_for(agent_type),
+                    purpose,
                 ) {
                     Ok(meta) => meta,
                     Err(e) => {
@@ -10412,7 +10511,7 @@ mod tests {
             &spec,
             adapter,
             &plan,
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let load_req = build_load_session_request(
             AgentType::ClaudeCode,
@@ -10422,7 +10521,7 @@ mod tests {
             &spec,
             adapter,
             &plan,
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let resume_req = build_resume_session_request(
             AgentType::ClaudeCode,
@@ -10432,7 +10531,7 @@ mod tests {
             &spec,
             adapter,
             &plan,
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         let expected = serde_json::json!(["Agent", "Task"]);
@@ -10670,7 +10769,7 @@ mod tests {
             &codeg_plan(AgentType::ClaudeCode),
             &spec,
             adapter,
-        )
+            ConnectionPurpose::User)
         .unwrap();
         assert_eq!(
             codeg_meta
@@ -10710,7 +10809,7 @@ mod tests {
             &native_plan(AgentType::ClaudeCode),
             &spec,
             adapter,
-        )
+            ConnectionPurpose::User)
         .unwrap();
         assert!(
             native_meta
@@ -11272,7 +11371,7 @@ mod tests {
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
             &native_plan(AgentType::ClaudeCode),
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         assert_eq!(
@@ -11303,7 +11402,7 @@ mod tests {
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
             &native_plan(AgentType::Codex),
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         // Terminal metadata is always present; Claude raw-SDK meta is not.
@@ -11323,7 +11422,7 @@ mod tests {
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
             &native_plan(AgentType::ClaudeCode),
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         assert_eq!(
@@ -11347,7 +11446,7 @@ mod tests {
             &test_posix_spec(),
             adapter_for(AgentType::Codex),
             &native_plan(AgentType::Codex),
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         let meta = req.meta.as_ref().expect("terminal meta required");
@@ -11367,7 +11466,7 @@ mod tests {
         let plan = native_plan(AgentType::Grok);
 
         let new_req =
-            build_new_session_request(AgentType::Grok, &cwd, Vec::new(), &spec, adapter, &plan)
+            build_new_session_request(AgentType::Grok, &cwd, Vec::new(), &spec, adapter, &plan, ConnectionPurpose::User)
                 .unwrap();
         let load_req = build_load_session_request(
             AgentType::Grok,
@@ -11377,7 +11476,7 @@ mod tests {
             &spec,
             adapter,
             &plan,
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let resume_req = build_resume_session_request(
             AgentType::Grok,
@@ -11387,7 +11486,7 @@ mod tests {
             &spec,
             adapter,
             &plan,
-        )
+            ConnectionPurpose::User)
         .unwrap();
 
         for (label, meta) in [
@@ -11409,6 +11508,80 @@ mod tests {
         }
     }
 
+    /// Hidden generation (title/translate) must stamp a restrictive
+    /// `_meta.agentProfile` so ACP strips shell/MCP tools; ordinary User
+    /// purpose must not.
+    #[test]
+    fn grok_hidden_generation_meta_stamps_agent_profile_denylist() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::Grok);
+        let plan = native_plan(AgentType::Grok);
+
+        for purpose in [
+            ConnectionPurpose::InternalTitle,
+            ConnectionPurpose::InternalTranslate,
+        ] {
+            let req = build_new_session_request(
+                AgentType::Grok,
+                &cwd,
+                Vec::new(),
+                &spec,
+                adapter,
+                &plan,
+                purpose,
+            )
+            .unwrap();
+            let meta = req.meta.as_ref().expect("meta");
+            let profile = meta
+                .get("agentProfile")
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("{purpose:?}: agentProfile required"));
+            assert_eq!(
+                profile.get("name").and_then(|v| v.as_str()),
+                Some("codeg-hidden-generation"),
+                "{purpose:?}"
+            );
+            let denied = profile
+                .get("disallowedTools")
+                .and_then(|v| v.as_array())
+                .expect("disallowedTools");
+            let as_str: Vec<&str> = denied.iter().filter_map(|v| v.as_str()).collect();
+            assert!(
+                as_str.contains(&"run_terminal_cmd"),
+                "{purpose:?}: must deny shell tool, got {as_str:?}"
+            );
+            assert!(
+                as_str.contains(&"search_tool") && as_str.contains(&"use_tool"),
+                "{purpose:?}: must deny MCP meta tools"
+            );
+            assert_eq!(
+                meta.get("askUserQuestion").and_then(|v| v.as_bool()),
+                Some(false),
+                "{purpose:?}: ask-user gate remains"
+            );
+        }
+
+        let user_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+        assert!(
+            user_req
+                .meta
+                .as_ref()
+                .map(|m| !m.contains_key("agentProfile"))
+                .unwrap_or(false),
+            "User purpose must not stamp hidden agentProfile"
+        );
+    }
+
     #[test]
     fn non_grok_session_meta_omits_ask_user_question_flag() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
@@ -11420,7 +11593,7 @@ mod tests {
                 &test_posix_spec(),
                 adapter_for(agent),
                 &native_plan(agent),
-            )
+                ConnectionPurpose::User)
             .unwrap();
             let meta = req.meta.as_ref().expect("session meta required");
             assert!(
@@ -11455,7 +11628,7 @@ mod tests {
             &test_posix_spec(),
             adapter_for(AgentType::ClaudeCode),
             &native_plan(AgentType::ClaudeCode),
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);
@@ -11473,7 +11646,7 @@ mod tests {
             &spec,
             adapter_for(AgentType::Codex),
             &native_plan(AgentType::Codex),
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
@@ -11490,7 +11663,7 @@ mod tests {
             &spec,
             adapter_for(AgentType::ClaudeCode),
             &native_plan(AgentType::ClaudeCode),
-        )
+            ConnectionPurpose::User)
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["_meta"]["claudeCode"]["emitRawSDKMessages"], true);

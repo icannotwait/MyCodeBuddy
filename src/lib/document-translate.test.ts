@@ -191,6 +191,6 @@ describe("format and naming helpers", () => {
   })
 
   it("exports the shared input scalar limit", () => {
-    expect(MAX_INPUT_SCALARS).toBe(24_000)
+    expect(MAX_INPUT_SCALARS).toBe(32_000)
   })
 })

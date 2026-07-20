@@ -650,6 +650,10 @@ pub fn normalize_generated_title(raw: &str) -> Option<String> {
         return None;
     }
 
+    // Collapse exact AA doubles from multi-chunk streams (e.g. model text then
+    // the same title again after a failed tool call), before the scalar cap.
+    let collapsed = collapse_exact_double_title(&collapsed);
+
     // Truncate to 80 Unicode scalars.
     let truncated: String = collapsed.chars().take(MAX_TITLE_SCALARS).collect();
     if truncated.is_empty() {
@@ -657,6 +661,21 @@ pub fn normalize_generated_title(raw: &str) -> Option<String> {
     } else {
         Some(truncated)
     }
+}
+
+/// If `s` is an exact AA concatenation (even scalar length, first half equals
+/// second half), return one half. Requires ≥4 scalars per half so short
+/// intentional reduplication (e.g. 2–3 character pairs) is left alone.
+fn collapse_exact_double_title(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n >= 8 && n % 2 == 0 {
+        let half = n / 2;
+        if chars[..half] == chars[half..] {
+            return chars[..half].iter().collect();
+        }
+    }
+    s.to_string()
 }
 
 fn strip_heading_or_list_prefix(s: &str) -> String {
@@ -2176,9 +2195,25 @@ mod tests {
             normalize_generated_title("* `hello world`"),
             Some("hello world".into())
         );
-        let long: String = "字".repeat(100);
+        // Monotonic codepoints so first half ≠ second half (no AA collapse).
+        let long: String = (0..100)
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap_or('字'))
+            .collect();
         let got = normalize_generated_title(&long).expect("title");
         assert_eq!(got.chars().count(), 80);
         assert_eq!(normalize_generated_title("   \n\t"), None);
+    }
+
+    #[test]
+    fn normalize_generated_title_collapses_exact_double_stream_concat() {
+        assert_eq!(
+            normalize_generated_title("文档过大无法翻译的原因文档过大无法翻译的原因"),
+            Some("文档过大无法翻译的原因".into())
+        );
+        // Short reduplication stays (half < 4 scalars).
+        assert_eq!(
+            normalize_generated_title("测试测试"),
+            Some("测试测试".into())
+        );
     }
 }

@@ -6,8 +6,11 @@ use thiserror::Error;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::models::system::AppLocale;
 
-/// Backend-authoritative max input size (Unicode scalars).
-pub const MAX_INPUT_SCALARS: usize = 24_000;
+/// Max size of the body sent to the translate agent (Unicode scalars).
+///
+/// Measured **after** Markdown code protection (fenced / inline → placeholders).
+/// Plain text is measured as-is. Backend is authoritative; FE mirrors for UX.
+pub const MAX_INPUT_SCALARS: usize = 32_000;
 /// Max UTF-8 bytes collected from the runner before fail-closed.
 pub const MAX_OUTPUT_BYTES: usize = 96_000;
 /// Overall runner deadline (seconds).
@@ -105,7 +108,7 @@ pub enum DocumentTranslateError {
     Unavailable,
     #[error("document content is empty")]
     ContentEmpty,
-    #[error("document content exceeds size limit")]
+    #[error("document content exceeds size limit after code protection")]
     ContentTooLarge,
     #[error("unsupported document format")]
     UnsupportedFormat,
@@ -158,7 +161,9 @@ impl DocumentTranslateError {
                 params.insert("limit".into(), MAX_INPUT_SCALARS.to_string());
                 AppCommandError::new(
                     AppErrorCode::InvalidInput,
-                    format!("Document exceeds {MAX_INPUT_SCALARS} Unicode scalars"),
+                    format!(
+                        "Document exceeds {MAX_INPUT_SCALARS} Unicode scalars after code protection"
+                    ),
                 )
                 .with_i18n(I18N_CONTENT_TOO_LARGE, params)
             }

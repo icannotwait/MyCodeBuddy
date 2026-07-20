@@ -14,8 +14,11 @@ import {
 import { isImageFile, isOfficePreviewable } from "@/lib/language-detect"
 import type { AppLocale } from "@/lib/types"
 
-/** Backend-authoritative max input size (Unicode scalars). Duplicated for FE pre-check UX. */
-export const MAX_INPUT_SCALARS = 24_000
+/**
+ * Max protected body size (Unicode scalars) sent to the translate agent.
+ * Backend measures after Markdown code protection; FE mirrors for pre-check UX.
+ */
+export const MAX_INPUT_SCALARS = 32_000
 
 export type DocumentTranslateFormat = "markdown" | "plainText"
 

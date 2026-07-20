@@ -68,25 +68,11 @@ impl DocumentTranslationService {
         if params.content.trim().is_empty() {
             return Err(DocumentTranslateError::ContentEmpty);
         }
-        if params.content.chars().count() > MAX_INPUT_SCALARS {
-            return Err(DocumentTranslateError::ContentTooLarge);
-        }
         let format = DocumentTranslateFormat::parse_wire(&params.format)?;
 
-        let agent = match load_auto_title_agent_from(&self.db.conn).await {
-            Ok(Some(a)) => a,
-            Ok(None) => return Err(DocumentTranslateError::AgentNotConfigured),
-            Err(e) => {
-                return Err(DocumentTranslateError::Failed(format!(
-                    "load auto title agent: {e}"
-                )));
-            }
-        };
-
-        let locale = resolve_locale(&self.db, params.locale.as_deref()).await;
-
-        // Protect Markdown before acquiring so integrity setup does not hold
-        // capacity on collision (rare). Protect is pure/fast.
+        // Protect Markdown before size check and capacity acquire so:
+        // - eligibility is measured on the agent-facing body (code → placeholders)
+        // - integrity setup does not hold capacity on collision (rare)
         let (body_for_agent, protected) = match format {
             DocumentTranslateFormat::Markdown => match protect_markdown(&params.content) {
                 Ok(p) => {
@@ -101,6 +87,21 @@ impl DocumentTranslationService {
             },
             DocumentTranslateFormat::PlainText => (params.content.clone(), None),
         };
+        if body_for_agent.chars().count() > MAX_INPUT_SCALARS {
+            return Err(DocumentTranslateError::ContentTooLarge);
+        }
+
+        let agent = match load_auto_title_agent_from(&self.db.conn).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return Err(DocumentTranslateError::AgentNotConfigured),
+            Err(e) => {
+                return Err(DocumentTranslateError::Failed(format!(
+                    "load auto title agent: {e}"
+                )));
+            }
+        };
+
+        let locale = resolve_locale(&self.db, params.locale.as_deref()).await;
 
         let permit = match Arc::clone(&self.capacity).try_acquire_owned() {
             Ok(p) => p,
@@ -314,6 +315,62 @@ mod tests {
             .expect_err("oversize");
         assert_eq!(err, DocumentTranslateError::ContentTooLarge);
         assert_eq!(agent.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oversize_protected_markdown_rejects() {
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        let agent = ControllableAgent::new(Ok("x".into()));
+        let svc =
+            DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
+        // No fenced code → protected body ≈ raw; still over limit.
+        let big = "a".repeat(MAX_INPUT_SCALARS + 1);
+        let err = svc
+            .translate(params(&big, "markdown"))
+            .await
+            .expect_err("oversize protected");
+        assert_eq!(err, DocumentTranslateError::ContentTooLarge);
+        assert_eq!(agent.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn size_limit_uses_protected_body_not_raw() {
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        // Placeholder-less reply → restore fails after admission; that is fine.
+        let agent = ControllableAgent::new(Ok("translated".into()));
+        let svc =
+            DocumentTranslationService::new(db, agent.clone() as Arc<dyn DocumentTranslateAgent>);
+        let huge_code = "x".repeat(MAX_INPUT_SCALARS + 2_000);
+        let content = format!("Intro prose\n\n```\n{huge_code}\n```\n\nOutro prose");
+        assert!(
+            content.chars().count() > MAX_INPUT_SCALARS,
+            "raw must exceed limit so this tests post-protect admission"
+        );
+
+        let result = svc.translate(params(&content, "markdown")).await;
+        assert_eq!(
+            agent.calls.load(Ordering::SeqCst),
+            1,
+            "admission must pass when protected body is under limit"
+        );
+        let body = agent
+            .last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runner body recorded");
+        assert!(
+            body.chars().count() <= MAX_INPUT_SCALARS,
+            "agent body must be the protected (shrunken) document"
+        );
+        assert!(
+            !body.contains(&huge_code),
+            "fenced code must not be sent raw to the agent"
+        );
+        assert!(
+            !matches!(result, Err(DocumentTranslateError::ContentTooLarge)),
+            "must not reject on raw size when protected size is fine: {result:?}"
+        );
     }
 
     #[tokio::test]
