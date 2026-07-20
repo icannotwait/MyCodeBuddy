@@ -552,11 +552,12 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     // the fast path; async focus is kicked for the same id.
     if (conversationId > 0) {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { isConversationDetachedCache, focusDetachedConversation } =
+        // Synchronous require avoids circular import with conversation-popout.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- circular dep
+        const popout =
           require("@/lib/conversation-popout") as typeof import("@/lib/conversation-popout")
-        if (isConversationDetachedCache(conversationId)) {
-          void focusDetachedConversation(conversationId)
+        if (popout.isConversationDetachedCache(conversationId)) {
+          void popout.focusDetachedConversation(conversationId)
           return
         }
       } catch {

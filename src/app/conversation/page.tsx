@@ -6,10 +6,7 @@ import { useTranslations } from "next-intl"
 import { Loader2 } from "lucide-react"
 import { AppTitleBar } from "@/components/layout/app-title-bar"
 import { AppToaster } from "@/components/ui/app-toaster"
-import {
-  getFolderConversation,
-  rebindConnectionOwnerWindow,
-} from "@/lib/api"
+import { getFolderConversation, rebindConnectionOwnerWindow } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import type { AgentType, DbConversationDetail } from "@/lib/types"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"

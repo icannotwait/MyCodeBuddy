@@ -481,9 +481,17 @@ pub async fn open_conversation_window(
     // Per-window close: close over THIS incarnation's operation_id so a delayed
     // Destroyed after label reuse cannot resolve to a newer open's op.
     register_conversation_window_close_handler(&conv_window, &operation_id);
-    conv_window
-        .set_focus()
-        .map_err(|e| AppCommandError::window("Failed to focus conversation window", e.to_string()))?;
+    // Focus is best-effort. The window + close handler already exist; failing
+    // focus must not return Err (which would leave main without compensating
+    // while the detached page continues handoff).
+    if let Err(e) = conv_window.set_focus() {
+        tracing::warn!(
+            "[popout] focus after open failed label={} op={}: {}",
+            label,
+            operation_id,
+            e
+        );
+    }
 
     Ok(OpenConversationResult::Opened)
 }
@@ -663,41 +671,64 @@ pub async fn abort_conversation_popout_operation(
     operation_id: String,
 ) -> Result<AbortOutcome, AppCommandError> {
     let status = popout.get_status(&operation_id)?;
-    let outcome = popout.abort(&operation_id, |rec| {
-        match rec.ownership_generation {
-            None => AbortOutcome::NeverRebound,
-            Some(gen) => {
-                // Reverse will be attempted below; if already main, AlreadyMain
-                AbortOutcome::Reversed { generation: gen }
-            }
-        }
-    })?;
+    // Peek: do not attempt reverse/close-side-effects for already-complete ops.
+    if matches!(status.phase, PopoutPhase::HandoffComplete) {
+        let outcome = popout.abort(&operation_id, |_| AbortOutcome::AlreadyComplete)?;
+        let _ = app.emit(
+            "conversation-window://abort",
+            serde_json::json!({
+                "conversationId": status.conversation_id,
+                "operationId": operation_id,
+                "abortOutcome": outcome,
+            }),
+        );
+        return Ok(outcome);
+    }
 
-    // Attempt reverse rebind when we had a generation. Log failures so
-    // residual disconnect still reaps incarnation-tagged resources only.
-    if let AbortOutcome::Reversed { generation } = &outcome {
+    let gen = status.ownership_generation;
+    let outcome = if let Some(generation) = gen {
         let to_label = conversation_window_label(status.conversation_id);
-        if let Err(e) = cm
+        match cm
             .rebind_connection_owner_window(
                 status.conversation_id,
                 None,
                 &to_label,
                 "main",
                 &operation_id,
-                Some(*generation),
+                Some(generation),
             )
             .await
         {
-            tracing::warn!(
-                "[popout] reverse rebind on abort failed op={} gen={}: {}",
-                operation_id,
+            Ok(_) => popout.abort(&operation_id, |_| AbortOutcome::Reversed {
                 generation,
-                e
-            );
+            })?,
+            Err(e) => {
+                // Gen/label CAS failure → newer owner; do not claim Reversed.
+                let msg = e.to_string();
+                tracing::warn!(
+                    "[popout] reverse rebind on abort failed op={} gen={}: {}",
+                    operation_id,
+                    generation,
+                    e
+                );
+                if msg.contains("generation CAS") || msg.contains("owner label CAS") {
+                    popout.abort(&operation_id, |_| AbortOutcome::Superseded {
+                        current_generation: generation,
+                        current_owner: "unknown".into(),
+                    })?
+                } else if msg.contains("not found") {
+                    // Already gone / already main.
+                    popout.abort(&operation_id, |_| AbortOutcome::AlreadyMain)?
+                } else {
+                    // Unknown reverse failure: abort without claiming reverse success.
+                    popout.abort(&operation_id, |_| AbortOutcome::NeverRebound)?
+                }
+            }
         }
-    }
+    } else {
+        popout.abort(&operation_id, |_| AbortOutcome::NeverRebound)?
+    };
 
-    // Emit closed hint so main can compensate (window may still be open)
     let _ = app.emit(
         "conversation-window://abort",
         serde_json::json!({

@@ -97,6 +97,7 @@ type ArmedWait = {
   ready: Promise<ReadyPayload>
   /** Rejects if the window closes before handoff completes. */
   closed: Promise<never>
+  isClosed: () => boolean
   cancel: () => void
   armed: Promise<void>
 }
@@ -104,7 +105,8 @@ type ArmedWait = {
 /**
  * Register ready/closed listeners **before** open returns so a fast ready
  * emission cannot race past an incomplete subscribe().
- * Closed stays observed until cancel() — including after ready.
+ * Closed stays observed until cancel(); callers must re-check isClosed() after
+ * each await (Promise.race alone does not cancel later stages).
  */
 function armHandoffWait(
   operationId: string,
@@ -114,15 +116,14 @@ function armHandoffWait(
   let settleReady!: (v: ReadyPayload) => void
   let settleClosed!: (e: Error) => void
   let readySettled = false
+  let closedFlag = false
   let cancelled = false
   let unsubReady: (() => void) | null = null
   let unsubClosed: (() => void) | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
 
-  const ready = new Promise<ReadyPayload>((resolve, reject) => {
+  const ready = new Promise<ReadyPayload>((resolve) => {
     settleReady = resolve
-    // ready rejection shared with timeout path
-    void reject
   })
 
   const closed = new Promise<never>((_, reject) => {
@@ -147,7 +148,6 @@ function armHandoffWait(
           payload.conversationId === conversationId
         ) {
           readySettled = true
-          // Keep closed armed until cancel after complete.
           unsubReady?.()
           unsubReady = null
           settleReady(payload)
@@ -158,6 +158,7 @@ function armHandoffWait(
       "conversation-window://closed",
       (payload) => {
         if (payload?.operationId === operationId) {
+          closedFlag = true
           settleClosed(
             new Error("pop-out window closed before handoff completed")
           )
@@ -166,12 +167,41 @@ function armHandoffWait(
     )
     timer = setTimeout(() => {
       if (!readySettled) {
+        closedFlag = true
         settleClosed(new Error("pop-out handoff timed out waiting for ready"))
       }
     }, timeoutMs)
   })()
 
-  return { ready, closed, cancel, armed }
+  return {
+    ready,
+    closed,
+    isClosed: () => closedFlag,
+    cancel,
+    armed,
+  }
+}
+
+class DetachCasError extends Error {
+  readonly restoreToken: DetachRestoreToken
+  readonly tabRemoved = true as const
+  constructor(restoreToken: DetachRestoreToken) {
+    super("opened_tabs CAS rejected")
+    this.name = "DetachCasError"
+    this.restoreToken = restoreToken
+  }
+}
+
+function isDetachCasError(
+  e: unknown
+): e is DetachCasError {
+  return (
+    e instanceof DetachCasError ||
+    (typeof e === "object" &&
+      e != null &&
+      (e as { name?: string }).name === "DetachCasError" &&
+      "restoreToken" in e)
+  )
 }
 
 async function detachIfNeeded(
@@ -185,33 +215,79 @@ async function detachIfNeeded(
   const flush = await useTabStore.getState().flushOpenedTabsSave()
   if (!flush.accepted) {
     // Do not restore here — compensation does reverse first, then restore.
-    throw Object.assign(new Error("opened_tabs CAS rejected"), {
-      restoreToken: result.restoreToken,
-      tabRemoved: true,
-    })
+    throw new DetachCasError(result.restoreToken)
   }
   return { restoreToken: result.restoreToken, tabRemoved: true }
 }
 
-function isTerminalHandoffComplete(status: PopoutOpStatus | null | undefined): boolean {
-  const phase = status?.phase
-  return phase === "handoff_complete" || phase === "HandoffComplete"
+function isHandoffComplete(status: PopoutOpStatus | null | undefined): boolean {
+  return status?.phase === "handoff_complete"
 }
 
-function isTerminalAborted(status: PopoutOpStatus | null | undefined): boolean {
-  const phase = status?.phase
-  return phase === "aborted" || phase === "Aborted"
+function isAbortedPhase(status: PopoutOpStatus | null | undefined): boolean {
+  return status?.phase === "aborted"
+}
+
+/** Parse abort outcome for safe compensation branching. */
+function classifyAbortOutcome(outcome: unknown): {
+  kind:
+    | "already_complete"
+    | "superseded"
+    | "reclaimable"
+    | "unknown"
+} {
+  if (outcome == null) return { kind: "unknown" }
+  if (typeof outcome === "string") {
+    const s = outcome.toLowerCase()
+    if (s.includes("already_complete") || s.includes("alreadycomplete")) {
+      return { kind: "already_complete" }
+    }
+    if (s.includes("superseded")) return { kind: "superseded" }
+    if (
+      s.includes("never_rebound") ||
+      s.includes("already_main") ||
+      s.includes("reversed")
+    ) {
+      return { kind: "reclaimable" }
+    }
+    return { kind: "unknown" }
+  }
+  if (typeof outcome === "object") {
+    const o = outcome as Record<string, unknown>
+    // serde externally tagged: { already_complete: null } or { kind: "..." }
+    const keys = Object.keys(o).map((k) => k.toLowerCase())
+    if (keys.some((k) => k.includes("already_complete") || k === "alreadycomplete")) {
+      return { kind: "already_complete" }
+    }
+    if (keys.some((k) => k.includes("superseded"))) {
+      return { kind: "superseded" }
+    }
+    if (
+      keys.some(
+        (k) =>
+          k.includes("never_rebound") ||
+          k.includes("already_main") ||
+          k.includes("reversed")
+      )
+    ) {
+      return { kind: "reclaimable" }
+    }
+    if (typeof o.kind === "string") {
+      return classifyAbortOutcome(o.kind)
+    }
+  }
+  return { kind: "unknown" }
 }
 
 /**
- * Compensation: reverse (abort) first, then restore tab only for reclaimable
- * outcomes. Never restore/close on AlreadyComplete (lost ack after success).
+ * Compensation: reverse (abort) first. Restore/close only on positively
+ * confirmed reclaimable outcomes. already_complete / superseded / unknown are
+ * non-destructive (do not kill a live transferred session).
  */
 async function compensate(args: {
   conversationId: number
   operationId: string
   restoreToken?: DetachRestoreToken | null
-  /** When true, tab was already detached and may need restore. */
   tabRemoved?: boolean
 }): Promise<void> {
   let abortOutcome: unknown = null
@@ -221,7 +297,6 @@ async function compensate(args: {
     /* best-effort reverse */
   }
 
-  // Authoritative status if abort payload is sparse
   let status: PopoutOpStatus | null = null
   try {
     status = await getConversationPopoutOperation(args.operationId)
@@ -229,22 +304,28 @@ async function compensate(args: {
     /* ignore */
   }
 
-  if (isTerminalHandoffComplete(status)) {
-    // Lost-response after success: do NOT restore main tab or close detached.
+  if (isHandoffComplete(status)) {
     detachedCache.add(args.conversationId)
     clearTransferringOut(args.conversationId, args.operationId)
     return
   }
 
-  const outcomeStr = JSON.stringify(abortOutcome ?? status?.abortOutcome ?? "")
-  const superseded =
-    outcomeStr.includes("Superseded") || outcomeStr.includes("superseded")
-  if (superseded) {
-    // Newer owner: clear our fences only; do not restore/close B.
+  const classified = classifyAbortOutcome(
+    abortOutcome ?? status?.abortOutcome ?? null
+  )
+  if (classified.kind === "already_complete") {
+    detachedCache.add(args.conversationId)
+    clearTransferringOut(args.conversationId, args.operationId)
+    return
+  }
+  if (classified.kind === "superseded" || classified.kind === "unknown") {
+    // Non-destructive: clear our fence only; never restore/close against an
+    // unknown or newer owner (closing would disconnect the live session).
     clearTransferringOut(args.conversationId, args.operationId)
     return
   }
 
+  // reclaimable: never_rebound | already_main | reversed
   if (args.tabRemoved && args.restoreToken) {
     useTabStore.getState().restoreDetachedTab(args.restoreToken)
     await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
@@ -260,7 +341,7 @@ async function compensate(args: {
 
 /**
  * Orchestrate pop-out: open → ready → release without disconnect → detach +
- * CAS → complete. Closed observation stays armed until terminal success.
+ * CAS → complete. Re-check closed after every await stage.
  */
 export async function popOutConversation(args: {
   conversationId: number
@@ -304,6 +385,12 @@ export async function popOutConversation(args: {
     markTransferringOut(args.conversationId, operationId)
 
     const wait = armHandoffWait(operationId, args.conversationId, 15_000)
+    const assertNotClosed = () => {
+      if (wait.isClosed()) {
+        throw new Error("pop-out window closed before handoff completed")
+      }
+    }
+
     try {
       await wait.armed
     } catch (e) {
@@ -322,7 +409,12 @@ export async function popOutConversation(args: {
       })
     } catch (e) {
       wait.cancel()
-      clearTransferringOut(args.conversationId, operationId)
+      // Window may have been created despite error in older code paths;
+      // still attempt non-destructive abort + close CAS.
+      await compensate({
+        conversationId: args.conversationId,
+        operationId,
+      })
       throw e
     }
 
@@ -337,32 +429,30 @@ export async function popOutConversation(args: {
     let tabRemoved = false
 
     try {
-      // Race ready against closed — closed stays armed after ready too.
       await Promise.race([wait.ready, wait.closed])
+      assertNotClosed()
 
-      // Live path: drop main owner UI without killing the agent.
       await releaseConnectionWithoutDisconnect(
         args.conversationId,
         operationId
       )
+      assertNotClosed()
 
       try {
         const detachResult = await detachIfNeeded(tab?.id)
         restoreToken = detachResult?.restoreToken ?? null
         tabRemoved = !!detachResult?.tabRemoved
       } catch (detachErr) {
-        const token = (
-          detachErr as { restoreToken?: DetachRestoreToken }
-        )?.restoreToken
-        if (token) {
-          restoreToken = token
+        if (isDetachCasError(detachErr)) {
+          restoreToken = detachErr.restoreToken
           tabRemoved = true
         }
         throw detachErr
       }
+      assertNotClosed()
 
       const status = await completeConversationPopoutOperation(operationId)
-      if (isTerminalAborted(status) || !isTerminalHandoffComplete(status)) {
+      if (isAbortedPhase(status) || !isHandoffComplete(status)) {
         throw new Error(
           `pop-out complete returned non-success phase: ${status?.phase ?? "unknown"}`
         )
