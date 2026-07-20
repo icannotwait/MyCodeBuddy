@@ -578,9 +578,14 @@ pub(crate) fn suppression_application_for_plan(
     }
 }
 
-/// Codex Codeg only: set/override `CODEX_ACP_MULTI_AGENT=0`.
-/// Native, unmanaged, and non-Codex plans leave the key byte-for-byte untouched
-/// (including user values `0`/`1` and absence).
+/// Process env for Codeg native-suppression plans.
+///
+/// - Codex: set/override `CODEX_ACP_MULTI_AGENT=0`
+/// - Grok: set/override `GROK_SUBAGENTS=0` (documented host kill-switch; pairs
+///   with argv `--no-subagents` and session `_meta.agentProfile` denylist)
+///
+/// Native, unmanaged, and non-matching agent plans leave keys byte-for-byte
+/// untouched (including user values `0`/`1` and absence).
 fn apply_route_environment(
     agent_type: AgentType,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -588,13 +593,14 @@ fn apply_route_environment(
 ) -> Result<(), AcpError> {
     use crate::acp::delegation::route::NativeSuppressionPlan;
 
-    if agent_type == AgentType::Codex
-        && matches!(
-            plan.native_suppression,
-            NativeSuppressionPlan::CodexMultiAgentFalse
-        )
-    {
-        env.insert("CODEX_ACP_MULTI_AGENT".into(), "0".into());
+    match (&plan.native_suppression, agent_type) {
+        (NativeSuppressionPlan::CodexMultiAgentFalse, AgentType::Codex) => {
+            env.insert("CODEX_ACP_MULTI_AGENT".into(), "0".into());
+        }
+        (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
+            env.insert("GROK_SUBAGENTS".into(), "0".into());
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2056,10 +2062,73 @@ fn merge_grok_hidden_generation_agent_profile(
     meta
 }
 
+/// Built-in Grok tool names that constitute the **native subagent creation
+/// surface**. Stripped on Codeg-route user sessions via session
+/// `_meta.agentProfile.disallowedTools` — the ACP-effective denylist path
+/// (CLI `--no-subagents` alone does not remove these from the model toolset
+/// on `agent stdio`).
+///
+/// Intentionally narrow: shell / read / MCP / skills stay available so the
+/// parent can still work and use `codeg-mcp` delegation.
+const GROK_CODEG_ROUTE_DISALLOWED_TOOLS: &[&str] = &[
+    "spawn_subagent",
+    "get_command_or_subagent_output",
+    "kill_command_or_subagent",
+    // Legacy / alternate names observed in Grok tool catalogs
+    "Agent",
+    "task",
+];
+
+/// Grok Codeg-route gate for ordinary (non-hidden) sessions: stamp a minimal
+/// `agentProfile` that denylists only native subagent tools so creation routes
+/// through `codeg-mcp` instead of `spawn_subagent`.
+///
+/// Skipped when:
+/// - not Grok, or
+/// - plan is not `GrokNoSubagents` (Native / FeatureDisabled / SafeFallback), or
+/// - purpose is hidden generation (that profile already denylists subagents
+///   plus shell/MCP and must not be overwritten with the narrow route profile).
+///
+/// Does **not** set `maxTurns`, `permissionMode`, `agentsMd`, or
+/// `discoverSkills` — those would break normal chat UX.
+/// `tools: []` is omitted (empty allowlist = inherit all).
+fn merge_grok_codeg_route_agent_profile(
+    mut meta: serde_json::Map<String, serde_json::Value>,
+    agent_type: AgentType,
+    plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    purpose: ConnectionPurpose,
+) -> serde_json::Map<String, serde_json::Value> {
+    use crate::acp::delegation::route::NativeSuppressionPlan;
+
+    if agent_type != AgentType::Grok
+        || purpose.is_hidden_generation()
+        || !matches!(
+            plan.native_suppression,
+            NativeSuppressionPlan::GrokNoSubagents
+        )
+    {
+        return meta;
+    }
+
+    let disallowed: Vec<serde_json::Value> = GROK_CODEG_ROUTE_DISALLOWED_TOOLS
+        .iter()
+        .map(|name| serde_json::Value::String((*name).to_string()))
+        .collect();
+    meta.insert(
+        "agentProfile".to_string(),
+        serde_json::json!({
+            "name": "codeg-route-no-native-subagents",
+            "description": "Codeg route: native subagent surface suppressed",
+            "disallowedTools": disallowed,
+        }),
+    );
+    meta
+}
+
 /// Merge Claude raw-SDK meta, Grok ask-user gate, optional hidden-generation
-/// agent profile, route suppression, terminal snapshot, and adapter
-/// contributions. Consumes the immutable `route_plan` only for
-/// `native_suppression` (Claude deny list).
+/// / Codeg-route agent profiles, Claude route suppression, terminal snapshot,
+/// and adapter contributions. Consumes `route_plan.native_suppression` for
+/// Claude deny list and Grok Codeg-route `agentProfile`.
 fn session_request_meta(
     agent_type: AgentType,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -2069,8 +2138,11 @@ fn session_request_meta(
 ) -> Result<Meta, AcpError> {
     let existing = claude_raw_sdk_session_meta(agent_type).unwrap_or_default();
     let with_grok = merge_grok_ask_user_question_meta(existing, agent_type);
-    let with_profile = merge_grok_hidden_generation_agent_profile(with_grok, agent_type, purpose);
-    let with_route = merge_claude_route_meta(with_profile, route_plan)?;
+    let with_hidden =
+        merge_grok_hidden_generation_agent_profile(with_grok, agent_type, purpose);
+    let with_grok_route =
+        merge_grok_codeg_route_agent_profile(with_hidden, agent_type, route_plan, purpose);
+    let with_route = merge_claude_route_meta(with_grok_route, route_plan)?;
     terminal_metadata(with_route, spec, adapter)
 }
 
@@ -10288,12 +10360,31 @@ mod tests {
             assert_eq!(native_env.get("KEEP").map(String::as_str), Some("yes"));
         }
 
-        // Non-Codex plan never touches CODEX_ACP_MULTI_AGENT.
-        let mut grok_env = BTreeMap::from([("CODEX_ACP_MULTI_AGENT".into(), "1".into())]);
+        // Grok Codeg sets GROK_SUBAGENTS=0 and never touches CODEX_ACP_MULTI_AGENT.
+        let mut grok_env = BTreeMap::from([
+            ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
+            ("GROK_SUBAGENTS".into(), "1".into()),
+        ]);
         apply_route_environment(AgentType::Grok, &codeg_plan(AgentType::Grok), &mut grok_env)
             .unwrap();
         assert_eq!(
             grok_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            grok_env.get("GROK_SUBAGENTS").map(String::as_str),
+            Some("0")
+        );
+        // Native Grok leaves GROK_SUBAGENTS untouched.
+        let mut grok_native_env = BTreeMap::from([("GROK_SUBAGENTS".into(), "1".into())]);
+        apply_route_environment(
+            AgentType::Grok,
+            &native_plan(AgentType::Grok),
+            &mut grok_native_env,
+        )
+        .unwrap();
+        assert_eq!(
+            grok_native_env.get("GROK_SUBAGENTS").map(String::as_str),
             Some("1")
         );
 
@@ -11578,7 +11669,127 @@ mod tests {
                 .as_ref()
                 .map(|m| !m.contains_key("agentProfile"))
                 .unwrap_or(false),
-            "User purpose must not stamp hidden agentProfile"
+            "User purpose on Native route must not stamp agentProfile"
+        );
+    }
+
+    /// Codeg-route Grok user sessions must stamp a **narrow** agentProfile that
+    /// denylists native subagent tools on new/load/resume (ACP-effective path).
+    /// Does not strip shell/read or set maxTurns/permissionMode.
+    #[test]
+    fn grok_codeg_route_meta_stamps_narrow_subagent_denylist_on_new_load_resume() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let spec = test_posix_spec();
+        let adapter = adapter_for(AgentType::Grok);
+        let plan = codeg_plan(AgentType::Grok);
+
+        let new_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+        let load_req = build_load_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-load".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+        let resume_req = build_resume_session_request(
+            AgentType::Grok,
+            SessionId::new("sess-resume".to_string()),
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::User,
+        )
+        .unwrap();
+
+        for (label, meta) in [
+            ("new", new_req.meta.as_ref()),
+            ("load", load_req.meta.as_ref()),
+            ("resume", resume_req.meta.as_ref()),
+        ] {
+            let meta = meta.unwrap_or_else(|| panic!("{label}: session meta required"));
+            let profile = meta
+                .get("agentProfile")
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("{label}: agentProfile required"));
+            assert_eq!(
+                profile.get("name").and_then(|v| v.as_str()),
+                Some("codeg-route-no-native-subagents"),
+                "{label}"
+            );
+            let denied = profile
+                .get("disallowedTools")
+                .and_then(|v| v.as_array())
+                .expect("disallowedTools");
+            let as_str: Vec<&str> = denied.iter().filter_map(|v| v.as_str()).collect();
+            for tool in [
+                "spawn_subagent",
+                "get_command_or_subagent_output",
+                "kill_command_or_subagent",
+            ] {
+                assert!(
+                    as_str.contains(&tool),
+                    "{label}: must deny {tool}, got {as_str:?}"
+                );
+            }
+            // Narrow profile: do not disable ordinary coding tools.
+            assert!(
+                !as_str.contains(&"read_file") && !as_str.contains(&"run_terminal_command"),
+                "{label}: must not strip shell/read, got {as_str:?}"
+            );
+            assert!(
+                profile.get("maxTurns").is_none(),
+                "{label}: must not set maxTurns"
+            );
+            assert!(
+                profile.get("permissionMode").is_none(),
+                "{label}: must not set permissionMode"
+            );
+            assert_eq!(
+                meta.get("askUserQuestion").and_then(|v| v.as_bool()),
+                Some(false),
+                "{label}: ask-user gate remains"
+            );
+            assert!(
+                meta.contains_key("codeg.dev/terminal"),
+                "{label}: terminal meta must remain"
+            );
+        }
+
+        // Hidden generation keeps the full denylist profile, not the narrow route one.
+        let hidden_req = build_new_session_request(
+            AgentType::Grok,
+            &cwd,
+            Vec::new(),
+            &spec,
+            adapter,
+            &plan,
+            ConnectionPurpose::InternalTitle,
+        )
+        .unwrap();
+        let hidden_profile = hidden_req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("agentProfile"))
+            .and_then(|v| v.as_object())
+            .expect("hidden agentProfile");
+        assert_eq!(
+            hidden_profile.get("name").and_then(|v| v.as_str()),
+            Some("codeg-hidden-generation")
         );
     }
 
