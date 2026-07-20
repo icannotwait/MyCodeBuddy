@@ -2,7 +2,7 @@
 # Codeg Server installer for Windows
 # Usage:
 #   irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
-#   .\install.ps1 -Version v0.20.2-mycodebuddy.7
+#   .\install.ps1 -Version v0.20.2-mycodebuddy.8
 #
 
 param(
