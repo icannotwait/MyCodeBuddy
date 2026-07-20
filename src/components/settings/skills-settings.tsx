@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
+import { parseYamlFrontMatter } from "@/lib/skill-frontmatter"
 import {
   acpDeleteAgentSkill,
   acpListAgents,
@@ -147,17 +148,6 @@ function skillDirectoryPath(skill: AgentSkillItem): string {
   return dirname(skill.path)
 }
 
-interface FrontMatterField {
-  key: string
-  value: string
-}
-
-interface ParsedFrontMatter {
-  frontMatterRaw: string | null
-  fields: FrontMatterField[]
-  body: string
-}
-
 const SKILLS_LEFT_MIN_WIDTH = 300
 const SKILLS_RIGHT_MIN_WIDTH = 420
 
@@ -168,42 +158,6 @@ function clamp(value: number, min: number, max: number): number {
 function toPercent(pixels: number, totalPixels: number): number {
   if (totalPixels <= 0) return 0
   return (pixels / totalPixels) * 100
-}
-
-function parseYamlFrontMatter(content: string): ParsedFrontMatter {
-  const match = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n)?/)
-  if (!match) {
-    return {
-      frontMatterRaw: null,
-      fields: [],
-      body: content,
-    }
-  }
-
-  const raw = match[1].trim()
-  const lines = raw.split(/\r?\n/)
-  const fields: FrontMatterField[] = []
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith("#")) continue
-    const kv = trimmed.match(/^([A-Za-z0-9_.-]+)\s*:\s*(.+)$/)
-    if (!kv) continue
-    let value = kv[2].trim()
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1)
-    }
-    fields.push({ key: kv[1], value })
-  }
-
-  return {
-    frontMatterRaw: raw,
-    fields,
-    body: content.slice(match[0].length),
-  }
 }
 
 export function SkillsSettings() {

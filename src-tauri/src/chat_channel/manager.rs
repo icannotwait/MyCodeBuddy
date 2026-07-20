@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
@@ -9,6 +10,7 @@ use super::session_bridge::SessionBridge;
 use super::traits::ChatChannelBackend;
 use super::types::*;
 use crate::acp::manager::ConnectionManager;
+use crate::db::service::thread_binding_service;
 use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
 
 struct ActiveChannel {
@@ -143,6 +145,123 @@ impl ChatChannelManager {
         backend.send_rich_message(message).await
     }
 
+    pub async fn send_to_target(
+        &self,
+        target: &ChannelMessageTarget,
+        message: &RichMessage,
+    ) -> Result<SentMessageId, ChatChannelError> {
+        let backend = {
+            let channels = self.inner.channels.lock().await;
+            channels
+                .get(&target.channel_id)
+                .ok_or(ChatChannelError::NotFound(target.channel_id))?
+                .backend
+                .clone()
+        };
+        backend.send_rich_message_to(message, target).await
+    }
+
+    pub async fn send_interactive_to_target(
+        &self,
+        target: &ChannelMessageTarget,
+        message: &InteractiveMessage,
+    ) -> Result<SentMessageId, ChatChannelError> {
+        let backend = {
+            let channels = self.inner.channels.lock().await;
+            channels
+                .get(&target.channel_id)
+                .ok_or(ChatChannelError::NotFound(target.channel_id))?
+                .backend
+                .clone()
+        };
+        backend.send_interactive_message_to(message, target).await
+    }
+
+    pub async fn create_thread(
+        &self,
+        channel_id: i32,
+        title: &str,
+    ) -> Result<ChannelMessageTarget, ChatChannelError> {
+        let backend = {
+            let channels = self.inner.channels.lock().await;
+            channels
+                .get(&channel_id)
+                .ok_or(ChatChannelError::NotFound(channel_id))?
+                .backend
+                .clone()
+        };
+        backend.create_thread(title).await
+    }
+
+    pub async fn edit_thread_title(
+        &self,
+        target: &ChannelMessageTarget,
+        title: &str,
+    ) -> Result<(), ChatChannelError> {
+        let backend = {
+            let channels = self.inner.channels.lock().await;
+            channels
+                .get(&target.channel_id)
+                .ok_or(ChatChannelError::NotFound(target.channel_id))?
+                .backend
+                .clone()
+        };
+        backend.edit_thread_title(target, title).await
+    }
+
+    pub async fn sync_conversation_title(
+        &self,
+        db: &DatabaseConnection,
+        conversation_id: i32,
+        title: &str,
+    ) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        let bindings = match thread_binding_service::list_by_conversation(db, conversation_id).await
+        {
+            Ok(bindings) => bindings,
+            Err(e) => {
+                tracing::warn!(
+                    "[ChatChannel] failed to load thread bindings for conversation {conversation_id}: {e}"
+                );
+                return;
+            }
+        };
+        let topic_title = topic_title_for_conversation(conversation_id, title);
+        for binding in bindings {
+            if binding.thread_kind != TELEGRAM_FORUM_THREAD_KIND || !binding.title_sync_enabled {
+                continue;
+            }
+            let target = ChannelMessageTarget {
+                channel_id: binding.channel_id,
+                chat_id: Some(binding.chat_id.clone()),
+                thread_key: Some(binding.thread_key.clone()),
+                thread_kind: Some(binding.thread_kind.clone()),
+                provider_payload: binding
+                    .provider_payload_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok()),
+            };
+            match self.edit_thread_title(&target, &topic_title).await {
+                Ok(()) => {
+                    let _ = thread_binding_service::update_display_title(
+                        db,
+                        binding.id,
+                        topic_title.clone(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[ChatChannel] failed to sync Telegram topic title for conversation {conversation_id}: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn send_to_all(&self, message: &RichMessage) {
         let backends: Vec<Arc<dyn ChatChannelBackend>> = {
             let channels = self.inner.channels.lock().await;
@@ -218,11 +337,13 @@ impl ChatChannelManager {
     /// `session_event_subscriber`). Phase 5 split: ACP-shaped data goes
     /// through the typed bus; chat-channel-shaped data stays on the JSON
     /// broadcaster.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_background(
         &self,
         broadcaster: Arc<WebEventBroadcaster>,
         bus: Arc<crate::acp::InternalEventBus>,
         db_conn: DatabaseConnection,
+        data_dir: PathBuf,
         conn_mgr: ConnectionManager,
         emitter: EventEmitter,
         runtime_ctx: super::command_dispatcher::ChatCommandRuntimeContext,
@@ -265,6 +386,7 @@ impl ChatChannelManager {
                 command_rx,
                 manager_for_cmds,
                 db_conn.clone(),
+                data_dir,
                 conn_mgr,
                 emitter,
                 bridge,
@@ -359,4 +481,11 @@ impl ChatChannelManager {
             }
         }
     }
+}
+
+fn topic_title_for_conversation(conversation_id: i32, title: &str) -> String {
+    format!("#{conversation_id} {title}")
+        .chars()
+        .take(128)
+        .collect()
 }

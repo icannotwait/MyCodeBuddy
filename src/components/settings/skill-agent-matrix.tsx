@@ -1,6 +1,12 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react"
 import {
   AlertTriangle,
   Check,
@@ -96,6 +102,16 @@ export interface SkillAgentMatrixProps {
   searchPlaceholder?: string
   /** Tooltip shown over a not-ready skill's cells (office: "sync first"). */
   notReadyHint?: string
+  /**
+   * Optional authoring slots — the three curated packs pass nothing (behavior
+   * unchanged); the Custom pack injects create/import/edit/duplicate/delete UI.
+   */
+  /** Extra buttons in the toolbar, right of the search box (e.g. New / Import). */
+  toolbarActions?: ReactNode
+  /** Extra items appended to a row's `⋯` menu (e.g. Edit / Duplicate / Delete). */
+  rowActions?: (skill: MatrixSkill) => ReactNode
+  /** Extra buttons in the selection bulk bar (e.g. Delete selected). */
+  bulkActions?: (selectedIds: string[]) => ReactNode
 }
 
 // ─── Pure helpers (unit-tested) ─────────────────────────────────────────
@@ -178,6 +194,9 @@ export function SkillAgentMatrix({
   onApplied,
   searchPlaceholder,
   notReadyHint,
+  toolbarActions,
+  rowActions,
+  bulkActions,
 }: SkillAgentMatrixProps) {
   const t = useTranslations("SkillMatrix")
 
@@ -510,7 +529,8 @@ export function SkillAgentMatrix({
             placeholder={searchPlaceholder ?? t("searchPlaceholder")}
             className="max-w-xs"
           />
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-2">
+            {toolbarActions}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button size="sm" variant="outline" disabled={!interactive}>
@@ -697,6 +717,12 @@ export function SkillAgentMatrix({
                                 >
                                   {t("rowMenu.disableAll")}
                                 </DropdownMenuItem>
+                                {rowActions && (
+                                  <>
+                                    <DropdownMenuSeparator />
+                                    {rowActions(skill)}
+                                  </>
+                                )}
                               </DropdownMenuContent>
                             </DropdownMenu>
                           </div>
@@ -772,6 +798,7 @@ export function SkillAgentMatrix({
               </DropdownMenuContent>
             </DropdownMenu>
             <div className="ml-auto flex items-center gap-2">
+              {bulkActions?.(selectedVisibleIds)}
               <Button
                 size="sm"
                 disabled={!interactive}

@@ -7,6 +7,7 @@ mod app_error;
 pub mod app_state;
 pub mod auto_title;
 pub mod automation;
+pub mod backgrounds;
 pub mod chat_channel;
 pub mod commands;
 pub mod db;
@@ -29,6 +30,7 @@ pub mod process;
 pub mod reference_search;
 pub mod supervise;
 mod terminal;
+pub mod turn_timings;
 pub mod update;
 pub mod web;
 pub mod workspace_state;
@@ -50,10 +52,10 @@ mod tauri_app {
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
-        backup, chat_channel as chat_channel_commands, conversations,
-        delegation as delegation_commands, experts as experts_commands,
-        feedback as feedback_commands, file_io, folder_commands, folders,
-        logging as logging_commands, mcp as mcp_commands,
+        background as background_commands, backup, chat_channel as chat_channel_commands,
+        conversations, custom_skills as custom_skills_commands, delegation as delegation_commands,
+        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
+        folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification,
         office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
@@ -344,10 +346,13 @@ mod tauri_app {
                         conn: db.conn.clone(),
                     });
                     let cm = app.state::<ConnectionManager>().clone_ref();
+                    let chat_channel_manager =
+                        app.state::<ChatChannelManager>().clone_ref();
                     let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
                     let coordinator = crate::auto_title::build_production_coordinator(
                         title_db,
                         cm,
+                        chat_channel_manager,
                         internal_sessions.clone(),
                         effective_data_dir.clone(),
                         emitter,
@@ -662,6 +667,7 @@ mod tauri_app {
                     let broadcaster =
                         app.state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>();
                     let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let data_dir = effective_data_dir.clone();
                     let ccm_ref = ccm.clone_ref();
                     let br = broadcaster.inner().clone();
                     let bus = app
@@ -676,11 +682,18 @@ mod tauri_app {
                         .clone();
                     let runtime_ctx = crate::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
                         runtime,
-                        data_dir: effective_data_dir.clone(),
                     };
                     tauri::async_runtime::spawn(async move {
                         ccm_ref
-                            .start_background(br, bus, db_conn, cm, emitter, runtime_ctx)
+                            .start_background(
+                                br,
+                                bus,
+                                db_conn,
+                                data_dir,
+                                cm,
+                                emitter,
+                                runtime_ctx,
+                            )
                             .await;
                     });
                 }
@@ -841,11 +854,19 @@ mod tauri_app {
                         .title("DrawCode")
                         .inner_size(1260.0, 860.0)
                         .min_inner_size(400.0, 600.0);
+                    let builder = windows::apply_platform_window_style(builder);
                     // Perf harness / reference builds only — ordinary release
                     // binaries must not expose DevTools on the main window.
                     #[cfg(feature = "test-utils")]
                     let builder = builder.devtools(true);
-                    if let Ok(w) = windows::apply_platform_window_style(builder).build() {
+                    // The workspace title bar is taller than the shared default
+                    // (it hosts the tab strips), so nudge the native macOS
+                    // traffic lights down to stay vertically centred.
+                    #[cfg(target_os = "macos")]
+                    let builder = builder.traffic_light_position(
+                        windows::workspace_window_traffic_light_position(),
+                    );
+                    if let Ok(w) = builder.build() {
                         windows::post_window_setup(&w);
                     }
                 }
@@ -1063,6 +1084,7 @@ mod tauri_app {
                 folders::remove_folder_from_workspace,
                 folders::reorder_folders,
                 folders::update_folder_color,
+                folders::update_folder_alias,
                 folders::update_folder_default_agent,
                 folders::add_folder_to_history,
                 folders::remove_folder_from_history,
@@ -1129,6 +1151,7 @@ mod tauri_app {
                 folders::save_file_content,
                 folders::save_file_copy,
                 folders::rename_file_tree_entry,
+                folders::move_file_tree_entry,
                 folders::delete_file_tree_entry,
                 folders::create_file_tree_entry,
                 folders::git_log,
@@ -1187,6 +1210,9 @@ mod tauri_app {
                 pet_commands::pet_celebrate,
                 pet_commands::pet_get_current_state,
                 pet_commands::pet_list_active_sessions,
+                background_commands::background_read,
+                background_commands::background_set,
+                background_commands::background_clear,
                 app_update_commands::app_update_state,
                 app_update_commands::perform_app_update,
                 app_update_commands::restart_app,
@@ -1244,6 +1270,8 @@ mod tauri_app {
                 version_control::get_account_token,
                 version_control::delete_account_token,
                 acp_commands::acp_preflight,
+                acp_commands::acp_cursor_auth_status,
+                acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
                 acp_commands::acp_set_mode,
@@ -1292,6 +1320,7 @@ mod tauri_app {
                 acp_commands::acp_delete_agent_skill,
                 acp_commands::opencode_list_plugins,
                 acp_commands::opencode_provider_catalog,
+                acp_commands::codex_bundled_catalog,
                 acp_commands::opencode_install_plugins,
                 acp_commands::opencode_uninstall_plugin,
                 acp_commands::codex_request_device_code,
@@ -1312,6 +1341,16 @@ mod tauri_app {
                 science_commands::science_apply_links,
                 science_commands::science_read_content,
                 science_commands::science_open_central_dir,
+                custom_skills_commands::custom_list,
+                custom_skills_commands::custom_list_all_install_statuses,
+                custom_skills_commands::custom_apply_links,
+                custom_skills_commands::custom_read_skill,
+                custom_skills_commands::custom_create_skill,
+                custom_skills_commands::custom_save_skill,
+                custom_skills_commands::custom_duplicate_skill,
+                custom_skills_commands::custom_import_skill,
+                custom_skills_commands::custom_import_from_agent,
+                custom_skills_commands::custom_delete_skills,
                 office_tools_commands::officecli_detect,
                 office_tools_commands::officecli_install,
                 office_tools_commands::officecli_uninstall,

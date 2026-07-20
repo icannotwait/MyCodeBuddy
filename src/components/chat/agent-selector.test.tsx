@@ -35,6 +35,7 @@ function agent(
     opencode_auth_json: null,
     codex_auth_json: null,
     codex_config_toml: null,
+    codex_model_catalog: null,
     grok_config_toml: null,
     grok_settings: null,
     cline_secrets_json: null,

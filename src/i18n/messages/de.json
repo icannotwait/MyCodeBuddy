@@ -117,6 +117,29 @@
       "sectionTitle": "Modusauswahlbereich",
       "sectionDescription": "Die Shortcut-Karten „Code-Entwicklung / Büroarbeit“ über dem Eingabefeld auf der Seite für eine neue Konversation.",
       "showQuickActions": "Auf der Seite für neue Konversationen anzeigen"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "Arbeitsbereich-Hintergrund",
+      "sectionDescription": "Zeigt ein Bild hinter dem gesamten Arbeitsbereich. Seitenleiste und Panels werden durchscheinend und mattiert, sodass das Bild durchscheint, und eine Maske sorgt für lesbaren Text.",
+      "enable": "Hintergrundbild aktivieren",
+      "image": "Bild",
+      "chooseImage": "Bild auswählen",
+      "replaceImage": "Bild ersetzen",
+      "removeImage": "Entfernen",
+      "fillMode": "Füllmodus",
+      "fillModes": {
+        "cover": "Füllen",
+        "contain": "Einpassen",
+        "center": "Zentrieren",
+        "tile": "Kacheln"
+      },
+      "maskOpacity": "Maskendeckkraft",
+      "maskOpacityHint": "Höhere Werte blenden das Bild zur Hintergrundfarbe des Themes aus und verbessern den Textkontrast.",
+      "imageBlur": "Bildunschärfe",
+      "panelOpacity": "Panel-Deckkraft",
+      "panelOpacityHint": "Wie deckend Seitenleiste, Panels und Tab-Leisten sind. Niedriger lässt mehr vom Bild durchscheinen.",
+      "errorTooLarge": "Bild ist zu groß (max. 16 MB).",
+      "errorUploadFailed": "Hintergrundbild konnte nicht festgelegt werden."
     }
   },
   "SystemSettings": {
@@ -624,7 +647,9 @@
     "grok": {
       "configDescription": "Konfiguriere Grok hier. Die folgenden Steuerelemente – Berechtigungsmodus, Reasoning-Aufwand, ein optionales benutzerdefiniertes Modell (eigener Endpunkt) und die Verdichtung – werden in ~/.grok/config.toml zusammengeführt, wobei deine anderen Schlüssel und Kommentare erhalten bleiben. Die Anmeldung nutzt deinen XAI_API_KEY oder `grok login`. Weitere Schlüssel bleiben unter „Erweitert“ bearbeitbar.",
       "permissionModeLabel": "Berechtigungsmodus",
-      "permissionAsk": "Jedes Mal fragen",
+      "permissionDefault": "Jedes Mal fragen",
+      "permissionAcceptEdits": "Bearbeitungen automatisch genehmigen",
+      "permissionAuto": "Intelligente Auto-Genehmigung",
       "permissionAlwaysApprove": "Immer zulassen",
       "reasoningEffortLabel": "Denkaufwand",
       "effortLow": "Niedrig (schneller)",
@@ -643,7 +668,7 @@
       "customModelTitle": "Benutzerdefiniertes Modell (eigener Endpunkt)",
       "customModelHint": "Richte Grok auf einen benutzerdefinierten oder selbst gehosteten Endpunkt. codeg schreibt einen `[model.*]`-Block pro Modell und legt es als Standard fest. Lasse die Modell-ID leer, um es zu entfernen.",
       "customModelIdLabel": "Modell-ID",
-      "customModelIdPlaceholder": "z. B. grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "Wird als `[model.*]`-Block registriert und als Modellname an die API gesendet; außerdem als `[models].default` gesetzt.",
       "customBaseUrlLabel": "Basis-URL",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1 (Standard)",
@@ -973,7 +998,9 @@
       "piBinaryUninstalled": "pi deinstalliert",
       "piBinaryUninstallFailed": "pi-Deinstallation fehlgeschlagen",
       "savePiTrustFailed": "Speichern des Arbeitsbereich-Vertrauens fehlgeschlagen",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
+      "cursorSaved": "Cursor-Konfiguration gespeichert",
+      "saveCursorConfigFailed": "Cursor-Konfiguration konnte nicht gespeichert werden"
     },
     "version": {
       "statusLabel": "Versionsstatus",
@@ -1063,7 +1090,50 @@
       "trustHint": "Nur hier geöffnete Ordner werden als vertrauenswürdig eingestuft, niemals der gesamte Rechner – und dies betrifft nur das Laden der Konfiguration, nicht das, was pi ausführen darf.",
       "configDirSkillsNote": "Mit einem benutzerdefinierten Konfigurationsverzeichnis gelten die in den Einstellungen verwalteten Skills, Experten und Office-Tools nicht für dieses pi — verwalte seine Skills direkt in diesem Ordner."
     },
-    "showThinking": "Show thinking"
+    "showThinking": "Show thinking",
+    "cursor": {
+      "configDescription": "Konfiguriere Cursor hier. Wähle eine Authentifizierungsmethode – offizielles Abo (Browser-Anmeldung) oder einen Cursor-API-Schlüssel für Headless-/Servermaschinen – wähle dann ein Modell und bearbeite die Berechtigungsregeln und die Sandbox des CLI. codeg schreibt sie in ~/.cursor/cli-config.json, gemeinsam mit dem cursor-agent-CLI.",
+      "authTitle": "Authentifizierung",
+      "authChecking": "Prüfe…",
+      "authNotInstalled": "cursor-agent ist nicht installiert",
+      "authLoggedIn": "Angemeldet",
+      "authNotLoggedIn": "Nicht angemeldet",
+      "loginHint": "Führe dies im Terminal aus, um dich mit deinem Cursor-Konto anzumelden (ein Browserfenster öffnet sich), und klicke danach auf Aktualisieren:",
+      "apiKeyLabel": "Cursor-API-Schlüssel",
+      "apiKeyPlaceholder": "Schlüssel von cursor.com/dashboard",
+      "apiKeyHint": "CURSOR_API_KEY – ein Cursor-Dashboard-Kontoschlüssel, Alternative zur Browser-Anmeldung für Headless-/Servermaschinen. Kein Drittanbieter- oder OpenAI-Schlüssel.",
+      "modelTitle": "Standardmodell",
+      "loadModels": "Modelle laden",
+      "modelsUnavailable": "Modellliste nicht verfügbar",
+      "modelHint": "Wird der CLI beim Sitzungsstart als --model übergeben. Auf Standard lassen, damit Cursor wählt.",
+      "permissionsTitle": "Berechtigungen & Sandbox",
+      "permissionsDescription": "Visueller Editor für die Berechtigungsregeln der CLI (cli-config.json). Erlaubte Regeln laufen ohne Rückfrage; verweigerte werden immer blockiert.",
+      "permissionModeLabel": "Berechtigungsmodus",
+      "permissionModeDefault": "Vor der Ausführung fragen (Standard)",
+      "permissionModeForce": "Run Everything (--force)",
+      "permissionModeHint": "Run Everything startet Sitzungen mit --force: Alle Tool-Aufrufe werden ohne Rückfrage automatisch erlaubt, außer Deny-Regeln (eine Organisationsrichtlinie kann dies auf Allow-Regeln beschränken). Gilt für neue Sitzungen.",
+      "optionDefault": "Standard (nicht gesetzt)",
+      "sandboxLabel": "Sandbox",
+      "sandboxEnabled": "Aktiviert",
+      "sandboxDisabled": "Deaktiviert",
+      "allowRulesLabel": "Erlauben-Regeln",
+      "denyRulesLabel": "Verweigern-Regeln",
+      "addRule": "Regel hinzufügen",
+      "rulesSyntaxHint": "Regelsyntax: Shell(Befehl), Read(Pfad/Glob), Write(Pfad/Glob), WebFetch(Domain), Mcp(Server:Tool) — Deny-Regeln haben immer Vorrang.",
+      "saveConfig": "Konfiguration speichern",
+      "advancedToggle": "Erweitert: rohe cli-config.json",
+      "advancedHint": "Die komplette ~/.cursor/cli-config.json. Speichern schreibt die Datei unverändert; die strukturierten Steuerelemente oben werden stattdessen zusammengeführt.",
+      "saveRawConfig": "Datei speichern",
+      "authMode": "Authentifizierungsmethode",
+      "subscriptionHint": "Mit deinem Cursor-Konto anmelden und Cursors Modelle verwenden.",
+      "customApiKeyRequired": "Ein Cursor-API-Schlüssel ist erforderlich.",
+      "authModeApiKey": "Cursor-API-Schlüssel (Headless/Server)",
+      "authModeApiKeyHint": "Mit einem Cursor-Konto-API-Schlüssel aus dem Cursor-Dashboard authentifizieren (für Headless-/Servermaschinen). Das ist ein Cursor-Kontoschlüssel, kein Drittanbieter-/OpenAI-Endpunkt – cursor-agent kommuniziert nur mit dem Cursor-Backend. Um einen codex-/OpenAI-kompatiblen Endpunkt zu nutzen, verwende stattdessen den Codex-Agenten.",
+      "modelPickerPlaceholder": "Modelle suchen…",
+      "modelNoMatch": "Kein passendes Modell",
+      "modelsNeedAuth": "Melde dich an, um die Modellliste zu laden.",
+      "modelDefaultBadge": "Standard"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "Agent-Einstellungen werden geladen...",
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "Ordner konnte nicht entfernt werden: {message}",
         "reorderFoldersFailed": "Ordner konnten nicht neu sortiert werden: {message}",
         "changeFolderColorFailed": "Farbe konnte nicht geändert werden: {message}",
+        "setFolderAliasFailed": "Alias konnte nicht festgelegt werden: {message}",
         "changeFolderDefaultAgentFailed": "Standard-Agent konnte nicht gesetzt werden: {message}"
       },
       "statsLabel": "{folders} Ordner · {convos} Konversationen",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "Kein Standard (global verwenden)",
         "agentUnavailableSuffix": "(nicht verfügbar)",
         "loadingAgents": "Agenten werden geladen…",
+        "setAlias": "Alias festlegen…",
+        "setAliasTitle": "Ordner-Alias festlegen",
+        "setAliasPlaceholder": "Alias eingeben (zum Entfernen leer lassen)",
+        "setAliasSave": "Speichern",
+        "setAliasCancel": "Abbrechen",
         "removeFromWorkspace": "Aus Arbeitsbereich entfernen"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "System",
         "toolResult": "Ergebnis",
         "toolError": "Fehler"
-      }
+      },
+      "moreActions": "Weitere Aktionen"
     },
     "sessionDetails": {
       "menuLabel": "Sitzungsdetails",
+      "noActiveSession": "Keine aktive Sitzung",
       "title": "Sitzungsdetails",
       "subtitle": "Sitzungsmetadaten und Token-Nutzung",
       "fieldTitle": "Titel",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "Unter diesem Pfad existiert bereits eine Datei. Wählen Sie einen anderen Namen.",
       "saveTranslationAs": "Speichern unter…",
       "translationTabTitle": "{name} ({locale})",
-      "translateProviderDisclosure": "Der Agent für automatische Titel wird auch für die Dokumentübersetzung verwendet. Dokumenttext wird an diesen Agenten/Anbieter gesendet; Codeg blendet interne Sitzungen in den eigenen Listen aus, löscht aber nicht den Speicher des Agent-CLI."
+      "translateProviderDisclosure": "Der Agent für automatische Titel wird auch für die Dokumentübersetzung verwendet. Dokumenttext wird an diesen Agenten/Anbieter gesendet; Codeg blendet interne Sitzungen in den eigenen Listen aus, löscht aber nicht den Speicher des Agent-CLI.",
+      "emptyDirectory": "Leerer Ordner"
     },
     "terminal": {
       "rename": "Umbenennen",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "{name} heruntergeladen",
         "pathCopied": "Pfad kopiert",
         "copyPathFailed": "Pfad konnte nicht kopiert werden",
-        "loadIgnoredFilesFailed": "Ignorierte Dateien konnten nicht geladen werden"
+        "loadIgnoredFilesFailed": "Ignorierte Dateien konnten nicht geladen werden",
+        "moveFailed": "Verschieben fehlgeschlagen"
       },
       "createDialog": {
         "newFile": "Neue Datei",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "Aktivieren Sie mindestens einen Agenten, bevor Sie eine Sitzung starten...",
         "prepareSessionFailed": "Die Chat-Sitzung konnte nicht vorbereitet werden. Bitte versuche es erneut.",
         "createConversationFailed": "Die Konversation konnte nicht erstellt werden. Bitte versuche es erneut.",
-        "askAnythingPlaceholder": "Fragen Sie alles..."
+        "askAnythingPlaceholder": "Fragen Sie alles...",
+        "agentNotInstalled": "{agent} ist nicht installiert · in den Agents-Einstellungen installieren"
       },
       "welcomePanel": {
         "greeting": "Was möchtest du heute <highlight>machen</highlight>?",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "Keine aktivierten Agenten",
-        "openAgentsSettings": "Agenten-Einstellungen öffnen"
+        "openAgentsSettings": "Agenten-Einstellungen öffnen",
+        "notInstalled": "Nicht installiert"
       },
       "subAgentOverlay": {
         "title": "Subagenten",
@@ -2924,6 +3006,8 @@
     "nameRequired": "Kanalname ist erforderlich.",
     "tokenRequired": "Token ist erforderlich.",
     "chatIdRequired": "Chat-ID ist erforderlich.",
+    "topicMode": "Themengruppenmodus",
+    "topicModeHint": "Leitet Telegram-Forum-Themen als separate Codeg-Sitzungen weiter. Der Bot muss in einer Forum-Supergruppe sein und Themen verwalten dürfen.",
     "loadFailed": "Kanäle konnten nicht geladen werden.",
     "saveFailed": "Änderungen konnten nicht gespeichert werden.",
     "connectSuccess": "Kanal verbunden.",
@@ -3284,7 +3368,8 @@
     "tabs": {
       "experts": "Experten",
       "science": "Wissenschaft",
-      "office": "Office-Tools"
+      "office": "Office-Tools",
+      "custom": "Benutzerdefiniert"
     },
     "actions": {
       "openCentralDir": "Zentralen Ordner öffnen",
@@ -3367,7 +3452,7 @@
       "deleteConfirm": "Pet „{name}\" löschen? Auch von der Festplatte entfernt.",
       "summon": "Pet-Fenster aufrufen",
       "openCodexHelp": "Codex-Pets müssen in ~/.codex/pets/ liegen. Nichts gefunden.",
-      "specRequirement": "Sprite-Sheet muss 1536x1872 PNG oder WebP mit Transparenz sein.",
+      "specRequirement": "Sprite-Sheet muss 1536px breit sein, mit einer Höhe als Vielfaches von 208px (z. B. 1872 oder 2288), als PNG oder WebP mit Transparenz.",
       "form": {
         "id": "Pet-ID",
         "idHelp": "Kleinbuchstaben, Ziffern, '-' und '_'. Max 64 Zeichen.",
@@ -3814,5 +3899,122 @@
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Branches suchen…",
     "branchNone": "Keine Branches"
+  },
+  "CustomSkillsSettings": {
+    "loading": "Benutzerdefinierte Skills werden geladen…",
+    "category": "Benutzerdefiniert",
+    "searchPlaceholder": "Benutzerdefinierte Skills nach Name, ID oder Beschreibung suchen",
+    "states": {
+      "not_linked": "Nicht aktiviert",
+      "linked_to_codeg": "Aktiviert",
+      "linked_elsewhere": "Anderweitig verknüpft",
+      "blocked_by_real_directory": "Durch echten Ordner blockiert",
+      "broken": "Defekter Link"
+    },
+    "actions": {
+      "new": "Neu",
+      "import": "Importieren",
+      "importFromAgent": "Von Agent importieren",
+      "cancel": "Abbrechen",
+      "save": "Speichern"
+    },
+    "rowMenu": {
+      "edit": "Bearbeiten",
+      "duplicate": "Duplizieren",
+      "delete": "Löschen"
+    },
+    "bulk": {
+      "delete": "Auswahl löschen"
+    },
+    "editor": {
+      "createTitle": "Neuer benutzerdefinierter Skill",
+      "editTitle": "Benutzerdefinierten Skill bearbeiten",
+      "description": "Benutzerdefinierte Skills liegen im gemeinsamen Speicher (~/.codeg/skills) und können für jeden Agenten aktiviert werden.",
+      "idLabel": "Skill-ID",
+      "idPlaceholder": "z. B. my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "Hier die SKILL.md des Skills schreiben…",
+      "preview": "Vorschau",
+      "edit": "Bearbeiten",
+      "emptyBody": "Noch kein Inhalt."
+    },
+    "duplicate": {
+      "title": "Skill duplizieren",
+      "description": "Eine Kopie von „{id}“ mit einer neuen ID erstellen.",
+      "newIdPlaceholder": "Neue Skill-ID",
+      "confirm": "Duplizieren"
+    },
+    "import": {
+      "title": "Skill-Ordner zum Importieren wählen"
+    },
+    "importFromAgent": {
+      "title": "Skills von einem Agenten importieren",
+      "description": "Kopiere die eigenen Skills eines Agenten in den gemeinsamen Speicher, um sie für jeden Agenten zu aktivieren.",
+      "agentLabel": "Agent",
+      "agentPlaceholder": "Agent auswählen",
+      "selectAll": "Alle auswählen ({count})",
+      "loading": "Skills des Agenten werden geladen…",
+      "unsupported": "Dieser Agent stellt kein Skill-Verzeichnis bereit.",
+      "empty": "Dieser Agent hat keine importierbaren Skills.",
+      "alreadyInLibrary": "In Bibliothek",
+      "confirm": "Auswahl importieren ({count})"
+    },
+    "delete": {
+      "title": "Benutzerdefinierte Skills löschen?",
+      "body": "Dadurch werden {count} benutzerdefinierte Skill(s) aus dem zentralen Speicher entfernt und von allen Agenten getrennt. Dies kann nicht rückgängig gemacht werden.",
+      "confirm": "Löschen"
+    },
+    "toasts": {
+      "loadFailed": "Skill konnte nicht geladen werden",
+      "idRequired": "Bitte eine Skill-ID eingeben",
+      "created": "Benutzerdefinierter Skill erstellt",
+      "updated": "Benutzerdefinierter Skill aktualisiert",
+      "saveFailed": "Skill konnte nicht gespeichert werden",
+      "imported": "Skill importiert",
+      "importFailed": "Skill konnte nicht importiert werden",
+      "duplicated": "Skill dupliziert",
+      "duplicateFailed": "Skill konnte nicht dupliziert werden",
+      "deleted": "{count} Skill(s) gelöscht",
+      "deletedPartial": "{ok} gelöscht, {failed} fehlgeschlagen",
+      "deleteFailed": "Skills konnten nicht gelöscht werden",
+      "importedFromAgent": "{count} Skill(s) importiert",
+      "importedFromAgentPartial": "{ok} importiert, {failed} fehlgeschlagen",
+      "importFromAgentAllSkipped": "Nichts zu importieren – {count} bereits in der Bibliothek",
+      "importFromAgentFailed": "Import vom Agenten fehlgeschlagen"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "Du hast die Modellliste angepasst, daher verwaltet codeg jetzt die gesamte Modelltabelle von codex. Offizielle Modelle, die codex später hinzufügt, erscheinen nicht automatisch – klicke unten auf Aktualisieren und speichere erneut, um sie zu übernehmen. Entferne alle Anpassungen, damit codex sich wieder automatisch aktualisiert.",
+    "officialsTitle": "Offizielle Modelle",
+    "officialsHint": "Automatisch aus dem gestarteten codex übernommen; nicht benötigte entfernen.",
+    "officialsEmpty": "Keine offiziellen Modelle verfügbar.",
+    "refresh": "Aus codex aktualisieren",
+    "readdOfficial": "Offizielles erneut hinzufügen",
+    "customsTitle": "Benutzerdefinierte Modelle",
+    "customsEmpty": "Noch keine benutzerdefinierten Modelle.",
+    "addCustom": "Benutzerdefiniert hinzufügen",
+    "slugPlaceholder": "Modell-ID (Slug)",
+    "displayNamePlaceholder": "Anzeigename",
+    "contextWindow": "Kontext",
+    "makeDefault": "Als Standard festlegen",
+    "defaultHint": "Standardmodell",
+    "remove": "Entfernen",
+    "advanced": "Erweitert",
+    "baseTemplate": "Basisvorlage",
+    "baseTemplateHint": "Offizielles Modell, von dem Pflichtfelder (System-Prompt, Tools, Limits) geklont werden.",
+    "groupBehavior": "Verhalten & Funktionen",
+    "fieldReasoningLevel": "Standard-Reasoning",
+    "fieldReasoningSummary": "Reasoning-Zusammenfassung",
+    "fieldVerbosity": "Ausführlichkeit",
+    "fieldShellType": "Shell-Typ",
+    "fieldApplyPatch": "Apply-Patch-Tool",
+    "fieldReasoningSummaries": "Reasoning-Zusammenfassungen",
+    "fieldSupportVerbosity": "Ausführlichkeitssteuerung",
+    "fieldParallelToolCalls": "Parallele Tool-Aufrufe",
+    "fieldSearchTool": "Websuche-Tool",
+    "optNone": "Keine",
+    "groupInstructions": "Beschreibung & System-Prompt",
+    "fieldDescription": "Beschreibung",
+    "baseInstructions": "System-Prompt (base_instructions)"
   }
 }

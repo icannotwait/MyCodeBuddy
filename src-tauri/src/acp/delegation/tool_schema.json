@@ -18,7 +18,8 @@
             "code_buddy",
             "kimi_code",
             "pi",
-            "grok"
+            "grok",
+            "cursor"
           ],
           "description": "Local agent to run the task."
         },

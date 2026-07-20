@@ -2,10 +2,12 @@ pub mod acp;
 #[cfg(feature = "tauri-runtime")]
 pub mod app_update;
 pub mod automation;
+pub mod background;
 pub mod backup;
 pub mod chat_channel;
 pub mod conversation_experience;
 pub mod conversations;
+pub mod custom_skills;
 pub mod delegation;
 pub mod document_translate;
 pub mod experts;

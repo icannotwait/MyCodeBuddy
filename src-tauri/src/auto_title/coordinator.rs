@@ -27,6 +27,7 @@ use crate::auto_title::service::{
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
 };
+use crate::chat_channel::manager::ChatChannelManager;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::error::DbError;
 use crate::db::AppDatabase;
@@ -88,6 +89,7 @@ pub struct AutoTitleCoordinator {
     db: Arc<AppDatabase>,
     runner: Arc<dyn TitleAgentRunner>,
     emitter: EventEmitter,
+    chat_channel_manager: Option<ChatChannelManager>,
     partial_source: Arc<dyn PartialAssistantTextSource>,
     deadline: Duration,
     sweep_interval: Duration,
@@ -156,6 +158,7 @@ pub struct AutoTitleCoordinator {
 pub fn build_production_coordinator(
     db: Arc<AppDatabase>,
     connection_manager: ConnectionManager,
+    chat_channel_manager: ChatChannelManager,
     registry: Arc<InternalAgentSessionRegistry>,
     data_dir: PathBuf,
     emitter: EventEmitter,
@@ -171,10 +174,11 @@ pub fn build_production_coordinator(
     ));
     let partial: Arc<dyn PartialAssistantTextSource> =
         Arc::new(ManagerPartialSource::from_manager_ref(&connection_manager));
-    AutoTitleCoordinator::new_with_deadline(
+    AutoTitleCoordinator::new_with_deadline_and_channels(
         db,
         runner,
         emitter,
+        Some(chat_channel_manager),
         partial,
         DEFAULT_DEADLINE,
         DEFAULT_SWEEP_INTERVAL,
@@ -209,10 +213,34 @@ impl AutoTitleCoordinator {
         sweep_interval: Duration,
         batch_limit: usize,
     ) -> Arc<Self> {
+        Self::new_with_deadline_and_channels(
+            db,
+            runner,
+            emitter,
+            None,
+            partial_source,
+            deadline,
+            sweep_interval,
+            batch_limit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_deadline_and_channels(
+        db: Arc<AppDatabase>,
+        runner: Arc<dyn TitleAgentRunner>,
+        emitter: EventEmitter,
+        chat_channel_manager: Option<ChatChannelManager>,
+        partial_source: Arc<dyn PartialAssistantTextSource>,
+        deadline: Duration,
+        sweep_interval: Duration,
+        batch_limit: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db,
             runner,
             emitter,
+            chat_channel_manager,
             partial_source,
             deadline,
             sweep_interval,
@@ -590,6 +618,11 @@ impl AutoTitleCoordinator {
                         claim.conversation_id,
                     )
                     .await;
+                    if let Some(manager) = &self.chat_channel_manager {
+                        manager
+                            .sync_conversation_title(&self.db.conn, claim.conversation_id, &title)
+                            .await;
+                    }
                 }
             }
             Err(AutoTitleRunError::Cancelled) => {
@@ -854,15 +887,23 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
-    use tokio::sync::Notify as TokioNotify;
+    use tokio::sync::{mpsc, Notify as TokioNotify};
     use tokio::time::{timeout, Duration as TokioDuration};
 
     use crate::auto_title::types::AutoTitleRunError;
+    use crate::chat_channel::error::ChatChannelError;
+    use crate::chat_channel::traits::ChatChannelBackend;
+    use crate::chat_channel::types::{
+        ChannelConnectionStatus, ChannelMessageTarget, ChannelType, IncomingCommand, RichMessage,
+        SentMessageId, TELEGRAM_FORUM_THREAD_KIND,
+    };
     use crate::commands::conversation_experience::set_auto_title_agent_persisted_core;
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
     use crate::db::service::conversation_service::{self, create};
+    use crate::db::service::{chat_channel_service, thread_binding_service};
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
     use crate::models::system::AppLocale;
@@ -881,6 +922,58 @@ mod tests {
         steps: Mutex<Vec<ScriptedStep>>,
         calls: AtomicUsize,
         cancelled_attempts: Mutex<Vec<i32>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct TopicTitleRecorder {
+        titles: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct RecordingTopicBackend {
+        recorder: TopicTitleRecorder,
+    }
+
+    #[async_trait]
+    impl ChatChannelBackend for RecordingTopicBackend {
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Telegram
+        }
+
+        async fn start(&self, _tx: mpsc::Sender<IncomingCommand>) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn status(&self) -> ChannelConnectionStatus {
+            ChannelConnectionStatus::Connected
+        }
+
+        async fn send_message(&self, _text: &str) -> Result<SentMessageId, ChatChannelError> {
+            Ok(SentMessageId("1".into()))
+        }
+
+        async fn send_rich_message(
+            &self,
+            _message: &RichMessage,
+        ) -> Result<SentMessageId, ChatChannelError> {
+            Ok(SentMessageId("1".into()))
+        }
+
+        async fn edit_thread_title(
+            &self,
+            _target: &ChannelMessageTarget,
+            title: &str,
+        ) -> Result<(), ChatChannelError> {
+            self.recorder.titles.lock().await.push(title.to_string());
+            Ok(())
+        }
+
+        async fn test_connection(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
     }
 
     impl FakeRunner {
@@ -1431,6 +1524,97 @@ mod tests {
         assert_eq!(
             fixture.conversation_title(cid).await.as_deref(),
             Some("Generated Title")
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_auto_title_syncs_bound_telegram_topic() {
+        let db = fresh_in_memory_db().await;
+        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
+            .await
+            .expect("enable titles");
+        let folder_id = seed_folder(&db, "/tmp/auto-title-topic-sync").await;
+        let channel_id = chat_channel_service::create(
+            &db.conn,
+            "Telegram test".into(),
+            "telegram".into(),
+            serde_json::json!({ "chat_id": "-100123", "topic_mode": true }).to_string(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("seed chat channel")
+        .id;
+        let chat_channel_manager = ChatChannelManager::new();
+        let recorder = TopicTitleRecorder::default();
+        chat_channel_manager
+            .add_channel(
+                channel_id,
+                "telegram-test".into(),
+                ChannelType::Telegram,
+                Box::new(RecordingTopicBackend {
+                    recorder: recorder.clone(),
+                }),
+            )
+            .await
+            .expect("add recording channel");
+        let runner = FakeRunner::succeed_once("Generated Topic Title");
+        let coordinator = AutoTitleCoordinator::new_with_deadline_and_channels(
+            Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            }),
+            runner.clone() as Arc<dyn TitleAgentRunner>,
+            EventEmitter::Noop,
+            Some(chat_channel_manager),
+            Arc::new(EmptyPartialSource),
+            DEFAULT_DEADLINE,
+            DEFAULT_SWEEP_INTERVAL,
+            DEFAULT_BATCH_LIMIT,
+        );
+        coordinator.recover_and_start().await.expect("start");
+        let fixture = CoordinatorFixture {
+            db,
+            folder_id,
+            runner,
+            coordinator,
+        };
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        let target = ChannelMessageTarget {
+            channel_id,
+            chat_id: Some("-100123".into()),
+            thread_key: Some("42".into()),
+            thread_kind: Some(TELEGRAM_FORUM_THREAD_KIND.into()),
+            provider_payload: None,
+        };
+        thread_binding_service::upsert_for_target(
+            &fixture.db.conn,
+            &target,
+            "telegram",
+            cid,
+            None,
+            "sender-1",
+            None,
+        )
+        .await
+        .expect("bind topic");
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_job_deleted(cid).await;
+        timeout(TokioDuration::from_secs(1), async {
+            loop {
+                if !recorder.titles.lock().await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("auto-title topic sync timeout");
+        assert_eq!(
+            recorder.titles.lock().await.as_slice(),
+            [format!("#{cid} Generated Topic Title")]
         );
     }
 

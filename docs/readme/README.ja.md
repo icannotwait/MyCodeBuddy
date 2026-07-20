@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg（Code Generation）は、マルチエージェント・コーディングワークスペースです。Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build などの複数のエージェントを 1 つのワークスペースに統合し、会話の集約とマルチエージェント協働に対応します。デスクトップへのインストールに加え、サーバー/Docker デプロイにも対応しています。
+Codeg（Code Generation）は、マルチエージェント・コーディングワークスペースです。Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor などの複数のエージェントを 1 つのワークスペースに統合し、会話の集約とマルチエージェント協働に対応します。デスクトップへのインストールに加え、サーバー/Docker デプロイにも対応しています。
 
 ![gallery](../images/gallery.svg)
 
@@ -39,6 +39,20 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
       <strong><a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">随想AI中转站</a></strong>
     </td>
     <td>本プロジェクトをスポンサードしてくださった随想AI中转站に感謝します！随想AI中转站は、Claude、Codex、Gemini などの中継サービスを提供する、信頼性が高く効率的な API 中継サービスプロバイダーです。新規アカウントは<a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">登録</a>後、毎日のチェックインで 0.5 元のテストクレジットがもらえます。チャージは 1:1 で反映され、サブスクリプション不要の従量課金制です。複数回線の冗長化、リージョン間ディザスタリカバリ、自動フェイルオーバーにより、長時間の SSE 接続も途切れません。</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://hezu.ink/sign-up?aff=0wVz" target="_blank"><img src="../images/hezu-ink.jpg" alt="合租巴士" width="200" /></a><br/>
+      <strong><a href="https://hezu.ink/sign-up?aff=0wVz">合租巴士</a></strong>
+    </td>
+    <td>本プロジェクトをスポンサードしてくださった合租巴士に感謝します！合租巴士は、Codex や Claude Code などの主流モデルに高い安定性の中継機能を提供する、信頼性が高く効率的な AI 中継サービスプラットフォームです。チャージ比率は透明（1:1）で、Codex のレート補助は 0.08 から利用可能です。<a href="https://hezu.ink/sign-up?aff=0wVz">公式サイトからグループに参加すると $5 分の体験クレジットがもらえます</a>。</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta" target="_blank"><img src="../images/onehop.jpg" alt="OneHop" width="120" /></a><br/>
+      <strong><a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">OneHop</a></strong>
+    </td>
+    <td>本プロジェクトをスポンサードしてくださった OneHop に感謝します！OneHop を使えば、Codeg ユーザーは OpenAI 互換の API キー 1 つで、GPT、Claude、Gemini、DeepSeek、Kimi、Qwen など数百もの主要モデルを利用できます。複数のプロバイダーアカウントを管理したり、コードを何度も書き換えたりすることなくモデルを切り替えられ、使った分だけの従量課金です。<a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">Codeg 経由でサインアップ</a>すると $1 分のクレジットが付与され、さらに OneHop コミュニティに参加してウェルカムアクティビティに参加すると追加で $5 分——合計で最大 $6 分のテストクレジットを獲得できます。</td>
   </tr>
 </table>
 
@@ -92,6 +106,7 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
 | Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
+| Cursor       | `$CURSOR_CONFIG_DIR/chats`            | `~/.cursor/chats`                     | `%USERPROFILE%\\.cursor\\chats`                       |
 
 > 注: 環境変数はフォールバックパスより優先されます。
 
@@ -119,6 +134,8 @@ Codeg（Code Generation）は、マルチエージェント・コーディング
 <summary><h2>チャットチャンネル</h2></summary>
 
 お気に入りのメッセージングアプリ — Telegram、Lark（Feishu）、iLink（Weixin）など — を AI コーディング Agent に接続。チャットからタスクの作成、フォローアップメッセージの送信、権限の承認、セッションの再開、アクティビティの監視が可能です。Agent のレスポンスはツールコール詳細、権限プロンプト、完了サマリーとともにリアルタイムで受信 — ブラウザを開くことなくすべて対応可能。
+
+Telegram のフォーラムスーパーグループでは [Telegram topic mode](../chat-channels/telegram-topic-mode.md) を使い、各 topic を独立した Codeg セッションに紐付けられます。
 
 ### 対応チャンネル
 
@@ -268,7 +285,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 または特定のバージョンをインストール:
 
 ```powershell
-.\install.ps1 -Version v0.20.2-mycodebuddy.8
+.\install.ps1 -Version v0.21.1-mycodebuddy.1
 ```
 
 #### オプション 2: GitHub Releases からダウンロード

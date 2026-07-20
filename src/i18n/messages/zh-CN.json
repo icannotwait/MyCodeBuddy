@@ -117,6 +117,29 @@
       "sectionTitle": "模式选择区域",
       "sectionDescription": "新会话页面输入框上方显示的「代码开发 / 日常办公」快捷卡片区域。",
       "showQuickActions": "在新会话页面显示"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "工作区背景",
+      "sectionDescription": "在整个工作区背后显示一张图片。侧栏与面板会变半透明并磨砂让图片透出，遮罩保证文字可读。",
+      "enable": "启用背景图片",
+      "image": "图片",
+      "chooseImage": "选择图片",
+      "replaceImage": "更换图片",
+      "removeImage": "移除",
+      "fillMode": "填充方式",
+      "fillModes": {
+        "cover": "覆盖",
+        "contain": "适应",
+        "center": "居中",
+        "tile": "平铺"
+      },
+      "maskOpacity": "遮罩不透明度",
+      "maskOpacityHint": "数值越高，图片越向主题背景色淡化，文字对比越清晰。",
+      "imageBlur": "图片模糊",
+      "panelOpacity": "面板不透明度",
+      "panelOpacityHint": "侧栏、面板与标签栏的不透明程度。越低，透出的图片越多。",
+      "errorTooLarge": "图片太大（最大 16 MB）。",
+      "errorUploadFailed": "设置背景图片失败。"
     }
   },
   "SystemSettings": {
@@ -625,7 +648,9 @@
     "grok": {
       "configDescription": "在此配置 Grok。下方控件——权限模式、推理强度、可选的自定义（自带端点）模型和压缩——会合并写入 ~/.grok/config.toml，并保留你的其他键与注释。登录使用你的 XAI_API_KEY 或 `grok login`。其他键可在“高级”中编辑。",
       "permissionModeLabel": "权限模式",
-      "permissionAsk": "每次询问",
+      "permissionDefault": "每次询问",
+      "permissionAcceptEdits": "自动批准编辑",
+      "permissionAuto": "智能自动批准",
       "permissionAlwaysApprove": "始终允许",
       "reasoningEffortLabel": "推理级别",
       "effortLow": "低（更快）",
@@ -644,7 +669,7 @@
       "customModelTitle": "自定义模型（自带端点）",
       "customModelHint": "让 Grok 指向自定义或自托管端点。codeg 会写入按模型的 `[model.*]` 块并将其设为默认模型。清空模型 ID 即可移除。",
       "customModelIdLabel": "模型 ID",
-      "customModelIdPlaceholder": "例如 grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "注册为 `[model.*]` 块，并作为模型名发送给 API；同时设为 `[models].default`。",
       "customBaseUrlLabel": "Base URL",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1（默认）",
@@ -974,7 +999,9 @@
       "piBinaryInstallFailed": "pi 安装失败",
       "piBinaryUninstalled": "pi 已卸载",
       "piBinaryUninstallFailed": "pi 卸载失败",
-      "savePiTrustFailed": "保存工作区信任失败"
+      "savePiTrustFailed": "保存工作区信任失败",
+      "cursorSaved": "Cursor 配置已保存",
+      "saveCursorConfigFailed": "保存 Cursor 配置失败"
     },
     "version": {
       "statusLabel": "版本状态",
@@ -1063,6 +1090,49 @@
       "trustDescription": "codeg 连接 pi 到某个目录时，将该目录标记为受信任，使 pi 无需单独确认即可加载该项目的本地配置与技能。",
       "trustHint": "仅信任你在此打开的目录，绝不涉及整台机器；且只影响配置加载，不影响 pi 能执行什么。",
       "configDirSkillsNote": "设置了自定义配置目录后，设置页中管理的技能、专家与办公工具将不会作用于该 pi；请直接在该目录中管理其技能。"
+    },
+    "cursor": {
+      "configDescription": "在此配置 Cursor。先选择认证方式——官网订阅（浏览器登录）或用于无头/服务器的 Cursor API 密钥——然后选择模型并编辑 CLI 的权限规则与沙箱。codeg 会写入 ~/.cursor/cli-config.json，与 cursor-agent CLI 共享。",
+      "authTitle": "鉴权",
+      "authChecking": "检测中…",
+      "authNotInstalled": "cursor-agent 未安装",
+      "authLoggedIn": "已登录",
+      "authNotLoggedIn": "未登录",
+      "loginHint": "在终端运行以下命令登录 Cursor 账号（会打开浏览器），完成后点刷新：",
+      "apiKeyLabel": "Cursor API 密钥",
+      "apiKeyPlaceholder": "在 cursor.com/dashboard 获取",
+      "apiKeyHint": "CURSOR_API_KEY —— Cursor Dashboard 的账号密钥，在无头/服务器环境下替代浏览器登录。不是第三方或 OpenAI 密钥。",
+      "modelTitle": "默认模型",
+      "loadModels": "获取模型列表",
+      "modelsUnavailable": "模型列表不可用",
+      "modelHint": "会话启动时通过 --model 传给 CLI；保持默认则由 Cursor 自行选择。",
+      "permissionsTitle": "权限与沙箱",
+      "permissionsDescription": "可视化编辑 CLI 权限规则（cli-config.json）。允许规则免确认执行；拒绝规则始终拦截。",
+      "permissionModeLabel": "权限模式",
+      "permissionModeDefault": "执行前询问（默认）",
+      "permissionModeForce": "全部放行 Run Everything（--force）",
+      "permissionModeHint": "Run Everything 以 --force 启动会话：除 deny 规则外的所有工具调用自动放行、不再弹确认（组织策略可能将其降级为仅按 allow 规则放行）。对新会话生效。",
+      "optionDefault": "默认（未设置）",
+      "sandboxLabel": "沙箱",
+      "sandboxEnabled": "启用",
+      "sandboxDisabled": "禁用",
+      "allowRulesLabel": "允许规则",
+      "denyRulesLabel": "拒绝规则",
+      "addRule": "添加规则",
+      "rulesSyntaxHint": "规则语法：Shell(命令)、Read(路径/通配)、Write(路径/通配)、WebFetch(域名)、Mcp(服务器:工具)——deny 规则始终优先。",
+      "saveConfig": "保存配置",
+      "advancedToggle": "高级：原始 cli-config.json",
+      "advancedHint": "完整的 ~/.cursor/cli-config.json。此处保存按原文写入；上方结构化控件则以合并方式写入。",
+      "saveRawConfig": "保存文件",
+      "authMode": "认证方式",
+      "subscriptionHint": "使用 Cursor 账号登录，使用 Cursor 的模型。",
+      "customApiKeyRequired": "需要填写 Cursor API 密钥。",
+      "authModeApiKey": "Cursor API 密钥（无头/服务器）",
+      "authModeApiKeyHint": "用 Cursor 官网 Dashboard 生成的账号 API 密钥认证（适用于无头/服务器环境）。这是 Cursor 账号密钥，不是第三方/OpenAI 端点——cursor-agent 只连 Cursor 自己的后端。要使用 codex/OpenAI 兼容端点，请改用 Codex 智能体。",
+      "modelPickerPlaceholder": "搜索模型…",
+      "modelNoMatch": "没有匹配的模型",
+      "modelsNeedAuth": "登录后加载模型列表。",
+      "modelDefaultBadge": "默认"
     }
   },
   "SettingsPages": {
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "移除文件夹失败：{message}",
         "reorderFoldersFailed": "重新排序文件夹失败：{message}",
         "changeFolderColorFailed": "修改颜色失败：{message}",
+        "setFolderAliasFailed": "设置别名失败：{message}",
         "changeFolderDefaultAgentFailed": "设置默认智能体失败：{message}"
       },
       "statsLabel": "{folders} 个文件夹 · {convos} 个会话",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "不设置（使用全局默认）",
         "agentUnavailableSuffix": "（不可用）",
         "loadingAgents": "正在加载代理…",
+        "setAlias": "设置别名…",
+        "setAliasTitle": "设置文件夹别名",
+        "setAliasPlaceholder": "输入别名（留空清除）",
+        "setAliasSave": "保存",
+        "setAliasCancel": "取消",
         "removeFromWorkspace": "从工作区移除"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "系统",
         "toolResult": "结果",
         "toolError": "错误"
-      }
+      },
+      "moreActions": "更多操作"
     },
     "sessionDetails": {
       "menuLabel": "会话详情",
+      "noActiveSession": "暂无活动会话",
       "title": "会话详情",
       "subtitle": "会话元信息与 Token 用量",
       "fieldTitle": "标题",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "该路径已存在文件。请选择其他名称。",
       "saveTranslationAs": "另存为…",
       "translationTabTitle": "{name}（{locale}）",
-      "translateProviderDisclosure": "自动标题智能体也用于文档翻译。文档正文会发送到该智能体/提供商；Codeg 会从自身列表中隐藏内部会话，但不会删除智能体 CLI 的存储。"
+      "translateProviderDisclosure": "自动标题智能体也用于文档翻译。文档正文会发送到该智能体/提供商；Codeg 会从自身列表中隐藏内部会话，但不会删除智能体 CLI 的存储。",
+      "emptyDirectory": "空目录"
     },
     "terminal": {
       "rename": "重命名",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "已下载 {name}",
         "pathCopied": "已复制路径",
         "copyPathFailed": "复制路径失败",
-        "loadIgnoredFilesFailed": "无法加载忽略的文件"
+        "loadIgnoredFilesFailed": "无法加载忽略的文件",
+        "moveFailed": "移动失败"
       },
       "createDialog": {
         "newFile": "新建文件",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "请先启用至少一个 Agent 后开始会话...",
         "prepareSessionFailed": "无法准备聊天会话，请重试。",
         "createConversationFailed": "无法创建会话，请重试。",
-        "askAnythingPlaceholder": "请开始输入..."
+        "askAnythingPlaceholder": "请开始输入...",
+        "agentNotInstalled": "{agent} 尚未安装 · 点击前往 Agents 设置安装"
       },
       "welcomePanel": {
         "greeting": "今天准备<highlight>做些什么</highlight>呢？",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "暂无已启用的 Agent",
-        "openAgentsSettings": "打开 Agents 设置"
+        "openAgentsSettings": "打开 Agents 设置",
+        "notInstalled": "未安装"
       },
       "subAgentOverlay": {
         "title": "子智能体",
@@ -2936,6 +3018,8 @@
     "nameRequired": "请输入渠道名称。",
     "tokenRequired": "请输入 Token。",
     "chatIdRequired": "请输入 Chat ID。",
+    "topicMode": "话题群模式",
+    "topicModeHint": "将 Telegram forum topics 路由为独立 Codeg 会话。Bot 必须加入 forum supergroup，并拥有管理 topics 权限。",
     "loadFailed": "加载渠道失败。",
     "saveFailed": "保存失败。",
     "connectSuccess": "渠道已连接。",
@@ -3296,7 +3380,8 @@
     "tabs": {
       "experts": "专家",
       "science": "科学研究",
-      "office": "办公工具"
+      "office": "办公工具",
+      "custom": "自定义"
     },
     "actions": {
       "openCentralDir": "打开中央目录",
@@ -3379,7 +3464,7 @@
       "deleteConfirm": "确认删除宠物 \"{name}\" 吗？会从磁盘上一并移除。",
       "summon": "召唤宠物窗口",
       "openCodexHelp": "Codex 宠物需位于 ~/.codex/pets/ 目录下,但未找到。",
-      "specRequirement": "精灵图必须是 1536x1872 像素的带透明通道 PNG 或 WebP。",
+      "specRequirement": "精灵图宽度必须为 1536 像素，高度需为 208 像素的整数倍（如 1872 或 2288），并为带透明通道的 PNG 或 WebP。",
       "form": {
         "id": "宠物 ID",
         "idHelp": "仅允许小写字母、数字、'-' 和 '_',最多 64 字符。",
@@ -3814,5 +3899,122 @@
     "branchRemote": "远程",
     "branchSearchPlaceholder": "搜索分支…",
     "branchNone": "无分支"
+  },
+  "CustomSkillsSettings": {
+    "loading": "正在加载自定义技能…",
+    "category": "自定义",
+    "searchPlaceholder": "按名称、ID 或描述搜索自定义技能",
+    "states": {
+      "not_linked": "未启用",
+      "linked_to_codeg": "已启用",
+      "linked_elsewhere": "链接到其他位置",
+      "blocked_by_real_directory": "被同名真实目录占用",
+      "broken": "链接已失效"
+    },
+    "actions": {
+      "new": "新建",
+      "import": "导入",
+      "importFromAgent": "从 Agent 导入",
+      "cancel": "取消",
+      "save": "保存"
+    },
+    "rowMenu": {
+      "edit": "编辑",
+      "duplicate": "复制为新技能",
+      "delete": "删除"
+    },
+    "bulk": {
+      "delete": "删除所选"
+    },
+    "editor": {
+      "createTitle": "新建自定义技能",
+      "editTitle": "编辑自定义技能",
+      "description": "自定义技能存放在共享库（~/.codeg/skills），可为任意智能体启用。",
+      "idLabel": "技能 ID",
+      "idPlaceholder": "例如 my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "在此编写技能的 SKILL.md…",
+      "preview": "预览",
+      "edit": "编辑",
+      "emptyBody": "暂无内容。"
+    },
+    "duplicate": {
+      "title": "复制技能",
+      "description": "以「{id}」为模板，用新 ID 创建一份副本。",
+      "newIdPlaceholder": "新技能 ID",
+      "confirm": "复制"
+    },
+    "import": {
+      "title": "选择要导入的技能文件夹"
+    },
+    "importFromAgent": {
+      "title": "从 Agent 导入技能",
+      "description": "把某个 Agent 自己的技能复制到共享库，即可为任意 Agent 启用。",
+      "agentLabel": "Agent",
+      "agentPlaceholder": "选择一个 Agent",
+      "selectAll": "全选（{count}）",
+      "loading": "正在加载该 Agent 的技能…",
+      "unsupported": "该 Agent 未提供技能目录。",
+      "empty": "该 Agent 没有可导入的技能。",
+      "alreadyInLibrary": "已在库中",
+      "confirm": "导入所选（{count}）"
+    },
+    "delete": {
+      "title": "删除自定义技能？",
+      "body": "将从中央库移除 {count} 个自定义技能，并解除它们在所有智能体中的链接。此操作不可撤销。",
+      "confirm": "删除"
+    },
+    "toasts": {
+      "loadFailed": "加载技能失败",
+      "idRequired": "请输入技能 ID",
+      "created": "已创建自定义技能",
+      "updated": "已更新自定义技能",
+      "saveFailed": "保存技能失败",
+      "imported": "已导入技能",
+      "importFailed": "导入技能失败",
+      "duplicated": "已复制技能",
+      "duplicateFailed": "复制技能失败",
+      "deleted": "已删除 {count} 个技能",
+      "deletedPartial": "已删除 {ok} 个，{failed} 个失败",
+      "deleteFailed": "删除技能失败",
+      "importedFromAgent": "已导入 {count} 个技能",
+      "importedFromAgentPartial": "已导入 {ok} 个，{failed} 个失败",
+      "importFromAgentAllSkipped": "无需导入——{count} 个已在库中",
+      "importFromAgentFailed": "从 Agent 导入失败"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "你已自定义模型列表，codeg 将接管 codex 的完整模型表。codex 日后新增的官方模型不会自动出现——点击下方刷新并重新保存即可同步。清空全部自定义即可交回 codex 自动更新。",
+    "officialsTitle": "官方模型",
+    "officialsHint": "自动纳入你启动的 codex 的官方模型；可删除不需要的。",
+    "officialsEmpty": "暂无官方模型。",
+    "refresh": "从 codex 刷新",
+    "readdOfficial": "重新加入官方",
+    "customsTitle": "自定义模型",
+    "customsEmpty": "暂无自定义模型。",
+    "addCustom": "添加自定义",
+    "slugPlaceholder": "模型 id（slug）",
+    "displayNamePlaceholder": "显示名",
+    "contextWindow": "上下文",
+    "makeDefault": "设为默认",
+    "defaultHint": "默认模型",
+    "remove": "删除",
+    "advanced": "高级",
+    "baseTemplate": "基础模板",
+    "baseTemplateHint": "从哪个官方模型克隆必填字段（系统提示词、工具、限制）。",
+    "groupBehavior": "行为与能力",
+    "fieldReasoningLevel": "默认推理强度",
+    "fieldReasoningSummary": "推理摘要",
+    "fieldVerbosity": "详细程度",
+    "fieldShellType": "Shell 类型",
+    "fieldApplyPatch": "应用补丁工具",
+    "fieldReasoningSummaries": "推理摘要支持",
+    "fieldSupportVerbosity": "详细程度控制",
+    "fieldParallelToolCalls": "并行工具调用",
+    "fieldSearchTool": "联网搜索工具",
+    "optNone": "无",
+    "groupInstructions": "描述与系统提示词",
+    "fieldDescription": "描述",
+    "baseInstructions": "系统提示词（base_instructions）"
   }
 }

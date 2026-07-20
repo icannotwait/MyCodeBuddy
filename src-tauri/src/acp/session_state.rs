@@ -17,7 +17,8 @@ use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
-    PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
+    GrokEffortSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo,
+    ToolCallImageInfo,
 };
 use crate::auto_title::{ConnectionPurpose, TurnCompletionSnapshot};
 use crate::models::agent::AgentType;
@@ -275,6 +276,10 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Bounded task text preview mirrored from `DelegationStarted` so a
+    /// snapshot re-attach can label identity-less parent tool calls.
+    #[serde(default)]
+    pub task_preview: String,
     /// Durable Broker task id — guards runtime/attention replacements so a
     /// stale event for a previous task on the same tool id cannot clobber
     /// the live card.
@@ -387,6 +392,14 @@ pub struct SessionState {
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
+    /// Grok only: per-model reasoning-effort specs, parsed from the top-level
+    /// `models` of the session-establishment response (guaranteed on
+    /// `session/new`; opportunistic on resume/fork). Grok never re-sends this on
+    /// `set_model`, so it is cached here to rebuild the composer's effort
+    /// selector for the target model on a mid-session model switch. `None` for
+    /// non-Grok agents and when the response carried no `models` (flat fallback).
+    /// Backend-internal — not serialized.
+    pub grok_effort_specs: Option<std::collections::HashMap<String, GrokEffortSpec>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
@@ -397,15 +410,15 @@ pub struct SessionState {
     /// "init complete" without waiting for an event that already fired.
     pub selectors_ready: bool,
 
-    /// Most recent `AcpEvent::Error` payload, or `None` if no error has
-    /// landed since the connection started. The probe path reads this
-    /// after `wait_for_session_options` errors so it can fold the
-    /// agent's own error message into the returned `AcpError` instead
-    /// of surfacing a generic "connection not found" once the
-    /// connection task has cleaned up its map entry.
+    /// Most recent unresolved `AcpEvent::Error` payload. Cleared when a new
+    /// prompt starts, matching the frontend reducer's live-event behavior. The
+    /// probe path reads this after `wait_for_session_options` errors so it can
+    /// fold the agent's own error message into the returned `AcpError` instead
+    /// of surfacing a generic "connection not found" once the connection task
+    /// has cleaned up its map entry.
     ///
-    /// Not exposed on `to_snapshot()` today — chat-side error UX already
-    /// flows through the live `AcpEvent::Error` channel.
+    /// Exposed on `to_snapshot()` so clients that reconnect after missing the
+    /// live `AcpEvent::Error` can still surface the latest agent failure.
     pub last_error: Option<SessionLastError>,
 
     /// Single-fire signal that fires when `SessionStarted` applies (i.e.
@@ -510,6 +523,19 @@ pub struct SessionState {
     /// Session-scoped dedup fence for a continuation's internal wake prompt.
     #[allow(dead_code)] // Task 6 installs and consumes this session-scoped fence.
     pub(crate) last_internal_prompt_admission: Option<InternalPromptAdmission>,
+    /// Whether the most recently completed turn ended via a stop reason other
+    /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
+    /// empty, unknown — the same "abnormal ending" bucket `connection.rs`
+    /// already treats uniformly for cascade-cancelling child delegations). Set
+    /// by `AcpEvent::TurnComplete`, alongside `pending_user_message`/
+    /// `turn_in_flight` clearing. The transcript watcher reads this at the
+    /// Prompting→Connected falling edge: an abnormal ending means the turn's
+    /// content never reached the wire (the ACP call was torn down before a
+    /// held sub-agent's real completion), so `current_turn_launched_ids`
+    /// must release immediately instead of waiting for the next turn — that
+    /// content has nowhere else to render. Not serialized: backend-internal,
+    /// like `turn_in_flight`.
+    pub last_turn_ended_abnormally: bool,
 
     /// True when the agent's effective settings changed after this connection
     /// was spawned — the running process is still on its launch-time config and
@@ -574,6 +600,7 @@ impl SessionState {
             modes: None,
             current_mode: None,
             config_options: None,
+            grok_effort_specs: None,
             prompt_capabilities: None,
             fork_supported: false,
             available_commands: Vec::new(),
@@ -597,6 +624,7 @@ impl SessionState {
             active_turn_generation: None,
             last_suspended_turn_generation: None,
             last_internal_prompt_admission: None,
+            last_turn_ended_abnormally: false,
             config_stale: false,
             config_stale_kind: None,
             // Placeholder until spawn installs the real plan snapshot; tests
@@ -716,6 +744,24 @@ impl SessionState {
                 }
             }
             AcpEvent::StatusChanged { status } => {
+                // Diagnostic only (no behavior change): StatusChanged was
+                // never logged anywhere, so there was no way to confirm from
+                // the log alone whether a held-open turn (claude-agent-acp
+                // v0.59.0's #870) actually stayed `Prompting` through an async
+                // sub-agent's full lifecycle, or settled earlier than assumed.
+                // The suppression filter reads live `Prompting` status and is
+                // only correct if the hold behaves as documented.
+                tracing::info!(
+                    "[ACP] status_changed session={:?} {:?} -> {status:?}",
+                    self.external_id,
+                    self.status
+                );
+                if matches!(status, ConnectionStatus::Prompting) {
+                    // Match the live frontend reducer: a new prompt starts a
+                    // new error scope, so stale recoverable errors must not be
+                    // resurrected by a later snapshot attach.
+                    self.last_error = None;
+                }
                 self.status = status.clone();
             }
             AcpEvent::SessionModes { modes } => {
@@ -885,7 +931,25 @@ impl SessionState {
                     self.supervisor_wake.notify();
                 }
             }
-            AcpEvent::TurnComplete { .. } => {
+            AcpEvent::TurnComplete { stop_reason, .. } => {
+                // Diagnostic only (no behavior change): pairs with the
+                // StatusChanged log above. This is the ACTUAL point the turn
+                // settles (`self.status` flips to `Connected` right below,
+                // bypassing StatusChanged entirely) — needed to tell whether
+                // claude-agent-acp v0.59.0's #870 held the turn open through
+                // an async sub-agent's full lifecycle, or settled earlier.
+                // `background_outstanding` at this instant shows whether a
+                // sub-agent/shell the watcher still considers live was
+                // outstanding when the ORIGINAL turn settled.
+                tracing::info!(
+                    "[ACP] turn_complete session={:?} stop_reason={stop_reason} background_outstanding={}",
+                    self.external_id,
+                    self.background_outstanding
+                );
+                // See `last_turn_ended_abnormally`'s doc comment: any reason
+                // other than a normal end-of-turn means this turn's content
+                // may never have reached the wire.
+                self.last_turn_ended_abnormally = stop_reason != "end_turn";
                 // Snapshot the just-finished turn's FINAL assistant text — what
                 // `get_delegation_status` returns as the child result. Shared
                 // with auto-title via `visible_assistant_text`: Text after the
@@ -960,8 +1024,18 @@ impl SessionState {
                 });
                 // Reference instant for the in-flight prompt's recency check in
                 // `apply_in_flight_message_id`. Set here (not at manager enqueue)
-                // so it tracks `pending_user_message` exactly.
-                self.pending_user_message_started_at = Some(Utc::now());
+                // so it tracks `pending_user_message` exactly. Truncated to
+                // whole milliseconds: the gate compares this against parsed
+                // turn timestamps that carry at most millisecond precision
+                // (Cursor's journal upgrade rewrites the in-flight user turn
+                // to a millisecond send stamp taken right after this event
+                // applies — sub-ms residue here would push the threshold past
+                // that stamp and unstamp the turn). The shed sub-ms window
+                // cannot admit a prior identical prompt: no agent turn
+                // round-trips in under a millisecond.
+                let now = Utc::now();
+                self.pending_user_message_started_at =
+                    DateTime::from_timestamp_millis(now.timestamp_millis());
                 // Live-feedback notes are turn-scoped steering: a new user turn
                 // starts with a clean slate. The previous turn's notes (read or
                 // not) are history at this point; the frontend's "agent didn't
@@ -1034,6 +1108,7 @@ impl SessionState {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_preview,
                 task_id,
                 started_at,
                 runtime_stats,
@@ -1053,6 +1128,7 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        task_preview: task_preview.clone(),
                         task_id: task_id.clone(),
                         started_at: *started_at,
                         runtime_stats: runtime_stats.clone(),
@@ -1474,6 +1550,7 @@ impl SessionState {
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
             delegation_route: self.delegation_route.clone(),
+            last_error: self.last_error.clone(),
             event_seq: self.event_seq,
         }
     }
@@ -1571,6 +1648,10 @@ pub struct LiveSessionSnapshot {
     /// Default preserves mixed-version clients and Rust deserialization tests.
     #[serde(default = "legacy_unmanaged_route_snapshot")]
     pub delegation_route: DelegationRouteSnapshot,
+    /// Most recent agent/runtime error for this live connection. Omitted when
+    /// no error has occurred so older clients and common snapshots stay small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<SessionLastError>,
     pub event_seq: u64,
 }
 
@@ -1893,6 +1974,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_user_message_started_at_has_no_sub_ms_residue() {
+        // The recency gate in `apply_in_flight_message_id` compares this
+        // stamp against millisecond-precision parsed-turn timestamps
+        // (Cursor's journal upgrade rewrites the in-flight user turn to a
+        // ms send stamp taken right after this event applies). Sub-ms
+        // residue would order the threshold AFTER a stamp taken later in
+        // real time and unstamp the turn.
+        let mut s = fresh_state();
+        s.apply_event(&text_user_message("user-1", "hello"));
+        let at = s.pending_user_message_started_at.expect("stamp set");
+        assert_eq!(at.timestamp_subsec_nanos() % 1_000_000, 0);
+    }
+
+    #[test]
     fn turn_complete_clears_pending_user_message() {
         let mut s = fresh_state();
         s.apply_event(&text_user_message("user-1", "hi"));
@@ -1938,6 +2033,44 @@ mod tests {
         assert!(
             !empty_json.contains("pending_user_message"),
             "no-pending snapshot must omit the field"
+        );
+    }
+
+    #[test]
+    fn snapshot_carries_last_error_and_clears_on_next_prompt() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::Error {
+            message: "ACP protocol error: forbidden".into(),
+            agent_type: "claude_code".into(),
+            code: Some("forbidden".into()),
+            terminal: true,
+        });
+
+        let snap = s.to_snapshot();
+        assert_eq!(
+            snap.last_error,
+            Some(SessionLastError {
+                message: "ACP protocol error: forbidden".into(),
+                code: Some("forbidden".into()),
+            })
+        );
+
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.last_error, snap.last_error);
+
+        let empty_json = serde_json::to_string(&fresh_state().to_snapshot()).expect("serialize");
+        assert!(
+            !empty_json.contains("last_error"),
+            "no-error snapshot must omit last_error"
+        );
+
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        assert!(
+            s.to_snapshot().last_error.is_none(),
+            "new prompts clear stale snapshot-recoverable errors"
         );
     }
 
@@ -2429,6 +2562,7 @@ mod tests {
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_preview: "run the tests".into(),
             task_id: "task-1".into(),
             started_at: started,
             runtime_stats: empty_stats(started),
@@ -2448,6 +2582,7 @@ mod tests {
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_preview: "run the tests".into(),
             task_id: task_id.into(),
             started_at: runtime_stats.started_at,
             runtime_stats,

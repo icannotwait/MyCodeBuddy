@@ -1,7 +1,10 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { Sparkles } from "lucide-react"
+
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu"
 
 vi.mock("sonner", () => ({
   toast: {
@@ -273,5 +276,56 @@ describe("SkillAgentMatrix", () => {
     expect(cell).toBeDisabled()
     fireEvent.click(cell)
     expect(applyLinks).not.toHaveBeenCalled()
+  })
+})
+
+// The optional authoring slots the Custom pack injects. The three curated packs
+// pass none of these, so they must be inert unless provided.
+describe("SkillAgentMatrix authoring slots", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("renders toolbarActions in the toolbar", async () => {
+    renderMatrix({ toolbarActions: <button>SLOT-TOOLBAR</button> })
+    expect(await screen.findByText("SLOT-TOOLBAR")).toBeInTheDocument()
+  })
+
+  it("appends rowActions inside a row's batch menu", async () => {
+    renderMatrix({
+      rowActions: (skill) => (
+        <DropdownMenuItem>ROW-SLOT-{skill.id}</DropdownMenuItem>
+      ),
+    })
+    // The injected item only exists once the row's ⋯ menu is opened.
+    expect(screen.queryByText("ROW-SLOT-brainstorming")).not.toBeInTheDocument()
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Batch actions for Brainstorming",
+      })
+    )
+    expect(
+      await screen.findByText("ROW-SLOT-brainstorming")
+    ).toBeInTheDocument()
+  })
+
+  it("renders bulkActions with the selected ids once a skill is selected", async () => {
+    renderMatrix({
+      bulkActions: (ids) => <button>BULK-SLOT-{ids.length}</button>,
+    })
+    // The bulk bar (and its slot) only appears after a selection.
+    expect(screen.queryByText(/^BULK-SLOT/)).not.toBeInTheDocument()
+    await userEvent.click(
+      await screen.findByRole("checkbox", { name: "Select Brainstorming" })
+    )
+    expect(await screen.findByText("BULK-SLOT-1")).toBeInTheDocument()
+  })
+
+  it("renders no authoring UI when no slots are provided", async () => {
+    renderMatrix()
+    await screen.findByRole("switch", {
+      name: "Brainstorming, Claude Code: not_linked",
+    })
+    expect(screen.queryByText(/SLOT/)).not.toBeInTheDocument()
   })
 })

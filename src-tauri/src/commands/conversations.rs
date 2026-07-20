@@ -15,6 +15,7 @@ use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
+use crate::parsers::cursor::CursorParser;
 use crate::parsers::gemini::GeminiParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
@@ -240,6 +241,7 @@ fn list_conversations_sync(
         (AgentType::KimiCode, Box::new(KimiCodeParser::new())),
         (AgentType::Pi, Box::new(PiParser::new())),
         (AgentType::Grok, Box::new(GrokParser::new())),
+        (AgentType::Cursor, Box::new(CursorParser::new())),
     ];
 
     for (at, parser) in &parsers {
@@ -385,6 +387,7 @@ pub async fn get_conversation_core(
             AgentType::KimiCode => Box::new(KimiCodeParser::new()),
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
+            AgentType::Cursor => Box::new(CursorParser::new()),
         };
 
         let detail = parser
@@ -609,6 +612,10 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
 
     let snapshot = DelegationMetaSnapshot {
         status,
+        // Historical rows predate the dedicated task preview projection. The
+        // conversation title may be user/auto-generated, so do not mislabel it
+        // as the delegated task text.
+        task_preview: None,
         task_id: child.delegation_call_id.clone().unwrap_or_default(),
         child_connection_id: None,
         child_conversation_id: child.id,
@@ -814,6 +821,7 @@ pub async fn get_folder_conversation_core(
                     AgentType::KimiCode => Box::new(KimiCodeParser::new()),
                     AgentType::Pi => Box::new(PiParser::new()),
                     AgentType::Grok => Box::new(GrokParser::new()),
+                    AgentType::Cursor => Box::new(CursorParser::new()),
                 };
                 match parser.get_conversation(&eid) {
                     Ok(d) => {
@@ -1086,6 +1094,7 @@ fn apply_in_flight_message_id(
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     emitter: &EventEmitter,
     registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
@@ -1112,6 +1121,9 @@ pub async fn get_folder_conversation_with_live_core(
                     Ok(true) => {
                         detail.summary.title = Some(parsed.to_string());
                         emit_conversation_upsert(emitter, conn, conversation_id).await;
+                        chat_channel_manager
+                            .sync_conversation_title(conn, conversation_id, parsed)
+                            .await;
                     }
                     Ok(false) => {}
                     Err(e) => tracing::error!(
@@ -1139,11 +1151,13 @@ pub async fn get_folder_conversation(
     db: tauri::State<'_, AppDatabase>,
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
     registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
     get_folder_conversation_with_live_core(
         &db.conn,
         &manager,
+        &chat_channel_manager,
         &EventEmitter::Tauri(app),
         registry.inner().as_ref(),
         conversation_id,
@@ -1871,12 +1885,31 @@ pub async fn update_conversation_title_core(
     Ok(())
 }
 
+/// Re-read the persisted conversation title and best-effort sync it to any
+/// bound chat-channel threads (e.g. Telegram forum topics). Lives in
+/// `commands/` so web handlers route through a `_core` helper instead of
+/// calling the db service layer directly.
+pub async fn sync_conversation_title_to_channels_core(
+    conn: &sea_orm::DatabaseConnection,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    conversation_id: i32,
+) {
+    if let Ok(conv) = conversation_service::get_by_id(conn, conversation_id).await {
+        if let Some(title) = conv.title.as_deref() {
+            chat_channel_manager
+                .sync_conversation_title(conn, conversation_id, title)
+                .await;
+        }
+    }
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn update_conversation_title(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
     coordinator: tauri::State<'_, std::sync::Arc<crate::auto_title::AutoTitleCoordinator>>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
@@ -1888,6 +1921,8 @@ pub async fn update_conversation_title(
     )
     .await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    sync_conversation_title_to_channels_core(&db.conn, &chat_channel_manager, conversation_id)
+        .await;
     Ok(())
 }
 
@@ -2383,6 +2418,7 @@ mod tests {
         child.delegation_runtime_stats = Some(finished_stats());
         let meta = build_historical_delegation_meta(&child);
         assert_eq!(meta["task_id"], "task-1");
+        assert!(meta.get("task_preview").is_none());
         assert_eq!(meta["error_code"], "join_abandoned");
         assert_eq!(meta["runtime_stats"]["tool_call_count"], 4);
         assert!(meta["runtime_stats"]["finished_at"].is_string());

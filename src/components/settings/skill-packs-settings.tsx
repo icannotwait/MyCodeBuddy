@@ -11,15 +11,18 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ExpertsBody } from "@/components/settings/experts-settings"
 import { ScienceBody } from "@/components/settings/science-settings"
 import { OfficeToolsBody } from "@/components/settings/office-tools-settings"
+import { CustomSkillsBody } from "@/components/settings/custom-skills-settings"
 import { expertsOpenCentralDir, openFolder } from "@/lib/api"
 import { revealItemInDir } from "@/lib/platform"
 import { getActiveRemoteConnectionId, isDesktop } from "@/lib/transport"
 import { toErrorMessage } from "@/lib/app-error"
 
-type SkillPackTab = "experts" | "science" | "office"
+type SkillPackTab = "experts" | "science" | "office" | "custom"
 
 function normalizeTab(raw: string | null): SkillPackTab {
-  return raw === "science" || raw === "office" ? raw : "experts"
+  return raw === "science" || raw === "office" || raw === "custom"
+    ? raw
+    : "experts"
 }
 
 // The Tabs primitive's built-in active styling uses a bare `data-active:`
@@ -112,6 +115,9 @@ export function SkillPacksSettings() {
             <TabsTrigger value="office" className={TRIGGER_ACTIVE}>
               {t("tabs.office")}
             </TabsTrigger>
+            <TabsTrigger value="custom" className={TRIGGER_ACTIVE}>
+              {t("tabs.custom")}
+            </TabsTrigger>
           </TabsList>
 
           {/* Fixed toolbar — identical on every tab. */}
@@ -159,6 +165,12 @@ export function SkillPacksSettings() {
           className="mt-0 flex-1 min-h-0 flex flex-col"
         >
           <OfficeToolsBody onRegisterRefresh={registerRefresh} />
+        </TabsContent>
+        <TabsContent
+          value="custom"
+          className="mt-0 flex-1 min-h-0 flex flex-col"
+        >
+          <CustomSkillsBody onRegisterRefresh={registerRefresh} />
         </TabsContent>
       </Tabs>
     </div>

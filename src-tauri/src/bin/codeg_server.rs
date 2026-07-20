@@ -255,6 +255,7 @@ async fn async_main() -> ExitCode {
     // Build AppState
     let pet_state_handle = codeg_lib::pet_state_mapper::new_pet_state_handle();
     let connection_manager = codeg_lib::app_state::default_connection_manager();
+    let chat_channel_manager = codeg_lib::app_state::default_chat_channel_manager();
     let stack = codeg_lib::app_state::build_delegation_stack(
         &connection_manager,
         db.conn.clone(),
@@ -276,6 +277,7 @@ async fn async_main() -> ExitCode {
     let auto_title_coordinator = codeg_lib::auto_title::build_production_coordinator(
         title_db,
         connection_manager.clone_ref(),
+        chat_channel_manager.clone_ref(),
         Arc::clone(&internal_sessions),
         data_dir.clone(),
         emitter.clone(),
@@ -335,7 +337,7 @@ async fn async_main() -> ExitCode {
         conversation_experience_gate,
         reference_search_registry,
         web_server_state: WebServerState::new(),
-        chat_channel_manager: codeg_lib::app_state::default_chat_channel_manager(),
+        chat_channel_manager,
         workspace_transfer: Arc::new(
             codeg_lib::workspace_transfer::WorkspaceTransferManager::new_from_env(),
         ),
@@ -496,11 +498,11 @@ async fn async_main() -> ExitCode {
             state.event_broadcaster.clone(),
             state.acp_event_bus.clone(),
             state.db.conn.clone(),
+            state.data_dir.clone(),
             state.connection_manager.clone_ref(),
             state.emitter.clone(),
             codeg_lib::chat_channel::command_dispatcher::ChatCommandRuntimeContext {
                 runtime: state.delegation_runtime_settings.clone(),
-                data_dir: state.data_dir.clone(),
             },
         )
         .await;

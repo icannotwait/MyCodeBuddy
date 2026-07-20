@@ -424,11 +424,13 @@ type Action =
       // accounting) plus whether this event settled tasks / carried overlay
       // turns, which drive the settle-syncing bridge state. No-op when
       // nothing it mirrors changed, so repeat events don't re-render
-      // connection consumers.
+      // connection consumers. `outOfTurnSettleCount` counts only settles whose
+      // reply arrives OUT OF TURN (a separate overlay turn) — i.e. NOT
+      // wire-visible; those are the ones the "syncing results" hint bridges.
       type: "SET_BACKGROUND_OUTSTANDING"
       contextKey: string
       outstanding: number
-      settledCount: number
+      outOfTurnSettleCount: number
       turnsCount: number
     }
   | StreamingAction
@@ -1414,9 +1416,13 @@ function reduceSingleAction(
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
       // Mutable fields (status, sessionId, liveMessage, pendingPermission,
-      // usage) are fresher in memory than in the snapshot and must NOT be
-      // overwritten — but the latched/fill-null fields above are still
-      // applied so the once-per-lifetime bits can recover.
+      // usage, error) are fresher in memory than in the snapshot and must NOT
+      // be overwritten — but the latched/fill-null fields above are still
+      // applied so the once-per-lifetime bits can recover. `error` in
+      // particular is cleared on a new prompt (STATUS_CHANGED → prompting), so
+      // folding a stale snapshot's `lastError` back in here would resurrect an
+      // error the current turn already cleared; it is recovered on the fresh
+      // path below instead.
       if (action.patch.eventSeq <= current.lastAppliedSeq) {
         if (
           mergedSelectorsReady === current.selectorsReady &&
@@ -1475,6 +1481,9 @@ function reduceSingleAction(
         delegationRoute: action.patch.delegationRoute,
         // Waiting projection is independent of status / turn_in_flight.
         waitingForSubagents: action.patch.waitingForSubagents,
+        // Recover the latest runtime error only from a fresh snapshot. The
+        // stale path above deliberately preserves the current cleared value.
+        error: action.patch.lastError,
         lastAppliedSeq: action.patch.eventSeq,
       })
       return next
@@ -1591,13 +1600,21 @@ function reduceSingleAction(
     case "SET_BACKGROUND_OUTSTANDING": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      // Settle-syncing bridge: a settlement means the agent's reaction turn
-      // is being generated (the task-notification always triggers one) — arm
-      // the indicator. The first turns-only event is that reaction arriving —
-      // disarm. An event carrying BOTH (reaction to task A + settlement of
-      // task B) re-arms: another reaction is still pending.
+      // Settle-syncing bridge: a settlement whose reply arrives OUT OF TURN
+      // (as a separate overlay turn) means that reply is being generated — arm
+      // the "syncing results" hint to fill the gap until it surfaces. The
+      // backend classifies this per settle via `wire_visible` (folded into
+      // `outOfTurnSettleCount` by the handler): under claude-agent-acp #870 the
+      // launching turn is held OPEN and the reply streams LIVE as its tail —
+      // already on screen, no gap to bridge — so those are excluded. Arming for
+      // a held settle would STRAND the hint: its reply never arrives as an
+      // overlay `turns` event, so nothing disarms it and it sits until the 30s
+      // cap (the "结果都出来了还显示 Syncing" bug). Using the backend flag rather
+      // than the connection's current status is deliberate — it's correct even
+      // when the watcher reads the settlement after the turn already fell back
+      // to `connected`. The first genuinely out-of-turn `turns` event disarms.
       const syncingSince =
-        action.settledCount > 0
+        action.outOfTurnSettleCount > 0
           ? Date.now()
           : action.turnsCount > 0
             ? null
@@ -2542,7 +2559,9 @@ function prepareMappedEnvelope(
         type: "SET_BACKGROUND_OUTSTANDING",
         contextKey,
         outstanding: e.outstanding,
-        settledCount: e.settled?.length ?? 0,
+        outOfTurnSettleCount:
+          e.settled?.filter((settlement) => !settlement.wire_visible).length ??
+          0,
         turnsCount: e.turns?.length ?? 0,
       })
       const sessionId = e.session_id
@@ -2597,11 +2616,18 @@ function prepareMappedEnvelope(
           const conversationId =
             getConversationIdByExternalIdFromStore(sessionId)
           if (conversationId != null) {
-            useConversationRuntimeStore
-              .getState()
-              .actions.refetchDetail(conversationId, {
-                preserveLive: statusAtPrepare === "prompting",
+            const runtimeActions =
+              useConversationRuntimeStore.getState().actions
+            for (const item of settled) {
+              if (!item.tool_use_id) continue
+              runtimeActions.resolveBackgroundTask(conversationId, {
+                toolUseId: item.tool_use_id,
+                taskId: item.task_id,
+                status: item.status,
+                summary: item.summary ?? null,
+                result: item.result ?? null,
               })
+            }
           }
         }
       })

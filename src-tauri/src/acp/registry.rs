@@ -14,10 +14,19 @@ pub enum AgentDistribution {
     },
     Binary {
         version: &'static str,
+        /// Command name on PATH (fallback launch + `which` probes). For
+        /// single-file archives this is also the file name copied out of the
+        /// archive into the cache.
         cmd: &'static str,
         args: &'static [&'static str],
         env: &'static [(&'static str, &'static str)],
         platforms: &'static [PlatformBinary],
+        /// `None`: the archive contains one self-contained binary named `cmd`,
+        /// which is copied out into the cache (OpenCode). `Some`: the archive
+        /// is a whole directory tree that must stay intact (bundled runtime,
+        /// e.g. Cursor's agent-cli-package); everything is extracted into the
+        /// per-version cache dir and the entry path inside it is launched.
+        dir_entry: Option<BinaryDirEntry>,
     },
     Bundled {
         version: &'static str,
@@ -56,6 +65,26 @@ pub enum AgentDistribution {
 pub struct PlatformBinary {
     pub platform: &'static str,
     pub url: &'static str,
+}
+
+/// Launch entry inside an extracted directory-tree archive (see
+/// [`AgentDistribution::Binary::dir_entry`]). Paths are relative to the
+/// archive root, '/'-separated; `windows` names the `.cmd`/`.bat` shim.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryDirEntry {
+    pub unix: &'static str,
+    pub windows: &'static str,
+}
+
+impl BinaryDirEntry {
+    /// Entry path for the current platform.
+    pub fn for_current_platform(&self) -> &'static str {
+        if cfg!(windows) {
+            self.windows
+        } else {
+            self.unix
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +159,7 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::KimiCode,
         AgentType::Pi,
         AgentType::Grok,
+        AgentType::Cursor,
     ]
 }
 
@@ -145,6 +175,7 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::KimiCode => "kimi-code",
         AgentType::Pi => "pi-acp",
         AgentType::Grok => "grok-build",
+        AgentType::Cursor => "cursor",
     }
 }
 
@@ -160,6 +191,7 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "kimi-code" => Some(AgentType::KimiCode),
         "pi-acp" => Some(AgentType::Pi),
         "grok-build" => Some(AgentType::Grok),
+        "cursor" => Some(AgentType::Cursor),
         _ => None,
     }
 }
@@ -246,8 +278,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Cline",
             description: "Autonomous coding agent CLI",
             distribution: AgentDistribution::Npx {
-                version: "3.0.39",
-                package: "cline@3.0.39",
+                version: "3.0.44",
+                package: "cline@3.0.44",
                 cmd: "cline",
                 args: &["--acp"],
                 env: &[],
@@ -260,36 +292,37 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenCode",
             description: "The open source coding agent",
             distribution: AgentDistribution::Binary {
-                version: "1.17.18",
+                version: "1.18.3",
                 cmd: "opencode",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-darwin-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-darwin-x64.zip",
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-arm64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-linux-arm64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-x64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-linux-x64.tar.gz",
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-windows-arm64.zip",
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.3/opencode-windows-x64.zip",
                     },
                 ],
+                dir_entry: None,
             },
         },
         AgentType::Hermes => AcpAgentMeta {
@@ -320,8 +353,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.118.2",
-                package: "@tencent-ai/codebuddy-code@2.118.2",
+                version: "2.124.0",
+                package: "@tencent-ai/codebuddy-code@2.124.0",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -334,8 +367,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "0.23.5",
-                package: "@moonshot-ai/kimi-code@0.23.5",
+                version: "0.27.0",
+                package: "@moonshot-ai/kimi-code@0.27.0",
                 cmd: "kimi",
                 args: &["acp"],
                 env: &[],
@@ -390,25 +423,74 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
             // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
             distribution: AgentDistribution::Npx {
-                version: "0.2.98",
-                package: "@xai-official/grok@0.2.98",
+                version: "0.2.103",
+                package: "@xai-official/grok@0.2.103",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
-                // flags (`--no-auto-update` always, `--disallowed-tools
-                // ask_user_question` as headless-only best-effort, and
-                // `--always-approve` only when the user picked that permission
-                // mode) MUST precede this subcommand — `grok agent stdio`
-                // itself rejects them (verified against 0.2.94; still applies
-                // on 0.2.98: it only accepts --debug/--debug-file/
-                // --leader-socket) — so `build_agent` inserts them ahead of
-                // these args rather than appending after. Native ask-user
-                // disable for ACP is `_meta.askUserQuestion: false` on
-                // session new/load/resume (pager `--no-ask-user` parity).
+                // flags (`--no-auto-update` always, `--permission-mode <value>`
+                // only for a non-default permission mode) MUST precede this
+                // subcommand — `grok agent stdio` itself rejects them (verified
+                // against 0.2.94/0.2.99: it only accepts --debug/--debug-file/
+                // --leader-socket) — so `build_agent` inserts them ahead of these
+                // args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@0.2.98` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@0.2.103` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
+            },
+        },
+        AgentType::Cursor => AcpAgentMeta {
+            agent_type,
+            supports_mcp: true,
+            name: "Cursor",
+            description: "Cursor's coding agent (ACP via cursor-agent acp)",
+            // Cursor's CLI ships as a ~230MB directory-tree archive (webpack
+            // chunks + bundled Node runtime + ripgrep); the `cursor-agent`
+            // entry is a shell script that resolves its own directory and
+            // execs the sibling `node`, so the tree must stay intact —
+            // `dir_entry` switches the binary cache to whole-tree extraction.
+            // codeg deliberately does NOT run Cursor's official install
+            // script: it symlinks `~/.local/bin/agent`, which collides with
+            // Grok's CLI of the same name (observed overwriting it).
+            // URL layout follows the ACP registry's `cursor` entry
+            // (downloads.cursor.com/lab/<version>/<os>/<arch>/...); custom
+            // versions substitute into the same pattern.
+            distribution: AgentDistribution::Binary {
+                version: "2026.07.16-899851b",
+                cmd: "cursor-agent",
+                args: &["acp"],
+                env: &[],
+                platforms: &[
+                    PlatformBinary {
+                        platform: "darwin-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/darwin/arm64/agent-cli-package.tar.gz",
+                    },
+                    PlatformBinary {
+                        platform: "darwin-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/darwin/x64/agent-cli-package.tar.gz",
+                    },
+                    PlatformBinary {
+                        platform: "linux-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/linux/arm64/agent-cli-package.tar.gz",
+                    },
+                    PlatformBinary {
+                        platform: "linux-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/linux/x64/agent-cli-package.tar.gz",
+                    },
+                    PlatformBinary {
+                        platform: "windows-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/windows/arm64/agent-cli-package.zip",
+                    },
+                    PlatformBinary {
+                        platform: "windows-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.16-899851b/windows/x64/agent-cli-package.zip",
+                    },
+                ],
+                dir_entry: Some(BinaryDirEntry {
+                    unix: "dist-package/cursor-agent",
+                    windows: "dist-package/cursor-agent.cmd",
+                }),
             },
         },
     }
@@ -498,6 +580,41 @@ mod tests {
         }
     }
 
+    // Cursor is the only dir-tree binary agent: the archive must be kept
+    // intact (bundled Node runtime) and launched via the in-tree entry
+    // script, never copied out as a single file.
+    #[test]
+    fn cursor_pins_dir_tree_binary() {
+        let meta = get_agent_meta(AgentType::Cursor);
+        assert_binary_version(
+            AgentType::Cursor,
+            "2026.07.16-899851b",
+            "/lab/2026.07.16-899851b/",
+        );
+        match meta.distribution {
+            AgentDistribution::Binary {
+                cmd,
+                args,
+                platforms,
+                dir_entry,
+                ..
+            } => {
+                assert_eq!(cmd, "cursor-agent");
+                assert_eq!(args, &["acp"]);
+                assert_eq!(platforms.len(), 6);
+                let entry = dir_entry.expect("cursor must use dir-tree extraction");
+                assert_eq!(entry.unix, "dist-package/cursor-agent");
+                assert_eq!(entry.windows, "dist-package/cursor-agent.cmd");
+            }
+            other => panic!("expected binary distribution for Cursor, got {other:?}"),
+        }
+        // OpenCode stays on the single-binary copy-out path.
+        match get_agent_meta(AgentType::OpenCode).distribution {
+            AgentDistribution::Binary { dir_entry, .. } => assert!(dir_entry.is_none()),
+            other => panic!("expected binary distribution for OpenCode, got {other:?}"),
+        }
+    }
+
     #[test]
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
@@ -512,31 +629,27 @@ mod tests {
             "@google/gemini-cli@0.50.0",
             Some("20.0.0"),
         );
-        assert_npx_version(AgentType::Cline, "3.0.39", "cline@3.0.39", Some("22.0.0"));
+        assert_npx_version(AgentType::Cline, "3.0.44", "cline@3.0.44", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.118.2",
-            "@tencent-ai/codebuddy-code@2.118.2",
+            "2.124.0",
+            "@tencent-ai/codebuddy-code@2.124.0",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::KimiCode,
-            "0.23.5",
-            "@moonshot-ai/kimi-code@0.23.5",
+            "0.27.0",
+            "@moonshot-ai/kimi-code@0.27.0",
             Some("22.19.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "0.2.98",
-            "@xai-official/grok@0.2.98",
+            "0.2.103",
+            "@xai-official/grok@0.2.103",
             Some("20.0.0"),
         );
-        assert_binary_version(
-            AgentType::OpenCode,
-            "1.17.18",
-            "/releases/download/v1.17.18/",
-        );
+        assert_binary_version(AgentType::OpenCode, "1.18.3", "/releases/download/v1.18.3/");
         assert_uvx_version(
             AgentType::Hermes,
             "0.18.2",

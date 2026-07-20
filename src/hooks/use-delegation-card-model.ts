@@ -392,7 +392,7 @@ export function buildDelegationCardModel(input: {
     undefined
 
   const conversationTitle = childProjection?.title ?? null
-  const task = parsedInput.task
+  const task = parsedInput.task ?? binding?.task ?? parsedMeta?.task ?? null
   const displaySecondary = formatDelegationDisplaySecondary(
     conversationTitle,
     task

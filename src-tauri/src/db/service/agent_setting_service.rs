@@ -38,6 +38,7 @@ fn default_enabled(agent_type: AgentType) -> bool {
             | AgentType::KimiCode
             | AgentType::Pi
             | AgentType::Grok
+            | AgentType::Cursor
     )
 }
 

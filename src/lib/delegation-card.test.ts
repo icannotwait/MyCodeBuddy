@@ -27,6 +27,7 @@ function binding(
     childConversationId: 99,
     agentType: "codex",
     status: "running",
+    task: null,
     taskId: "task-1",
     startedAt: "2026-07-19T00:00:00.000Z",
     runtimeStats: emptyRuntimeStats("2026-07-19T00:00:00.000Z"),
@@ -79,6 +80,7 @@ describe("parseDelegationMeta", () => {
 
     expect(parsed).toEqual({
       status: "ok",
+      task: null,
       taskId: "task-abc",
       childConnectionId: "child-conn",
       childConversationId: 42,
@@ -702,5 +704,59 @@ describe("parseToolOutput — durationMs retention", () => {
       kind: "ack",
       childConversationId: 1,
     })
+  })
+})
+
+describe("parseInput wrapper peeling", () => {
+  it("peels Cursor's MCP args wrapper", () => {
+    const parsed = parseInput(
+      JSON.stringify({
+        providerIdentifier: "codeg-mcp",
+        toolName: "delegate_to_agent",
+        args: { agent_type: "claude_code", task: "run pnpm build" },
+      })
+    )
+    expect(parsed.agentType).toBe("claude_code")
+    expect(parsed.task).toBe("run pnpm build")
+    expect(parsed.workingDir).toBeNull()
+  })
+
+  it("returns empty fields for a non-delegation payload", () => {
+    const parsed = parseInput(JSON.stringify({ command: "ls -la" }))
+    expect(parsed.agentType).toBeNull()
+    expect(parsed.task).toBeNull()
+  })
+})
+
+describe("parseDelegationMeta task fields", () => {
+  it("surfaces broker-stamped task_preview and task_id", () => {
+    const parsed = parseDelegationMeta({
+      "codeg.delegation": {
+        status: "running",
+        child_conversation_id: 42,
+        task_preview: "run pnpm build",
+        task_id: "task-uuid-1",
+      },
+    })
+    expect(parsed?.task).toBe("run pnpm build")
+    expect(parsed?.taskId).toBe("task-uuid-1")
+    expect(parsed?.childConversationId).toBe(42)
+  })
+
+  it("keeps task fields null for older or malformed meta", () => {
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": { status: "completed" },
+      })
+    ).toMatchObject({ task: null, taskId: null })
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": {
+          status: "running",
+          task_preview: "",
+          task_id: 7,
+        },
+      })
+    ).toMatchObject({ task: null, taskId: null })
   })
 })

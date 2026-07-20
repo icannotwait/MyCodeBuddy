@@ -26,9 +26,9 @@ import type {
 
 /**
  * Snapshot-derived subset of ConnectionState. Fields not present here
- * (pendingQuestion, claudeApiRetry, error, contextKey, agentType,
- * workingDir) are frontend-only or set elsewhere and must not be touched
- * by HYDRATE_FROM_SNAPSHOT.
+ * (pendingQuestion, claudeApiRetry, contextKey, agentType, workingDir) are
+ * frontend-only or set elsewhere and must not be touched by
+ * HYDRATE_FROM_SNAPSHOT.
  */
 export interface SnapshotPatch {
   // Carries the snapshot's source connection_id so the reducer can reject
@@ -68,6 +68,8 @@ export interface SnapshotPatch {
    *  the one-shot `background_activity` events won't replay. `0` when the
    *  server omitted the field. */
   backgroundOutstanding: number
+  /** Latest ACP runtime error carried by the snapshot. `null` means none. */
+  lastError: string | null
   eventSeq: number
   /** Live sub-agent delegations carried by the snapshot. Consumed directly at
    *  the attach call sites to re-seed `DelegationProvider` bindings (see
@@ -97,6 +99,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
   for (const tc of wire.active_tool_calls) {
     toolMap.set(tc.id, tc)
   }
+  const lastError = normalizeSnapshotLastError(wire.last_error)
 
   return {
     connectionId: wire.connection_id,
@@ -135,11 +138,22 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     configStale: wire.config_stale ?? false,
     configStaleKind: wire.config_stale_kind ?? null,
     backgroundOutstanding: wire.background_outstanding ?? 0,
+    lastError,
     eventSeq: wire.event_seq,
     activeDelegations: wire.active_delegations ?? [],
     delegationRoute: wire.delegation_route ?? null,
     waitingForSubagents: wire.waiting_for_subagents ?? null,
   }
+}
+
+function normalizeSnapshotLastError(
+  lastError: LiveSessionSnapshot["last_error"]
+): string | null {
+  const message =
+    lastError && typeof lastError.message === "string"
+      ? lastError.message.trim()
+      : ""
+  return message || null
 }
 
 function denormalizeLiveMessage(

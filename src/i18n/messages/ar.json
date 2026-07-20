@@ -117,6 +117,29 @@
       "sectionTitle": "منطقة اختيار الوضع",
       "sectionDescription": "بطاقات الاختصار «تطوير الكود / الأعمال المكتبية» التي تظهر أعلى مربع الإدخال في صفحة المحادثة الجديدة.",
       "showQuickActions": "العرض في صفحة المحادثة الجديدة"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "خلفية مساحة العمل",
+      "sectionDescription": "عرض صورة خلف مساحة العمل بالكامل. يصبح الشريط الجانبي واللوحات شبه شفافة ومصنفرة لتظهر الصورة من خلالها، ويحافظ القناع على وضوح النص.",
+      "enable": "تفعيل صورة الخلفية",
+      "image": "الصورة",
+      "chooseImage": "اختيار صورة",
+      "replaceImage": "استبدال الصورة",
+      "removeImage": "إزالة",
+      "fillMode": "وضع الملء",
+      "fillModes": {
+        "cover": "تغطية",
+        "contain": "احتواء",
+        "center": "توسيط",
+        "tile": "تكرار"
+      },
+      "maskOpacity": "عتامة القناع",
+      "maskOpacityHint": "القيم الأعلى تمزج الصورة نحو لون خلفية السمة، مما يحسّن تباين النص.",
+      "imageBlur": "تمويه الصورة",
+      "panelOpacity": "عتامة اللوحات",
+      "panelOpacityHint": "مدى عتامة الشريط الجانبي واللوحات وأشرطة التبويب. الأقل يُظهر المزيد من الصورة.",
+      "errorTooLarge": "الصورة كبيرة جدًا (16 ميجابايت كحد أقصى).",
+      "errorUploadFailed": "فشل تعيين صورة الخلفية."
     }
   },
   "SystemSettings": {
@@ -624,7 +647,9 @@
     "grok": {
       "configDescription": "اضبط Grok هنا. عناصر التحكم أدناه — وضع الأذونات، وجهد الاستدلال، ونموذج مخصّص اختياري (نقطة نهاية خاصة)، والضغط — تُدمج في ~/.grok/config.toml مع الحفاظ على مفاتيحك وتعليقاتك الأخرى. يستخدم تسجيل الدخول XAI_API_KEY أو `grok login`. تبقى المفاتيح الأخرى قابلة للتحرير ضمن «متقدم».",
       "permissionModeLabel": "وضع الأذونات",
-      "permissionAsk": "السؤال في كل مرة",
+      "permissionDefault": "السؤال في كل مرة",
+      "permissionAcceptEdits": "الموافقة التلقائية على التعديلات",
+      "permissionAuto": "موافقة تلقائية ذكية",
       "permissionAlwaysApprove": "الموافقة دائمًا",
       "reasoningEffortLabel": "جهد الاستدلال",
       "effortLow": "منخفض (أسرع)",
@@ -643,7 +668,7 @@
       "customModelTitle": "نموذج مخصّص (نقطة نهاية خاصة)",
       "customModelHint": "وجِّه Grok إلى نقطة نهاية مخصّصة أو مستضافة ذاتيًا. يكتب codeg كتلة `[model.*]` لكل نموذج ويجعلها النموذج الافتراضي. اترك معرّف النموذج فارغًا لإزالته.",
       "customModelIdLabel": "معرّف النموذج",
-      "customModelIdPlaceholder": "مثال: grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "يُسجَّل ككتلة `[model.*]` ويُرسَل إلى الـ API كاسم للنموذج؛ ويُضبط أيضًا كـ `[models].default`.",
       "customBaseUrlLabel": "عنوان URL الأساسي",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1 (الافتراضي)",
@@ -973,7 +998,9 @@
       "piBinaryUninstalled": "تم إلغاء تثبيت pi",
       "piBinaryUninstallFailed": "فشل إلغاء تثبيت pi",
       "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
+      "cursorSaved": "تم حفظ إعدادات Cursor",
+      "saveCursorConfigFailed": "فشل حفظ إعدادات Cursor"
     },
     "version": {
       "statusLabel": "حالة الإصدار",
@@ -1063,7 +1090,50 @@
       "trustHint": "يُوثَق فقط بالمجلدات التي تفتحها هنا، وليس جهازك بالكامل، كما أن ذلك يؤثر على تحميل الإعدادات فقط، لا على ما يُسمح لـ pi بتشغيله.",
       "configDirSkillsNote": "عند تحديد دليل إعدادات مخصص، لن تنطبق المهارات والخبراء وأدوات المكتب المُدارة في الإعدادات على pi هذا — أدِر مهاراته مباشرةً في ذلك المجلد."
     },
-    "showThinking": "Show thinking"
+    "showThinking": "Show thinking",
+    "cursor": {
+      "configDescription": "اضبط Cursor هنا. اختر طريقة مصادقة — اشتراك رسمي (تسجيل دخول عبر المتصفح) أو مفتاح Cursor API للأجهزة بدون واجهة أو الخوادم — ثم اختر نموذجًا وحرّر قواعد أذونات CLI وبيئة الحماية. يكتبها codeg في ~/.cursor/cli-config.json، بالمشاركة مع أداة cursor-agent.",
+      "authTitle": "المصادقة",
+      "authChecking": "جارٍ التحقق…",
+      "authNotInstalled": "cursor-agent غير مثبّت",
+      "authLoggedIn": "تم تسجيل الدخول",
+      "authNotLoggedIn": "غير مسجّل الدخول",
+      "loginHint": "شغّل هذا الأمر في الطرفية لتسجيل الدخول إلى حساب Cursor (سيفتح المتصفح)، ثم اضغط تحديث:",
+      "apiKeyLabel": "مفتاح Cursor API",
+      "apiKeyPlaceholder": "المفتاح من cursor.com/dashboard",
+      "apiKeyHint": "CURSOR_API_KEY — مفتاح حساب من لوحة تحكم Cursor، بديل لتسجيل الدخول عبر المتصفح للأجهزة بدون واجهة أو الخوادم. ليس مفتاحًا خارجيًا أو من OpenAI.",
+      "modelTitle": "النموذج الافتراضي",
+      "loadModels": "جلب النماذج",
+      "modelsUnavailable": "قائمة النماذج غير متاحة",
+      "modelHint": "يُمرَّر إلى CLI عبر ‎--model عند بدء الجلسة. اتركه افتراضيًا ليختار Cursor بنفسه.",
+      "permissionsTitle": "الأذونات ووضع الحماية",
+      "permissionsDescription": "محرّر بصري لقواعد أذونات CLI‏ (cli-config.json). القواعد المسموحة تُنفَّذ دون تأكيد؛ والمرفوضة تُحظر دائمًا.",
+      "permissionModeLabel": "وضع الأذونات",
+      "permissionModeDefault": "السؤال قبل التنفيذ (افتراضي)",
+      "permissionModeForce": "تشغيل كل شيء (--force)",
+      "permissionModeHint": "يبدأ وضع Run Everything الجلسات بـ --force: يُسمح تلقائيًا بجميع استدعاءات الأدوات باستثناء قواعد الرفض دون طلب تأكيد (قد تقيّده سياسة المؤسسة بقواعد السماح فقط). يسري على الجلسات الجديدة.",
+      "optionDefault": "افتراضي (غير محدد)",
+      "sandboxLabel": "وضع الحماية",
+      "sandboxEnabled": "مفعّل",
+      "sandboxDisabled": "معطّل",
+      "allowRulesLabel": "قواعد السماح",
+      "denyRulesLabel": "قواعد الرفض",
+      "addRule": "إضافة قاعدة",
+      "rulesSyntaxHint": "صيغة القواعد: Shell(أمر)، Read(مسار/نمط)، Write(مسار/نمط)، WebFetch(نطاق)، Mcp(خادم:أداة) — قواعد الرفض لها الأولوية دائمًا.",
+      "saveConfig": "حفظ الإعدادات",
+      "advancedToggle": "متقدم: cli-config.json الخام",
+      "advancedHint": "ملف ‎~/.cursor/cli-config.json كاملًا. الحفظ هنا يكتب الملف كما هو؛ أما عناصر التحكم أعلاه فتُدمج فيه.",
+      "saveRawConfig": "حفظ الملف",
+      "authMode": "طريقة المصادقة",
+      "subscriptionHint": "سجّل الدخول بحساب Cursor واستخدم نماذج Cursor.",
+      "customApiKeyRequired": "مفتاح Cursor API مطلوب.",
+      "authModeApiKey": "مفتاح Cursor API (بدون واجهة/خادم)",
+      "authModeApiKeyHint": "المصادقة باستخدام مفتاح API لحساب Cursor من لوحة تحكم Cursor (للأجهزة بدون واجهة أو الخوادم). هذا مفتاح حساب Cursor وليس نقطة نهاية خارجية/OpenAI — إذ يتصل cursor-agent بخادم Cursor الخاص فقط. لاستخدام نقطة نهاية متوافقة مع codex/OpenAI، استخدم وكيل Codex بدلاً من ذلك.",
+      "modelPickerPlaceholder": "ابحث عن النماذج…",
+      "modelNoMatch": "لا يوجد نموذج مطابق",
+      "modelsNeedAuth": "سجّل الدخول لتحميل قائمة النماذج.",
+      "modelDefaultBadge": "افتراضي"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "فشل إزالة المجلد: {message}",
         "reorderFoldersFailed": "فشل إعادة ترتيب المجلدات: {message}",
         "changeFolderColorFailed": "فشل تغيير اللون: {message}",
+        "setFolderAliasFailed": "فشل تعيين الاسم المستعار: {message}",
         "changeFolderDefaultAgentFailed": "فشل تعيين الوكيل الافتراضي: {message}"
       },
       "statsLabel": "{folders} مجلدات · {convos} محادثة",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "بدون افتراضي (استخدام العام)",
         "agentUnavailableSuffix": "(غير متاح)",
         "loadingAgents": "جارٍ تحميل الوكلاء…",
+        "setAlias": "تعيين اسم مستعار…",
+        "setAliasTitle": "تعيين اسم مستعار للمجلد",
+        "setAliasPlaceholder": "أدخل اسمًا مستعارًا (اتركه فارغًا للمسح)",
+        "setAliasSave": "حفظ",
+        "setAliasCancel": "إلغاء",
         "removeFromWorkspace": "إزالة من مساحة العمل"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "النظام",
         "toolResult": "النتيجة",
         "toolError": "خطأ"
-      }
+      },
+      "moreActions": "إجراءات إضافية"
     },
     "sessionDetails": {
       "menuLabel": "تفاصيل الجلسة",
+      "noActiveSession": "لا توجد جلسة نشطة",
       "title": "تفاصيل الجلسة",
       "subtitle": "بيانات الجلسة الوصفية واستخدام الرموز",
       "fieldTitle": "العنوان",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "يوجد ملف بالفعل في هذا المسار. اختر اسمًا آخر.",
       "saveTranslationAs": "حفظ باسم…",
       "translationTabTitle": "{name} ({locale})",
-      "translateProviderDisclosure": "يُستخدم وكيل العنوان التلقائي أيضًا لترجمة المستندات. يُرسل نص المستند إلى ذلك الوكيل/المزوّد؛ يخفي Codeg الجلسات الداخلية من قوائمه لكنه لا يحذف تخزين واجهة سطر أوامر الوكيل."
+      "translateProviderDisclosure": "يُستخدم وكيل العنوان التلقائي أيضًا لترجمة المستندات. يُرسل نص المستند إلى ذلك الوكيل/المزوّد؛ يخفي Codeg الجلسات الداخلية من قوائمه لكنه لا يحذف تخزين واجهة سطر أوامر الوكيل.",
+      "emptyDirectory": "مجلد فارغ"
     },
     "terminal": {
       "rename": "إعادة تسمية",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "تم تنزيل {name}",
         "pathCopied": "تم نسخ المسار",
         "copyPathFailed": "فشل نسخ المسار",
-        "loadIgnoredFilesFailed": "تعذر تحميل الملفات المتجاهلة"
+        "loadIgnoredFilesFailed": "تعذر تحميل الملفات المتجاهلة",
+        "moveFailed": "فشل النقل"
       },
       "createDialog": {
         "newFile": "ملف جديد",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "فعّل وكيلًا واحدًا على الأقل قبل بدء جلسة...",
         "prepareSessionFailed": "تعذّر تحضير جلسة الدردشة. يرجى المحاولة مرة أخرى.",
         "createConversationFailed": "تعذّر إنشاء المحادثة. يرجى المحاولة مرة أخرى.",
-        "askAnythingPlaceholder": "اسأل أي شيء..."
+        "askAnythingPlaceholder": "اسأل أي شيء...",
+        "agentNotInstalled": "{agent} غير مثبّت · افتح إعدادات Agents لتثبيته"
       },
       "welcomePanel": {
         "greeting": "ماذا تودّ أن <highlight>تفعل اليوم</highlight>؟",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "لا يوجد وكلاء مفعّلون",
-        "openAgentsSettings": "فتح إعدادات الوكلاء"
+        "openAgentsSettings": "فتح إعدادات الوكلاء",
+        "notInstalled": "غير مثبّت"
       },
       "subAgentOverlay": {
         "title": "الوكلاء الفرعيون",
@@ -2924,6 +3006,8 @@
     "nameRequired": "اسم القناة مطلوب.",
     "tokenRequired": "الرمز مطلوب.",
     "chatIdRequired": "معرف المحادثة مطلوب.",
+    "topicMode": "وضع مجموعة المواضيع",
+    "topicModeHint": "يوجه مواضيع منتدى Telegram كجلسات Codeg منفصلة. يجب أن يكون البوت في forum supergroup وأن يملك صلاحية إدارة المواضيع.",
     "loadFailed": "فشل في تحميل القنوات.",
     "saveFailed": "فشل في حفظ التغييرات.",
     "connectSuccess": "تم توصيل القناة.",
@@ -3284,7 +3368,8 @@
     "tabs": {
       "experts": "الخبراء",
       "science": "البحث العلمي",
-      "office": "أدوات المكتب"
+      "office": "أدوات المكتب",
+      "custom": "مخصّصة"
     },
     "actions": {
       "openCentralDir": "فتح المجلد المركزي",
@@ -3367,7 +3452,7 @@
       "deleteConfirm": "حذف الحيوان «{name}»؟ سيُحذف من القرص.",
       "summon": "استدعاء نافذة الحيوان",
       "openCodexHelp": "يجب أن توجد حيوانات Codex داخل ~/.codex/pets/. لم يُعثر على شيء.",
-      "specRequirement": "يجب أن يكون السبرايت PNG أو WebP بحجم 1536x1872 مع شفافية.",
+      "specRequirement": "يجب أن يكون السبرايت بعرض 1536 بكسل وارتفاع من مضاعفات 208 بكسل (مثل 1872 أو 2288)، بصيغة PNG أو WebP مع شفافية.",
       "form": {
         "id": "معرف الحيوان",
         "idHelp": "حروف صغيرة، أرقام، '-' و '_' فقط. حد أقصى 64 حرفًا.",
@@ -3814,5 +3899,122 @@
     "branchRemote": "بعيد",
     "branchSearchPlaceholder": "بحث في الفروع…",
     "branchNone": "لا توجد فروع"
+  },
+  "CustomSkillsSettings": {
+    "loading": "جارٍ تحميل المهارات المخصّصة…",
+    "category": "مخصّصة",
+    "searchPlaceholder": "ابحث عن المهارات المخصّصة بالاسم أو المعرّف أو الوصف",
+    "states": {
+      "not_linked": "غير مُفعّلة",
+      "linked_to_codeg": "مُفعّلة",
+      "linked_elsewhere": "مرتبطة في مكان آخر",
+      "blocked_by_real_directory": "محجوبة بمجلد فعلي",
+      "broken": "رابط معطوب"
+    },
+    "actions": {
+      "new": "جديدة",
+      "import": "استيراد",
+      "importFromAgent": "استيراد من وكيل",
+      "cancel": "إلغاء",
+      "save": "حفظ"
+    },
+    "rowMenu": {
+      "edit": "تعديل",
+      "duplicate": "تكرار",
+      "delete": "حذف"
+    },
+    "bulk": {
+      "delete": "حذف المحدد"
+    },
+    "editor": {
+      "createTitle": "مهارة مخصّصة جديدة",
+      "editTitle": "تعديل مهارة مخصّصة",
+      "description": "تُحفَظ المهارات المخصّصة في المخزن المشترك (~/.codeg/skills) ويمكن تفعيلها لأي وكيل.",
+      "idLabel": "معرّف المهارة",
+      "idPlaceholder": "مثال: my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "اكتب هنا ملف SKILL.md للمهارة…",
+      "preview": "معاينة",
+      "edit": "تعديل",
+      "emptyBody": "لا يوجد محتوى بعد."
+    },
+    "duplicate": {
+      "title": "تكرار المهارة",
+      "description": "إنشاء نسخة من «{id}» بمعرّف جديد.",
+      "newIdPlaceholder": "معرّف المهارة الجديد",
+      "confirm": "تكرار"
+    },
+    "import": {
+      "title": "اختر مجلد مهارة للاستيراد"
+    },
+    "importFromAgent": {
+      "title": "استيراد المهارات من وكيل",
+      "description": "انسخ مهارات الوكيل الخاصة إلى المخزن المشترك لتفعيلها لأي وكيل.",
+      "agentLabel": "الوكيل",
+      "agentPlaceholder": "اختر وكيلاً",
+      "selectAll": "تحديد الكل ({count})",
+      "loading": "جارٍ تحميل مهارات الوكيل…",
+      "unsupported": "لا يوفّر هذا الوكيل دليل مهارات.",
+      "empty": "لا توجد مهارات قابلة للاستيراد لهذا الوكيل.",
+      "alreadyInLibrary": "في المكتبة",
+      "confirm": "استيراد المحدد ({count})"
+    },
+    "delete": {
+      "title": "حذف المهارات المخصّصة؟",
+      "body": "سيؤدي هذا إلى إزالة {count} مهارة مخصّصة من المخزن المركزي وفصل روابطها من كل وكيل. لا يمكن التراجع عن ذلك.",
+      "confirm": "حذف"
+    },
+    "toasts": {
+      "loadFailed": "فشل تحميل المهارة",
+      "idRequired": "أدخل معرّف المهارة",
+      "created": "تم إنشاء المهارة المخصّصة",
+      "updated": "تم تحديث المهارة المخصّصة",
+      "saveFailed": "فشل حفظ المهارة",
+      "imported": "تم استيراد المهارة",
+      "importFailed": "فشل استيراد المهارة",
+      "duplicated": "تم تكرار المهارة",
+      "duplicateFailed": "فشل تكرار المهارة",
+      "deleted": "تم حذف {count} مهارة",
+      "deletedPartial": "تم حذف {ok}، وفشل {failed}",
+      "deleteFailed": "فشل حذف المهارات",
+      "importedFromAgent": "تم استيراد {count} مهارة",
+      "importedFromAgentPartial": "تم استيراد {ok}، وفشل {failed}",
+      "importFromAgentAllSkipped": "لا شيء للاستيراد — {count} موجودة بالفعل في المكتبة",
+      "importFromAgentFailed": "فشل الاستيراد من الوكيل"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "لقد خصّصت قائمة النماذج، لذا يدير codeg الآن جدول نماذج codex بالكامل. لن تظهر النماذج الرسمية التي يضيفها codex لاحقًا تلقائيًا — انقر على زر التحديث بالأسفل ثم احفظ مرة أخرى لمزامنتها. امسح كل تخصيصاتك ليعود codex إلى التحديث تلقائيًا.",
+    "officialsTitle": "النماذج الرسمية",
+    "officialsHint": "تُضاف تلقائيًا من codex الذي تشغّله؛ احذف ما لا تريده.",
+    "officialsEmpty": "لا توجد نماذج رسمية متاحة.",
+    "refresh": "تحديث من codex",
+    "readdOfficial": "إعادة إضافة رسمي",
+    "customsTitle": "النماذج المخصّصة",
+    "customsEmpty": "لا توجد نماذج مخصّصة بعد.",
+    "addCustom": "إضافة مخصص",
+    "slugPlaceholder": "معرّف النموذج (slug)",
+    "displayNamePlaceholder": "الاسم المعروض",
+    "contextWindow": "السياق",
+    "makeDefault": "تعيين كافتراضي",
+    "defaultHint": "النموذج الافتراضي",
+    "remove": "إزالة",
+    "advanced": "متقدم",
+    "baseTemplate": "القالب الأساسي",
+    "baseTemplateHint": "النموذج الرسمي الذي تُنسخ منه الحقول المطلوبة (موجّه النظام، الأدوات، الحدود).",
+    "groupBehavior": "السلوك والقدرات",
+    "fieldReasoningLevel": "الاستدلال الافتراضي",
+    "fieldReasoningSummary": "ملخص الاستدلال",
+    "fieldVerbosity": "مستوى التفصيل",
+    "fieldShellType": "نوع الصدفة",
+    "fieldApplyPatch": "أداة تطبيق التصحيح",
+    "fieldReasoningSummaries": "ملخصات الاستدلال",
+    "fieldSupportVerbosity": "التحكم في التفصيل",
+    "fieldParallelToolCalls": "استدعاءات الأدوات المتوازية",
+    "fieldSearchTool": "أداة البحث على الويب",
+    "optNone": "بلا",
+    "groupInstructions": "الوصف وموجّه النظام",
+    "fieldDescription": "الوصف",
+    "baseInstructions": "موجّه النظام (base_instructions)"
   }
 }

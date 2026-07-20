@@ -2222,7 +2222,9 @@ function DecoupleProbe({
     fileTabs,
     activeFileTabId,
     updateActiveFileContent,
+    updateFileTabContent,
     saveActiveFile,
+    setFileTabComposing,
     switchFileTab,
   } = useWorkspaceContext()
   onCapture({
@@ -2244,9 +2246,37 @@ function DecoupleProbe({
       <button onClick={() => updateActiveFileContent("dirty-local")}>
         edit
       </button>
+      <button
+        onClick={() =>
+          updateFileTabContent(fileTabId("/repo/a.ts"), "composing-local")
+        }
+      >
+        edit-a-by-id
+      </button>
+      <button
+        onClick={() => setFileTabComposing(fileTabId("/repo/a.ts"), true)}
+      >
+        compose-a-start
+      </button>
+      <button
+        onClick={() => setFileTabComposing(fileTabId("/repo/a.ts"), false)}
+      >
+        compose-a-end
+      </button>
       <button onClick={() => void saveActiveFile()}>save</button>
+      <button
+        onClick={() => {
+          updateActiveFileContent("deleted-content")
+          void saveActiveFile()
+        }}
+      >
+        edit-and-save-immediately
+      </button>
       <button onClick={() => switchFileTab(fileTabId("/repo2/a.ts"))}>
         switch-a-f2
+      </button>
+      <button onClick={() => switchFileTab(fileTabId("/repo/a.ts"))}>
+        switch-a-f1
       </button>
     </div>
   )
@@ -2270,6 +2300,51 @@ describe("file tabs decoupled from the active folder", () => {
         line_ending: "lf",
       })
     )
+  })
+
+  it("defers every save path during composition and flushes the original tab", async () => {
+    mockedApi.saveFileContent.mockResolvedValue({
+      path: "a.ts",
+      etag: "saved",
+      mtime_ms: 2,
+      readonly: false,
+      line_ending: "lf",
+    })
+    const snap = renderDecouple()
+
+    await act(async () => screen.getByText("open-a-f1").click())
+    await act(async () => screen.getByText("open-a-f2").click())
+    await act(async () => screen.getByText("switch-a-f1").click())
+    await act(async () => screen.getByText("compose-a-start").click())
+    await act(async () => screen.getByText("edit-a-by-id").click())
+
+    await act(async () => screen.getByText("save").click())
+    await act(async () => screen.getByText("switch-a-f2").click())
+    expect(mockedApi.saveFileContent).not.toHaveBeenCalled()
+    expect(snap().activeId).toBe(fileTabId("/repo2/a.ts"))
+
+    await act(async () => screen.getByText("compose-a-end").click())
+    expect(mockedApi.saveFileContent).toHaveBeenCalledTimes(1)
+    expect(mockedApi.saveFileContent.mock.calls[0][0]).toBe("/repo")
+    expect(mockedApi.saveFileContent.mock.calls[0][1]).toBe("a.ts")
+    expect(mockedApi.saveFileContent.mock.calls[0][2]).toBe("composing-local")
+  })
+
+  it("saves the latest edit when the shortcut follows in the same turn", async () => {
+    mockedApi.saveFileContent.mockResolvedValue({
+      path: "a.ts",
+      etag: "saved",
+      mtime_ms: 2,
+      readonly: false,
+      line_ending: "lf",
+    })
+    renderDecouple()
+
+    await act(async () => screen.getByText("open-a-f1").click())
+    await act(async () => screen.getByText("edit-and-save-immediately").click())
+
+    expect(mockedApi.saveFileContent).toHaveBeenCalledTimes(1)
+    expect(mockedApi.saveFileContent.mock.calls[0][2]).toBe("deleted-content")
   })
 
   function renderDecouple() {

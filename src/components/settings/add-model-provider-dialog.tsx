@@ -22,12 +22,15 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { createModelProvider } from "@/lib/api"
+import { CodexModelListEditor } from "@/components/settings/codex-model-list-editor"
 import {
   MODEL_PROVIDER_AGENT_TYPES,
   AGENT_LABELS,
   serializeClaudeProviderModel,
+  serializeCodexModelConfig,
   type AgentType,
   type ClaudeProviderModel,
+  type CodexModelConfig,
 } from "@/lib/types"
 
 interface AddModelProviderDialogProps {
@@ -53,6 +56,9 @@ export function AddModelProviderDialog({
   )
   const [singleModel, setSingleModel] = useState("")
   const [claudeModel, setClaudeModel] = useState<ClaudeProviderModel>({})
+  const [codexModel, setCodexModel] = useState<CodexModelConfig>({
+    customs: [],
+  })
 
   const resetForm = useCallback(() => {
     setName("")
@@ -61,6 +67,7 @@ export function AddModelProviderDialog({
     setAgentType(MODEL_PROVIDER_AGENT_TYPES[0])
     setSingleModel("")
     setClaudeModel({})
+    setCodexModel({ customs: [] })
     setError(null)
   }, [])
 
@@ -76,6 +83,7 @@ export function AddModelProviderDialog({
     setAgentType(next)
     setSingleModel("")
     setClaudeModel({})
+    setCodexModel({ customs: [] })
   }, [])
 
   const modelPlaceholder = useMemo(() => {
@@ -105,6 +113,8 @@ export function AddModelProviderDialog({
     let modelPayload: string | null = null
     if (agentType === "claude_code") {
       modelPayload = serializeClaudeProviderModel(claudeModel)
+    } else if (agentType === "codex") {
+      modelPayload = serializeCodexModelConfig(codexModel)
     } else if (singleModel.trim()) {
       modelPayload = singleModel.trim()
     }
@@ -141,6 +151,7 @@ export function AddModelProviderDialog({
     agentType,
     singleModel,
     claudeModel,
+    codexModel,
     handleOpenChange,
     onProviderAdded,
     t,
@@ -335,6 +346,13 @@ export function AddModelProviderDialog({
               <p className="text-[11px] text-muted-foreground md:col-span-2">
                 {t("claudeCustomModelOptionHint")}
               </p>
+            </div>
+          ) : agentType === "codex" ? (
+            <div className="space-y-1.5">
+              <CodexModelListEditor
+                value={codexModel}
+                onChange={setCodexModel}
+              />
             </div>
           ) : (
             <div className="space-y-1.5">

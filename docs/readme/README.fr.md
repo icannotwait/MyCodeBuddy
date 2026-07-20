@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réunit plusieurs agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, etc.) dans un seul espace de travail, prend en charge l'agrégation des conversations et la collaboration multi-agent, ainsi que l'installation desktop et le déploiement serveur/Docker.
+Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réunit plusieurs agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, etc.) dans un seul espace de travail, prend en charge l'agrégation des conversations et la collaboration multi-agent, ainsi que l'installation desktop et le déploiement serveur/Docker.
 
 ![gallery](../images/gallery.svg)
 
@@ -39,6 +39,20 @@ Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réun
       <strong><a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">随想AI中转站</a></strong>
     </td>
     <td>Merci à 随想AI中转站 pour son parrainage de ce projet ! 随想AI中转站 est un fournisseur de relais d'API fiable et efficace, proposant des services de relais pour Claude, Codex, Gemini et plus encore. Les nouveaux comptes reçoivent 0,5 ¥ de crédit de test à chaque pointage quotidien après <a href="https://sui-xiang.com/register?aff=JPFCRHHBE8HE">inscription</a> ; les recharges sont créditées à 1:1, sans abonnement, avec paiement à l'usage. La redondance multi-lignes, la reprise après sinistre inter-régions et le basculement automatique garantissent des connexions SSE de longue durée sans interruption.</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://hezu.ink/sign-up?aff=0wVz" target="_blank"><img src="../images/hezu-ink.jpg" alt="合租巴士" width="200" /></a><br/>
+      <strong><a href="https://hezu.ink/sign-up?aff=0wVz">合租巴士</a></strong>
+    </td>
+    <td>Merci à 合租巴士 pour son parrainage de ce projet ! 合租巴士 est une plateforme de relais d'IA fiable et efficace, offrant un relais très stable pour les principaux modèles tels que Codex et Claude Code. Le ratio de recharge est transparent (1:1), avec des subventions de taux Codex dès 0,08. <a href="https://hezu.ink/sign-up?aff=0wVz">Rejoignez le groupe depuis le site officiel pour obtenir 5 USD de crédit d'essai</a>.</td>
+  </tr>
+  <tr>
+    <td align="center" width="220">
+      <a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta" target="_blank"><img src="../images/onehop.jpg" alt="OneHop" width="120" /></a><br/>
+      <strong><a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">OneHop</a></strong>
+    </td>
+    <td>Merci à OneHop pour son parrainage de ce projet ! OneHop offre aux utilisateurs de Codeg une seule clé API compatible avec OpenAI pour des centaines de modèles de premier plan, dont GPT, Claude, Gemini, DeepSeek, Kimi et Qwen. Changez de modèle sans gérer plusieurs comptes de fournisseurs ni modifier votre code à répétition, et ne payez que ce que vous utilisez. <a href="https://onehop.ai/platform/login?ref=CODEG&utm_source=github&utm_medium=readme_sponsor&utm_campaign=codeg&utm_content=sponsor_cta">Inscrivez-vous via Codeg</a> pour recevoir 1 USD de crédit, puis rejoignez la communauté OneHop et participez à l'activité de bienvenue pour obtenir 5 USD supplémentaires, soit jusqu'à 6 USD de crédit d'essai au total.</td>
   </tr>
 </table>
 
@@ -92,6 +106,7 @@ Codeg (Code Generation) est un espace de travail de codage multi-agent. Il réun
 | Kimi Code    | `$KIMI_CODE_HOME/sessions`            | `~/.kimi-code/sessions`               | `%USERPROFILE%\\.kimi-code\\sessions`                 |
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
 | Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
+| Cursor       | `$CURSOR_CONFIG_DIR/chats`            | `~/.cursor/chats`                     | `%USERPROFILE%\\.cursor\\chats`                       |
 
 > Remarque : les variables d'environnement ont priorité sur les chemins par défaut.
 
@@ -119,6 +134,8 @@ Prend actuellement en charge le scaffolding de projets **shadcn/ui**, avec un de
 <summary><h2>Canaux de chat</h2></summary>
 
 Connectez vos applications de messagerie préférées — Telegram, Lark (Feishu), iLink (Weixin) et plus — à vos agents de codage IA. Créez des tâches, envoyez des messages de suivi, approuvez les permissions, reprenez des sessions et surveillez l'activité directement depuis votre chat — recevez les réponses des agents en temps réel avec les détails des appels d'outils, les demandes de permissions et les résumés de complétion, le tout sans ouvrir de navigateur.
+
+Les supergroupes forum Telegram peuvent aussi utiliser le [Telegram topic mode](../chat-channels/telegram-topic-mode.md) pour lier chaque topic à une session Codeg distincte.
 
 ### Canaux pris en charge
 
@@ -268,7 +285,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 Ou installer une version spécifique :
 
 ```powershell
-.\install.ps1 -Version v0.20.2-mycodebuddy.8
+.\install.ps1 -Version v0.21.1-mycodebuddy.1
 ```
 
 #### Option 2 : Télécharger depuis GitHub Releases
