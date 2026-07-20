@@ -113,6 +113,16 @@ import {
   branchRowPaddingLeft,
 } from "@/components/layout/branch-tree-collapsible"
 import { useBranchTreeExpansion } from "@/hooks/use-branch-tree-expansion"
+import {
+  buildCommitFileTree,
+  collectExpandedDirectoryPaths,
+  type CommitFileTreeNode,
+} from "@/lib/commit-file-tree"
+import {
+  formatRelativeTime,
+  mapFileStatus,
+  parseDate,
+} from "@/lib/git-log-format"
 
 // Local section open by default; Remote stays collapsed until expanded or seeded.
 const SIDEBAR_DEFAULT_EXPANDED = [sectionKey("local")]
@@ -126,42 +136,6 @@ const emitEvent = async (event: string, payload?: unknown) => {
   }
 }
 
-function formatRelativeTime(
-  dateStr: string,
-  t: (
-    key:
-      | "time.monthsAgo"
-      | "time.daysAgo"
-      | "time.hoursAgo"
-      | "time.minsAgo"
-      | "time.justNow",
-    values?: { count: number }
-  ) => string
-): string {
-  const date = new Date(dateStr)
-  if (Number.isNaN(date.getTime())) return dateStr
-
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffMin = Math.floor(diffMs / 60_000)
-  const diffHour = Math.floor(diffMin / 60)
-  const diffDay = Math.floor(diffHour / 24)
-
-  if (diffDay > 30) {
-    const diffMonth = Math.floor(diffDay / 30)
-    return t("time.monthsAgo", { count: diffMonth })
-  }
-  if (diffDay > 0) return t("time.daysAgo", { count: diffDay })
-  if (diffHour > 0) return t("time.hoursAgo", { count: diffHour })
-  if (diffMin > 0) return t("time.minsAgo", { count: diffMin })
-  return t("time.justNow", { count: 0 })
-}
-
-function parseDate(dateStr: string): Date | null {
-  const date = new Date(dateStr)
-  return Number.isNaN(date.getTime()) ? null : date
-}
-
 function filterRecordByCommitHashes<T>(
   record: Record<string, T>,
   hashes: Set<string>
@@ -173,21 +147,6 @@ function filterRecordByCommitHashes<T>(
     }
   }
   return next
-}
-
-function mapFileStatus(
-  status: string
-): "added" | "modified" | "deleted" | "renamed" {
-  switch (status.toUpperCase().charAt(0)) {
-    case "A":
-      return "added"
-    case "D":
-      return "deleted"
-    case "R":
-      return "renamed"
-    default:
-      return "modified"
-  }
 }
 
 function getPushStatusMeta(
@@ -225,23 +184,6 @@ function getPushStatusMeta(
   }
 }
 
-type CommitFileTreeDirNode = {
-  kind: "dir"
-  name: string
-  path: string
-  children: CommitFileTreeNode[]
-  fileCount: number
-}
-
-type CommitFileTreeFileNode = {
-  kind: "file"
-  name: string
-  path: string
-  change: GitLogFileChange
-}
-
-type CommitFileTreeNode = CommitFileTreeDirNode | CommitFileTreeFileNode
-
 interface CommitBranchTarget {
   fullHash: string
   shortHash: string
@@ -251,150 +193,6 @@ interface CommitResetTarget {
   fullHash: string
   shortHash: string
   message: string
-}
-
-interface MutableCommitFileTreeDirNode {
-  kind: "dir"
-  name: string
-  path: string
-  children: Map<string, MutableCommitFileTreeDirNode | CommitFileTreeFileNode>
-}
-
-function normalizePathSegments(path: string): string[] {
-  const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")
-  if (!normalized) return []
-  return normalized.split("/").filter(Boolean)
-}
-
-function toSortedTreeNodes(
-  dir: MutableCommitFileTreeDirNode
-): CommitFileTreeNode[] {
-  return Array.from(dir.children.values())
-    .map<CommitFileTreeNode>((node) => {
-      if (node.kind === "file") return node
-      return {
-        kind: "dir" as const,
-        fileCount: 0,
-        name: node.name,
-        path: node.path,
-        children: toSortedTreeNodes(node),
-      }
-    })
-    .sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1
-      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
-    })
-}
-
-function compressAndAnnotateDir(
-  node: CommitFileTreeDirNode
-): CommitFileTreeDirNode {
-  let compressedChildren: CommitFileTreeNode[] = node.children.map((child) => {
-    if (child.kind === "file") return child
-    return compressAndAnnotateDir(child)
-  })
-
-  let fileCount = compressedChildren.reduce((count, child) => {
-    if (child.kind === "file") return count + 1
-    return count + child.fileCount
-  }, 0)
-
-  let nextNode: CommitFileTreeDirNode = {
-    ...node,
-    children: compressedChildren,
-    fileCount,
-  }
-
-  // Merge "dir/dir/dir" chains where each directory only has one directory child.
-  while (
-    nextNode.children.length === 1 &&
-    nextNode.children[0].kind === "dir"
-  ) {
-    const onlyChild = nextNode.children[0]
-    nextNode = {
-      kind: "dir",
-      name: `${nextNode.name}/${onlyChild.name}`,
-      path: onlyChild.path,
-      children: onlyChild.children,
-      fileCount: onlyChild.fileCount,
-    }
-  }
-
-  compressedChildren = nextNode.children
-  fileCount = compressedChildren.reduce((count, child) => {
-    if (child.kind === "file") return count + 1
-    return count + child.fileCount
-  }, 0)
-
-  return {
-    ...nextNode,
-    children: compressedChildren,
-    fileCount,
-  }
-}
-
-function buildCommitFileTree(files: GitLogFileChange[]): CommitFileTreeNode[] {
-  const root: MutableCommitFileTreeDirNode = {
-    kind: "dir",
-    name: "",
-    path: "",
-    children: new Map(),
-  }
-
-  for (const change of files) {
-    const segments = normalizePathSegments(change.path)
-    if (segments.length === 0) continue
-
-    let current = root
-    for (const [index, segment] of segments.entries()) {
-      const nodePath = segments.slice(0, index + 1).join("/")
-      const isLeaf = index === segments.length - 1
-
-      if (isLeaf) {
-        current.children.set(`file:${nodePath}`, {
-          kind: "file",
-          name: segment,
-          path: nodePath,
-          change,
-        })
-        continue
-      }
-
-      const dirKey = `dir:${nodePath}`
-      const existing = current.children.get(dirKey)
-      if (existing && existing.kind === "dir") {
-        current = existing
-        continue
-      }
-
-      const nextDir: MutableCommitFileTreeDirNode = {
-        kind: "dir",
-        name: segment,
-        path: nodePath,
-        children: new Map(),
-      }
-      current.children.set(dirKey, nextDir)
-      current = nextDir
-    }
-  }
-
-  const sortedNodes = toSortedTreeNodes(root)
-  return sortedNodes.map((node) => {
-    if (node.kind === "file") return node
-    return compressAndAnnotateDir(node)
-  })
-}
-
-function collectExpandedDirectoryPaths(
-  nodes: CommitFileTreeNode[],
-  expanded = new Set<string>()
-): Set<string> {
-  for (const node of nodes) {
-    if (node.kind !== "dir") continue
-    expanded.add(node.path)
-    collectExpandedDirectoryPaths(node.children, expanded)
-  }
-  return expanded
 }
 
 function CommitFilesTree({
